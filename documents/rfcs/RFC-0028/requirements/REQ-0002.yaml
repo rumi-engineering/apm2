@@ -1,0 +1,26 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0002"
+  title: "Proof-carrying identity, freshness, and revocation authority closure"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Tier2+ external authority admission MUST require proof-carrying identity membership,
+    HTF-compatible freshness authority, and revocation dominance under partition/rejoin.
+    Missing, stale, conflicting, or unverifiable identity/freshness state MUST deny.
+  rationale: |
+    Authentic identity without freshness and revocation closure is insufficient at adversarial boundaries.
+  acceptance_criteria:
+    - "Tier2+ admissions fail closed on stale or ambiguous identity head state."
+    - "Revoked identity/delegation acceptance converges to zero within bounded anti-entropy windows."
+    - "No wall-time-based authorization semantics for identity freshness."
+  imported_dependencies:
+    - "RFC-0020::REQ-0002"
+    - "RFC-0020::REQ-0018"
+    - "RFC-0020::REQ-0019"
+    - "RFC-0020::REQ-0035"
+    - "RFC-0016::REQ-HTF-0003"
+  evidence_ids:
+    - "EVID-0002"
+

@@ -48,6 +48,6 @@ OPT-HYBRID was selected because:
 - [ ] Review meeting notes (pending)
 
 ## References
-- documents/theory/unified_theory.json (PHY-04)
-- documents/theory/laws.json
-- documents/theory/laws.json
+- documents/theory/unified-theory-v2.json (PHY-04)
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json

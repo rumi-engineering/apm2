@@ -40,6 +40,9 @@ rfc_requirements_readme:
     - id: "REQ-0012"
       title: "Scale-envelope verifier-economics and anti-entropy controls"
       file: "REQ-0012.yaml"
+    - id: "REQ-0013"
+      title: "Trade-secret-only IP posture and patent-filing denial"
+      file: "REQ-0013.yaml"
   required_conventions:
     - "Root key MUST be requirement."
     - "requirement.id MUST match filename."

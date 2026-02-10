@@ -9,7 +9,7 @@ rfc_meta:
     status: "DRAFT"
     version: "v0.1"
     created_date: "2026-02-05"
-    last_updated_date: "2026-02-05"
+    last_updated_date: "2026-02-09"
     source_of_truth:
       path: "HOLONIC_VENTURE_PROVING_INTERFACE.md"
       role: "authoritative normative specification"
@@ -49,6 +49,8 @@ rfc_meta:
         summary: "Normative gate time authority is HTF-bound; wall-clock metadata is display-only."
       - id: "VPHI-INV-007"
         summary: "Scale controls enforce bounded anti-entropy and verifier-economics ceilings with fail-closed unknown-state behavior."
+      - id: "VPHI-INV-008"
+        summary: "VPHI runs in trade-secret-only mode; patent/provisional filing pathways are denied by policy."
 
   binds_to_prd:
     prd_id: "PRD-0009"

@@ -1,0 +1,60 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00466"
+    title: "RFC-0028 REQ-0005 portable acceptance evidence and deterministic reverification"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0028"
+    requirements:
+      - requirement_id: "REQ-0005"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0005.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0005"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0005.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_OBSERVABILITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00464"
+        reason: "Portable evidence must include delegation/consume/effect closure receipts."
+      - ticket_id: "TCK-00465"
+        reason: "Portable evidence must include boundary/declassification receipt lineage."
+  scope:
+    in_scope:
+      - "Define portable acceptance package contract with complete receipt pointers and verification metadata."
+      - "Guarantee deterministic replay/reverification by at least two independent verifier implementations."
+      - "Fail closed on missing, stale, or unverifiable imported authority claims."
+      - "Add replay fixture generation and verifier-concordance reporting for promotion-critical traces."
+    out_of_scope:
+      - "Cross-organization key governance policy."
+      - "Non-authoritative observability export formats."
+  plan:
+    steps:
+      - "Define acceptance package schema and digest-set completeness constraints."
+      - "Implement deterministic verifier harness and cross-verifier concordance checks."
+      - "Add fail-closed behavior for incomplete or non-portable evidence bundles."
+      - "Add integration tests that replay evidence without ambient runtime state."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0005"
+    criteria:
+      - "Portable replay package is sufficient for deterministic third-party reverification."
+      - "At least two verifier implementations produce matching admissibility verdicts."
+      - "Any missing required receipt pointer yields deny."
+  notes:
+    security: |
+      Authority trust is portable-evidence-based, not process-local-state-based.
+    verification: |
+      Include independent verifier replay tests and mismatch deny fixtures.
+    general: |
+      This ticket closes the replay portability requirement before promotion readiness gating.

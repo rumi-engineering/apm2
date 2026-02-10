@@ -1,0 +1,322 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-02-09"
+
+  schema_governance:
+    canonicalizer_contract:
+      tuple: "(canonicalizer_id, canonicalizer_version, canonicalizer_vectors_ref)"
+      compatibility_rule: "Canonicalizer tuple MUST match the active snapshot tuple for promotion-critical evaluation."
+      precondition: "Schema IDs must resolve through CAC schema registry artifacts (kind = schema.definition)."
+    versioning_policy:
+      - "Each required CAC input is validated as (kind, schema_id, schema_major, canonicalizer_id, canonicalizer_version, digest, signature_set, window_or_ttl_ref)."
+      - "Unknown or incompatible schema versions are non-admissible."
+      - "Digest and canonicalizer mismatches are fail-closed denial conditions."
+      - "Validation order is mandatory and non-bypassable."
+
+  cac_schemas:
+    - schema_id: "apm2.anti_entropy_convergence_receipt.v1"
+      name: "AntiEntropyConvergenceReceiptV1"
+      schema: "apm2.anti_entropy_convergence_receipt.v1"
+      kind: "anti_entropy.convergence.receipt"
+      purpose: "Proof of required authority-set convergence within declared anti-entropy horizon."
+
+    - schema_id: "apm2.authority_kernel_decision.v1"
+      name: "AuthorityKernelDecisionV1"
+      schema: "apm2.authority_kernel_decision.v1"
+      kind: "authority.kernel.decision"
+      purpose: "Binds lifecycle authority decisions and optimization interlock evidence."
+
+    - schema_id: "apm2.bft_recovery_quorum_certificate.v1"
+      name: "BftRecoveryQuorumCertificateV1"
+      schema: "apm2.bft_recovery_quorum_certificate.v1"
+      kind: "bft.recovery.quorum.certificate"
+      purpose: "Quorum certificate proving trust-valid reconstruction of recovered digests."
+
+    - schema_id: "apm2.boundary_flow_policy.v1"
+      name: "BoundaryFlowPolicyV1"
+      schema: "apm2.boundary_flow_policy.v1"
+      kind: "boundary.flow.policy"
+      purpose: "Enforces boundary safety constraints during optimization interlock evaluation."
+
+    - schema_id: "apm2.codebase_recovery_profile.v1"
+      name: "CodebaseRecoveryProfileV1"
+      schema: "apm2.codebase_recovery_profile.v1"
+      kind: "codebase.recovery.profile"
+      purpose: "Declares recovery envelope and tier constraints for redundancy/recoverability gates."
+
+    - schema_id: "apm2.countermetric_profile.v1"
+      name: "CountermetricProfileV1"
+      schema: "apm2.countermetric_profile.v1"
+      kind: "countermetric.profile"
+      purpose: "Defines KPI-countermetric pairings and non-regression checks for optimization gates."
+
+    - schema_id: "apm2.crypto_agility_policy.v1"
+      name: "CryptoAgilityPolicyV1"
+      schema: "apm2.crypto_agility_policy.v1"
+      kind: "crypto.agility.policy"
+      purpose: "Declares algorithm allowlists, downgrade bans, and epoch/risk-tier crypto policy."
+
+    - schema_id: "apm2.economics_constraint_profile.v1"
+      name: "EconomicsConstraintProfileV1"
+      schema: "apm2.economics_constraint_profile.v1"
+      kind: "economics.constraint.profile"
+      purpose: "Encodes cost bounds and hard-constraint interlocks for economics admission."
+
+    - schema_id: "apm2.erasure_recovery_receipt.v1"
+      name: "ErasureRecoveryReceiptV1"
+      schema: "apm2.erasure_recovery_receipt.v1"
+      kind: "erasure.recovery.receipt"
+      purpose: "Evidence of erasure decode completion and reconstruction traceability."
+
+    - schema_id: "apm2.evidence_freshness_sla.v1"
+      name: "EvidenceFreshnessSlaV1"
+      schema: "apm2.evidence_freshness_sla.v1"
+      kind: "evidence.freshness.sla"
+      purpose: "Freshness age bounds for promotion-critical evidence classes."
+
+    - schema_id: "apm2.evidence_quality_profile.v1"
+      name: "EvidenceQualityProfileV1"
+      schema: "apm2.evidence_quality_profile.v1"
+      kind: "evidence.quality.profile"
+      purpose: "Statistical power and reproducibility contracts for evidence quality gates."
+
+    - schema_id: "apm2.halt_state_receipt.v1"
+      name: "HaltStateReceiptV1"
+      schema: "apm2.halt_state_receipt.v1"
+      kind: "halt.state.receipt"
+      purpose: "Receipted state for explicit emergency halt and bounded recovery workflow."
+
+    - schema_id: "apm2.hardware_tier_envelope.v1"
+      name: "HardwareTierEnvelopeV1"
+      schema: "apm2.hardware_tier_envelope.v1"
+      kind: "hardware.tier.envelope"
+      purpose: "Declares hardware-class envelope and stress admissibility constraints."
+
+    - schema_id: "apm2.pcac_snapshot_report.v1"
+      name: "PcacSnapshotReportV1"
+      schema: "apm2.pcac_snapshot_report.v1"
+      kind: "snapshot.report"
+      purpose: "Snapshot digest coverage and baseline canonicalizer compatibility for gate sequencing."
+
+    - schema_id: "apm2.projection_continuity_window.v1"
+      name: "ProjectionContinuityWindowV1"
+      schema: "apm2.projection_continuity_window.v1"
+      kind: "projection.continuity.window"
+      purpose: "Defines outage/replay HTF windows for projection continuity gating."
+
+    - schema_id: "apm2.projection_isolation_policy.v1"
+      name: "ProjectionIsolationPolicyV1"
+      schema: "apm2.projection_isolation_policy.v1"
+      kind: "projection.isolation.policy"
+      purpose: "Enforces authority-surface monotonicity and sink-agnostic isolation invariants."
+
+    - schema_id: "apm2.projection_sink_continuity_profile.v1"
+      name: "ProjectionSinkContinuityProfileV1"
+      schema: "apm2.projection_sink_continuity_profile.v1"
+      kind: "projection.sink.continuity.profile"
+      purpose: "Declares scenario sets and bounded backlog continuity requirements for sink outages."
+
+    - schema_id: "apm2.recoverability_profile.v1"
+      name: "RecoverabilityProfileV1"
+      schema: "apm2.recoverability_profile.v1"
+      kind: "recoverability.profile"
+      purpose: "Tiered redundancy envelope declaration for recoverability gates."
+
+    - schema_id: "apm2.recovery_admissibility_receipt.v1"
+      name: "RecoveryAdmissibilityReceiptV1"
+      schema: "apm2.recovery_admissibility_receipt.v1"
+      kind: "recovery.admissibility.receipt"
+      purpose: "Temporal-bound receipt proving reconstruction admissibility closure."
+
+    - schema_id: "apm2.replay_convergence_receipt.v1"
+      name: "ReplayConvergenceReceiptV1"
+      schema: "apm2.replay_convergence_receipt.v1"
+      kind: "replay.convergence.receipt"
+      purpose: "Bounded replay convergence and idempotency evidence for temporal predicates and gates."
+
+    - schema_id: "apm2.revocation_frontier_snapshot.v1"
+      name: "RevocationFrontierSnapshotV1"
+      schema: "apm2.revocation_frontier_snapshot.v1"
+      kind: "revocation.frontier.snapshot"
+      purpose: "Revocation frontier state for monotonicity and freshness predicate evaluation."
+
+    - schema_id: "apm2.semantic_diff_report.v1"
+      name: "SemanticDiffReportV1"
+      schema: "apm2.semantic_diff_report.v1"
+      kind: "semantic.diff.report"
+      purpose: "Semantic drift classification report for promotion-blocking compatibility decisions."
+
+    - schema_id: "apm2.sink_identity_snapshot.v1"
+      name: "SinkIdentitySnapshotV1"
+      schema: "apm2.sink_identity_snapshot.v1"
+      kind: "sink.identity.snapshot"
+      purpose: "Sink endpoint/key/DNS identity continuity and compromise detection evidence."
+
+    - schema_id: "apm2.source_trust_snapshot.v1"
+      name: "SourceTrustSnapshotV1"
+      schema: "apm2.source_trust_snapshot.v1"
+      kind: "source.trust.snapshot"
+      purpose: "Trusted source digest bindings used during reconstruction admissibility checks."
+
+    - schema_id: "apm2.temporal_arbitration_receipt.v1"
+      name: "TemporalArbitrationReceiptV1"
+      schema: "apm2.temporal_arbitration_receipt.v1"
+      kind: "temporal.arbitration.receipt"
+      purpose: "Adjudicated cross-verifier temporal disagreement outcome receipt."
+
+    - schema_id: "apm2.temporal_disagreement_receipt.v1"
+      name: "TemporalDisagreementReceiptV1"
+      schema: "apm2.temporal_disagreement_receipt.v1"
+      kind: "temporal.disagreement.receipt"
+      purpose: "Receipt of unresolved or transient temporal predicate disagreement states."
+
+    - schema_id: "apm2.temporal_predicate_evaluator.v1"
+      name: "TemporalPredicateEvaluatorV1"
+      schema: "apm2.temporal_predicate_evaluator.v1"
+      kind: "temporal.evaluator"
+      purpose: "Canonical evaluator tuple contract for TP-EIO29 predicate execution."
+
+    - schema_id: "apm2.temporal_slo_profile.v1"
+      name: "TemporalSloProfileV1"
+      schema: "apm2.temporal_slo_profile.v1"
+      kind: "temporal.slo.profile"
+      purpose: "Temporal objective tuple definitions and queue/throughput/freshness policy windows."
+
+    - schema_id: "apm2.time_authority_envelope.v1"
+      name: "TimeAuthorityEnvelopeV1"
+      schema: "apm2.time_authority_envelope.v1"
+      kind: "time.envelope"
+      purpose: "Signed time authority contract for all promotion-critical temporal evaluations."
+
+    - schema_id: "apm2.trade_secret_policy_profile.v1"
+      name: "TradeSecretPolicyProfileV1"
+      schema: "apm2.trade_secret_policy_profile.v1"
+      kind: "trade.secret.policy"
+      purpose: "Disclosure-control policy epoch profile for trade-secret interlock non-regression."
+
+    - schema_id: "cac.budget_profile.v1"
+      name: "BudgetProfileV1"
+      schema: "cac.budget_profile.v1"
+      kind: "budget.profile"
+      purpose: "Budget envelope contract for queue and context-injection admissibility checks."
+
+    - schema_id: "cac.context_pack_manifest.v1"
+      name: "ContextPackManifestV1"
+      schema: "cac.context_pack_manifest.v1"
+      kind: "context_pack.manifest"
+      purpose: "Manifest hash for deterministic context closure and run receipt binding."
+
+    - schema_id: "cac.context_pack_spec.v1"
+      name: "ContextPackSpecV1"
+      schema: "cac.context_pack_spec.v1"
+      kind: "context_pack.spec"
+      purpose: "Declared context pack selector and content contract for role context injection."
+
+    - schema_id: "cac.defect_record.v1"
+      name: "CacDefectRecordV1"
+      schema: "cac.defect_record.v1"
+      kind: "cac.defect_record"
+      purpose: "Structured defect emission artifact for gate-deny failure classes."
+
+    - schema_id: "cac.holon_contract.v1"
+      name: "HolonContractV1"
+      schema: "cac.holon_contract.v1"
+      kind: "role.spec.contract"
+      purpose: "RoleSpec contract surface for deterministic context and bound-policy enforcement."
+
+    - schema_id: "cac.reasoning_selector.v1"
+      name: "ReasoningSelectorV1"
+      schema: "cac.reasoning_selector.v1"
+      kind: "reasoning.selector"
+      purpose: "Selector closure declaration for context admissibility and no-ambient-read enforcement."
+
+    - schema_id: "cac.run_receipt.v1"
+      name: "RunReceiptV1"
+      schema: "cac.run_receipt.v1"
+      kind: "receipt.run"
+      purpose: "Execution receipt binding KPI/countermetric and context manifest digest integrity."
+
+  cac_validation_order:
+    - step: 1
+      statement: "schema resolution (schema_id, schema_major)"
+    - step: 2
+      statement: "canonicalizer tuple compatibility check"
+    - step: 3
+      statement: "signature/freshness check for signed inputs"
+    - step: 4
+      statement: "contract_digest_set completeness and equality constraints"
+    - step: 5
+      statement: "gate predicate execution"
+
+  defect_classes:
+    - id: "CAC_SCHEMA_UNRESOLVED"
+      statement: "Referenced schema cannot be resolved."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_SCHEMA_VERSION_INCOMPATIBLE"
+      statement: "Resolved schema version is incompatible with required major contract."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_CANONICALIZER_UNRESOLVED"
+      statement: "Canonicalizer tuple cannot be resolved."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_CANONICALIZER_VECTOR_MISMATCH"
+      statement: "Canonicalizer vectors mismatch active snapshot tuple."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_DIGEST_SET_INCOMPLETE"
+      statement: "Required digest entries are missing from contract_digest_set."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_DIGEST_MISMATCH"
+      statement: "Digest equality constraints fail."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_SIGNATURE_INVALID"
+      statement: "Signature set verification failed for signed inputs."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_INPUT_STALE"
+      statement: "Signed input freshness or ttl binding is stale for the evaluated window."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+    - id: "CAC_VALIDATION_ORDER_VIOLATION"
+      statement: "Gate predicate execution attempted before completing mandatory validation order."
+      tier_behavior:
+        tier0_tier1: "deny gate and emit cac.defect_record.v1"
+        tier2_plus: "deny gate, force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref"
+
+  tier_policy:
+    missed_adjudication_deadline: "Tier2+ missed adjudication deadline escalates to D4 emergency halt."
+
+  ownership_boundary:
+    canonical_ownership:
+      - rfc_id: "RFC-0016"
+        ownership: "canonical temporal substrate semantics"
+      - rfc_id: "RFC-0019"
+        ownership: "shared cross-profile temporal contract surfaces and gate-order binding for promotion-critical admission"
+      - rfc_id: "RFC-0027"
+        ownership: "lifecycle semantics"
+      - rfc_id: "RFC-0028"
+        ownership: "security profile constraints"
+      - rfc_id: "RFC-0029"
+        ownership: "efficiency and temporal-economics execution constraints"
+    mirror_policy:
+      - "RFC-0019 chapter 16 remains derived mirror only."
+      - "GATE-EIO-PROFILE-SYNC enforces one-way sync from RFC-0029 to RFC-0019 chapter 16."

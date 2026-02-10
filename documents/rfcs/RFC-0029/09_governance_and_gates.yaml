@@ -1,0 +1,483 @@
+rfc_governance_and_gates:
+  schema_version: "2026-02-10"
+
+  governance_overview:
+    description: |
+      RFC-0029 enforces fail-closed efficiency-plane admission over PCAC
+      lifecycle semantics with strict security interlock and temporal authority
+      constraints.
+    signoff_expectations:
+      - "AUTH_ARCHITECTURE"
+      - "AUTH_RELIABILITY"
+      - "AUTH_SECURITY"
+    dominance_order: "containment/security > verification/correctness > liveness/progress"
+    fail_closed_posture: "All unknown or ambiguous authority-critical inputs deny."
+
+  gates:
+    - id: "GATE-EIO29-SNAPSHOT"
+      name: "Snapshot drift guard"
+      type: "DETERMINISTIC"
+      purpose: "Blocks on snapshot drift."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Snapshot digest covers all required economics/temporal contract digests."
+      evidence_required:
+        - "RFC-0029::EVID-0001"
+      cac_inputs:
+        - kind: "snapshot.report"
+          schema: "apm2.pcac_snapshot_report.v1"
+          binding_rule: "snapshot digest MUST cover all required economics/temporal contract digests"
+
+    - id: "GATE-EIO29-TIME-AUTHORITY"
+      name: "Temporal authority evaluator binding"
+      type: "DETERMINISTIC"
+      purpose: "Enforces TP-EIO29-001."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Time envelope and evaluator digests are present and compatible with snapshot canonicalizer tuple."
+      evidence_required:
+        - "RFC-0029::EVID-0004"
+      cac_inputs:
+        - kind: "time.envelope"
+          schema: "apm2.time_authority_envelope.v1"
+          binding_rule: "Envelope digest MUST be present and canonicalizer-compatible with snapshot"
+        - kind: "temporal.evaluator"
+          schema: "apm2.temporal_predicate_evaluator.v1"
+          binding_rule: "Evaluator digest MUST be present and canonicalizer-compatible with snapshot"
+
+    - id: "GATE-EIO29-BOUNDS"
+      name: "Economics bounds and context-injection contract"
+      type: "DETERMINISTIC"
+      purpose: "Blocks on verifier-economics bound violations and RoleSpec context-injection contract violations."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Bounds profile digest and RoleSpec/context selector digests match active policy epoch and canonicalizer tuple."
+      evidence_required:
+        - "RFC-0029::EVID-0001"
+        - "RFC-0029::EVID-0002"
+      cac_inputs:
+        - kind: "economics.constraint.profile"
+          schema: "apm2.economics_constraint_profile.v1"
+          binding_rule: "Bounds digest MUST match active policy epoch root"
+        - kind: "role.spec.contract"
+          schema: "cac.holon_contract.v1"
+          binding_rule: "Role contract digest MUST match admitted selector closure"
+        - kind: "context_pack.spec"
+          schema: "cac.context_pack_spec.v1"
+          binding_rule: "Context pack spec digest MUST match admitted selector closure"
+        - kind: "context_pack.manifest"
+          schema: "cac.context_pack_manifest.v1"
+          binding_rule: "Context manifest digest MUST match run receipt and admitted manifest"
+        - kind: "reasoning.selector"
+          schema: "cac.reasoning_selector.v1"
+          binding_rule: "Selector digest MUST match role/context closure"
+        - kind: "budget.profile"
+          schema: "cac.budget_profile.v1"
+          binding_rule: "Budget profile digest MUST match active policy epoch"
+
+    - id: "GATE-EIO29-COUNTERMETRICS"
+      name: "KPI-countermetric integrity"
+      type: "DETERMINISTIC"
+      purpose: "Blocks on missing/regressed KPI-countermetric pairs or missing context-injection quality counters."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "KPI/countermetric pairing digests are complete and signed."
+        - "receipt.run.context_pack_manifest_hash matches admitted manifest digest."
+      evidence_required:
+        - "RFC-0029::EVID-0006"
+      cac_inputs:
+        - kind: "economics.constraint.profile"
+          schema: "apm2.economics_constraint_profile.v1"
+          binding_rule: "Constraint profile digest MUST align with active epoch"
+        - kind: "countermetric.profile"
+          schema: "apm2.countermetric_profile.v1"
+          binding_rule: "Countermetric profile digest MUST pair every required KPI"
+        - kind: "receipt.run"
+          schema: "cac.run_receipt.v1"
+          binding_rule: "run receipt digest MUST bind admitted context_pack_manifest_hash"
+
+    - id: "GATE-EIO29-REPLAY-RECOVERY"
+      name: "Replay and recovery convergence"
+      type: "DETERMINISTIC"
+      purpose: "Enforces TP-EIO29-004 and reconstruction receipts."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Replay and recovery digests bind to the same window_ref and time_authority_ref."
+      evidence_required:
+        - "RFC-0029::EVID-0005"
+      cac_inputs:
+        - kind: "replay.convergence.receipt"
+          schema: "apm2.replay_convergence_receipt.v1"
+          binding_rule: "Replay convergence digest MUST be bound to referenced window and authority"
+        - kind: "recovery.admissibility.receipt"
+          schema: "apm2.recovery_admissibility_receipt.v1"
+          binding_rule: "Recovery admissibility digest MUST be bound to same window and authority"
+
+    - id: "GATE-EIO29-INTERLOCK"
+      name: "Hard security interlock"
+      type: "DETERMINISTIC"
+      purpose: "Prevents optimization from regressing hard-safety predicates."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Interlock digest set proves no hard-safety regression under optimization candidate."
+      evidence_required:
+        - "RFC-0029::EVID-0006"
+      cac_inputs:
+        - kind: "authority.kernel.decision"
+          schema: "apm2.authority_kernel_decision.v1"
+          binding_rule: "Authority decision digest MUST bind relevant interlock predicates"
+        - kind: "boundary.flow.policy"
+          schema: "apm2.boundary_flow_policy.v1"
+          binding_rule: "Boundary flow policy digest MUST prove no containment regression"
+
+    - id: "GATE-EIO29-QUEUE-STABILITY"
+      name: "Queue tick-floor stability"
+      type: "DETERMINISTIC"
+      purpose: "Enforces queue tick floors and anti-starvation invariants."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Tick-floor and queue-budget digests bind to identical HTF boundary and authority clock."
+      evidence_required:
+        - "RFC-0029::EVID-0004"
+      cac_inputs:
+        - kind: "temporal.slo.profile"
+          schema: "apm2.temporal_slo_profile.v1"
+          binding_rule: "Tick-floor and queue SLO digest MUST bind boundary and authority clock"
+        - kind: "projection.continuity.window"
+          schema: "apm2.projection_continuity_window.v1"
+          binding_rule: "Queue budget window digest MUST bind boundary and authority clock"
+
+    - id: "GATE-EIO29-TEMPORAL-MONOTONICITY"
+      name: "Revocation and replay temporal monotonicity"
+      type: "DETERMINISTIC"
+      purpose: "Enforces TP-EIO29-006..008."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Adjacent-window monotonicity digests are complete and arbitration-bound."
+        - "Unresolved arbitration digest denies promotion."
+      evidence_required:
+        - "RFC-0029::EVID-0004"
+        - "RFC-0029::EVID-0005"
+      cac_inputs:
+        - kind: "revocation.frontier.snapshot"
+          schema: "apm2.revocation_frontier_snapshot.v1"
+          binding_rule: "Adjacent-window revocation digests MUST be complete and monotone"
+        - kind: "replay.convergence.receipt"
+          schema: "apm2.replay_convergence_receipt.v1"
+          binding_rule: "Replay monotonicity and dedup digests MUST be complete"
+        - kind: "temporal.disagreement.receipt"
+          schema: "apm2.temporal_disagreement_receipt.v1"
+          binding_rule: "Temporal disagreement receipt MUST bind verdict bundle"
+        - kind: "temporal.arbitration.receipt"
+          schema: "apm2.temporal_arbitration_receipt.v1"
+          binding_rule: "Arbitration receipt MUST bind disagreement and outcome"
+
+    - id: "GATE-EIO29-REDUNDANCY-RECOVERABILITY"
+      name: "Tier recoverability envelope"
+      type: "DETERMINISTIC"
+      purpose: "Enforces tier recoverability envelope."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Tier envelope digests match current (k,n,failure_domains,repair_slo) declaration."
+      evidence_required:
+        - "RFC-0029::EVID-0010"
+      cac_inputs:
+        - kind: "recoverability.profile"
+          schema: "apm2.recoverability_profile.v1"
+          binding_rule: "Recoverability profile digest MUST match current tier envelope declaration"
+        - kind: "codebase.recovery.profile"
+          schema: "apm2.codebase_recovery_profile.v1"
+          binding_rule: "Codebase recovery profile digest MUST match current tier envelope declaration"
+
+    - id: "GATE-EIO29-TRADE-SECRET-INTERLOCK"
+      name: "Disclosure-control non-regression"
+      type: "DETERMINISTIC"
+      purpose: "Enforces non-regression on disclosure-control posture (default mode: trade-secret-only)."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Trade-secret policy digest matches security-plane policy digest for same epoch."
+      evidence_required:
+        - "RFC-0029::EVID-0007"
+      cac_inputs:
+        - kind: "trade.secret.policy"
+          schema: "apm2.trade_secret_policy_profile.v1"
+          binding_rule: "trade-secret policy digest MUST match security-plane policy digest for same epoch"
+
+    - id: "GATE-EIO29-PROJECTION-ISOLATION-INTERLOCK"
+      name: "Authority-surface monotonicity interlock"
+      type: "DETERMINISTIC"
+      purpose: "Enforces authority-surface monotonicity for projection paths."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Authority-surface digest and sink identity digest cohere with truth-plane trust snapshot."
+      evidence_required:
+        - "RFC-0029::EVID-0008"
+      cac_inputs:
+        - kind: "projection.isolation.policy"
+          schema: "apm2.projection_isolation_policy.v1"
+          binding_rule: "Authority-surface digest MUST prove monotonicity"
+        - kind: "sink.identity.snapshot"
+          schema: "apm2.sink_identity_snapshot.v1"
+          binding_rule: "Sink identity digest MUST cohere with truth-plane trust snapshot"
+
+    - id: "GATE-EIO29-PROJECTION-SINK-CONTINUITY"
+      name: "Multi-sink outage continuity"
+      type: "DETERMINISTIC"
+      purpose: "Enforces TP-EIO29-005 plus backlog boundedness."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Outage/replay/queue-window digests bind to one valid time-authority envelope."
+      evidence_required:
+        - "RFC-0029::EVID-0009"
+      cac_inputs:
+        - kind: "projection.sink.continuity.profile"
+          schema: "apm2.projection_sink_continuity_profile.v1"
+          binding_rule: "Scenario and bounded backlog digest MUST bind to continuity window and authority envelope"
+        - kind: "projection.continuity.window"
+          schema: "apm2.projection_continuity_window.v1"
+          binding_rule: "Continuity window digest MUST bind to authority envelope"
+        - kind: "time.envelope"
+          schema: "apm2.time_authority_envelope.v1"
+          binding_rule: "Time envelope digest MUST bind continuity scenario evaluation window"
+
+    - id: "GATE-EIO29-RECONSTRUCTION-ADMISSIBILITY"
+      name: "Erasure+BFT reconstruction admissibility"
+      type: "DETERMINISTIC"
+      purpose: "Requires erasure + BFT + digest-match + valid temporal authority."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Decode, quorum, digest-match, and time-authority digests are all present."
+      evidence_required:
+        - "RFC-0029::EVID-0010"
+      cac_inputs:
+        - kind: "erasure.recovery.receipt"
+          schema: "apm2.erasure_recovery_receipt.v1"
+          binding_rule: "Erasure decode digest MUST be present"
+        - kind: "bft.recovery.quorum.certificate"
+          schema: "apm2.bft_recovery_quorum_certificate.v1"
+          binding_rule: "BFT quorum certificate digest MUST be present"
+        - kind: "recovery.admissibility.receipt"
+          schema: "apm2.recovery_admissibility_receipt.v1"
+          binding_rule: "Recovery admissibility digest MUST be present and authority-bound"
+        - kind: "source.trust.snapshot"
+          schema: "apm2.source_trust_snapshot.v1"
+          binding_rule: "Source trust snapshot digest MUST match recovered digest bindings"
+
+    - id: "GATE-EIO29-SCALE-TEMPORAL-STRESS"
+      name: "Scale and temporal stress conformance"
+      type: "DETERMINISTIC"
+      purpose: "Enforces scale stress conformance."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Stress verdict digest includes tier-tagged percentile/tick outputs and HTF window refs."
+      evidence_required:
+        - "RFC-0029::EVID-0004"
+        - "RFC-0029::EVID-0009"
+      cac_inputs:
+        - kind: "hardware.tier.envelope"
+          schema: "apm2.hardware_tier_envelope.v1"
+          binding_rule: "Tier envelope digest MUST match evaluated stress class"
+        - kind: "temporal.slo.profile"
+          schema: "apm2.temporal_slo_profile.v1"
+          binding_rule: "Temporal SLO digest MUST bind stress verdict windows"
+        - kind: "projection.sink.continuity.profile"
+          schema: "apm2.projection_sink_continuity_profile.v1"
+          binding_rule: "Continuity profile digest MUST include stress scenario verdicts"
+
+    - id: "GATE-EIO29-DEGRADE-BUDGET"
+      name: "Freeze/halt risk budget"
+      type: "DETERMINISTIC"
+      purpose: "Blocks when freeze/halt risk budget exhausted."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Freeze/halt risk budget digest remains monotone and time-authority bound."
+      evidence_required:
+        - "RFC-0029::EVID-0006"
+      cac_inputs:
+        - kind: "halt.state.receipt"
+          schema: "apm2.halt_state_receipt.v1"
+          binding_rule: "Halt state digest MUST encode freeze/halt budget consumption"
+        - kind: "temporal.disagreement.receipt"
+          schema: "apm2.temporal_disagreement_receipt.v1"
+          binding_rule: "Temporal disagreement digest MUST bind budget escalation triggers"
+
+    - id: "GATE-EIO29-CRYPTO-AGILITY"
+      name: "Algorithm downgrade and epoch policy guard"
+      type: "DETERMINISTIC"
+      purpose: "Blocks on algorithm downgrade risk or stale key-epoch policy."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Algorithm policy digest resolves for active epoch and authority window."
+      evidence_required:
+        - "RFC-0029::EVID-0006"
+      cac_inputs:
+        - kind: "crypto.agility.policy"
+          schema: "apm2.crypto_agility_policy.v1"
+          binding_rule: "Algorithm policy digest MUST resolve for active epoch"
+        - kind: "time.envelope"
+          schema: "apm2.time_authority_envelope.v1"
+          binding_rule: "Authority envelope digest MUST bind active epoch window"
+
+    - id: "GATE-EIO29-EVIDENCE-QUALITY"
+      name: "Statistical power/reproducibility/freshness gate"
+      type: "DETERMINISTIC"
+      purpose: "Blocks on insufficient statistical power, reproducibility gaps, or stale evidence."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "For load/chaos/adversarial claims, statistical power is >= 0.90 and alpha <= 0.01 with sample-size proofs."
+        - "Reproducibility matrix covers >= 3 hardware/runtime classes with deterministic replay checks."
+        - "Quality and freshness digests are current for all promotion-critical evidence classes."
+        - "Evidence throughput dominance holds per class: evidence_generation_throughput(c) > evidence_expiry_rate(c)."
+      evidence_required:
+        - "RFC-0029::EVID-0001"
+        - "RFC-0029::EVID-0004"
+        - "RFC-0029::EVID-0005"
+        - "RFC-0029::EVID-0009"
+        - "RFC-0029::EVID-0010"
+      cac_inputs:
+        - kind: "evidence.quality.profile"
+          schema: "apm2.evidence_quality_profile.v1"
+          binding_rule: "Quality profile digest MUST satisfy power and reproducibility contracts"
+        - kind: "evidence.freshness.sla"
+          schema: "apm2.evidence_freshness_sla.v1"
+          binding_rule: "Freshness SLA digest MUST be current for promotion-critical classes"
+
+    - id: "GATE-EIO29-SEMANTIC-DRIFT"
+      name: "Cross-RFC semantic drift classifier gate"
+      type: "DETERMINISTIC"
+      purpose: "Blocks on SEMANTIC_RISKY or AMBIGUOUS cross-RFC drift."
+      applies_to: "RFC-0029 efficiency profile"
+      pass_criteria:
+        - "Semantic diff report is signed and canonicalizer-compatible before classification."
+        - "Classification is not SEMANTIC_RISKY and not AMBIGUOUS."
+      evidence_required:
+        - "RFC-0029::EVID-0006"
+      cac_inputs:
+        - kind: "semantic.diff.report"
+          schema: "apm2.semantic_diff_report.v1"
+          binding_rule: "semantic diff digest MUST be signed and canonicalizer-compatible before classification"
+
+  gate_validation_policy:
+    validation_order:
+      - "schema resolution (schema_id, schema_major)"
+      - "canonicalizer tuple compatibility check"
+      - "signature/freshness check for signed inputs"
+      - "contract_digest_set completeness and equality constraints"
+      - "gate predicate execution"
+    defect_classes:
+      - "CAC_SCHEMA_UNRESOLVED"
+      - "CAC_SCHEMA_VERSION_INCOMPATIBLE"
+      - "CAC_CANONICALIZER_UNRESOLVED"
+      - "CAC_CANONICALIZER_VECTOR_MISMATCH"
+      - "CAC_DIGEST_SET_INCOMPLETE"
+      - "CAC_DIGEST_MISMATCH"
+      - "CAC_SIGNATURE_INVALID"
+      - "CAC_INPUT_STALE"
+      - "CAC_VALIDATION_ORDER_VIOLATION"
+    tier_behavior:
+      tier0_tier1: "deny + emit cac.defect_record.v1"
+      tier2_plus: "deny + force D3 freeze until adjudicated before cac_adjudication_deadline_window_ref; missed deadline escalates to D4 emergency halt"
+    gate_order_safety_rule: "Any gate consuming temporal predicates MUST execute after GATE-EIO29-TIME-AUTHORITY and before promotion decisions."
+
+  unified_sequence_binding:
+    - gate_number: 1
+      name: "snapshot validity"
+      gate_id: "GATE-PCAC-SNAPSHOT-VALIDITY"
+    - gate_number: 2
+      name: "security profile conformance"
+      gate_id: "GATE-SIO28-*"
+    - gate_number: 3
+      name: "efficiency profile conformance"
+      gate_id: "GATE-EIO29-*"
+    - gate_number: 4
+      name: "joint adversarial replay/revocation drills"
+      gate_id: "GATE-JOINT-REPLAY-REVOCATION-DRILLS"
+    - gate_number: 5
+      name: "promotion readiness"
+      gate_id: "GATE-PROMOTION-READINESS"
+
+  theory_lineage:
+    rows:
+      - contract_surface: "Temporal fail-closed authority"
+        law_anchors:
+          - "LAW-09"
+          - "LAW-15"
+          - "LAW-20"
+        principle_anchors:
+          - "PRIN-105"
+          - "PRIN-122"
+      - contract_surface: "Queue/backpressure under attack"
+        law_anchors:
+          - "LAW-12"
+          - "LAW-14"
+        principle_anchors:
+          - "PRIN-053"
+          - "PRIN-101"
+      - contract_surface: "Projection sink independence"
+        law_anchors:
+          - "LAW-03"
+          - "LAW-16"
+        principle_anchors:
+          - "PRIN-047"
+          - "PRIN-107"
+      - contract_surface: "Verifier economics and anti-Goodhart"
+        law_anchors:
+          - "LAW-08"
+          - "LAW-14"
+        principle_anchors:
+          - "PRIN-101"
+          - "PRIN-106"
+      - contract_surface: "Recoverability and reconstruction trust"
+        law_anchors:
+          - "LAW-10"
+          - "LAW-15"
+          - "LAW-19"
+        principle_anchors:
+          - "PRIN-049"
+          - "PRIN-121"
+      - contract_surface: "Revocation monotonicity"
+        law_anchors:
+          - "LAW-18"
+          - "LAW-20"
+        principle_anchors:
+          - "PRIN-124"
+    control_theory_formulation:
+      closed_loop_state: "x_t = (queue_state, revocation_state, replay_state, sink_state, mode_state)"
+      controller_objective: "Maintain safety invariants while minimizing C_total."
+      adversarial_disturbance: "d_t includes sink outages, traffic pressure, partition, and compromise events."
+      stability_requirement: "Bounded-input bounded-output behavior for control lanes under declared disturbance envelope; violation is non-promotable."
+    information_leakage_budget:
+      invariant: "L_projection(window_ref) <= L_max(risk_tier)"
+      units: "leakage_bits"
+      estimator_contract:
+        - "Estimator family and confidence metadata MUST be bound in signed leakage receipts."
+        - "Unknown estimator semantics or unit ambiguity is non-admissible."
+      overrun_behavior:
+        - "Emit leakage defect."
+        - "Block promotion-critical paths."
+        - "Require declassification adjudication receipts before recovery."
+
+  traceability:
+    laws_alignment:
+      - law_id: "LAW-03"
+        role: "Enforces truth-plane authority substrate separate from projection state."
+      - law_id: "LAW-08"
+        role: "Constrains verifier economics and anti-Goodhart optimization behavior."
+      - law_id: "LAW-09"
+        role: "Defines temporal pinning and fail-closed freshness contracts."
+      - law_id: "LAW-10"
+        role: "Provides merge/anti-entropy semantics for reconstruction and split-brain handling."
+      - law_id: "LAW-12"
+        role: "Requires bounded search/termination in queue and replay scheduling."
+      - law_id: "LAW-14"
+        role: "Binds risk-weighted evidence sufficiency and countermetric interlocks."
+      - law_id: "LAW-15"
+        role: "Maintains measurement integrity for gate/evidence and latency observables."
+      - law_id: "LAW-16"
+        role: "Preserves boundary contract composition across profile planes."
+      - law_id: "LAW-18"
+        role: "Enforces revocation latency/propagation monotonicity across windows."
+      - law_id: "LAW-19"
+        role: "Supports uncertainty-qualified promotion framing for recoverability stress claims."
+      - law_id: "LAW-20"
+        role: "Requires deterministic reverification and replayable predicate evaluation paths."

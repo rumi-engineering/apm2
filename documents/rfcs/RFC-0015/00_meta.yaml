@@ -120,30 +120,30 @@ rfc_meta:
     laws:
       - id: LAW-01
         name: "Receipt-Backed Gate for Authoritative Promotion"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-02
         name: "ZTI-Configured Context Supply"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-03
         name: "Monotone Ledger vs. Overwritable Projection"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-04
         name: "Stochastic Stability Contracts"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-05
         name: "OCAP and Capability Scoping"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-10
         name: "Anti-Entropy & Merge Semantics"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-12
         name: "Termination Guarantees"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-15
         name: "Measurement Integrity"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
     related_documents:
-      glossary: "documents/skills/glossary/SKILL.md"
+      glossary: "documents/theory/unified-theory-v2.json"
       laws: "documents/theory/AGENTS.md"
       work_substrate: "documents/prds/PRD-0004/"
       cac_substrate: "documents/prds/PRD-0007/"

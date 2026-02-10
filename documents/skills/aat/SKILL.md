@@ -248,7 +248,7 @@ aat_result:
 
 ## References
 
-- `documents/theory/glossary/glossary.json`: REQUIRED READING: APM2 terminology and ontology.
+- `documents/theory/unified-theory-v2.json`: REQUIRED READING: APM2 terminology and ontology.
 - PRD-0003: Agent Acceptance Testing Quality Gate
 - GATE-AAT-ACCEPTANCE: PR passes hypothesis-driven testing
 - GATE-AAT-ANTI-GAMING: No hardcoded values or undocumented TODOs

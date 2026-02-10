@@ -1,0 +1,99 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-02-10"
+
+  risks:
+    - id: "RSK-SIO28-0001"
+      title: "Stop/revoke temporal fallback misuse"
+      statement: |
+        Emergency temporal fallback can become unsafe if used beyond its
+        constrained carve-out when full envelope validity is unavailable.
+      mitigation: |
+        v0.4 constrains fallback to local emergency monotonic-time proof for
+        authority-reduction stop/revoke paths only, and denies all
+        authority-expansion paths during fallback operation.
+      status: "MITIGATED"
+
+    - id: "RSK-SIO28-0002"
+      title: "Delegation depth and satisfiability underbounded"
+      statement: |
+        Exact-meet delegation remains unsafe if deep chains or expensive
+        satisfiability checks are admitted without explicit bounds.
+      mitigation: |
+        v0.4 introduces delegation_max_depth and
+        delegation_satisfiability_budget_ticks; overflow or budget exhaustion is
+        non-admissible.
+      status: "MITIGATED"
+
+    - id: "RSK-SIO28-0003"
+      title: "Evidence liveness under S3 freeze"
+      statement: |
+        Strict freeze can starve recovery if no bounded pathway exists to
+        regenerate evidence or restore temporal authority.
+      mitigation: |
+        v0.4 allows bounded evidence-regeneration/time-authority-recovery
+        workflows in S3 that cannot authorize new external effects.
+      status: "MITIGATED"
+
+    - id: "RSK-SIO28-0004"
+      title: "Trade-secret posture versus redundancy recoverability"
+      statement: |
+        Redundancy recoverability needs controlled declassification, which can
+        conflict with hard disclosure constraints if not explicitly scoped.
+      mitigation: |
+        v0.4 introduces redundancy_purpose_declassification with mandatory
+        receipts and explicit prohibition on exposing authority-bearing plaintext
+        semantics beyond required fragment metadata.
+      status: "MITIGATED"
+
+    - id: "RSK-SIO28-0005"
+      title: "Probabilistic detection and stress outcomes"
+      statement: |
+        Detection latency and adversarial stress outcomes are probabilistic and
+        cannot be treated as absolute guarantees.
+      mitigation: |
+        Require confidence metadata, statistical power declarations, and evidence
+        freshness SLAs for promotion-critical claims.
+      status: "OPEN"
+
+    - id: "RSK-SIO28-0006"
+      title: "Supported-envelope boundary"
+      statement: |
+        Only tested federation/adversary envelopes are promotable; claims beyond
+        tested envelope remain non-authoritative.
+      mitigation: |
+        Admit expanded envelope claims only after new evidence receipts are
+        produced and accepted.
+      status: "OPEN"
+
+  claim_classification:
+    absolute_claims:
+      - "Unknown or ambiguous authority-critical states fail closed."
+      - "Delegation widening is never admissible."
+    probabilistic_claims:
+      - "Detection latency is probabilistic and must carry confidence metadata."
+      - "Adversarial stress outcomes are probabilistic and must carry sample-plan and freshness metadata."
+
+  supported_envelope:
+    promotable_rule: "Only tested federation and adversary envelopes are promotable."
+    non_authoritative_rule: "Claims beyond tested envelopes remain non-authoritative until new evidence receipts are admitted."
+
+  open_questions:
+    - id: "Q-SIO28-0001"
+      question: "How should leakage budget composition be computed across recursion depth while preserving typed leakage contract semantics?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"
+
+    - id: "Q-SIO28-0002"
+      question: "What GST bound should govern BFT projection_worker liveness without weakening containment dominance?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"
+
+    - id: "Q-SIO28-0003"
+      question: "What explicit upper bound should apply to temporal arbitration chain depth before mandatory deny/escalation?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"
+
+    - id: "Q-SIO28-0004"
+      question: "Where is the formal proof artifact for overlap-safe predicate composition claims used by profile admission logic?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"

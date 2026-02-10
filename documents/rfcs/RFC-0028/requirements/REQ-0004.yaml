@@ -1,0 +1,25 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0004"
+  title: "Context integrity, dual-lattice propagation, and declassification receipts"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Boundary interactions MUST preserve context integrity and dual-lattice taint/confidentiality
+    semantics end-to-end. Confidentiality downgrade MUST require explicit declassification policy
+    and receipt emission.
+  rationale: |
+    Non-continuous taint/confidentiality propagation creates covert authority and exfiltration paths.
+  acceptance_criteria:
+    - "Out-of-pack or TOCTOU-violating context access denies."
+    - "Tier3+ actuators reject untrusted or over-confidential inputs by policy."
+    - "No boundary downgrade occurs without declassification receipt."
+  imported_dependencies:
+    - "RFC-0020::REQ-0029"
+    - "RFC-0020::REQ-0030"
+    - "RFC-0020::REQ-0032"
+    - "RFC-0020::REQ-0034"
+  evidence_ids:
+    - "EVID-0004"
+

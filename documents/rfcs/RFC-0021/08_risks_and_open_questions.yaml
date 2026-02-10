@@ -53,6 +53,15 @@ rfc_risks_and_open_questions:
         - "fanout amplification limits"
         - "anti-entropy boundedness proofs"
 
+    - id: "RSK-0007"
+      title: "Strategic mechanism leakage via IP filing or disclosure workflow"
+      severity: "HIGH"
+      impact: "Irreversible exposure of strategic mechanisms and privacy-sensitive operating patterns"
+      mitigation:
+        - "trade-secret-only gate enforcement"
+        - "deny-by-default disclosure channel classification"
+        - "security defect emission and escalation on filing attempts"
+
   open_questions:
     - id: "Q-0001"
       question: "Should VentureSignalPublished be a mandatory kernel event in v1 or deferred to v2?"
@@ -72,3 +81,7 @@ rfc_risks_and_open_questions:
       question: "What control strategy best keeps verification_compute_share <= 0.45 at zettabyte-scale replay envelopes?"
       why_it_matters: "Directly constrains admissibility of scale-envelope operation"
       proposed_resolution: "Run bounded A/B policy simulations with anti-entropy and receipt fanout knobs"
+    - id: "Q-0005"
+      question: "Which minimal external disclosure channel classes are admissible under trade-secret-only posture without increasing strategic leakage risk?"
+      why_it_matters: "Determines operational communication boundaries while preserving strict confidentiality controls"
+      proposed_resolution: "Define deny-by-default channel taxonomy and admit classes only with security council signoff and replay-tested controls"

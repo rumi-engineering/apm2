@@ -57,12 +57,12 @@ prd_meta:
       ticket_meta_schema: standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema
       lint_spec: standards/lint/LINT_SPEC.yaml#lint_spec
     related_documents:
-      glossary: documents/skills/glossary/SKILL.md
+      glossary: documents/theory/unified-theory-v2.json
       laws: documents/theory/AGENTS.md
       fac_prd: documents/prds/PRD-0009/
       work_substrate: documents/prds/PRD-0004/
-      daemon_glossary: documents/skills/glossary/references/daemon.md
-      lease_glossary: documents/skills/glossary/references/lease_and_budget.md
+      daemon_glossary: documents/theory/unified-theory-v2.json
+      lease_glossary: documents/theory/unified-theory-v2.json
     dependencies:
       - id: RFC-0015
         version: "v4.1+"
@@ -75,15 +75,15 @@ prd_meta:
         breaking_change_policy: "Any breaking changes to FAC event schema require coordinated PRD-0010 update."
   terminology:
     - term: Daemon
-      ref: documents/skills/glossary/references/daemon.md
+      ref: documents/theory/unified-theory-v2.json
     - term: Lease
-      ref: documents/skills/glossary/references/lease_and_budget.md
+      ref: documents/theory/unified-theory-v2.json
     - term: Episode
-      ref: documents/skills/glossary/references/episode.md
+      ref: documents/theory/unified-theory-v2.json
     - term: OCAP
-      ref: documents/skills/glossary/references/ocap.md
+      ref: documents/theory/unified-theory-v2.json
     - term: ContextPack
-      ref: documents/skills/glossary/references/context_pack.md
+      ref: documents/theory/unified-theory-v2.json
   law_alignment:
     - law_id: LAW-01
       applies_to:

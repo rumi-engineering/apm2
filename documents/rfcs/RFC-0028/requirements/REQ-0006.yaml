@@ -1,0 +1,25 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0006"
+  title: "Downgrade resistance and adversarial economic fail-closed posture"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Boundary protocol negotiation and parser/canonicalization behavior MUST resist downgrade
+    and malformed-input coercion. Under adversarial cost pressure, enforcement MUST fail closed
+    and preserve containment precedence over liveness.
+  rationale: |
+    Economic and downgrade attacks turn partial enforcement into unsafe permissive behavior.
+  acceptance_criteria:
+    - "Tier2+ contract/canonicalizer mismatch denies by default."
+    - "Unknown/invalid enum and bounded-decoding violations deny with structured defects."
+    - "Budget exhaustion cannot force permissive acceptance of authoritative claims."
+  imported_dependencies:
+    - "RFC-0020::REQ-0002"
+    - "RFC-0020::REQ-0003"
+    - "RFC-0020::REQ-0034"
+    - "RFC-0020::REQ-0035"
+  evidence_ids:
+    - "EVID-0006"
+

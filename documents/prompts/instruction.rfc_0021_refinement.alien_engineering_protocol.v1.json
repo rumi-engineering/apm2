@@ -17,6 +17,8 @@
       "fac",
       "aat-biz",
       "strategy-coupling",
+      "htf-native-slo-hardening",
+      "external-io",
       "v1"
     ],
     "provenance": {
@@ -26,8 +28,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_0021/refinement@v1"
   },
   "payload": {
-    "i": "RFC-0021 refinement CAC instruction: pressure-test and strengthen Holonic Venture Proving Interface against its own goals under Alien Engineering Protocol constraints.",
-    "pb": "RFC-0021 is drafted and can be iteratively refined so its goals are explicit, machine-checkable, FAC-compatible, and strategy-coupled without weakening containment or evidence authority.",
+    "i": "RFC-0021 refinement CAC instruction: pressure-test and strengthen Holonic Venture Proving Interface against its own goals under Alien Engineering Protocol constraints, while aligning FAC external-I/O temporal semantics with HTF-native authority contracts.",
+    "pb": "RFC-0021 is drafted and can be iteratively refined so its goals are explicit, machine-checkable, FAC-compatible, and strategy-coupled without weakening containment or evidence authority. Cross-RFC synchronization must harden external-I/O SLO semantics from wall-duration prose to HTF-bound typed contracts.",
     "t": {
       "sys": "APM2",
       "repo": "{repo_root}",
@@ -35,8 +37,11 @@
         "documents/rfcs/RFC-0021",
         "documents/strategy",
         "documents/rfcs/RFC-0015",
+        "documents/rfcs/RFC-0016",
         "documents/rfcs/RFC-0019",
         "documents/rfcs/RFC-0020",
+        "documents/rfcs/RFC-0028",
+        "documents/rfcs/RFC-0029",
         "proto/kernel_events.proto",
         "documents/prompts/instruction.alien_engineering_protocol.v1.json"
       ]
@@ -54,6 +59,15 @@
       "GOAL_DOMINANCE_ORDER": "Preferred constraint ordering is containment/security > verification/correctness > liveness/progress.",
       "GOAL_TIME_AUTHORITY": "Normative time logic uses HTF boundary/time-envelope authority; wall-clock is display-only.",
       "GOAL_SCALE_ENVELOPE": "Design should remain admissible under globally distributed multi-exabyte to zettabyte evidence and coordination envelopes.",
+      "GOAL_HTF_NATIVE_SLOS": "Replace wall-duration SLO prose with HTF outage/replay envelopes and signed TimeAuthorityEnvelopeV1 references.",
+      "GOAL_TYPED_TEMPORAL_CONTRACTS": "Temporal continuity/replay/recovery claims should be represented via typed contracts (TemporalSloProfileV1, ProjectionContinuityWindowV1, ReplayConvergenceReceiptV1, RecoveryAdmissibilityReceiptV1).",
+      "GOAL_TEMPORAL_HORIZONS": "Freshness, anti-entropy convergence, and replay convergence should each be represented as HTF horizon references bound to boundary IDs and tick-space.",
+      "GOAL_TEMPORAL_CONTRACT_IDS": "Temporal predicates should be bound to stable contract IDs and evaluated by a canonical temporal predicate evaluator.",
+      "GOAL_MULTI_SINK_CONTINUITY": "Continuity semantics should remain admissible under N projection sinks down/rate-limited/adversarially divergent with fail-closed gate behavior on ambiguity.",
+      "GOAL_TEMPORAL_MONOTONICITY": "Security and recovery coupling should include revocation frontier monotonicity, replay idempotency monotonicity, and no promotion on temporal ambiguity.",
+      "GOAL_TEMPORAL_GATE_BINDING": "Every top-level temporal claim should map to predicate, falsification mode, evidence family, and fail-closed gate behavior.",
+      "GOAL_VOCABULARY_ALIGNMENT": "Cross-RFC vocabulary should standardize on htf_boundary, authority_clock, time_envelope, tick_floor_met, and display_clock.",
+      "DEFAULT_POLICY": "Default dominance policy is containment/security > verification/correctness > liveness/progress, with HTF authority mandatory at each stage boundary.",
       "AEP_01": "Prefer physics-first admissibility; conventional execution anxiety should not downscope goals.",
       "AEP_02": "Physical, information-theoretic, computability, causality, biological, or explicit APM2 invariant limits carry the strongest blocking weight.",
       "AEP_03": "Prefer novel engineering; analogies are stronger when they evolve into mechanism-level contracts.",
@@ -91,6 +105,11 @@
       "New or revised requirements can be paired with test targets and evidence artifact bindings where practical.",
       "Gate and transition claims can be made machine-checkable, with unknown/missing states treated through the ANTIPATTERNS posture.",
       "Dominance order and HTF time authority can be explicit in normative sections and gating logic.",
+      "External-I/O continuity/replay/recovery claims can be rewritten using typed HTF temporal contracts rather than wall-duration prose.",
+      "Cross-RFC traceability rows can include temporal baseline, target, boundary authority ref, falsification predicate, and fail-closed mode.",
+      "Queue and anti-entropy semantics can be expressed in HTF tick windows with fairness and starvation-prevention invariants.",
+      "Temporal horizon semantics (freshness, anti-entropy convergence, replay convergence) can be encoded as contract fields and gate-validated predicates.",
+      "Temporal stress profiles (multi-exabyte replay, correlated failure recovery timing, p99/p99.9 in tick-space) can be tied to promotion gates.",
       "Alien Engineering clauses AEP_01..AEP_08 can be reflected materially in design, not only prose declarations.",
       "Physics feasibility ledgers can exist for major VPHI claims with falsification tests and admissibility assumptions.",
       "AAT-BIZ coupling ledgers can map venture signal classes to Stage-5 verification obligations and promotion outcomes.",
@@ -111,9 +130,9 @@
     "required_reading": [
       "Read these materials before RFC-0021 refinement; principles/laws/unified theory carry the core concepts while RFC, strategy, FAC, and HSI artifacts provide operating context.",
       [
-        "documents/theory/principles.json",
-        "documents/theory/laws.json",
-        "documents/theory/unified_theory.json",
+        "documents/theory/unified-theory-v2.json",
+        "documents/theory/unified-theory-v2.json",
+        "documents/theory/unified-theory-v2.json",
         "documents/prompts/instruction.alien_engineering_protocol.v1.json",
         "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
         "documents/rfcs/RFC-0021/00_meta.yaml",
@@ -151,7 +170,20 @@
         "documents/strategy/ROADMAP.json",
         "documents/strategy/BUSINESS_PLAN.json",
         "documents/rfcs/RFC-0015/00_meta.yaml",
+        "documents/rfcs/RFC-0016/README.yaml",
+        "documents/rfcs/RFC-0016/requirements/REQ-HTF-0003.yaml",
+        "documents/rfcs/RFC-0016/requirements/REQ-HTF-0007.yaml",
         "documents/rfcs/RFC-0019/00_meta.yaml",
+        "documents/rfcs/RFC-0019/17_pcac_implementation_contract_snapshot.md",
+        "documents/rfcs/RFC-0019/16_holonic_external_io_efficiency_problem_landscape.md",
+        "documents/rfcs/RFC-0019/18_fac_vnext_cross_rfc_traceability_matrix.md",
+        "documents/rfcs/RFC-0028/HOLONIC_EXTERNAL_IO_SECURITY.md",
+        "documents/rfcs/RFC-0028/requirements/REQ-0009.yaml",
+        "documents/rfcs/RFC-0029/HOLONIC_EXTERNAL_IO_EFFICIENCY.md",
+        "documents/rfcs/RFC-0029/requirements/REQ-0004.yaml",
+        "documents/rfcs/RFC-0029/requirements/REQ-0005.yaml",
+        "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml",
+        "documents/rfcs/RFC-0029/requirements/REQ-0010.yaml",
         "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
         "proto/kernel_events.proto"
       ]

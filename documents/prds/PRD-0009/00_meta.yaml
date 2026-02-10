@@ -56,13 +56,13 @@ prd_meta:
       ticket_meta_schema: standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema
       lint_spec: standards/lint/LINT_SPEC.yaml#lint_spec
     related_documents:
-      glossary: documents/skills/glossary/SKILL.md
+      glossary: documents/theory/unified-theory-v2.json
       laws: documents/theory/AGENTS.md
       work_substrate: documents/prds/PRD-0004/
       cac_substrate: documents/prds/PRD-0007/
       coordination: documents/rfcs/RFC-0012/
       daemon_runtime: documents/rfcs/RFC-0013/
-      git_digest: documents/skills/glossary/references/git_digest_conventions.md
+      git_digest: documents/theory/unified-theory-v2.json
   source_document:
     id: APM2-PRD-FAC-0001
     path: forge-admission-cycle-prd.json
@@ -74,21 +74,21 @@ prd_meta:
         - GitHub is a projection target; it is never a source of truth.
   terminology:
     - term: Gate
-      ref: documents/skills/glossary/references/gate.md
+      ref: documents/theory/unified-theory-v2.json
     - term: Merge Receipt
-      ref: documents/skills/glossary/references/merge_receipt.md
+      ref: documents/theory/unified-theory-v2.json
     - term: ContextPack
-      ref: documents/skills/glossary/references/context_pack.md
+      ref: documents/theory/unified-theory-v2.json
     - term: View Commitment
-      ref: documents/skills/glossary/references/view_commitment.md
+      ref: documents/theory/unified-theory-v2.json
     - term: Lease/Budget
-      ref: documents/skills/glossary/references/lease_and_budget.md
+      ref: documents/theory/unified-theory-v2.json
     - term: OCAP
-      ref: documents/skills/glossary/references/ocap.md
+      ref: documents/theory/unified-theory-v2.json
     - term: Terminal Verifier
-      ref: documents/skills/glossary/references/terminal_verifier.md
+      ref: documents/theory/unified-theory-v2.json
     - term: Oracle
-      ref: documents/skills/glossary/references/oracle.md
+      ref: documents/theory/unified-theory-v2.json
   law_alignment:
     - law_id: LAW-01
       applies_to:

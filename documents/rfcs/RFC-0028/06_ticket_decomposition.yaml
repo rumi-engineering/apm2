@@ -1,0 +1,119 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-02-10"
+  status: DEFINED
+  decomposition_policy:
+    - "Each ticket must be independently shippable and produce at least one verifiable evidence artifact."
+    - "Tickets are ordered to establish lifecycle/temporal roots before projection and compromise workflows."
+    - "Cross-RFC CAC harmonization tickets (TCK-00439/TCK-00440) remain mandatory for REQ-0006."
+  tickets:
+    - ticket_id: "TCK-00462"
+      title: "RFC-0028 lifecycle intent typing and acceptance-fact separation enforcement"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0001"
+      evidence_targets:
+        - "RFC-0028::EVID-0001"
+      scope_slice: "Lifecycle stage typing, acceptance-fact separation, and replay-verifiable intent records."
+      depends_on: []
+
+    - ticket_id: "TCK-00463"
+      title: "RFC-0028 identity/freshness/revocation closure and temporal ambiguity deny"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0002"
+      evidence_targets:
+        - "RFC-0028::EVID-0002"
+      scope_slice: "Tier2+ temporal/freshness admission closure, revocation dominance, and arbitration-path fail-closed behavior."
+      depends_on:
+        - "TCK-00462"
+
+    - ticket_id: "TCK-00464"
+      title: "RFC-0028 delegation exact-meet determinism and no-bypass actuation closure"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0003"
+      evidence_targets:
+        - "RFC-0028::EVID-0003"
+        - "RFC-0028::EVID-0004"
+      scope_slice: "Deterministic meet/satisfiability checks plus mandatory enforcement dependencies on all actuation paths."
+      depends_on:
+        - "TCK-00462"
+
+    - ticket_id: "TCK-00465"
+      title: "RFC-0028 boundary-flow dual-lattice integrity and declassification receipt enforcement"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0004"
+      evidence_targets:
+        - "RFC-0028::EVID-0004"
+        - "RFC-0028::EVID-0005"
+      scope_slice: "Capability/taint/classification boundary policy and declassification receipt linkage."
+      depends_on:
+        - "TCK-00462"
+
+    - ticket_id: "TCK-00466"
+      title: "RFC-0028 portable reverification package and independent replay contract"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0005"
+      evidence_targets:
+        - "RFC-0028::EVID-0005"
+      scope_slice: "Portable acceptance package schema and deterministic third-party reverification workflow."
+      depends_on:
+        - "TCK-00464"
+        - "TCK-00465"
+
+    - ticket_id: "TCK-00439"
+      title: "RFC-0019 ch17 CAC snapshot contract registry hardening"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0006"
+      evidence_targets:
+        - "RFC-0028::EVID-0006"
+      scope_slice: "Schema-qualified CAC registry coverage needed by RFC-0028 and RFC-0029 gate contracts."
+      depends_on: []
+
+    - ticket_id: "TCK-00440"
+      title: "RFC-0019 ch18 CAC traceability overlay and Tier2+ fail-closed matrix"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0006"
+      evidence_targets:
+        - "RFC-0028::EVID-0006"
+      scope_slice: "Traceability-layer CAC contract precision and Tier2+ unresolved ambiguity escalation semantics."
+      depends_on:
+        - "TCK-00439"
+
+    - ticket_id: "TCK-00467"
+      title: "RFC-0028 disclosure-control policy interlock and trade-secret mode enforcement"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0007"
+      evidence_targets:
+        - "RFC-0028::EVID-0007"
+      scope_slice: "Signed policy epoch binding, phase-qualified disclosure modes, and structured deny traces for unapproved channels."
+      depends_on:
+        - "TCK-00465"
+
+    - ticket_id: "TCK-00468"
+      title: "RFC-0028 projection isolation stage-policy enforcement for production runtimes"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0008"
+      evidence_targets:
+        - "RFC-0028::EVID-0008"
+      scope_slice: "Direct GitHub capability elimination in production agent_runtime and projection_worker receipt linkage."
+      depends_on:
+        - "TCK-00462"
+
+    - ticket_id: "TCK-00469"
+      title: "RFC-0028 projection compromise detection, quarantine, and replay-recovery"
+      status: "OPEN"
+      requirements:
+        - "RFC-0028::REQ-0009"
+      evidence_targets:
+        - "RFC-0028::EVID-0009"
+      scope_slice: "CAS+ledger-rooted divergence detection, containment guarantees, and post-compromise reconstruction controls."
+      depends_on:
+        - "TCK-00463"
+        - "TCK-00468"

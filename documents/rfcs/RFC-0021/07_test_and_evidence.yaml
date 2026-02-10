@@ -22,6 +22,9 @@ rfc_test_and_evidence:
       - id: "UT-0006"
         name: "Scale control predicate evaluator"
         coverage_target: "REQ-0012"
+      - id: "UT-0007"
+        name: "Trade-secret policy and disclosure-channel evaluator"
+        coverage_target: "REQ-0013"
 
     integration:
       - id: "IT-0001"
@@ -42,6 +45,9 @@ rfc_test_and_evidence:
       - id: "IT-0006"
         name: "Scale-envelope verifier-economics telemetry and gate coupling"
         coverage_target: "REQ-0012"
+      - id: "IT-0007"
+        name: "Patent/provisional filing deny and defect emission path"
+        coverage_target: "REQ-0013"
 
     adversarial:
       - id: "ADV-0001"
@@ -64,6 +70,10 @@ rfc_test_and_evidence:
         name: "Anti-entropy boundedness proof omission"
         expected_result: "promotion blocked"
         coverage_target: "REQ-0012"
+      - id: "ADV-0006"
+        name: "Disguised patent filing via unclassified disclosure channel"
+        expected_result: "deny + security defect + receipt evidence"
+        coverage_target: "REQ-0013"
 
   evidence_bundle:
     root: "evidence/rfc/RFC-0021/"
@@ -101,3 +111,6 @@ rfc_test_and_evidence:
         - id: "EVID-0010"
           file_ref: "evidence_artifacts/EVID-0010.yaml"
           description: "Scale-envelope and verifier-economics evidence"
+        - id: "EVID-0011"
+          file_ref: "evidence_artifacts/EVID-0011.yaml"
+          description: "Trade-secret control and no-patent enforcement evidence"

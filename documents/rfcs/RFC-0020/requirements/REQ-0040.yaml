@@ -1,0 +1,27 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0040"
+  title: "Auditor and orchestrator projections for launch lineage and uncertainty"
+  category: "OBSERVABILITY"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    FAC launch execution MUST expose auditor- and orchestrator-facing projection surfaces
+    that report lineage completeness, liveness state, restart counters, and uncertainty flags
+    from receipt-backed facts rather than transcript inspection.
+
+    Primary delivery ticket: TCK-00452.
+  rationale: |
+    Operational control and governance require stable projection interfaces over receipts,
+    not ad-hoc process introspection.
+  acceptance_criteria:
+    - "Auditor projection surfaces provide receipt-chain completeness and boundary-conformance indicators."
+    - "Orchestrator projection surfaces provide active run count, last receipt tick, restart counters, and uncertainty flags."
+    - "Projection responses are digest-first and replay-consistent across observers."
+    - "Missing lineage data is surfaced as explicit non-admissible uncertainty."
+  evidence_ids:
+    - "EVID-0030"
+    - "EVID-0014"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §8"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §9"

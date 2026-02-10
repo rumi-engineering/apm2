@@ -1,0 +1,58 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00463"
+    title: "RFC-0028 REQ-0002 identity/freshness/revocation closure and temporal arbitration"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0028"
+    requirements:
+      - requirement_id: "REQ-0002"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0002.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0002"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0002.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_OBSERVABILITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00462"
+        reason: "Identity/freshness checks consume lifecycle intent/receipt typing from REQ-0001 baseline."
+  scope:
+    in_scope:
+      - "Enforce Tier2+ fail-closed identity membership, freshness, and revocation dominance checks at revalidate/consume."
+      - "Bind temporal evaluation to shared predicates TP-EIO29-001 and TP-EIO29-008 with signed arbitration receipts."
+      - "Implement explicit behavior for agreed allow/deny and transient/persistent disagreement outcomes."
+      - "Emit structured deny defects for stale/unknown/unverifiable temporal or identity state."
+    out_of_scope:
+      - "Changes to RFC-0016 temporal semantics."
+      - "Cross-profile economics policy tuning."
+  plan:
+    steps:
+      - "Add evaluator tuple validation for temporal predicate checks."
+      - "Wire revocation-frontier freshness and ambiguity checks into admission path."
+      - "Implement S3 freeze trigger on transient disagreement and deny on persistent disagreement."
+      - "Add adversarial tests for stale windows, revoked identities, and disagreement timeout."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0002"
+    criteria:
+      - "Tier2+ admissions deny on stale or ambiguous identity/freshness state."
+      - "Temporal arbitration outcomes map to required fail-closed behaviors with signed receipts."
+      - "No wall-time-only freshness path can authorize promotion-critical effects."
+  notes:
+    security: |
+      Unknown temporal authority state is non-admissible for promotion-critical decisions.
+    verification: |
+      Include tests for agreement, transient disagreement, persistent disagreement, and deadline miss.
+    general: |
+      This ticket establishes temporal/identity closure needed by compromise and projection tickets.

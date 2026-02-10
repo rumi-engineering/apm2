@@ -8,9 +8,11 @@ rfc_rollout_and_ops:
       goals:
         - "Implement VentureSignalBundleV1 validation"
         - "Store validated signals in CAS"
+        - "Enable trade-secret mode policy verification and patent/provisional deny checks"
       promotion_scope: "none"
       success_predicates:
         - "signal_validation_pass_ratio >= 0.99"
+        - "patent_or_provisional_filing_attempt_count == 0"
 
     - stage_id: "STAGE-1"
       name: "Shadow attention routing"
@@ -54,6 +56,7 @@ rfc_rollout_and_ops:
       goals:
         - "Enforce dominance-order and HTF-bound gate evaluator"
         - "Enforce verifier-economics and anti-entropy boundedness controls"
+        - "Enforce no-patent trade-secret gate at promotion boundaries"
       promotion_scope: "all tiers"
       success_predicates:
         - "dominance_order_evaluator_coverage == 1.0"
@@ -74,6 +77,8 @@ rfc_rollout_and_ops:
       statement: "HTF boundary artifacts are mandatory for gate truth; wall-clock cannot authorize gate outcomes."
     - id: "OPS-0006"
       statement: "Scale controls enforce tiered retention manifests, anti-entropy boundedness proofs, and verifier-economics ceilings."
+    - id: "OPS-0007"
+      statement: "Trade-secret-only mode is mandatory; patent/provisional filing and unapproved external disclosure workflows are denied and logged as security defects."
 
   observability:
     dashboards:
@@ -84,3 +89,4 @@ rfc_rollout_and_ops:
       - "vphi.strategy.coupling"
       - "vphi.governance.time_authority"
       - "vphi.scale.verifier_economics"
+      - "vphi.security.trade_secret_controls"

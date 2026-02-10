@@ -15,6 +15,11 @@ rfc_readme:
     strategic AAT extension (AAT-BIZ) so business-domain feedback becomes
     replayable gate evidence rather than narrative guidance.
 
+    This RFC also defines a trade-secret-only security posture for venture-origin
+    strategic mechanisms: patent/provisional filing pathways are non-admissible
+    and external disclosure channels are deny-by-default unless explicitly
+    confidential and policy-authorized.
+
   primary_document:
     path: "HOLONIC_VENTURE_PROVING_INTERFACE.md"
     role: "Master normative specification"

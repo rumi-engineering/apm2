@@ -1,0 +1,163 @@
+rfc_meta:
+  schema_version: "2026-02-09"
+  template_version: "2026-01-23"
+
+  rfc:
+    id: "RFC-0028"
+    title: "Holonic External I/O Security Profile over PCAC"
+    full_title: "RFC-0028 - Holonic External I/O Security Profile over PCAC"
+    status: "DRAFT"
+    version: "v0.5"
+    created_date: "2026-02-09"
+    last_updated_date: "2026-02-10"
+    version_history:
+      - version: "v0.5"
+        date: "2026-02-10"
+        phase: "PROFILE_DEFINITION"
+        notes: |
+          Gap-closure revision: normalized CAC kind identifiers, replaced undefined
+          rollout gate IDs with explicit composite bindings, expanded structured
+          YAML coverage for split-brain/UX/evidence-claim semantics, and defined
+          RFC-0028 implementation decomposition tickets for REQ-0001..REQ-0009.
+      - version: "v0.4"
+        date: "2026-02-09"
+        phase: "PROFILE_DEFINITION"
+        notes: |
+          Enriched metadata and YAML decomposition baseline for RFC-0028
+          profile-definition scope. No runtime behavior changes are introduced
+          by this metadata revision.
+    source_of_truth:
+      path: "HOLONIC_EXTERNAL_IO_SECURITY.md"
+      role: "authoritative profile draft"
+      resolution_hint: "Repository-resolved file path: documents/rfcs/RFC-0028/HOLONIC_EXTERNAL_IO_SECURITY.md"
+
+  source_drafts:
+    - id: "HOLONIC_EXTERNAL_IO_SECURITY_PROFILE"
+      path: "documents/rfcs/RFC-0028/HOLONIC_EXTERNAL_IO_SECURITY.md"
+      role: "master draft"
+      note: "Profiles RFC-0027 lifecycle semantics; does not redefine them."
+
+  module_contract:
+    spine_role: "Security profile constraints over PCAC lifecycle for external I/O"
+    laws_upheld_minimum:
+      - "LAW-05"
+      - "LAW-09"
+      - "LAW-14"
+      - "LAW-15"
+      - "LAW-17"
+      - "LAW-20"
+    core_invariants_minimum:
+      - id: "SIO28-INV-001"
+        summary: "No authority-bearing external effect without full PCAC lifecycle validity."
+      - id: "SIO28-INV-002"
+        summary: "Tier2+ stale/ambiguous freshness or revocation ambiguity denies."
+      - id: "SIO28-INV-003"
+        summary: "Consume-time intent equality and single-consume are mandatory."
+      - id: "SIO28-INV-004"
+        summary: "No-bypass actuation and acceptance-fact completeness are mandatory."
+      - id: "SIO28-INV-005"
+        summary: "Trade-secret-only disclosure controls are mandatory; patent/provisional filing workflows are denied."
+      - id: "SIO28-INV-006"
+        summary: "Production agent runtimes have zero direct GitHub API/gh authority surface; external projection executes only via projection worker."
+      - id: "SIO28-INV-007"
+        summary: "Compromise of public projection surfaces is non-authoritative and cannot alter CAS+ledger-rooted admission decisions."
+      - id: "SIO28-INV-008"
+        summary: "Delegated authority vectors are admitted only when they equal deterministic canonical exact meet(parent, overlay)."
+      - id: "SIO28-INV-009"
+        summary: "Promotion-critical external-I/O gates require valid signed HTF time authority and deny on temporal ambiguity."
+      - id: "SIO28-INV-010"
+        summary: "Authority-bearing paths require crypto-agility policy compliance with downgrade resistance and key-epoch continuity."
+      - id: "SIO28-INV-011"
+        summary: "Post-compromise promotion is non-admissible until retroactive trust invalidation and re-proof requirements are satisfied."
+
+  binds_to_prd:
+    prd_id: "PRD-0010"
+    prd_base_path: "documents/prds/PRD-0010/"
+    requirement_registry_ref: "07_traceability.yaml#prd_traceability.requirement_registry"
+    evidence_bundle_ref: "12_evidence_bundle.yaml#prd_evidence_bundle.bundle"
+    prd_meta_ref: "00_meta.yaml#prd_meta"
+    rationale: |
+      RFC-0028 defines the external I/O security profile that constrains
+      promotion-critical projection and boundary-admission behavior for the
+      PRD-0010 daemon/runtime control plane surfaces.
+
+  protocol_profile:
+    id: "NONE"
+    applies: false
+    inherited_from_prd: false
+    profile_ref: "N/A"
+
+  custody:
+    producing_agent_roles:
+      - "AGENT_AUTHOR"
+      - "AGENT_REVIEWER"
+    responsible_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_AUTHN_AUTHZ"
+    authority_signoffs_required:
+      - "AUTH_ARCHITECTURE"
+      - "AUTH_SECURITY"
+
+  depends_on:
+    - id: "RFC-0016"
+      relationship: "DEPENDS_ON"
+      rationale: "Canonical HTF temporal authority semantics and fail-closed temporal contracts."
+    - id: "RFC-0019"
+      relationship: "COMPOSES_WITH"
+      rationale: "Imports PCAC snapshot baseline and unified gate sequencing contracts."
+    - id: "RFC-0020"
+      relationship: "COMPOSES_WITH"
+      rationale: "Boundary enforcement and acceptance-fact companion constraints."
+    - id: "RFC-0021"
+      relationship: "COMPOSES_WITH"
+      rationale: "Disclosure-control posture constraints for strategic mechanisms."
+    - id: "RFC-0027"
+      relationship: "DEPENDS_ON"
+      rationale: "Canonical PCAC lifecycle semantics (join/revalidate/consume/effect)."
+
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
+      rfc_meta_schema: "standards/schemas/08_rfc_meta.schema.yaml#rfc_meta"
+    laws:
+      - id: "LAW-05"
+        name: "Dual-Axis Containment & Variety Control"
+        ref: "documents/theory/unified-theory-v2.json"
+      - id: "LAW-09"
+        name: "Temporal Pinning & Freshness"
+        ref: "documents/theory/unified-theory-v2.json"
+      - id: "LAW-14"
+        name: "Proportionality and Risk-Weighted Evidence"
+        ref: "documents/theory/unified-theory-v2.json"
+      - id: "LAW-15"
+        name: "Measurement Integrity"
+        ref: "documents/theory/unified-theory-v2.json"
+      - id: "LAW-17"
+        name: "Verifier Independence"
+        ref: "documents/theory/unified-theory-v2.json"
+      - id: "LAW-20"
+        name: "Deterministic Re-verification Path"
+        ref: "documents/theory/unified-theory-v2.json"
+    related_rfcs:
+      - id: "RFC-0027"
+        relationship: "DEPENDS_ON"
+        rationale: "Canonical PCAC lifecycle semantics"
+      - id: "RFC-0019"
+        relationship: "COMPOSES_WITH"
+        rationale: "Imports PCAC snapshot baseline and unified gate sequencing"
+      - id: "RFC-0020"
+        relationship: "COMPOSES_WITH"
+        rationale: "Boundary enforcement companion requirements"
+
+  implementation:
+    language: "Rust"
+    edition: "2024"
+    primary_crates:
+      - "apm2-daemon"
+      - "apm2-core"

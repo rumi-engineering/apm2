@@ -20,7 +20,7 @@ rfc_problem_and_imports:
       This RFC defines the missing layer: a kernel-hosted episode runtime and
       low-latency process control protocol for running any agent harness (vendor
       CLIs and local models) as bounded holonic episodes.
-    doctrine_ref: "documents/theory/unified_theory.json"
+    doctrine_ref: "documents/theory/unified-theory-v2.json"
 
   doctrine_requirements:
     # Non-negotiable requirements derived from holonic unified theory

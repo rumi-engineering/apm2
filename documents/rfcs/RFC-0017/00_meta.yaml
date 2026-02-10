@@ -108,38 +108,38 @@ rfc_meta:
     laws:
       - id: LAW-01
         name: "Receipt-Backed Gate for Authoritative Promotion"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-02
         name: "Context Sufficiency Observation"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-03
         name: "Monotone Ledger vs. Overwritable Projection"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-04
         name: "Stochastic Stability Contracts"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-05
         name: "OCAP and Capability Scoping"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-06
         name: "MDL as Gated Budget"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-11
         name: "Idempotent Tool Calls"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-12
         name: "Episode Budget Enforcement"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-13
         name: "Canonical Encodings"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-15
         name: "Measurement Integrity"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
     related_documents:
-      glossary: "documents/skills/glossary/SKILL.md"
-      daemon_glossary: "documents/skills/glossary/references/daemon.md"
-      lease_glossary: "documents/skills/glossary/references/lease_and_budget.md"
+      glossary: "documents/theory/unified-theory-v2.json"
+      daemon_glossary: "documents/theory/unified-theory-v2.json"
+      lease_glossary: "documents/theory/unified-theory-v2.json"
       fac_rfc: "documents/rfcs/RFC-0015/"
       fac_prd: "documents/prds/PRD-0009/"
       work_substrate: "documents/prds/PRD-0004/"

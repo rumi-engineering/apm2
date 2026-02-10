@@ -206,7 +206,7 @@ Solution: Use `--force` to rebuild all stages.
 
 ## References
 
-- `documents/theory/glossary/glossary.json`: REQUIRED READING: APM2 terminology and ontology.
+- `documents/theory/unified-theory-v2.json`: REQUIRED READING: APM2 terminology and ontology.
 - `references/pipeline_stages.md`: Stage definitions, inputs/outputs, and completion predicates.
 - `references/determinism_envelope.md`: Canonicalization and diff acceptance rules.
 - `references/model_routing.md`: Routing profile design and canary process.

@@ -1,0 +1,19 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0009"
+  title: "Projection multi-sink outage continuity and replay convergence evidence"
+  category: "CHAOS_TEST_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that authoritative FAC progression remains live across HTF-bounded multi-sink outage scenarios and that deferred replay converges safely after restoration."
+  requirement_ids:
+    - "RFC-0029::REQ-0009"
+  expected_contents:
+    - "decision-lineage proofs showing authoritative progression excludes projection sink state as authority input"
+    - "ProjectionContinuityWindowV1 outage/replay window declarations"
+    - "multi-sink outage/churn/partition drill traces bound to declared HTF windows"
+    - "backlog growth and retention envelope reports"
+    - "deferred replay idempotency and convergence receipts (ReplayConvergenceReceiptV1)"
+    - "TP-EIO29-001/003/004/005 predicate verdict receipts from canonical evaluator"
+    - "time-authority denial tests: missing/stale/invalid-signature/boundary-mismatch envelopes"
+    - "signed time_authority_ref fields and verifier replay receipts"
+    - "gate verdict traces for continuity and replay boundedness"
