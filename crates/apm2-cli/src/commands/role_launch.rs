@@ -24,7 +24,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::client::protocol::OperatorClient;
+use crate::client::protocol::SessionClient;
 use crate::exit_codes::codes as exit_codes;
 
 /// Maximum allowed size for a CAS object read by this command (64 MiB).
@@ -328,10 +328,10 @@ pub fn handle_role_launch(
     args: &RoleLaunchArgs,
     ledger_path: &Path,
     cas_path: &Path,
-    operator_socket_path: &Path,
+    session_socket_path: &Path,
     json: bool,
 ) -> Result<()> {
-    let daemon_verifying_key = resolve_daemon_channel_verifying_key(args, operator_socket_path);
+    let daemon_verifying_key = resolve_daemon_channel_verifying_key(args, session_socket_path);
     match execute_role_launch_with_daemon_verifying_key(
         args,
         ledger_path,
@@ -361,7 +361,7 @@ fn execute_role_launch_with_daemon_verifying_key(
 
 fn resolve_daemon_channel_verifying_key(
     args: &RoleLaunchArgs,
-    operator_socket_path: &Path,
+    session_socket_path: &Path,
 ) -> Option<VerifyingKey> {
     args.channel_context_token.as_ref()?;
 
@@ -370,7 +370,7 @@ fn resolve_daemon_channel_verifying_key(
         .build()
         .ok()?;
     runtime.block_on(async {
-        let client = OperatorClient::connect(operator_socket_path).await.ok()?;
+        let client = SessionClient::connect(session_socket_path).await.ok()?;
         let key_bytes = client.daemon_signing_public_key()?;
         apm2_core::crypto::parse_verifying_key(key_bytes).ok()
     })

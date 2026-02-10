@@ -301,6 +301,7 @@ pub struct OperatorClient {
     /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
+    #[allow(dead_code)]
     daemon_signing_public_key: Option<[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]>,
     timeout: Duration,
 }
@@ -433,6 +434,7 @@ impl OperatorClient {
     }
 
     /// Returns the daemon signing public key from handshake metadata.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn daemon_signing_public_key(&self) -> Option<&[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]> {
         self.daemon_signing_public_key.as_ref()
@@ -2229,6 +2231,7 @@ pub struct SessionClient {
     /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
+    daemon_signing_public_key: Option<[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]>,
     timeout: Duration,
 }
 
@@ -2273,8 +2276,15 @@ impl SessionClient {
         Ok(Self {
             framed,
             server_info: handshake.server_info,
+            daemon_signing_public_key: handshake.daemon_signing_public_key,
             timeout,
         })
+    }
+
+    /// Returns the daemon signing public key from handshake metadata.
+    #[must_use]
+    pub const fn daemon_signing_public_key(&self) -> Option<&[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]> {
+        self.daemon_signing_public_key.as_ref()
     }
 
     /// Requests tool execution within session capability bounds.

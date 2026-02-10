@@ -219,6 +219,18 @@ fn matches_channel_source_witness(source: ChannelSource, witness: &[u8; 32]) -> 
     bool::from(expected.ct_eq(witness))
 }
 
+fn canonical_payload(
+    payload: &ChannelContextTokenPayloadV1,
+) -> Result<Vec<u8>, ChannelContextTokenError> {
+    let value =
+        serde_json::to_value(payload).map_err(|error| ChannelContextTokenError::InvalidJson {
+            detail: error.to_string(),
+        })?;
+    serde_json::to_vec(&value).map_err(|error| ChannelContextTokenError::InvalidJson {
+        detail: error.to_string(),
+    })
+}
+
 /// Validates a channel source witness token and daemon signature.
 #[must_use]
 pub fn verify_channel_source_witness(
@@ -286,10 +298,7 @@ fn issue_channel_context_token_with_freshness(
         policy_ledger_verified: check.policy_ledger_verified,
     };
 
-    let payload_json =
-        serde_json::to_vec(&payload).map_err(|error| ChannelContextTokenError::InvalidJson {
-            detail: error.to_string(),
-        })?;
+    let payload_json = canonical_payload(&payload)?;
     let signature = signer.sign(&payload_json);
     let token = ChannelContextTokenV1 {
         schema_id: CHANNEL_CONTEXT_TOKEN_SCHEMA_ID.to_string(),
@@ -341,11 +350,7 @@ pub fn decode_channel_context_token(
         });
     }
 
-    let payload_json = serde_json::to_vec(&payload.payload).map_err(|error| {
-        ChannelContextTokenError::InvalidJson {
-            detail: error.to_string(),
-        }
-    })?;
+    let payload_json = canonical_payload(&payload.payload)?;
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(&payload.signature)
         .map_err(|error| ChannelContextTokenError::InvalidSignature {
@@ -714,6 +719,29 @@ mod tests {
     }
 
     #[test]
+    fn test_payload_serialization_is_deterministic() {
+        let payload = ChannelContextTokenPayloadV1 {
+            source: ChannelSource::TypedToolIntent,
+            lease_id: "lease-1".to_string(),
+            request_id: "REQ-1".to_string(),
+            issued_at_secs: 1_700_000_000,
+            expires_after_secs: CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
+            channel_source_witness: derive_channel_source_witness(ChannelSource::TypedToolIntent),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+        };
+
+        let bytes1 = canonical_payload(&payload).expect("payload should serialize");
+        let bytes2 = canonical_payload(&payload).expect("payload should serialize");
+        assert_eq!(
+            bytes1, bytes2,
+            "payload serialization must be deterministic"
+        );
+    }
+
+    #[test]
     fn test_channel_context_token_rejects_invalid_witness() {
         let signer = Signer::generate();
         let payload = ChannelContextTokenPayloadV1 {
@@ -728,7 +756,7 @@ mod tests {
             context_firewall_verified: true,
             policy_ledger_verified: true,
         };
-        let payload_json = serde_json::to_vec(&payload).expect("payload should serialize");
+        let payload_json = canonical_payload(&payload).expect("payload should serialize");
         let token_payload = ChannelContextTokenV1 {
             schema_id: CHANNEL_CONTEXT_TOKEN_SCHEMA_ID.to_string(),
             payload,

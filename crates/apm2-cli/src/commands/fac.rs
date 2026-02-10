@@ -720,7 +720,7 @@ pub struct ErrorResponse {
 // =============================================================================
 
 /// Runs the FAC command, returning an appropriate exit code.
-pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
+pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) -> u8 {
     let json_output = cmd.json;
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
@@ -747,7 +747,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
                 args,
                 &ledger_path,
                 &cas_path,
-                operator_socket,
+                session_socket,
                 json_output,
             ) {
                 Ok(()) => exit_codes::SUCCESS,

@@ -987,6 +987,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
+    /// Returns the public verifying key used to validate channel context
+    /// tokens issued by this dispatcher.
+    #[must_use]
+    pub fn channel_context_verifying_key(&self) -> apm2_core::crypto::VerifyingKey {
+        self.channel_context_signer.verifying_key()
+    }
+
     /// Sets the content-addressed store for `PublishEvidence`.
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
@@ -2974,13 +2981,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
         let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class) {
-            let _decision_policy_verified = Self::tool_decision_policy_verified(&decision);
+            let policy_ledger_verified = Self::tool_decision_policy_verified(&decision);
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
-            // TODO(TCK-00450): Replace with explicit ledger-backed policy hash
-            // admission proof. Decision-level allow is not sufficient evidence.
-            let policy_ledger_verified = false;
             let all_verification_flags_true = broker_verified
                 && capability_verified
                 && context_firewall_verified

@@ -600,16 +600,9 @@ impl DispatcherState {
     #[must_use]
     #[allow(dead_code)] // Kept for testing and potential future use
     pub fn new(metrics_registry: Option<SharedMetricsRegistry>) -> Self {
-        // TCK-00450: Non-persistent wiring must keep daemon signing surfaces
-        // aligned. Derive the session token secret and channel-context signer
-        // from the same key material.
-        let signing_key = {
-            use rand::rngs::OsRng;
-            ed25519_dalek::SigningKey::generate(&mut OsRng)
-        };
-        let token_secret = SecretString::from(hex::encode(signing_key.to_bytes()));
+        let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
-        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
 
         // TCK-00287 MAJOR 3: Use shared manifest store.
         // Manifests registered during SpawnEpisode will be visible to SessionDispatcher
@@ -636,13 +629,12 @@ impl DispatcherState {
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
-        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state_and_signing_key(
+        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
-            signing_key,
         )
         .with_credential_store(credential_store)
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
@@ -705,16 +697,9 @@ impl DispatcherState {
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
     ) -> Self {
-        // TCK-00450: Non-persistent wiring must keep daemon signing surfaces
-        // aligned. Derive the session token secret and channel-context signer
-        // from the same key material.
-        let signing_key = {
-            use rand::rngs::OsRng;
-            ed25519_dalek::SigningKey::generate(&mut OsRng)
-        };
-        let token_secret = SecretString::from(hex::encode(signing_key.to_bytes()));
+        let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
-        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
 
         // TCK-00287 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -735,13 +720,12 @@ impl DispatcherState {
 
         // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
         // registry
-        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state_and_signing_key(
+        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
-            signing_key,
         )
         .with_credential_store(credential_store)
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
@@ -840,7 +824,7 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
         let sqlite_conn_for_pcac = sqlite_conn.clone();
-        let mut channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
         let mut sovereignty_trusted_signer_key = ledger_signing_key
             .as_ref()
             .map(|key| key.verifying_key().to_bytes());
@@ -871,7 +855,6 @@ impl DispatcherState {
                 use rand::rngs::OsRng;
                 ed25519_dalek::SigningKey::generate(&mut OsRng)
             });
-            channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
             sovereignty_trusted_signer_key = Some(signing_key.verifying_key().to_bytes());
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
@@ -1250,7 +1233,7 @@ impl DispatcherState {
             use rand::rngs::OsRng;
             ed25519_dalek::SigningKey::generate(&mut OsRng)
         });
-        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
         let sovereignty_trusted_signer_key = signing_key.verifying_key().to_bytes();
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());

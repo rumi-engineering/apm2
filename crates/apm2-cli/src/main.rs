@@ -424,7 +424,7 @@ fn main() -> Result<()> {
             // FAC commands are primarily ledger/CAS-driven; work lifecycle
             // status/list subcommands route through operator IPC.
             // Exit codes per RFC-0018.
-            let exit_code = commands::fac::run_fac(&fac_cmd, &operator_socket);
+            let exit_code = commands::fac::run_fac(&fac_cmd, &operator_socket, &session_socket);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {

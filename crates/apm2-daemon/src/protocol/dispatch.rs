@@ -6774,35 +6774,8 @@ impl PrivilegedDispatcher {
         clock: Arc<HolonicClock>,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
-        use rand::rngs::OsRng;
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-        Self::with_shared_state_and_signing_key(
-            token_minter,
-            manifest_store,
-            session_registry,
-            clock,
-            subscription_registry,
-            signing_key,
-        )
-    }
-
-    /// Creates a new dispatcher with shared token minter/manifest state and
-    /// an explicit signing key for stub ledger events.
-    ///
-    /// The caller can use this to keep daemon signing-key surfaces aligned
-    /// across dispatchers in non-persistent wiring paths.
-    #[must_use]
-    pub fn with_shared_state_and_signing_key(
-        token_minter: Arc<TokenMinter>,
-        manifest_store: Arc<InMemoryManifestStore>,
-        session_registry: Arc<dyn SessionRegistry>,
-        clock: Arc<HolonicClock>,
-        subscription_registry: SharedSubscriptionRegistry,
-        signing_key: ed25519_dalek::SigningKey,
-    ) -> Self {
         // TCK-00415: Create shared event emitter and work authority.
-        let event_emitter: Arc<dyn LedgerEventEmitter> =
-            Arc::new(StubLedgerEventEmitter::with_signing_key(signing_key));
+        let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
         // TCK-00420: Create alias reconciliation gate backed by shared emitter.
         let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
