@@ -67,9 +67,18 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
 
+      - name: Enforce FAC credential posture lint
+        run: |
+          set -euo pipefail
+          ./scripts/ci/credential_hardening.sh lint \
+            .github/workflows/forge-admission-cycle.yml \
+            scripts/ci/fac_preflight_authorization.sh
+
       - name: Evaluate trusted workflow context
         env:
-          GH_TOKEN: ${{ github.token }}
+          APM2_FAC_CREDENTIAL_SOURCE: github_token
+          APM2_CREDENTIAL_HARDENING_STAGE: preflight
+          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
@@ -98,9 +107,13 @@ jobs:
       - name: Resolve PR context
         id: pr-context
         env:
-          GH_TOKEN: ${{ github.token }}
+          APM2_FAC_CREDENTIAL_SOURCE: github_token
+          APM2_CREDENTIAL_HARDENING_STAGE: projection_context
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          ./scripts/ci/credential_hardening.sh runtime
+
           if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
             pr_number="${{ github.event.pull_request.number }}"
             head_sha="${{ github.event.pull_request.head.sha }}"
@@ -114,9 +127,12 @@ jobs:
 
       - name: Poll review gate
         env:
-          GH_TOKEN: ${{ github.token }}
+          APM2_FAC_CREDENTIAL_SOURCE: github_token
+          APM2_CREDENTIAL_HARDENING_STAGE: projection_poll
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          ./scripts/ci/credential_hardening.sh runtime
 
           repo="${{ github.repository }}"
           pr_number="${{ steps.pr-context.outputs.pr_number }}"

@@ -12,6 +12,8 @@ repository="${APM2_PREFLIGHT_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
 actor="${APM2_PREFLIGHT_ACTOR:-${GITHUB_ACTOR:-unknown}}"
 dispatch_ref="${APM2_PREFLIGHT_REF_NAME:-${GITHUB_REF_NAME:-}}"
 policy_path="${APM2_PREFLIGHT_TRUST_POLICY_PATH:-.github/review-gate/workflow-trust-policy.json}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+credential_hardening_script="${APM2_PREFLIGHT_CREDENTIAL_HARDENING_SCRIPT:-${script_dir}/credential_hardening.sh}"
 
 log_decision() {
     local check="$1"
@@ -66,7 +68,11 @@ if ! jq -e '
     (.trusted_base_refs | type == "array" and length > 0) and
     (.trusted_fork_pr_numbers | type == "array") and
     (.trusted_fork_head_repositories | type == "array") and
-    (.trusted_fork_labels | type == "array")
+    (.trusted_fork_labels | type == "array") and
+    (.credential_posture | type == "object") and
+    ((.credential_posture.projection_credential_source // "") == "github_token") and
+    (.credential_posture.allow_personal_access_tokens == false) and
+    (.credential_posture.allow_argv_credentials == false)
 ' "$policy_path" >/dev/null; then
     deny "policy" "invalid_policy_schema" "policy_path=${policy_path}"
 fi
@@ -76,6 +82,22 @@ readarray -t trusted_base_refs < <(jq -r '.trusted_base_refs[]' "$policy_path")
 readarray -t trusted_fork_pr_numbers < <(jq -r '.trusted_fork_pr_numbers[] | tostring' "$policy_path")
 readarray -t trusted_fork_head_repositories < <(jq -r '.trusted_fork_head_repositories[]' "$policy_path")
 readarray -t trusted_fork_labels < <(jq -r '.trusted_fork_labels[]' "$policy_path")
+credential_source_policy="$(jq -r '.credential_posture.projection_credential_source // empty' "$policy_path")"
+allow_pat_policy="$(jq -r '.credential_posture.allow_personal_access_tokens // empty' "$policy_path")"
+allow_argv_policy="$(jq -r '.credential_posture.allow_argv_credentials // empty' "$policy_path")"
+
+allow "credential_posture" "source=${credential_source_policy} allow_pat=${allow_pat_policy} allow_argv=${allow_argv_policy}"
+
+if [[ ! -f "${credential_hardening_script}" ]]; then
+    deny "credential_posture" "missing_credential_hardening_script" "path=${credential_hardening_script}"
+fi
+
+export APM2_FAC_CREDENTIAL_SOURCE="${APM2_FAC_CREDENTIAL_SOURCE:-${credential_source_policy}}"
+export APM2_CREDENTIAL_HARDENING_STAGE="${APM2_CREDENTIAL_HARDENING_STAGE:-preflight}"
+if ! "${credential_hardening_script}" runtime; then
+    deny "credential_posture" "credential_runtime_check_failed"
+fi
+allow "credential_posture" "runtime_check=passed"
 
 event_json="$(cat "$event_path")"
 pr_json=""

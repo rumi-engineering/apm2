@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="${SCRIPT_DIR}/fixtures/fac_preflight"
+CREDENTIAL_FIXTURE_DIR="${SCRIPT_DIR}/fixtures/credential_hardening"
 PREFLIGHT_SCRIPT="${SCRIPT_DIR}/fac_preflight_authorization.sh"
 POLICY_FIXTURE="${FIXTURE_DIR}/trust_policy_main_only.json"
 FAILURES=0
@@ -24,22 +25,27 @@ log_fail() { echo -e "${RED}FAIL:${NC} $*" >&2; FAILURES=$((FAILURES + 1)); }
 
 run_preflight() {
     local fixture_path="$1"
-    APM2_PREFLIGHT_EVENT_NAME="pull_request_target" \
-    APM2_PREFLIGHT_EVENT_PATH="${fixture_path}" \
-    APM2_PREFLIGHT_REPOSITORY="guardian-intelligence/apm2" \
-    APM2_PREFLIGHT_ACTOR="ci-test" \
-    APM2_PREFLIGHT_REF_NAME="main" \
-    APM2_PREFLIGHT_TRUST_POLICY_PATH="${POLICY_FIXTURE}" \
-        "${PREFLIGHT_SCRIPT}"
+    local policy_fixture="${2:-${POLICY_FIXTURE}}"
+    env -u GH_TOKEN -u GH_PAT -u GITHUB_PAT -u APM2_GITHUB_PAT -u APM2_FAC_PAT \
+        APM2_PREFLIGHT_EVENT_NAME="pull_request_target" \
+        APM2_PREFLIGHT_EVENT_PATH="${fixture_path}" \
+        APM2_PREFLIGHT_REPOSITORY="guardian-intelligence/apm2" \
+        APM2_PREFLIGHT_ACTOR="ci-test" \
+        APM2_PREFLIGHT_REF_NAME="main" \
+        APM2_PREFLIGHT_TRUST_POLICY_PATH="${policy_fixture}" \
+        APM2_CREDENTIAL_HARDENING_CMDLINE_PATH="${CREDENTIAL_FIXTURE_DIR}/cmdline_safe.txt" \
+        GITHUB_TOKEN="ghs_fac_fixture_token_123456789012345678901234567890" \
+            "${PREFLIGHT_SCRIPT}"
 }
 
 expect_pass() {
     local test_name="$1"
     local fixture_path="$2"
+    local policy_fixture="${3:-${POLICY_FIXTURE}}"
 
     set +e
     local output
-    output="$(run_preflight "${fixture_path}" 2>&1)"
+    output="$(run_preflight "${fixture_path}" "${policy_fixture}" 2>&1)"
     local status=$?
     set -e
 
@@ -62,10 +68,11 @@ expect_fail() {
     local test_name="$1"
     local fixture_path="$2"
     local expected_reason="$3"
+    local policy_fixture="${4:-${POLICY_FIXTURE}}"
 
     set +e
     local output
-    output="$(run_preflight "${fixture_path}" 2>&1)"
+    output="$(run_preflight "${fixture_path}" "${policy_fixture}" 2>&1)"
     local status=$?
     set -e
 
@@ -106,6 +113,10 @@ expect_fail "Fork without trust grant denied" \
 expect_fail "Non-main base ref denied" \
     "${FIXTURE_DIR}/event_non_main_base_denied.json" \
     "untrusted_base_ref"
+expect_fail "Policy missing credential posture denied" \
+    "${FIXTURE_DIR}/event_owner_allowed.json" \
+    "invalid_policy_schema" \
+    "${FIXTURE_DIR}/trust_policy_missing_credential_posture.json"
 
 echo
 if [[ ${FAILURES} -gt 0 ]]; then
