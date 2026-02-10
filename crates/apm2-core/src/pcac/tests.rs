@@ -3031,3 +3031,619 @@ fn batched_pointer_all_valid_merkle_steps_passes() {
     };
     assert!(auth.validate().is_ok());
 }
+
+// =============================================================================
+// Receipt authentication composition tests (TCK-00425)
+// =============================================================================
+
+const AUTHV_SEAL: Hash = [0xDD; 32];
+const AUTHV_TIME_REF: Hash = [0x07; 32];
+const AUTHV_LEDGER: Hash = [0x08; 32];
+const AUTHV_TICK: u64 = 1000;
+
+fn authv_replay_entry(
+    stage: LifecycleStage,
+    tick: u64,
+    requires_pre_actuation: bool,
+    pre_actuation_selector_hash: Option<Hash>,
+) -> ReplayLifecycleEntry {
+    ReplayLifecycleEntry {
+        stage,
+        tick,
+        requires_pre_actuation,
+        pre_actuation_selector_hash,
+    }
+}
+
+fn authv_valid_direct_auth() -> ReceiptAuthentication {
+    ReceiptAuthentication::Direct {
+        authority_seal_hash: AUTHV_SEAL,
+    }
+}
+
+fn authv_valid_pointer_unbatched_auth() -> ReceiptAuthentication {
+    ReceiptAuthentication::PointerUnbatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: AUTHV_SEAL,
+    }
+}
+
+fn authv_valid_pointer_batched_auth_left() -> ReceiptAuthentication {
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&leaf, &sibling0);
+    let root = hash_internal(&level1, &sibling1);
+
+    ReceiptAuthentication::PointerBatched {
+        receipt_hash,
+        authority_seal_hash: AUTHV_SEAL,
+        merkle_inclusion_proof: vec![sibling0, sibling1],
+        receipt_batch_root_hash: root,
+    }
+}
+
+fn authv_valid_pointer_batched_auth_right() -> ReceiptAuthentication {
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&sibling0, &leaf);
+    let root = hash_internal(&sibling1, &level1);
+
+    ReceiptAuthentication::PointerBatched {
+        receipt_hash,
+        authority_seal_hash: AUTHV_SEAL,
+        merkle_inclusion_proof: vec![sibling0, sibling1],
+        receipt_batch_root_hash: root,
+    }
+}
+
+fn authv_expected_subject_hash(auth: &ReceiptAuthentication) -> Option<Hash> {
+    match auth {
+        ReceiptAuthentication::Direct { .. } => None,
+        ReceiptAuthentication::PointerUnbatched { receipt_hash, .. } => Some(*receipt_hash),
+        ReceiptAuthentication::PointerBatched {
+            receipt_batch_root_hash,
+            ..
+        } => Some(*receipt_batch_root_hash),
+    }
+}
+
+fn authv_verify_with_default_subject(
+    auth: &ReceiptAuthentication,
+) -> Result<(), Box<AuthorityDenyV1>> {
+    let expected_subject = authv_expected_subject_hash(auth);
+    verify_receipt_authentication(
+        auth,
+        &AUTHV_SEAL,
+        expected_subject.as_ref(),
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+}
+
+fn authv_valid_bindings(authentication: ReceiptAuthentication) -> AuthoritativeBindings {
+    AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0xA1),
+        view_commitment_hash: test_hash(0xA2),
+        time_envelope_ref: AUTHV_TIME_REF,
+        authentication,
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    }
+}
+
+fn authv_classify_with_default_subject(
+    bindings: Option<&AuthoritativeBindings>,
+    expected_view_commitment: Option<&Hash>,
+    expected_ledger_anchor: Option<&Hash>,
+) -> FactClass {
+    let expected_subject =
+        bindings.and_then(|binding| authv_expected_subject_hash(&binding.authentication));
+    classify_fact(
+        bindings,
+        &AUTHV_SEAL,
+        expected_subject.as_ref(),
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+        BindingExpectations {
+            expected_view_commitment,
+            expected_ledger_anchor,
+        },
+    )
+}
+
+#[test]
+fn auth_verifier_direct_path_happy_path() {
+    let result = authv_verify_with_default_subject(&authv_valid_direct_auth());
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_direct_path_zero_seal_denied() {
+    let auth = ReceiptAuthentication::Direct {
+        authority_seal_hash: zero_hash(),
+    };
+    let err = authv_verify_with_default_subject(&auth).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "authority_seal_hash")
+    );
+}
+
+#[test]
+fn auth_verifier_direct_path_seal_mismatch_denied() {
+    let auth = ReceiptAuthentication::Direct {
+        authority_seal_hash: test_hash(0xAA),
+    };
+    let err = authv_verify_with_default_subject(&auth).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("expected seal"))
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_unbatched_happy_path() {
+    let auth = authv_valid_pointer_unbatched_auth();
+    let result = authv_verify_with_default_subject(&auth);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_pointer_unbatched_missing_expected_subject_denied() {
+    let auth = authv_valid_pointer_unbatched_auth();
+    let err = verify_receipt_authentication(
+        &auth,
+        &AUTHV_SEAL,
+        None,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("missing expected_seal_subject_hash"))
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_unbatched_subject_mismatch_denied() {
+    let auth = authv_valid_pointer_unbatched_auth();
+    let wrong_subject = test_hash(0xE2);
+    let err = verify_receipt_authentication(
+        &auth,
+        &AUTHV_SEAL,
+        Some(&wrong_subject),
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("UnbatchedReceiptNotSealSubject"))
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_batched_happy_path() {
+    let auth = authv_valid_pointer_batched_auth_left();
+    let result = authv_verify_with_default_subject(&auth);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_pointer_batched_right_oriented_path_happy_path() {
+    let auth = authv_valid_pointer_batched_auth_right();
+    let result = authv_verify_with_default_subject(&auth);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_pointer_batched_missing_expected_subject_denied() {
+    let auth = authv_valid_pointer_batched_auth_left();
+    let err = verify_receipt_authentication(
+        &auth,
+        &AUTHV_SEAL,
+        None,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("missing expected_seal_subject_hash"))
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_batched_anchor_mismatch_denied() {
+    let auth = authv_valid_pointer_batched_auth_left();
+    let wrong_subject = test_hash(0xFF);
+    let err = verify_receipt_authentication(
+        &auth,
+        &AUTHV_SEAL,
+        Some(&wrong_subject),
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("batch root not anchored to authority seal"))
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_batched_wrong_root_denied() {
+    let mut auth = authv_valid_pointer_batched_auth_left();
+    if let ReceiptAuthentication::PointerBatched {
+        receipt_batch_root_hash,
+        ..
+    } = &mut auth
+    {
+        *receipt_batch_root_hash = test_hash(0x44);
+    }
+    let err = authv_verify_with_default_subject(&auth).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("recomputed root does not match"))
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_batched_zero_step_denied() {
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: AUTHV_SEAL,
+        merkle_inclusion_proof: vec![zero_hash()],
+        receipt_batch_root_hash: test_hash(0xA5),
+    };
+    let err = authv_verify_with_default_subject(&auth).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "merkle_inclusion_proof[step]")
+    );
+}
+
+#[test]
+fn auth_verifier_pointer_batched_exceeds_max_depth_denied() {
+    let too_many = vec![test_hash(0xE7); MAX_MERKLE_INCLUSION_PROOF_DEPTH + 1];
+    assert_eq!(too_many.len(), MAX_MERKLE_INCLUSION_PROOF_DEPTH + 1);
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: AUTHV_SEAL,
+        merkle_inclusion_proof: too_many,
+        receipt_batch_root_hash: test_hash(0xE5),
+    };
+    let err = authv_verify_with_default_subject(&auth).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("exceeds maximum"))
+    );
+}
+
+#[test]
+fn auth_verifier_validate_bindings_happy_path() {
+    let bindings = authv_valid_bindings(authv_valid_direct_auth());
+    let result = validate_authoritative_bindings(
+        &bindings,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+        None,
+        None,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_validate_bindings_time_mismatch_denied() {
+    let mut bindings = authv_valid_bindings(authv_valid_direct_auth());
+    bindings.time_envelope_ref = test_hash(0x33);
+    let err = validate_authoritative_bindings(
+        &bindings,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("time_envelope_ref"))
+    );
+}
+
+#[test]
+fn auth_verifier_validate_bindings_expected_view_mismatch_denied() {
+    let bindings = authv_valid_bindings(authv_valid_direct_auth());
+    let expected_view_commitment = test_hash(0x99);
+    let err = validate_authoritative_bindings(
+        &bindings,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+        Some(&expected_view_commitment),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("view_commitment_hash"))
+    );
+}
+
+#[test]
+fn auth_verifier_validate_bindings_expected_ledger_mismatch_denied() {
+    let bindings = authv_valid_bindings(authv_valid_direct_auth());
+    let expected_ledger_anchor = test_hash(0x66);
+    let err = validate_authoritative_bindings(
+        &bindings,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+        None,
+        Some(&expected_ledger_anchor),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("ledger_anchor"))
+    );
+}
+
+#[test]
+fn auth_verifier_validate_bindings_incomplete_delegation_denied() {
+    let mut bindings = authv_valid_bindings(authv_valid_direct_auth());
+    bindings.permeability_receipt_hash = Some(test_hash(0xB1));
+    bindings.delegation_chain_hash = None;
+    let err = validate_authoritative_bindings(
+        &bindings,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("delegated-path bindings are incomplete"))
+    );
+}
+
+#[test]
+fn auth_verifier_classify_acceptance_fact_direct() {
+    let bindings = authv_valid_bindings(authv_valid_direct_auth());
+    let class = authv_classify_with_default_subject(Some(&bindings), None, Some(&AUTHV_LEDGER));
+    assert_eq!(class, FactClass::AcceptanceFact);
+}
+
+#[test]
+fn auth_verifier_classify_acceptance_fact_pointer_batched() {
+    let bindings = authv_valid_bindings(authv_valid_pointer_batched_auth_left());
+    let class = authv_classify_with_default_subject(Some(&bindings), None, Some(&AUTHV_LEDGER));
+    assert_eq!(class, FactClass::AcceptanceFact);
+}
+
+#[test]
+fn auth_verifier_classify_routing_fact_without_bindings() {
+    let class = authv_classify_with_default_subject(None, None, Some(&AUTHV_LEDGER));
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn auth_verifier_classify_routing_fact_for_invalid_bindings() {
+    let mut bindings = authv_valid_bindings(authv_valid_direct_auth());
+    bindings.episode_envelope_hash = zero_hash();
+    let class = authv_classify_with_default_subject(Some(&bindings), None, Some(&AUTHV_LEDGER));
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn auth_verifier_classify_routing_fact_for_invalid_auth() {
+    let mut bindings = authv_valid_bindings(authv_valid_direct_auth());
+    bindings.authentication = ReceiptAuthentication::Direct {
+        authority_seal_hash: zero_hash(),
+    };
+    let class = authv_classify_with_default_subject(Some(&bindings), None, Some(&AUTHV_LEDGER));
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn auth_verifier_fact_class_display_and_serde() {
+    assert_eq!(FactClass::AcceptanceFact.to_string(), "acceptance_fact");
+    assert_eq!(FactClass::RoutingFact.to_string(), "routing_fact");
+
+    let acceptance_json = serde_json::to_string(&FactClass::AcceptanceFact).unwrap();
+    let acceptance_back: FactClass = serde_json::from_str(&acceptance_json).unwrap();
+    assert_eq!(acceptance_back, FactClass::AcceptanceFact);
+
+    let routing_json = serde_json::to_string(&FactClass::RoutingFact).unwrap();
+    let routing_back: FactClass = serde_json::from_str(&routing_json).unwrap();
+    assert_eq!(routing_back, FactClass::RoutingFact);
+}
+
+#[test]
+fn auth_verifier_replay_order_happy_path() {
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Join, 100, false, None),
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 300, false, None),
+    ];
+    let result = validate_replay_lifecycle_order(
+        &entries,
+        Some(300),
+        &[],
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_replay_order_missing_join_denied() {
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 300, false, None),
+    ];
+    let err = validate_replay_lifecycle_order(
+        &entries,
+        None,
+        &[],
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::BoundaryMonotonicityViolation { ref description } if description.contains("missing AuthorityJoin"))
+    );
+}
+
+#[test]
+fn auth_verifier_replay_order_join_must_precede_revalidate() {
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Join, 200, false, None),
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 300, false, None),
+    ];
+    let err = validate_replay_lifecycle_order(
+        &entries,
+        None,
+        &[],
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::BoundaryMonotonicityViolation { ref description } if description.contains("AuthorityJoin tick"))
+    );
+}
+
+#[test]
+fn auth_verifier_replay_order_consume_after_effect_denied() {
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Join, 100, false, None),
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 400, false, None),
+    ];
+    let err = validate_replay_lifecycle_order(
+        &entries,
+        Some(300),
+        &[],
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::BoundaryMonotonicityViolation { ref description } if description.contains("EffectReceipt tick"))
+    );
+}
+
+#[test]
+fn auth_verifier_replay_order_missing_pre_actuation_selector_denied() {
+    let known_hashes = [test_hash(0xAB)];
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Join, 100, false, None),
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 300, true, None),
+    ];
+    let err = validate_replay_lifecycle_order(
+        &entries,
+        None,
+        &known_hashes,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::MissingPreActuationReceipt
+    ));
+}
+
+#[test]
+fn auth_verifier_replay_order_selector_not_known_denied() {
+    let known_hashes = [test_hash(0xAB)];
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Join, 100, false, None),
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 300, true, Some(test_hash(0xCD))),
+    ];
+    let err = validate_replay_lifecycle_order(
+        &entries,
+        None,
+        &known_hashes,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::MissingPreActuationReceipt
+    ));
+}
+
+#[test]
+fn auth_verifier_replay_order_selector_known_passes() {
+    let known_hashes = [test_hash(0xAB), test_hash(0xCD)];
+    assert_eq!(known_hashes.len(), 2);
+    let entries = vec![
+        authv_replay_entry(LifecycleStage::Join, 100, false, None),
+        authv_replay_entry(LifecycleStage::Revalidate, 200, false, None),
+        authv_replay_entry(LifecycleStage::Consume, 300, true, Some(test_hash(0xCD))),
+    ];
+    let result = validate_replay_lifecycle_order(
+        &entries,
+        None,
+        &known_hashes,
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn auth_verifier_replay_order_exceeds_max_entries_denied() {
+    let mut entries: Vec<ReplayLifecycleEntry> =
+        Vec::with_capacity(MAX_REPLAY_LIFECYCLE_ENTRIES + 1);
+    entries.push(authv_replay_entry(LifecycleStage::Join, 1, false, None));
+    for idx in 2..=MAX_REPLAY_LIFECYCLE_ENTRIES {
+        entries.push(authv_replay_entry(
+            LifecycleStage::Revalidate,
+            idx as u64,
+            false,
+            None,
+        ));
+    }
+    entries.push(authv_replay_entry(
+        LifecycleStage::Consume,
+        (MAX_REPLAY_LIFECYCLE_ENTRIES + 1) as u64,
+        false,
+        None,
+    ));
+    assert_eq!(entries.len(), MAX_REPLAY_LIFECYCLE_ENTRIES + 1);
+
+    let err = validate_replay_lifecycle_order(
+        &entries,
+        None,
+        &[],
+        AUTHV_TIME_REF,
+        AUTHV_LEDGER,
+        AUTHV_TICK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("exceeds maximum"))
+    );
+}
