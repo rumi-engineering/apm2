@@ -154,6 +154,7 @@ async fn test_atomic_receipt_emission() {
             timestamp_ns,
             &identity_proof_hash,
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            None,
         )
         .unwrap();
 

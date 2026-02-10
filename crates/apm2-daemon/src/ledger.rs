@@ -25,9 +25,10 @@ use tracing::{info, warn};
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
-    STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
-    WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
+    LedgerEventError, PrivilegedPcacLifecycleArtifacts, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
+    STOP_FLAGS_MUTATED_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent,
+    StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim,
+    WorkRegistry, WorkRegistryError, WorkTransition, append_privileged_pcac_lifecycle_fields,
     build_session_started_payload,
 };
 
@@ -1056,6 +1057,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
         time_envelope_ref: &str,
+        pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
         // protocol compatibility across daemon/core boundary.
@@ -1072,19 +1074,41 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
         // post-signing.
-        let payload_json = serde_json::json!({
-            "event_type": "review_receipt_recorded",
-            "episode_id": episode_id,
-            "lease_id": episode_id,
-            "receipt_id": receipt_id,
-            "changeset_digest": hex::encode(changeset_digest),
-            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
-            "verdict": "APPROVE",
-            "reviewer_actor_id": reviewer_actor_id,
-            "timestamp_ns": timestamp_ns,
-            "identity_proof_hash": hex::encode(identity_proof_hash),
-            "time_envelope_ref": time_envelope_ref,
-        });
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert(
+            "event_type".to_string(),
+            serde_json::json!("review_receipt_recorded"),
+        );
+        payload_map.insert("episode_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
+        payload_map.insert(
+            "changeset_digest".to_string(),
+            serde_json::json!(hex::encode(changeset_digest)),
+        );
+        payload_map.insert(
+            "artifact_bundle_hash".to_string(),
+            serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert("verdict".to_string(), serde_json::json!("APPROVE"));
+        payload_map.insert(
+            "reviewer_actor_id".to_string(),
+            serde_json::json!(reviewer_actor_id),
+        );
+        payload_map.insert("timestamp_ns".to_string(), serde_json::json!(timestamp_ns));
+        payload_map.insert(
+            "identity_proof_hash".to_string(),
+            serde_json::json!(hex::encode(identity_proof_hash)),
+        );
+        payload_map.insert(
+            "time_envelope_ref".to_string(),
+            serde_json::json!(time_envelope_ref),
+        );
+        if let Some(artifacts) = pcac_lifecycle {
+            append_privileged_pcac_lifecycle_fields(&mut payload_map, artifacts);
+        }
+
+        let payload_json = serde_json::Value::Object(payload_map);
 
         // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
         let payload_string = payload_json.to_string();
@@ -1161,6 +1185,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
         time_envelope_ref: &str,
+        pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
 
@@ -1169,22 +1194,50 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
         // post-signing, matching the APPROVE path's payload binding.
-        let payload_json = serde_json::json!({
-            "event_type": "review_blocked_recorded",
-            "lease_id": lease_id,
-            "receipt_id": receipt_id,
-            "changeset_digest": hex::encode(changeset_digest),
-            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
-            "verdict": "BLOCKED",
-            "blocked_reason_code": reason_code,
-            // Preserve legacy field for backward compatibility with old readers.
-            "reason_code": reason_code,
-            "blocked_log_hash": hex::encode(blocked_log_hash),
-            "reviewer_actor_id": reviewer_actor_id,
-            "timestamp_ns": timestamp_ns,
-            "identity_proof_hash": hex::encode(identity_proof_hash),
-            "time_envelope_ref": time_envelope_ref,
-        });
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert(
+            "event_type".to_string(),
+            serde_json::json!("review_blocked_recorded"),
+        );
+        payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
+        payload_map.insert(
+            "changeset_digest".to_string(),
+            serde_json::json!(hex::encode(changeset_digest)),
+        );
+        payload_map.insert(
+            "artifact_bundle_hash".to_string(),
+            serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert("verdict".to_string(), serde_json::json!("BLOCKED"));
+        payload_map.insert(
+            "blocked_reason_code".to_string(),
+            serde_json::json!(reason_code),
+        );
+        // Preserve legacy field for backward compatibility with old readers.
+        payload_map.insert("reason_code".to_string(), serde_json::json!(reason_code));
+        payload_map.insert(
+            "blocked_log_hash".to_string(),
+            serde_json::json!(hex::encode(blocked_log_hash)),
+        );
+        payload_map.insert(
+            "reviewer_actor_id".to_string(),
+            serde_json::json!(reviewer_actor_id),
+        );
+        payload_map.insert("timestamp_ns".to_string(), serde_json::json!(timestamp_ns));
+        payload_map.insert(
+            "identity_proof_hash".to_string(),
+            serde_json::json!(hex::encode(identity_proof_hash)),
+        );
+        payload_map.insert(
+            "time_envelope_ref".to_string(),
+            serde_json::json!(time_envelope_ref),
+        );
+        if let Some(artifacts) = pcac_lifecycle {
+            append_privileged_pcac_lifecycle_fields(&mut payload_map, artifacts);
+        }
+
+        let payload_json = serde_json::Value::Object(payload_map);
 
         let payload_string = payload_json.to_string();
         let canonical_payload =
@@ -3119,6 +3172,7 @@ mod tests {
                 1_000_000_000,
                 &identity_proof,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                None,
             )
             .expect("first emit should succeed");
 
@@ -3166,6 +3220,7 @@ mod tests {
                 2_000_000_000,
                 &identity_proof_hash,
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                None,
             )
             .expect("blocked receipt emit should succeed");
 
@@ -3430,6 +3485,7 @@ mod tests {
                 3_000_000_000,
                 &identity_proof_hash,
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                None,
             )
             .expect("blocked receipt emit should succeed");
 
