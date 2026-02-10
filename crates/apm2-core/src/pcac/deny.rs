@@ -10,14 +10,30 @@
 //! Unknown or missing authority state always maps to a denial class.
 //! There is no "unknown -> allow" path in the deny taxonomy.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::intent_class::BoundaryIntentClass;
+use super::temporal_arbitration::{MAX_DENY_REASON_LENGTH, MAX_PREDICATE_ID_LENGTH};
 use super::types::{
     MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_OPERATION_LENGTH, MAX_REASON_LENGTH,
     MAX_STRING_LENGTH, PcacValidationError, RiskTier, deserialize_bounded_string,
 };
 use crate::crypto::Hash;
+
+fn deserialize_bounded_temporal_detail<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX_DENY_REASON_LENGTH {
+        return Err(serde::de::Error::custom(format!(
+            "detail length {} exceeds maximum {}",
+            value.len(),
+            MAX_DENY_REASON_LENGTH,
+        )));
+    }
+    Ok(value)
+}
 
 // =============================================================================
 // AuthorityDenyClass
@@ -68,6 +84,13 @@ pub enum AuthorityDenyClass {
     /// Identity proof hash is invalid or missing.
     InvalidIdentityProof,
 
+    /// Identity membership proof missing or unverifiable at Tier2+.
+    IdentityMembershipUnverifiable {
+        /// Structured membership verification failure detail.
+        #[serde(deserialize_with = "deserialize_bounded_temporal_detail")]
+        detail: String,
+    },
+
     /// Freshness witness is missing or stale at join time.
     StaleFreshnessAtJoin,
 
@@ -87,6 +110,24 @@ pub enum AuthorityDenyClass {
     ///
     /// Per RFC-0027 §4 Law 3 (Freshness Dominance).
     StaleFreshnessAtRevalidate,
+
+    /// Temporal arbitration resulted in agreed deny (RFC-0028 REQ-0002).
+    TemporalArbitrationDenied {
+        /// Temporal predicate identifier (`TP-EIO29-*`).
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        predicate_id: String,
+        /// Arbitration outcome string.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        outcome: String,
+    },
+
+    /// Temporal arbitration resulted in persistent disagreement requiring
+    /// rebaseline.
+    TemporalArbitrationPersistentDisagreement {
+        /// Temporal predicate identifier (`TP-EIO29-*`).
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        predicate_id: String,
+    },
 
     /// The AJC has expired (tick > `expires_at_tick`).
     CertificateExpired {
@@ -246,11 +287,25 @@ impl std::fmt::Display for AuthorityDenyClass {
             Self::InvalidIntentDigest => write!(f, "invalid intent digest"),
             Self::InvalidCapabilityManifest => write!(f, "invalid capability manifest"),
             Self::InvalidIdentityProof => write!(f, "invalid identity proof"),
+            Self::IdentityMembershipUnverifiable { detail } => {
+                write!(f, "identity membership unverifiable: {detail}")
+            },
             Self::StaleFreshnessAtJoin => write!(f, "stale freshness at join"),
             Self::InvalidTimeEnvelope => write!(f, "invalid time envelope"),
             Self::InvalidLedgerAnchor => write!(f, "invalid ledger anchor"),
             Self::RevocationFrontierAdvanced => write!(f, "revocation frontier advanced"),
             Self::StaleFreshnessAtRevalidate => write!(f, "stale freshness at revalidate"),
+            Self::TemporalArbitrationDenied {
+                predicate_id,
+                outcome,
+            } => write!(
+                f,
+                "temporal arbitration denied for predicate {predicate_id} ({outcome})"
+            ),
+            Self::TemporalArbitrationPersistentDisagreement { predicate_id } => write!(
+                f,
+                "temporal arbitration persistent disagreement for predicate {predicate_id}"
+            ),
             Self::CertificateExpired {
                 expired_at,
                 current_tick,
@@ -383,6 +438,7 @@ impl AuthorityDenyClass {
     ///
     /// Returns `PcacValidationError::StringTooLong` if any string field
     /// exceeds its maximum length.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), PcacValidationError> {
         match self {
             Self::MissingRequiredField { field_name } | Self::ZeroHash { field_name } => {
@@ -437,6 +493,43 @@ impl AuthorityDenyClass {
                         field: "reason",
                         len: reason.len(),
                         max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
+            Self::TemporalArbitrationDenied {
+                predicate_id,
+                outcome,
+            } => {
+                if predicate_id.len() > MAX_PREDICATE_ID_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "predicate_id",
+                        len: predicate_id.len(),
+                        max: MAX_PREDICATE_ID_LENGTH,
+                    });
+                }
+                if outcome.len() > MAX_REASON_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "outcome",
+                        len: outcome.len(),
+                        max: MAX_REASON_LENGTH,
+                    });
+                }
+            },
+            Self::TemporalArbitrationPersistentDisagreement { predicate_id } => {
+                if predicate_id.len() > MAX_PREDICATE_ID_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "predicate_id",
+                        len: predicate_id.len(),
+                        max: MAX_PREDICATE_ID_LENGTH,
+                    });
+                }
+            },
+            Self::IdentityMembershipUnverifiable { detail } => {
+                if detail.len() > MAX_DENY_REASON_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "detail",
+                        len: detail.len(),
+                        max: MAX_DENY_REASON_LENGTH,
                     });
                 }
             },

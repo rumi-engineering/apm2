@@ -42,6 +42,7 @@ mod deny;
 pub mod intent_class;
 mod kernel;
 mod receipts;
+pub mod temporal_arbitration;
 mod types;
 
 #[cfg(test)]
@@ -59,6 +60,12 @@ pub use receipts::{
     AuthoritativeBindings, AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1,
     AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, LifecycleStage, ReceiptAuthentication,
     ReceiptDigestMeta,
+};
+pub use temporal_arbitration::{
+    ArbitrationAction, ArbitrationOutcome, EvaluatorTuple, FreshnessViolation,
+    MAX_DENY_REASON_LENGTH, MAX_EVALUATOR_ID_LENGTH, MAX_PREDICATE_ID_LENGTH, RevocationViolation,
+    TemporalArbitrationReceiptV1, TemporalPredicateId, check_freshness_dominance,
+    check_revocation_dominance, map_arbitration_outcome,
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
