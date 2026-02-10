@@ -286,6 +286,16 @@ impl InProcessKernel {
             IdentityEvidenceLevel::PointerOnly => 1u8,
             _ => u8::MAX, // fail-closed: unknown levels
         }]);
+        // Pointer-only waiver binding
+        match input.pointer_only_waiver_hash {
+            Some(ref waiver_hash) => {
+                hasher.update(&[1u8]); // present marker
+                hasher.update(waiver_hash);
+            },
+            None => {
+                hasher.update(&[0u8]); // absent marker
+            },
+        }
         // Freshness bindings
         hasher.update(&input.directory_head_hash);
         hasher.update(&input.freshness_policy_hash);

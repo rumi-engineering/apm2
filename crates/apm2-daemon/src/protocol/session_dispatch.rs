@@ -2257,7 +2257,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     lifecycle_enforcement: true,
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
-                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    // Bootstrap sovereignty state is transitional and not yet
+                    // projection-hydrated; default to monitor-only until
+                    // runtime policy/state hydration can support strict mode.
+                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Monitor,
                 });
 
             let capability_manifest_hash: Hash =
@@ -6678,7 +6681,14 @@ mod tests {
                         lease_id: "principal-A".to_string(),
                         ephemeral_handle: "handle-pcac-stage2-principal".to_string(),
                         policy_resolved_ref: "policy-head-ref".to_string(),
-                        pcac_policy: None,
+                        pcac_policy: Some(apm2_core::pcac::PcacPolicyKnobs {
+                            lifecycle_enforcement: true,
+                            min_tier2_identity_evidence:
+                                apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                            freshness_max_age_ticks: 100,
+                            tier2_sovereignty_mode:
+                                apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                        }),
                         pointer_only_waiver: None,
                         capability_manifest_hash: blake3::hash(b"pcac-stage2-principal")
                             .as_bytes()

@@ -1031,6 +1031,24 @@ fn compute_join_hash_changes_on_identity_evidence_level() {
     );
 }
 
+#[test]
+fn compute_join_hash_changes_on_pointer_only_waiver_hash() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+
+    let mut input_a = valid_input();
+    input_a.pointer_only_waiver_hash = Some(test_hash(0xA1));
+    let mut input_b = valid_input();
+    input_b.pointer_only_waiver_hash = Some(test_hash(0xA2));
+
+    let cert_a = kernel.join(&input_a).unwrap();
+    let cert_b = kernel.join(&input_b).unwrap();
+
+    assert_ne!(
+        cert_a.authority_join_hash, cert_b.authority_join_hash,
+        "Changing pointer_only_waiver_hash must change the join hash"
+    );
+}
+
 // =============================================================================
 // TCK-00427 MAJOR 3: LedgerAnchorDrift and CertificateExpired in consume
 // =============================================================================

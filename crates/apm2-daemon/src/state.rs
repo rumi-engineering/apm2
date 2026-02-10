@@ -227,7 +227,11 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
 /// TODO(TCK-00427): Load this mode from runtime governance/policy projection
 /// instead of a transitional static default.
 const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::SovereigntyEnforcementMode {
-    apm2_core::pcac::SovereigntyEnforcementMode::Strict
+    // Bootstrap sovereignty state is an incomplete snapshot (epoch/revocation
+    // head/autonomy ceiling are not yet projection-hydrated), so strict mode
+    // would deterministically fail Tier2+ requests. Keep bootstrap in monitor
+    // mode until runtime IPC hydrates authoritative sovereignty state.
+    apm2_core::pcac::SovereigntyEnforcementMode::Monitor
 }
 
 /// Builds the bootstrap sovereignty state snapshot for session dispatcher
