@@ -335,6 +335,7 @@ fn make_deny(deny_class: AuthorityDenyClass, ctx: &DenyContext) -> Box<Authority
         time_envelope_ref: ctx.time_envelope_ref,
         ledger_anchor: ctx.ledger_anchor,
         denied_at_tick: ctx.denied_at_tick,
+        containment_action: None,
     })
 }
 

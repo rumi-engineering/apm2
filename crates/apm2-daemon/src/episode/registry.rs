@@ -1476,6 +1476,12 @@ struct PersistableSessionState {
     pub ephemeral_handle: String,
     /// Policy resolution reference.
     pub policy_resolved_ref: String,
+    /// PCAC policy configuration (TCK-00428).
+    #[serde(default)]
+    pub pcac_policy: Option<apm2_core::pcac::PcacPolicyKnobs>,
+    /// Active waiver for `PointerOnly` identity (TCK-00428).
+    #[serde(default)]
+    pub pointer_only_waiver: Option<apm2_core::pcac::PointerOnlyWaiver>,
     /// Hash of the capability manifest for this session.
     pub capability_manifest_hash: Vec<u8>,
     /// Episode ID in the runtime (if created).
@@ -1490,6 +1496,8 @@ impl From<&SessionState> for PersistableSessionState {
             role: session.role,
             ephemeral_handle: session.ephemeral_handle.clone(),
             policy_resolved_ref: session.policy_resolved_ref.clone(),
+            pcac_policy: session.pcac_policy.clone(),
+            pointer_only_waiver: session.pointer_only_waiver.clone(),
             capability_manifest_hash: session.capability_manifest_hash.clone(),
             episode_id: session.episode_id.clone(),
         }
@@ -1508,6 +1516,8 @@ impl From<PersistableSessionState> for SessionState {
             policy_resolved_ref: persistable.policy_resolved_ref,
             capability_manifest_hash: persistable.capability_manifest_hash,
             episode_id: persistable.episode_id,
+            pcac_policy: persistable.pcac_policy,
+            pointer_only_waiver: persistable.pointer_only_waiver,
         }
     }
 }
@@ -2361,6 +2371,8 @@ mod session_registry_tests {
             ephemeral_handle: handle.to_string(),
             lease_id: format!("lease-{id}"),
             policy_resolved_ref: "policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
         }
@@ -3439,6 +3451,8 @@ mod tck_00267 {
             ephemeral_handle: handle.to_string(),
             lease_id: lease_id.to_string(),
             policy_resolved_ref: "policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
         }
@@ -3760,6 +3774,8 @@ mod tck_00385_security_fixes {
             ephemeral_handle: handle.to_string(),
             lease_id: format!("lease-{id}"),
             policy_resolved_ref: "policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
         }
@@ -4247,6 +4263,8 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-exp".to_string(),
                     policy_resolved_ref: String::new(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
                 },
@@ -4402,6 +4420,8 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-ae".to_string(),
                     policy_resolved_ref: String::new(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
                 },
@@ -4440,6 +4460,8 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-av".to_string(),
                     policy_resolved_ref: String::new(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
                 },
@@ -4542,6 +4564,8 @@ mod tck_00385_security_fixes {
                 role: 1,
                 ephemeral_handle: "h-c1".to_string(),
                 policy_resolved_ref: String::new(),
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
             }],
@@ -4552,6 +4576,8 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-c1-term".to_string(),
                     policy_resolved_ref: String::new(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
                 },
@@ -4605,6 +4631,8 @@ mod tck_00385_security_fixes {
                         role: 1,
                         ephemeral_handle: format!("h-{sid}"),
                         policy_resolved_ref: String::new(),
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
                         capability_manifest_hash: vec![],
                         episode_id: None,
                     },

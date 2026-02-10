@@ -223,6 +223,35 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
     Err("sqlite main database entry not found while deriving PCAC path".to_string())
 }
 
+/// Returns the bootstrap sovereignty enforcement mode used during daemon
+/// construction.
+///
+/// TODO(TCK-00427): Load this mode from runtime governance/policy projection
+/// instead of a transitional static default.
+const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::SovereigntyEnforcementMode {
+    apm2_core::pcac::SovereigntyEnforcementMode::Strict
+}
+
+/// Builds the bootstrap sovereignty state snapshot for session dispatcher
+/// wiring.
+///
+/// TODO(TCK-00427): Hydrate and wire authoritative sovereignty state via
+/// runtime IPC/projection updates.
+///
+/// NOTE: Tier2+ requests are denied fail-closed by default because no runtime
+/// sovereignty state is hydrated. This is intentional — the operator must
+/// provide authoritative sovereignty state via IPC before Tier2+ operations are
+/// permitted. See RFC-0027 §6.6 for runtime hydration requirements.
+fn bootstrap_sovereignty_state(
+    mode: apm2_core::pcac::SovereigntyEnforcementMode,
+) -> Option<Arc<crate::pcac::SovereigntyState>> {
+    if mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled {
+        return None;
+    }
+
+    None
+}
+
 const GITHUB_PROFILE_PREFIX: &str = "github-installation:";
 const SSH_PROFILE_PREFIX: &str = "ssh-session:";
 
@@ -795,6 +824,9 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
         let sqlite_conn_for_pcac = sqlite_conn.clone();
+        let mut sovereignty_trusted_signer_key = ledger_signing_key
+            .as_ref()
+            .map(|key| key.verifying_key().to_bytes());
 
         // TCK-00303: Create shared subscription registry for HEF resource governance
         let subscription_registry: SharedSubscriptionRegistry =
@@ -822,6 +854,7 @@ impl DispatcherState {
                 use rand::rngs::OsRng;
                 ed25519_dalek::SigningKey::generate(&mut OsRng)
             });
+            sovereignty_trusted_signer_key = Some(signing_key.verifying_key().to_bytes());
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
@@ -1011,6 +1044,7 @@ impl DispatcherState {
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store);
 
+        let sovereignty_trusted_signer_key = sovereignty_trusted_signer_key.unwrap_or([0u8; 32]);
         if let Some(conn) = sqlite_conn_for_pcac {
             match derive_pcac_consume_log_path(&conn) {
                 Ok(consume_log_path) => {
@@ -1031,13 +1065,25 @@ impl DispatcherState {
                     );
                     let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                         Arc::new(durable_kernel);
-                    let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
-                        pcac_kernel,
-                        tick_kernel,
-                    ));
+                    let sovereignty_checker =
+                        crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+                    let sovereignty_mode = bootstrap_sovereignty_enforcement_mode();
+                    let sovereignty_state = bootstrap_sovereignty_state(sovereignty_mode);
+                    let pcac_gate = Arc::new(
+                        crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
+                            pcac_kernel,
+                            tick_kernel,
+                            sovereignty_checker,
+                            Arc::clone(&stop_authority),
+                        ),
+                    );
                     privileged_dispatcher =
                         privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
+                    if let Some(sovereignty_state) = sovereignty_state {
+                        session_dispatcher =
+                            session_dispatcher.with_sovereignty_state(sovereignty_state);
+                    }
                 },
                 Err(error) if error.contains("in-memory main database has no durable path") => {
                     tracing::warn!(
@@ -1184,6 +1230,7 @@ impl DispatcherState {
             use rand::rngs::OsRng;
             ed25519_dalek::SigningKey::generate(&mut OsRng)
         });
+        let sovereignty_trusted_signer_key = signing_key.verifying_key().to_bytes();
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
         let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
@@ -1392,13 +1439,21 @@ impl DispatcherState {
             Box::new(durable_index),
         );
         let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
-        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
-            pcac_kernel,
-            tick_kernel,
-        ));
+        let sovereignty_checker =
+            crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+        let sovereignty_mode = bootstrap_sovereignty_enforcement_mode();
+        let sovereignty_state = bootstrap_sovereignty_state(sovereignty_mode);
+        let pcac_gate = Arc::new(
+            crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
+                pcac_kernel,
+                tick_kernel,
+                sovereignty_checker,
+                Arc::clone(&stop_authority),
+            ),
+        );
         privileged_dispatcher =
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
-        let session_dispatcher =
+        let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1413,6 +1468,9 @@ impl DispatcherState {
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
                 .with_pcac_lifecycle_gate(pcac_gate);
+        if let Some(sovereignty_state) = sovereignty_state {
+            session_dispatcher = session_dispatcher.with_sovereignty_state(sovereignty_state);
+        }
 
         Ok(Self {
             privileged_dispatcher,
