@@ -24,7 +24,7 @@ use subtle::{Choice, ConstantTimeEq};
 
 use super::deny::{AuthorityDenyClass, AuthorityDenyV1};
 use super::receipts::{AuthoritativeBindings, LifecycleStage, ReceiptAuthentication};
-use crate::consensus::merkle;
+use crate::consensus::{anti_entropy, merkle};
 use crate::crypto::Hash;
 
 /// Zero hash constant for fail-closed comparisons.
@@ -88,6 +88,8 @@ pub struct TimedVerificationResult<T> {
     pub result: T,
     /// Elapsed wall-clock time in microseconds.
     pub elapsed_us: u64,
+    /// Count of proof checks performed by the operation.
+    pub proof_check_count: u64,
 }
 
 /// Verify an authentication shape is admissible for authoritative acceptance.
@@ -355,6 +357,7 @@ pub fn timed_verify_receipt_authentication(
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
+        proof_check_count: proof_checks_for_receipt_auth(auth),
     }
 }
 
@@ -380,6 +383,7 @@ pub fn timed_validate_authoritative_bindings(
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
+        proof_check_count: 0,
     }
 }
 
@@ -407,6 +411,7 @@ pub fn timed_classify_fact(
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
+        proof_check_count: 0,
     }
 }
 
@@ -432,12 +437,52 @@ pub fn timed_validate_replay_lifecycle_order(
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
+        proof_check_count: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+    }
+}
+
+/// Times anti-entropy digest + transfer verification and returns elapsed
+/// microseconds.
+#[must_use]
+pub fn timed_anti_entropy_verification(
+    local_digest: Option<&Hash>,
+    remote_digest: Option<&Hash>,
+    events: &[anti_entropy::SyncEvent],
+    expected_prev_hash: &Hash,
+    expected_start_seq_id: Option<u64>,
+    proof: Option<&merkle::MerkleProof>,
+    proof_root: Option<&Hash>,
+) -> TimedVerificationResult<Result<(), anti_entropy::AntiEntropyError>> {
+    let start = Instant::now();
+    let result = anti_entropy::verify_sync_catchup(
+        local_digest,
+        remote_digest,
+        events,
+        expected_prev_hash,
+        expected_start_seq_id,
+        proof,
+        proof_root,
+    );
+    let event_checks = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    let proof_checks = u64::from(proof.is_some());
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+        proof_check_count: event_checks.saturating_add(proof_checks),
     }
 }
 
 #[inline]
 fn elapsed_us_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+#[inline]
+const fn proof_checks_for_receipt_auth(auth: &ReceiptAuthentication) -> u64 {
+    match auth {
+        ReceiptAuthentication::PointerBatched { .. } => 1,
+        ReceiptAuthentication::Direct { .. } | ReceiptAuthentication::PointerUnbatched { .. } => 0,
+    }
 }
 
 struct DenyContext {

@@ -22,16 +22,24 @@ pub struct VerifierEconomicsProfile {
     pub p95_classify_fact_us: u64,
     /// p95 upper bound for `validate_replay_lifecycle_order` (microseconds).
     pub p95_replay_lifecycle_us: u64,
+    /// p95 upper bound for anti-entropy verification operations (microseconds).
+    pub p95_anti_entropy_us: u64,
+    /// Maximum allowed proof checks per verification operation.
+    pub max_proof_checks: u64,
 }
 
 impl Default for VerifierEconomicsProfile {
     fn default() -> Self {
-        // Conservative finite defaults (10ms per verifier operation).
+        // Conservative finite defaults.
         Self {
             p95_verify_receipt_us: 10_000,
             p95_validate_bindings_us: 10_000,
             p95_classify_fact_us: 10_000,
             p95_replay_lifecycle_us: 10_000,
+            // Anti-entropy verification may include digest + transfer checks.
+            p95_anti_entropy_us: 50_000,
+            // Match replay lifecycle entry bound (`MAX_REPLAY_LIFECYCLE_ENTRIES`).
+            max_proof_checks: 256,
         }
     }
 }
@@ -47,6 +55,8 @@ pub enum VerifierOperation {
     ClassifyFact,
     /// Timing sample for `validate_replay_lifecycle_order`.
     ValidateReplayLifecycleOrder,
+    /// Timing sample for anti-entropy verification.
+    AntiEntropy,
 }
 
 impl std::fmt::Display for VerifierOperation {
@@ -56,6 +66,7 @@ impl std::fmt::Display for VerifierOperation {
             Self::ValidateAuthoritativeBindings => write!(f, "validate_authoritative_bindings"),
             Self::ClassifyFact => write!(f, "classify_fact"),
             Self::ValidateReplayLifecycleOrder => write!(f, "validate_replay_lifecycle_order"),
+            Self::AntiEntropy => write!(f, "anti_entropy_verification"),
         }
     }
 }
@@ -80,6 +91,7 @@ impl VerifierEconomicsChecker {
             },
             VerifierOperation::ClassifyFact => self.profile.p95_classify_fact_us,
             VerifierOperation::ValidateReplayLifecycleOrder => self.profile.p95_replay_lifecycle_us,
+            VerifierOperation::AntiEntropy => self.profile.p95_anti_entropy_us,
         }
     }
 
@@ -110,6 +122,34 @@ impl VerifierEconomicsChecker {
             }),
         }
     }
+
+    /// Checks verifier proof-check count against profile bounds for a risk
+    /// tier.
+    ///
+    /// Tier2+ is fail-closed on bound exceedance. Tier0/1 is monitor-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityDenyClass::VerifierEconomicsBoundsExceeded`] when
+    /// proof count exceeds bounds for Tier2+ operations.
+    pub fn check_proof_count(
+        &self,
+        operation: VerifierOperation,
+        proof_check_count: u64,
+        risk_tier: RiskTier,
+    ) -> Result<(), AuthorityDenyClass> {
+        if proof_check_count <= self.profile.max_proof_checks {
+            return Ok(());
+        }
+
+        match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 => Ok(()),
+            RiskTier::Tier2Plus => Err(AuthorityDenyClass::VerifierEconomicsBoundsExceeded {
+                operation: operation.to_string(),
+                risk_tier,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +162,8 @@ mod tests {
             p95_validate_bindings_us: 20,
             p95_classify_fact_us: 30,
             p95_replay_lifecycle_us: 40,
+            p95_anti_entropy_us: 50,
+            max_proof_checks: 3,
         }
     }
 
@@ -179,6 +221,11 @@ mod tests {
                 41,
                 "validate_replay_lifecycle_order",
             ),
+            (
+                VerifierOperation::AntiEntropy,
+                51,
+                "anti_entropy_verification",
+            ),
         ];
 
         for (operation, elapsed, expected_name) in cases {
@@ -200,6 +247,8 @@ mod tests {
         assert_eq!(profile.p95_validate_bindings_us, 10_000);
         assert_eq!(profile.p95_classify_fact_us, 10_000);
         assert_eq!(profile.p95_replay_lifecycle_us, 10_000);
+        assert_eq!(profile.p95_anti_entropy_us, 50_000);
+        assert_eq!(profile.max_proof_checks, 256);
     }
 
     #[test]
@@ -209,6 +258,8 @@ mod tests {
             p95_validate_bindings_us: 222,
             p95_classify_fact_us: 333,
             p95_replay_lifecycle_us: 444,
+            p95_anti_entropy_us: 555,
+            max_proof_checks: 666,
         };
         let json = serde_json::to_string(&profile).unwrap();
         let decoded: VerifierEconomicsProfile = serde_json::from_str(&json).unwrap();
@@ -216,6 +267,8 @@ mod tests {
         assert_eq!(decoded.p95_validate_bindings_us, 222);
         assert_eq!(decoded.p95_classify_fact_us, 333);
         assert_eq!(decoded.p95_replay_lifecycle_us, 444);
+        assert_eq!(decoded.p95_anti_entropy_us, 555);
+        assert_eq!(decoded.max_proof_checks, 666);
     }
 
     #[test]
@@ -225,6 +278,8 @@ mod tests {
             p95_validate_bindings_us: 0,
             p95_classify_fact_us: 0,
             p95_replay_lifecycle_us: 0,
+            p95_anti_entropy_us: 0,
+            max_proof_checks: 0,
         });
         let err = checker
             .check_timing(VerifierOperation::ClassifyFact, 1, RiskTier::Tier2Plus)
@@ -258,5 +313,37 @@ mod tests {
             AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
                 if operation == "validate_replay_lifecycle_order" && risk_tier == RiskTier::Tier2Plus
         ));
+    }
+
+    #[test]
+    fn proof_count_tier2plus_exceedance_denies() {
+        let checker = VerifierEconomicsChecker::new(tight_profile());
+        let err = checker
+            .check_proof_count(
+                VerifierOperation::ValidateReplayLifecycleOrder,
+                4,
+                RiskTier::Tier2Plus,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+                if operation == "validate_replay_lifecycle_order" && risk_tier == RiskTier::Tier2Plus
+        ));
+    }
+
+    #[test]
+    fn proof_count_tier0_tier1_exceedance_is_monitor_only() {
+        let checker = VerifierEconomicsChecker::new(tight_profile());
+        assert!(
+            checker
+                .check_proof_count(VerifierOperation::ClassifyFact, 4, RiskTier::Tier0)
+                .is_ok()
+        );
+        assert!(
+            checker
+                .check_proof_count(VerifierOperation::ClassifyFact, 4, RiskTier::Tier1)
+                .is_ok()
+        );
     }
 }

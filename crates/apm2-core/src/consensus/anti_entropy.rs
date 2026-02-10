@@ -1076,6 +1076,49 @@ pub fn verify_events_with_proof(
     Ok(())
 }
 
+/// Verifies anti-entropy catch-up inputs using digest comparison and event
+/// transfer verification.
+///
+/// This is a thin composition wrapper that checks:
+/// 1. Optional local/remote digest equality.
+/// 2. Event transfer integrity (`verify_sync_events_with_start_seq`).
+/// 3. Optional Merkle proof verification for transferred events.
+///
+/// # Errors
+///
+/// Returns [`AntiEntropyError::InvalidResponse`] when digest/proof context is
+/// ambiguous and propagates verifier errors from the underlying checks.
+pub fn verify_sync_catchup(
+    local_digest: Option<&Hash>,
+    remote_digest: Option<&Hash>,
+    events: &[SyncEvent],
+    expected_prev_hash: &Hash,
+    expected_start_seq_id: Option<u64>,
+    proof: Option<&MerkleProof>,
+    proof_root: Option<&Hash>,
+) -> Result<(), AntiEntropyError> {
+    if let (Some(local), Some(remote)) = (local_digest, remote_digest) {
+        if local != remote {
+            return Err(AntiEntropyError::InvalidResponse(
+                "anti-entropy digest mismatch between local and remote roots".to_string(),
+            ));
+        }
+    }
+
+    verify_sync_events_with_start_seq(events, expected_prev_hash, expected_start_seq_id)?;
+
+    if let Some(proof) = proof {
+        let root = proof_root.ok_or_else(|| {
+            AntiEntropyError::InvalidResponse(
+                "missing proof root for anti-entropy transfer verification".to_string(),
+            )
+        })?;
+        verify_events_with_proof(events, proof, root)?;
+    }
+
+    Ok(())
+}
+
 /// Converts an `EventRecord` to a `SyncEvent`.
 #[must_use]
 pub fn event_record_to_sync_event(record: &EventRecord) -> Option<SyncEvent> {
