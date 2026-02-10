@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 
 use super::types::MAX_REASON_LENGTH;
+use crate::crypto::{Signer, parse_signature, parse_verifying_key, verify_signature};
 
 /// Maximum length for evaluator identifiers.
 pub const MAX_EVALUATOR_ID_LENGTH: usize = 256;
@@ -19,6 +20,83 @@ pub const MAX_PREDICATE_ID_LENGTH: usize = 256;
 pub const MAX_DENY_REASON_LENGTH: usize = MAX_REASON_LENGTH;
 
 const ZERO_HASH: [u8; 32] = [0u8; 32];
+
+mod signature_bytes_serde {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SignatureBytesVisitor;
+
+        impl<'de> Visitor<'de> for SignatureBytesVisitor {
+            type Value = [u8; 64];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte sequence of exactly 64 bytes")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if let Some(size) = seq.size_hint() {
+                    if size > 64 {
+                        return Err(de::Error::custom(format!(
+                            "signature too long: more than 64 bytes ({size})"
+                        )));
+                    }
+                }
+
+                let mut arr = [0u8; 64];
+                for (index, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+                }
+
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::custom("signature too long: more than 64 bytes"));
+                }
+
+                Ok(arr)
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if bytes.len() != 64 {
+                    return Err(E::custom(format!(
+                        "expected 64 bytes for signature, got {}",
+                        bytes.len()
+                    )));
+                }
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(bytes);
+                Ok(arr)
+            }
+
+            fn visit_byte_buf<E>(self, bytes: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&bytes)
+            }
+        }
+
+        deserializer.deserialize_seq(SignatureBytesVisitor)
+    }
+}
 
 /// Temporal predicate identifiers for shared arbitration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -171,9 +249,60 @@ pub struct TemporalArbitrationReceiptV1 {
     pub deadline_tick: Option<u64>,
     /// Content digest of this receipt (for CAS binding).
     pub content_digest: [u8; 32],
+    /// Ed25519 public key of the signer (32 bytes).
+    pub signer_id: [u8; 32],
+    /// Ed25519 signature over the canonical receipt payload (64 bytes).
+    #[serde(with = "signature_bytes_serde")]
+    pub signature: [u8; 64],
 }
 
 impl TemporalArbitrationReceiptV1 {
+    /// Serializes the canonical payload covered by signature verification.
+    ///
+    /// This payload includes all fields except `signer_id` and `signature`.
+    #[must_use]
+    pub fn canonical_payload_for_signing(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"apm2-temporal-arbitration-receipt-v1");
+        payload.push(predicate_tag(self.predicate_id));
+        encode_u64(&mut payload, self.evaluators.len() as u64);
+        for evaluator in &self.evaluators {
+            encode_string(&mut payload, &evaluator.evaluator_id);
+            payload.push(predicate_tag(evaluator.predicate_id));
+            payload.extend_from_slice(&evaluator.contract_digest_set);
+            payload.extend_from_slice(&evaluator.canonicalizer_tuple);
+            payload.extend_from_slice(&evaluator.time_authority_ref);
+            payload.extend_from_slice(&evaluator.window_ref);
+            payload.push(outcome_tag(evaluator.verdict));
+            match evaluator.deny_reason.as_ref() {
+                Some(reason) => {
+                    payload.push(1);
+                    encode_string(&mut payload, reason);
+                },
+                None => payload.push(0),
+            }
+        }
+        payload.push(outcome_tag(self.aggregate_outcome));
+        payload.extend_from_slice(&self.time_envelope_ref);
+        encode_u64(&mut payload, self.arbitrated_at_tick);
+        match self.deadline_tick {
+            Some(deadline_tick) => {
+                payload.push(1);
+                encode_u64(&mut payload, deadline_tick);
+            },
+            None => payload.push(0),
+        }
+        payload.extend_from_slice(&self.content_digest);
+        payload
+    }
+
+    /// Signs the receipt payload with the provided signer.
+    pub fn sign(&mut self, signer: &Signer) {
+        let payload = self.canonical_payload_for_signing();
+        self.signer_id = signer.public_key_bytes();
+        self.signature = signer.sign(&payload).to_bytes();
+    }
+
     /// Validates receipt shape and deterministic arbitration constraints.
     ///
     /// # Errors
@@ -218,6 +347,12 @@ impl TemporalArbitrationReceiptV1 {
         if is_zero_hash(&self.content_digest) {
             return Err("content_digest must not be zero".to_string());
         }
+        if is_zero_hash(&self.signer_id) {
+            return Err("signer_id must not be zero".to_string());
+        }
+        if self.signature == [0u8; 64] {
+            return Err("signature must not be zero".to_string());
+        }
 
         let first = &self.evaluators[0];
         let mut previous_evaluator_id: Option<&str> = None;
@@ -261,6 +396,17 @@ impl TemporalArbitrationReceiptV1 {
                 self.aggregate_outcome, expected,
             ));
         }
+
+        let verifying_key = parse_verifying_key(&self.signer_id)
+            .map_err(|error| format!("invalid signer_id: {error}"))?;
+        let signature = parse_signature(&self.signature)
+            .map_err(|error| format!("invalid signature bytes: {error}"))?;
+        verify_signature(
+            &verifying_key,
+            &self.canonical_payload_for_signing(),
+            &signature,
+        )
+        .map_err(|_| "receipt signature verification failed".to_string())?;
 
         Ok(())
     }
@@ -471,6 +617,31 @@ fn derive_aggregate_outcome(evaluators: &[EvaluatorTuple]) -> ArbitrationOutcome
     ArbitrationOutcome::DisagreementTransient
 }
 
+fn encode_u64(payload: &mut Vec<u8>, value: u64) {
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_string(payload: &mut Vec<u8>, value: &str) {
+    encode_u64(payload, value.len() as u64);
+    payload.extend_from_slice(value.as_bytes());
+}
+
+const fn predicate_tag(predicate: TemporalPredicateId) -> u8 {
+    match predicate {
+        TemporalPredicateId::TpEio29001 => 1,
+        TemporalPredicateId::TpEio29008 => 8,
+    }
+}
+
+const fn outcome_tag(outcome: ArbitrationOutcome) -> u8 {
+    match outcome {
+        ArbitrationOutcome::AgreedAllow => 1,
+        ArbitrationOutcome::AgreedDeny => 2,
+        ArbitrationOutcome::DisagreementTransient => 3,
+        ArbitrationOutcome::DisagreementPersistent => 4,
+    }
+}
+
 fn is_zero_hash(hash: &[u8; 32]) -> bool {
     hash.ct_eq(&ZERO_HASH).unwrap_u8() == 1
 }
@@ -563,6 +734,10 @@ mod tests {
         [byte; 32]
     }
 
+    fn test_signer() -> Signer {
+        Signer::from_bytes(&[0x5A; 32]).expect("deterministic temporal arbitration signer")
+    }
+
     fn valid_tuple() -> EvaluatorTuple {
         EvaluatorTuple {
             evaluator_id: "eval-a".to_string(),
@@ -580,7 +755,7 @@ mod tests {
         let mut tuple_b = valid_tuple();
         tuple_b.evaluator_id = "eval-b".to_string();
 
-        TemporalArbitrationReceiptV1 {
+        let mut receipt = TemporalArbitrationReceiptV1 {
             predicate_id: TemporalPredicateId::TpEio29001,
             evaluators: vec![valid_tuple(), tuple_b],
             aggregate_outcome: ArbitrationOutcome::AgreedAllow,
@@ -588,7 +763,11 @@ mod tests {
             arbitrated_at_tick: 42,
             deadline_tick: None,
             content_digest: hash(0xAA),
-        }
+            signer_id: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        receipt.sign(&test_signer());
+        receipt
     }
 
     #[test]
@@ -750,6 +929,8 @@ mod tests {
             arbitrated_at_tick: 42,
             deadline_tick: None,
             content_digest: hash(0xAA),
+            signer_id: [0u8; 32],
+            signature: [0u8; 64],
         };
 
         let err = receipt.validate().unwrap_err();
@@ -770,7 +951,7 @@ mod tests {
         let mut tuple_b = tuple_a.clone();
         tuple_b.evaluator_id = "eval-b".to_string();
 
-        let receipt = TemporalArbitrationReceiptV1 {
+        let mut receipt = TemporalArbitrationReceiptV1 {
             predicate_id: TemporalPredicateId::TpEio29008,
             evaluators: vec![tuple_a, tuple_b],
             aggregate_outcome: ArbitrationOutcome::DisagreementTransient,
@@ -778,7 +959,10 @@ mod tests {
             arbitrated_at_tick: 42,
             deadline_tick: Some(100),
             content_digest: hash(0xAA),
+            signer_id: [0u8; 32],
+            signature: [0u8; 64],
         };
+        receipt.sign(&test_signer());
 
         assert!(receipt.validate().is_ok());
         assert!(receipt.check_deadline_miss(101));
@@ -810,6 +994,8 @@ mod tests {
             arbitrated_at_tick: 42,
             deadline_tick: None,
             content_digest: hash(0xAA),
+            signer_id: [0u8; 32],
+            signature: [0u8; 64],
         };
 
         let err = receipt.validate().unwrap_err();
@@ -834,6 +1020,8 @@ mod tests {
             arbitrated_at_tick: 42,
             deadline_tick: Some(42),
             content_digest: hash(0xAA),
+            signer_id: [0u8; 32],
+            signature: [0u8; 64],
         };
 
         let err = receipt.validate().unwrap_err();
@@ -848,5 +1036,21 @@ mod tests {
 
         let result = check_revocation_dominance(&hash(0x10), &zero);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tampered_receipt_fails_validation() {
+        let mut receipt = valid_receipt();
+        receipt.arbitrated_at_tick += 1;
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("signature verification failed"));
+    }
+
+    #[test]
+    fn test_unsigned_receipt_fails_validation() {
+        let mut receipt = valid_receipt();
+        receipt.signature = [0u8; 64];
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("signature must not be zero"));
     }
 }
