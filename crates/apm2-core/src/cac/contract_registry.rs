@@ -7,7 +7,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
@@ -221,10 +221,11 @@ impl ContractObjectRegistry {
     /// # Errors
     ///
     /// Returns a bounded defect list when the registry is incomplete, contains
-    /// duplicate schema/stable identifiers, or downgrades required-row
-    /// signature/freshness semantics.
+    /// duplicate schema/stable identifiers, or downgrades required-row security
+    /// semantics.
     pub fn validate_completeness(&self) -> Result<(), Vec<RegistryDefect>> {
         let mut defects = Vec::new();
+        let expected_required_rows = expected_required_row_bindings();
 
         if self.entries.len() > MAX_CONTRACT_REGISTRY_ENTRIES {
             push_registry_defect(
@@ -262,22 +263,19 @@ impl ContractObjectRegistry {
         for schema_id in REQUIRED_CONTRACT_SCHEMA_IDS {
             match self.lookup_by_schema_id(schema_id) {
                 Some(entry) => {
-                    if entry.signature_set_ref.is_none() {
-                        push_registry_defect(
+                    if let Some(expected) = expected_required_rows.get(*schema_id) {
+                        check_required_row_security_bindings(
                             &mut defects,
-                            RegistryDefect::RequiredSchemaSecurityDowngrade {
-                                schema_id: (*schema_id).to_string(),
-                                field_name: "signature_set_ref".to_string(),
-                            },
+                            schema_id,
+                            entry,
+                            expected,
                         );
-                    }
-
-                    if entry.window_or_ttl_ref.is_none() {
+                    } else {
                         push_registry_defect(
                             &mut defects,
                             RegistryDefect::RequiredSchemaSecurityDowngrade {
                                 schema_id: (*schema_id).to_string(),
-                                field_name: "window_or_ttl_ref".to_string(),
+                                field_name: "schema_id".to_string(),
                             },
                         );
                     }
@@ -1318,6 +1316,25 @@ pub fn validate_cac_contract(
                 }
             },
             CacValidationStep::PredicateExecution => {
+                if let Some(entry) = resolved_entry {
+                    if requires_role_spec_context_binding(entry.schema_id.as_str())
+                        && object.role_spec_context_binding.is_none()
+                    {
+                        update_with_defect(
+                            &mut defects,
+                            &mut compatibility_state,
+                            CacDefect::new(
+                                CacDefectClass::PredicateExecutionFailed,
+                                step,
+                                format!(
+                                    "required schema '{}' is missing role_spec_context_binding",
+                                    entry.schema_id
+                                ),
+                            ),
+                        );
+                    }
+                }
+
                 if let Some(binding) = &object.role_spec_context_binding {
                     if let Err(error) = binding.validate() {
                         update_with_defect(
@@ -1375,6 +1392,97 @@ fn push_registry_defect(defects: &mut Vec<RegistryDefect>, defect: RegistryDefec
     if defects.len() < MAX_CAC_DEFECTS {
         defects.push(defect);
     }
+}
+
+fn check_required_schema_field(
+    defects: &mut Vec<RegistryDefect>,
+    schema_id: &str,
+    field_name: &str,
+    matches_expected: bool,
+) {
+    if !matches_expected {
+        push_registry_defect(
+            defects,
+            RegistryDefect::RequiredSchemaSecurityDowngrade {
+                schema_id: schema_id.to_string(),
+                field_name: field_name.to_string(),
+            },
+        );
+    }
+}
+
+fn check_required_row_security_bindings(
+    defects: &mut Vec<RegistryDefect>,
+    schema_id: &str,
+    entry: &ContractObjectRegistryEntry,
+    expected: &ContractObjectRegistryEntry,
+) {
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "object_id",
+        entry.object_id == expected.object_id,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "schema_major",
+        entry.schema_major == expected.schema_major,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "schema_stable_id",
+        entry.schema_stable_id == expected.schema_stable_id,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "digest_required",
+        entry.digest_required == expected.digest_required,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "digest_algorithm",
+        entry.digest_algorithm == expected.digest_algorithm,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "digest_field_name",
+        entry.digest_field == expected.digest_field,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "canonicalizer_kind",
+        entry.canonicalizer_id == expected.canonicalizer_id,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "canonicalizer_version",
+        entry.canonicalizer_version == expected.canonicalizer_version,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "canonicalizer_vectors_ref",
+        entry.canonicalizer_vectors_ref == expected.canonicalizer_vectors_ref,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "signature_set_ref",
+        entry.signature_set_ref == expected.signature_set_ref,
+    );
+    check_required_schema_field(
+        defects,
+        schema_id,
+        "window_or_ttl_ref",
+        entry.window_or_ttl_ref == expected.window_or_ttl_ref,
+    );
 }
 
 fn ensure_non_zero_hash(field: &str, hash: &[u8; 32]) -> Result<(), RoleSpecContextBindingError> {
@@ -1807,8 +1915,23 @@ const REQUIRED_CONTRACT_SCHEMA_IDS: &[&str] = &[
     "apm2.anti_entropy_convergence_receipt.v1",
 ];
 
+fn expected_required_row_bindings() -> HashMap<String, ContractObjectRegistryEntry> {
+    let expected: HashMap<String, ContractObjectRegistryEntry> =
+        default_contract_registry_entries()
+            .into_iter()
+            .filter(|entry| is_required_contract_schema(entry.schema_id.as_str()))
+            .map(|entry| (entry.schema_id.clone(), entry))
+            .collect();
+    debug_assert_eq!(expected.len(), REQUIRED_CONTRACT_SCHEMA_IDS.len());
+    expected
+}
+
 fn is_required_contract_schema(schema_id: &str) -> bool {
     REQUIRED_CONTRACT_SCHEMA_IDS.contains(&schema_id)
+}
+
+fn requires_role_spec_context_binding(schema_id: &str) -> bool {
+    is_required_contract_schema(schema_id) && schema_id.starts_with("cac.")
 }
 
 #[cfg(test)]
@@ -1843,22 +1966,6 @@ mod tests {
         entries.push(optional_entry);
         ContractObjectRegistry::new(entries)
             .expect("mutated non-required registry should satisfy completeness constraints")
-    }
-
-    fn registry_with_entry_mutation(
-        schema_id: &str,
-        mutate: impl FnOnce(&mut ContractObjectRegistryEntry),
-    ) -> ContractObjectRegistry {
-        let mut entries = ContractObjectRegistry::default_registry()
-            .entries()
-            .to_vec();
-        let entry = entries
-            .iter_mut()
-            .find(|entry| entry.schema_id == schema_id)
-            .unwrap_or_else(|| panic!("schema_id '{schema_id}' should exist in default registry"));
-        mutate(entry);
-        ContractObjectRegistry::new(entries)
-            .expect("mutated registry should still satisfy completeness constraints")
     }
 
     fn sample_admissible_object(entry: &ContractObjectRegistryEntry) -> CacObject {
@@ -2146,8 +2253,8 @@ mod tests {
 
     #[test]
     fn test_unknown_ref_value_is_explicit_defect() {
-        let schema_id = "apm2.pcac_snapshot_report.v1";
-        let registry = registry_with_entry_mutation(schema_id, |entry| {
+        let schema_id = NON_REQUIRED_TEST_SCHEMA_ID;
+        let registry = registry_with_non_required_entry_mutation(|entry| {
             entry.signature_set_ref = Some("signature_set.unknown".to_string());
         });
         let entry = registry
@@ -2219,6 +2326,84 @@ mod tests {
     }
 
     #[test]
+    fn test_required_schema_digest_downgrade_rejected() {
+        let required_schema_id = "apm2.pcac_snapshot_report.v1";
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == required_schema_id)
+            .expect("required schema should exist in default registry");
+        entry.digest_required = false;
+
+        let defects = ContractObjectRegistry::new(entries)
+            .expect_err("required schema digest_required downgrade must be rejected");
+
+        assert!(defects.iter().any(|defect| {
+            matches!(
+                defect,
+                RegistryDefect::RequiredSchemaSecurityDowngrade {
+                    schema_id,
+                    field_name,
+                } if schema_id == required_schema_id && field_name == "digest_required"
+            )
+        }));
+    }
+
+    #[test]
+    fn test_required_schema_canonicalizer_downgrade_rejected() {
+        let required_schema_id = "apm2.pcac_snapshot_report.v1";
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == required_schema_id)
+            .expect("required schema should exist in default registry");
+        entry.canonicalizer_id = "canonicalizer.tampered".to_string();
+
+        let defects = ContractObjectRegistry::new(entries)
+            .expect_err("required schema canonicalizer downgrade must be rejected");
+
+        assert!(defects.iter().any(|defect| {
+            matches!(
+                defect,
+                RegistryDefect::RequiredSchemaSecurityDowngrade {
+                    schema_id,
+                    field_name,
+                } if schema_id == required_schema_id && field_name == "canonicalizer_kind"
+            )
+        }));
+    }
+
+    #[test]
+    fn test_required_schema_algorithm_downgrade_rejected() {
+        let required_schema_id = "apm2.pcac_snapshot_report.v1";
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == required_schema_id)
+            .expect("required schema should exist in default registry");
+        entry.digest_algorithm = "sha256".to_string();
+
+        let defects = ContractObjectRegistry::new(entries)
+            .expect_err("required schema digest algorithm downgrade must be rejected");
+
+        assert!(defects.iter().any(|defect| {
+            matches!(
+                defect,
+                RegistryDefect::RequiredSchemaSecurityDowngrade {
+                    schema_id,
+                    field_name,
+                } if schema_id == required_schema_id && field_name == "digest_algorithm"
+            )
+        }));
+    }
+
+    #[test]
     fn test_required_schema_downgrade_blocked() {
         let required_schema_id = "apm2.pcac_snapshot_report.v1";
         let mut entries = ContractObjectRegistry::default_registry()
@@ -2252,6 +2437,23 @@ mod tests {
                 .iter()
                 .any(|defect| defect.class == CacDefectClass::RequirementRefUnresolved)
         );
+    }
+
+    #[test]
+    fn test_required_cac_schema_missing_binding_defect() {
+        let registry = ContractObjectRegistry::default_registry();
+        let entry = registry
+            .lookup_by_schema_id("cac.context_pack_spec.v1")
+            .expect("required cac schema should resolve");
+        let object = sample_admissible_object(entry);
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(result.defects.iter().any(|defect| {
+            defect.class == CacDefectClass::PredicateExecutionFailed
+                && defect.detail.contains("missing role_spec_context_binding")
+        }));
     }
 
     #[test]
