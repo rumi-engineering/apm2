@@ -1,0 +1,57 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0040"
+  title: "Auditor/orchestrator projection determinism and fail-closed uncertainty evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that REQ-0040 acceptance criteria are enforced for auditor and
+    orchestrator projection surfaces (TCK-00452).
+
+    Coverage proves:
+    - Digest-first projection payloads expose canonical JSON plus matching digest.
+    - Repeated queries over unchanged ledger state are replay-consistent.
+    - Missing lineage/liveness evidence is surfaced as explicit uncertainty and
+      marked non-admissible (fail-closed).
+    - Bounded projection windows flag truncated history uncertainty.
+    - Orchestrator projections report active runs, authoritative receipt tick,
+      and restart counters from receipt-backed events.
+  requirement_ids:
+    - "REQ-0040"
+  source_refs:
+    - "documents/rfcs/RFC-0020/requirements/REQ-0040.yaml"
+    - "crates/apm2-daemon/tests/tck_00452_projections.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+  artifacts:
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00452_projections.rs"
+      description: |
+        `test_auditor_projection_is_digest_first_and_replay_consistent`
+        validates digest binding and deterministic replay for auditor projections.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00452_projections.rs"
+      description: |
+        `test_projections_fail_closed_when_evidence_is_missing`
+        validates fail-closed uncertainty flags and non-admissible outcomes when
+        lineage/liveness evidence is missing.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00452_projections.rs"
+      description: |
+        `test_orchestrator_projection_reports_liveness_tick_restart_and_is_deterministic`
+        validates orchestrator active-runs, receipt-tick, restart-count reporting,
+        and replay-consistent digest-first output.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00452_projections.rs"
+      description: |
+        `test_auditor_projection_flags_truncated_history_when_receipts_exceed_limit`
+        validates truncated-history uncertainty for bounded auditor windows.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00452_projections.rs"
+      description: |
+        `test_orchestrator_projection_uses_recent_window_and_flags_truncated_history`
+        validates bounded recent-window behavior and truncated-history uncertainty
+        signaling for orchestrator projections.
+    - type: "test_output"
+      description: "Projection integration suite execution command."
+      ref:
+        - "cargo test -p apm2-daemon --test tck_00452_projections"

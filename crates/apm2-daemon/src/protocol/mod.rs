@@ -175,6 +175,8 @@ pub use dispatch::{
     emit_authority_binding_defect,
     // CTR-PROTO-012: Credential Management encoding (TCK-00343)
     encode_add_credential_request,
+    // TCK-00452: Auditor projection encoding
+    encode_auditor_launch_projection_request,
     // Request encoding helpers
     encode_claim_work_request,
     encode_consensus_byzantine_evidence_request,
@@ -189,6 +191,8 @@ pub use dispatch::{
     // TCK-00342: Process management encoding helpers
     encode_list_processes_request,
     encode_login_credential_request,
+    // TCK-00452: Orchestrator projection encoding
+    encode_orchestrator_launch_projection_request,
     encode_process_status_request,
     encode_publish_changeset_request,
     encode_refresh_credential_request,
@@ -226,6 +230,8 @@ pub use messages::{
     // CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
     AddCredentialRequest,
     AddCredentialResponse,
+    AuditorLaunchProjectionRequest,
+    AuditorLaunchProjectionResponse,
     BoundedDecode,
     // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
     BoundedWallInterval,
@@ -278,6 +284,8 @@ pub use messages::{
     LogEntry,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    OrchestratorLaunchProjectionRequest,
+    OrchestratorLaunchProjectionResponse,
     PatternRejection,
     PrivilegedError,
     PrivilegedErrorCode,
@@ -286,6 +294,7 @@ pub use messages::{
     ProcessStateEnum,
     ProcessStatusRequest,
     ProcessStatusResponse,
+    ProjectionUncertaintyFlag,
     // TCK-00394: ChangeSet publishing messages
     PublishChangeSetRequest,
     PublishChangeSetResponse,

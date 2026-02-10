@@ -338,6 +338,8 @@ impl_bounded_decode_simple!(
     StreamTelemetryResponse,
     SessionError,
     // TCK-00344: Status query endpoints
+    AuditorLaunchProjectionRequest,
+    OrchestratorLaunchProjectionRequest,
     WorkStatusRequest,
     WorkStatusResponse,
     WorkListRequest,
@@ -428,6 +430,9 @@ impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
 impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
 // TCK-00415: Projection-backed work list
 impl_bounded_decode_with_repeated!(WorkListResponse, work_items);
+// TCK-00452: Auditor/orchestrator projections with uncertainty flags.
+impl_bounded_decode_with_repeated!(AuditorLaunchProjectionResponse, uncertainty_flags);
+impl_bounded_decode_with_repeated!(OrchestratorLaunchProjectionResponse, uncertainty_flags);
 // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
 impl_bounded_decode_with_repeated!(ConsensusValidatorsResponse, validators);
 impl_bounded_decode_with_repeated!(ConsensusByzantineEvidenceResponse, evidence);

@@ -20,8 +20,7 @@ requirement:
     - "Projection responses are digest-first and replay-consistent across observers."
     - "Missing lineage data is surfaced as explicit non-admissible uncertainty."
   evidence_ids:
-    - "EVID-0030"
-    - "EVID-0014"
+    - "EVID-0040"
   source_refs:
     - "HOLONIC_SUBSTRATE_INTERFACE.md §8"
     - "HOLONIC_SUBSTRATE_INTERFACE.md §9"

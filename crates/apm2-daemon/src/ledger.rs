@@ -26,11 +26,11 @@ use tracing::{info, warn};
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, PrivilegedPcacLifecycleArtifacts, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
-    STOP_FLAGS_MUTATED_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent,
-    StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim,
-    WorkRegistry, WorkRegistryError, WorkTransition, append_privileged_pcac_lifecycle_fields,
-    build_session_started_payload,
+    LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
+    SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
+    STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
+    append_privileged_pcac_lifecycle_fields, build_session_started_payload,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -954,6 +954,124 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .optional()
         .ok()
         .flatten()
+    }
+
+    fn get_authoritative_receipt_event_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+
+        let Ok(count) = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return 0;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = count as usize;
+        count
+    }
+
+    fn get_authoritative_receipt_events(&self) -> Vec<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let projection_limit = i64::try_from(MAX_PROJECTION_EVENTS).unwrap_or(i64::MAX);
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM (
+                 SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')
+                 ORDER BY rowid DESC
+                 LIMIT ?1
+             ) recent
+             ORDER BY timestamp_ns ASC, rowid ASC",
+        ) else {
+            return Vec::new();
+        };
+
+        let rows = stmt.query_map(params![projection_limit], |row| {
+            Ok(SignedLedgerEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                work_id: row.get(2)?,
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get(6)?,
+            })
+        });
+
+        rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn get_launch_liveness_projection_event_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+
+        let Ok(count) = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events
+             WHERE event_type IN (
+                 'session_started',
+                 'session_terminated',
+                 'review_receipt_recorded',
+                 'review_blocked_recorded'
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return 0;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = count as usize;
+        count
+    }
+
+    fn get_launch_liveness_projection_events(&self) -> Vec<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let projection_limit = i64::try_from(MAX_PROJECTION_EVENTS).unwrap_or(i64::MAX);
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM (
+                 SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type IN (
+                     'session_started',
+                     'session_terminated',
+                     'review_receipt_recorded',
+                     'review_blocked_recorded'
+                 )
+                 ORDER BY rowid DESC
+                 LIMIT ?1
+             ) recent
+             ORDER BY timestamp_ns ASC, rowid ASC",
+        ) else {
+            return Vec::new();
+        };
+
+        let rows = stmt.query_map(params![projection_limit], |row| {
+            Ok(SignedLedgerEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                work_id: row.get(2)?,
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get(6)?,
+            })
+        });
+
+        rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
     }
 
     fn get_event_by_receipt_identity(
@@ -2689,6 +2807,117 @@ mod tests {
             resolved_scope_baseline: None,
             expected_adapter_profile_hash: None,
         }
+    }
+
+    fn insert_projection_event(
+        emitter: &SqliteLedgerEventEmitter,
+        idx: usize,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) {
+        let payload_bytes = serde_json::to_vec(payload).expect("payload should serialize");
+        let conn = emitter
+            .conn
+            .lock()
+            .expect("sqlite lock should be available");
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                format!("EVT-PROJ-{idx:08}"),
+                event_type,
+                format!("W-PROJ-{idx:08}"),
+                "actor:test",
+                payload_bytes,
+                vec![0u8; 64],
+                i64::try_from(idx).expect("idx should fit i64"),
+            ],
+        )
+        .expect("projection seed event should insert");
+    }
+
+    #[test]
+    fn authoritative_projection_query_is_bounded_to_recent_receipts() {
+        let emitter = test_emitter();
+        let total = MAX_PROJECTION_EVENTS + 3;
+
+        for idx in 0..total {
+            insert_projection_event(
+                &emitter,
+                idx,
+                "review_receipt_recorded",
+                &serde_json::json!({
+                    "receipt_id": format!("RCP-PROJ-{idx:08}"),
+                }),
+            );
+        }
+
+        assert_eq!(
+            emitter.get_authoritative_receipt_event_count(),
+            total,
+            "authoritative receipt count should report full history"
+        );
+
+        let events = emitter.get_authoritative_receipt_events();
+        assert_eq!(
+            events.len(),
+            MAX_PROJECTION_EVENTS,
+            "authoritative projection query must cap returned rows"
+        );
+
+        let expected_first = total - MAX_PROJECTION_EVENTS;
+        assert_eq!(
+            events.first().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{expected_first:08}")),
+            "bounded query must keep the most recent receipt window"
+        );
+        assert_eq!(
+            events.last().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{:08}", total - 1)),
+            "bounded query must include newest receipt event"
+        );
+    }
+
+    #[test]
+    fn liveness_projection_query_is_bounded_to_recent_events() {
+        let emitter = test_emitter();
+        let total = MAX_PROJECTION_EVENTS + 4;
+
+        for idx in 0..total {
+            insert_projection_event(
+                &emitter,
+                idx,
+                "session_started",
+                &serde_json::json!({
+                    "session_id": format!("SESS-PROJ-{idx:08}"),
+                }),
+            );
+        }
+
+        assert_eq!(
+            emitter.get_launch_liveness_projection_event_count(),
+            total,
+            "liveness event count should report full history"
+        );
+
+        let events = emitter.get_launch_liveness_projection_events();
+        assert_eq!(
+            events.len(),
+            MAX_PROJECTION_EVENTS,
+            "liveness projection query must cap returned rows"
+        );
+
+        let expected_first = total - MAX_PROJECTION_EVENTS;
+        assert_eq!(
+            events.first().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{expected_first:08}")),
+            "bounded liveness query must keep the most recent event window"
+        );
+        assert_eq!(
+            events.last().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{:08}", total - 1)),
+            "bounded liveness query must include newest event"
+        );
     }
 
     /// FIX-SEC-BLOCKER: Events with equal timestamps are retrieved in

@@ -1171,7 +1171,7 @@ mod tests {
         }
 
         // Unknown tags must return None (fail-closed)
-        let unknown_tags: Vec<u8> = vec![0, 20, 27, 50, 63, 65, 67, 69, 71, 100, 255];
+        let unknown_tags: Vec<u8> = vec![0, 50, 63, 65, 67, 69, 71, 100, 255];
         for tag in unknown_tags {
             assert!(
                 PrivilegedMessageType::from_tag(tag).is_none(),

@@ -438,6 +438,67 @@ message WorkListResponse {
   repeated WorkStatusResponse work_items = 1;
 }
 
+// Projection uncertainty classification for fail-closed consumers.
+enum ProjectionUncertaintyFlag {
+  PROJECTION_UNCERTAINTY_FLAG_UNSPECIFIED = 0;
+  // Required lineage evidence is missing or malformed.
+  PROJECTION_UNCERTAINTY_FLAG_MISSING_LINEAGE_EVIDENCE = 1;
+  // Required boundary-conformance evidence is missing or malformed.
+  PROJECTION_UNCERTAINTY_FLAG_BOUNDARY_CONFORMANCE_UNVERIFIABLE = 2;
+  // Liveness evidence is missing or malformed.
+  PROJECTION_UNCERTAINTY_FLAG_MISSING_LIVENESS_EVIDENCE = 3;
+  // No authoritative receipt tick is available.
+  PROJECTION_UNCERTAINTY_FLAG_MISSING_AUTHORITATIVE_RECEIPT_TICK = 4;
+  // Projection replay used a bounded recent-history window.
+  PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY = 5;
+}
+
+// IPC-PRIV-020: AuditorLaunchProjection (TCK-00452)
+// Return launch-lineage and boundary-conformance projection for auditors.
+message AuditorLaunchProjectionRequest {}
+
+message AuditorLaunchProjectionResponse {
+  // BLAKE3 digest of canonical_projection_json.
+  bytes projection_digest = 1;
+  // Canonical JSON bytes of the projection payload (JCS).
+  bytes canonical_projection_json = 2;
+  // True when all authoritative receipts provide complete lineage evidence.
+  bool lineage_complete = 3;
+  // True when all authoritative receipts satisfy boundary conformance checks.
+  bool boundary_conformant = 4;
+  // Number of authoritative receipt events used by the projection.
+  uint32 authoritative_receipt_count = 5;
+  // Number of receipts with complete lineage fields.
+  uint32 complete_lineage_receipt_count = 6;
+  // Number of receipts that satisfy boundary-conformance checks.
+  uint32 boundary_conformant_receipt_count = 7;
+  // Fail-closed uncertainty classification.
+  repeated ProjectionUncertaintyFlag uncertainty_flags = 8;
+  // Authoritative admissibility verdict (false on any uncertainty).
+  bool admissible = 9;
+}
+
+// IPC-PRIV-027: OrchestratorLaunchProjection (TCK-00452)
+// Return launch liveness/restart projection for orchestrator consumers.
+message OrchestratorLaunchProjectionRequest {}
+
+message OrchestratorLaunchProjectionResponse {
+  // BLAKE3 digest of canonical_projection_json.
+  bytes projection_digest = 1;
+  // Canonical JSON bytes of the projection payload (JCS).
+  bytes canonical_projection_json = 2;
+  // Number of currently active runs.
+  uint32 active_runs = 3;
+  // Most recent authoritative receipt tick, when available.
+  optional uint64 last_authoritative_receipt_tick = 4;
+  // Aggregate restart count derived from lifecycle evidence.
+  uint32 restart_count = 5;
+  // Fail-closed uncertainty classification.
+  repeated ProjectionUncertaintyFlag uncertainty_flags = 6;
+  // Authoritative admissibility verdict (false on any uncertainty).
+  bool admissible = 7;
+}
+
 // =============================================================================
 // IPC-PRIV-017: PublishChangeSet (TCK-00394, RFC-0018)
 // =============================================================================
