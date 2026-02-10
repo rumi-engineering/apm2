@@ -43,6 +43,7 @@ use apm2_core::crypto::Signer;
 use apm2_core::fac::{MergeReceipt, PolicyResolvedForChangeSet, ReasonCode, ReviewBlockedRecorded};
 use apm2_core::ledger::EventRecord;
 use apm2_core::work::{EventFamilyPromotionGate, WorkReducerState};
+use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -63,6 +64,11 @@ pub const MAX_PENDING_MERGES: usize = 1_000;
 ///
 /// Prevents unbounded CPU/memory usage in the promotion gate.
 pub const MAX_WORK_EVENTS: usize = 10_000;
+
+/// Maximum aggregate payload bytes across all work events.
+///
+/// Prevents expensive JSON/protobuf decode under adversarial payload sizing.
+pub const MAX_WORK_EVENTS_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Maximum length of any string field in merge executor events.
 const MAX_STRING_LENGTH: usize = 4096;
@@ -163,6 +169,19 @@ pub enum MergeExecutorError {
         actual: usize,
         /// Maximum allowed work event count.
         max: usize,
+    },
+
+    /// Aggregate event payload bytes exceed bounded merge-input limit.
+    #[error(
+        "work_events aggregate payload {actual_bytes} bytes exceeds maximum {max_bytes} for work_id {work_id}"
+    )]
+    WorkEventByteLimitExceeded {
+        /// The work ID.
+        work_id: String,
+        /// Actual aggregate payload bytes.
+        actual_bytes: usize,
+        /// Maximum allowed aggregate payload bytes.
+        max_bytes: usize,
     },
 
     /// Missing PR number for merge.
@@ -266,6 +285,9 @@ pub enum MergeExecutorEvent {
         work_id: String,
         /// Number of defect records.
         defect_count: usize,
+        /// Serialized defect records for ledger persistence
+        /// (protobuf-encoded bytes).
+        defect_payloads: Vec<Vec<u8>>,
         /// Summary reason for the denial.
         reason: String,
         /// Timestamp (ms since epoch).
@@ -458,6 +480,49 @@ impl MergeExecutor {
                 defect_records: Vec::new(),
             }
         })?;
+
+        // REQ-HEF-0014: Bind work_events to input.work_id — reject foreign events.
+        for (idx, event) in input.work_events.iter().enumerate() {
+            if event.session_id != input.work_id {
+                return Err(MergeExecutorError::PromotionGateBlocked {
+                    work_id: input.work_id.clone(),
+                    reason: format!(
+                        "work_events[{idx}] has session_id '{}' which does not match work_id '{}' (binding violation)",
+                        event.session_id, input.work_id
+                    ),
+                    defect_records: Vec::new(),
+                });
+            }
+        }
+
+        // Verify expected_reducer_state is keyed only to this work_id.
+        if expected_state.get(&input.work_id).is_none() {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "expected_reducer_state does not contain work_id '{}' (binding violation)",
+                    input.work_id
+                ),
+                defect_records: Vec::new(),
+            });
+        }
+        if expected_state.len() > 1 {
+            let mut foreign_work_ids: Vec<&str> = expected_state
+                .work_items
+                .keys()
+                .filter_map(|key| (key.as_str() != input.work_id).then_some(key.as_str()))
+                .collect();
+            foreign_work_ids.sort_unstable();
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "expected_reducer_state contains foreign work_ids [{}] for work_id '{}' (binding violation)",
+                    foreign_work_ids.join(", "),
+                    input.work_id
+                ),
+                defect_records: Vec::new(),
+            });
+        }
 
         let gate_result = EventFamilyPromotionGate::evaluate(&input.work_events, expected_state)
             .map_err(|e| MergeExecutorError::PromotionGateBlocked {
@@ -670,9 +735,12 @@ impl MergeExecutor {
                 ref defect_records,
             }) => {
                 let now_ms = self.clock.now_ms();
+                let defect_payloads: Vec<Vec<u8>> =
+                    defect_records.iter().map(Message::encode_to_vec).collect();
                 let events = vec![MergeExecutorEvent::PromotionGateDenied {
                     work_id: work_id.clone(),
                     defect_count: defect_records.len(),
+                    defect_payloads,
                     reason: reason.clone(),
                     timestamp_ms: now_ms,
                 }];
@@ -702,6 +770,16 @@ impl MergeExecutor {
                 work_id: input.work_id.clone(),
                 actual: input.work_events.len(),
                 max: MAX_WORK_EVENTS,
+            });
+        }
+        let total_bytes = input.work_events.iter().fold(0usize, |total, event| {
+            total.saturating_add(event.payload.len())
+        });
+        if total_bytes > MAX_WORK_EVENTS_BYTES {
+            return Err(MergeExecutorError::WorkEventByteLimitExceeded {
+                work_id: input.work_id.clone(),
+                actual_bytes: total_bytes,
+                max_bytes: MAX_WORK_EVENTS_BYTES,
             });
         }
         if input.gate_outcomes.is_empty() {
@@ -1305,18 +1383,23 @@ mod tests {
         assert!(receipt.is_none());
         assert!(blocked.is_none());
         assert_eq!(events.len(), 1);
-        assert!(
-            matches!(
-                &events[0],
-                MergeExecutorEvent::PromotionGateDenied {
-                    work_id,
-                    defect_count,
-                    ..
-                } if work_id == "work-001" && *defect_count > 0
-            ),
-            "expected PromotionGateDenied with defects, got {:?}",
-            events[0]
-        );
+        match &events[0] {
+            MergeExecutorEvent::PromotionGateDenied {
+                work_id,
+                defect_count,
+                defect_payloads,
+                ..
+            } => {
+                assert_eq!(work_id, "work-001");
+                assert!(*defect_count > 0);
+                assert_eq!(*defect_count, defect_payloads.len());
+                assert!(defect_payloads.iter().all(|payload| !payload.is_empty()));
+                let decoded = apm2_core::events::DefectRecorded::decode(&defect_payloads[0][..])
+                    .expect("serialized defect payload must decode");
+                assert!(!decoded.defect_id.is_empty());
+            },
+            other => panic!("expected PromotionGateDenied with defects, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1375,6 +1458,98 @@ mod tests {
             Err(MergeExecutorError::WorkEventLimitExceeded {
                 actual: _,
                 max: MAX_WORK_EVENTS,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_promotion_gate_rejects_foreign_work_events() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        let (foreign_events, foreign_expected_state) = make_valid_work_events("WRONG-WORK");
+        input.work_events = foreign_events;
+        input.expected_reducer_state = Some(foreign_expected_state);
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+
+        let err = executor.execute_merge(&input, &adapter).unwrap_err();
+        match err {
+            MergeExecutorError::PromotionGateBlocked {
+                work_id,
+                reason,
+                defect_records,
+            } => {
+                assert_eq!(work_id, "work-001");
+                assert!(reason.contains("binding violation"));
+                assert!(reason.contains("WRONG-WORK"));
+                assert!(defect_records.is_empty());
+            },
+            other => panic!("expected PromotionGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_promotion_gate_rejects_foreign_expected_reducer_state_entries() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        let (_, foreign_expected_state) = make_valid_work_events("foreign-work");
+        let mut expected = input
+            .expected_reducer_state
+            .clone()
+            .expect("test input should contain expected state");
+        expected
+            .work_items
+            .extend(foreign_expected_state.work_items);
+        input.expected_reducer_state = Some(expected);
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+
+        let err = executor.execute_merge(&input, &adapter).unwrap_err();
+        match err {
+            MergeExecutorError::PromotionGateBlocked { reason, .. } => {
+                assert!(reason.contains("expected_reducer_state contains foreign work_ids"));
+                assert!(reason.contains("foreign-work"));
+            },
+            other => panic!("expected PromotionGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_work_event_byte_limit_exceeded_rejected() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.work_events = vec![
+            EventRecord::with_timestamp(
+                "work.opened",
+                "work-001",
+                "actor:test",
+                vec![0_u8; MAX_WORK_EVENTS_BYTES + 1],
+                1_000,
+            )
+            .with_seq_id(1),
+        ];
+
+        let adapter = SuccessAdapter {
+            result_sha: "sha-ok".to_string(),
+        };
+
+        let result = executor.execute_merge(&input, &adapter);
+        assert!(matches!(
+            result,
+            Err(MergeExecutorError::WorkEventByteLimitExceeded {
+                actual_bytes: _,
+                max_bytes: MAX_WORK_EVENTS_BYTES,
                 ..
             })
         ));
