@@ -9,7 +9,7 @@
 use std::fs;
 
 use apm2_core::pcac::{
-    PcacEvidenceBundle, PcacGateId, PcacObjectiveId, PcacPredicateSummary,
+    PcacEvidenceBundle, PcacGateId, PcacObjectiveId, PcacPredicateSummary, SummarySource,
     assert_exported_predicates, evaluate_exported_predicates, evaluate_gate_predicate_value,
     evaluate_objective_predicate_value, export_pcac_evidence_bundle,
 };
@@ -19,7 +19,10 @@ use tempfile::TempDir;
 #[test]
 fn tck_00430_exports_declared_paths_and_predicates_pass() {
     let temp_dir = TempDir::new().expect("tempdir must be created");
-    let bundle = PcacEvidenceBundle::all_pass();
+    let bundle = PcacEvidenceBundle::with_uniform_summary(
+        SummarySource::Observed,
+        &PcacPredicateSummary::all_pass(),
+    );
 
     export_pcac_evidence_bundle(temp_dir.path(), &bundle)
         .expect("summary export must succeed for all RFC-0027 objective and gate paths");
@@ -52,6 +55,12 @@ fn tck_00430_exports_declared_paths_and_predicates_pass() {
     let sample_path = temp_dir
         .path()
         .join(PcacObjectiveId::ObjPcac01.summary_relative_path());
+    let sample_summary = fs::read_to_string(&sample_path).expect("summary file must be readable");
+    assert!(
+        sample_summary.contains("\"summary_source\": \"observed\""),
+        "exported summary must carry observed source classification"
+    );
+
     let first = fs::read(&sample_path).expect("first read of objective summary must succeed");
     export_pcac_evidence_bundle(temp_dir.path(), &bundle)
         .expect("second deterministic export must succeed");
@@ -65,7 +74,10 @@ fn tck_00430_exports_declared_paths_and_predicates_pass() {
 #[test]
 fn tck_00430_missing_field_fails_closed() {
     let temp_dir = TempDir::new().expect("tempdir must be created");
-    let bundle = PcacEvidenceBundle::all_pass();
+    let bundle = PcacEvidenceBundle::with_uniform_summary(
+        SummarySource::Observed,
+        &PcacPredicateSummary::all_pass(),
+    );
     export_pcac_evidence_bundle(temp_dir.path(), &bundle).expect("initial export must succeed");
 
     let objective_path = temp_dir
@@ -110,6 +122,7 @@ fn tck_00430_missing_field_fails_closed() {
 #[test]
 fn tck_00430_partial_summary_fields_are_non_admissible() {
     let partial_gate_summary = serde_json::json!({
+        "summary_source": "observed",
         "duplicate_consume_accept_count": 0u64,
         "unknown_state_count": 0u64
     });
@@ -125,6 +138,7 @@ fn tck_00430_partial_summary_fields_are_non_admissible() {
     );
 
     let partial_objective_summary = serde_json::json!({
+        "summary_source": "observed",
         "missing_lifecycle_stage_count": 0u64
     });
     let objective_eval =
@@ -143,6 +157,7 @@ fn tck_00430_partial_summary_fields_are_non_admissible() {
 fn tck_00430_unknown_state_field_enforces_fail_closed() {
     let mut summary_value =
         serde_json::to_value(PcacPredicateSummary::all_pass()).expect("summary must serialize");
+    summary_value["summary_source"] = serde_json::json!("observed");
     summary_value["unknown_state_count"] = serde_json::json!(1u64);
 
     let objective_eval =
@@ -156,5 +171,25 @@ fn tck_00430_unknown_state_field_enforces_fail_closed() {
     assert!(
         !gate_eval.passed,
         "unknown_state_count > 0 must deny gate predicate"
+    );
+}
+
+#[test]
+fn tck_00430_synthetic_source_is_non_admissible() {
+    let temp_dir = TempDir::new().expect("tempdir must be created");
+    let bundle = PcacEvidenceBundle::all_pass();
+    export_pcac_evidence_bundle(temp_dir.path(), &bundle).expect("export must succeed");
+
+    let report = evaluate_exported_predicates(temp_dir.path());
+    assert!(
+        !report.all_passed(),
+        "synthetic summary source must fail machine predicates"
+    );
+    let reason = report
+        .first_failure_reason()
+        .expect("synthetic source failure reason must be present");
+    assert!(
+        reason.contains("summary_source"),
+        "failure reason must mention summary_source gating"
     );
 }

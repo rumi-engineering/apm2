@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::{AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1};
+
 const FLOAT_EQ_TOLERANCE: f64 = 1e-9;
 
 /// Environment variable used to enable runtime summary export.
@@ -130,6 +132,149 @@ impl PcacGateId {
     }
 }
 
+/// Source classification for RFC-0027 summary evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummarySource {
+    /// Derived from authoritative runtime lifecycle outcomes.
+    Observed,
+    /// Generated placeholder/test data (non-admissible).
+    Synthetic,
+}
+
+/// Runtime lifecycle state used to derive RFC-0027 objective and gate summary
+/// fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PcacLifecycleEvidenceState {
+    /// Classification for the produced summaries.
+    pub summary_source: SummarySource,
+    /// Missing lifecycle stage count (`join`/`revalidate`/`consume`).
+    pub missing_lifecycle_stage_count: u64,
+    /// Ordered receipt chain continuity status.
+    pub ordered_receipt_chain_pass: bool,
+    /// Duplicate consume acceptance count, when measured.
+    pub duplicate_consume_accept_count: Option<u64>,
+    /// Durable consume record coverage ratio, when measured.
+    pub durable_consume_record_coverage: Option<f64>,
+    /// Tier2+ stale allow count, when measured.
+    pub tier2plus_stale_allow_count: Option<u64>,
+    /// Freshness unknown-state count, when measured.
+    pub freshness_unknown_state_count: Option<u64>,
+    /// Delegation narrowing violation count, when measured.
+    pub delegation_narrowing_violations: Option<u64>,
+    /// Intent mismatch allow count, when measured.
+    pub intent_mismatch_allow_count: Option<u64>,
+    /// Replay-contract coverage ratio, when measured.
+    pub authoritative_outcomes_with_full_replay_contract: Option<f64>,
+    /// Missing replay selector count, when measured.
+    pub missing_selector_count: Option<u64>,
+    /// Baseline unknown-state count contributed by caller context.
+    pub unknown_state_count: u64,
+}
+
+impl PcacLifecycleEvidenceState {
+    /// Builds observed runtime state from a successful lifecycle consume
+    /// transition.
+    #[must_use]
+    pub fn from_successful_consume(
+        cert: &AuthorityJoinCertificateV1,
+        consumed_witness: &AuthorityConsumedV1,
+        consume_record: &AuthorityConsumeRecordV1,
+    ) -> Self {
+        let receipt_identity_matches =
+            cert.ajc_id == consumed_witness.ajc_id && cert.ajc_id == consume_record.ajc_id;
+        let issued_before_consume = cert.issued_at_tick <= consumed_witness.consumed_at_tick;
+        let witness_record_tick_match =
+            consumed_witness.consumed_at_tick == consume_record.consumed_at_tick;
+        let receipt_tick_monotonic = issued_before_consume && witness_record_tick_match;
+        let receipt_time_binding_matches = consumed_witness.consumed_time_envelope_ref
+            == consume_record.consumed_time_envelope_ref;
+        let ordered_receipt_chain_pass =
+            receipt_identity_matches && receipt_tick_monotonic && receipt_time_binding_matches;
+
+        Self {
+            summary_source: SummarySource::Observed,
+            missing_lifecycle_stage_count: 0,
+            ordered_receipt_chain_pass,
+            duplicate_consume_accept_count: Some(0),
+            durable_consume_record_coverage: Some(1.0),
+            // These lifecycle aggregates are not yet wired to authoritative
+            // runtime counters. Emit unknown-state to fail closed.
+            tier2plus_stale_allow_count: None,
+            freshness_unknown_state_count: None,
+            delegation_narrowing_violations: None,
+            intent_mismatch_allow_count: Some(0),
+            authoritative_outcomes_with_full_replay_contract: None,
+            missing_selector_count: None,
+            unknown_state_count: 0,
+        }
+    }
+
+    #[must_use]
+    fn to_summary(&self) -> PcacPredicateSummary {
+        let mut unknown_state_count = self.unknown_state_count;
+
+        let duplicate_consume_accept_count = require_metric_u64(
+            self.duplicate_consume_accept_count,
+            &mut unknown_state_count,
+        );
+        let durable_consume_record_coverage = require_metric_f64(
+            self.durable_consume_record_coverage,
+            &mut unknown_state_count,
+        );
+        let tier2plus_stale_allow_count =
+            require_metric_u64(self.tier2plus_stale_allow_count, &mut unknown_state_count);
+        let freshness_unknown_state_count =
+            require_metric_u64(self.freshness_unknown_state_count, &mut unknown_state_count);
+        let delegation_narrowing_violations = require_metric_u64(
+            self.delegation_narrowing_violations,
+            &mut unknown_state_count,
+        );
+        let intent_mismatch_allow_count =
+            require_metric_u64(self.intent_mismatch_allow_count, &mut unknown_state_count);
+        let authoritative_outcomes_with_full_replay_contract = require_metric_f64(
+            self.authoritative_outcomes_with_full_replay_contract,
+            &mut unknown_state_count,
+        );
+        let missing_selector_count =
+            require_metric_u64(self.missing_selector_count, &mut unknown_state_count);
+
+        PcacPredicateSummary {
+            missing_lifecycle_stage_count: self.missing_lifecycle_stage_count,
+            ordered_receipt_chain_pass: self.ordered_receipt_chain_pass,
+            duplicate_consume_accept_count,
+            durable_consume_record_coverage,
+            tier2plus_stale_allow_count,
+            freshness_unknown_state_count,
+            delegation_narrowing_violations,
+            intent_mismatch_allow_count,
+            authoritative_outcomes_with_full_replay_contract,
+            missing_selector_count,
+            unknown_state_count,
+        }
+    }
+
+    /// Converts runtime lifecycle state into an export bundle.
+    #[must_use]
+    pub fn to_bundle(&self) -> PcacEvidenceBundle {
+        PcacEvidenceBundle::with_uniform_summary(self.summary_source, &self.to_summary())
+    }
+}
+
+fn require_metric_u64(metric: Option<u64>, unknown_state_count: &mut u64) -> u64 {
+    metric.unwrap_or_else(|| {
+        *unknown_state_count = unknown_state_count.saturating_add(1);
+        0
+    })
+}
+
+fn require_metric_f64(metric: Option<f64>, unknown_state_count: &mut u64) -> f64 {
+    metric.unwrap_or_else(|| {
+        *unknown_state_count = unknown_state_count.saturating_add(1);
+        0.0
+    })
+}
+
 /// Stable summary fields used by RFC-0027 objective and gate machine
 /// predicates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,6 +328,8 @@ impl PcacPredicateSummary {
 /// Objective and gate summary bundle for RFC-0027 evidence export.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PcacEvidenceBundle {
+    /// Source classification for all summaries in this bundle.
+    pub summary_source: SummarySource,
     /// Per-objective summaries keyed by RFC objective ID.
     pub objective_summaries: BTreeMap<PcacObjectiveId, PcacPredicateSummary>,
     /// Per-gate summaries keyed by RFC gate ID.
@@ -193,7 +340,10 @@ impl PcacEvidenceBundle {
     /// Builds a bundle with a single summary value replicated across all
     /// objectives and gates.
     #[must_use]
-    pub fn with_uniform_summary(summary: &PcacPredicateSummary) -> Self {
+    pub fn with_uniform_summary(
+        summary_source: SummarySource,
+        summary: &PcacPredicateSummary,
+    ) -> Self {
         let objective_summaries = PcacObjectiveId::ALL
             .into_iter()
             .map(|objective_id| (objective_id, summary.clone()))
@@ -203,15 +353,19 @@ impl PcacEvidenceBundle {
             .map(|gate_id| (gate_id, summary.clone()))
             .collect();
         Self {
+            summary_source,
             objective_summaries,
             gate_summaries,
         }
     }
 
-    /// Builds a fully passing bundle for all objective and gate predicates.
+    /// Builds a synthetic all-pass bundle.
+    ///
+    /// This helper is intended for tests and scaffolding. Machine predicates
+    /// fail closed on synthetic summaries.
     #[must_use]
     pub fn all_pass() -> Self {
-        Self::with_uniform_summary(&PcacPredicateSummary::all_pass())
+        Self::with_uniform_summary(SummarySource::Synthetic, &PcacPredicateSummary::all_pass())
     }
 }
 
@@ -367,7 +521,7 @@ pub fn export_pcac_evidence_bundle(
                 id: objective_id.as_str(),
             })?;
         let summary_path = root.join(objective_id.summary_relative_path());
-        write_summary_file(&summary_path, summary)?;
+        write_summary_file(&summary_path, bundle.summary_source, summary)?;
     }
 
     for gate_id in PcacGateId::ALL {
@@ -378,7 +532,7 @@ pub fn export_pcac_evidence_bundle(
             }
         })?;
         let summary_path = root.join(gate_id.summary_relative_path());
-        write_summary_file(&summary_path, summary)?;
+        write_summary_file(&summary_path, bundle.summary_source, summary)?;
     }
 
     Ok(())
@@ -393,14 +547,14 @@ pub fn evaluate_objective_predicate_value(
     objective_id: PcacObjectiveId,
     summary: &Value,
 ) -> PredicateEvaluation {
-    let result = match objective_id {
+    let result = require_observed_summary_source(summary).and_then(|()| match objective_id {
         PcacObjectiveId::ObjPcac01 => evaluate_obj_pcac_01(summary),
         PcacObjectiveId::ObjPcac02 => evaluate_obj_pcac_02(summary),
         PcacObjectiveId::ObjPcac03 => evaluate_obj_pcac_03(summary),
         PcacObjectiveId::ObjPcac04 => evaluate_obj_pcac_04(summary),
         PcacObjectiveId::ObjPcac05 => evaluate_obj_pcac_05(summary),
         PcacObjectiveId::ObjPcac06 => evaluate_obj_pcac_06(summary),
-    };
+    });
 
     evaluate_predicate_result(
         result,
@@ -417,12 +571,12 @@ pub fn evaluate_objective_predicate_value(
 /// outcomes.
 #[must_use]
 pub fn evaluate_gate_predicate_value(gate_id: PcacGateId, summary: &Value) -> PredicateEvaluation {
-    let result = match gate_id {
+    let result = require_observed_summary_source(summary).and_then(|()| match gate_id {
         PcacGateId::GatePcacLifecycle => evaluate_gate_pcac_lifecycle(summary),
         PcacGateId::GatePcacSingleConsume => evaluate_gate_pcac_single_consume(summary),
         PcacGateId::GatePcacFreshness => evaluate_gate_pcac_freshness(summary),
         PcacGateId::GatePcacReplay => evaluate_gate_pcac_replay(summary),
-    };
+    });
 
     evaluate_predicate_result(
         result,
@@ -492,27 +646,37 @@ pub fn assert_exported_predicates(
 /// Runtime convenience hook.
 ///
 /// If [`PCAC_EVIDENCE_EXPORT_ROOT_ENV`] is set, this exports a fail-closed
-/// all-pass bundle and validates all objective/gate predicates against the
-/// exported artifacts.
+/// lifecycle-derived bundle and validates all objective/gate predicates against
+/// the exported artifacts.
 ///
 /// # Errors
 ///
 /// Returns [`PcacEvidenceExportError`] when export or predicate evaluation
 /// fails while runtime export is enabled.
-pub fn maybe_export_runtime_pass_bundle() -> Result<(), PcacEvidenceExportError> {
+pub fn maybe_export_runtime_pass_bundle(
+    lifecycle_state: &PcacLifecycleEvidenceState,
+) -> Result<(), PcacEvidenceExportError> {
     let Some(root) = std::env::var_os(PCAC_EVIDENCE_EXPORT_ROOT_ENV) else {
         return Ok(());
     };
 
     let root = PathBuf::from(root);
-    let bundle = PcacEvidenceBundle::all_pass();
+    let bundle = lifecycle_state.to_bundle();
     export_pcac_evidence_bundle(&root, &bundle)?;
     let _report = assert_exported_predicates(&root)?;
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ExportedPredicateSummary<'a> {
+    summary_source: SummarySource,
+    #[serde(flatten)]
+    summary: &'a PcacPredicateSummary,
+}
+
 fn write_summary_file(
     path: &Path,
+    summary_source: SummarySource,
     summary: &PcacPredicateSummary,
 ) -> Result<(), PcacEvidenceExportError> {
     let parent = path
@@ -530,7 +694,11 @@ fn write_summary_file(
         source,
     })?;
 
-    let mut encoded = serde_json::to_vec_pretty(summary).map_err(|source| {
+    let exported_summary = ExportedPredicateSummary {
+        summary_source,
+        summary,
+    };
+    let mut encoded = serde_json::to_vec_pretty(&exported_summary).map_err(|source| {
         PcacEvidenceExportError::Serialize {
             path: path.to_path_buf(),
             source,
@@ -667,6 +835,23 @@ fn evaluate_summary_file(
         },
     };
     eval(&parsed)
+}
+
+fn require_observed_summary_source(summary: &Value) -> Result<(), String> {
+    let source = require_field(summary, "summary_source")?;
+    let source = source
+        .as_str()
+        .ok_or_else(|| "field 'summary_source' must be a string".to_string())?;
+    match source {
+        "observed" => Ok(()),
+        "synthetic" => Err(
+            "summary_source is 'synthetic'; RFC-0027 machine predicates require observed evidence"
+                .to_string(),
+        ),
+        _ => Err(format!(
+            "field 'summary_source' must be one of ['observed','synthetic']; got '{source}'"
+        )),
+    }
 }
 
 fn require_field<'a>(summary: &'a Value, field: &str) -> Result<&'a Value, String> {

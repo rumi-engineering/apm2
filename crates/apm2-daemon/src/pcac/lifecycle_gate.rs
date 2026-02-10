@@ -2675,19 +2675,18 @@ impl LifecycleGate {
             resolved_policy,
         )?;
 
-        if let Err(error) = apm2_core::pcac::maybe_export_runtime_pass_bundle() {
-            return Err(Box::new(AuthorityDenyV1 {
-                deny_class: AuthorityDenyClass::UnknownState {
-                    description: format!(
-                        "pcac objective/gate evidence export failed (fail-closed): {error}"
-                    ),
-                },
-                ajc_id: Some(cert.ajc_id),
-                time_envelope_ref: current_time_envelope_ref,
-                ledger_anchor: current_ledger_anchor,
-                denied_at_tick: current_tick,
-                containment_action: None,
-            }));
+        let lifecycle_evidence =
+            apm2_core::pcac::PcacLifecycleEvidenceState::from_successful_consume(
+                cert,
+                &consume_result.0,
+                &consume_result.1,
+            );
+        if let Err(error) = apm2_core::pcac::maybe_export_runtime_pass_bundle(&lifecycle_evidence) {
+            warn!(
+                error = %error,
+                ajc_id = %hex::encode(cert.ajc_id),
+                "pcac objective/gate evidence export failed after consume; continuing to avoid authority burn"
+            );
         }
 
         Ok(consume_result)

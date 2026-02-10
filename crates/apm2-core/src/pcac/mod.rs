@@ -62,8 +62,9 @@ pub use auth_verifier::{
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use evidence_export::{
     PCAC_EVIDENCE_EXPORT_ROOT_ENV, PcacEvidenceBundle, PcacEvidenceExportError, PcacGateId,
-    PcacObjectiveId, PcacPredicateEvaluationReport, PcacPredicateSummary, PredicateEvaluation,
-    assert_exported_predicates, evaluate_exported_predicates, evaluate_gate_predicate_value,
+    PcacLifecycleEvidenceState, PcacObjectiveId, PcacPredicateEvaluationReport,
+    PcacPredicateSummary, PredicateEvaluation, SummarySource, assert_exported_predicates,
+    evaluate_exported_predicates, evaluate_gate_predicate_value,
     evaluate_objective_predicate_value, export_pcac_evidence_bundle,
     maybe_export_runtime_pass_bundle,
 };
