@@ -51,5 +51,6 @@ pub mod fac_review;
 pub mod factory;
 pub mod pack;
 pub mod process;
+pub mod role_launch;
 pub mod tool;
 pub mod work;
