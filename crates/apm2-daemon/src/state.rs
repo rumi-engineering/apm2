@@ -600,11 +600,9 @@ impl DispatcherState {
     #[must_use]
     #[allow(dead_code)] // Kept for testing and potential future use
     pub fn new(metrics_registry: Option<SharedMetricsRegistry>) -> Self {
-        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
-        // This secret is used for the entire daemon lifetime, ensuring tokens
-        // minted on one connection are valid on other connections.
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
 
         // TCK-00287 MAJOR 3: Use shared manifest store.
         // Manifests registered during SpawnEpisode will be visible to SessionDispatcher
@@ -665,6 +663,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
                 .with_telemetry_store(telemetry_store);
@@ -698,9 +697,9 @@ impl DispatcherState {
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
     ) -> Self {
-        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
 
         // TCK-00287 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -753,6 +752,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
                 .with_telemetry_store(telemetry_store);
@@ -824,6 +824,7 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
         let sqlite_conn_for_pcac = sqlite_conn.clone();
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
         let mut sovereignty_trusted_signer_key = ledger_signing_key
             .as_ref()
             .map(|key| key.verifying_key().to_bytes());
@@ -1037,6 +1038,7 @@ impl DispatcherState {
         // enforcement and lifecycle gate wiring.
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_telemetry_store(telemetry_store)
@@ -1231,6 +1233,7 @@ impl DispatcherState {
             use rand::rngs::OsRng;
             ed25519_dalek::SigningKey::generate(&mut OsRng)
         });
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
         let sovereignty_trusted_signer_key = signing_key.verifying_key().to_bytes();
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
@@ -1457,6 +1460,7 @@ impl DispatcherState {
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_ledger(event_emitter)
