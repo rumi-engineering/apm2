@@ -30,6 +30,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use apm2_core::channel::{
+    ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
+    derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
+};
 use apm2_core::credentials::{
     AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
 };
@@ -44,6 +48,9 @@ use apm2_core::fac::{
     seed_builtin_role_contracts_v2_in_cas, validate_receipt_attestation,
 };
 use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
+use apm2_core::liveness::{
+    HealthVerdict, LivenessHeartbeatReceiptV1, MAX_RESTARTS_LIMIT, MAX_RUN_ID_LENGTH,
+};
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, DeterminismClass as PcacDeterminismClass,
     IdentityEvidenceLevel, RiskTier as PcacRiskTier,
@@ -146,7 +153,7 @@ use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
     RuntimePreconditionEvaluator, SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass,
-    ToolBroker, ToolBrokerConfig, validate_custody_domain_overlap,
+    ToolBroker, ToolBrokerConfig, ToolClass, validate_custody_domain_overlap,
 };
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
@@ -4528,6 +4535,37 @@ pub fn generate_lease_id() -> String {
     format!("L-{uuid}")
 }
 
+/// Build a deterministic liveness heartbeat receipt for daemon progression
+/// checks.
+#[must_use]
+pub fn build_liveness_heartbeat(
+    episode_id: &[u8; 32],
+    run_id: &str,
+    current_tick: u64,
+    health: HealthVerdict,
+) -> LivenessHeartbeatReceiptV1 {
+    let mut run_id = run_id.to_string();
+    if run_id.len() > MAX_RUN_ID_LENGTH {
+        let mut truncation_index = MAX_RUN_ID_LENGTH;
+        while !run_id.is_char_boundary(truncation_index) {
+            truncation_index = truncation_index.saturating_sub(1);
+        }
+        run_id.truncate(truncation_index);
+    }
+
+    LivenessHeartbeatReceiptV1 {
+        run_id,
+        episode_id: *episode_id,
+        emitted_at_tick: current_tick,
+        time_envelope_ref: *episode_id,
+        health_verdict: health,
+        restart_count: 0,
+        max_restarts: MAX_RESTARTS_LIMIT,
+        uptime_ms: 0,
+        detail: None,
+    }
+}
+
 fn decode_hash32_hex(field: &str, value: &str) -> Result<[u8; 32], String> {
     let decoded = hex::decode(value).map_err(|e| format!("{field} is not valid hex: {e}"))?;
     decoded
@@ -6377,6 +6415,96 @@ pub struct PrivilegedPcacLifecycleArtifacts {
 }
 
 impl PrivilegedDispatcher {
+    /// Builds a channel-boundary check from daemon-classified tool context.
+    ///
+    /// Tool requests accepted by the daemon session plane are treated as
+    /// typed tool-intent authority inputs. Unknown future tool classes
+    /// fail-closed to `Unknown`.
+    #[must_use]
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn build_channel_boundary_check(
+        &self,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+    ) -> ChannelBoundaryCheck {
+        let source = match tool_class {
+            ToolClass::Read
+            | ToolClass::Write
+            | ToolClass::Execute
+            | ToolClass::Network
+            | ToolClass::Git
+            | ToolClass::Inference
+            | ToolClass::Artifact
+            | ToolClass::ListFiles
+            | ToolClass::Search => ChannelSource::TypedToolIntent,
+            _ => ChannelSource::Unknown,
+        };
+
+        let channel_source_witness = if source == ChannelSource::TypedToolIntent {
+            Some(derive_channel_source_witness(source))
+        } else {
+            None
+        };
+        let effective_source =
+            if source == ChannelSource::TypedToolIntent && channel_source_witness.is_none() {
+                ChannelSource::Unknown
+            } else {
+                source
+            };
+
+        ChannelBoundaryCheck {
+            source: effective_source,
+            channel_source_witness,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+            policy_ledger_verified: policy_verified,
+        }
+    }
+
+    /// Validates channel boundaries and issues a daemon-signed context token.
+    ///
+    /// # Errors
+    ///
+    /// Returns boundary defects when validation fails or token issuance fails.
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+    pub fn validate_channel_boundary_and_issue_context_token(
+        &self,
+        signer: &apm2_core::crypto::Signer,
+        lease_id: &str,
+        request_id: &str,
+        issued_at_secs: u64,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+    ) -> Result<String, Vec<ChannelBoundaryDefect>> {
+        let check = self.build_channel_boundary_check(
+            tool_class,
+            policy_verified,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+        );
+        let defects = validate_channel_boundary(&check);
+        if !defects.is_empty() {
+            return Err(defects);
+        }
+
+        issue_channel_context_token(&check, lease_id, request_id, issued_at_secs, signer).map_err(
+            |error| {
+                vec![ChannelBoundaryDefect::new(
+                    ChannelViolationClass::MissingChannelMetadata,
+                    format!("failed to issue channel context token: {error}"),
+                )]
+            },
+        )
+    }
+
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
     ///
     /// # Warning: RSK-2503 Mixed Clock Domain Hazard
@@ -7359,14 +7487,67 @@ impl PrivilegedDispatcher {
         join_revocation_head: [u8; 32],
         effect_intent_digest: [u8; 32],
     ) -> Result<Option<PrivilegedPcacLifecycleArtifacts>, PrivilegedResponse> {
+        let work_id = self
+            .lease_validator
+            .get_lease_work_id(lease_id)
+            .ok_or_else(|| {
+                PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "PCAC authority denied for {operation}: policy state missing for lease '{lease_id}'"
+                    ),
+                )
+            })?;
+        let claim = self.work_registry.get_claim(&work_id).ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "PCAC authority denied for {operation}: work claim missing for policy lookup \
+                     (lease='{lease_id}', work_id='{work_id}')"
+                ),
+            )
+        })?;
+
+        let mut pcac_policy = claim.policy_resolution.pcac_policy.clone().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "PCAC authority denied for {operation}: unknown policy state \
+                             (pcac_policy missing for work_id='{work_id}')"
+                ),
+            )
+        })?;
+        if pcac_policy.pointer_only_waiver.is_none() {
+            pcac_policy
+                .pointer_only_waiver
+                .clone_from(&claim.policy_resolution.pointer_only_waiver);
+        }
+        if !pcac_policy.lifecycle_enforcement {
+            return Ok(None);
+        }
+
+        let mut effective_join_input = join_input.clone();
+        if matches!(
+            effective_join_input.identity_evidence_level,
+            IdentityEvidenceLevel::PointerOnly
+        ) && matches!(effective_join_input.risk_tier, PcacRiskTier::Tier2Plus)
+            && effective_join_input.pointer_only_waiver_hash.is_none()
+        {
+            effective_join_input.pointer_only_waiver_hash = pcac_policy
+                .pointer_only_waiver
+                .as_ref()
+                .map(apm2_core::pcac::PointerOnlyWaiver::content_hash);
+        }
+
         gate.advance_tick(join_freshness_tick);
 
         let certificate = gate
             .join_and_revalidate(
-                join_input,
+                &effective_join_input,
                 join_time_envelope_ref,
                 join_ledger_anchor,
                 join_revocation_head,
+                &pcac_policy,
             )
             .map_err(|deny| {
                 warn!(
@@ -7397,6 +7578,7 @@ impl PrivilegedDispatcher {
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head,
+            &pcac_policy,
         )
         .map_err(|deny| {
             warn!(
@@ -7431,10 +7613,11 @@ impl PrivilegedDispatcher {
             .consume_before_effect(
                 &certificate,
                 effect_intent_digest,
-                join_input.boundary_intent_class,
+                effective_join_input.boundary_intent_class,
                 true,
                 current_time_envelope_ref,
                 current_revocation_head,
+                &pcac_policy,
             )
             .map_err(|deny| {
                 warn!(
@@ -15690,6 +15873,134 @@ mod tests {
     /// Uses /tmp which exists on all Unix systems.
     fn test_workspace_root() -> String {
         "/tmp".to_string()
+    }
+
+    mod channel_boundary_integration {
+        use apm2_core::channel::{
+            ChannelSource, ChannelViolationClass, decode_channel_context_token,
+            validate_channel_boundary,
+        };
+
+        use super::*;
+
+        #[test]
+        fn test_daemon_classifies_tool_request_as_typed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, true, true, true);
+
+            assert_eq!(check.source, ChannelSource::TypedToolIntent);
+            assert!(
+                check.channel_source_witness.is_some(),
+                "typed tool request must carry channel source witness"
+            );
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects.is_empty(),
+                "fully verified daemon-built check should pass boundary validation"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_policy() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, false, true, true, true);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects.iter().any(|defect| defect.violation_class
+                    == ChannelViolationClass::PolicyNotLedgerVerified),
+                "unverified policy must emit PolicyNotLedgerVerified defect"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_broker() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, false, true, true);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects
+                    .iter()
+                    .any(|defect| defect.violation_class
+                        == ChannelViolationClass::BrokerBypassDetected),
+                "unverified broker must emit BrokerBypassDetected defect"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_capability() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, true, false, true);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects
+                    .iter()
+                    .any(|defect| defect.violation_class
+                        == ChannelViolationClass::CapabilityNotVerified),
+                "unverified capability must emit CapabilityNotVerified defect"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_context_firewall() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, true, true, false);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects.iter().any(|defect| defect.violation_class
+                    == ChannelViolationClass::ContextFirewallNotVerified),
+                "unverified context firewall must emit ContextFirewallNotVerified defect"
+            );
+        }
+
+        #[test]
+        fn test_channel_context_token_roundtrip() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let signer = apm2_core::crypto::Signer::generate();
+            let issued_at_secs = std::time::UNIX_EPOCH
+                .elapsed()
+                .expect("current time should be after unix epoch")
+                .as_secs();
+            let token = dispatcher
+                .validate_channel_boundary_and_issue_context_token(
+                    &signer,
+                    "lease-1",
+                    "REQ-1",
+                    issued_at_secs,
+                    &ToolClass::Execute,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .expect("validated boundary should issue token");
+
+            let decoded = decode_channel_context_token(
+                &token,
+                &signer.verifying_key(),
+                "lease-1",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock should be after unix epoch")
+                    .as_secs(),
+                "REQ-1",
+            )
+            .expect("token should decode");
+            assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
+            assert!(decoded.broker_verified);
+            assert!(decoded.capability_verified);
+            assert!(decoded.context_firewall_verified);
+            assert!(decoded.policy_ledger_verified);
+        }
     }
 
     mod governance_probe_failure_classification {
@@ -27279,6 +27590,7 @@ mod tests {
                 resolved_risk_tier,
             );
             policy_resolution.resolved_policy_hash = policy_hash;
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 work_id,
@@ -28092,7 +28404,8 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert!(
                         err.message
-                            .contains("pointer-only identity denied at Tier2+"),
+                            .contains("pointer-only identity denied at Tier2+")
+                            || err.message.contains("waiver expired or invalid"),
                         "Tier2 DelegateSublease must deny pointer-only identity evidence, got: {}",
                         err.message
                     );
@@ -28135,12 +28448,13 @@ mod tests {
                 fn join(
                     &self,
                     input: &AuthorityJoinInputV1,
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
                 ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
                     self.observed_levels
                         .lock()
                         .expect("lock poisoned")
                         .push(input.identity_evidence_level);
-                    self.inner.join(input)
+                    AuthorityJoinKernel::join(&self.inner, input, policy)
                 }
 
                 fn revalidate(
@@ -28149,12 +28463,15 @@ mod tests {
                     current_time_envelope_ref: [u8; 32],
                     current_ledger_anchor: [u8; 32],
                     current_revocation_head_hash: [u8; 32],
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
                 ) -> Result<(), Box<AuthorityDenyV1>> {
-                    self.inner.revalidate(
+                    AuthorityJoinKernel::revalidate(
+                        &self.inner,
                         cert,
                         current_time_envelope_ref,
                         current_ledger_anchor,
                         current_revocation_head_hash,
+                        policy,
                     )
                 }
 
@@ -28166,15 +28483,18 @@ mod tests {
                     requires_authoritative_acceptance: bool,
                     current_time_envelope_ref: [u8; 32],
                     current_revocation_head_hash: [u8; 32],
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
                 ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
                 {
-                    self.inner.consume(
+                    AuthorityJoinKernel::consume(
+                        &self.inner,
                         cert,
                         intent_digest,
                         boundary_intent_class,
                         requires_authoritative_acceptance,
                         current_time_envelope_ref,
                         current_revocation_head_hash,
+                        policy,
                     )
                 }
             }
@@ -28212,6 +28532,7 @@ mod tests {
                 0,
             );
             policy_resolution.resolved_policy_hash = [0xC2; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-PCAC-RR-PO-OBSERVE",

@@ -94,7 +94,7 @@ pub use anti_entropy::{
     MAX_DIVERGENT_RANGES, MAX_PENDING_REQUESTS_PER_PEER, MAX_REQUESTS_PER_INTERVAL,
     MAX_SYNC_BATCH_SIZE, RATE_LIMIT_INTERVAL, RangeDigestResult, RangeQuery, SyncEvent,
     SyncRateLimiter, SyncSession, event_record_to_sync_event, verify_events_with_proof,
-    verify_sync_events,
+    verify_sync_catchup, verify_sync_events,
 };
 // BatchEpochRootV1 hierarchical batch forests (TCK-00371)
 pub use batch_epoch::{

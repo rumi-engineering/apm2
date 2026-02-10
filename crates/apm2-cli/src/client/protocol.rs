@@ -179,6 +179,13 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Reserved for future use when client-side frame size validation is needed.
 #[allow(dead_code)]
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const DAEMON_SIGNING_PUBLIC_KEY_LEN: usize = 32;
+
+#[derive(Debug, Clone)]
+struct HandshakeInfo {
+    server_info: String,
+    daemon_signing_public_key: Option<[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]>,
+}
 
 // ============================================================================
 // Error Types
@@ -294,6 +301,8 @@ pub struct OperatorClient {
     /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
+    #[allow(dead_code)]
+    daemon_signing_public_key: Option<[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]>,
     timeout: Duration,
 }
 
@@ -333,11 +342,12 @@ impl OperatorClient {
         let mut framed = Framed::new(stream, FrameCodec::new());
 
         // Perform handshake
-        let server_info = Self::perform_handshake(&mut framed, timeout).await?;
+        let handshake = Self::perform_handshake(&mut framed, timeout).await?;
 
         Ok(Self {
             framed,
-            server_info,
+            server_info: handshake.server_info,
+            daemon_signing_public_key: handshake.daemon_signing_public_key,
             timeout,
         })
     }
@@ -362,7 +372,7 @@ impl OperatorClient {
     async fn perform_handshake(
         framed: &mut Framed<UnixStream, FrameCodec>,
         timeout: Duration,
-    ) -> Result<String, ProtocolClientError> {
+    ) -> Result<HandshakeInfo, ProtocolClientError> {
         let mut client_handshake = ClientHandshake::new(CLIENT_INFO);
 
         // TCK-00348 BLOCKER-3: Populate Hello with client contract hash
@@ -394,10 +404,40 @@ impl OperatorClient {
             .process_response(response)
             .map_err(|e| ProtocolClientError::HandshakeFailed(e.to_string()))?;
 
-        Ok(client_handshake
-            .server_info()
-            .unwrap_or("unknown")
-            .to_string())
+        let daemon_signing_public_key = match client_handshake.daemon_signing_public_key() {
+            Some(key_hex) => {
+                let key_bytes = hex::decode(key_hex).map_err(|e| {
+                    ProtocolClientError::HandshakeFailed(format!(
+                        "invalid daemon_signing_public_key hex in handshake: {e}"
+                    ))
+                })?;
+                let key: [u8; DAEMON_SIGNING_PUBLIC_KEY_LEN] =
+                    key_bytes.as_slice().try_into().map_err(|_| {
+                        ProtocolClientError::HandshakeFailed(format!(
+                            "invalid daemon_signing_public_key length: expected {}, got {}",
+                            DAEMON_SIGNING_PUBLIC_KEY_LEN,
+                            key_bytes.len()
+                        ))
+                    })?;
+                Some(key)
+            },
+            None => None,
+        };
+
+        Ok(HandshakeInfo {
+            server_info: client_handshake
+                .server_info()
+                .unwrap_or("unknown")
+                .to_string(),
+            daemon_signing_public_key,
+        })
+    }
+
+    /// Returns the daemon signing public key from handshake metadata.
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn daemon_signing_public_key(&self) -> Option<&[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]> {
+        self.daemon_signing_public_key.as_ref()
     }
 
     /// Sends a shutdown request to the daemon.
@@ -2191,6 +2231,7 @@ pub struct SessionClient {
     /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
+    daemon_signing_public_key: Option<[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]>,
     timeout: Duration,
 }
 
@@ -2230,13 +2271,20 @@ impl SessionClient {
         let mut framed = Framed::new(stream, FrameCodec::new());
 
         // Perform handshake (same as operator)
-        let server_info = OperatorClient::perform_handshake(&mut framed, timeout).await?;
+        let handshake = OperatorClient::perform_handshake(&mut framed, timeout).await?;
 
         Ok(Self {
             framed,
-            server_info,
+            server_info: handshake.server_info,
+            daemon_signing_public_key: handshake.daemon_signing_public_key,
             timeout,
         })
+    }
+
+    /// Returns the daemon signing public key from handshake metadata.
+    #[must_use]
+    pub const fn daemon_signing_public_key(&self) -> Option<&[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]> {
+        self.daemon_signing_public_key.as_ref()
     }
 
     /// Requests tool execution within session capability bounds.

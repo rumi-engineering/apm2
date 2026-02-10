@@ -14,7 +14,7 @@ pub const MAX_INTENT_CLASS_DETAIL_LENGTH: usize = 512;
 /// External interaction channels MUST classify boundary intents as one of these
 /// classes. Lower-assurance classes (Observe) cannot be consumed as
 /// authoritative acceptance facts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

@@ -206,6 +206,9 @@ pub struct HandshakeConfig {
 
     /// Optional metrics handle for emitting `contract_mismatch_total`.
     pub metrics: Option<DaemonMetrics>,
+
+    /// Daemon Ed25519 verifying key (hex-encoded) for signed authority tokens.
+    pub daemon_signing_public_key: String,
 }
 
 impl Default for HandshakeConfig {
@@ -230,6 +233,7 @@ impl Default for HandshakeConfig {
             }],
             risk_tier: RiskTier::Tier2,
             metrics: None,
+            daemon_signing_public_key: String::new(),
         }
     }
 }
@@ -296,6 +300,13 @@ impl HandshakeConfig {
     #[must_use]
     pub fn with_metrics(mut self, metrics: DaemonMetrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Sets the daemon signing public key (hex-encoded).
+    #[must_use]
+    pub fn with_daemon_signing_public_key(mut self, key_hex: impl Into<String>) -> Self {
+        self.daemon_signing_public_key = key_hex.into();
         self
     }
 }
@@ -384,6 +395,7 @@ pub async fn perform_handshake(
     let mut handshake = ServerHandshake::new(server_info())
         .with_server_contract_hash(&config.server_contract_hash)
         .with_server_canonicalizers(config.server_canonicalizers.clone())
+        .with_daemon_signing_public_key(&config.daemon_signing_public_key)
         .with_risk_tier(config.risk_tier);
 
     // Receive Hello from client
@@ -629,6 +641,7 @@ mod tests {
                 version: DAEMON_CANONICALIZER_VERSION,
             }],
             risk_tier: RiskTier::Tier2,
+            daemon_signing_public_key: String::new(),
             metrics: None,
         };
 
@@ -785,6 +798,7 @@ mod tests {
                 version: DAEMON_CANONICALIZER_VERSION,
             }],
             risk_tier: RiskTier::Tier1,
+            daemon_signing_public_key: String::new(),
             metrics: None,
         };
 
@@ -857,6 +871,7 @@ mod tests {
             server_contract_hash: "blake3:server_hash".to_string(),
             server_canonicalizers: vec![],
             risk_tier: RiskTier::Tier0,
+            daemon_signing_public_key: String::new(),
             metrics: Some(metrics.clone()),
         };
 

@@ -736,6 +736,9 @@ message RequestToolResponse {
   // Inline result for small outputs (bounded by MAX_INLINE_RESULT_SIZE = 64KB).
   // TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
   optional bytes inline_result = 6;
+  // Daemon-issued signed channel context token for FAC role-launch authorization.
+  // Present when authoritative channel-boundary checks pass for launch-relevant tools.
+  optional string channel_context_token = 11;
   // TCK-00351: Pre-actuation stop check proof.
   // True indicates stop conditions were evaluated and cleared before actuation.
   // False or absent indicates stop check was not performed (fail-closed: deny).

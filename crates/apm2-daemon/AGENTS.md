@@ -12,6 +12,9 @@ The `apm2-daemon` crate implements the persistent daemon process in APM2's four-
 - Process lifecycle management via the supervisor
 - Signal handling (SIGTERM, SIGINT) for graceful shutdown
 - Double-fork daemonization for background operation
+- PCAC verifier-economics enforcement wired through `InProcessKernel` lifecycle stages (`join`, `revalidate`, `consume`, anti-entropy verification) via `apm2_core::pcac::verifier_economics`
+
+**Performance/Security Constraint:** verifier-economics bounds are containment controls. Tier2+ lifecycle operations fail closed on timing/proof-check budget exceedance; Tier0/1 stays monitor-only.
 
 ```
 ┌─────────────────┐

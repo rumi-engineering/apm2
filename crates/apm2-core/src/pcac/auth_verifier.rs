@@ -17,12 +17,14 @@
 //! All checks fail closed: unknown, incomplete, or mismatched proof state is
 //! denied.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use subtle::{Choice, ConstantTimeEq};
 
 use super::deny::{AuthorityDenyClass, AuthorityDenyV1};
 use super::receipts::{AuthoritativeBindings, LifecycleStage, ReceiptAuthentication};
-use crate::consensus::merkle;
+use crate::consensus::{anti_entropy, merkle};
 use crate::crypto::Hash;
 
 /// Zero hash constant for fail-closed comparisons.
@@ -77,6 +79,26 @@ pub struct ReplayLifecycleEntry {
     /// Pre-actuation selector hash, required when
     /// `requires_pre_actuation == true`.
     pub pre_actuation_selector_hash: Option<Hash>,
+}
+
+/// Result of a timed verification operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedVerificationResult<T> {
+    /// Original result returned by the verification operation.
+    pub result: T,
+    /// Elapsed wall-clock time in microseconds.
+    pub elapsed_us: u64,
+    /// Count of cryptographic proof checks performed by the operation.
+    ///
+    /// This count is reserved for cryptographic verification work
+    /// (for example, digest comparisons or Merkle-proof verification calls).
+    /// It intentionally excludes generic payload volume.
+    pub proof_check_count: u64,
+    /// Count of non-crypto items processed by the operation.
+    ///
+    /// For anti-entropy verification this is the number of events processed.
+    /// Other verifier operations set this to `0`.
+    pub event_count: u64,
 }
 
 /// Verify an authentication shape is admissible for authoritative acceptance.
@@ -320,6 +342,192 @@ pub fn validate_replay_lifecycle_order(
     let classified = classify_lifecycle_entries(entries, known_pre_actuation_hashes, &ctx)?;
     require_all_stages_present(&classified, &ctx)?;
     check_stage_ordering(&classified, effect_receipt_tick, &ctx)
+}
+
+/// Times [`verify_receipt_authentication`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_verify_receipt_authentication(
+    auth: &ReceiptAuthentication,
+    expected_seal_hash: &Hash,
+    expected_seal_subject_hash: Option<&Hash>,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+) -> TimedVerificationResult<Result<(), Box<AuthorityDenyV1>>> {
+    let start = Instant::now();
+    let result = verify_receipt_authentication(
+        auth,
+        expected_seal_hash,
+        expected_seal_subject_hash,
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+        proof_check_count: proof_checks_for_receipt_auth(auth),
+        event_count: 0,
+    }
+}
+
+/// Times [`validate_authoritative_bindings`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_validate_authoritative_bindings(
+    bindings: &AuthoritativeBindings,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+    expected_view_commitment: Option<&Hash>,
+    expected_ledger_anchor: Option<&Hash>,
+) -> TimedVerificationResult<Result<(), Box<AuthorityDenyV1>>> {
+    let start = Instant::now();
+    let result = validate_authoritative_bindings(
+        bindings,
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+        expected_view_commitment,
+        expected_ledger_anchor,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+        proof_check_count: proof_checks_for_validate_bindings(
+            expected_view_commitment.is_some(),
+            expected_ledger_anchor.is_some(),
+        ),
+        event_count: 0,
+    }
+}
+
+/// Times [`classify_fact`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_classify_fact(
+    bindings: Option<&AuthoritativeBindings>,
+    expected_seal_hash: &Hash,
+    expected_seal_subject_hash: Option<&Hash>,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    current_tick: u64,
+    expectations: BindingExpectations<'_>,
+) -> TimedVerificationResult<FactClass> {
+    let start = Instant::now();
+    let binding_checks = bindings.map_or(0, |_| {
+        proof_checks_for_validate_bindings(
+            expectations.expected_view_commitment.is_some(),
+            expectations.expected_ledger_anchor.is_some(),
+        )
+    });
+    let receipt_checks = bindings.map_or(0, |binding| {
+        proof_checks_for_receipt_auth(&binding.authentication)
+    });
+    let result = classify_fact(
+        bindings,
+        expected_seal_hash,
+        expected_seal_subject_hash,
+        time_envelope_ref,
+        ledger_anchor,
+        current_tick,
+        expectations,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+        proof_check_count: binding_checks.saturating_add(receipt_checks),
+        event_count: 0,
+    }
+}
+
+/// Times [`validate_replay_lifecycle_order`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_validate_replay_lifecycle_order(
+    entries: &[ReplayLifecycleEntry],
+    effect_receipt_tick: Option<u64>,
+    known_pre_actuation_hashes: &[Hash],
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+) -> TimedVerificationResult<Result<(), Box<AuthorityDenyV1>>> {
+    let start = Instant::now();
+    let result = validate_replay_lifecycle_order(
+        entries,
+        effect_receipt_tick,
+        known_pre_actuation_hashes,
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+        proof_check_count: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+        event_count: 0,
+    }
+}
+
+/// Times anti-entropy digest + transfer verification and returns elapsed
+/// microseconds.
+#[must_use]
+pub fn timed_anti_entropy_verification(
+    local_digest: Option<&Hash>,
+    remote_digest: Option<&Hash>,
+    events: &[anti_entropy::SyncEvent],
+    expected_prev_hash: &Hash,
+    expected_start_seq_id: Option<u64>,
+    proof: Option<&merkle::MerkleProof>,
+    proof_root: Option<&Hash>,
+) -> TimedVerificationResult<Result<(), anti_entropy::AntiEntropyError>> {
+    let start = Instant::now();
+    let result = anti_entropy::verify_sync_catchup(
+        local_digest,
+        remote_digest,
+        events,
+        expected_prev_hash,
+        expected_start_seq_id,
+        proof,
+        proof_root,
+    );
+    let digest_comparison_checks = u64::from(local_digest.is_some() && remote_digest.is_some());
+    let merkle_proof_checks = u64::from(proof.is_some());
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+        proof_check_count: digest_comparison_checks.saturating_add(merkle_proof_checks),
+        event_count: u64::try_from(events.len()).unwrap_or(u64::MAX),
+    }
+}
+
+#[inline]
+fn elapsed_us_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Counts the constant-time hash comparisons performed by
+/// [`validate_authoritative_bindings`].
+///
+/// 1 mandatory (`time_envelope_ref`) + conditionals for view commitment
+/// and ledger anchor.
+#[inline]
+const fn proof_checks_for_validate_bindings(
+    expected_view_commitment: bool,
+    expected_ledger_anchor: bool,
+) -> u64 {
+    1 + expected_view_commitment as u64 + expected_ledger_anchor as u64
+}
+
+#[inline]
+fn proof_checks_for_receipt_auth(auth: &ReceiptAuthentication) -> u64 {
+    match auth {
+        ReceiptAuthentication::PointerBatched {
+            merkle_inclusion_proof,
+            ..
+        } => {
+            let proof_depth = u64::try_from(merkle_inclusion_proof.len()).unwrap_or(u64::MAX);
+            2_u64.saturating_add(proof_depth)
+        },
+        ReceiptAuthentication::Direct { .. } | ReceiptAuthentication::PointerUnbatched { .. } => 0,
+    }
 }
 
 struct DenyContext {
