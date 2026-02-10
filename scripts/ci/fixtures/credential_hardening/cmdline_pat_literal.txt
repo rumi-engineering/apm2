@@ -1,0 +1,1 @@
+bash scripts/ci/fac_projection_gate.sh github_pat_fixture_token_123456789012345678901234567890
