@@ -250,6 +250,12 @@ impl ImportAdmissionGate {
     where
         F: Fn(&Hash) -> Result<(), String>,
     {
+        // Fail-closed: enforce all envelope invariants before issuing any
+        // receipt. This prevents callers from obtaining admission receipts
+        // for envelopes that violate channel-class / message-class
+        // consistency, permeability-receipt requirements, or field bounds.
+        message.validate()?;
+
         if artifact_hashes.len() > super::MAX_ADMITTED_HASHES {
             return Err(HmpError::TooManyAdmittedHashes {
                 count: artifact_hashes.len(),
@@ -375,7 +381,7 @@ impl ImportAdmissionGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hmp::{BodyRef, ChannelClass, HmpMessageV1};
+    use crate::hmp::{BodyRef, ChannelClass, HmpError, HmpMessageV1};
 
     fn test_hash(b: u8) -> Hash {
         [b; 32]
@@ -717,5 +723,81 @@ mod tests {
     fn gate_exposes_local_cell_id() {
         let gate = test_gate();
         assert_eq!(gate.local_cell_id(), "cell:v1:blake3:local");
+    }
+
+    // ─── Fail-closed envelope validation in admission ───────────
+
+    #[test]
+    fn evaluate_admission_rejects_channel_message_mismatch() {
+        // HSI.PERMEABILITY.GRANT is only valid on Handshake channel, not
+        // Evidence. evaluate_admission must reject this before issuing
+        // any receipt.
+        let gate = test_gate();
+        let mut msg = test_message("HSI.PERMEABILITY.GRANT");
+        msg.channel_class = ChannelClass::Evidence;
+        let hashes = vec![test_hash(0x10)];
+
+        let result = gate.evaluate_admission(
+            &msg,
+            &hashes,
+            VerificationMethod::SingleSignature,
+            test_hash(0x30),
+            2000,
+            |_| Ok(()),
+        );
+
+        assert!(
+            matches!(result, Err(HmpError::ChannelClassMismatch { .. })),
+            "evaluate_admission must enforce channel/message consistency"
+        );
+    }
+
+    #[test]
+    fn evaluate_admission_rejects_missing_permeability_receipt() {
+        // HANDSHAKE channel requires a permeability receipt hash.
+        // evaluate_admission must reject envelopes that lack it.
+        let gate = test_gate();
+        let mut msg = test_message("HSI.PERMEABILITY.GRANT");
+        msg.channel_class = ChannelClass::Handshake;
+        msg.permeability_receipt_hash = None; // Missing required receipt
+
+        let result = gate.evaluate_admission(
+            &msg,
+            &[test_hash(0x10)],
+            VerificationMethod::SingleSignature,
+            test_hash(0x30),
+            2000,
+            |_| Ok(()),
+        );
+
+        assert!(
+            matches!(result, Err(HmpError::MissingPermeabilityReceipt { .. })),
+            "evaluate_admission must enforce permeability receipt requirement"
+        );
+    }
+
+    #[test]
+    fn issue_import_receipt_rejects_channel_message_mismatch() {
+        // Even through issue_import_receipt, channel/message mismatch
+        // must be caught by the envelope validation inside evaluate_admission.
+        let gate = test_gate();
+        let mut msg = test_message("HSI.ANTI_ENTROPY.OFFER");
+        msg.channel_class = ChannelClass::Handshake;
+        msg.permeability_receipt_hash = Some(test_hash(0xFF));
+
+        let result = gate.issue_import_receipt(
+            &msg,
+            &[test_hash(0x10)],
+            VerificationMethod::SingleSignature,
+            test_hash(0x30),
+            2000,
+            Some((100, 200)),
+            |_| Ok(()),
+        );
+
+        assert!(
+            matches!(result, Err(HmpError::ChannelClassMismatch { .. })),
+            "issue_import_receipt must enforce channel/message consistency"
+        );
     }
 }

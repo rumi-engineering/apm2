@@ -714,11 +714,40 @@ impl ImportReceiptV1 {
     pub fn validate(&self) -> Result<(), HmpError> {
         self.admission_receipt.validate()?;
 
-        // If range is specified, start must not exceed end.
-        if let (Some(start), Some(end)) = (self.source_range_start, self.source_range_end) {
-            if start > end {
-                return Err(HmpError::InvalidSourceRange { start, end });
-            }
+        // Source range bounds must be both-present or both-absent.
+        match (self.source_range_start, self.source_range_end) {
+            (Some(start), Some(end)) => {
+                if start > end {
+                    return Err(HmpError::InvalidSourceRange { start, end });
+                }
+            },
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(HmpError::IncompleteSourceRange);
+            },
+            (None, None) => {},
+        }
+
+        // Category/range consistency: LedgerEventRange requires an explicit
+        // source range for provenance traceability. Non-range categories
+        // must not carry range metadata.
+        let has_range = self.source_range_start.is_some();
+        match self.import_category {
+            ImportCategory::LedgerEventRange => {
+                if !has_range {
+                    return Err(HmpError::MissingSourceRangeForCategory {
+                        category: self.import_category,
+                    });
+                }
+            },
+            ImportCategory::CasArtifact
+            | ImportCategory::PermeabilityGrant
+            | ImportCategory::PolicyRootCertificate => {
+                if has_range {
+                    return Err(HmpError::UnexpectedSourceRangeForCategory {
+                        category: self.import_category,
+                    });
+                }
+            },
         }
 
         Ok(())
@@ -834,6 +863,24 @@ pub enum HmpError {
         start: u64,
         /// Range end.
         end: u64,
+    },
+
+    /// One-sided source range (start without end, or vice versa).
+    #[error("incomplete source range: both start and end must be present or both absent")]
+    IncompleteSourceRange,
+
+    /// Source range required for the given import category but not present.
+    #[error("source range required for import category {category}")]
+    MissingSourceRangeForCategory {
+        /// The import category that requires a range.
+        category: ImportCategory,
+    },
+
+    /// Source range present for a non-range import category.
+    #[error("unexpected source range for import category {category}")]
+    UnexpectedSourceRangeForCategory {
+        /// The import category that must not have a range.
+        category: ImportCategory,
     },
 
     /// Import admission denied: facts below attestation floor.
@@ -1332,6 +1379,90 @@ mod tests {
             source_range_end: None,
         };
         assert!(ir.validate().is_ok());
+    }
+
+    #[test]
+    fn import_receipt_one_sided_range_start_only_rejected() {
+        let ir = ImportReceiptV1 {
+            admission_receipt: valid_admission_receipt(),
+            import_category: ImportCategory::LedgerEventRange,
+            source_range_start: Some(100),
+            source_range_end: None,
+        };
+        assert!(matches!(
+            ir.validate(),
+            Err(HmpError::IncompleteSourceRange)
+        ));
+    }
+
+    #[test]
+    fn import_receipt_one_sided_range_end_only_rejected() {
+        let ir = ImportReceiptV1 {
+            admission_receipt: valid_admission_receipt(),
+            import_category: ImportCategory::LedgerEventRange,
+            source_range_start: None,
+            source_range_end: Some(200),
+        };
+        assert!(matches!(
+            ir.validate(),
+            Err(HmpError::IncompleteSourceRange)
+        ));
+    }
+
+    #[test]
+    fn import_receipt_ledger_range_requires_source_range() {
+        let ir = ImportReceiptV1 {
+            admission_receipt: valid_admission_receipt(),
+            import_category: ImportCategory::LedgerEventRange,
+            source_range_start: None,
+            source_range_end: None,
+        };
+        assert!(matches!(
+            ir.validate(),
+            Err(HmpError::MissingSourceRangeForCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn import_receipt_cas_artifact_rejects_range() {
+        let ir = ImportReceiptV1 {
+            admission_receipt: valid_admission_receipt(),
+            import_category: ImportCategory::CasArtifact,
+            source_range_start: Some(100),
+            source_range_end: Some(200),
+        };
+        assert!(matches!(
+            ir.validate(),
+            Err(HmpError::UnexpectedSourceRangeForCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn import_receipt_permeability_grant_rejects_range() {
+        let ir = ImportReceiptV1 {
+            admission_receipt: valid_admission_receipt(),
+            import_category: ImportCategory::PermeabilityGrant,
+            source_range_start: Some(1),
+            source_range_end: Some(2),
+        };
+        assert!(matches!(
+            ir.validate(),
+            Err(HmpError::UnexpectedSourceRangeForCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn import_receipt_policy_root_certificate_rejects_range() {
+        let ir = ImportReceiptV1 {
+            admission_receipt: valid_admission_receipt(),
+            import_category: ImportCategory::PolicyRootCertificate,
+            source_range_start: Some(1),
+            source_range_end: Some(2),
+        };
+        assert!(matches!(
+            ir.validate(),
+            Err(HmpError::UnexpectedSourceRangeForCategory { .. })
+        ));
     }
 
     // ─── VerificationMethod tests ───────────────────────────────

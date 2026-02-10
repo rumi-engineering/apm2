@@ -92,6 +92,12 @@ evidence_artifact:
         - import_receipt_valid: valid import receipt passes
         - import_receipt_invalid_range: inverted range rejected
         - import_receipt_no_range: no range for non-range imports
+        - import_receipt_one_sided_range_start_only_rejected: incomplete range blocked
+        - import_receipt_one_sided_range_end_only_rejected: incomplete range blocked
+        - import_receipt_ledger_range_requires_source_range: category/range consistency
+        - import_receipt_cas_artifact_rejects_range: non-range category rejects range
+        - import_receipt_permeability_grant_rejects_range: non-range category rejects range
+        - import_receipt_policy_root_certificate_rejects_range: non-range category rejects range
         Verification method:
         - verification_method_display: canonical display strings
         - verification_method_serde_roundtrip: JSON roundtrip

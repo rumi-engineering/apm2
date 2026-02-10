@@ -19,10 +19,14 @@ evidence_artifact:
     - Import receipts carry category metadata and optional source ranges
     - Non-import message classes are denied at the gate (fail-closed)
     - All structural bounds from the parent HMP module are enforced
+    - Envelope validation enforced inside receipt issuance APIs (fail-closed:
+      channel/message mismatch and missing permeability receipts block receipt
+      issuance)
 
     Covers digest-first fetch policy, import classification, admission
     evaluation, receipt issuance, deterministic receipt hashes, rejection
-    truncation, and fail-closed gate behavior.
+    truncation, fail-closed gate behavior, and envelope validation at
+    receipt issuance boundary.
   requirement_ids:
     - "REQ-0034"
   source_refs:
@@ -53,6 +57,10 @@ evidence_artifact:
         - receipt_hash_changes_with_different_input: different inputs differ
         Rejection handling:
         - rejection_reason_truncated_safely: char-boundary-safe truncation
+        Fail-closed envelope validation at receipt boundary:
+        - evaluate_admission_rejects_channel_message_mismatch: channel/message mismatch blocked
+        - evaluate_admission_rejects_missing_permeability_receipt: missing receipt blocked
+        - issue_import_receipt_rejects_channel_message_mismatch: mismatch via import path blocked
         Gate accessors:
         - gate_exposes_fetch_policy: fetch policy accessible
         - gate_exposes_local_cell_id: local cell ID accessible
