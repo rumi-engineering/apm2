@@ -758,6 +758,8 @@ struct PendingPcacAuthority {
     gate: Arc<crate::pcac::LifecycleGate>,
     certificate: apm2_core::pcac::AuthorityJoinCertificateV1,
     intent_digest: Hash,
+    pre_actuation_required: bool,
+    pre_actuation_receipt_hashes: Vec<Hash>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -2202,11 +2204,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             // on real monotonic time rather than a static starting tick.
             pcac_gate.advance_tick(freshness_witness_tick);
 
+            let pre_actuation_required = broker.is_some();
             let pre_actuation_receipt_hashes = preactuation_receipt
                 .as_ref()
                 .map(Self::hash_preactuation_receipt)
                 .into_iter()
                 .collect::<Vec<_>>();
+            if pre_actuation_required && pre_actuation_receipt_hashes.is_empty() {
+                let deny_class = apm2_core::pcac::AuthorityDenyClass::MissingPreActuationReceipt;
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    deny_class = %deny_class,
+                    "PCAC denied: required pre-actuation selector binding missing"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    format!(
+                        "PCAC authority denied: {deny_class} (required pre-actuation selector binding missing)"
+                    ),
+                ));
+            }
             let stop_budget_profile_digest = {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(b"pcac-stop-budget-profile-v1");
@@ -2247,7 +2265,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 freshness_policy_hash,
                 freshness_witness_tick,
                 stop_budget_profile_digest,
-                pre_actuation_receipt_hashes,
+                pre_actuation_receipt_hashes: pre_actuation_receipt_hashes.clone(),
                 risk_tier,
                 determinism_class,
                 time_envelope_ref,
@@ -2296,6 +2314,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 gate: Arc::clone(pcac_gate),
                 certificate,
                 intent_digest,
+                pre_actuation_required,
+                pre_actuation_receipt_hashes,
             })
         } else if self.is_authoritative_mode() {
             // BLOCKER 4 FIX: Authoritative mode requires mandatory PCAC gate wiring.
@@ -2875,11 +2895,54 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         ));
                     }
 
+                    // TCK-00423: Consume-time pre-actuation selector binding
+                    // prerequisite (REQ-0009). Any policy-required pre-actuation
+                    // path missing selector bindings must deny before effect.
+                    if pending_pcac.pre_actuation_required
+                        && pending_pcac.pre_actuation_receipt_hashes.is_empty()
+                    {
+                        let deny_class =
+                            apm2_core::pcac::AuthorityDenyClass::MissingPreActuationReceipt;
+                        warn!(
+                            session_id = %session_id,
+                            request_id = %request_id,
+                            deny_class = %deny_class,
+                            "RequestTool denied by PCAC consume prerequisite: missing pre-actuation selector"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("PCAC authority denied before effect: {deny_class}"),
+                        ));
+                    }
+
+                    // TCK-00423: Enforce intent digest equality at consume time
+                    // against the concrete effect arguments.
+                    let effect_intent_digest = *blake3::hash(request_arguments).as_bytes();
+                    if effect_intent_digest != pending_pcac.intent_digest {
+                        let deny_class =
+                            apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
+                                expected: pending_pcac.intent_digest,
+                                actual: effect_intent_digest,
+                            };
+                        warn!(
+                            session_id = %session_id,
+                            request_id = %request_id,
+                            expected_intent = %hex::encode(pending_pcac.intent_digest),
+                            actual_intent = %hex::encode(effect_intent_digest),
+                            deny_class = %deny_class,
+                            "RequestTool denied by PCAC consume prerequisite: intent digest mismatch"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("PCAC authority denied before effect: {deny_class}"),
+                        ));
+                    }
+
                     let (consumed_witness, consume_record) = match pending_pcac
                         .gate
                         .consume_before_effect(
                             &pending_pcac.certificate,
-                            pending_pcac.intent_digest,
+                            effect_intent_digest,
                             current_time_envelope_ref,
                             current_revocation_head,
                         ) {
@@ -2917,7 +2980,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             "event_kind": "ToolActuation",
                             "ajc_id": hex::encode(pending_pcac.certificate.ajc_id),
                             "tool_class": tool_class.to_string(),
-                            "intent_digest": hex::encode(pending_pcac.intent_digest),
+                            "intent_digest": hex::encode(effect_intent_digest),
+                            "pre_actuation_required": pending_pcac.pre_actuation_required,
+                            "pre_actuation_receipt_hashes": pending_pcac
+                                .pre_actuation_receipt_hashes
+                                .iter()
+                                .map(hex::encode)
+                                .collect::<Vec<_>>(),
                             "join_tick": pending_pcac.certificate.expires_at_tick.saturating_sub(300),
                             "consume_tick": consumed_witness.consumed_at_tick,
                             "time_envelope_ref": hex::encode(current_time_envelope_ref),
@@ -5636,6 +5705,7 @@ mod tests {
         use apm2_core::pcac::{
             AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyClass, AuthorityDenyV1,
             AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+            IdentityEvidenceLevel, RiskTier,
         };
 
         use super::*;
@@ -6038,6 +6108,239 @@ mod tests {
                     "consume must not run on broker deny; it is executed only on allow/effect path"
                 );
             });
+        }
+
+        #[test]
+        fn test_request_tool_denies_consume_intent_mismatch_before_effect() {
+            let minter = test_minter();
+            let session_id = "session-intent-mismatch";
+            let policy_ref = "policy-intent-mismatch";
+
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            let ledger_dyn: Arc<dyn LedgerEventEmitter> = Arc::clone(&ledger) as _;
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-PCAC-INTENT-MISMATCH".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-intent-mismatch".to_string(),
+                    policy_resolved_ref: policy_ref.to_string(),
+                    capability_manifest_hash: blake3::hash(b"intent-mismatch-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter, manifest_store)
+                .with_clock(clock)
+                .with_ledger(ledger_dyn)
+                .with_session_registry(registry_dyn);
+
+            let request_arguments = br#"{"type":"read","path":"/tmp/in"}"#;
+            let episode_id = EpisodeId::new(session_id).expect("valid episode id");
+            let actuation_timestamp = ReplayTimestamp::new(1_000_000_000, 0);
+
+            let current_ledger_anchor =
+                SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
+                    ledger.as_ref(),
+                );
+            let current_revocation_head = *blake3::hash(policy_ref.as_bytes()).as_bytes();
+
+            let cert = AuthorityJoinCertificateV1 {
+                ajc_id: [0x11; 32],
+                authority_join_hash: [0x12; 32],
+                intent_digest: [0xAA; 32],
+                risk_tier: RiskTier::Tier1,
+                issued_time_envelope_ref: [0x13; 32],
+                as_of_ledger_anchor: current_ledger_anchor,
+                expires_at_tick: u64::MAX,
+                revocation_head_hash: current_revocation_head,
+                identity_evidence_level: IdentityEvidenceLevel::Verified,
+                admission_capacity_token: None,
+            };
+            let pcac_kernel: Arc<dyn AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pending_pcac = PendingPcacAuthority {
+                gate: Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel)),
+                certificate: cert,
+                intent_digest: [0xAA; 32],
+                pre_actuation_required: true,
+                pre_actuation_receipt_hashes: vec![[0x55; 32]],
+            };
+
+            let decision = ToolDecision::Allow {
+                request_id: "REQ-PCAC-INTENT-MISMATCH".to_string(),
+                capability_id: "cap-read".to_string(),
+                rule_id: Some("rule-read".to_string()),
+                policy_hash: [0x21; 32],
+                budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+                credential: None,
+            };
+
+            let response = dispatcher
+                .handle_broker_decision(
+                    Ok(decision),
+                    session_id,
+                    ToolClass::Read,
+                    request_arguments,
+                    actuation_timestamp,
+                    &episode_id,
+                    None,
+                    None,
+                    false,
+                    Some(pending_pcac),
+                )
+                .expect("dispatch should return application-level response");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "intent mismatch must fail closed before effect"
+                    );
+                    assert!(
+                        err.message.contains("intent digest mismatch"),
+                        "expected consume-time intent mismatch denial, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected fail-closed error response, got: {other:?}"),
+            }
+
+            let pcac_actuation_event_count = ledger
+                .get_events_by_work_id(session_id)
+                .into_iter()
+                .filter(|event| event.event_type == "pcac_tool_actuation")
+                .count();
+            assert_eq!(
+                pcac_actuation_event_count, 0,
+                "intent mismatch denial must prevent tool actuation side effects"
+            );
+        }
+
+        #[test]
+        fn test_request_tool_denies_missing_preactuation_selector_before_effect() {
+            let minter = test_minter();
+            let session_id = "session-missing-preactuation-selector";
+            let policy_ref = "policy-missing-preactuation-selector";
+
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            let ledger_dyn: Arc<dyn LedgerEventEmitter> = Arc::clone(&ledger) as _;
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-PCAC-MISSING-PREACTUATION".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-missing-preactuation-selector".to_string(),
+                    policy_resolved_ref: policy_ref.to_string(),
+                    capability_manifest_hash: blake3::hash(b"missing-preactuation-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter, manifest_store)
+                .with_clock(clock)
+                .with_ledger(ledger_dyn)
+                .with_session_registry(registry_dyn);
+
+            let request_arguments = br#"{"type":"read","path":"/tmp/in"}"#;
+            let intent_digest = *blake3::hash(request_arguments).as_bytes();
+            let episode_id = EpisodeId::new(session_id).expect("valid episode id");
+            let actuation_timestamp = ReplayTimestamp::new(1_000_000_000, 0);
+
+            let current_ledger_anchor =
+                SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
+                    ledger.as_ref(),
+                );
+            let current_revocation_head = *blake3::hash(policy_ref.as_bytes()).as_bytes();
+
+            let cert = AuthorityJoinCertificateV1 {
+                ajc_id: [0x31; 32],
+                authority_join_hash: [0x32; 32],
+                intent_digest,
+                risk_tier: RiskTier::Tier1,
+                issued_time_envelope_ref: [0x33; 32],
+                as_of_ledger_anchor: current_ledger_anchor,
+                expires_at_tick: u64::MAX,
+                revocation_head_hash: current_revocation_head,
+                identity_evidence_level: IdentityEvidenceLevel::Verified,
+                admission_capacity_token: None,
+            };
+            let pcac_kernel: Arc<dyn AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pending_pcac = PendingPcacAuthority {
+                gate: Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel)),
+                certificate: cert,
+                intent_digest,
+                pre_actuation_required: true,
+                pre_actuation_receipt_hashes: vec![],
+            };
+
+            let decision = ToolDecision::Allow {
+                request_id: "REQ-PCAC-MISSING-PREACTUATION".to_string(),
+                capability_id: "cap-read".to_string(),
+                rule_id: Some("rule-read".to_string()),
+                policy_hash: [0x41; 32],
+                budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+                credential: None,
+            };
+
+            let response = dispatcher
+                .handle_broker_decision(
+                    Ok(decision),
+                    session_id,
+                    ToolClass::Read,
+                    request_arguments,
+                    actuation_timestamp,
+                    &episode_id,
+                    None,
+                    None,
+                    false,
+                    Some(pending_pcac),
+                )
+                .expect("dispatch should return application-level response");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "missing pre-actuation selector must fail closed before effect"
+                    );
+                    assert!(
+                        err.message.contains("missing pre-actuation receipt"),
+                        "expected missing pre-actuation selector denial, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected fail-closed error response, got: {other:?}"),
+            }
+
+            let pcac_actuation_event_count = ledger
+                .get_events_by_work_id(session_id)
+                .into_iter()
+                .filter(|event| event.event_type == "pcac_tool_actuation")
+                .count();
+            assert_eq!(
+                pcac_actuation_event_count, 0,
+                "missing selector denial must prevent tool actuation side effects"
+            );
         }
 
         /// TCK-00336: Verify fail-closed behavior when no broker is configured.
