@@ -165,20 +165,28 @@ impl InProcessKernel {
     ///
     /// [`current_tick`]: InProcessKernel::current_tick
     pub(crate) fn clock_error_to_deny(
+        &self,
         reason: String,
         ajc_id: Option<Hash>,
         time_envelope_ref: Hash,
         ledger_anchor: Hash,
     ) -> Box<AuthorityDenyV1> {
+        let denied_at_tick = {
+            let manual_tick = *self.manual_tick.lock().expect("lock poisoned");
+            if manual_tick == 0 {
+                u64::MAX
+            } else {
+                manual_tick
+            }
+        };
+
         Box::new(AuthorityDenyV1 {
             deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty { reason },
             ajc_id,
             time_envelope_ref,
             ledger_anchor,
-            // denied_at_tick is 0 because we cannot determine the current
-            // tick. This is acceptable for clock-error denials — the denial
-            // itself is the critical safety property.
-            denied_at_tick: 0,
+            // Prefer last-known kernel tick; use MAX as unknown sentinel.
+            denied_at_tick,
             containment_action: None,
         })
     }
@@ -328,7 +336,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         input: &AuthorityJoinInputV1,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
         let tick = self.current_tick().map_err(|reason| {
-            Self::clock_error_to_deny(
+            self.clock_error_to_deny(
                 reason,
                 None,
                 input.time_envelope_ref,
@@ -498,7 +506,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_revocation_head_hash: Hash,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         let tick = self.current_tick().map_err(|reason| {
-            Self::clock_error_to_deny(
+            self.clock_error_to_deny(
                 reason,
                 Some(cert.ajc_id),
                 current_time_envelope_ref,
@@ -559,7 +567,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         let tick = self.current_tick().map_err(|reason| {
-            Self::clock_error_to_deny(
+            self.clock_error_to_deny(
                 reason,
                 Some(cert.ajc_id),
                 current_time_envelope_ref,

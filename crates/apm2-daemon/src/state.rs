@@ -221,6 +221,35 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
     Err("sqlite main database entry not found while deriving PCAC path".to_string())
 }
 
+/// Returns the bootstrap sovereignty enforcement mode used during daemon
+/// construction.
+///
+/// TODO(TCK-00427): Load this mode from runtime governance/policy projection
+/// instead of a transitional static default.
+const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::SovereigntyEnforcementMode {
+    apm2_core::pcac::SovereigntyEnforcementMode::Strict
+}
+
+/// Builds the bootstrap sovereignty state snapshot for session dispatcher
+/// wiring.
+fn bootstrap_sovereignty_state(
+    mode: apm2_core::pcac::SovereigntyEnforcementMode,
+    principal_id: String,
+) -> Option<Arc<crate::pcac::SovereigntyState>> {
+    if mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled {
+        return None;
+    }
+
+    Some(Arc::new(crate::pcac::SovereigntyState {
+        // TODO(TCK-00427): Seed and refresh epoch from runtime authority state.
+        epoch: None,
+        principal_id,
+        revocation_head_known: false,
+        autonomy_ceiling: None,
+        active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+    }))
+}
+
 const GITHUB_PROFILE_PREFIX: &str = "github-installation:";
 const SSH_PROFILE_PREFIX: &str = "ssh-session:";
 
@@ -1031,6 +1060,11 @@ impl DispatcherState {
                         Arc::new(durable_kernel);
                     let sovereignty_checker =
                         crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+                    let sovereignty_mode = bootstrap_sovereignty_enforcement_mode();
+                    let sovereignty_state = bootstrap_sovereignty_state(
+                        sovereignty_mode,
+                        hex::encode(sovereignty_trusted_signer_key),
+                    );
                     // TODO(TCK-00427): When wiring a bootstrap
                     // `SovereigntyState` into `SessionDispatcher`, the epoch is
                     // currently a static snapshot. Add an IPC/projection-driven
@@ -1046,6 +1080,10 @@ impl DispatcherState {
                         ),
                     );
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
+                    if let Some(sovereignty_state) = sovereignty_state {
+                        session_dispatcher =
+                            session_dispatcher.with_sovereignty_state(sovereignty_state);
+                    }
                 },
                 Err(error) if error.contains("in-memory main database has no durable path") => {
                     tracing::warn!(
@@ -1402,6 +1440,11 @@ impl DispatcherState {
         let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
         let sovereignty_checker =
             crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+        let sovereignty_mode = bootstrap_sovereignty_enforcement_mode();
+        let sovereignty_state = bootstrap_sovereignty_state(
+            sovereignty_mode,
+            hex::encode(sovereignty_trusted_signer_key),
+        );
         // TODO(TCK-00427): When wiring a bootstrap `SovereigntyState` into
         // `SessionDispatcher`, the epoch is currently a static snapshot. Add
         // an IPC/projection-driven refresh path (see
@@ -1415,7 +1458,7 @@ impl DispatcherState {
                 Arc::clone(&stop_authority),
             ),
         );
-        let session_dispatcher =
+        let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1430,6 +1473,9 @@ impl DispatcherState {
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
                 .with_pcac_lifecycle_gate(pcac_gate);
+        if let Some(sovereignty_state) = sovereignty_state {
+            session_dispatcher = session_dispatcher.with_sovereignty_state(sovereignty_state);
+        }
 
         Ok(Self {
             privileged_dispatcher,

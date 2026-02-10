@@ -2403,52 +2403,68 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
             let sovereignty_state_ref = self.sovereignty_state.as_deref();
             if matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus) {
-                if let Some(sovereignty_state) = sovereignty_state_ref {
-                    let session_principal_id = Self::token_principal_id(&token);
-                    if session_principal_id != sovereignty_state.principal_id.as_str() {
-                        let deny = Self::build_sovereignty_principal_mismatch_deny(
-                            "revalidate-before-decision",
-                            session_principal_id,
-                            sovereignty_state.principal_id.as_str(),
-                            None,
-                            current_time_envelope_ref,
-                            current_ledger_anchor,
-                            freshness_witness_tick,
-                        );
-                        let containment_action = deny.containment_action;
-                        warn!(
-                            session_id = %token.session_id,
-                            deny_class = %deny.deny_class,
-                            containment_action = ?containment_action,
-                            "RequestTool denied by PCAC sovereignty principal binding"
-                        );
-                        if let Some(action) = containment_action {
-                            if let Some(ref authority) = self.stop_authority {
-                                match action {
-                                    apm2_core::pcac::FreezeAction::HardFreeze => {
-                                        authority.set_emergency_stop(true);
-                                    },
-                                    apm2_core::pcac::FreezeAction::SoftFreeze => {
-                                        authority.set_governance_stop(true);
-                                    },
-                                    apm2_core::pcac::FreezeAction::NoAction => {},
-                                    _ => authority.set_emergency_stop(true),
+                match pcac_policy.tier2_sovereignty_mode {
+                    apm2_core::pcac::SovereigntyEnforcementMode::Disabled => {},
+                    mode => {
+                        if let Some(sovereignty_state) = sovereignty_state_ref {
+                            let session_principal_id = Self::token_principal_id(&token);
+                            if session_principal_id != sovereignty_state.principal_id.as_str() {
+                                let deny = Self::build_sovereignty_principal_mismatch_deny(
+                                    "revalidate-before-decision",
+                                    session_principal_id,
+                                    sovereignty_state.principal_id.as_str(),
+                                    None,
+                                    current_time_envelope_ref,
+                                    current_ledger_anchor,
+                                    freshness_witness_tick,
+                                );
+                                let containment_action = deny.containment_action;
+                                if mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        deny_class = %deny.deny_class,
+                                        containment_action = ?containment_action,
+                                        sovereignty_mode = %mode,
+                                        "Sovereignty principal mismatch observed (monitor mode)"
+                                    );
+                                } else {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        deny_class = %deny.deny_class,
+                                        containment_action = ?containment_action,
+                                        sovereignty_mode = %mode,
+                                        "RequestTool denied by PCAC sovereignty principal binding"
+                                    );
+                                    if let Some(action) = containment_action {
+                                        if let Some(ref authority) = self.stop_authority {
+                                            match action {
+                                                apm2_core::pcac::FreezeAction::HardFreeze => {
+                                                    authority.set_emergency_stop(true);
+                                                },
+                                                apm2_core::pcac::FreezeAction::SoftFreeze => {
+                                                    authority.set_governance_stop(true);
+                                                },
+                                                apm2_core::pcac::FreezeAction::NoAction => {},
+                                                _ => authority.set_emergency_stop(true),
+                                            }
+                                        }
+                                    }
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        containment_action.map_or_else(
+                                            || format!("PCAC authority denied: {}", deny.deny_class),
+                                            |action| {
+                                                format!(
+                                                    "PCAC authority denied: {} (containment_action: {action})",
+                                                    deny.deny_class
+                                                )
+                                            },
+                                        ),
+                                    ));
                                 }
                             }
                         }
-                        return Ok(SessionResponse::error(
-                            SessionErrorCode::SessionErrorToolNotAllowed,
-                            containment_action.map_or_else(
-                                || format!("PCAC authority denied: {}", deny.deny_class),
-                                |action| {
-                                    format!(
-                                        "PCAC authority denied: {} (containment_action: {action})",
-                                        deny.deny_class
-                                    )
-                                },
-                            ),
-                        ));
-                    }
+                    },
                 }
             }
             let certificate = match pcac_gate.join_and_revalidate_with_sovereignty(
@@ -3077,58 +3093,78 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         pending_pcac.certificate.risk_tier,
                         apm2_core::pcac::RiskTier::Tier2Plus
                     ) {
-                        if let Some(sovereignty_state) = sovereignty_state_ref {
-                            if pending_pcac.principal_id != sovereignty_state.principal_id.as_str()
-                            {
-                                let deny = Self::build_sovereignty_principal_mismatch_deny(
-                                    "revalidate-before-execution",
-                                    &pending_pcac.principal_id,
-                                    sovereignty_state.principal_id.as_str(),
-                                    Some(pending_pcac.certificate.ajc_id),
-                                    current_time_envelope_ref,
-                                    current_ledger_anchor,
-                                    fresh_tick,
-                                );
-                                let containment_action = deny.containment_action;
-                                warn!(
-                                    session_id = %session_id,
-                                    request_id = %request_id,
-                                    deny_class = %deny.deny_class,
-                                    containment_action = ?containment_action,
-                                    "RequestTool denied by PCAC sovereignty principal binding before execution"
-                                );
-                                if let Some(action) = containment_action {
-                                    if let Some(ref authority) = self.stop_authority {
-                                        match action {
-                                            apm2_core::pcac::FreezeAction::HardFreeze => {
-                                                authority.set_emergency_stop(true);
-                                            },
-                                            apm2_core::pcac::FreezeAction::SoftFreeze => {
-                                                authority.set_governance_stop(true);
-                                            },
-                                            apm2_core::pcac::FreezeAction::NoAction => {},
-                                            _ => authority.set_emergency_stop(true),
+                        match pending_pcac.pcac_policy.tier2_sovereignty_mode {
+                            apm2_core::pcac::SovereigntyEnforcementMode::Disabled => {},
+                            mode => {
+                                if let Some(sovereignty_state) = sovereignty_state_ref {
+                                    if pending_pcac.principal_id
+                                        != sovereignty_state.principal_id.as_str()
+                                    {
+                                        let deny = Self::build_sovereignty_principal_mismatch_deny(
+                                            "revalidate-before-execution",
+                                            &pending_pcac.principal_id,
+                                            sovereignty_state.principal_id.as_str(),
+                                            Some(pending_pcac.certificate.ajc_id),
+                                            current_time_envelope_ref,
+                                            current_ledger_anchor,
+                                            fresh_tick,
+                                        );
+                                        let containment_action = deny.containment_action;
+                                        if mode
+                                            == apm2_core::pcac::SovereigntyEnforcementMode::Monitor
+                                        {
+                                            warn!(
+                                                session_id = %session_id,
+                                                request_id = %request_id,
+                                                deny_class = %deny.deny_class,
+                                                containment_action = ?containment_action,
+                                                sovereignty_mode = %mode,
+                                                "Sovereignty principal mismatch observed before execution (monitor mode)"
+                                            );
+                                        } else {
+                                            warn!(
+                                                session_id = %session_id,
+                                                request_id = %request_id,
+                                                deny_class = %deny.deny_class,
+                                                containment_action = ?containment_action,
+                                                sovereignty_mode = %mode,
+                                                "RequestTool denied by PCAC sovereignty principal binding before execution"
+                                            );
+                                            if let Some(action) = containment_action {
+                                                if let Some(ref authority) = self.stop_authority {
+                                                    match action {
+                                                        apm2_core::pcac::FreezeAction::HardFreeze => {
+                                                            authority.set_emergency_stop(true);
+                                                        },
+                                                        apm2_core::pcac::FreezeAction::SoftFreeze => {
+                                                            authority.set_governance_stop(true);
+                                                        },
+                                                        apm2_core::pcac::FreezeAction::NoAction => {},
+                                                        _ => authority.set_emergency_stop(true),
+                                                    }
+                                                }
+                                            }
+                                            return Ok(SessionResponse::error(
+                                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                                containment_action.map_or_else(
+                                                    || {
+                                                        format!(
+                                                            "PCAC authority denied before execution: {}",
+                                                            deny.deny_class
+                                                        )
+                                                    },
+                                                    |action| {
+                                                        format!(
+                                                            "PCAC authority denied before execution: {} (containment_action: {action})",
+                                                            deny.deny_class
+                                                        )
+                                                    },
+                                                ),
+                                            ));
                                         }
                                     }
                                 }
-                                return Ok(SessionResponse::error(
-                                    SessionErrorCode::SessionErrorToolNotAllowed,
-                                    containment_action.map_or_else(
-                                        || {
-                                            format!(
-                                                "PCAC authority denied before execution: {}",
-                                                deny.deny_class
-                                            )
-                                        },
-                                        |action| {
-                                            format!(
-                                                "PCAC authority denied before execution: {} (containment_action: {action})",
-                                                deny.deny_class
-                                            )
-                                        },
-                                    ),
-                                ));
-                            }
+                            },
                         }
                     }
                     if let Err(deny) = pending_pcac
@@ -3315,8 +3351,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             "ledger_anchor": hex::encode(current_ledger_anchor),
                             "consume_record_hash": hex::encode(consume_record_hash),
                         });
-                        let payload_bytes =
-                            serde_json::to_vec(&tool_actuation_payload).unwrap_or_default();
+                        let payload_bytes = match serde_json::to_vec(&tool_actuation_payload) {
+                            Ok(bytes) => bytes,
+                            Err(serialization_error) => {
+                                error!(
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    error = %serialization_error,
+                                    "ToolActuation payload serialization failed (fail-closed)"
+                                );
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorToolNotAllowed,
+                                    format!(
+                                        "PCAC authority denied before effect: ToolActuation payload serialization failed: {serialization_error}"
+                                    ),
+                                ));
+                            },
+                        };
                         if let Err(e) = ledger.emit_session_event(
                             session_id,
                             "pcac_tool_actuation",

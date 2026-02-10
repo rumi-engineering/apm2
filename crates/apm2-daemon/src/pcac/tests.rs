@@ -1895,8 +1895,10 @@ fn current_tick_returns_result_not_raw_u64() {
 /// `current_tick()` returns `Result`.
 #[test]
 fn clock_error_deny_uses_sovereignty_uncertainty_class() {
+    let kernel = InProcessKernel::new(42);
+
     // Verify the helper produces the correct deny class.
-    let deny = InProcessKernel::clock_error_to_deny(
+    let deny = kernel.clock_error_to_deny(
         "test clock regression".to_string(),
         None,
         test_hash(0x07),
@@ -1915,14 +1917,19 @@ fn clock_error_deny_uses_sovereignty_uncertainty_class() {
     assert_eq!(deny.time_envelope_ref, test_hash(0x07));
     assert_eq!(deny.ledger_anchor, test_hash(0x08));
     assert!(deny.ajc_id.is_none());
+    assert!(
+        deny.denied_at_tick > 0,
+        "clock error deny must carry a non-zero denied_at_tick"
+    );
 }
 
 /// Proves that `clock_error_to_deny` carries the AJC ID when provided
 /// (used by `revalidate` and `consume` call sites).
 #[test]
 fn clock_error_deny_carries_ajc_id_when_provided() {
+    let kernel = InProcessKernel::new(100);
     let ajc_id = test_hash(0xAA);
-    let deny = InProcessKernel::clock_error_to_deny(
+    let deny = kernel.clock_error_to_deny(
         "regression in revalidate".to_string(),
         Some(ajc_id),
         test_hash(0x07),
@@ -1938,6 +1945,18 @@ fn clock_error_deny_carries_ajc_id_when_provided() {
         "deny class must be SovereigntyUncertainty, got: {:?}",
         deny.deny_class
     );
+}
+
+#[test]
+fn clock_error_deny_uses_unknown_tick_sentinel_when_tick_unavailable() {
+    let kernel = InProcessKernel::new(0);
+    let deny = kernel.clock_error_to_deny(
+        "regression with no tick floor".to_string(),
+        None,
+        test_hash(0x07),
+        test_hash(0x08),
+    );
+    assert_eq!(deny.denied_at_tick, u64::MAX);
 }
 
 // =============================================================================
