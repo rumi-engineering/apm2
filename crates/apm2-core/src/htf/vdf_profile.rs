@@ -364,6 +364,39 @@ pub enum VdfPolicy {
     },
 }
 
+/// Resolves a VDF policy for a specific link/cell key.
+pub trait VdfPolicyResolver: fmt::Debug + Send + Sync {
+    /// Returns the effective policy for `key`.
+    fn resolve_policy(&self, key: &str) -> VdfPolicy;
+}
+
+/// Backward-compatible resolver that always returns one configured default
+/// policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DefaultVdfPolicyResolver {
+    default_policy: VdfPolicy,
+}
+
+impl DefaultVdfPolicyResolver {
+    /// Creates a resolver with `default_policy`.
+    #[must_use]
+    pub const fn new(default_policy: VdfPolicy) -> Self {
+        Self { default_policy }
+    }
+
+    /// Returns the configured default policy.
+    #[must_use]
+    pub const fn default_policy(&self) -> &VdfPolicy {
+        &self.default_policy
+    }
+}
+
+impl VdfPolicyResolver for DefaultVdfPolicyResolver {
+    fn resolve_policy(&self, _key: &str) -> VdfPolicy {
+        self.default_policy.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +569,16 @@ mod tests {
             },
             _ => panic!("unexpected error variant"),
         }
+    }
+
+    #[test]
+    fn default_policy_resolver_returns_configured_policy() {
+        let resolver = DefaultVdfPolicyResolver::new(VdfPolicy::Required { min_difficulty: 9 });
+
+        let policy_alpha = resolver.resolve_policy("cell-alpha");
+        let policy_beta = resolver.resolve_policy("cell-beta");
+
+        assert_eq!(policy_alpha, VdfPolicy::Required { min_difficulty: 9 });
+        assert_eq!(policy_beta, VdfPolicy::Required { min_difficulty: 9 });
     }
 }

@@ -35,6 +35,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -44,7 +45,7 @@ use subtle::ConstantTimeEq;
 // the tier-based seal-required check via `verify_with_policy`.
 use crate::fac::RiskTier;
 use crate::htf::vdf_profile::{
-    MIN_VDF_DIFFICULTY, VdfPolicy, VdfProfileError, VdfProfileV1, VdfVerifier,
+    MIN_VDF_DIFFICULTY, VdfPolicy, VdfPolicyResolver, VdfProfileError, VdfProfileV1, VdfVerifier,
 };
 
 // =============================================================================
@@ -1340,13 +1341,34 @@ struct CellState {
     last_access: u64,
 }
 
+/// Tombstone persisted for an evicted monotonicity key.
+///
+/// Stores enough state to preserve both:
+/// - replay-after-eviction high-water enforcement (`last_epoch`), and
+/// - VDF challenge continuity (`last_root_hash`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvictionTombstone {
+    /// Last accepted epoch for the evicted key.
+    last_epoch: u64,
+    /// Root hash from the last accepted seal for the evicted key.
+    last_root_hash: [u8; 32],
+}
+
 // =============================================================================
 // EpochSealVerifier
 // =============================================================================
 
-/// Maximum number of evicted high-water marks retained. Bounded to prevent
-/// unbounded memory growth if many keys are evicted over time.
-pub const MAX_EVICTION_HIGH_WATER_MARKS: usize = 4096;
+/// Maximum number of eviction tombstones retained.
+///
+/// Bounded to prevent unbounded memory growth if many keys are evicted over
+/// time.
+pub const MAX_EVICTED_TOMBSTONES: usize = 256;
+
+/// Backward-compatible alias for eviction tombstone capacity.
+pub const MAX_EVICTION_TOMBSTONES: usize = MAX_EVICTED_TOMBSTONES;
+
+/// Backward-compatible alias for eviction tombstone capacity.
+pub const MAX_EVICTION_HIGH_WATER_MARKS: usize = MAX_EVICTED_TOMBSTONES;
 
 /// Verifies epoch seals for monotonicity, rollback rejection,
 /// equivocation detection, and signature authenticity.
@@ -1387,16 +1409,26 @@ pub struct EpochSealVerifier {
     /// Per-link/per-cell VDF enforcement policy.
     vdf_policy: VdfPolicy,
 
+    /// Optional resolver for per-key VDF policy.
+    ///
+    /// When set, this resolver is authoritative and is used instead of
+    /// `vdf_policy` for enforcement decisions.
+    vdf_policy_resolver: Option<Arc<dyn VdfPolicyResolver>>,
+
     /// Monotonically increasing counter for LRU access ordering.
     access_counter: u64,
 
-    /// High-water epoch marks for evicted keys.
+    /// Tombstones for evicted keys.
     ///
-    /// When a key is evicted from `cells`, its last-known epoch is stored
-    /// here. On re-introduction, the seal's epoch must be strictly greater
-    /// than this high-water mark to prevent replay-after-eviction attacks.
-    /// This map is itself bounded by [`MAX_EVICTION_HIGH_WATER_MARKS`].
-    evicted_high_water: HashMap<MonotonicityKey, u64>,
+    /// When a key is evicted from `cells`, both its last-known epoch and root
+    /// hash are stored here. On re-introduction:
+    /// - the seal epoch must be strictly greater than `last_epoch`
+    ///   (replay-after-eviction defense), and
+    /// - `last_root_hash` is used to derive the expected VDF challenge input
+    ///   for continuity.
+    ///
+    /// This map is bounded by [`MAX_EVICTION_TOMBSTONES`].
+    evicted_tombstones: HashMap<MonotonicityKey, EvictionTombstone>,
 }
 
 impl Clone for EpochSealVerifier {
@@ -1408,8 +1440,9 @@ impl Clone for EpochSealVerifier {
             signature_verifier: None,
             vdf_verifier: None,
             vdf_policy: self.vdf_policy.clone(),
+            vdf_policy_resolver: self.vdf_policy_resolver.clone(),
             access_counter: self.access_counter,
-            evicted_high_water: self.evicted_high_water.clone(),
+            evicted_tombstones: self.evicted_tombstones.clone(),
         }
     }
 }
@@ -1430,8 +1463,9 @@ impl EpochSealVerifier {
             signature_verifier: None,
             vdf_verifier: None,
             vdf_policy: VdfPolicy::Optional,
+            vdf_policy_resolver: None,
             access_counter: 0,
-            evicted_high_water: HashMap::new(),
+            evicted_tombstones: HashMap::new(),
         }
     }
 
@@ -1443,8 +1477,9 @@ impl EpochSealVerifier {
             signature_verifier: Some(signature_verifier),
             vdf_verifier: None,
             vdf_policy: VdfPolicy::Optional,
+            vdf_policy_resolver: None,
             access_counter: 0,
-            evicted_high_water: HashMap::new(),
+            evicted_tombstones: HashMap::new(),
         }
     }
 
@@ -1463,6 +1498,16 @@ impl EpochSealVerifier {
         self.vdf_policy = policy;
     }
 
+    /// Sets the per-key VDF policy resolver.
+    pub fn set_vdf_policy_resolver(&mut self, resolver: Arc<dyn VdfPolicyResolver>) {
+        self.vdf_policy_resolver = Some(resolver);
+    }
+
+    /// Clears the per-key VDF policy resolver.
+    pub fn clear_vdf_policy_resolver(&mut self) {
+        self.vdf_policy_resolver = None;
+    }
+
     /// Returns whether a signature verifier is configured.
     #[must_use]
     pub fn has_signature_verifier(&self) -> bool {
@@ -1475,10 +1520,25 @@ impl EpochSealVerifier {
         self.vdf_verifier.is_some()
     }
 
+    /// Returns whether a VDF policy resolver is configured.
+    #[must_use]
+    pub fn has_vdf_policy_resolver(&self) -> bool {
+        self.vdf_policy_resolver.is_some()
+    }
+
     /// Returns the active VDF policy.
     #[must_use]
     pub const fn vdf_policy(&self) -> &VdfPolicy {
         &self.vdf_policy
+    }
+
+    /// Resolves the active VDF policy for a monotonicity key.
+    #[must_use]
+    fn effective_vdf_policy_for(&self, key: &MonotonicityKey) -> VdfPolicy {
+        self.vdf_policy_resolver.as_ref().map_or_else(
+            || self.vdf_policy.clone(),
+            |resolver| resolver.resolve_policy(&key.cell_id),
+        )
     }
 
     /// Increments and returns the next access counter value.
@@ -1501,8 +1561,9 @@ impl EpochSealVerifier {
 
     /// Evicts the least recently used entry from the verifier state.
     ///
-    /// The evicted key's epoch is persisted in [`evicted_high_water`] so
-    /// that replay-after-eviction attacks are detected on re-introduction.
+    /// The evicted key's tombstone is persisted in [`evicted_tombstones`] so
+    /// replay-after-eviction and VDF continuity are preserved on
+    /// re-introduction.
     /// Returns `true` if an entry was evicted, `false` if the map is empty.
     fn evict_lru(&mut self) -> bool {
         if let Some(lru_key) = self
@@ -1512,7 +1573,7 @@ impl EpochSealVerifier {
             .map(|(key, _)| key.clone())
         {
             if let Some(state) = self.cells.remove(&lru_key) {
-                self.persist_eviction_high_water(&lru_key, state.epoch);
+                self.persist_eviction_tombstone(&lru_key, &state);
             }
             true
         } else {
@@ -1522,8 +1583,9 @@ impl EpochSealVerifier {
 
     /// Evicts the least recently used entry for a specific `cell_id`.
     ///
-    /// The evicted key's epoch is persisted in [`evicted_high_water`] so
-    /// that replay-after-eviction attacks are detected on re-introduction.
+    /// The evicted key's tombstone is persisted in [`evicted_tombstones`] so
+    /// replay-after-eviction and VDF continuity are preserved on
+    /// re-introduction.
     /// Returns `true` if an entry was evicted.
     fn evict_lru_for_cell(&mut self, cell_id: &str) -> bool {
         if let Some(lru_key) = self
@@ -1534,7 +1596,7 @@ impl EpochSealVerifier {
             .map(|(key, _)| key.clone())
         {
             if let Some(state) = self.cells.remove(&lru_key) {
-                self.persist_eviction_high_water(&lru_key, state.epoch);
+                self.persist_eviction_tombstone(&lru_key, &state);
             }
             true
         } else {
@@ -1542,35 +1604,49 @@ impl EpochSealVerifier {
         }
     }
 
-    /// Persists a high-water epoch mark for an evicted key.
+    /// Persists an eviction tombstone for an evicted key.
     ///
-    /// If the high-water map is at capacity, the entry with the lowest
-    /// epoch is evicted to make room (the oldest high-water mark is the
-    /// least useful for replay protection).
-    fn persist_eviction_high_water(&mut self, key: &MonotonicityKey, epoch: u64) {
-        // Update existing entry to max (never decrease high-water mark).
-        let entry = self.evicted_high_water.entry(key.clone()).or_insert(0);
-        if epoch > *entry {
-            *entry = epoch;
+    /// If the tombstone map is at capacity, the entry with the lowest
+    /// `last_epoch` is evicted to make room.
+    fn persist_eviction_tombstone(&mut self, key: &MonotonicityKey, state: &CellState) {
+        let tombstone = EvictionTombstone {
+            last_epoch: state.epoch,
+            last_root_hash: state.root_hash,
+        };
+
+        match self.evicted_tombstones.get(key).copied() {
+            Some(existing) if existing.last_epoch > tombstone.last_epoch => {},
+            _ => {
+                self.evicted_tombstones.insert(key.clone(), tombstone);
+            },
         }
 
-        // Bound the high-water map: evict the entry with the lowest epoch.
-        if self.evicted_high_water.len() > MAX_EVICTION_HIGH_WATER_MARKS {
+        // Bound the tombstone map: evict the entry with the lowest epoch.
+        if self.evicted_tombstones.len() > MAX_EVICTION_TOMBSTONES {
             if let Some(min_key) = self
-                .evicted_high_water
+                .evicted_tombstones
                 .iter()
-                .min_by_key(|(_, e)| **e)
+                .min_by_key(|(_, t)| t.last_epoch)
                 .map(|(k, _)| k.clone())
             {
-                self.evicted_high_water.remove(&min_key);
+                self.evicted_tombstones.remove(&min_key);
             }
         }
     }
 
+    /// Returns the number of eviction tombstones tracked.
+    #[must_use]
+    pub fn evicted_tombstone_count(&self) -> usize {
+        self.evicted_tombstones.len()
+    }
+
     /// Returns the number of evicted high-water marks tracked.
+    ///
+    /// Kept for backward compatibility. Equivalent to
+    /// [`Self::evicted_tombstone_count`].
     #[must_use]
     pub fn evicted_high_water_count(&self) -> usize {
-        self.evicted_high_water.len()
+        self.evicted_tombstone_count()
     }
 
     /// Returns the last accepted epoch for the given issuer cell ID.
@@ -1705,6 +1781,7 @@ impl EpochSealVerifier {
         let epoch_number = seal.epoch_number();
         let profile = seal.vdf_profile();
         let key = Self::monotonicity_key_for(seal);
+        let tombstone = self.evicted_tombstones.get(&key).copied();
 
         // For same-or-lower epochs, defer to monotonicity handling. This
         // preserves rollback/equivocation semantics as the primary replay
@@ -1713,10 +1790,19 @@ impl EpochSealVerifier {
             if seal.epoch_number() <= state.epoch {
                 return None;
             }
+        } else if let Some(evicted) = tombstone {
+            if seal.epoch_number() <= evicted.last_epoch {
+                return None;
+            }
         }
 
-        if let VdfPolicy::Required { min_difficulty } = self.vdf_policy() {
-            if *min_difficulty < MIN_VDF_DIFFICULTY {
+        let policy_min_difficulty = match self.effective_vdf_policy_for(&key) {
+            VdfPolicy::Optional => None,
+            VdfPolicy::Required { min_difficulty } => Some(min_difficulty),
+        };
+
+        if let Some(min_difficulty) = policy_min_difficulty {
+            if min_difficulty < MIN_VDF_DIFFICULTY {
                 return Some(EpochSealVerdict {
                     accepted: false,
                     risk_tier,
@@ -1726,7 +1812,7 @@ impl EpochSealVerifier {
                         issuer_cell_id: issuer,
                         epoch_number,
                         difficulty: 0,
-                        min_difficulty: *min_difficulty,
+                        min_difficulty,
                     },
                 });
             }
@@ -1734,7 +1820,7 @@ impl EpochSealVerifier {
 
         match profile {
             None => {
-                if let VdfPolicy::Required { min_difficulty } = self.vdf_policy() {
+                if let Some(min_difficulty) = policy_min_difficulty {
                     return Some(EpochSealVerdict {
                         accepted: false,
                         risk_tier,
@@ -1743,15 +1829,15 @@ impl EpochSealVerifier {
                         audit_event: EpochSealAuditEvent::VdfRequiredByPolicy {
                             issuer_cell_id: issuer,
                             epoch_number,
-                            min_difficulty: *min_difficulty,
+                            min_difficulty,
                         },
                     });
                 }
                 None
             },
             Some(vdf_profile) => {
-                if let VdfPolicy::Required { min_difficulty } = self.vdf_policy() {
-                    if vdf_profile.difficulty() < *min_difficulty {
+                if let Some(min_difficulty) = policy_min_difficulty {
+                    if vdf_profile.difficulty() < min_difficulty {
                         return Some(EpochSealVerdict {
                             accepted: false,
                             risk_tier,
@@ -1761,7 +1847,7 @@ impl EpochSealVerifier {
                                 issuer_cell_id: issuer,
                                 epoch_number,
                                 difficulty: vdf_profile.difficulty(),
-                                min_difficulty: *min_difficulty,
+                                min_difficulty,
                             },
                         });
                     }
@@ -1770,7 +1856,9 @@ impl EpochSealVerifier {
                 let prior_epoch_root = self
                     .cells
                     .get(&key)
-                    .map_or(GENESIS_PRIOR_EPOCH_ROOT, |state| state.root_hash);
+                    .map(|state| state.root_hash)
+                    .or_else(|| tombstone.map(|entry| entry.last_root_hash))
+                    .unwrap_or(GENESIS_PRIOR_EPOCH_ROOT);
                 let expected_input_hash = VdfProfileV1::derive_challenge(
                     seal.cell_id(),
                     &prior_epoch_root,
@@ -1896,10 +1984,10 @@ impl EpochSealVerifier {
     ) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
 
-        // Check evicted high-water mark for replay-after-eviction.
+        // Check evicted tombstone for replay-after-eviction.
         // Fail-closed for Tier2+: reject if epoch <= evicted high-water.
-        if let Some(&hw_epoch) = self.evicted_high_water.get(key) {
-            if seal.epoch_number() <= hw_epoch {
+        if let Some(tombstone) = self.evicted_tombstones.get(key).copied() {
+            if seal.epoch_number() <= tombstone.last_epoch {
                 return EpochSealVerdict {
                     accepted: false,
                     risk_tier,
@@ -1908,13 +1996,13 @@ impl EpochSealVerifier {
                     audit_event: EpochSealAuditEvent::EvictionReplayRejected {
                         issuer_cell_id: issuer.to_string(),
                         epoch_number: seal.epoch_number(),
-                        evicted_high_water_epoch: hw_epoch,
+                        evicted_high_water_epoch: tombstone.last_epoch,
                     },
                 };
             }
             // Seal passes high-water check: remove the high-water entry
             // since this key is being re-introduced with a valid epoch.
-            self.evicted_high_water.remove(key);
+            self.evicted_tombstones.remove(key);
         }
 
         // Per-cell-id limit: prevent a single cell_id from exhausting
@@ -2190,6 +2278,8 @@ pub const fn is_seal_required_tier(risk_tier: RiskTier) -> bool {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::htf::vdf_profile::{
         DefaultVdfVerifier, MAX_VDF_DIFFICULTY, MAX_VDF_OUTPUT_LENGTH, SlothV1Verifier,
@@ -2427,6 +2517,31 @@ mod tests {
             Err(SignatureVerificationError {
                 reason: self.reason.clone(),
             })
+        }
+    }
+
+    /// Test resolver for per-cell VDF policy selection.
+    #[derive(Debug)]
+    struct StaticPolicyResolver {
+        default_policy: VdfPolicy,
+        by_cell: HashMap<String, VdfPolicy>,
+    }
+
+    impl StaticPolicyResolver {
+        fn new(default_policy: VdfPolicy, by_cell: HashMap<String, VdfPolicy>) -> Self {
+            Self {
+                default_policy,
+                by_cell,
+            }
+        }
+    }
+
+    impl VdfPolicyResolver for StaticPolicyResolver {
+        fn resolve_policy(&self, key: &str) -> VdfPolicy {
+            self.by_cell
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| self.default_policy.clone())
         }
     }
 
@@ -4228,6 +4343,82 @@ mod tests {
     }
 
     #[test]
+    fn mixed_policy_enforcement_works_in_single_verifier_instance() {
+        let mut verifier = test_verifier();
+        verifier.set_vdf_verifier(Box::new(DefaultVdfVerifier::default()));
+        verifier.set_vdf_policy(VdfPolicy::Required { min_difficulty: 99 });
+
+        let resolver = StaticPolicyResolver::new(
+            VdfPolicy::Optional,
+            HashMap::from([
+                (
+                    "cell-required-valid".to_string(),
+                    VdfPolicy::Required { min_difficulty: 4 },
+                ),
+                (
+                    "cell-required-missing".to_string(),
+                    VdfPolicy::Required { min_difficulty: 4 },
+                ),
+                ("cell-optional-missing".to_string(), VdfPolicy::Optional),
+            ]),
+        );
+        verifier.set_vdf_policy_resolver(Arc::new(resolver));
+        assert!(verifier.has_vdf_policy_resolver());
+
+        let required_valid = make_seal_full_with_vdf(
+            1,
+            "issuer-required-valid",
+            test_root_hash(0x34),
+            "cell-required-valid",
+            10,
+            10,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        let required_missing = make_seal_full(
+            1,
+            "issuer-required-missing",
+            test_root_hash(0x35),
+            "cell-required-missing",
+            11,
+            11,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        );
+        let optional_missing = make_seal_full(
+            1,
+            "issuer-optional-missing",
+            test_root_hash(0x36),
+            "cell-optional-missing",
+            12,
+            12,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        );
+
+        let required_valid_verdict = verifier.verify(&required_valid, RiskTier::Tier2);
+        assert!(required_valid_verdict.accepted);
+
+        let required_missing_verdict = verifier.verify(&required_missing, RiskTier::Tier2);
+        assert!(!required_missing_verdict.accepted);
+        assert!(matches!(
+            required_missing_verdict.audit_event,
+            EpochSealAuditEvent::VdfRequiredByPolicy {
+                min_difficulty: 4,
+                ..
+            }
+        ));
+
+        let optional_missing_verdict = verifier.verify(&optional_missing, RiskTier::Tier2);
+        assert!(optional_missing_verdict.accepted);
+    }
+
+    #[test]
     fn valid_sloth_vdf_profile_passes_verification() {
         let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
         let seal = make_seal_full_with_vdf(
@@ -4814,6 +5005,140 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn evicted_key_valid_next_vdf_seal_uses_tombstone_root() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+
+        let target = make_seal_full_with_vdf(
+            10,
+            "issuer-evict-vdf",
+            test_root_hash(0x71),
+            "cell-evict-vdf",
+            10,
+            10,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        assert!(verifier.verify(&target, RiskTier::Tier2).accepted);
+
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-cell-vdf-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x22),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        assert_eq!(verifier.evicted_tombstone_count(), 1);
+
+        let next_epoch = make_seal_full_with_vdf(
+            11,
+            "issuer-evict-vdf",
+            test_root_hash(0x72),
+            "cell-evict-vdf",
+            11,
+            11,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            *target.sealed_root_hash(),
+            4,
+        );
+        let verdict = verifier.verify(&next_epoch, RiskTier::Tier2);
+        assert!(verdict.accepted);
+
+        // Promotion check: after re-admission from tombstone state, the key
+        // must continue as a normal monotonic chain.
+        let next_next = make_seal_full_with_vdf(
+            12,
+            "issuer-evict-vdf",
+            test_root_hash(0x73),
+            "cell-evict-vdf",
+            12,
+            12,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            *next_epoch.sealed_root_hash(),
+            4,
+        );
+        let next_next_verdict = verifier.verify(&next_next, RiskTier::Tier2);
+        assert!(next_next_verdict.accepted);
+    }
+
+    #[test]
+    fn evicted_key_replay_with_vdf_is_rejected_by_tombstone_epoch() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+
+        let target = make_seal_full_with_vdf(
+            8,
+            "issuer-evict-replay",
+            test_root_hash(0x81),
+            "cell-evict-replay",
+            8,
+            8,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        assert!(verifier.verify(&target, RiskTier::Tier2).accepted);
+
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-cell-replay-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x44),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xD2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        assert_eq!(verifier.evicted_tombstone_count(), 1);
+
+        let replay = make_seal_full_with_vdf(
+            8,
+            "issuer-evict-replay",
+            test_root_hash(0x81),
+            "cell-evict-replay",
+            8,
+            8,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        let verdict = verifier.verify(&replay, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::EvictionReplayRejected {
+                epoch_number: 8,
+                evicted_high_water_epoch: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn eviction_replay_rejected_after_lru_eviction() {
         // Fill verifier to capacity, evict, then replay the evicted
         // issuer with the same epoch. The replayed seal must be rejected.
@@ -4942,7 +5267,7 @@ mod tests {
 
     #[test]
     fn eviction_high_water_count_bounded() {
-        // Verify that the evicted high-water map doesn't grow unbounded.
+        // Verify that the eviction tombstone map doesn't grow unbounded.
         let mut verifier = test_verifier();
 
         // Create and evict many keys.
@@ -4980,7 +5305,7 @@ mod tests {
 
         assert!(
             verifier.evicted_high_water_count() <= MAX_EVICTION_HIGH_WATER_MARKS,
-            "evicted high-water map must be bounded at {}, got {}",
+            "eviction tombstone map must be bounded at {}, got {}",
             MAX_EVICTION_HIGH_WATER_MARKS,
             verifier.evicted_high_water_count()
         );

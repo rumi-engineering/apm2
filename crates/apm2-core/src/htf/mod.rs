@@ -79,9 +79,9 @@ pub mod vdf_profile;
 pub use canonical::{Canonicalizable, CanonicalizationError};
 pub use epoch_seal::{
     EpochSealAuditEvent, EpochSealError, EpochSealIssuanceError, EpochSealIssuer, EpochSealV1,
-    EpochSealVerdict, EpochSealVerificationError, EpochSealVerifier, MAX_EVICTION_HIGH_WATER_MARKS,
-    MAX_SEAL_AUDIT_EVENTS, MAX_SEAL_STRING_LENGTH, MAX_TRACKED_ISSUERS, SignatureVerificationError,
-    SignatureVerifier, is_seal_required_tier,
+    EpochSealVerdict, EpochSealVerificationError, EpochSealVerifier, MAX_EVICTED_TOMBSTONES,
+    MAX_EVICTION_HIGH_WATER_MARKS, MAX_SEAL_AUDIT_EVENTS, MAX_SEAL_STRING_LENGTH,
+    MAX_TRACKED_ISSUERS, SignatureVerificationError, SignatureVerifier, is_seal_required_tier,
 };
 pub use freshness::{
     DEFAULT_TIER0_MAX_HEAD_AGE_TICKS, DEFAULT_TIER1_MAX_HEAD_AGE_TICKS,
@@ -111,7 +111,7 @@ pub use types::{
     WallTimeSource,
 };
 pub use vdf_profile::{
-    DefaultVdfVerifier, MAX_VDF_DIFFICULTY, MAX_VDF_OUTPUT_LENGTH, MIN_VDF_DIFFICULTY,
-    PietrzakV1Verifier, SlothV1Verifier, VdfPolicy, VdfProfileError, VdfProfileV1, VdfScheme,
-    VdfVerificationError, VdfVerifier,
+    DefaultVdfPolicyResolver, DefaultVdfVerifier, MAX_VDF_DIFFICULTY, MAX_VDF_OUTPUT_LENGTH,
+    MIN_VDF_DIFFICULTY, PietrzakV1Verifier, SlothV1Verifier, VdfPolicy, VdfPolicyResolver,
+    VdfProfileError, VdfProfileV1, VdfScheme, VdfVerificationError, VdfVerifier,
 };
