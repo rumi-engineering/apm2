@@ -1,0 +1,2259 @@
+//! Deterministic `ContextPack` recipe compilation and drift fingerprinting.
+//!
+//! This module compiles hash-pinned selector inputs into deterministic
+//! [`ContextPackRecipe`] artifacts, emits comparable [`DriftFingerprint`]s, and
+//! reconstructs recipes from receipt-bound CAS hashes without ambient
+//! filesystem fallback.
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use thiserror::Error;
+
+use crate::determinism::canonicalize_json;
+use crate::events::Canonicalize;
+use crate::evidence::{CasError, ContentAddressedStore};
+
+/// Schema identifier for `ContextPackRecipe`.
+pub const CONTEXT_PACK_RECIPE_SCHEMA: &str = "apm2.context_pack_recipe.v1";
+
+/// Schema version for `ContextPackRecipe`.
+pub const CONTEXT_PACK_RECIPE_VERSION: &str = "1.0.0";
+
+/// Maximum length for schema fields.
+pub const MAX_SCHEMA_FIELD_LENGTH: usize = 128;
+
+/// Maximum length for schema version fields.
+pub const MAX_SCHEMA_VERSION_LENGTH: usize = 32;
+
+/// Maximum number of required read paths.
+pub const MAX_REQUIRED_READ_PATHS: usize = 10_000;
+
+/// Maximum length of a required read path.
+pub const MAX_REQUIRED_READ_PATH_LENGTH: usize = 4_096;
+
+/// Maximum number of path components in a required read path.
+pub const MAX_REQUIRED_READ_PATH_COMPONENTS: usize = 256;
+
+/// Maximum aggregate number of path components processed per compilation.
+pub const MAX_AGGREGATE_COMPONENTS: usize = 100_000;
+
+/// Maximum number of hash-pinned required-read digests.
+pub const MAX_REQUIRED_READ_DIGESTS: usize = MAX_REQUIRED_READ_PATHS;
+
+/// Maximum allowed length of the workspace root path.
+pub const MAX_WORKSPACE_ROOT_LENGTH: usize = 4_096;
+
+/// Maximum recipe artifact size allowed during CAS replay reconstruction.
+pub const MAX_RECIPE_ARTIFACT_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Hash-pinned selector input for deterministic recipe compilation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPackSelectorInput {
+    /// Hash of `RoleSpec v2` contract.
+    pub role_spec_hash: [u8; 32],
+    /// Deterministic set of files required for context reads.
+    pub required_read_paths: BTreeSet<String>,
+    /// Hash-pinned digest set for required reads.
+    ///
+    /// Keys are normalized workspace-relative paths. Values are BLAKE3 digests
+    /// of the corresponding read artifact bytes.
+    pub required_read_digests: BTreeMap<String, [u8; 32]>,
+    /// Hash of the `ContextPackManifest`.
+    pub context_manifest_hash: [u8; 32],
+    /// Hash of the budget profile.
+    pub budget_profile_hash: [u8; 32],
+}
+
+/// Result of recipe compilation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledContextPackRecipe {
+    /// Deterministic compiled recipe.
+    pub recipe: ContextPackRecipe,
+    /// Drift fingerprint emitted for run-to-run comparison.
+    pub fingerprint: DriftFingerprint,
+}
+
+impl CompiledContextPackRecipe {
+    /// Binds this compilation fingerprint to a specific run identity so it can
+    /// be persisted and queried per run.
+    #[must_use]
+    pub fn bind_drift_fingerprint_to_run(
+        &self,
+        work_object_id: impl Into<String>,
+        epoch: u64,
+        timestamp_ns: u64,
+    ) -> DriftFingerprintBinding {
+        DriftFingerprintBinding::new(
+            work_object_id,
+            epoch,
+            timestamp_ns,
+            self.fingerprint.clone(),
+        )
+    }
+}
+
+/// Machine-readable reason codes for recipe compiler failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RecipeCompilerReasonCode {
+    /// Workspace root is not absolute.
+    WorkspaceRootNotAbsolute,
+    /// Workspace root path exceeds allowed length.
+    WorkspaceRootTooLong,
+    /// Workspace root canonicalization failed.
+    WorkspaceRootCanonicalizationFailed,
+    /// Selector contains no required read paths.
+    EmptyRequiredReadPaths,
+    /// Selector contains too many required read paths.
+    TooManyRequiredReadPaths,
+    /// Required path is empty.
+    RequiredReadPathEmpty,
+    /// Required path exceeds maximum length.
+    RequiredReadPathTooLong,
+    /// Required path contains an embedded null byte.
+    RequiredReadPathContainsNull,
+    /// Required path contains a backslash character on non-Windows targets.
+    BackslashInPathComponent,
+    /// Required path uses an absolute path.
+    RequiredReadPathAbsolute,
+    /// Required path contains traversal (`..`) components.
+    RequiredReadPathTraversal,
+    /// Required path has too many components.
+    RequiredReadPathTooManyComponents,
+    /// Aggregate path component processing budget exceeded.
+    AggregateComponentLimitExceeded,
+    /// Required path resolves outside workspace boundaries.
+    RequiredReadPathOutsideWorkspace,
+    /// Required path resolves through a symlink component.
+    RequiredReadPathSymlink,
+    /// Required path or one of its components does not exist.
+    RequiredReadPathNotFound,
+    /// Failed to inspect path metadata during closure validation.
+    RequiredReadPathMetadataReadFailed,
+    /// Two required paths normalize to the same value.
+    DuplicateNormalizedRequiredReadPath,
+    /// Recipe schema field is invalid.
+    InvalidRecipeSchema,
+    /// Recipe schema version field is invalid.
+    InvalidRecipeVersion,
+    /// Required read paths are not sorted canonically.
+    UnsortedRequiredReadPaths,
+    /// Required read paths contain duplicates.
+    DuplicateRequiredReadPath,
+    /// Selector contains too many required-read digest entries.
+    TooManyRequiredReadDigests,
+    /// A required read path is not hash-pinned in the digest set.
+    MissingRequiredReadDigest,
+    /// The selector contains digest entries that are not required reads.
+    UnexpectedRequiredReadDigest,
+    /// Required-read digest set hash does not match required digests.
+    RequiredReadDigestMismatch,
+    /// Observed filesystem dependency is not hash-pinned by selector digests.
+    AmbientReadNotHashPinned,
+    /// Missing role hash artifact in CAS.
+    MissingCasRoleHash,
+    /// Missing required-read digest artifact in CAS.
+    MissingCasRequiredReadDigest,
+    /// Missing context manifest hash artifact in CAS.
+    MissingCasContextManifestHash,
+    /// Missing budget profile hash artifact in CAS.
+    MissingCasBudgetProfileHash,
+    /// Missing drift fingerprint artifact in CAS.
+    MissingCasFingerprint,
+    /// Missing recipe artifact in CAS.
+    MissingCasRecipeHash,
+    /// Storing an artifact in CAS failed.
+    CasStorageError,
+    /// Recipe artifact exceeds the maximum decode size limit.
+    ArtifactTooLarge,
+    /// CAS operation failed.
+    CasOperationFailed,
+    /// Serialization or canonicalization failed.
+    SerializationFailed,
+    /// Deserialization failed.
+    DeserializationFailed,
+    /// Recipe hash verification failed.
+    RecipeHashMismatch,
+    /// Fingerprint binding verification failed.
+    FingerprintMismatch,
+    /// Integer conversion overflowed.
+    IntegerOverflow,
+}
+
+impl std::fmt::Display for RecipeCompilerReasonCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::WorkspaceRootNotAbsolute => "workspace_root_not_absolute",
+            Self::WorkspaceRootTooLong => "workspace_root_too_long",
+            Self::WorkspaceRootCanonicalizationFailed => "workspace_root_canonicalization_failed",
+            Self::EmptyRequiredReadPaths => "empty_required_read_paths",
+            Self::TooManyRequiredReadPaths => "too_many_required_read_paths",
+            Self::RequiredReadPathEmpty => "required_read_path_empty",
+            Self::RequiredReadPathTooLong => "required_read_path_too_long",
+            Self::RequiredReadPathContainsNull => "required_read_path_contains_null",
+            Self::BackslashInPathComponent => "backslash_in_path_component",
+            Self::RequiredReadPathAbsolute => "required_read_path_absolute",
+            Self::RequiredReadPathTraversal => "required_read_path_traversal",
+            Self::RequiredReadPathTooManyComponents => "required_read_path_too_many_components",
+            Self::AggregateComponentLimitExceeded => "aggregate_component_limit_exceeded",
+            Self::RequiredReadPathOutsideWorkspace => "required_read_path_outside_workspace",
+            Self::RequiredReadPathSymlink => "required_read_path_symlink",
+            Self::RequiredReadPathNotFound => "required_read_path_not_found",
+            Self::RequiredReadPathMetadataReadFailed => "required_read_path_metadata_read_failed",
+            Self::DuplicateNormalizedRequiredReadPath => "duplicate_normalized_required_read_path",
+            Self::InvalidRecipeSchema => "invalid_recipe_schema",
+            Self::InvalidRecipeVersion => "invalid_recipe_version",
+            Self::UnsortedRequiredReadPaths => "unsorted_required_read_paths",
+            Self::DuplicateRequiredReadPath => "duplicate_required_read_path",
+            Self::TooManyRequiredReadDigests => "too_many_required_read_digests",
+            Self::MissingRequiredReadDigest => "missing_required_read_digest",
+            Self::UnexpectedRequiredReadDigest => "unexpected_required_read_digest",
+            Self::RequiredReadDigestMismatch => "required_read_digest_mismatch",
+            Self::AmbientReadNotHashPinned => "ambient_read_not_hash_pinned",
+            Self::MissingCasRoleHash => "missing_cas_role_hash",
+            Self::MissingCasRequiredReadDigest => "missing_cas_required_read_digest",
+            Self::MissingCasContextManifestHash => "missing_cas_context_manifest_hash",
+            Self::MissingCasBudgetProfileHash => "missing_cas_budget_profile_hash",
+            Self::MissingCasFingerprint => "missing_cas_fingerprint",
+            Self::MissingCasRecipeHash => "missing_cas_recipe_hash",
+            Self::CasStorageError => "cas_storage_error",
+            Self::ArtifactTooLarge => "artifact_too_large",
+            Self::CasOperationFailed => "cas_operation_failed",
+            Self::SerializationFailed => "serialization_failed",
+            Self::DeserializationFailed => "deserialization_failed",
+            Self::RecipeHashMismatch => "recipe_hash_mismatch",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+            Self::IntegerOverflow => "integer_overflow",
+        };
+        write!(f, "{value}")
+    }
+}
+
+/// Errors that can occur while compiling or reconstructing context recipes.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecipeCompilerError {
+    /// Selector closure validation failed.
+    #[error("selector closure violation ({code}): {message}")]
+    SelectorClosure {
+        /// Machine-readable reason code.
+        code: RecipeCompilerReasonCode,
+        /// Human-readable detail.
+        message: String,
+        /// Offending path when available.
+        path: Option<String>,
+    },
+
+    /// Recipe structure or field validation failed.
+    #[error("recipe validation failed ({code}): {message}")]
+    RecipeValidation {
+        /// Machine-readable reason code.
+        code: RecipeCompilerReasonCode,
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// Serialization or canonicalization failed.
+    #[error("serialization failed ({code}): {message}")]
+    Serialization {
+        /// Machine-readable reason code.
+        code: RecipeCompilerReasonCode,
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// CAS operation failed or required hash is missing.
+    #[error("cas operation failed ({code}) for hash {hash_hex}: {message}")]
+    Cas {
+        /// Machine-readable reason code.
+        code: RecipeCompilerReasonCode,
+        /// Hex-encoded hash context.
+        hash_hex: String,
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// Hash binding verification failed.
+    #[error("hash mismatch ({code}): expected {expected_hex}, actual {actual_hex}; {message}")]
+    HashMismatch {
+        /// Machine-readable reason code.
+        code: RecipeCompilerReasonCode,
+        /// Expected hash (hex).
+        expected_hex: String,
+        /// Actual hash (hex).
+        actual_hex: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+impl RecipeCompilerError {
+    /// Returns the machine-readable reason code for this error.
+    #[must_use]
+    pub const fn reason_code(&self) -> RecipeCompilerReasonCode {
+        match self {
+            Self::SelectorClosure { code, .. }
+            | Self::RecipeValidation { code, .. }
+            | Self::Serialization { code, .. }
+            | Self::Cas { code, .. }
+            | Self::HashMismatch { code, .. } => *code,
+        }
+    }
+}
+
+/// Deterministic compiler for `ContextPackRecipe`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPackRecipeCompiler {
+    workspace_root: PathBuf,
+    default_compiled_at_tick: u64,
+}
+
+#[derive(Debug, Default)]
+struct PathValidationSession {
+    aggregate_components: usize,
+    verified_prefixes: HashSet<PathBuf>,
+}
+
+type NormalizedSelectorClosure = (Vec<String>, BTreeMap<String, [u8; 32]>);
+
+impl ContextPackRecipeCompiler {
+    /// Creates a compiler rooted at `workspace_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if `workspace_root` is invalid.
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self, RecipeCompilerError> {
+        let workspace_root = workspace_root.into();
+        if !workspace_root.is_absolute() {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::WorkspaceRootNotAbsolute,
+                message: "workspace root must be an absolute path".to_string(),
+                path: Some(workspace_root.to_string_lossy().to_string()),
+            });
+        }
+
+        let root_len = workspace_root.to_string_lossy().len();
+        if root_len > MAX_WORKSPACE_ROOT_LENGTH {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::WorkspaceRootTooLong,
+                message: format!(
+                    "workspace root exceeds maximum length ({root_len} > \
+                     {MAX_WORKSPACE_ROOT_LENGTH})"
+                ),
+                path: Some(workspace_root.to_string_lossy().to_string()),
+            });
+        }
+
+        let canonical_root = fs::canonicalize(&workspace_root).map_err(|error| {
+            RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::WorkspaceRootCanonicalizationFailed,
+                message: format!("failed to canonicalize workspace root: {error}"),
+                path: Some(workspace_root.to_string_lossy().to_string()),
+            }
+        })?;
+
+        Ok(Self {
+            workspace_root: canonical_root,
+            default_compiled_at_tick: 0,
+        })
+    }
+
+    /// Returns the canonical workspace root boundary used by this compiler.
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Sets the default `compiled_at_tick` used by [`Self::compile`].
+    #[must_use]
+    pub const fn with_default_compiled_at_tick(mut self, tick: u64) -> Self {
+        self.default_compiled_at_tick = tick;
+        self
+    }
+
+    /// Compiles selector input into a deterministic recipe and drift
+    /// fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] on selector closure, canonicalization,
+    /// or validation failure.
+    pub fn compile(
+        &self,
+        selector: &ContextPackSelectorInput,
+    ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
+        self.compile_at_tick(selector, self.default_compiled_at_tick)
+    }
+
+    /// Compiles selector input at an explicit `compiled_at_tick`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] on selector closure, canonicalization,
+    /// or validation failure.
+    pub fn compile_at_tick(
+        &self,
+        selector: &ContextPackSelectorInput,
+        compiled_at_tick: u64,
+    ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
+        self.compile_with_observed_reads(selector, &BTreeSet::new(), compiled_at_tick)
+    }
+
+    /// Compiles selector input with explicit observed filesystem dependencies.
+    ///
+    /// Any `observed_read_paths` entry not hash-pinned in
+    /// `selector.required_read_digests` fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] when closure validation or
+    /// ambient-read validation fails.
+    pub fn compile_with_observed_reads(
+        &self,
+        selector: &ContextPackSelectorInput,
+        observed_read_paths: &BTreeSet<String>,
+        compiled_at_tick: u64,
+    ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
+        let mut path_validation = PathValidationSession::default();
+        let (normalized_paths, normalized_digest_map) = self.validate_selector_closure(
+            &selector.required_read_paths,
+            &selector.required_read_digests,
+            &mut path_validation,
+        )?;
+        let required_read_digest_set_hash =
+            compute_required_read_digest_set_hash(&normalized_digest_map)?;
+
+        let recipe = ContextPackRecipe::new(
+            selector.role_spec_hash,
+            normalized_paths,
+            normalized_digest_map,
+            required_read_digest_set_hash,
+            selector.context_manifest_hash,
+            selector.budget_profile_hash,
+        )?;
+        self.enforce_observed_dependencies_hash_pinned(
+            observed_read_paths,
+            &recipe,
+            &mut path_validation,
+        )?;
+        let recipe_hash = recipe.recipe_hash()?;
+
+        let fingerprint = DriftFingerprint {
+            role_hash: selector.role_spec_hash,
+            required_read_digest_set_hash,
+            context_manifest_hash: selector.context_manifest_hash,
+            budget_profile_hash: selector.budget_profile_hash,
+            recipe_hash,
+            compiled_at_tick,
+        };
+
+        Ok(CompiledContextPackRecipe {
+            recipe,
+            fingerprint,
+        })
+    }
+
+    fn validate_selector_closure(
+        &self,
+        required_read_paths: &BTreeSet<String>,
+        required_read_digests: &BTreeMap<String, [u8; 32]>,
+        path_validation: &mut PathValidationSession,
+    ) -> Result<NormalizedSelectorClosure, RecipeCompilerError> {
+        if required_read_paths.is_empty() {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::EmptyRequiredReadPaths,
+                message: "required_read_paths must not be empty".to_string(),
+                path: None,
+            });
+        }
+        if required_read_paths.len() > MAX_REQUIRED_READ_PATHS {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::TooManyRequiredReadPaths,
+                message: format!(
+                    "required_read_paths exceeds maximum size ({} > {})",
+                    required_read_paths.len(),
+                    MAX_REQUIRED_READ_PATHS
+                ),
+                path: None,
+            });
+        }
+        if required_read_digests.len() > MAX_REQUIRED_READ_DIGESTS {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::TooManyRequiredReadDigests,
+                message: format!(
+                    "required_read_digests exceeds maximum size ({} > {})",
+                    required_read_digests.len(),
+                    MAX_REQUIRED_READ_DIGESTS
+                ),
+                path: None,
+            });
+        }
+
+        let mut normalized = Vec::with_capacity(required_read_paths.len());
+        let mut dedupe = BTreeSet::new();
+
+        for raw_path in required_read_paths {
+            let normalized_path = self.validate_required_read_path(raw_path, path_validation)?;
+            if !dedupe.insert(normalized_path.clone()) {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::DuplicateNormalizedRequiredReadPath,
+                    message: "required read paths collapse to duplicate normalized value"
+                        .to_string(),
+                    path: Some(normalized_path),
+                });
+            }
+            normalized.push(normalized_path);
+        }
+
+        let mut normalized_digest_map: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+        for (raw_path, digest) in required_read_digests {
+            let normalized_path = self.validate_required_read_path(raw_path, path_validation)?;
+            if normalized_digest_map
+                .insert(normalized_path.clone(), *digest)
+                .is_some()
+            {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::DuplicateNormalizedRequiredReadPath,
+                    message: "required read digests collapse to duplicate normalized path"
+                        .to_string(),
+                    path: Some(normalized_path),
+                });
+            }
+        }
+
+        for path in &normalized {
+            if !normalized_digest_map.contains_key(path) {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::MissingRequiredReadDigest,
+                    message: "required read path is not hash-pinned in required_read_digests"
+                        .to_string(),
+                    path: Some(path.clone()),
+                });
+            }
+        }
+        for digest_path in normalized_digest_map.keys() {
+            if !dedupe.contains(digest_path) {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::UnexpectedRequiredReadDigest,
+                    message: "required_read_digests contains a path not in required_read_paths"
+                        .to_string(),
+                    path: Some(digest_path.clone()),
+                });
+            }
+        }
+
+        normalized.sort_unstable();
+        Ok((normalized, normalized_digest_map))
+    }
+
+    fn enforce_observed_dependencies_hash_pinned(
+        &self,
+        observed_read_paths: &BTreeSet<String>,
+        recipe: &ContextPackRecipe,
+        path_validation: &mut PathValidationSession,
+    ) -> Result<(), RecipeCompilerError> {
+        for observed in observed_read_paths {
+            let normalized_observed =
+                self.validate_required_read_path(observed, path_validation)?;
+            if !recipe
+                .required_read_digests
+                .contains_key(&normalized_observed)
+            {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::AmbientReadNotHashPinned,
+                    message:
+                        "observed filesystem dependency is not hash-pinned by selector digest set"
+                            .to_string(),
+                    path: Some(observed.clone()),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_required_read_path(
+        &self,
+        raw_path: &str,
+        path_validation: &mut PathValidationSession,
+    ) -> Result<String, RecipeCompilerError> {
+        if raw_path.is_empty() {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::RequiredReadPathEmpty,
+                message: "required read path must not be empty".to_string(),
+                path: Some(raw_path.to_string()),
+            });
+        }
+        if raw_path.len() > MAX_REQUIRED_READ_PATH_LENGTH {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::RequiredReadPathTooLong,
+                message: format!(
+                    "required read path exceeds maximum length ({} > {})",
+                    raw_path.len(),
+                    MAX_REQUIRED_READ_PATH_LENGTH
+                ),
+                path: Some(raw_path.to_string()),
+            });
+        }
+        if raw_path.contains('\0') {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::RequiredReadPathContainsNull,
+                message: "required read path contains embedded null byte".to_string(),
+                path: Some(raw_path.to_string()),
+            });
+        }
+        #[cfg(not(windows))]
+        if raw_path.contains('\\') {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::BackslashInPathComponent,
+                message: "required read path contains backslash on non-Windows target".to_string(),
+                path: Some(raw_path.to_string()),
+            });
+        }
+
+        let normalized_relative = normalize_required_read_path(raw_path)?;
+        let candidate = self.workspace_root.join(&normalized_relative);
+
+        if !candidate.starts_with(&self.workspace_root) {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::RequiredReadPathOutsideWorkspace,
+                message: "required read path resolves outside workspace boundaries".to_string(),
+                path: Some(raw_path.to_string()),
+            });
+        }
+
+        self.ensure_no_symlink_components(&candidate, raw_path, path_validation)?;
+
+        Ok(normalized_required_read_path_string(&normalized_relative))
+    }
+
+    fn ensure_no_symlink_components(
+        &self,
+        absolute_candidate: &Path,
+        raw_path: &str,
+        path_validation: &mut PathValidationSession,
+    ) -> Result<(), RecipeCompilerError> {
+        let relative = absolute_candidate
+            .strip_prefix(&self.workspace_root)
+            .map_err(|_| RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::RequiredReadPathOutsideWorkspace,
+                message: "required read path failed workspace boundary check".to_string(),
+                path: Some(raw_path.to_string()),
+            })?;
+
+        let mut current = self.workspace_root.clone();
+        for component in relative.components() {
+            if let Component::Normal(part) = component {
+                path_validation.aggregate_components =
+                    path_validation.aggregate_components.saturating_add(1);
+                if path_validation.aggregate_components > MAX_AGGREGATE_COMPONENTS {
+                    return Err(RecipeCompilerError::SelectorClosure {
+                        code: RecipeCompilerReasonCode::AggregateComponentLimitExceeded,
+                        message: format!(
+                            "aggregate path component budget exceeded ({} > {})",
+                            path_validation.aggregate_components, MAX_AGGREGATE_COMPONENTS
+                        ),
+                        path: Some(raw_path.to_string()),
+                    });
+                }
+                current.push(part);
+                if path_validation.verified_prefixes.contains(&current) {
+                    continue;
+                }
+                let metadata =
+                    fs::symlink_metadata(&current).map_err(|error| match error.kind() {
+                        std::io::ErrorKind::NotFound => RecipeCompilerError::SelectorClosure {
+                            code: RecipeCompilerReasonCode::RequiredReadPathNotFound,
+                            message: "required read path does not exist".to_string(),
+                            path: Some(raw_path.to_string()),
+                        },
+                        _ => RecipeCompilerError::SelectorClosure {
+                            code: RecipeCompilerReasonCode::RequiredReadPathMetadataReadFailed,
+                            message: format!(
+                                "failed to inspect required read path metadata: {error}"
+                            ),
+                            path: Some(raw_path.to_string()),
+                        },
+                    })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(RecipeCompilerError::SelectorClosure {
+                        code: RecipeCompilerReasonCode::RequiredReadPathSymlink,
+                        message: "required read path resolves through symlink component"
+                            .to_string(),
+                        path: Some(raw_path.to_string()),
+                    });
+                }
+                path_validation.verified_prefixes.insert(current.clone());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Deterministic compiled recipe for hash-pinned context selectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPackRecipe {
+    /// Recipe schema identifier.
+    #[serde(deserialize_with = "deserialize_schema_field")]
+    pub schema: String,
+    /// Recipe schema version.
+    #[serde(deserialize_with = "deserialize_schema_version_field")]
+    pub schema_version: String,
+    /// Hash of the `RoleSpec v2` contract.
+    pub role_spec_hash: [u8; 32],
+    /// Canonically sorted required read paths.
+    #[serde(deserialize_with = "deserialize_required_read_paths")]
+    pub required_read_paths: Vec<String>,
+    /// Hash-pinned digest entries for required reads.
+    #[serde(deserialize_with = "deserialize_required_read_digests")]
+    pub required_read_digests: BTreeMap<String, [u8; 32]>,
+    /// Digest of canonical required-read digest set.
+    #[serde(alias = "required_read_digest")]
+    pub required_read_digest_set_hash: [u8; 32],
+    /// Hash of the `ContextPackManifest`.
+    pub context_manifest_hash: [u8; 32],
+    /// Hash of the budget profile.
+    pub budget_profile_hash: [u8; 32],
+}
+
+impl Canonicalize for ContextPackRecipe {
+    fn canonicalize(&mut self) {
+        self.required_read_paths.sort_unstable();
+    }
+}
+
+impl ContextPackRecipe {
+    /// Creates and validates a recipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] when the recipe is invalid.
+    pub fn new(
+        role_spec_hash: [u8; 32],
+        required_read_paths: Vec<String>,
+        required_read_digests: BTreeMap<String, [u8; 32]>,
+        required_read_digest_set_hash: [u8; 32],
+        context_manifest_hash: [u8; 32],
+        budget_profile_hash: [u8; 32],
+    ) -> Result<Self, RecipeCompilerError> {
+        let recipe = Self {
+            schema: CONTEXT_PACK_RECIPE_SCHEMA.to_string(),
+            schema_version: CONTEXT_PACK_RECIPE_VERSION.to_string(),
+            role_spec_hash,
+            required_read_paths,
+            required_read_digests,
+            required_read_digest_set_hash,
+            context_manifest_hash,
+            budget_profile_hash,
+        };
+        recipe.validate()?;
+        Ok(recipe)
+    }
+
+    /// Validates recipe invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] when any invariant is violated.
+    pub fn validate(&self) -> Result<(), RecipeCompilerError> {
+        if self.schema != CONTEXT_PACK_RECIPE_SCHEMA {
+            return Err(RecipeCompilerError::RecipeValidation {
+                code: RecipeCompilerReasonCode::InvalidRecipeSchema,
+                message: format!(
+                    "invalid recipe schema: expected {CONTEXT_PACK_RECIPE_SCHEMA}, got {}",
+                    self.schema
+                ),
+            });
+        }
+        if self.schema_version != CONTEXT_PACK_RECIPE_VERSION {
+            return Err(RecipeCompilerError::RecipeValidation {
+                code: RecipeCompilerReasonCode::InvalidRecipeVersion,
+                message: format!(
+                    "invalid recipe schema_version: expected {CONTEXT_PACK_RECIPE_VERSION}, got {}",
+                    self.schema_version
+                ),
+            });
+        }
+        if self.required_read_paths.is_empty() {
+            return Err(RecipeCompilerError::RecipeValidation {
+                code: RecipeCompilerReasonCode::EmptyRequiredReadPaths,
+                message: "required_read_paths must not be empty".to_string(),
+            });
+        }
+        if self.required_read_paths.len() > MAX_REQUIRED_READ_PATHS {
+            return Err(RecipeCompilerError::RecipeValidation {
+                code: RecipeCompilerReasonCode::TooManyRequiredReadPaths,
+                message: format!(
+                    "required_read_paths exceeds maximum size ({} > {})",
+                    self.required_read_paths.len(),
+                    MAX_REQUIRED_READ_PATHS
+                ),
+            });
+        }
+
+        for path in &self.required_read_paths {
+            validate_required_read_path_shape(path)?;
+        }
+        if self.required_read_digests.len() > MAX_REQUIRED_READ_DIGESTS {
+            return Err(RecipeCompilerError::RecipeValidation {
+                code: RecipeCompilerReasonCode::TooManyRequiredReadDigests,
+                message: format!(
+                    "required_read_digests exceeds maximum size ({} > {})",
+                    self.required_read_digests.len(),
+                    MAX_REQUIRED_READ_DIGESTS
+                ),
+            });
+        }
+
+        for pair in self.required_read_paths.windows(2) {
+            match pair[0].cmp(&pair[1]) {
+                Ordering::Greater => {
+                    return Err(RecipeCompilerError::RecipeValidation {
+                        code: RecipeCompilerReasonCode::UnsortedRequiredReadPaths,
+                        message: "required_read_paths must be sorted lexicographically".to_string(),
+                    });
+                },
+                Ordering::Equal => {
+                    return Err(RecipeCompilerError::RecipeValidation {
+                        code: RecipeCompilerReasonCode::DuplicateRequiredReadPath,
+                        message: format!("duplicate required read path: {}", pair[0]),
+                    });
+                },
+                Ordering::Less => {},
+            }
+        }
+
+        for digest_path in self.required_read_digests.keys() {
+            validate_required_read_path_shape(digest_path)?;
+        }
+        for path in &self.required_read_paths {
+            if !self.required_read_digests.contains_key(path) {
+                return Err(RecipeCompilerError::RecipeValidation {
+                    code: RecipeCompilerReasonCode::MissingRequiredReadDigest,
+                    message: format!("required read path '{path}' is not hash-pinned"),
+                });
+            }
+        }
+        for digest_path in self.required_read_digests.keys() {
+            if self.required_read_paths.binary_search(digest_path).is_err() {
+                return Err(RecipeCompilerError::RecipeValidation {
+                    code: RecipeCompilerReasonCode::UnexpectedRequiredReadDigest,
+                    message: format!(
+                        "required_read_digests path '{digest_path}' is not in required_read_paths"
+                    ),
+                });
+            }
+        }
+
+        let computed_digest_set_hash =
+            compute_required_read_digest_set_hash(&self.required_read_digests)?;
+        if computed_digest_set_hash != self.required_read_digest_set_hash {
+            return Err(RecipeCompilerError::HashMismatch {
+                code: RecipeCompilerReasonCode::RequiredReadDigestMismatch,
+                expected_hex: hex::encode(self.required_read_digest_set_hash),
+                actual_hex: hex::encode(computed_digest_set_hash),
+                message: "required_read_digest_set_hash does not match required_read_digests"
+                    .to_string(),
+            });
+        }
+        self.validate_artifact_size_limit()?;
+
+        Ok(())
+    }
+
+    fn validate_artifact_size_limit(&self) -> Result<(), RecipeCompilerError> {
+        let canonical_size = self.canonical_bytes()?.len();
+        if canonical_size <= MAX_RECIPE_ARTIFACT_BYTES {
+            return Ok(());
+        }
+        Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::ArtifactTooLarge,
+            message: format!(
+                "recipe artifact exceeds maximum size ({canonical_size} > {MAX_RECIPE_ARTIFACT_BYTES})"
+            ),
+        })
+    }
+
+    /// Returns canonical JSON bytes for deterministic hashing/CAS storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization fails.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, RecipeCompilerError> {
+        let mut canonical = self.clone();
+        canonical.canonicalize();
+        let json = serde_json::to_string(&canonical).map_err(|error| {
+            RecipeCompilerError::Serialization {
+                code: RecipeCompilerReasonCode::SerializationFailed,
+                message: error.to_string(),
+            }
+        })?;
+        let canonical_json =
+            canonicalize_json(&json).map_err(|error| RecipeCompilerError::Serialization {
+                code: RecipeCompilerReasonCode::SerializationFailed,
+                message: error.to_string(),
+            })?;
+        Ok(canonical_json.into_bytes())
+    }
+
+    /// Computes the deterministic hash of this recipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization fails.
+    pub fn recipe_hash(&self) -> Result<[u8; 32], RecipeCompilerError> {
+        let bytes = self.canonical_bytes()?;
+        Ok(*blake3::hash(&bytes).as_bytes())
+    }
+
+    /// Returns the canonical payload used to compute
+    /// `required_read_digest_set_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if payload encoding fails.
+    pub fn required_read_digest_set_payload(&self) -> Result<Vec<u8>, RecipeCompilerError> {
+        build_required_read_digest_set_payload(&self.required_read_digests)
+    }
+
+    /// Backward-compatible alias for
+    /// [`required_read_digest_set_payload`](Self::required_read_digest_set_payload).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if payload encoding fails.
+    pub fn required_read_digest_payload(&self) -> Result<Vec<u8>, RecipeCompilerError> {
+        self.required_read_digest_set_payload()
+    }
+}
+
+/// Compact fingerprint emitted on every recipe compilation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftFingerprint {
+    /// `RoleSpec` hash binding.
+    pub role_hash: [u8; 32],
+    /// Digest of canonical required-read digest set.
+    #[serde(alias = "required_read_digest")]
+    pub required_read_digest_set_hash: [u8; 32],
+    /// Context manifest hash binding.
+    pub context_manifest_hash: [u8; 32],
+    /// Budget profile hash binding.
+    pub budget_profile_hash: [u8; 32],
+    /// Compiled recipe hash binding.
+    pub recipe_hash: [u8; 32],
+    /// HTF tick at which compilation occurred.
+    #[serde(default)]
+    pub compiled_at_tick: u64,
+}
+
+impl Canonicalize for DriftFingerprint {
+    fn canonicalize(&mut self) {}
+}
+
+impl DriftFingerprint {
+    /// Returns canonical JSON bytes for deterministic hashing/CAS storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization fails.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, RecipeCompilerError> {
+        let json =
+            serde_json::to_string(self).map_err(|error| RecipeCompilerError::Serialization {
+                code: RecipeCompilerReasonCode::SerializationFailed,
+                message: error.to_string(),
+            })?;
+        let canonical_json =
+            canonicalize_json(&json).map_err(|error| RecipeCompilerError::Serialization {
+                code: RecipeCompilerReasonCode::SerializationFailed,
+                message: error.to_string(),
+            })?;
+        Ok(canonical_json.into_bytes())
+    }
+
+    /// Computes the deterministic hash of this fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization fails.
+    pub fn compute_fingerprint(&self) -> Result<[u8; 32], RecipeCompilerError> {
+        let bytes = self.canonical_bytes()?;
+        Ok(*blake3::hash(&bytes).as_bytes())
+    }
+
+    /// Backward-compatible alias for
+    /// [`compute_fingerprint`](Self::compute_fingerprint).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization fails.
+    pub fn fingerprint_hash(&self) -> Result<[u8; 32], RecipeCompilerError> {
+        self.compute_fingerprint()
+    }
+
+    /// Stores this fingerprint in CAS using canonical JSON bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization or CAS storage
+    /// fails.
+    pub fn store_to_cas(
+        &self,
+        cas: &dyn ContentAddressedStore,
+    ) -> Result<[u8; 32], RecipeCompilerError> {
+        let bytes = self.canonical_bytes()?;
+        let hash = *blake3::hash(&bytes).as_bytes();
+
+        cas.store(&bytes)
+            .map_err(|error| RecipeCompilerError::Cas {
+                code: RecipeCompilerReasonCode::CasStorageError,
+                hash_hex: hex::encode(hash),
+                message: format!("failed to store fingerprint: {error}"),
+            })?;
+
+        Ok(hash)
+    }
+}
+
+/// Drift fingerprint bound to run/work identity for persistence and
+/// cross-run comparison queries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftFingerprintBinding {
+    /// Canonical work object identity.
+    pub work_object_id: String,
+    /// Consensus/runtime epoch for the run.
+    pub epoch: u64,
+    /// Binding timestamp in Unix nanoseconds.
+    pub timestamp_ns: u64,
+    /// Drift fingerprint emitted by recipe compilation.
+    pub fingerprint: DriftFingerprint,
+}
+
+impl DriftFingerprintBinding {
+    /// Creates a new run-scoped drift fingerprint binding.
+    #[must_use]
+    pub fn new(
+        work_object_id: impl Into<String>,
+        epoch: u64,
+        timestamp_ns: u64,
+        fingerprint: DriftFingerprint,
+    ) -> Self {
+        Self {
+            work_object_id: work_object_id.into(),
+            epoch,
+            timestamp_ns,
+            fingerprint,
+        }
+    }
+
+    /// Returns true when this binding belongs to the given work object.
+    #[must_use]
+    pub fn is_for_work_object(&self, work_object_id: &str) -> bool {
+        self.work_object_id == work_object_id
+    }
+
+    /// Returns drift-change status when two bindings are comparable (same work
+    /// object). Returns `None` when they represent different work objects.
+    #[must_use]
+    pub fn drift_changed_from(&self, other: &Self) -> Option<bool> {
+        if self.work_object_id != other.work_object_id {
+            return None;
+        }
+        Some(self.fingerprint != other.fingerprint)
+    }
+}
+
+/// Loads a drift fingerprint from CAS by hash.
+///
+/// # Errors
+///
+/// Returns [`RecipeCompilerError`] if the fingerprint is missing, exceeds size
+/// bounds, CAS retrieval fails, or deserialization fails.
+pub fn load_fingerprint_from_cas(
+    cas: &dyn ContentAddressedStore,
+    hash: &[u8; 32],
+) -> Result<DriftFingerprint, RecipeCompilerError> {
+    let artifact_size = match cas.size(hash) {
+        Ok(size) => size,
+        Err(CasError::NotFound { .. }) => {
+            return Err(RecipeCompilerError::Cas {
+                code: RecipeCompilerReasonCode::MissingCasFingerprint,
+                hash_hex: hex::encode(hash),
+                message: "fingerprint not found in CAS".to_string(),
+            });
+        },
+        Err(error) => {
+            return Err(cas_error(
+                RecipeCompilerReasonCode::CasOperationFailed,
+                hash,
+                &error,
+            ));
+        },
+    };
+    if artifact_size > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error_with_kind(
+            hash,
+            artifact_size,
+            "fingerprint",
+        ));
+    }
+
+    let bytes = match cas.retrieve(hash) {
+        Ok(bytes) => bytes,
+        Err(CasError::NotFound { .. }) => {
+            return Err(RecipeCompilerError::Cas {
+                code: RecipeCompilerReasonCode::MissingCasFingerprint,
+                hash_hex: hex::encode(hash),
+                message: "fingerprint not found in CAS".to_string(),
+            });
+        },
+        Err(error) => {
+            return Err(cas_error(
+                RecipeCompilerReasonCode::CasOperationFailed,
+                hash,
+                &error,
+            ));
+        },
+    };
+    if bytes.len() > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error_with_kind(
+            hash,
+            bytes.len(),
+            "fingerprint",
+        ));
+    }
+
+    serde_json::from_slice(&bytes).map_err(|error| RecipeCompilerError::Serialization {
+        code: RecipeCompilerReasonCode::DeserializationFailed,
+        message: error.to_string(),
+    })
+}
+
+/// Reconstructs a recipe from receipt-bound hashes in CAS.
+///
+/// This function is fail-closed:
+/// - every hash in `fingerprint` must exist in CAS,
+/// - recipe bytes are loaded from CAS only,
+/// - no ambient filesystem reads are attempted.
+///
+/// # Errors
+///
+/// Returns [`RecipeCompilerError`] on missing CAS entries, deserialization
+/// failure, or hash mismatch.
+pub fn reconstruct_from_receipts(
+    cas: &dyn ContentAddressedStore,
+    fingerprint: &DriftFingerprint,
+) -> Result<ContextPackRecipe, RecipeCompilerError> {
+    ensure_hash_exists(
+        cas,
+        &fingerprint.role_hash,
+        RecipeCompilerReasonCode::MissingCasRoleHash,
+    )?;
+    ensure_hash_exists(
+        cas,
+        &fingerprint.required_read_digest_set_hash,
+        RecipeCompilerReasonCode::MissingCasRequiredReadDigest,
+    )?;
+    ensure_hash_exists(
+        cas,
+        &fingerprint.context_manifest_hash,
+        RecipeCompilerReasonCode::MissingCasContextManifestHash,
+    )?;
+    ensure_hash_exists(
+        cas,
+        &fingerprint.budget_profile_hash,
+        RecipeCompilerReasonCode::MissingCasBudgetProfileHash,
+    )?;
+    ensure_hash_exists(
+        cas,
+        &fingerprint.recipe_hash,
+        RecipeCompilerReasonCode::MissingCasRecipeHash,
+    )?;
+
+    let recipe_size = cas.size(&fingerprint.recipe_hash).map_err(|error| {
+        cas_error(
+            RecipeCompilerReasonCode::CasOperationFailed,
+            &fingerprint.recipe_hash,
+            &error,
+        )
+    })?;
+    if recipe_size > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error(
+            &fingerprint.recipe_hash,
+            recipe_size,
+        ));
+    }
+
+    let recipe_bytes = cas.retrieve(&fingerprint.recipe_hash).map_err(|error| {
+        cas_error(
+            RecipeCompilerReasonCode::CasOperationFailed,
+            &fingerprint.recipe_hash,
+            &error,
+        )
+    })?;
+    if recipe_bytes.len() > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error(
+            &fingerprint.recipe_hash,
+            recipe_bytes.len(),
+        ));
+    }
+
+    let recipe: ContextPackRecipe = serde_json::from_slice(&recipe_bytes).map_err(|error| {
+        RecipeCompilerError::Serialization {
+            code: RecipeCompilerReasonCode::DeserializationFailed,
+            message: error.to_string(),
+        }
+    })?;
+    recipe.validate()?;
+
+    let computed_hash = recipe.recipe_hash()?;
+    if computed_hash.ct_ne(&fingerprint.recipe_hash).into() {
+        return Err(RecipeCompilerError::HashMismatch {
+            code: RecipeCompilerReasonCode::RecipeHashMismatch,
+            expected_hex: hex::encode(fingerprint.recipe_hash),
+            actual_hex: hex::encode(computed_hash),
+            message: "reconstructed recipe hash does not match fingerprint".to_string(),
+        });
+    }
+
+    let bindings_mismatch = recipe.role_spec_hash.ct_ne(&fingerprint.role_hash)
+        | recipe
+            .required_read_digest_set_hash
+            .ct_ne(&fingerprint.required_read_digest_set_hash)
+        | recipe
+            .context_manifest_hash
+            .ct_ne(&fingerprint.context_manifest_hash)
+        | recipe
+            .budget_profile_hash
+            .ct_ne(&fingerprint.budget_profile_hash);
+    if bindings_mismatch.into() {
+        return Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::FingerprintMismatch,
+            message: "reconstructed recipe fields do not match drift fingerprint".to_string(),
+        });
+    }
+
+    Ok(recipe)
+}
+
+fn ensure_hash_exists(
+    cas: &dyn ContentAddressedStore,
+    hash: &[u8; 32],
+    missing_code: RecipeCompilerReasonCode,
+) -> Result<(), RecipeCompilerError> {
+    match cas.exists(hash) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(RecipeCompilerError::Cas {
+            code: missing_code,
+            hash_hex: hex::encode(hash),
+            message: "required hash missing from CAS".to_string(),
+        }),
+        Err(error) => Err(cas_error(
+            RecipeCompilerReasonCode::CasOperationFailed,
+            hash,
+            &error,
+        )),
+    }
+}
+
+fn cas_error(
+    code: RecipeCompilerReasonCode,
+    hash: &[u8; 32],
+    error: &CasError,
+) -> RecipeCompilerError {
+    RecipeCompilerError::Cas {
+        code,
+        hash_hex: hex::encode(hash),
+        message: error.to_string(),
+    }
+}
+
+fn artifact_too_large_error(hash: &[u8; 32], size: usize) -> RecipeCompilerError {
+    artifact_too_large_error_with_kind(hash, size, "recipe")
+}
+
+fn artifact_too_large_error_with_kind(
+    hash: &[u8; 32],
+    size: usize,
+    artifact_kind: &str,
+) -> RecipeCompilerError {
+    RecipeCompilerError::Cas {
+        code: RecipeCompilerReasonCode::ArtifactTooLarge,
+        hash_hex: hex::encode(hash),
+        message: format!(
+            "{artifact_kind} artifact exceeds maximum size ({size} > {MAX_RECIPE_ARTIFACT_BYTES})"
+        ),
+    }
+}
+
+fn validate_required_read_path_shape(path: &str) -> Result<(), RecipeCompilerError> {
+    if path.is_empty() {
+        return Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::RequiredReadPathEmpty,
+            message: "required read path must not be empty".to_string(),
+        });
+    }
+    if path.len() > MAX_REQUIRED_READ_PATH_LENGTH {
+        return Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::RequiredReadPathTooLong,
+            message: format!(
+                "required read path exceeds maximum length ({} > {})",
+                path.len(),
+                MAX_REQUIRED_READ_PATH_LENGTH
+            ),
+        });
+    }
+    if path.contains('\0') {
+        return Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::RequiredReadPathContainsNull,
+            message: "required read path contains embedded null byte".to_string(),
+        });
+    }
+    #[cfg(not(windows))]
+    if path.contains('\\') {
+        return Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::BackslashInPathComponent,
+            message: "required read path contains backslash on non-Windows target".to_string(),
+        });
+    }
+    let _ = normalize_required_read_path(path)?;
+    Ok(())
+}
+
+fn normalize_required_read_path(path: &str) -> Result<PathBuf, RecipeCompilerError> {
+    let mut normalized = PathBuf::new();
+    let mut component_count = 0usize;
+
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => {
+                component_count = component_count.saturating_add(1);
+                if component_count > MAX_REQUIRED_READ_PATH_COMPONENTS {
+                    return Err(RecipeCompilerError::SelectorClosure {
+                        code: RecipeCompilerReasonCode::RequiredReadPathTooManyComponents,
+                        message: format!(
+                            "required read path exceeds maximum component count \
+                             ({component_count} > {MAX_REQUIRED_READ_PATH_COMPONENTS})"
+                        ),
+                        path: Some(path.to_string()),
+                    });
+                }
+                normalized.push(part);
+            },
+            Component::CurDir => {},
+            Component::ParentDir => {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::RequiredReadPathTraversal,
+                    message: "required read path contains path traversal component".to_string(),
+                    path: Some(path.to_string()),
+                });
+            },
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::RequiredReadPathAbsolute,
+                    message: "required read path must be workspace-relative".to_string(),
+                    path: Some(path.to_string()),
+                });
+            },
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(RecipeCompilerError::SelectorClosure {
+            code: RecipeCompilerReasonCode::RequiredReadPathEmpty,
+            message: "required read path resolves to empty path".to_string(),
+            path: Some(path.to_string()),
+        });
+    }
+
+    Ok(normalized)
+}
+
+#[cfg(windows)]
+fn path_to_forward_slashes(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(windows)]
+fn normalized_required_read_path_string(path: &Path) -> String {
+    path_to_forward_slashes(path)
+}
+
+#[cfg(not(windows))]
+fn normalized_required_read_path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn build_required_read_digest_set_payload(
+    required_read_digests: &BTreeMap<String, [u8; 32]>,
+) -> Result<Vec<u8>, RecipeCompilerError> {
+    let mut payload = Vec::new();
+    for (path, digest) in required_read_digests {
+        let length = u32::try_from(path.len()).map_err(|_| RecipeCompilerError::Serialization {
+            code: RecipeCompilerReasonCode::IntegerOverflow,
+            message: "required read path length exceeds u32 range".to_string(),
+        })?;
+        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(path.as_bytes());
+        payload.extend_from_slice(digest);
+    }
+    Ok(payload)
+}
+
+fn compute_required_read_digest_set_hash(
+    required_read_digests: &BTreeMap<String, [u8; 32]>,
+) -> Result<[u8; 32], RecipeCompilerError> {
+    let payload = build_required_read_digest_set_payload(required_read_digests)?;
+    Ok(*blake3::hash(&payload).as_bytes())
+}
+
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > max_len {
+        return Err(de::Error::custom(format!(
+            "{field_name} exceeds maximum length ({} > {max_len})",
+            value.len()
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_schema_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SCHEMA_FIELD_LENGTH, "schema")
+}
+
+fn deserialize_schema_version_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SCHEMA_VERSION_LENGTH, "schema_version")
+}
+
+fn deserialize_required_read_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RequiredReadPathsVisitor;
+
+    impl<'de> Visitor<'de> for RequiredReadPathsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_REQUIRED_READ_PATHS} required read paths"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values =
+                Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_REQUIRED_READ_PATHS));
+            while let Some(value) = seq.next_element::<String>()? {
+                if value.len() > MAX_REQUIRED_READ_PATH_LENGTH {
+                    return Err(de::Error::custom(format!(
+                        "required read path exceeds maximum length ({} > {})",
+                        value.len(),
+                        MAX_REQUIRED_READ_PATH_LENGTH
+                    )));
+                }
+                if values.len() >= MAX_REQUIRED_READ_PATHS {
+                    return Err(de::Error::custom(format!(
+                        "required_read_paths exceeds maximum size ({MAX_REQUIRED_READ_PATHS})"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(RequiredReadPathsVisitor)
+}
+
+fn deserialize_required_read_digests<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, [u8; 32]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RequiredReadDigestsVisitor;
+
+    impl<'de> Visitor<'de> for RequiredReadDigestsVisitor {
+        type Value = BTreeMap<String, [u8; 32]>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a map of at most {MAX_REQUIRED_READ_DIGESTS} required-read digests"
+            )
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((path, digest)) = map.next_entry::<String, [u8; 32]>()? {
+                if path.len() > MAX_REQUIRED_READ_PATH_LENGTH {
+                    return Err(de::Error::custom(format!(
+                        "required read path exceeds maximum length ({} > {})",
+                        path.len(),
+                        MAX_REQUIRED_READ_PATH_LENGTH
+                    )));
+                }
+                if values.len() >= MAX_REQUIRED_READ_DIGESTS {
+                    return Err(de::Error::custom(format!(
+                        "required_read_digests exceeds maximum size ({MAX_REQUIRED_READ_DIGESTS})"
+                    )));
+                }
+                if values.insert(path, digest).is_some() {
+                    return Err(de::Error::custom(
+                        "duplicate required_read_digests key encountered",
+                    ));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(RequiredReadDigestsVisitor)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::evidence::{ContentAddressedStore, MemoryCas};
+
+    fn setup_workspace() -> TempDir {
+        let workspace = tempfile::tempdir().expect("tempdir should be created");
+        fs::create_dir_all(workspace.path().join("src")).expect("src dir should be created");
+        fs::create_dir_all(workspace.path().join("docs")).expect("docs dir should be created");
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn deterministic_recipe() -> bool { true }\n",
+        )
+        .expect("src/lib.rs should be created");
+        fs::write(workspace.path().join("README.md"), b"# recipe test\n")
+            .expect("README.md should be created");
+        fs::write(workspace.path().join("docs/spec.md"), b"spec\n")
+            .expect("docs/spec.md should be created");
+        fs::write(workspace.path().join("src/ambient.rs"), b"ambient\n")
+            .expect("src/ambient.rs should be created");
+        workspace
+    }
+
+    fn selector_with_paths(
+        role_spec_hash: [u8; 32],
+        context_manifest_hash: [u8; 32],
+        budget_profile_hash: [u8; 32],
+        paths: &[&str],
+    ) -> ContextPackSelectorInput {
+        let mut required_read_paths = BTreeSet::new();
+        let mut required_read_digests = BTreeMap::new();
+        for path in paths {
+            let owned = (*path).to_string();
+            required_read_paths.insert(owned.clone());
+            required_read_digests.insert(owned.clone(), *blake3::hash(owned.as_bytes()).as_bytes());
+        }
+
+        ContextPackSelectorInput {
+            role_spec_hash,
+            required_read_paths,
+            required_read_digests,
+            context_manifest_hash,
+            budget_profile_hash,
+        }
+    }
+
+    #[test]
+    fn compile_is_deterministic_for_identical_inputs() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let role_hash = [0x11; 32];
+        let context_hash = [0x22; 32];
+        let budget_hash = [0x33; 32];
+        let selector = selector_with_paths(
+            role_hash,
+            context_hash,
+            budget_hash,
+            &["README.md", "src/lib.rs"],
+        );
+
+        let first = compiler
+            .compile(&selector)
+            .expect("first compile should pass");
+        let second = compiler
+            .compile(&selector)
+            .expect("second compile should pass");
+
+        assert_eq!(
+            first
+                .recipe
+                .recipe_hash()
+                .expect("recipe hash should compute"),
+            second
+                .recipe
+                .recipe_hash()
+                .expect("recipe hash should compute")
+        );
+        assert_eq!(
+            first
+                .recipe
+                .canonical_bytes()
+                .expect("canonical bytes should compute"),
+            second
+                .recipe
+                .canonical_bytes()
+                .expect("canonical bytes should compute")
+        );
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.fingerprint.role_hash, [0x11; 32]);
+        assert_eq!(first.fingerprint.context_manifest_hash, [0x22; 32]);
+        assert_eq!(first.fingerprint.budget_profile_hash, [0x33; 32]);
+        assert_eq!(first.fingerprint.compiled_at_tick, 0);
+        assert_eq!(
+            first
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute"),
+            second
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute")
+        );
+    }
+
+    #[test]
+    fn compile_normalizes_digest_keys_for_deterministic_recipe_hash() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("test")).expect("test dir should be created");
+        fs::write(workspace.path().join("test/foo.txt"), b"selector fixture")
+            .expect("test fixture should be created");
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let mut required_read_paths_a = BTreeSet::new();
+        required_read_paths_a.insert("./test/foo.txt".to_string());
+        let mut required_read_digests_a = BTreeMap::new();
+        required_read_digests_a.insert("./test/foo.txt".to_string(), [0xAB; 32]);
+
+        let selector_a = ContextPackSelectorInput {
+            role_spec_hash: [0x31; 32],
+            required_read_paths: required_read_paths_a,
+            required_read_digests: required_read_digests_a,
+            context_manifest_hash: [0x32; 32],
+            budget_profile_hash: [0x33; 32],
+        };
+
+        let mut required_read_paths_b = BTreeSet::new();
+        required_read_paths_b.insert("test/foo.txt".to_string());
+        let mut required_read_digests_b = BTreeMap::new();
+        required_read_digests_b.insert("test/foo.txt".to_string(), [0xAB; 32]);
+
+        let selector_b = ContextPackSelectorInput {
+            role_spec_hash: [0x31; 32],
+            required_read_paths: required_read_paths_b,
+            required_read_digests: required_read_digests_b,
+            context_manifest_hash: [0x32; 32],
+            budget_profile_hash: [0x33; 32],
+        };
+
+        let first = compiler
+            .compile(&selector_a)
+            .expect("compile with dot-prefix path should pass");
+        let second = compiler
+            .compile(&selector_b)
+            .expect("compile with normalized path should pass");
+
+        assert_eq!(
+            first
+                .recipe
+                .recipe_hash()
+                .expect("recipe hash should compute"),
+            second
+                .recipe
+                .recipe_hash()
+                .expect("recipe hash should compute")
+        );
+        assert_eq!(
+            first.fingerprint.recipe_hash,
+            second.fingerprint.recipe_hash
+        );
+        assert_eq!(
+            first
+                .recipe
+                .required_read_digests
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["test/foo.txt"]
+        );
+    }
+
+    #[test]
+    fn compile_normalizes_mixed_equivalent_selector_and_digest_map_paths() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("test")).expect("test dir should be created");
+        fs::write(workspace.path().join("test/foo.txt"), b"selector fixture")
+            .expect("test fixture should be created");
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let mut mixed_paths = BTreeSet::new();
+        mixed_paths.insert("./test/foo.txt/".to_string());
+        let mut mixed_digests = BTreeMap::new();
+        mixed_digests.insert("./test/./foo.txt/".to_string(), [0xCD; 32]);
+
+        let mixed_selector = ContextPackSelectorInput {
+            role_spec_hash: [0x41; 32],
+            required_read_paths: mixed_paths,
+            required_read_digests: mixed_digests,
+            context_manifest_hash: [0x42; 32],
+            budget_profile_hash: [0x43; 32],
+        };
+
+        let mut canonical_paths = BTreeSet::new();
+        canonical_paths.insert("test/foo.txt".to_string());
+        let mut canonical_digests = BTreeMap::new();
+        canonical_digests.insert("test/foo.txt".to_string(), [0xCD; 32]);
+
+        let canonical_selector = ContextPackSelectorInput {
+            role_spec_hash: [0x41; 32],
+            required_read_paths: canonical_paths,
+            required_read_digests: canonical_digests,
+            context_manifest_hash: [0x42; 32],
+            budget_profile_hash: [0x43; 32],
+        };
+
+        let mixed = compiler
+            .compile(&mixed_selector)
+            .expect("compile with mixed equivalent paths should pass");
+        let canonical = compiler
+            .compile(&canonical_selector)
+            .expect("compile with canonical paths should pass");
+
+        assert_eq!(
+            mixed.recipe.required_read_paths,
+            vec!["test/foo.txt".to_string()]
+        );
+        assert!(
+            mixed
+                .recipe
+                .required_read_digests
+                .contains_key("test/foo.txt")
+        );
+        assert_eq!(
+            mixed.recipe.required_read_digest_set_hash,
+            canonical.recipe.required_read_digest_set_hash
+        );
+        assert_eq!(mixed.fingerprint, canonical.fingerprint);
+    }
+
+    #[test]
+    fn selector_closure_rejects_path_traversal() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x01; 32], [0x02; 32], [0x03; 32], &["../outside.txt"]);
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("path traversal should be rejected");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::RequiredReadPathTraversal
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn selector_closure_rejects_backslash_path_to_prevent_aliasing() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("a")).expect("a dir should be created");
+        fs::write(workspace.path().join("a/b"), b"slash path").expect("a/b should be created");
+        fs::write(workspace.path().join("a\\b"), b"literal backslash filename")
+            .expect("a\\\\b should be created");
+
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x01; 32], [0x02; 32], [0x03; 32], &["a/b", "a\\b"]);
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("backslash path must be rejected on non-Windows targets");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::BackslashInPathComponent
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selector_closure_rejects_symlink_path() {
+        let workspace = setup_workspace();
+        let outside = tempfile::tempdir().expect("outside tempdir should be created");
+        fs::write(outside.path().join("leak.txt"), b"leak").expect("outside file should exist");
+        symlink(
+            outside.path().join("leak.txt"),
+            workspace.path().join("src/leak_link"),
+        )
+        .expect("symlink should be created");
+
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x01; 32], [0x02; 32], [0x03; 32], &["src/leak_link"]);
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("symlink should be rejected");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::RequiredReadPathSymlink
+        );
+    }
+
+    #[test]
+    fn selector_closure_rejects_empty_required_paths() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x01; 32], [0x02; 32], [0x03; 32], &[]);
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("empty required paths should be rejected");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::EmptyRequiredReadPaths
+        );
+    }
+
+    #[test]
+    fn selector_closure_rejects_excessive_aggregate_component_count() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let shared_components: Vec<String> =
+            (0..24).map(|index| format!("deep{index:02}")).collect();
+        let shared_prefix = shared_components.join("/");
+        let shared_dir = workspace.path().join(&shared_prefix);
+        fs::create_dir_all(&shared_dir).expect("deep directory structure should be created");
+
+        let mut required_read_paths = BTreeSet::new();
+        let mut required_read_digests = BTreeMap::new();
+        for index in 0..2001usize {
+            let file_name = format!("file_{index:04}.txt");
+            fs::write(shared_dir.join(&file_name), b"component budget")
+                .expect("required read fixture should be created");
+            let path = format!("{shared_prefix}/{file_name}");
+            required_read_paths.insert(path.clone());
+            required_read_digests.insert(path.clone(), *blake3::hash(path.as_bytes()).as_bytes());
+        }
+
+        let selector = ContextPackSelectorInput {
+            role_spec_hash: [0x41; 32],
+            required_read_paths,
+            required_read_digests,
+            context_manifest_hash: [0x42; 32],
+            budget_profile_hash: [0x43; 32],
+        };
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("aggregate component validation budget should be enforced");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::AggregateComponentLimitExceeded
+        );
+    }
+
+    #[test]
+    fn selector_closure_rejects_missing_required_digest() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let mut selector = selector_with_paths(
+            [0x01; 32],
+            [0x02; 32],
+            [0x03; 32],
+            &["README.md", "src/lib.rs"],
+        );
+        selector.required_read_digests.remove("src/lib.rs");
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("missing required digest should fail selector closure");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::MissingRequiredReadDigest
+        );
+    }
+
+    #[test]
+    fn ambient_read_denial_rejects_unpinned_observed_dependency() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x11; 32], [0x22; 32], [0x33; 32], &["README.md"]);
+
+        let mut observed = BTreeSet::new();
+        observed.insert("src/ambient.rs".to_string());
+        let error = compiler
+            .compile_with_observed_reads(&selector, &observed, 42)
+            .expect_err("unhash-pinned observed dependency must be rejected");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::AmbientReadNotHashPinned
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn observed_read_backslash_path_is_rejected_before_aliasing() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("a")).expect("a dir should be created");
+        fs::write(workspace.path().join("a/b"), b"slash path").expect("a/b should be created");
+        fs::write(workspace.path().join("a\\b"), b"literal backslash filename")
+            .expect("a\\\\b should be created");
+
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x11; 32], [0x22; 32], [0x33; 32], &["a/b"]);
+
+        let mut observed = BTreeSet::new();
+        observed.insert("a\\b".to_string());
+
+        let error = compiler
+            .compile_with_observed_reads(&selector, &observed, 7)
+            .expect_err("backslash observed path must fail before any aliasing can occur");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::BackslashInPathComponent
+        );
+    }
+
+    #[test]
+    fn drift_fingerprint_changes_when_selector_changes() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let base_selector = selector_with_paths([0xA1; 32], [0xB2; 32], [0xC3; 32], &["README.md"]);
+        let same_selector = selector_with_paths([0xA1; 32], [0xB2; 32], [0xC3; 32], &["README.md"]);
+        let changed_selector =
+            selector_with_paths([0xA1; 32], [0xB2; 32], [0xC3; 32], &["docs/spec.md"]);
+
+        let first = compiler
+            .compile(&base_selector)
+            .expect("base compile should pass");
+        let second = compiler
+            .compile(&same_selector)
+            .expect("same compile should pass");
+        let changed = compiler
+            .compile(&changed_selector)
+            .expect("changed compile should pass");
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_ne!(first.fingerprint, changed.fingerprint);
+        assert_ne!(
+            first.fingerprint.required_read_digest_set_hash,
+            changed.fingerprint.required_read_digest_set_hash
+        );
+        assert_ne!(
+            first
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute"),
+            changed
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute")
+        );
+    }
+
+    #[test]
+    fn reconstruct_round_trip_from_cas_succeeds() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let cas = MemoryCas::new();
+
+        let role_hash = cas
+            .store(b"role-spec-v2")
+            .expect("role hash should store")
+            .hash;
+        let context_manifest_hash = cas
+            .store(b"context-manifest")
+            .expect("manifest hash should store")
+            .hash;
+        let budget_profile_hash = cas
+            .store(b"budget-profile")
+            .expect("budget hash should store")
+            .hash;
+
+        let selector = selector_with_paths(
+            role_hash,
+            context_manifest_hash,
+            budget_profile_hash,
+            &["README.md", "src/lib.rs"],
+        );
+        let compilation = compiler.compile(&selector).expect("compile should pass");
+
+        let required_digest_payload = compilation
+            .recipe
+            .required_read_digest_payload()
+            .expect("required-read payload should encode");
+        let required_store = cas
+            .store(&required_digest_payload)
+            .expect("required digest payload should store");
+        assert_eq!(
+            required_store.hash,
+            compilation.fingerprint.required_read_digest_set_hash
+        );
+
+        let recipe_bytes = compilation
+            .recipe
+            .canonical_bytes()
+            .expect("recipe canonical bytes should serialize");
+        let recipe_store = cas.store(&recipe_bytes).expect("recipe should store");
+        assert_eq!(recipe_store.hash, compilation.fingerprint.recipe_hash);
+
+        let reconstructed = reconstruct_from_receipts(&cas, &compilation.fingerprint)
+            .expect("reconstruction should succeed");
+
+        assert_eq!(reconstructed.role_spec_hash, role_hash);
+        assert_eq!(reconstructed.context_manifest_hash, context_manifest_hash);
+        assert_eq!(reconstructed.budget_profile_hash, budget_profile_hash);
+        assert_eq!(
+            reconstructed.required_read_paths,
+            vec!["README.md".to_string(), "src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn drift_fingerprint_round_trip_from_cas_succeeds() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let cas = MemoryCas::new();
+        let selector = selector_with_paths(
+            [0x71; 32],
+            [0x72; 32],
+            [0x73; 32],
+            &["README.md", "src/lib.rs"],
+        );
+
+        let compilation = compiler.compile(&selector).expect("compile should pass");
+        let fingerprint_hash = compilation
+            .fingerprint
+            .store_to_cas(&cas)
+            .expect("fingerprint should store to CAS");
+        let loaded = load_fingerprint_from_cas(&cas, &fingerprint_hash)
+            .expect("fingerprint should load from CAS");
+
+        assert_eq!(loaded, compilation.fingerprint);
+    }
+
+    #[test]
+    fn drift_fingerprint_binding_serialization_round_trip() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths(
+            [0x81; 32],
+            [0x82; 32],
+            [0x83; 32],
+            &["README.md", "src/lib.rs"],
+        );
+        let result = compiler.compile(&selector).expect("compile should pass");
+
+        let binding = result.bind_drift_fingerprint_to_run("work-object-17", 9, 1_700_000_000);
+        let encoded =
+            serde_json::to_vec(&binding).expect("binding serialization should produce JSON bytes");
+        let decoded: DriftFingerprintBinding =
+            serde_json::from_slice(&encoded).expect("binding deserialization should succeed");
+
+        assert_eq!(decoded, binding);
+    }
+
+    #[test]
+    fn drift_fingerprint_binding_supports_query_and_cross_run_comparison() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let selector = selector_with_paths(
+            [0x91; 32],
+            [0x92; 32],
+            [0x93; 32],
+            &["README.md", "src/lib.rs"],
+        );
+        let stable_a = compiler
+            .compile_with_observed_reads(&selector, &BTreeSet::new(), 10)
+            .expect("first compile should pass");
+        let stable_b = compiler
+            .compile_with_observed_reads(&selector, &BTreeSet::new(), 10)
+            .expect("second compile should pass");
+
+        let changed_selector =
+            selector_with_paths([0x91; 32], [0x92; 32], [0x93; 32], &["docs/spec.md"]);
+        let changed = compiler
+            .compile_with_observed_reads(&changed_selector, &BTreeSet::new(), 11)
+            .expect("changed compile should pass");
+
+        let stable_binding_a = stable_a.bind_drift_fingerprint_to_run("work-object-99", 1, 100);
+        let stable_binding_b = stable_b.bind_drift_fingerprint_to_run("work-object-99", 2, 200);
+        let changed_binding = changed.bind_drift_fingerprint_to_run("work-object-99", 3, 300);
+        let other_work_binding = stable_a.bind_drift_fingerprint_to_run("work-object-100", 1, 400);
+
+        assert!(stable_binding_a.is_for_work_object("work-object-99"));
+        assert_eq!(
+            stable_binding_b.drift_changed_from(&stable_binding_a),
+            Some(false)
+        );
+        assert_eq!(
+            changed_binding.drift_changed_from(&stable_binding_a),
+            Some(true)
+        );
+        assert_eq!(
+            stable_binding_a.drift_changed_from(&other_work_binding),
+            None
+        );
+    }
+
+    #[test]
+    fn reconstruct_fails_when_required_cas_entry_is_missing() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let cas = MemoryCas::new();
+
+        let role_hash = cas.store(b"role").expect("role hash should store").hash;
+        let context_manifest_hash = cas
+            .store(b"context")
+            .expect("context hash should store")
+            .hash;
+        let budget_profile_hash = cas.store(b"budget").expect("budget hash should store").hash;
+
+        let selector = selector_with_paths(
+            role_hash,
+            context_manifest_hash,
+            budget_profile_hash,
+            &["README.md"],
+        );
+        let compilation = compiler.compile(&selector).expect("compile should pass");
+
+        let recipe_bytes = compilation
+            .recipe
+            .canonical_bytes()
+            .expect("recipe canonical bytes should serialize");
+        cas.store(&recipe_bytes).expect("recipe should store");
+        // Intentionally skip storing required_read_digest_set payload.
+
+        let error = reconstruct_from_receipts(&cas, &compilation.fingerprint)
+            .expect_err("missing CAS digest entry must fail closed");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::MissingCasRequiredReadDigest
+        );
+    }
+
+    #[test]
+    fn recipe_validate_rejects_oversized_canonical_artifact() {
+        let mut required_read_paths = Vec::new();
+        let mut required_read_digests = BTreeMap::new();
+        let repeated_component = "component".repeat(16);
+
+        for index in 0..6_000usize {
+            let path = format!("oversized/{index:05}/{repeated_component}.txt");
+            required_read_paths.push(path.clone());
+            required_read_digests.insert(path, [0x5A; 32]);
+        }
+
+        let required_read_digest_set_hash =
+            compute_required_read_digest_set_hash(&required_read_digests)
+                .expect("digest set hash should compute");
+        let error = ContextPackRecipe::new(
+            [0x10; 32],
+            required_read_paths,
+            required_read_digests,
+            required_read_digest_set_hash,
+            [0x20; 32],
+            [0x30; 32],
+        )
+        .expect_err("oversized canonical recipe artifact should fail validation");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::ArtifactTooLarge
+        );
+    }
+
+    #[test]
+    fn reconstruct_rejects_oversized_recipe_artifact() {
+        let cas = MemoryCas::new();
+
+        let role_hash = cas.store(b"role").expect("role hash should store").hash;
+        let required_digest_hash = cas
+            .store(b"required-digest-set")
+            .expect("required digest set should store")
+            .hash;
+        let context_manifest_hash = cas
+            .store(b"context")
+            .expect("context hash should store")
+            .hash;
+        let budget_profile_hash = cas.store(b"budget").expect("budget hash should store").hash;
+
+        let oversized_recipe = vec![b'{'; MAX_RECIPE_ARTIFACT_BYTES + 1];
+        let recipe_hash = cas
+            .store(&oversized_recipe)
+            .expect("oversized recipe artifact should store")
+            .hash;
+
+        let fingerprint = DriftFingerprint {
+            role_hash,
+            required_read_digest_set_hash: required_digest_hash,
+            context_manifest_hash,
+            budget_profile_hash,
+            recipe_hash,
+            compiled_at_tick: 0,
+        };
+
+        let error = reconstruct_from_receipts(&cas, &fingerprint)
+            .expect_err("oversized recipe artifact should fail closed");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::ArtifactTooLarge
+        );
+    }
+}
