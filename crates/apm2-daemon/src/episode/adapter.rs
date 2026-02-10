@@ -13,6 +13,7 @@
 //!
 //! - [`AdapterType::Raw`]: Baseline adapter that emits unstructured output
 //! - [`AdapterType::ClaudeCode`]: (Future) Claude Code-specific parsing
+//! - [`AdapterType::Codex`]: Codex CLI TI1 tool-bridge adapter
 //!
 //! # Example
 //!
@@ -303,6 +304,12 @@ pub enum AdapterType {
     /// Parses Claude Code's output format to emit structured events
     /// including tool requests and progress updates.
     ClaudeCode,
+
+    /// Codex CLI adapter with TI1 delimiter-framed tool bridge.
+    ///
+    /// Parses only `⟦TI1 <nonce>⟧` frames for tool requests and treats all
+    /// other output as opaque internal agent state.
+    Codex,
 }
 
 impl fmt::Display for AdapterType {
@@ -310,6 +317,7 @@ impl fmt::Display for AdapterType {
         match self {
             Self::Raw => write!(f, "raw"),
             Self::ClaudeCode => write!(f, "claude_code"),
+            Self::Codex => write!(f, "codex"),
         }
     }
 }
@@ -1553,6 +1561,7 @@ mod tests {
     fn test_adapter_type_display() {
         assert_eq!(AdapterType::Raw.to_string(), "raw");
         assert_eq!(AdapterType::ClaudeCode.to_string(), "claude_code");
+        assert_eq!(AdapterType::Codex.to_string(), "codex");
     }
 
     #[test]
@@ -1564,6 +1573,10 @@ mod tests {
         let claude = AdapterType::ClaudeCode;
         let json = serde_json::to_string(&claude).unwrap();
         assert_eq!(json, "\"claude_code\"");
+
+        let codex = AdapterType::Codex;
+        let json = serde_json::to_string(&codex).unwrap();
+        assert_eq!(json, "\"codex\"");
     }
 
     #[test]
@@ -1573,6 +1586,9 @@ mod tests {
 
         let claude: AdapterType = serde_json::from_str("\"claude_code\"").unwrap();
         assert_eq!(claude, AdapterType::ClaudeCode);
+
+        let codex: AdapterType = serde_json::from_str("\"codex\"").unwrap();
+        assert_eq!(codex, AdapterType::Codex);
     }
 
     #[test]

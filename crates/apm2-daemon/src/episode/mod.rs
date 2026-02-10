@@ -123,6 +123,10 @@ pub mod registry;
 pub mod claude_code;
 pub mod claude_parser;
 
+// TCK-00402: Codex CLI adapter with TI1 tool bridge
+pub mod codex_cli;
+pub mod ti1_scanner;
+
 // TCK-00163: Capability manifest and validation
 pub mod capability;
 pub mod reviewer_manifest;
@@ -193,6 +197,10 @@ pub use claude_parser::{
     ClaudeCodeParser, DEFAULT_RATE_LIMIT_PER_SEC, MAX_BUFFER_SIZE,
     MAX_TOOL_ARGS_SIZE as CLAUDE_MAX_TOOL_ARGS_SIZE, MAX_TOOL_NAME_LEN, ParseResult,
     ParsedToolCall, ParserDefect, ParserState, strip_ansi,
+};
+pub use codex_cli::{
+    CodexCliAdapter, CodexCliAdapterConfig, CodexCliHolon, CodexCliOutput, CodexCliState,
+    SharedCodexCliState, build_codex_harness_config,
 };
 pub use decision::{
     BrokerResponse, BrokerToolRequest, BudgetDelta, DedupeKey, DedupeKeyError, MAX_DEDUPE_KEY_LEN,
@@ -266,6 +274,11 @@ pub use scope::{
 };
 pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
 pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
+pub use ti1_scanner::{
+    Ti1Frame, Ti1ParseError, Ti1ScannerConfig, compute_nonce, format_tr1_denial,
+    format_tr1_response, frame_to_harness_event, generate_ti1_preamble, parse_ti1_line,
+    scan_output,
+};
 pub use tool_class::{MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN, ToolClass, ToolClassExt};
 pub use tool_handler::{
     ARTIFACT_FETCH_MAX_BYTES, ArtifactArgs, ExecuteArgs, GIT_DIFF_MAX_BYTES, GIT_DIFF_MAX_LINES,

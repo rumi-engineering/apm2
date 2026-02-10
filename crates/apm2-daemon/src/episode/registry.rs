@@ -52,10 +52,13 @@
 use std::collections::HashMap;
 
 use apm2_core::evidence::ContentAddressedStore;
-use apm2_core::fac::{AgentAdapterProfileError, AgentAdapterProfileV1};
+use apm2_core::fac::{
+    AgentAdapterProfileError, AgentAdapterProfileV1, CODEX_CLI_PROFILE_ID, ToolBridgeConfig,
+};
 
 use super::adapter::{AdapterType, HarnessAdapter};
 use super::claude_code::{ClaudeCodeAdapter, ClaudeCodeHolon};
+use super::codex_cli::{CodexCliAdapter, CodexCliAdapterConfig};
 use super::raw_adapter::{RawAdapter, RawAdapterHolon};
 
 /// Error type for adapter registry operations.
@@ -205,11 +208,29 @@ impl AdapterRegistry {
             profile: Some(profile),
         };
 
-        // Register adapters
-        // Note: All adapter modes currently use the same set of adapters for FAC v0.
-        // As we implement specific bridging logic (e.g. MCP), this may diverge.
+        // Register baseline adapters.
         registry.register(Box::new(ClaudeCodeAdapter::new()));
         registry.register(Box::new(RawAdapter::new()));
+
+        // TCK-00402: Register Codex adapter when codex-cli-v1 is selected.
+        if let Some(profile) = registry.profile.as_ref() {
+            if profile.profile_id == CODEX_CLI_PROFILE_ID {
+                let tool_bridge = profile.tool_bridge.clone().ok_or_else(|| {
+                    AdapterRegistryError::ProfileInvalid(
+                        "codex-cli-v1 requires tool_bridge configuration".to_string(),
+                    )
+                })?;
+                validate_codex_tool_bridge(&tool_bridge)?;
+
+                let codex_config = CodexCliAdapterConfig {
+                    model: "gpt-5.3-codex".to_string(),
+                    tool_bridge_config: tool_bridge,
+                    capability_map: profile.capability_map.clone().into_iter().collect(),
+                    bypass_enabled: false,
+                };
+                registry.register(Box::new(CodexCliAdapter::with_config(codex_config)));
+            }
+        }
 
         Ok(registry)
     }
@@ -394,8 +415,28 @@ impl AdapterRegistry {
                 // Use create_claude_code_holon() for ClaudeCode adapters
                 None
             },
+            AdapterType::Codex => {
+                // Return None for backwards compatibility
+                // Codex-specific holon creation is via concrete adapter type.
+                None
+            },
         }
     }
+}
+
+fn validate_codex_tool_bridge(tb: &ToolBridgeConfig) -> Result<(), AdapterRegistryError> {
+    if !tb.enabled {
+        return Err(AdapterRegistryError::ProfileInvalid(
+            "codex-cli-v1 tool_bridge must be enabled".to_string(),
+        ));
+    }
+    if tb.protocol_version != "TI1" {
+        return Err(AdapterRegistryError::ProfileInvalid(format!(
+            "codex-cli-v1 requires TI1 protocol_version, got '{}'",
+            tb.protocol_version
+        )));
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for AdapterRegistry {
@@ -445,6 +486,7 @@ mod tests {
         let registry = AdapterRegistry::new();
         assert!(registry.get(AdapterType::Raw).is_none());
         assert!(registry.get(AdapterType::ClaudeCode).is_none());
+        assert!(registry.get(AdapterType::Codex).is_none());
     }
 
     #[test]
@@ -557,6 +599,14 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_create_holon_codex_returns_none() {
+        // create_holon returns None for Codex for backwards compatibility
+        let registry = AdapterRegistry::with_defaults();
+        let holon = registry.create_holon(AdapterType::Codex);
+        assert!(holon.is_none());
+    }
+
+    #[test]
     fn test_registry_create_multiple_holons() {
         let registry = AdapterRegistry::with_defaults();
 
@@ -664,6 +714,20 @@ mod tests {
         // Verify adapters are registered
         assert!(registry.contains(AdapterType::ClaudeCode));
         assert!(registry.contains(AdapterType::Raw));
+        assert!(!registry.contains(AdapterType::Codex));
+    }
+
+    #[test]
+    fn test_profile_registry_registers_codex_for_codex_profile() {
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::builtin_profiles::codex_cli_profile;
+
+        let profile = codex_cli_profile();
+        let cas = MemoryCas::new();
+        let hash = profile.store_in_cas(&cas).expect("store should succeed");
+
+        let registry = AdapterRegistry::with_profile(&cas, &hash).expect("load profile");
+        assert!(registry.contains(AdapterType::Codex));
     }
 
     #[test]

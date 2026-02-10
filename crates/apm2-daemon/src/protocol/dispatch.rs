@@ -10223,20 +10223,23 @@ impl PrivilegedDispatcher {
                 )
                 .map_err(|e| SpawnFailure::config(format!("adapter profile load failed: {e}")))?;
 
-                // SECURITY: Fail-closed adapter mode mapping.  Unknown or
-                // unsupported modes MUST be denied, not silently downgraded
-                // to Raw (MAJOR: fail-open fix).
-                let adapter_type = match profile.adapter_mode {
-                    apm2_core::fac::AdapterMode::StructuredOutput => {
-                        crate::episode::AdapterType::ClaudeCode
-                    },
-                    apm2_core::fac::AdapterMode::BlackBox => crate::episode::AdapterType::Raw,
-                    unsupported => {
-                        return Err(SpawnFailure::config(format!(
-                            "unsupported adapter mode '{unsupported}': \
-                             only BlackBox and StructuredOutput are supported"
-                        )));
-                    },
+                // SECURITY: Fail-closed adapter mapping. Unknown/unsupported
+                // profiles or modes MUST be denied, never silently downgraded.
+                let adapter_type = if profile.profile_id == apm2_core::fac::CODEX_CLI_PROFILE_ID {
+                    crate::episode::AdapterType::Codex
+                } else {
+                    match profile.adapter_mode {
+                        apm2_core::fac::AdapterMode::StructuredOutput => {
+                            crate::episode::AdapterType::ClaudeCode
+                        },
+                        apm2_core::fac::AdapterMode::BlackBox => crate::episode::AdapterType::Raw,
+                        unsupported => {
+                            return Err(SpawnFailure::config(format!(
+                                "unsupported adapter mode '{unsupported}': \
+                                 only BlackBox and StructuredOutput are supported"
+                            )));
+                        },
+                    }
                 };
 
                 let adapter = registry.get(adapter_type).ok_or_else(|| {
@@ -10244,6 +10247,12 @@ impl PrivilegedDispatcher {
                         "adapter type {adapter_type} not registered in registry"
                     ))
                 })?;
+
+                let model = if profile.profile_id == apm2_core::fac::CODEX_CLI_PROFILE_ID {
+                    "gpt-5.3-codex"
+                } else {
+                    &profile.profile_id
+                };
 
                 // Build HarnessConfig. Prompt is empty -- actual prompt
                 // delivery is via stdin/PTY, not in argv.
@@ -10253,7 +10262,7 @@ impl PrivilegedDispatcher {
                     episode_id.as_str(),
                     &request.workspace_root,
                     "",
-                    &profile.profile_id,
+                    model,
                     &session_token_secret,
                 )
                 .map_err(SpawnFailure::config)?;

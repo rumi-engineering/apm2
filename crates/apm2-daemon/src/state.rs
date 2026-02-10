@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use apm2_core::config::{AdapterRotationConfig, AdapterRotationStrategyConfig, EcosystemConfig};
 use apm2_core::credentials::{AuthMethod, CredentialProfile, CredentialStore, ProfileId, Provider};
 use apm2_core::fac::{
-    AdapterSelectionPolicy, AdapterSelectionStrategy, CLAUDE_CODE_PROFILE_ID,
+    AdapterSelectionPolicy, AdapterSelectionStrategy, CLAUDE_CODE_PROFILE_ID, CODEX_CLI_PROFILE_ID,
     GEMINI_CLI_PROFILE_ID, LOCAL_INFERENCE_PROFILE_ID, ProfileWeight, all_builtin_profiles,
 };
 use apm2_core::process::ProcessId;
@@ -104,12 +104,12 @@ fn is_profile_adapter_available(
     use crate::episode::AdapterType;
 
     match profile_id {
-        // Current spawn path uses Raw adapter for black-box profiles.
+        // Current spawn path uses Raw adapter for most black-box profiles.
         CLAUDE_CODE_PROFILE_ID | GEMINI_CLI_PROFILE_ID | LOCAL_INFERENCE_PROFILE_ID => {
             adapter_registry.contains(AdapterType::Raw)
         },
-        // All other profiles (including Codex) remain disabled until dedicated
-        // adapter support lands (TCK-00402).
+        // TCK-00402: codex-cli-v1 uses dedicated Codex adapter.
+        CODEX_CLI_PROFILE_ID => adapter_registry.contains(AdapterType::Codex),
         _ => false,
     }
 }
@@ -917,6 +917,7 @@ impl DispatcherState {
             adapter_registry.register(Box::new(
                 crate::episode::claude_code::ClaudeCodeAdapter::new(),
             ));
+            adapter_registry.register(Box::new(crate::episode::codex_cli::CodexCliAdapter::new()));
 
             // TCK-00399: CAS for adapter profile resolution during spawn.
             let cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
@@ -1308,6 +1309,7 @@ impl DispatcherState {
         adapter_registry.register(Box::new(
             crate::episode::claude_code::ClaudeCodeAdapter::new(),
         ));
+        adapter_registry.register(Box::new(crate::episode::codex_cli::CodexCliAdapter::new()));
         // TCK-00400: Store all builtin adapter profiles in CAS at startup.
         let profile_hashes = seed_builtin_profiles_in_cas(evidence_cas.as_ref()).map_err(|e| {
             DurableCasError::InitializationFailed {
