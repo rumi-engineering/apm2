@@ -45,6 +45,9 @@ pub const MAX_REQUIRED_READ_DIGESTS: usize = MAX_REQUIRED_READ_PATHS;
 /// Maximum allowed length of the workspace root path.
 pub const MAX_WORKSPACE_ROOT_LENGTH: usize = 4_096;
 
+/// Maximum recipe artifact size allowed during CAS replay reconstruction.
+pub const MAX_RECIPE_ARTIFACT_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Hash-pinned selector input for deterministic recipe compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPackSelectorInput {
@@ -93,6 +96,8 @@ pub enum RecipeCompilerReasonCode {
     RequiredReadPathTooLong,
     /// Required path contains an embedded null byte.
     RequiredReadPathContainsNull,
+    /// Required path contains a backslash character on non-Windows targets.
+    BackslashInPathComponent,
     /// Required path uses an absolute path.
     RequiredReadPathAbsolute,
     /// Required path contains traversal (`..`) components.
@@ -137,6 +142,8 @@ pub enum RecipeCompilerReasonCode {
     MissingCasBudgetProfileHash,
     /// Missing recipe artifact in CAS.
     MissingCasRecipeHash,
+    /// Recipe artifact exceeds the maximum decode size limit.
+    ArtifactTooLarge,
     /// CAS operation failed.
     CasOperationFailed,
     /// Serialization or canonicalization failed.
@@ -162,6 +169,7 @@ impl std::fmt::Display for RecipeCompilerReasonCode {
             Self::RequiredReadPathEmpty => "required_read_path_empty",
             Self::RequiredReadPathTooLong => "required_read_path_too_long",
             Self::RequiredReadPathContainsNull => "required_read_path_contains_null",
+            Self::BackslashInPathComponent => "backslash_in_path_component",
             Self::RequiredReadPathAbsolute => "required_read_path_absolute",
             Self::RequiredReadPathTraversal => "required_read_path_traversal",
             Self::RequiredReadPathTooManyComponents => "required_read_path_too_many_components",
@@ -184,6 +192,7 @@ impl std::fmt::Display for RecipeCompilerReasonCode {
             Self::MissingCasContextManifestHash => "missing_cas_context_manifest_hash",
             Self::MissingCasBudgetProfileHash => "missing_cas_budget_profile_hash",
             Self::MissingCasRecipeHash => "missing_cas_recipe_hash",
+            Self::ArtifactTooLarge => "artifact_too_large",
             Self::CasOperationFailed => "cas_operation_failed",
             Self::SerializationFailed => "serialization_failed",
             Self::DeserializationFailed => "deserialization_failed",
@@ -546,6 +555,14 @@ impl ContextPackRecipeCompiler {
                 path: Some(raw_path.to_string()),
             });
         }
+        #[cfg(not(windows))]
+        if raw_path.contains('\\') {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::BackslashInPathComponent,
+                message: "required read path contains backslash on non-Windows target".to_string(),
+                path: Some(raw_path.to_string()),
+            });
+        }
 
         let normalized_relative = normalize_required_read_path(raw_path)?;
         let candidate = self.workspace_root.join(&normalized_relative);
@@ -560,7 +577,7 @@ impl ContextPackRecipeCompiler {
 
         self.ensure_no_symlink_components(&candidate, raw_path)?;
 
-        Ok(path_to_forward_slashes(&normalized_relative))
+        Ok(normalized_required_read_path_string(&normalized_relative))
     }
 
     fn ensure_no_symlink_components(
@@ -940,6 +957,20 @@ pub fn reconstruct_from_receipts(
         RecipeCompilerReasonCode::MissingCasRecipeHash,
     )?;
 
+    let recipe_size = cas.size(&fingerprint.recipe_hash).map_err(|error| {
+        cas_error(
+            RecipeCompilerReasonCode::CasOperationFailed,
+            &fingerprint.recipe_hash,
+            &error,
+        )
+    })?;
+    if recipe_size > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error(
+            &fingerprint.recipe_hash,
+            recipe_size,
+        ));
+    }
+
     let recipe_bytes = cas.retrieve(&fingerprint.recipe_hash).map_err(|error| {
         cas_error(
             RecipeCompilerReasonCode::CasOperationFailed,
@@ -947,6 +978,12 @@ pub fn reconstruct_from_receipts(
             &error,
         )
     })?;
+    if recipe_bytes.len() > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error(
+            &fingerprint.recipe_hash,
+            recipe_bytes.len(),
+        ));
+    }
 
     let recipe: ContextPackRecipe = serde_json::from_slice(&recipe_bytes).map_err(|error| {
         RecipeCompilerError::Serialization {
@@ -1020,6 +1057,16 @@ fn cas_error(
     }
 }
 
+fn artifact_too_large_error(hash: &[u8; 32], size: usize) -> RecipeCompilerError {
+    RecipeCompilerError::Cas {
+        code: RecipeCompilerReasonCode::ArtifactTooLarge,
+        hash_hex: hex::encode(hash),
+        message: format!(
+            "recipe artifact exceeds maximum size ({size} > {MAX_RECIPE_ARTIFACT_BYTES})"
+        ),
+    }
+}
+
 fn validate_required_read_path_shape(path: &str) -> Result<(), RecipeCompilerError> {
     if path.is_empty() {
         return Err(RecipeCompilerError::RecipeValidation {
@@ -1041,6 +1088,13 @@ fn validate_required_read_path_shape(path: &str) -> Result<(), RecipeCompilerErr
         return Err(RecipeCompilerError::RecipeValidation {
             code: RecipeCompilerReasonCode::RequiredReadPathContainsNull,
             message: "required read path contains embedded null byte".to_string(),
+        });
+    }
+    #[cfg(not(windows))]
+    if path.contains('\\') {
+        return Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::BackslashInPathComponent,
+            message: "required read path contains backslash on non-Windows target".to_string(),
         });
     }
     let _ = normalize_required_read_path(path)?;
@@ -1096,8 +1150,19 @@ fn normalize_required_read_path(path: &str) -> Result<PathBuf, RecipeCompilerErr
     Ok(normalized)
 }
 
+#[cfg(windows)]
 fn path_to_forward_slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(windows)]
+fn normalized_required_read_path_string(path: &Path) -> String {
+    path_to_forward_slashes(path)
+}
+
+#[cfg(not(windows))]
+fn normalized_required_read_path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn build_required_read_digest_set_payload(
@@ -1376,6 +1441,28 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn selector_closure_rejects_backslash_path_to_prevent_aliasing() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("a")).expect("a dir should be created");
+        fs::write(workspace.path().join("a/b"), b"slash path").expect("a/b should be created");
+        fs::write(workspace.path().join("a\\b"), b"literal backslash filename")
+            .expect("a\\\\b should be created");
+
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x01; 32], [0x02; 32], [0x03; 32], &["a/b", "a\\b"]);
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("backslash path must be rejected on non-Windows targets");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::BackslashInPathComponent
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn selector_closure_rejects_symlink_path() {
@@ -1454,6 +1541,31 @@ mod tests {
         assert_eq!(
             error.reason_code(),
             RecipeCompilerReasonCode::AmbientReadNotHashPinned
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn observed_read_backslash_path_is_rejected_before_aliasing() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("a")).expect("a dir should be created");
+        fs::write(workspace.path().join("a/b"), b"slash path").expect("a/b should be created");
+        fs::write(workspace.path().join("a\\b"), b"literal backslash filename")
+            .expect("a\\\\b should be created");
+
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x11; 32], [0x22; 32], [0x33; 32], &["a/b"]);
+
+        let mut observed = BTreeSet::new();
+        observed.insert("a\\b".to_string());
+
+        let error = compiler
+            .compile_with_observed_reads(&selector, &observed, 7)
+            .expect_err("backslash observed path must fail before any aliasing can occur");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::BackslashInPathComponent
         );
     }
 
@@ -1589,6 +1701,44 @@ mod tests {
         assert_eq!(
             error.reason_code(),
             RecipeCompilerReasonCode::MissingCasRequiredReadDigest
+        );
+    }
+
+    #[test]
+    fn reconstruct_rejects_oversized_recipe_artifact() {
+        let cas = MemoryCas::new();
+
+        let role_hash = cas.store(b"role").expect("role hash should store").hash;
+        let required_digest_hash = cas
+            .store(b"required-digest-set")
+            .expect("required digest set should store")
+            .hash;
+        let context_manifest_hash = cas
+            .store(b"context")
+            .expect("context hash should store")
+            .hash;
+        let budget_profile_hash = cas.store(b"budget").expect("budget hash should store").hash;
+
+        let oversized_recipe = vec![b'{'; MAX_RECIPE_ARTIFACT_BYTES + 1];
+        let recipe_hash = cas
+            .store(&oversized_recipe)
+            .expect("oversized recipe artifact should store")
+            .hash;
+
+        let fingerprint = DriftFingerprint {
+            role_hash,
+            required_read_digest_set_hash: required_digest_hash,
+            context_manifest_hash,
+            budget_profile_hash,
+            recipe_hash,
+            compiled_at_tick: 0,
+        };
+
+        let error = reconstruct_from_receipts(&cas, &fingerprint)
+            .expect_err("oversized recipe artifact should fail closed");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::ArtifactTooLarge
         );
     }
 }
