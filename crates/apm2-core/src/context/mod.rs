@@ -88,7 +88,8 @@ pub use manifest::{
 pub use recipe::{
     CONTEXT_PACK_RECIPE_SCHEMA, CONTEXT_PACK_RECIPE_VERSION, CompiledContextPackRecipe,
     ContextPackRecipe, ContextPackRecipeCompiler, ContextPackSelectorInput, DriftFingerprint,
-    MAX_AGGREGATE_COMPONENTS, MAX_RECIPE_ARTIFACT_BYTES, MAX_REQUIRED_READ_PATH_COMPONENTS,
-    MAX_REQUIRED_READ_PATH_LENGTH, MAX_REQUIRED_READ_PATHS, MAX_WORKSPACE_ROOT_LENGTH,
-    RecipeCompilerError, RecipeCompilerReasonCode, reconstruct_from_receipts,
+    DriftFingerprintBinding, MAX_AGGREGATE_COMPONENTS, MAX_RECIPE_ARTIFACT_BYTES,
+    MAX_REQUIRED_READ_PATH_COMPONENTS, MAX_REQUIRED_READ_PATH_LENGTH, MAX_REQUIRED_READ_PATHS,
+    MAX_WORKSPACE_ROOT_LENGTH, RecipeCompilerError, RecipeCompilerReasonCode,
+    load_fingerprint_from_cas, reconstruct_from_receipts,
 };

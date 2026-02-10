@@ -79,6 +79,25 @@ pub struct CompiledContextPackRecipe {
     pub fingerprint: DriftFingerprint,
 }
 
+impl CompiledContextPackRecipe {
+    /// Binds this compilation fingerprint to a specific run identity so it can
+    /// be persisted and queried per run.
+    #[must_use]
+    pub fn bind_drift_fingerprint_to_run(
+        &self,
+        work_object_id: impl Into<String>,
+        epoch: u64,
+        timestamp_ns: u64,
+    ) -> DriftFingerprintBinding {
+        DriftFingerprintBinding::new(
+            work_object_id,
+            epoch,
+            timestamp_ns,
+            self.fingerprint.clone(),
+        )
+    }
+}
+
 /// Machine-readable reason codes for recipe compiler failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,8 +165,12 @@ pub enum RecipeCompilerReasonCode {
     MissingCasContextManifestHash,
     /// Missing budget profile hash artifact in CAS.
     MissingCasBudgetProfileHash,
+    /// Missing drift fingerprint artifact in CAS.
+    MissingCasFingerprint,
     /// Missing recipe artifact in CAS.
     MissingCasRecipeHash,
+    /// Storing an artifact in CAS failed.
+    CasStorageError,
     /// Recipe artifact exceeds the maximum decode size limit.
     ArtifactTooLarge,
     /// CAS operation failed.
@@ -198,7 +221,9 @@ impl std::fmt::Display for RecipeCompilerReasonCode {
             Self::MissingCasRequiredReadDigest => "missing_cas_required_read_digest",
             Self::MissingCasContextManifestHash => "missing_cas_context_manifest_hash",
             Self::MissingCasBudgetProfileHash => "missing_cas_budget_profile_hash",
+            Self::MissingCasFingerprint => "missing_cas_fingerprint",
             Self::MissingCasRecipeHash => "missing_cas_recipe_hash",
+            Self::CasStorageError => "cas_storage_error",
             Self::ArtifactTooLarge => "artifact_too_large",
             Self::CasOperationFailed => "cas_operation_failed",
             Self::SerializationFailed => "serialization_failed",
@@ -295,6 +320,8 @@ struct PathValidationSession {
     aggregate_components: usize,
     verified_prefixes: HashSet<PathBuf>,
 }
+
+type NormalizedSelectorClosure = (Vec<String>, BTreeMap<String, [u8; 32]>);
 
 impl ContextPackRecipeCompiler {
     /// Creates a compiler rooted at `workspace_root`.
@@ -395,18 +422,18 @@ impl ContextPackRecipeCompiler {
         compiled_at_tick: u64,
     ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
         let mut path_validation = PathValidationSession::default();
-        let normalized_paths = self.validate_selector_closure(
+        let (normalized_paths, normalized_digest_map) = self.validate_selector_closure(
             &selector.required_read_paths,
             &selector.required_read_digests,
             &mut path_validation,
         )?;
         let required_read_digest_set_hash =
-            compute_required_read_digest_set_hash(&selector.required_read_digests)?;
+            compute_required_read_digest_set_hash(&normalized_digest_map)?;
 
         let recipe = ContextPackRecipe::new(
             selector.role_spec_hash,
             normalized_paths,
-            selector.required_read_digests.clone(),
+            normalized_digest_map,
             required_read_digest_set_hash,
             selector.context_manifest_hash,
             selector.budget_profile_hash,
@@ -438,7 +465,7 @@ impl ContextPackRecipeCompiler {
         required_read_paths: &BTreeSet<String>,
         required_read_digests: &BTreeMap<String, [u8; 32]>,
         path_validation: &mut PathValidationSession,
-    ) -> Result<Vec<String>, RecipeCompilerError> {
+    ) -> Result<NormalizedSelectorClosure, RecipeCompilerError> {
         if required_read_paths.is_empty() {
             return Err(RecipeCompilerError::SelectorClosure {
                 code: RecipeCompilerReasonCode::EmptyRequiredReadPaths,
@@ -523,7 +550,7 @@ impl ContextPackRecipeCompiler {
         }
 
         normalized.sort_unstable();
-        Ok(normalized)
+        Ok((normalized, normalized_digest_map))
     }
 
     fn enforce_observed_dependencies_hash_pinned(
@@ -971,6 +998,144 @@ impl DriftFingerprint {
     pub fn fingerprint_hash(&self) -> Result<[u8; 32], RecipeCompilerError> {
         self.compute_fingerprint()
     }
+
+    /// Stores this fingerprint in CAS using canonical JSON bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization or CAS storage
+    /// fails.
+    pub fn store_to_cas(
+        &self,
+        cas: &dyn ContentAddressedStore,
+    ) -> Result<[u8; 32], RecipeCompilerError> {
+        let bytes = self.canonical_bytes()?;
+        let hash = *blake3::hash(&bytes).as_bytes();
+
+        cas.store(&bytes)
+            .map_err(|error| RecipeCompilerError::Cas {
+                code: RecipeCompilerReasonCode::CasStorageError,
+                hash_hex: hex::encode(hash),
+                message: format!("failed to store fingerprint: {error}"),
+            })?;
+
+        Ok(hash)
+    }
+}
+
+/// Drift fingerprint bound to run/work identity for persistence and
+/// cross-run comparison queries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftFingerprintBinding {
+    /// Canonical work object identity.
+    pub work_object_id: String,
+    /// Consensus/runtime epoch for the run.
+    pub epoch: u64,
+    /// Binding timestamp in Unix nanoseconds.
+    pub timestamp_ns: u64,
+    /// Drift fingerprint emitted by recipe compilation.
+    pub fingerprint: DriftFingerprint,
+}
+
+impl DriftFingerprintBinding {
+    /// Creates a new run-scoped drift fingerprint binding.
+    #[must_use]
+    pub fn new(
+        work_object_id: impl Into<String>,
+        epoch: u64,
+        timestamp_ns: u64,
+        fingerprint: DriftFingerprint,
+    ) -> Self {
+        Self {
+            work_object_id: work_object_id.into(),
+            epoch,
+            timestamp_ns,
+            fingerprint,
+        }
+    }
+
+    /// Returns true when this binding belongs to the given work object.
+    #[must_use]
+    pub fn is_for_work_object(&self, work_object_id: &str) -> bool {
+        self.work_object_id == work_object_id
+    }
+
+    /// Returns drift-change status when two bindings are comparable (same work
+    /// object). Returns `None` when they represent different work objects.
+    #[must_use]
+    pub fn drift_changed_from(&self, other: &Self) -> Option<bool> {
+        if self.work_object_id != other.work_object_id {
+            return None;
+        }
+        Some(self.fingerprint != other.fingerprint)
+    }
+}
+
+/// Loads a drift fingerprint from CAS by hash.
+///
+/// # Errors
+///
+/// Returns [`RecipeCompilerError`] if the fingerprint is missing, exceeds size
+/// bounds, CAS retrieval fails, or deserialization fails.
+pub fn load_fingerprint_from_cas(
+    cas: &dyn ContentAddressedStore,
+    hash: &[u8; 32],
+) -> Result<DriftFingerprint, RecipeCompilerError> {
+    let artifact_size = match cas.size(hash) {
+        Ok(size) => size,
+        Err(CasError::NotFound { .. }) => {
+            return Err(RecipeCompilerError::Cas {
+                code: RecipeCompilerReasonCode::MissingCasFingerprint,
+                hash_hex: hex::encode(hash),
+                message: "fingerprint not found in CAS".to_string(),
+            });
+        },
+        Err(error) => {
+            return Err(cas_error(
+                RecipeCompilerReasonCode::CasOperationFailed,
+                hash,
+                &error,
+            ));
+        },
+    };
+    if artifact_size > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error_with_kind(
+            hash,
+            artifact_size,
+            "fingerprint",
+        ));
+    }
+
+    let bytes = match cas.retrieve(hash) {
+        Ok(bytes) => bytes,
+        Err(CasError::NotFound { .. }) => {
+            return Err(RecipeCompilerError::Cas {
+                code: RecipeCompilerReasonCode::MissingCasFingerprint,
+                hash_hex: hex::encode(hash),
+                message: "fingerprint not found in CAS".to_string(),
+            });
+        },
+        Err(error) => {
+            return Err(cas_error(
+                RecipeCompilerReasonCode::CasOperationFailed,
+                hash,
+                &error,
+            ));
+        },
+    };
+    if bytes.len() > MAX_RECIPE_ARTIFACT_BYTES {
+        return Err(artifact_too_large_error_with_kind(
+            hash,
+            bytes.len(),
+            "fingerprint",
+        ));
+    }
+
+    serde_json::from_slice(&bytes).map_err(|error| RecipeCompilerError::Serialization {
+        code: RecipeCompilerReasonCode::DeserializationFailed,
+        message: error.to_string(),
+    })
 }
 
 /// Reconstructs a recipe from receipt-bound hashes in CAS.
@@ -1113,11 +1278,19 @@ fn cas_error(
 }
 
 fn artifact_too_large_error(hash: &[u8; 32], size: usize) -> RecipeCompilerError {
+    artifact_too_large_error_with_kind(hash, size, "recipe")
+}
+
+fn artifact_too_large_error_with_kind(
+    hash: &[u8; 32],
+    size: usize,
+    artifact_kind: &str,
+) -> RecipeCompilerError {
     RecipeCompilerError::Cas {
         code: RecipeCompilerReasonCode::ArtifactTooLarge,
         hash_hex: hex::encode(hash),
         message: format!(
-            "recipe artifact exceeds maximum size ({size} > {MAX_RECIPE_ARTIFACT_BYTES})"
+            "{artifact_kind} artifact exceeds maximum size ({size} > {MAX_RECIPE_ARTIFACT_BYTES})"
         ),
     }
 }
@@ -1481,6 +1654,132 @@ mod tests {
     }
 
     #[test]
+    fn compile_normalizes_digest_keys_for_deterministic_recipe_hash() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("test")).expect("test dir should be created");
+        fs::write(workspace.path().join("test/foo.txt"), b"selector fixture")
+            .expect("test fixture should be created");
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let mut required_read_paths_a = BTreeSet::new();
+        required_read_paths_a.insert("./test/foo.txt".to_string());
+        let mut required_read_digests_a = BTreeMap::new();
+        required_read_digests_a.insert("./test/foo.txt".to_string(), [0xAB; 32]);
+
+        let selector_a = ContextPackSelectorInput {
+            role_spec_hash: [0x31; 32],
+            required_read_paths: required_read_paths_a,
+            required_read_digests: required_read_digests_a,
+            context_manifest_hash: [0x32; 32],
+            budget_profile_hash: [0x33; 32],
+        };
+
+        let mut required_read_paths_b = BTreeSet::new();
+        required_read_paths_b.insert("test/foo.txt".to_string());
+        let mut required_read_digests_b = BTreeMap::new();
+        required_read_digests_b.insert("test/foo.txt".to_string(), [0xAB; 32]);
+
+        let selector_b = ContextPackSelectorInput {
+            role_spec_hash: [0x31; 32],
+            required_read_paths: required_read_paths_b,
+            required_read_digests: required_read_digests_b,
+            context_manifest_hash: [0x32; 32],
+            budget_profile_hash: [0x33; 32],
+        };
+
+        let first = compiler
+            .compile(&selector_a)
+            .expect("compile with dot-prefix path should pass");
+        let second = compiler
+            .compile(&selector_b)
+            .expect("compile with normalized path should pass");
+
+        assert_eq!(
+            first
+                .recipe
+                .recipe_hash()
+                .expect("recipe hash should compute"),
+            second
+                .recipe
+                .recipe_hash()
+                .expect("recipe hash should compute")
+        );
+        assert_eq!(
+            first.fingerprint.recipe_hash,
+            second.fingerprint.recipe_hash
+        );
+        assert_eq!(
+            first
+                .recipe
+                .required_read_digests
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["test/foo.txt"]
+        );
+    }
+
+    #[test]
+    fn compile_normalizes_mixed_equivalent_selector_and_digest_map_paths() {
+        let workspace = setup_workspace();
+        fs::create_dir_all(workspace.path().join("test")).expect("test dir should be created");
+        fs::write(workspace.path().join("test/foo.txt"), b"selector fixture")
+            .expect("test fixture should be created");
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let mut mixed_paths = BTreeSet::new();
+        mixed_paths.insert("./test/foo.txt/".to_string());
+        let mut mixed_digests = BTreeMap::new();
+        mixed_digests.insert("./test/./foo.txt/".to_string(), [0xCD; 32]);
+
+        let mixed_selector = ContextPackSelectorInput {
+            role_spec_hash: [0x41; 32],
+            required_read_paths: mixed_paths,
+            required_read_digests: mixed_digests,
+            context_manifest_hash: [0x42; 32],
+            budget_profile_hash: [0x43; 32],
+        };
+
+        let mut canonical_paths = BTreeSet::new();
+        canonical_paths.insert("test/foo.txt".to_string());
+        let mut canonical_digests = BTreeMap::new();
+        canonical_digests.insert("test/foo.txt".to_string(), [0xCD; 32]);
+
+        let canonical_selector = ContextPackSelectorInput {
+            role_spec_hash: [0x41; 32],
+            required_read_paths: canonical_paths,
+            required_read_digests: canonical_digests,
+            context_manifest_hash: [0x42; 32],
+            budget_profile_hash: [0x43; 32],
+        };
+
+        let mixed = compiler
+            .compile(&mixed_selector)
+            .expect("compile with mixed equivalent paths should pass");
+        let canonical = compiler
+            .compile(&canonical_selector)
+            .expect("compile with canonical paths should pass");
+
+        assert_eq!(
+            mixed.recipe.required_read_paths,
+            vec!["test/foo.txt".to_string()]
+        );
+        assert!(
+            mixed
+                .recipe
+                .required_read_digests
+                .contains_key("test/foo.txt")
+        );
+        assert_eq!(
+            mixed.recipe.required_read_digest_set_hash,
+            canonical.recipe.required_read_digest_set_hash
+        );
+        assert_eq!(mixed.fingerprint, canonical.fingerprint);
+    }
+
+    #[test]
     fn selector_closure_rejects_path_traversal() {
         let workspace = setup_workspace();
         let compiler =
@@ -1759,6 +2058,97 @@ mod tests {
         assert_eq!(
             reconstructed.required_read_paths,
             vec!["README.md".to_string(), "src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn drift_fingerprint_round_trip_from_cas_succeeds() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let cas = MemoryCas::new();
+        let selector = selector_with_paths(
+            [0x71; 32],
+            [0x72; 32],
+            [0x73; 32],
+            &["README.md", "src/lib.rs"],
+        );
+
+        let compilation = compiler.compile(&selector).expect("compile should pass");
+        let fingerprint_hash = compilation
+            .fingerprint
+            .store_to_cas(&cas)
+            .expect("fingerprint should store to CAS");
+        let loaded = load_fingerprint_from_cas(&cas, &fingerprint_hash)
+            .expect("fingerprint should load from CAS");
+
+        assert_eq!(loaded, compilation.fingerprint);
+    }
+
+    #[test]
+    fn drift_fingerprint_binding_serialization_round_trip() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths(
+            [0x81; 32],
+            [0x82; 32],
+            [0x83; 32],
+            &["README.md", "src/lib.rs"],
+        );
+        let result = compiler.compile(&selector).expect("compile should pass");
+
+        let binding = result.bind_drift_fingerprint_to_run("work-object-17", 9, 1_700_000_000);
+        let encoded =
+            serde_json::to_vec(&binding).expect("binding serialization should produce JSON bytes");
+        let decoded: DriftFingerprintBinding =
+            serde_json::from_slice(&encoded).expect("binding deserialization should succeed");
+
+        assert_eq!(decoded, binding);
+    }
+
+    #[test]
+    fn drift_fingerprint_binding_supports_query_and_cross_run_comparison() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let selector = selector_with_paths(
+            [0x91; 32],
+            [0x92; 32],
+            [0x93; 32],
+            &["README.md", "src/lib.rs"],
+        );
+        let stable_a = compiler
+            .compile_with_observed_reads(&selector, &BTreeSet::new(), 10)
+            .expect("first compile should pass");
+        let stable_b = compiler
+            .compile_with_observed_reads(&selector, &BTreeSet::new(), 10)
+            .expect("second compile should pass");
+
+        let changed_selector =
+            selector_with_paths([0x91; 32], [0x92; 32], [0x93; 32], &["docs/spec.md"]);
+        let changed = compiler
+            .compile_with_observed_reads(&changed_selector, &BTreeSet::new(), 11)
+            .expect("changed compile should pass");
+
+        let stable_binding_a = stable_a.bind_drift_fingerprint_to_run("work-object-99", 1, 100);
+        let stable_binding_b = stable_b.bind_drift_fingerprint_to_run("work-object-99", 2, 200);
+        let changed_binding = changed.bind_drift_fingerprint_to_run("work-object-99", 3, 300);
+        let other_work_binding = stable_a.bind_drift_fingerprint_to_run("work-object-100", 1, 400);
+
+        assert!(stable_binding_a.is_for_work_object("work-object-99"));
+        assert_eq!(
+            stable_binding_b.drift_changed_from(&stable_binding_a),
+            Some(false)
+        );
+        assert_eq!(
+            changed_binding.drift_changed_from(&stable_binding_a),
+            Some(true)
+        );
+        assert_eq!(
+            stable_binding_a.drift_changed_from(&other_work_binding),
+            None
         );
     }
 
