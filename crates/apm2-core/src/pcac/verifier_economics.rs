@@ -26,6 +26,10 @@ pub struct VerifierEconomicsProfile {
     pub p95_replay_lifecycle_us: u64,
     /// p95 upper bound for anti-entropy verification operations (microseconds).
     pub p95_anti_entropy_us: u64,
+    /// p95 upper bound for the entire `revalidate` stage (microseconds).
+    pub p95_revalidate_us: u64,
+    /// p95 upper bound for the entire `consume` stage (microseconds).
+    pub p95_consume_us: u64,
     /// Maximum allowed cryptographic proof checks per verification operation.
     ///
     /// This bound applies only to cryptographic verification work
@@ -45,6 +49,9 @@ impl Default for VerifierEconomicsProfile {
             p95_replay_lifecycle_us: 10_000,
             // Anti-entropy verification may include digest + transfer checks.
             p95_anti_entropy_us: 50_000,
+            // Stage-level envelopes include sub-check operations.
+            p95_revalidate_us: 30_000,
+            p95_consume_us: 30_000,
             // Conservative cryptographic-check budget per verifier call.
             max_proof_checks: 256,
         }
@@ -66,6 +73,10 @@ pub enum VerifierOperation {
     ValidateReplayLifecycleOrder,
     /// Timing sample for anti-entropy verification.
     AntiEntropy,
+    /// Wall-clock timing for the entire `revalidate` stage.
+    Revalidate,
+    /// Wall-clock timing for the entire `consume` stage.
+    Consume,
 }
 
 impl std::fmt::Display for VerifierOperation {
@@ -77,6 +88,8 @@ impl std::fmt::Display for VerifierOperation {
             Self::ClassifyFact => write!(f, "classify_fact"),
             Self::ValidateReplayLifecycleOrder => write!(f, "validate_replay_lifecycle_order"),
             Self::AntiEntropy => write!(f, "anti_entropy_verification"),
+            Self::Revalidate => write!(f, "revalidate"),
+            Self::Consume => write!(f, "consume"),
         }
     }
 }
@@ -103,6 +116,8 @@ impl VerifierEconomicsChecker {
             VerifierOperation::ClassifyFact => self.profile.p95_classify_fact_us,
             VerifierOperation::ValidateReplayLifecycleOrder => self.profile.p95_replay_lifecycle_us,
             VerifierOperation::AntiEntropy => self.profile.p95_anti_entropy_us,
+            VerifierOperation::Revalidate => self.profile.p95_revalidate_us,
+            VerifierOperation::Consume => self.profile.p95_consume_us,
         }
     }
 
@@ -175,6 +190,8 @@ mod tests {
             p95_classify_fact_us: 30,
             p95_replay_lifecycle_us: 40,
             p95_anti_entropy_us: 50,
+            p95_revalidate_us: 60,
+            p95_consume_us: 70,
             max_proof_checks: 3,
         }
     }
@@ -239,6 +256,8 @@ mod tests {
                 51,
                 "anti_entropy_verification",
             ),
+            (VerifierOperation::Revalidate, 61, "revalidate"),
+            (VerifierOperation::Consume, 71, "consume"),
         ];
 
         for (operation, elapsed, expected_name) in cases {
@@ -262,6 +281,8 @@ mod tests {
         assert_eq!(profile.p95_classify_fact_us, 10_000);
         assert_eq!(profile.p95_replay_lifecycle_us, 10_000);
         assert_eq!(profile.p95_anti_entropy_us, 50_000);
+        assert_eq!(profile.p95_revalidate_us, 30_000);
+        assert_eq!(profile.p95_consume_us, 30_000);
         assert_eq!(profile.max_proof_checks, 256);
     }
 
@@ -274,6 +295,8 @@ mod tests {
             p95_classify_fact_us: 333,
             p95_replay_lifecycle_us: 444,
             p95_anti_entropy_us: 555,
+            p95_revalidate_us: 666,
+            p95_consume_us: 777,
             max_proof_checks: 666,
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -284,6 +307,8 @@ mod tests {
         assert_eq!(decoded.p95_classify_fact_us, 333);
         assert_eq!(decoded.p95_replay_lifecycle_us, 444);
         assert_eq!(decoded.p95_anti_entropy_us, 555);
+        assert_eq!(decoded.p95_revalidate_us, 666);
+        assert_eq!(decoded.p95_consume_us, 777);
         assert_eq!(decoded.max_proof_checks, 666);
     }
 
@@ -296,6 +321,8 @@ mod tests {
             p95_classify_fact_us: 0,
             p95_replay_lifecycle_us: 0,
             p95_anti_entropy_us: 0,
+            p95_revalidate_us: 0,
+            p95_consume_us: 0,
             max_proof_checks: 0,
         });
         let err = checker

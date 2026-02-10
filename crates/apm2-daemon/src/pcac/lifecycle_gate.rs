@@ -34,7 +34,7 @@ use apm2_core::pcac::{
     SovereigntyEnforcementMode, VerifierEconomicsChecker, VerifierEconomicsProfile,
     VerifierOperation, record_anti_entropy_event_metrics, record_verifier_metrics,
     timed_anti_entropy_verification, timed_classify_fact, timed_validate_authoritative_bindings,
-    timed_validate_replay_lifecycle_order,
+    timed_validate_replay_lifecycle_order, timed_verify_receipt_authentication,
 };
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -1095,6 +1095,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             current_ledger_anchor,
             tick,
         )?;
+        let revalidate_started_at = Instant::now();
 
         match cert.risk_tier {
             RiskTier::Tier0 | RiskTier::Tier1 | RiskTier::Tier2Plus => {},
@@ -1215,6 +1216,27 @@ impl AuthorityJoinKernel for InProcessKernel {
             tick,
         )?;
 
+        // TCK-00429: enforce declared receipt-auth timing bound separately.
+        let timed_receipt_auth = timed_verify_receipt_authentication(
+            &bindings.authentication,
+            &cert.ajc_id,
+            None,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            tick,
+        );
+        timed_receipt_auth.result?;
+        self.enforce_verifier_economics_sample(
+            VerifierOperation::VerifyReceiptAuthentication,
+            timed_receipt_auth.elapsed_us,
+            timed_receipt_auth.proof_check_count,
+            cert.risk_tier,
+            Some(cert.ajc_id),
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            tick,
+        )?;
+
         let timed_classification = timed_classify_fact(
             Some(&bindings),
             &cert.ajc_id,
@@ -1250,6 +1272,17 @@ impl AuthorityJoinKernel for InProcessKernel {
             tick,
         )?;
 
+        self.enforce_verifier_economics_sample(
+            VerifierOperation::Revalidate,
+            u64::try_from(revalidate_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            0, // stage-level doesn't track individual proof checks
+            cert.risk_tier,
+            Some(cert.ajc_id),
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            tick,
+        )?;
+
         Ok(())
     }
 
@@ -1278,6 +1311,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             cert.as_of_ledger_anchor,
             tick,
         )?;
+        let consume_started_at = Instant::now();
 
         if cert.issued_at_tick == 0 {
             return Err(Self::deny(
@@ -1458,6 +1492,17 @@ impl AuthorityJoinKernel for InProcessKernel {
             consumed_at_tick: tick,
             effect_selector_digest,
         };
+
+        self.enforce_verifier_economics_sample(
+            VerifierOperation::Consume,
+            u64::try_from(consume_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            0, // stage-level doesn't track individual proof checks
+            cert.risk_tier,
+            Some(cert.ajc_id),
+            current_time_envelope_ref,
+            cert.as_of_ledger_anchor,
+            tick,
+        )?;
 
         Ok((consumed_witness, consume_record))
     }

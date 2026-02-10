@@ -63,6 +63,8 @@ const fn permissive_timing_profile(max_proof_checks: u64) -> VerifierEconomicsPr
         p95_classify_fact_us: u64::MAX,
         p95_replay_lifecycle_us: u64::MAX,
         p95_anti_entropy_us: u64::MAX,
+        p95_revalidate_us: u64::MAX,
+        p95_consume_us: u64::MAX,
         max_proof_checks,
     }
 }
@@ -147,6 +149,8 @@ fn test_join_operation_uses_join_metric_and_enforces_join_bound() {
         p95_classify_fact_us: u64::MAX,
         p95_replay_lifecycle_us: u64::MAX,
         p95_anti_entropy_us: u64::MAX,
+        p95_revalidate_us: u64::MAX,
+        p95_consume_us: u64::MAX,
         max_proof_checks: u64::MAX,
     });
     let input = valid_input(RiskTier::Tier2Plus, 1, 0x22);
@@ -348,6 +352,30 @@ fn test_evid_0005_benchmark_output() {
     let consume_p95 = p95(&mut consume_samples);
     let anti_entropy_p95 = p95(&mut anti_entropy_samples);
 
+    // Assert p95 values are within declared profile thresholds.
+    // Use 10x tolerance for CI environment variability.
+    let tolerance = 10;
+    assert!(
+        join_p95 <= profile.p95_join_us * tolerance,
+        "join p95 ({join_p95}) exceeds profile threshold ({}) with {tolerance}x tolerance",
+        profile.p95_join_us,
+    );
+    assert!(
+        revalidate_p95 <= profile.p95_revalidate_us * tolerance,
+        "revalidate p95 ({revalidate_p95}) exceeds profile threshold ({}) with {tolerance}x tolerance",
+        profile.p95_revalidate_us,
+    );
+    assert!(
+        consume_p95 <= profile.p95_consume_us * tolerance,
+        "consume p95 ({consume_p95}) exceeds profile threshold ({}) with {tolerance}x tolerance",
+        profile.p95_consume_us,
+    );
+    assert!(
+        anti_entropy_p95 <= profile.p95_anti_entropy_us * tolerance,
+        "anti-entropy p95 ({anti_entropy_p95}) exceeds profile threshold ({}) with {tolerance}x tolerance",
+        profile.p95_anti_entropy_us,
+    );
+
     let tier2_join_deny = {
         let kernel = InProcessKernel::new(200).with_verifier_economics(VerifierEconomicsProfile {
             p95_join_us: 0,
@@ -356,6 +384,8 @@ fn test_evid_0005_benchmark_output() {
             p95_classify_fact_us: u64::MAX,
             p95_replay_lifecycle_us: u64::MAX,
             p95_anti_entropy_us: u64::MAX,
+            p95_revalidate_us: u64::MAX,
+            p95_consume_us: u64::MAX,
             max_proof_checks: u64::MAX,
         });
         let input = valid_input(
@@ -423,6 +453,18 @@ fn test_evid_0005_benchmark_output() {
     assert!(!revalidate_samples.is_empty());
     assert!(!consume_samples.is_empty());
     assert!(!anti_entropy_samples.is_empty());
+    assert!(
+        join_proof_checks_total > 0,
+        "join must have non-zero proof checks"
+    );
+    assert!(
+        replay_proof_checks_total > 0,
+        "replay must have non-zero proof checks"
+    );
+    assert!(
+        anti_entropy_proof_checks_total > 0,
+        "anti-entropy must have non-zero proof checks"
+    );
     assert!(matches!(
         tier2_join_deny,
         AuthorityDenyClass::VerifierEconomicsBoundsExceeded { .. }
