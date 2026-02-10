@@ -647,6 +647,7 @@ mod tests {
             issued_time_envelope_ref: test_hash(0x07),
             as_of_ledger_anchor: test_hash(0x08),
             expires_at_tick: 500,
+            issued_at_tick: 100,
             revocation_head_hash: test_hash(0x04),
             identity_evidence_level: IdentityEvidenceLevel::Verified,
             admission_capacity_token: None,

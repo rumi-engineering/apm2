@@ -67,5 +67,5 @@ pub use types::{
     MAX_FIELD_NAME_LENGTH, MAX_MERKLE_PROOF_STEPS, MAX_OPERATION_LENGTH,
     MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH, MAX_SCOPE_WITNESS_HASHES,
     MAX_STRING_LENGTH, PcacPolicyKnobs, PcacValidationError, PointerOnlyWaiver, RiskTier,
-    SovereigntyEnforcementMode, SovereigntyEpoch,
+    SovereigntyEnforcementMode, SovereigntyEpoch, WaiverBindingMeta,
 };

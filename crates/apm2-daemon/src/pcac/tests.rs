@@ -6,7 +6,8 @@ use std::sync::Arc;
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
-    DeterminismClass, IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
+    DeterminismClass, IdentityEvidenceLevel, PcacPolicyKnobs, PointerOnlyWaiver, RiskTier,
+    SovereigntyEnforcementMode,
 };
 
 use super::durable_consume::DurableConsumeIndex;
@@ -96,6 +97,22 @@ fn strict_sovereignty_policy() -> PcacPolicyKnobs {
         min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
         freshness_max_age_ticks: 300,
         tier2_sovereignty_mode: SovereigntyEnforcementMode::Strict,
+        pointer_only_waiver: None,
+    }
+}
+
+fn policy_with_max_age(max_age: u64) -> PcacPolicyKnobs {
+    PcacPolicyKnobs {
+        freshness_max_age_ticks: max_age,
+        ..strict_sovereignty_policy()
+    }
+}
+
+fn valid_pointer_only_waiver(scope_binding_hash: Hash, expires_at_tick: u64) -> PointerOnlyWaiver {
+    PointerOnlyWaiver {
+        waiver_id: "WVR-PO-0001".to_string(),
+        expires_at_tick,
+        scope_binding_hash,
     }
 }
 
@@ -187,11 +204,236 @@ fn join_denies_pointer_only_at_tier2plus() {
     input.risk_tier = RiskTier::Tier2Plus;
     input.identity_evidence_level = IdentityEvidenceLevel::PointerOnly;
 
-    let err = kernel.join(&input).unwrap_err();
+    let err = AuthorityJoinKernel::join(&kernel, &input, &PcacPolicyKnobs::default()).unwrap_err();
     assert!(matches!(
         err.deny_class,
-        AuthorityDenyClass::PointerOnlyDeniedAtTier2Plus
+        AuthorityDenyClass::WaiverExpiredOrInvalid
     ));
+}
+
+#[test]
+fn join_allows_pointer_only_at_tier2plus_with_valid_waiver() {
+    let kernel = InProcessKernel::new(100);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    input.identity_evidence_level = IdentityEvidenceLevel::PointerOnly;
+    let scope_hash = test_hash(0xA0);
+    input.scope_witness_hashes = vec![scope_hash];
+
+    let waiver = valid_pointer_only_waiver(scope_hash, 200);
+    input.pointer_only_waiver_hash = Some(waiver.content_hash());
+    let policy = PcacPolicyKnobs {
+        pointer_only_waiver: Some(waiver),
+        ..PcacPolicyKnobs::default()
+    };
+
+    let cert = AuthorityJoinKernel::join(&kernel, &input, &policy).expect("waiver-bound join");
+    assert_eq!(
+        cert.identity_evidence_level,
+        IdentityEvidenceLevel::PointerOnly
+    );
+    assert_eq!(cert.issued_at_tick, 100);
+}
+
+#[test]
+fn join_denies_pointer_only_at_tier2plus_with_expired_waiver() {
+    let kernel = InProcessKernel::new(100);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    input.identity_evidence_level = IdentityEvidenceLevel::PointerOnly;
+    let scope_hash = test_hash(0xA1);
+    input.scope_witness_hashes = vec![scope_hash];
+
+    let waiver = valid_pointer_only_waiver(scope_hash, 99);
+    input.pointer_only_waiver_hash = Some(waiver.content_hash());
+    let policy = PcacPolicyKnobs {
+        pointer_only_waiver: Some(waiver),
+        ..PcacPolicyKnobs::default()
+    };
+
+    let err = AuthorityJoinKernel::join(&kernel, &input, &policy).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::WaiverExpiredOrInvalid
+    ));
+}
+
+#[test]
+fn join_denies_pointer_only_at_tier2plus_with_scope_mismatch() {
+    let kernel = InProcessKernel::new(100);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    input.identity_evidence_level = IdentityEvidenceLevel::PointerOnly;
+    input.scope_witness_hashes = vec![test_hash(0xA2)];
+
+    let waiver = valid_pointer_only_waiver(test_hash(0xA3), 200);
+    input.pointer_only_waiver_hash = Some(waiver.content_hash());
+    let policy = PcacPolicyKnobs {
+        pointer_only_waiver: Some(waiver),
+        ..PcacPolicyKnobs::default()
+    };
+
+    let err = AuthorityJoinKernel::join(&kernel, &input, &policy).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::WaiverScopeInvalid
+    ));
+}
+
+#[test]
+fn join_denies_ambiguous_policy_state_missing_freshness_window() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let policy = PcacPolicyKnobs {
+        freshness_max_age_ticks: 0,
+        ..PcacPolicyKnobs::default()
+    };
+
+    let err = AuthorityJoinKernel::join(&kernel, &input, &policy).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+            if description.contains("freshness_max_age_ticks")
+    ));
+}
+
+#[test]
+fn revalidate_freshness_exactly_at_limit_passes() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let policy = policy_with_max_age(5);
+    let cert = AuthorityJoinKernel::join(&kernel, &input, &policy).expect("join should pass");
+
+    kernel.advance_tick(cert.issued_at_tick + policy.freshness_max_age_ticks);
+    let result = AuthorityJoinKernel::revalidate(
+        &kernel,
+        &cert,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        cert.revocation_head_hash,
+        &policy,
+    );
+    assert!(result.is_ok(), "freshness boundary at max age must pass");
+}
+
+#[test]
+fn revalidate_freshness_one_past_limit_denies() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let policy = policy_with_max_age(5);
+    let cert = AuthorityJoinKernel::join(&kernel, &input, &policy).expect("join should pass");
+
+    let stale_tick = cert.issued_at_tick + policy.freshness_max_age_ticks + 1;
+    kernel.advance_tick(stale_tick);
+    let err = AuthorityJoinKernel::revalidate(
+        &kernel,
+        &cert,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        cert.revocation_head_hash,
+        &policy,
+    )
+    .expect_err("one past freshness limit must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::FreshnessExceeded { .. }
+            | AuthorityDenyClass::CertificateExpired { .. }
+    ));
+}
+
+#[test]
+fn policy_matrix_tier_identity_waiver_freshness() {
+    #[derive(Clone, Copy, Debug)]
+    enum FreshnessState {
+        AtLimit,
+        OnePast,
+    }
+
+    let risk_tiers = [RiskTier::Tier1, RiskTier::Tier2Plus];
+    let evidence_levels = [
+        IdentityEvidenceLevel::Verified,
+        IdentityEvidenceLevel::PointerOnly,
+    ];
+    let waiver_presence = [false, true];
+    let freshness_states = [FreshnessState::AtLimit, FreshnessState::OnePast];
+
+    for risk_tier in risk_tiers {
+        for evidence_level in evidence_levels {
+            for has_waiver in waiver_presence {
+                for freshness_state in freshness_states {
+                    let kernel = InProcessKernel::new(100);
+                    let mut input = valid_input();
+                    input.risk_tier = risk_tier;
+                    input.identity_evidence_level = evidence_level;
+
+                    let scope_hash = test_hash(0xB0);
+                    input.scope_witness_hashes = vec![scope_hash];
+
+                    let policy = if has_waiver {
+                        let waiver = valid_pointer_only_waiver(scope_hash, 500);
+                        input.pointer_only_waiver_hash = Some(waiver.content_hash());
+                        PcacPolicyKnobs {
+                            pointer_only_waiver: Some(waiver),
+                            ..policy_with_max_age(5)
+                        }
+                    } else {
+                        input.pointer_only_waiver_hash = None;
+                        policy_with_max_age(5)
+                    };
+
+                    let join_result = AuthorityJoinKernel::join(&kernel, &input, &policy);
+                    let requires_waiver = matches!(risk_tier, RiskTier::Tier2Plus)
+                        && matches!(evidence_level, IdentityEvidenceLevel::PointerOnly);
+                    let join_should_pass = !requires_waiver || has_waiver;
+
+                    if !join_should_pass {
+                        let err = join_result.expect_err("join must fail without required waiver");
+                        assert!(matches!(
+                            err.deny_class,
+                            AuthorityDenyClass::WaiverExpiredOrInvalid
+                        ));
+                        continue;
+                    }
+
+                    let cert = join_result.expect("join must pass");
+                    let revalidate_tick = match freshness_state {
+                        FreshnessState::AtLimit => {
+                            cert.issued_at_tick + policy.freshness_max_age_ticks
+                        },
+                        FreshnessState::OnePast => {
+                            cert.issued_at_tick + policy.freshness_max_age_ticks + 1
+                        },
+                    };
+                    kernel.advance_tick(revalidate_tick);
+
+                    let revalidate_result = AuthorityJoinKernel::revalidate(
+                        &kernel,
+                        &cert,
+                        input.time_envelope_ref,
+                        input.as_of_ledger_anchor,
+                        cert.revocation_head_hash,
+                        &policy,
+                    );
+                    match freshness_state {
+                        FreshnessState::AtLimit => assert!(
+                            revalidate_result.is_ok(),
+                            "matrix at-limit case must pass: tier={risk_tier:?} evidence={evidence_level:?} waiver={has_waiver}"
+                        ),
+                        FreshnessState::OnePast => {
+                            let err = revalidate_result.expect_err(
+                                "matrix stale case must deny one-past freshness boundary",
+                            );
+                            assert!(matches!(
+                                err.deny_class,
+                                AuthorityDenyClass::FreshnessExceeded { .. }
+                                    | AuthorityDenyClass::CertificateExpired { .. }
+                            ));
+                        },
+                    }
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -232,7 +474,8 @@ fn revalidate_denies_expired_certificate() {
         .unwrap_err();
     assert!(matches!(
         err.deny_class,
-        AuthorityDenyClass::CertificateExpired { .. }
+        AuthorityDenyClass::FreshnessExceeded { .. }
+            | AuthorityDenyClass::CertificateExpired { .. }
     ));
 }
 
@@ -441,6 +684,7 @@ fn lifecycle_gate_succeeds_full_sequence() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash, // Revocation head matches
+            &PcacPolicyKnobs::default(),
         )
         .expect("full lifecycle should succeed");
 
@@ -466,6 +710,7 @@ fn lifecycle_gate_denies_at_join_stage() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -487,6 +732,7 @@ fn lifecycle_gate_denies_at_revalidate_stage() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             test_hash(0xFF), // Changed revocation head
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -509,6 +755,7 @@ fn lifecycle_gate_prevents_effect_without_consume() {
         input.time_envelope_ref,
         input.as_of_ledger_anchor,
         input.directory_head_hash,
+        &PcacPolicyKnobs::default(),
     )
     .unwrap();
 
@@ -519,6 +766,7 @@ fn lifecycle_gate_prevents_effect_without_consume() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -534,6 +782,7 @@ fn lifecycle_gate_prevents_effect_without_consume() {
         input.time_envelope_ref,
         input.as_of_ledger_anchor,
         input.directory_head_hash,
+        &PcacPolicyKnobs::default(),
     );
     assert!(
         result.is_ok(),
@@ -558,6 +807,7 @@ fn no_side_effect_without_successful_consume() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .is_err()
     );
@@ -571,6 +821,7 @@ fn no_side_effect_without_successful_consume() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .is_err()
     );
@@ -584,6 +835,7 @@ fn no_side_effect_without_successful_consume() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .is_err()
     );
@@ -605,6 +857,7 @@ fn lifecycle_receipts_have_monotonic_ticks() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap();
 
@@ -632,6 +885,7 @@ fn pre_actuation_receipt_binding() {
         input.time_envelope_ref,
         input.as_of_ledger_anchor,
         input.directory_head_hash,
+        &PcacPolicyKnobs::default(),
     );
     assert!(result.is_ok());
 }
@@ -671,6 +925,7 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
         input.directory_head_hash,
         Some(&sov_state),
         100,
+        &PcacPolicyKnobs::default(),
     );
     assert!(
         result.is_ok(),
@@ -710,6 +965,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
             input.directory_head_hash,
             Some(&sov_state),
             200, // tick 200, epoch at 10 -> drift 190 > threshold 50
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -758,6 +1014,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -797,6 +1054,7 @@ fn lifecycle_gate_with_sovereignty_tier1_bypasses_bad_state() {
         input.directory_head_hash,
         Some(&sov_state),
         200,
+        &PcacPolicyKnobs::default(),
     );
     assert!(
         result.is_ok(),
@@ -828,6 +1086,7 @@ fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
             input.directory_head_hash,
             None,
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -863,7 +1122,7 @@ fn lifecycle_gate_missing_checker_denies_revalidate_in_strict_mode() {
             input.directory_head_hash,
             None,
             100,
-            Some(&strict_policy),
+            &strict_policy,
         )
         .unwrap_err();
 
@@ -899,6 +1158,7 @@ fn lifecycle_gate_missing_checker_denies_consume_in_strict_mode() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect("join_and_revalidate should succeed before consume check");
 
@@ -913,7 +1173,7 @@ fn lifecycle_gate_missing_checker_denies_consume_in_strict_mode() {
             input.directory_head_hash,
             None,
             100,
-            Some(&strict_policy),
+            &strict_policy,
         )
         .unwrap_err();
 
@@ -951,6 +1211,7 @@ fn lifecycle_gate_without_sovereignty_state_passes_tier1() {
         input.directory_head_hash,
         None,
         100,
+        &PcacPolicyKnobs::default(),
     );
     assert!(
         result.is_ok(),
@@ -991,6 +1252,7 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1039,6 +1301,7 @@ fn lifecycle_gate_sovereignty_uncertainty_carries_freeze_signal() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
 
@@ -1290,9 +1553,10 @@ fn consume_denies_expired_certificate() {
     assert!(
         matches!(
             err.deny_class,
-            AuthorityDenyClass::CertificateExpired { .. }
+            AuthorityDenyClass::FreshnessExceeded { .. }
+                | AuthorityDenyClass::CertificateExpired { .. }
         ),
-        "expected CertificateExpired, got: {:?}",
+        "expected freshness/expiry denial, got: {:?}",
         err.deny_class
     );
 }
@@ -1337,6 +1601,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1368,6 +1633,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
         input.directory_head_hash,
         Some(&good_sov_state),
         100,
+        &PcacPolicyKnobs::default(),
     );
     assert!(
         result.is_ok(),
@@ -1422,6 +1688,7 @@ fn epoch_with_invalid_signature_denied() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1475,6 +1742,7 @@ fn epoch_with_untrusted_signer_denied() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1544,6 +1812,7 @@ fn sovereignty_hard_freeze_actuates_emergency_stop() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1614,6 +1883,7 @@ fn sovereignty_soft_freeze_actuates_governance_stop() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1679,6 +1949,7 @@ fn post_hard_freeze_blocks_subsequent_valid_requests() {
             input.directory_head_hash,
             Some(&bad_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
 
@@ -1768,6 +2039,7 @@ fn lifecycle_gate_denies_future_dated_epoch() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &PcacPolicyKnobs::default(),
         )
         .unwrap_err();
     assert!(
@@ -1855,6 +2127,7 @@ fn production_signer_key_accepts_valid_epoch() {
         input.directory_head_hash,
         Some(&sov_state),
         100,
+        &PcacPolicyKnobs::default(),
     );
     assert!(
         result.is_ok(),
@@ -2003,8 +2276,6 @@ fn clock_backed_kernel_tick_advances() {
 /// This validates RFC-0027 Law 4 (Freshness Dominance) for TTL enforcement.
 #[test]
 fn clock_backed_kernel_certificates_can_expire() {
-    use apm2_core::pcac::AuthorityJoinKernel;
-
     use crate::htf::{ClockConfig, HolonicClock};
 
     let clock =
@@ -2029,7 +2300,7 @@ fn clock_backed_kernel_certificates_can_expire() {
         cert.expires_at_tick,
     );
 
-    // Revalidation must now fail with CertificateExpired.
+    // Revalidation must now fail with freshness/expiry denial.
     let err = kernel
         .revalidate(
             &cert,
@@ -2041,9 +2312,10 @@ fn clock_backed_kernel_certificates_can_expire() {
     assert!(
         matches!(
             err.deny_class,
-            apm2_core::pcac::AuthorityDenyClass::CertificateExpired { .. }
+            apm2_core::pcac::AuthorityDenyClass::FreshnessExceeded { .. }
+                | apm2_core::pcac::AuthorityDenyClass::CertificateExpired { .. }
         ),
-        "clock-backed kernel must deny expired certificate on revalidate, got: {:?}",
+        "clock-backed kernel must deny freshness/expiry on revalidate, got: {:?}",
         err.deny_class
     );
 }
@@ -2207,6 +2479,7 @@ fn durable_kernel_lifecycle_gate_integration() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect("durable lifecycle gate should succeed");
 
@@ -2222,6 +2495,7 @@ fn durable_kernel_lifecycle_gate_integration() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect_err("duplicate consume should deny");
     assert!(matches!(
@@ -2235,9 +2509,12 @@ fn revalidation_denies_when_tick_advanced_past_ajc_expiry() {
     let kernel = InProcessKernel::new(100);
     let input = valid_input();
     let cert = kernel.join(&input).expect("join");
-    assert_eq!(cert.expires_at_tick, 400);
+    assert_eq!(
+        cert.expires_at_tick,
+        cert.issued_at_tick + PcacPolicyKnobs::default().freshness_max_age_ticks
+    );
 
-    kernel.advance_tick(399);
+    kernel.advance_tick(cert.expires_at_tick.saturating_sub(1));
     kernel
         .revalidate(
             &cert,
@@ -2245,9 +2522,9 @@ fn revalidation_denies_when_tick_advanced_past_ajc_expiry() {
             input.as_of_ledger_anchor,
             cert.revocation_head_hash,
         )
-        .expect("revalidation at tick 399 should succeed");
+        .expect("revalidation one tick before expiry should succeed");
 
-    kernel.advance_tick(401);
+    kernel.advance_tick(cert.expires_at_tick + 1);
     let err = kernel
         .revalidate(
             &cert,
@@ -2258,10 +2535,8 @@ fn revalidation_denies_when_tick_advanced_past_ajc_expiry() {
         .expect_err("expired cert must deny");
     assert!(matches!(
         err.deny_class,
-        AuthorityDenyClass::CertificateExpired {
-            expired_at: 400,
-            current_tick: 401
-        }
+        AuthorityDenyClass::FreshnessExceeded { .. }
+            | AuthorityDenyClass::CertificateExpired { .. }
     ));
 }
 
@@ -2340,7 +2615,8 @@ fn test_revalidate_denies_stale_freshness() {
         .expect_err("stale freshness must deny");
     assert!(matches!(
         err.deny_class,
-        AuthorityDenyClass::StaleFreshnessAtRevalidate
+        AuthorityDenyClass::FreshnessExceeded { .. }
+            | AuthorityDenyClass::StaleFreshnessAtRevalidate
             | AuthorityDenyClass::CertificateExpired { .. }
     ));
 }
@@ -2368,7 +2644,9 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
     let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
 
     let input = valid_input();
-    let cert = durable.join(&input).expect("join");
+    let cert = durable
+        .join(&input, &PcacPolicyKnobs::default())
+        .expect("join");
 
     let (witness, record) = durable
         .consume(
@@ -2378,6 +2656,7 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
             input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             cert.revocation_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect("consume");
     assert_eq!(witness.ajc_id, cert.ajc_id);
@@ -2394,6 +2673,7 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
             input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             cert.revocation_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect_err("double consume must deny");
     assert!(matches!(
@@ -2422,6 +2702,7 @@ fn durable_kernel_crash_replay_lifecycle_gate() {
                 input.time_envelope_ref,
                 input.as_of_ledger_anchor,
                 input.directory_head_hash,
+                &PcacPolicyKnobs::default(),
             )
             .expect("first consume");
         ajc_id = receipts.certificate.ajc_id;
@@ -2442,6 +2723,7 @@ fn durable_kernel_crash_replay_lifecycle_gate() {
                 input.time_envelope_ref,
                 input.as_of_ledger_anchor,
                 input.directory_head_hash,
+                &PcacPolicyKnobs::default(),
             )
             .expect_err("replayed consume must deny");
         assert!(matches!(
@@ -2465,9 +2747,13 @@ fn test_stale_tick_after_broker_phase_denies_expired_authority() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect("join and revalidate");
-    assert_eq!(cert.expires_at_tick, 1300);
+    assert_eq!(
+        cert.expires_at_tick,
+        cert.issued_at_tick + PcacPolicyKnobs::default().freshness_max_age_ticks
+    );
 
     let post_broker_tick = cert.expires_at_tick + 1;
     gate.advance_tick(post_broker_tick);
@@ -2479,14 +2765,13 @@ fn test_stale_tick_after_broker_phase_denies_expired_authority() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
-        .expect_err("revalidate-before-execution must deny expired cert");
+        .expect_err("revalidate-before-execution must deny stale/expired cert");
     assert!(matches!(
         err.deny_class,
-        AuthorityDenyClass::CertificateExpired {
-            expired_at: 1300,
-            current_tick: 1301
-        }
+        AuthorityDenyClass::FreshnessExceeded { .. }
+            | AuthorityDenyClass::CertificateExpired { .. }
     ));
 }
 
@@ -2504,6 +2789,7 @@ fn test_tick_advance_within_ttl_allows_revalidation() {
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
         )
         .expect("join");
 
@@ -2513,6 +2799,7 @@ fn test_tick_advance_within_ttl_allows_revalidation() {
         input.time_envelope_ref,
         input.as_of_ledger_anchor,
         input.directory_head_hash,
+        &PcacPolicyKnobs::default(),
     )
     .expect("within TTL should pass");
 }

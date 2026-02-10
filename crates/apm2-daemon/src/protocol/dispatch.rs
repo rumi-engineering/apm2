@@ -7393,14 +7393,67 @@ impl PrivilegedDispatcher {
         join_revocation_head: [u8; 32],
         effect_intent_digest: [u8; 32],
     ) -> Result<Option<PrivilegedPcacLifecycleArtifacts>, PrivilegedResponse> {
+        let work_id = self
+            .lease_validator
+            .get_lease_work_id(lease_id)
+            .ok_or_else(|| {
+                PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "PCAC authority denied for {operation}: policy state missing for lease '{lease_id}'"
+                    ),
+                )
+            })?;
+        let claim = self.work_registry.get_claim(&work_id).ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "PCAC authority denied for {operation}: work claim missing for policy lookup \
+                     (lease='{lease_id}', work_id='{work_id}')"
+                ),
+            )
+        })?;
+
+        let mut pcac_policy = claim.policy_resolution.pcac_policy.clone().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "PCAC authority denied for {operation}: unknown policy state \
+                             (pcac_policy missing for work_id='{work_id}')"
+                ),
+            )
+        })?;
+        if pcac_policy.pointer_only_waiver.is_none() {
+            pcac_policy
+                .pointer_only_waiver
+                .clone_from(&claim.policy_resolution.pointer_only_waiver);
+        }
+        if !pcac_policy.lifecycle_enforcement {
+            return Ok(None);
+        }
+
+        let mut effective_join_input = join_input.clone();
+        if matches!(
+            effective_join_input.identity_evidence_level,
+            IdentityEvidenceLevel::PointerOnly
+        ) && matches!(effective_join_input.risk_tier, PcacRiskTier::Tier2Plus)
+            && effective_join_input.pointer_only_waiver_hash.is_none()
+        {
+            effective_join_input.pointer_only_waiver_hash = pcac_policy
+                .pointer_only_waiver
+                .as_ref()
+                .map(apm2_core::pcac::PointerOnlyWaiver::content_hash);
+        }
+
         gate.advance_tick(join_freshness_tick);
 
         let certificate = gate
             .join_and_revalidate(
-                join_input,
+                &effective_join_input,
                 join_time_envelope_ref,
                 join_ledger_anchor,
                 join_revocation_head,
+                &pcac_policy,
             )
             .map_err(|deny| {
                 warn!(
@@ -7431,6 +7484,7 @@ impl PrivilegedDispatcher {
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head,
+            &pcac_policy,
         )
         .map_err(|deny| {
             warn!(
@@ -7465,10 +7519,11 @@ impl PrivilegedDispatcher {
             .consume_before_effect(
                 &certificate,
                 effect_intent_digest,
-                join_input.boundary_intent_class,
+                effective_join_input.boundary_intent_class,
                 true,
                 current_time_envelope_ref,
                 current_revocation_head,
+                &pcac_policy,
             )
             .map_err(|deny| {
                 warn!(
@@ -27313,6 +27368,7 @@ mod tests {
                 resolved_risk_tier,
             );
             policy_resolution.resolved_policy_hash = policy_hash;
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 work_id,
@@ -28126,7 +28182,8 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert!(
                         err.message
-                            .contains("pointer-only identity denied at Tier2+"),
+                            .contains("pointer-only identity denied at Tier2+")
+                            || err.message.contains("waiver expired or invalid"),
                         "Tier2 DelegateSublease must deny pointer-only identity evidence, got: {}",
                         err.message
                     );
@@ -28169,12 +28226,13 @@ mod tests {
                 fn join(
                     &self,
                     input: &AuthorityJoinInputV1,
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
                 ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
                     self.observed_levels
                         .lock()
                         .expect("lock poisoned")
                         .push(input.identity_evidence_level);
-                    self.inner.join(input)
+                    AuthorityJoinKernel::join(&self.inner, input, policy)
                 }
 
                 fn revalidate(
@@ -28183,12 +28241,15 @@ mod tests {
                     current_time_envelope_ref: [u8; 32],
                     current_ledger_anchor: [u8; 32],
                     current_revocation_head_hash: [u8; 32],
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
                 ) -> Result<(), Box<AuthorityDenyV1>> {
-                    self.inner.revalidate(
+                    AuthorityJoinKernel::revalidate(
+                        &self.inner,
                         cert,
                         current_time_envelope_ref,
                         current_ledger_anchor,
                         current_revocation_head_hash,
+                        policy,
                     )
                 }
 
@@ -28200,15 +28261,18 @@ mod tests {
                     requires_authoritative_acceptance: bool,
                     current_time_envelope_ref: [u8; 32],
                     current_revocation_head_hash: [u8; 32],
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
                 ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
                 {
-                    self.inner.consume(
+                    AuthorityJoinKernel::consume(
+                        &self.inner,
                         cert,
                         intent_digest,
                         boundary_intent_class,
                         requires_authoritative_acceptance,
                         current_time_envelope_ref,
                         current_revocation_head_hash,
+                        policy,
                     )
                 }
             }
@@ -28246,6 +28310,7 @@ mod tests {
                 0,
             );
             policy_resolution.resolved_policy_hash = [0xC2; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-PCAC-RR-PO-OBSERVE",
