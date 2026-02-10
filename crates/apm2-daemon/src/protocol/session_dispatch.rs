@@ -2257,10 +2257,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     lifecycle_enforcement: true,
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
-                    // Bootstrap sovereignty state is transitional and not yet
-                    // projection-hydrated; default to monitor-only until
-                    // runtime policy/state hydration can support strict mode.
-                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Monitor,
+                    // Fail closed for Tier2+ until authoritative runtime
+                    // sovereignty state/policy is hydrated.
+                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
                 });
 
             let capability_manifest_hash: Hash =

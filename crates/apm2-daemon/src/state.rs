@@ -227,31 +227,27 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
 /// TODO(TCK-00427): Load this mode from runtime governance/policy projection
 /// instead of a transitional static default.
 const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::SovereigntyEnforcementMode {
-    // Bootstrap sovereignty state is an incomplete snapshot (epoch/revocation
-    // head/autonomy ceiling are not yet projection-hydrated), so strict mode
-    // would deterministically fail Tier2+ requests. Keep bootstrap in monitor
-    // mode until runtime IPC hydrates authoritative sovereignty state.
-    apm2_core::pcac::SovereigntyEnforcementMode::Monitor
+    apm2_core::pcac::SovereigntyEnforcementMode::Strict
 }
 
 /// Builds the bootstrap sovereignty state snapshot for session dispatcher
 /// wiring.
+///
+/// TODO(TCK-00427): Hydrate and wire authoritative sovereignty state via
+/// runtime IPC/projection updates.
+///
+/// NOTE: Tier2+ requests are denied fail-closed by default because no runtime
+/// sovereignty state is hydrated. This is intentional — the operator must
+/// provide authoritative sovereignty state via IPC before Tier2+ operations are
+/// permitted. See RFC-0027 §6.6 for runtime hydration requirements.
 fn bootstrap_sovereignty_state(
     mode: apm2_core::pcac::SovereigntyEnforcementMode,
-    principal_id: String,
 ) -> Option<Arc<crate::pcac::SovereigntyState>> {
     if mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled {
         return None;
     }
 
-    Some(Arc::new(crate::pcac::SovereigntyState {
-        // TODO(TCK-00427): Seed and refresh epoch from runtime authority state.
-        epoch: None,
-        principal_id,
-        revocation_head_known: false,
-        autonomy_ceiling: None,
-        active_freeze: apm2_core::pcac::FreezeAction::NoAction,
-    }))
+    None
 }
 
 const GITHUB_PROFILE_PREFIX: &str = "github-installation:";
@@ -1065,16 +1061,7 @@ impl DispatcherState {
                     let sovereignty_checker =
                         crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
                     let sovereignty_mode = bootstrap_sovereignty_enforcement_mode();
-                    let sovereignty_state = bootstrap_sovereignty_state(
-                        sovereignty_mode,
-                        hex::encode(sovereignty_trusted_signer_key),
-                    );
-                    // TODO(TCK-00427): When wiring a bootstrap
-                    // `SovereigntyState` into `SessionDispatcher`, the epoch is
-                    // currently a static snapshot. Add an IPC/projection-driven
-                    // refresh path (see `SovereigntyState::refresh_epoch`) so
-                    // Tier2+ operations do not age into global stale-epoch
-                    // denial.
+                    let sovereignty_state = bootstrap_sovereignty_state(sovereignty_mode);
                     let pcac_gate = Arc::new(
                         crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
                             pcac_kernel,
@@ -1445,15 +1432,7 @@ impl DispatcherState {
         let sovereignty_checker =
             crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
         let sovereignty_mode = bootstrap_sovereignty_enforcement_mode();
-        let sovereignty_state = bootstrap_sovereignty_state(
-            sovereignty_mode,
-            hex::encode(sovereignty_trusted_signer_key),
-        );
-        // TODO(TCK-00427): When wiring a bootstrap `SovereigntyState` into
-        // `SessionDispatcher`, the epoch is currently a static snapshot. Add
-        // an IPC/projection-driven refresh path (see
-        // `SovereigntyState::refresh_epoch`) so Tier2+ operations do not age
-        // into global stale-epoch denial.
+        let sovereignty_state = bootstrap_sovereignty_state(sovereignty_mode);
         let pcac_gate = Arc::new(
             crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
                 pcac_kernel,
