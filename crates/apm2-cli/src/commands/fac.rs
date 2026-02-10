@@ -10,6 +10,8 @@
 //! - `apm2 fac work status <work_id>` - Show projection-backed work status via
 //!   daemon
 //! - `apm2 fac work list` - List projection-known work items via daemon
+//! - `apm2 fac role-launch <work_id> <role> --role-spec-hash ...` - Perform
+//!   fail-closed hash-binding admission checks and emit launch receipt
 //! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool
 //!   log index
 //! - `apm2 fac receipt show <receipt_hash>` - Show receipt from CAS
@@ -63,6 +65,7 @@ use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::fac_review;
+use crate::commands::role_launch::{self, RoleLaunchArgs};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -122,6 +125,12 @@ pub enum FacSubcommand {
     /// Displays work status or lists work items from runtime projection state.
     /// This is the authoritative runtime surface for work lifecycle reads.
     Work(WorkArgs),
+
+    /// Launch a FAC role with explicit hash-bound admission checks.
+    ///
+    /// Requires non-zero, CAS-resolvable role/context/capability/policy hashes
+    /// and emits a replay-verifiable launch receipt on success.
+    RoleLaunch(RoleLaunchArgs),
 
     /// Inspect episode details and tool log index.
     ///
@@ -732,6 +741,24 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             WorkSubcommand::List(list_args) => {
                 run_work_list(list_args, operator_socket, json_output)
             },
+        },
+        FacSubcommand::RoleLaunch(args) => {
+            match role_launch::handle_role_launch(args, &ledger_path, &cas_path, json_output) {
+                Ok(()) => exit_codes::SUCCESS,
+                Err(error) => error
+                    .downcast_ref::<role_launch::RoleLaunchError>()
+                    .map_or_else(
+                        || {
+                            output_error(
+                                json_output,
+                                "role_launch_error",
+                                &format!("role launch failed: {error}"),
+                                exit_codes::GENERIC_ERROR,
+                            )
+                        },
+                        role_launch::RoleLaunchError::exit_code,
+                    ),
+            }
         },
         FacSubcommand::Episode(args) => match &args.subcommand {
             EpisodeSubcommand::Inspect(inspect_args) => {
