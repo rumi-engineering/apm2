@@ -9,6 +9,8 @@ use subtle::ConstantTimeEq;
 
 /// Maximum length for evaluator identifiers.
 pub const MAX_EVALUATOR_ID_LENGTH: usize = 256;
+/// Maximum number of evaluator tuples allowed in one receipt.
+pub const MAX_EVALUATORS: usize = 64;
 /// Maximum length for predicate identifiers.
 pub const MAX_PREDICATE_ID_LENGTH: usize = 256;
 /// Maximum length for deny reason strings.
@@ -18,11 +20,12 @@ const ZERO_HASH: [u8; 32] = [0u8; 32];
 
 /// Temporal predicate identifiers for shared arbitration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING-KEBAB-CASE")]
 pub enum TemporalPredicateId {
     /// Time authority envelope is valid.
+    #[serde(rename = "TP-EIO29-001")]
     TpEio29001,
     /// Promotion temporal ambiguity is false.
+    #[serde(rename = "TP-EIO29-008")]
     TpEio29008,
 }
 
@@ -153,6 +156,7 @@ pub struct TemporalArbitrationReceiptV1 {
     /// The predicate being arbitrated.
     pub predicate_id: TemporalPredicateId,
     /// Evaluator tuples participating in this arbitration.
+    #[serde(deserialize_with = "deserialize_evaluators")]
     pub evaluators: Vec<EvaluatorTuple>,
     /// Aggregate outcome.
     pub aggregate_outcome: ArbitrationOutcome,
@@ -160,6 +164,9 @@ pub struct TemporalArbitrationReceiptV1 {
     pub time_envelope_ref: [u8; 32],
     /// HTF tick at which arbitration was performed.
     pub arbitrated_at_tick: u64,
+    /// Optional adjudication deadline tick for disagreement resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_tick: Option<u64>,
     /// Content digest of this receipt (for CAS binding).
     pub content_digest: [u8; 32],
 }
@@ -176,16 +183,27 @@ impl TemporalArbitrationReceiptV1 {
         if self.evaluators.is_empty() {
             return Err("at least one evaluator tuple is required".to_string());
         }
+        if self.evaluators.len() > MAX_EVALUATORS {
+            return Err(format!(
+                "evaluators length {} exceeds maximum {}",
+                self.evaluators.len(),
+                MAX_EVALUATORS,
+            ));
+        }
         if is_zero_hash(&self.time_envelope_ref) {
             return Err("time_envelope_ref must not be zero".to_string());
         }
         if self.arbitrated_at_tick == 0 {
             return Err("arbitrated_at_tick must be > 0".to_string());
         }
+        if matches!(self.deadline_tick, Some(0)) {
+            return Err("deadline_tick must be > 0 when present".to_string());
+        }
         if is_zero_hash(&self.content_digest) {
             return Err("content_digest must not be zero".to_string());
         }
 
+        let first = &self.evaluators[0];
         let mut previous_evaluator_id: Option<&str> = None;
         for evaluator in &self.evaluators {
             evaluator.validate()?;
@@ -195,6 +213,18 @@ impl TemporalArbitrationReceiptV1 {
                     "tuple predicate {} does not match receipt predicate {}",
                     evaluator.predicate_id, self.predicate_id,
                 ));
+            }
+            if !hashes_equal(&evaluator.contract_digest_set, &first.contract_digest_set) {
+                return Err("context coherence violation: contract_digest_set mismatch".to_string());
+            }
+            if !hashes_equal(&evaluator.canonicalizer_tuple, &first.canonicalizer_tuple) {
+                return Err("context coherence violation: canonicalizer_tuple mismatch".to_string());
+            }
+            if !hashes_equal(&evaluator.time_authority_ref, &first.time_authority_ref) {
+                return Err("context coherence violation: time_authority_ref mismatch".to_string());
+            }
+            if !hashes_equal(&evaluator.window_ref, &first.window_ref) {
+                return Err("context coherence violation: window_ref mismatch".to_string());
             }
 
             if let Some(previous) = previous_evaluator_id {
@@ -217,6 +247,25 @@ impl TemporalArbitrationReceiptV1 {
         }
 
         Ok(())
+    }
+
+    /// Returns `true` if arbitration missed its adjudication deadline.
+    #[must_use]
+    pub fn check_deadline_miss(&self, current_tick: u64) -> bool {
+        self.deadline_tick.is_some_and(|d| current_tick > d)
+    }
+
+    /// Returns the effective outcome at `current_tick`, escalating transient
+    /// disagreement to persistent after deadline miss.
+    #[must_use]
+    pub fn effective_outcome(&self, current_tick: u64) -> ArbitrationOutcome {
+        if self.check_deadline_miss(current_tick)
+            && self.aggregate_outcome == ArbitrationOutcome::DisagreementTransient
+        {
+            ArbitrationOutcome::DisagreementPersistent
+        } else {
+            self.aggregate_outcome
+        }
     }
 }
 
@@ -446,6 +495,21 @@ where
     Ok(value)
 }
 
+fn deserialize_evaluators<'de, D>(deserializer: D) -> Result<Vec<EvaluatorTuple>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let evaluators = Vec::<EvaluatorTuple>::deserialize(deserializer)?;
+    if evaluators.len() > MAX_EVALUATORS {
+        return Err(serde::de::Error::custom(format!(
+            "evaluators length {} exceeds maximum {}",
+            evaluators.len(),
+            MAX_EVALUATORS,
+        )));
+    }
+    Ok(evaluators)
+}
+
 fn deserialize_action_reason<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -493,6 +557,21 @@ mod tests {
             window_ref: hash(0x44),
             verdict: ArbitrationOutcome::AgreedAllow,
             deny_reason: None,
+        }
+    }
+
+    fn valid_receipt() -> TemporalArbitrationReceiptV1 {
+        let mut tuple_b = valid_tuple();
+        tuple_b.evaluator_id = "eval-b".to_string();
+
+        TemporalArbitrationReceiptV1 {
+            predicate_id: TemporalPredicateId::TpEio29001,
+            evaluators: vec![valid_tuple(), tuple_b],
+            aggregate_outcome: ArbitrationOutcome::AgreedAllow,
+            time_envelope_ref: hash(0x99),
+            arbitrated_at_tick: 42,
+            deadline_tick: None,
+            content_digest: hash(0xAA),
         }
     }
 
@@ -584,35 +663,7 @@ mod tests {
 
     #[test]
     fn test_arbitration_receipt_serialization() {
-        let receipt = TemporalArbitrationReceiptV1 {
-            predicate_id: TemporalPredicateId::TpEio29001,
-            evaluators: vec![
-                EvaluatorTuple {
-                    evaluator_id: "eval-a".to_string(),
-                    predicate_id: TemporalPredicateId::TpEio29001,
-                    contract_digest_set: hash(0x11),
-                    canonicalizer_tuple: hash(0x22),
-                    time_authority_ref: hash(0x33),
-                    window_ref: hash(0x44),
-                    verdict: ArbitrationOutcome::AgreedAllow,
-                    deny_reason: None,
-                },
-                EvaluatorTuple {
-                    evaluator_id: "eval-b".to_string(),
-                    predicate_id: TemporalPredicateId::TpEio29001,
-                    contract_digest_set: hash(0x55),
-                    canonicalizer_tuple: hash(0x66),
-                    time_authority_ref: hash(0x77),
-                    window_ref: hash(0x88),
-                    verdict: ArbitrationOutcome::AgreedAllow,
-                    deny_reason: None,
-                },
-            ],
-            aggregate_outcome: ArbitrationOutcome::AgreedAllow,
-            time_envelope_ref: hash(0x99),
-            arbitrated_at_tick: 42,
-            content_digest: hash(0xAA),
-        };
+        let receipt = valid_receipt();
 
         assert!(receipt.validate().is_ok());
 
@@ -620,6 +671,109 @@ mod tests {
         let decoded: TemporalArbitrationReceiptV1 = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, receipt);
         assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tp_eio29_001_serializes_correctly() {
+        let value = serde_json::to_string(&TemporalPredicateId::TpEio29001).unwrap();
+        assert_eq!(value, "\"TP-EIO29-001\"");
+    }
+
+    #[test]
+    fn test_tp_eio29_008_serializes_correctly() {
+        let value = serde_json::to_string(&TemporalPredicateId::TpEio29008).unwrap();
+        assert_eq!(value, "\"TP-EIO29-008\"");
+    }
+
+    #[test]
+    fn test_mismatched_contract_digest_rejected() {
+        let mut receipt = valid_receipt();
+        receipt.evaluators[1].contract_digest_set = hash(0xFE);
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("contract_digest_set mismatch"));
+    }
+
+    #[test]
+    fn test_mismatched_canonicalizer_tuple_rejected() {
+        let mut receipt = valid_receipt();
+        receipt.evaluators[1].canonicalizer_tuple = hash(0xFE);
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("canonicalizer_tuple mismatch"));
+    }
+
+    #[test]
+    fn test_mismatched_time_authority_rejected() {
+        let mut receipt = valid_receipt();
+        receipt.evaluators[1].time_authority_ref = hash(0xFE);
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("time_authority_ref mismatch"));
+    }
+
+    #[test]
+    fn test_mismatched_window_ref_rejected() {
+        let mut receipt = valid_receipt();
+        receipt.evaluators[1].window_ref = hash(0xFE);
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("window_ref mismatch"));
+    }
+
+    #[test]
+    fn test_too_many_evaluators_rejected() {
+        let mut evaluators = Vec::with_capacity(MAX_EVALUATORS + 1);
+        for i in 0..=MAX_EVALUATORS {
+            let mut tuple = valid_tuple();
+            tuple.evaluator_id = format!("eval-{i:03}");
+            evaluators.push(tuple);
+        }
+
+        let receipt = TemporalArbitrationReceiptV1 {
+            predicate_id: TemporalPredicateId::TpEio29001,
+            evaluators,
+            aggregate_outcome: ArbitrationOutcome::AgreedAllow,
+            time_envelope_ref: hash(0x99),
+            arbitrated_at_tick: 42,
+            deadline_tick: None,
+            content_digest: hash(0xAA),
+        };
+
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("evaluators length"));
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        let decode_err = serde_json::from_str::<TemporalArbitrationReceiptV1>(&json).unwrap_err();
+        assert!(decode_err.to_string().contains("evaluators length"));
+    }
+
+    #[test]
+    fn test_deadline_miss_escalates_to_persistent() {
+        let mut tuple_a = valid_tuple();
+        tuple_a.predicate_id = TemporalPredicateId::TpEio29008;
+        tuple_a.verdict = ArbitrationOutcome::DisagreementTransient;
+        tuple_a.deny_reason = Some("awaiting adjudication".to_string());
+
+        let mut tuple_b = tuple_a.clone();
+        tuple_b.evaluator_id = "eval-b".to_string();
+
+        let receipt = TemporalArbitrationReceiptV1 {
+            predicate_id: TemporalPredicateId::TpEio29008,
+            evaluators: vec![tuple_a, tuple_b],
+            aggregate_outcome: ArbitrationOutcome::DisagreementTransient,
+            time_envelope_ref: hash(0x99),
+            arbitrated_at_tick: 42,
+            deadline_tick: Some(100),
+            content_digest: hash(0xAA),
+        };
+
+        assert!(receipt.validate().is_ok());
+        assert!(receipt.check_deadline_miss(101));
+        let action = map_arbitration_outcome(
+            receipt.effective_outcome(101),
+            TemporalPredicateId::TpEio29008,
+        );
+        assert!(matches!(
+            action,
+            ArbitrationAction::DenyAndRebaseline { .. }
+        ));
     }
 
     #[test]

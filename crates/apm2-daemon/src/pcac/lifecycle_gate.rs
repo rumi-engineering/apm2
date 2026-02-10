@@ -21,12 +21,15 @@
 //! consume` sequence.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
-    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass, FreezeAction, RiskTier,
+    ArbitrationAction, ArbitrationOutcome, AuthorityConsumeRecordV1, AuthorityConsumedV1,
+    AuthorityDenyV1, AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+    BoundaryIntentClass, FreezeAction, RiskTier, TemporalArbitrationReceiptV1,
+    map_arbitration_outcome,
 };
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -776,6 +779,34 @@ pub struct LifecycleReceipts {
     pub consumed_witness: AuthorityConsumedV1,
 }
 
+/// Errors emitted while validating temporal arbitration receipts at admission
+/// boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalArbitrationError {
+    /// Receipt failed structural/semantic validation.
+    InvalidReceipt(String),
+    /// Local tick derivation failed while evaluating deadline escalation.
+    TickDerivation(String),
+}
+
+impl fmt::Display for TemporalArbitrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidReceipt(detail) => {
+                write!(
+                    f,
+                    "temporal arbitration receipt validation failed: {detail}"
+                )
+            },
+            Self::TickDerivation(detail) => {
+                write!(f, "temporal arbitration tick derivation failed: {detail}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for TemporalArbitrationError {}
+
 // =============================================================================
 // LifecycleGate
 // =============================================================================
@@ -901,6 +932,123 @@ impl LifecycleGate {
     pub fn advance_tick(&self, new_tick: u64) {
         if let Some(ref tick_kernel) = self.tick_kernel {
             tick_kernel.advance_tick(new_tick);
+        }
+    }
+
+    fn temporal_arbitration_tick(
+        &self,
+        receipt: &TemporalArbitrationReceiptV1,
+    ) -> Result<u64, TemporalArbitrationError> {
+        self.tick_kernel
+            .as_ref()
+            .map_or(Ok(receipt.arbitrated_at_tick), |kernel| {
+                kernel
+                    .current_tick()
+                    .map_err(TemporalArbitrationError::TickDerivation)
+            })
+    }
+
+    /// Validates and maps temporal arbitration receipt outcome into admission
+    /// action.
+    ///
+    /// When the adjudication deadline has passed, transient disagreement is
+    /// escalated to persistent disagreement before mapping.
+    pub fn check_temporal_arbitration(
+        &self,
+        receipt: &TemporalArbitrationReceiptV1,
+    ) -> Result<ArbitrationAction, TemporalArbitrationError> {
+        receipt
+            .validate()
+            .map_err(TemporalArbitrationError::InvalidReceipt)?;
+        let current_tick = self.temporal_arbitration_tick(receipt)?;
+        Ok(map_arbitration_outcome(
+            receipt.effective_outcome(current_tick),
+            receipt.predicate_id,
+        ))
+    }
+
+    fn enforce_temporal_arbitration(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        temporal_arbitration_receipt: Option<&TemporalArbitrationReceiptV1>,
+        stage: &'static str,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        let Some(receipt) = temporal_arbitration_receipt else {
+            return Ok(());
+        };
+
+        let denied_at_tick = self
+            .temporal_arbitration_tick(receipt)
+            .unwrap_or(receipt.arbitrated_at_tick);
+        let action = match self.check_temporal_arbitration(receipt) {
+            Ok(action) => action,
+            Err(error) => {
+                warn!(
+                    stage = stage,
+                    error = %error,
+                    predicate_id = %receipt.predicate_id,
+                    "temporal arbitration receipt rejected"
+                );
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
+                        predicate_id: receipt.predicate_id.to_string(),
+                        outcome: "invalid_receipt".to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                self.actuate_containment(stage, &deny);
+                return Err(deny);
+            },
+        };
+
+        match action {
+            ArbitrationAction::Continue => Ok(()),
+            ArbitrationAction::Deny { .. } => Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
+                    predicate_id: receipt.predicate_id.to_string(),
+                    outcome: ArbitrationOutcome::AgreedDeny.to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick,
+                containment_action: None,
+            })),
+            ArbitrationAction::FreezeAndRequireAdjudication { .. } => {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
+                        predicate_id: receipt.predicate_id.to_string(),
+                        outcome: ArbitrationOutcome::DisagreementTransient.to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                self.actuate_containment(stage, &deny);
+                Err(deny)
+            },
+            ArbitrationAction::DenyAndRebaseline { .. } => {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationPersistentDisagreement {
+                        predicate_id: receipt.predicate_id.to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                self.actuate_containment(stage, &deny);
+                Err(deny)
+            },
         }
     }
 
@@ -1232,6 +1380,7 @@ impl LifecycleGate {
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
         pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        temporal_arbitration_receipt: Option<&TemporalArbitrationReceiptV1>,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         self.revalidate_before_execution(
             cert,
@@ -1246,6 +1395,13 @@ impl LifecycleGate {
             sovereignty_state,
             current_tick,
             pcac_policy,
+            "revalidate-before-execution",
+        )?;
+        self.enforce_temporal_arbitration(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            temporal_arbitration_receipt,
             "revalidate-before-execution",
         )
     }
@@ -1285,6 +1441,7 @@ impl LifecycleGate {
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
         pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        temporal_arbitration_receipt: Option<&TemporalArbitrationReceiptV1>,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         self.check_consume_sovereignty(
             cert,
@@ -1293,6 +1450,13 @@ impl LifecycleGate {
             sovereignty_state,
             current_tick,
             pcac_policy,
+            "consume-before-effect",
+        )?;
+        self.enforce_temporal_arbitration(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            temporal_arbitration_receipt,
             "consume-before-effect",
         )?;
         self.consume_before_effect(
@@ -1353,6 +1517,7 @@ impl LifecycleGate {
             sovereignty_state,
             current_tick,
             None,
+            None,
         )?;
 
         let (consumed_witness, consume_record) = self.consume_before_effect_with_sovereignty(
@@ -1365,6 +1530,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
+            None,
             None,
         )?;
 

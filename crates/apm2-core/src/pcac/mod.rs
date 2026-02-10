@@ -63,9 +63,9 @@ pub use receipts::{
 };
 pub use temporal_arbitration::{
     ArbitrationAction, ArbitrationOutcome, EvaluatorTuple, FreshnessViolation,
-    MAX_DENY_REASON_LENGTH, MAX_EVALUATOR_ID_LENGTH, MAX_PREDICATE_ID_LENGTH, RevocationViolation,
-    TemporalArbitrationReceiptV1, TemporalPredicateId, check_freshness_dominance,
-    check_revocation_dominance, map_arbitration_outcome,
+    MAX_DENY_REASON_LENGTH, MAX_EVALUATOR_ID_LENGTH, MAX_EVALUATORS, MAX_PREDICATE_ID_LENGTH,
+    RevocationViolation, TemporalArbitrationReceiptV1, TemporalPredicateId,
+    check_freshness_dominance, check_revocation_dominance, map_arbitration_outcome,
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,

@@ -3194,6 +3194,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             sovereignty_state_ref,
                             fresh_tick,
                             Some(&pending_pcac.pcac_policy),
+                            None,
                         )
                     {
                         let containment_action = deny.containment_action;
@@ -3293,6 +3294,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             sovereignty_state_ref,
                             fresh_tick,
                             Some(&pending_pcac.pcac_policy),
+                            None,
                         ) {
                         Ok(receipts) => receipts,
                         Err(deny) => {
