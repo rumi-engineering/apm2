@@ -12,7 +12,8 @@ use anyhow::{Result, anyhow};
 #[cfg(test)]
 use apm2_core::channel::derive_channel_source_witness;
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelSource, ChannelViolationClass, validate_channel_boundary,
+    ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
+    decode_channel_context_token, validate_channel_boundary, verify_channel_source_witness,
 };
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::fac::{DenyCondition, RoleSpecV2};
@@ -31,6 +32,12 @@ const MAX_WORK_ID_LENGTH: usize = 512;
 const MAX_ROLE_LENGTH: usize = 128;
 /// Maximum supported `lease_id` length.
 const MAX_LEASE_ID_LENGTH: usize = 256;
+/// Maximum accepted channel context token length.
+const MAX_CHANNEL_CONTEXT_TOKEN_LENGTH: usize = 8192;
+/// Maximum number of defect details surfaced in deny payloads.
+const MAX_CHANNEL_DEFECT_DETAILS: usize = 8;
+/// Maximum length for each surfaced defect detail.
+const MAX_CHANNEL_DEFECT_DETAIL_LENGTH: usize = 160;
 /// Launch receipt schema identifier.
 const LAUNCH_RECEIPT_SCHEMA_ID: &str = "apm2.launch_receipt.v1";
 
@@ -56,6 +63,9 @@ pub struct RoleLaunchArgs {
     /// Optional lease ID for authorization.
     #[arg(long)]
     pub lease_id: Option<String>,
+    /// Optional daemon-issued base64 channel context token.
+    #[arg(long)]
+    pub channel_context_token: Option<String>,
 }
 
 /// System-resolved channel context used for boundary enforcement.
@@ -141,6 +151,9 @@ pub enum LaunchDenyReason {
         /// Channel violation classes observed in deterministic validation
         /// order.
         violations: Vec<ChannelViolationClass>,
+        /// Bounded defect detail payloads.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        defect_details: Vec<String>,
     },
     /// A hash input is malformed.
     InvalidHashFormat {
@@ -331,12 +344,43 @@ fn execute_role_launch(
     ledger_path: &Path,
     cas_path: &Path,
 ) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
-    execute_role_launch_with_channel_context(
-        args,
-        ledger_path,
-        cas_path,
-        RoleLaunchChannelContext::direct_cli_fail_closed(),
-    )
+    let channel_context = resolve_channel_context(args);
+    execute_role_launch_with_channel_context(args, ledger_path, cas_path, channel_context)
+}
+
+fn resolve_channel_context(args: &RoleLaunchArgs) -> RoleLaunchChannelContext {
+    let Some(token) = args.channel_context_token.as_deref() else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
+
+    if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LENGTH {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    }
+
+    let Ok(check) = decode_channel_context_token(token) else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
+
+    let Some(witness) = check.channel_source_witness else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
+
+    if !verify_channel_source_witness(ChannelSource::TypedToolIntent, &witness) {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    }
+
+    if check.source != ChannelSource::TypedToolIntent {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    }
+
+    RoleLaunchChannelContext {
+        source: ChannelSource::TypedToolIntent,
+        channel_source_witness: Some(witness),
+        broker_verified: check.broker_verified,
+        capability_verified: check.capability_verified,
+        context_firewall_verified: check.context_firewall_verified,
+        policy_ledger_verified: check.policy_ledger_verified,
+    }
 }
 
 fn execute_role_launch_with_channel_context(
@@ -506,6 +550,7 @@ fn enforce_channel_boundary(
         return Ok(());
     }
 
+    let defect_details = bounded_channel_defect_details(&defects);
     let mut violations = Vec::new();
     for defect in defects {
         if !violations.contains(&defect.violation_class) {
@@ -513,7 +558,33 @@ fn enforce_channel_boundary(
         }
     }
 
-    Err(LaunchDenyReason::ChannelBoundaryViolation { violations })
+    Err(LaunchDenyReason::ChannelBoundaryViolation {
+        violations,
+        defect_details,
+    })
+}
+
+fn bounded_channel_defect_details(defects: &[ChannelBoundaryDefect]) -> Vec<String> {
+    defects
+        .iter()
+        .take(MAX_CHANNEL_DEFECT_DETAILS)
+        .map(|defect| {
+            let label = channel_violation_label(defect.violation_class);
+            truncate_boundary_detail(format!("{label}: {}", defect.detail))
+        })
+        .collect()
+}
+
+fn truncate_boundary_detail(mut detail: String) -> String {
+    if detail.len() <= MAX_CHANNEL_DEFECT_DETAIL_LENGTH {
+        return detail;
+    }
+    let mut boundary = MAX_CHANNEL_DEFECT_DETAIL_LENGTH;
+    while !detail.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    detail.truncate(boundary);
+    detail
 }
 
 fn parse_hex_hash_literal(field: &str, value: &str) -> std::result::Result<[u8; 32], String> {
@@ -1208,7 +1279,10 @@ fn deny_reason_message(reason: &LaunchDenyReason) -> String {
                 missing.join(", ")
             )
         },
-        LaunchDenyReason::ChannelBoundaryViolation { violations } => {
+        LaunchDenyReason::ChannelBoundaryViolation {
+            violations,
+            defect_details,
+        } => {
             if violations.is_empty() {
                 "channel boundary violation".to_string()
             } else {
@@ -1217,7 +1291,14 @@ fn deny_reason_message(reason: &LaunchDenyReason) -> String {
                     .map(|violation| channel_violation_label(*violation))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("channel boundary violation: {labels}")
+                if defect_details.is_empty() {
+                    format!("channel boundary violation: {labels}")
+                } else {
+                    format!(
+                        "channel boundary violation: {labels}; details: {}",
+                        defect_details.join(" | ")
+                    )
+                }
             }
         },
         LaunchDenyReason::InvalidHashFormat { field, detail } => {
@@ -1252,6 +1333,7 @@ impl From<LedgerError> for RoleLaunchError {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::channel::issue_channel_context_token;
     use apm2_core::fac::fac_workobject_implementor_v2_role_contract;
     use apm2_core::ledger::EventRecord;
 
@@ -1367,6 +1449,7 @@ mod tests {
             capability_manifest_hash: capability_manifest_hash_hex,
             policy_hash: hex::encode(policy_hash),
             lease_id: Some("L-TEST-001".to_string()),
+            channel_context_token: None,
         };
 
         TestEnv {
@@ -1671,7 +1754,7 @@ mod tests {
         let error = execute_launch(&env).expect_err("free-form channel source should deny launch");
         match error {
             RoleLaunchError::Denied {
-                reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations, .. },
             } => {
                 assert!(
                     violations.contains(&ChannelViolationClass::UntypedChannelSource),
@@ -1694,7 +1777,7 @@ mod tests {
         let error = execute_launch(&env).expect_err("unverified policy should deny launch");
         match error {
             RoleLaunchError::Denied {
-                reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations, .. },
             } => {
                 assert!(
                     violations.contains(&ChannelViolationClass::PolicyNotLedgerVerified),
@@ -1712,7 +1795,7 @@ mod tests {
             .expect_err("direct CLI launch without daemon context should fail closed");
         match error {
             RoleLaunchError::Denied {
-                reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
+                reason: LaunchDenyReason::ChannelBoundaryViolation { ref violations, .. },
             } => {
                 assert!(
                     violations.contains(&ChannelViolationClass::UnknownChannelSource),
@@ -1721,6 +1804,53 @@ mod tests {
                 assert!(
                     violations.contains(&ChannelViolationClass::PolicyNotLedgerVerified),
                     "violations should include policy_not_ledger_verified"
+                );
+            },
+            other => panic!("expected channel-boundary denial, got {other:?}"),
+        }
+
+        assert!(
+            error.message().contains("details:"),
+            "channel-boundary deny message must include bounded defect details"
+        );
+    }
+
+    #[test]
+    fn test_daemon_channel_context_token_allows_launch() {
+        let mut env = setup_test_env();
+        let check = ChannelBoundaryCheck {
+            source: ChannelSource::TypedToolIntent,
+            channel_source_witness: Some(derive_channel_source_witness(
+                ChannelSource::TypedToolIntent,
+            )),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+        };
+        env.args.channel_context_token =
+            Some(issue_channel_context_token(&check).expect("token issuance should succeed"));
+
+        let response = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect("daemon-issued channel context token should admit launch");
+        assert_eq!(response.work_id, env.args.work_id);
+        assert_eq!(response.role, env.args.role);
+    }
+
+    #[test]
+    fn test_invalid_channel_context_token_fails_closed() {
+        let mut env = setup_test_env();
+        env.args.channel_context_token = Some("not-base64-token".to_string());
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("invalid token should fail closed to direct CLI denial");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations, .. },
+            } => {
+                assert!(
+                    violations.contains(&ChannelViolationClass::UnknownChannelSource),
+                    "fail-closed fallback should deny unknown channel source"
                 );
             },
             other => panic!("expected channel-boundary denial, got {other:?}"),

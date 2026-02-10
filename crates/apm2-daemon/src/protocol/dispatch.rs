@@ -31,7 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelSource, derive_channel_source_witness,
+    ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
+    derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
     verify_channel_source_witness,
 };
 use apm2_core::credentials::{
@@ -6387,10 +6388,14 @@ impl PrivilegedDispatcher {
     /// typed tool-intent authority inputs. Unknown future tool classes
     /// fail-closed to `Unknown`.
     #[must_use]
+    #[allow(clippy::fn_params_excessive_bools)]
     pub fn build_channel_boundary_check(
         &self,
         tool_class: &ToolClass,
         policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
     ) -> ChannelBoundaryCheck {
         let source = match tool_class {
             ToolClass::Read
@@ -6405,23 +6410,61 @@ impl PrivilegedDispatcher {
             _ => ChannelSource::Unknown,
         };
 
-        let witness = derive_channel_source_witness(source);
-        let channel_source_witness =
-            verify_channel_source_witness(source, &witness).then_some(witness);
-        let effective_source = if channel_source_witness.is_some() {
-            source
+        let channel_source_witness = if source == ChannelSource::TypedToolIntent {
+            let witness = derive_channel_source_witness(source);
+            verify_channel_source_witness(source, &witness).then_some(witness)
         } else {
-            ChannelSource::Unknown
+            None
         };
+        let effective_source =
+            if source == ChannelSource::TypedToolIntent && channel_source_witness.is_none() {
+                ChannelSource::Unknown
+            } else {
+                source
+            };
 
         ChannelBoundaryCheck {
             source: effective_source,
             channel_source_witness,
-            broker_verified: effective_source == ChannelSource::TypedToolIntent,
-            capability_verified: effective_source == ChannelSource::TypedToolIntent,
-            context_firewall_verified: effective_source == ChannelSource::TypedToolIntent,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
             policy_ledger_verified: policy_verified,
         }
+    }
+
+    /// Validates channel boundaries and issues a daemon-signed context token.
+    ///
+    /// # Errors
+    ///
+    /// Returns boundary defects when validation fails or token issuance fails.
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn validate_channel_boundary_and_issue_context_token(
+        &self,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+    ) -> Result<String, Vec<ChannelBoundaryDefect>> {
+        let check = self.build_channel_boundary_check(
+            tool_class,
+            policy_verified,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+        );
+        let defects = validate_channel_boundary(&check);
+        if !defects.is_empty() {
+            return Err(defects);
+        }
+
+        issue_channel_context_token(&check).map_err(|error| {
+            vec![ChannelBoundaryDefect::new(
+                ChannelViolationClass::MissingChannelMetadata,
+                format!("failed to issue channel context token: {error}"),
+            )]
+        })
     }
 
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
@@ -15740,14 +15783,18 @@ mod tests {
     }
 
     mod channel_boundary_integration {
-        use apm2_core::channel::{ChannelSource, ChannelViolationClass, validate_channel_boundary};
+        use apm2_core::channel::{
+            ChannelSource, ChannelViolationClass, decode_channel_context_token,
+            validate_channel_boundary,
+        };
 
         use super::*;
 
         #[test]
         fn test_daemon_classifies_tool_request_as_typed() {
             let dispatcher = PrivilegedDispatcher::new();
-            let check = dispatcher.build_channel_boundary_check(&ToolClass::Read, true);
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, true, true, true);
 
             assert_eq!(check.source, ChannelSource::TypedToolIntent);
             assert!(
@@ -15765,7 +15812,8 @@ mod tests {
         #[test]
         fn test_daemon_denies_unverified_policy() {
             let dispatcher = PrivilegedDispatcher::new();
-            let check = dispatcher.build_channel_boundary_check(&ToolClass::Read, false);
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, false, true, true, true);
 
             let defects = validate_channel_boundary(&check);
             assert!(
@@ -15773,6 +15821,73 @@ mod tests {
                     == ChannelViolationClass::PolicyNotLedgerVerified),
                 "unverified policy must emit PolicyNotLedgerVerified defect"
             );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_broker() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, false, true, true);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects
+                    .iter()
+                    .any(|defect| defect.violation_class
+                        == ChannelViolationClass::BrokerBypassDetected),
+                "unverified broker must emit BrokerBypassDetected defect"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_capability() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, true, false, true);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects
+                    .iter()
+                    .any(|defect| defect.violation_class
+                        == ChannelViolationClass::CapabilityNotVerified),
+                "unverified capability must emit CapabilityNotVerified defect"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_context_firewall() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check =
+                dispatcher.build_channel_boundary_check(&ToolClass::Read, true, true, true, false);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects.iter().any(|defect| defect.violation_class
+                    == ChannelViolationClass::ContextFirewallNotVerified),
+                "unverified context firewall must emit ContextFirewallNotVerified defect"
+            );
+        }
+
+        #[test]
+        fn test_channel_context_token_roundtrip() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let token = dispatcher
+                .validate_channel_boundary_and_issue_context_token(
+                    &ToolClass::Execute,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .expect("validated boundary should issue token");
+
+            let decoded = decode_channel_context_token(&token).expect("token should decode");
+            assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
+            assert!(decoded.broker_verified);
+            assert!(decoded.capability_verified);
+            assert!(decoded.context_firewall_verified);
+            assert!(decoded.policy_ledger_verified);
         }
     }
 
