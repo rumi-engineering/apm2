@@ -942,6 +942,8 @@ pub fn create_artifact_bundle(
     time_envelope_ref: [u8; 32],
     view_commitment_hash: Option<[u8; 32]>,
     policy_resolved_ref: Option<String>,
+            pcac_policy: None,
+            pointer_only_waiver: None,
     metadata: Option<ReviewMetadata>,
 ) -> Result<ReviewArtifactBundleV1, ReviewReceiptError> {
     let mut builder = ReviewArtifactBundleV1::builder()
@@ -1035,6 +1037,8 @@ pub struct ReviewCompletionResultBuilder {
     reviewer_actor_id: Option<String>,
     view_commitment_hash: Option<[u8; 32]>,
     policy_resolved_ref: Option<String>,
+            pcac_policy: None,
+            pointer_only_waiver: None,
     metadata: Option<ReviewMetadata>,
     capability_manifest_hash: Option<[u8; 32]>,
     context_pack_hash: Option<[u8; 32]>,
@@ -1350,6 +1354,8 @@ impl WorkspaceManager {
         &self,
         work_id: &str,
         policy_resolved_ref: &str,
+            pcac_policy: None,
+            pointer_only_waiver: None,
         changeset_digest: &[u8; 32],
         timestamp_ns: u64,
     ) -> Result<ViewCommitmentV1, WorkspaceError> {
@@ -1506,6 +1512,8 @@ impl WorkspaceManager {
         bundle: &ChangeSetBundleV1,
         work_id: &str,
         policy_resolved_ref: &str,
+            pcac_policy: None,
+            pointer_only_waiver: None,
         timestamp_ns: u64,
     ) -> Result<ApplyResult, WorkspaceError> {
         // Delegate to existing apply logic

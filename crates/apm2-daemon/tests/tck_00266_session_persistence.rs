@@ -30,6 +30,8 @@ fn make_session(id: &str, handle: &str) -> SessionState {
         ephemeral_handle: handle.to_string(),
         lease_id: format!("lease-{id}"),
         policy_resolved_ref: "policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
         capability_manifest_hash: vec![0x01, 0x02, 0x03],
         episode_id: None,
     }
@@ -217,6 +219,8 @@ fn tck_00266_all_session_fields_preserved() {
         ephemeral_handle: "handle-full".to_string(),
         lease_id: "lease-full".to_string(),
         policy_resolved_ref: "policy-ref-full".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
         capability_manifest_hash: vec![0xDE, 0xAD, 0xBE, 0xEF],
         episode_id: Some("episode-123".to_string()),
     };

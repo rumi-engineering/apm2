@@ -360,6 +360,8 @@ fn test_multiple_missing_bindings_all_reported() {
         },
         typed_budget_hash: [0u8; 32],
         policy_resolved_ref: String::new(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
     };
 
     let cas = MemoryCas::new();
@@ -651,6 +653,8 @@ fn test_derive_claim_bindings_matches_manual() {
         role: WorkRole::Reviewer,
         policy_resolution: PolicyResolution {
             policy_resolved_ref: "policy-claim-001".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             resolved_policy_hash: [0xAA; 32],
             capability_manifest_hash: cap_hash,
             context_pack_hash: ctx_hash,
@@ -1122,6 +1126,8 @@ fn test_emit_work_claimed_includes_authority_fields() {
         role: WorkRole::Implementer,
         policy_resolution: PolicyResolution {
             policy_resolved_ref: "policy-emit-001".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             resolved_policy_hash: [0xAA; 32],
             capability_manifest_hash: cap_hash,
             context_pack_hash: ctx_hash,

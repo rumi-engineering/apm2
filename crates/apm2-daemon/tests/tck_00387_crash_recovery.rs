@@ -49,6 +49,8 @@ fn make_stale_session(id: &str, work_id: &str) -> SessionState {
         ephemeral_handle: format!("handle-{id}"),
         lease_id: String::new(), // Empty after loading from disk (SEC-001)
         policy_resolved_ref: "policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
         capability_manifest_hash: vec![],
         episode_id: None,
     }
@@ -89,6 +91,8 @@ fn register_work_claim(conn: &Arc<Mutex<Connection>>, work_id: &str) {
         role: WorkRole::Implementer,
         policy_resolution: PolicyResolution {
             policy_resolved_ref: "test-policy".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             resolved_policy_hash: [0u8; 32],
             capability_manifest_hash: [0u8; 32],
             context_pack_hash: [0u8; 32],

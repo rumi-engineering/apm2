@@ -25,6 +25,8 @@ pub use consume::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use apm2_core::pcac::{PcacPolicyKnobs, PointerOnlyWaiver};
+
 pub use crate::episode::decision::SessionTerminationInfo;
 
 /// Ephemeral session handle for IPC authentication.
@@ -102,6 +104,12 @@ pub struct SessionState {
     pub capability_manifest_hash: Vec<u8>,
     /// Episode ID in the runtime (if created).
     pub episode_id: Option<String>,
+    /// PCAC policy configuration (TCK-00428).
+    #[serde(default)]
+    pub pcac_policy: Option<PcacPolicyKnobs>,
+    /// Active waiver for PointerOnly identity (TCK-00428).
+    #[serde(default)]
+    pub pointer_only_waiver: Option<PointerOnlyWaiver>,
 }
 
 impl std::fmt::Debug for SessionState {

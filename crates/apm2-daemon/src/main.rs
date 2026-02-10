@@ -2384,6 +2384,8 @@ mod crash_recovery_integration_tests {
             ephemeral_handle: format!("handle-{id}"),
             lease_id: String::new(),
             policy_resolved_ref: "policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
         }
@@ -2407,6 +2409,8 @@ mod crash_recovery_integration_tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "test-policy".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
