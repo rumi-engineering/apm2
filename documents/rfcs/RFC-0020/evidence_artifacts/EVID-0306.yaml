@@ -1,72 +1,64 @@
 evidence_artifact:
-  schema_version: "2026-02-07"
+  schema_version: "2026-02-10"
   id: "EVID-0306"
-  title: "AuthoritySealV1 domain separation and batch-root rejection evidence"
-  category: "UNIT_TEST_RESULT"
+  title: "Rollout phase S2.5/S2.6 attestation batching and fallback benchmark evidence"
+  category: "PERF_BENCHMARK"
   status: "PASS"
   description: |
-    Supplementary evidence for TCK-00362 focusing on two critical security
-    properties of AuthoritySealV1:
+    Rollout evidence for RFC-0020 phase S2.5/S2.6 (attestation batching and
+    overhead gating), delivered by TCK-00372.
 
-    1. Domain separation correctness: preimage construction includes seal kind
-       tag, issuer cell ID, issuer identity bytes (public key ID or keyset ID),
-       subject kind string, subject hash, and ledger anchor canonical bytes,
-       all prefixed with the authority seal domain separator. Tests confirm
-       that varying any single field — including issuer_cell_id and issuer_id —
-       produces a distinct preimage, preventing cross-protocol confusion
-       attacks and metadata substitution per RFC-0020 section 1.7.8.
-
-    2. Unsigned/free-floating batch root rejection: MerkleBatch seal
-       construction rejects empty signature vectors, ensuring that batch
-       roots cannot enter the verification pipeline without at least one
-       cryptographic attestation. Free-floating batch root rejection is
-       enforced at construction time (empty signature vectors are rejected
-       by AuthoritySealV1::new). The reject_free_floating_batch_root helper
-       provides a named assertion point for integration code.
-
-    Receipt leaf hashing uses a separate domain separator
-    ("apm2:receipt_leaf:v1\0") per section 9.5.2, verified to produce
-    results distinct from raw blake3 hashing of the same input.
+    This artifact captures measured benchmark outputs for batched attestation
+    verification against direct verification, including:
+    - direct measurements at `10^3`, `10^4`, and `10^5` effects,
+    - bootstrap-modeled `10^6` and `10^8` p99 envelopes,
+    - `10^12` projection from the modeled high-scale points,
+    - `<1%` p99 CPU/network overhead gate compliance,
+    - automatic fallback to direct verification when degradation/integrity/
+      freshness failures occur,
+    - fail-closed behavior when fallback material is unavailable or invalid.
   requirement_ids:
-    - "REQ-0016"
+    - "REQ-0026"
   source_refs:
-    - "documents/rfcs/RFC-0020/requirements/REQ-0016.yaml"
-    - "crates/apm2-daemon/src/identity/authority_seal.rs"
+    - "documents/rfcs/RFC-0020/requirements/REQ-0026.yaml"
+    - "crates/apm2-core/src/consensus/attestation_overhead.rs"
+    - "crates/apm2-daemon/src/identity/receipt_pointer.rs"
+    - "crates/apm2-daemon/tests/tck_00372_attestation_overhead.rs"
   artifacts:
+    - type: "benchmark_output"
+      description: |
+        Integrated attestation overhead benchmark + projection output:
+        - `batch_size=256` benchmark run
+        - direct-measurement scales (`10^3`, `10^4`, `10^5`)
+        - bootstrap-modeled p99 envelopes for `10^6` and `10^8`
+        - projected overhead ratios for `10^12`
+      ref:
+        - "cargo test -p apm2-daemon --test tck_00372_attestation_overhead -- --nocapture"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_attestation_overhead.log"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/measurement_snapshot.json"
     - type: "test_output"
       description: |
-        Domain separation preimage uniqueness across all varying axes:
-        - domain_separated_preimage_differs_by_subject_kind: same hash/anchor,
-          different artifact kind produces different preimage
-        - domain_separated_preimage_differs_by_seal_kind: QuorumMultisig vs
-          QuorumThreshold on same inputs produce different preimages
-        - domain_separated_preimage_differs_by_ledger_anchor: same seal/subject,
-          different consensus index produces different preimage
-        - test_preimage_changes_with_different_issuer_cell_id: different cell_id
-          produces different preimage
-        - test_preimage_changes_with_different_issuer_id: different issuer key
-          produces different preimage
+        Fallback trigger coverage in the integrated TCK harness:
+        - integrity failure triggers automatic direct fallback
+        - freshness failure triggers automatic direct fallback
+        - degradation (overhead gate breach) triggers direct fallback
+        - quorum batch path preserves fail-closed semantics under mismatched direct fallback material
       ref:
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_subject_kind"
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_seal_kind"
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_ledger_anchor"
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_preimage_changes_with_different_issuer_cell_id"
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_preimage_changes_with_different_issuer_id"
+        - "cargo test -p apm2-daemon --test tck_00372_attestation_overhead -- --nocapture"
     - type: "test_output"
       description: |
-        Receipt leaf hash domain separation (section 9.5.2):
-        - receipt_leaf_hash_is_domain_separated: leaf hash differs from raw hash
-        - receipt_leaf_hash_is_deterministic: same input yields same output
+        Additional unit-level fallback assertions (fail-closed):
+        - verify_batch_falls_back_to_direct_on_integrity_failure
+        - verify_batch_falls_back_to_direct_on_freshness_failure
+        - verify_batch_falls_back_to_direct_on_degradation_overhead_gate
+        - verify_batch_fail_closed_when_fallback_is_unavailable
+        - verify_batch_fail_closed_when_fallback_receipt_mismatches
       ref:
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::receipt_leaf_hash_is_domain_separated"
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::receipt_leaf_hash_is_deterministic"
-    - type: "test_output"
-      description: |
-        Unsigned batch root rejection (section 0.1(11b)):
-        - merkle_batch_rejects_empty_signatures: unsigned batch root rejected
-          at construction time with InvalidQuorumSignatureCount error
-        - reject_free_floating_batch_root_passes_for_anchored: properly
-          anchored seal passes the API-level free-floating check
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::verify_batch_falls_back_to_direct_on_ -- --nocapture"
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::verify_batch_fail_closed_when_ -- --nocapture"
+    - type: "log_bundle"
+      description: "Captured fallback activation and fail-closed logs for S2.5/S2.6 rollout evidence."
       ref:
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::merkle_batch_rejects_empty_signatures"
-        - "cargo test -p apm2-daemon identity::authority_seal::tests::reject_free_floating_batch_root_passes_for_anchored"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_fallback_activation.log"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_fail_closed_fallback.log"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/fallback_summary.json"
