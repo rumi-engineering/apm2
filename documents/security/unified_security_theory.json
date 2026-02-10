@@ -1128,7 +1128,7 @@
         "purpose": "Eliminate long-lived signing keys from release operations via OIDC → Fulcio → Cosign → Rekor pipeline.",
         "law_refs": ["SEC-LAW-02"],
         "rfc_ref": "N/A (release infrastructure)",
-        "operational_doc_refs": ["SIGNING_AND_VERIFICATION.cac.json", "RELEASE_PROCEDURE.cac.json", "AGENTS.cac.json"],
+        "operational_doc_refs": ["SIGNING_AND_VERIFICATION.cac.json", "RELEASE_PROCEDURE.cac.json", "SECURITY_POLICY.cac.json"],
         "key_properties": [
           "GitHub Actions OIDC token → Fulcio short-lived certificate → Cosign ephemeral signing → Rekor transparency logging",
           "No long-lived private keys to store, rotate, or protect",

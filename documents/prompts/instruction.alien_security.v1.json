@@ -150,7 +150,7 @@
             "note": "Boundary, identity, and delegation constraints."
           },
           {
-            "file": "documents/security/AGENTS.cac.json",
+            "file": "documents/security/SECURITY_POLICY.cac.json",
             "note": "Security governance context."
           },
           {
@@ -318,7 +318,7 @@
         "documents/theory/unified-theory-v2.json",
         "documents/theory/unified-theory-v2.json",
         "documents/theory/unified-theory-v2.json",
-        "documents/security/AGENTS.cac.json",
+        "documents/security/SECURITY_POLICY.cac.json",
         "documents/security/INCIDENT_RESPONSE.cac.json",
         "documents/security/NETWORK_DEFENSE.cac.json",
         "documents/security/RELEASE_PROCEDURE.cac.json",

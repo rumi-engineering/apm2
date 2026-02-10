@@ -138,7 +138,7 @@
         "precondition": "You know which crate(s) and module(s) you are working in.",
         "priority_reads": [
           "README.md",
-          "documents/reviews/CI_EXPECTATIONS.md"
+          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
         ],
         "supplementary_reads": [
           "DAEMON.md",
@@ -167,7 +167,7 @@
         "intent_name": "Testing and Quality Assurance",
         "precondition": "You know which crate or feature you are testing.",
         "priority_reads": [
-          "documents/reviews/CI_EXPECTATIONS.md",
+          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md",
           "documents/reviews/AAT_HYPOTHESIS_PROMPT.md",
           "crates/apm2-core/src/evidence/AGENTS.md"
         ],
@@ -189,7 +189,7 @@
         "intent_name": "Security Review and Threat Modeling",
         "precondition": "None.",
         "priority_reads": [
-          "documents/security/AGENTS.cac.json",
+          "documents/security/SECURITY_POLICY.cac.json",
           "documents/reviews/SECURITY_REVIEW_PROMPT.md",
           "documents/security/THREAT_MODEL.cac.json",
           "SECURITY.md"
@@ -212,7 +212,7 @@
         "precondition": "You have a PR URL or diff to review.",
         "priority_reads": [
           "documents/reviews/CODE_QUALITY_PROMPT.md",
-          "documents/reviews/CI_EXPECTATIONS.md"
+          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
         ],
         "supplementary_reads": [
           "documents/theory/unified-theory-v2.json",
@@ -271,7 +271,7 @@
             "rfc": "documents/rfcs/template/",
             "skill": "documents/skills/skill-authoring/SKILL.md",
             "agents_md": "crates/apm2-core/src/reducer/AGENTS.md",
-            "cac_json": "documents/security/AGENTS.cac.json"
+            "cac_json": "documents/security/SECURITY_POLICY.cac.json"
           }
         },
         "related_skills": [
@@ -304,7 +304,7 @@
         "intent_name": "CI/CD and Infrastructure",
         "precondition": "None.",
         "priority_reads": [
-          "documents/reviews/CI_EXPECTATIONS.md",
+          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md",
           ".github/workflows/ci.yml"
         ],
         "supplementary_reads": [
@@ -326,7 +326,7 @@
         "intent_name": "Working a Ticket",
         "precondition": "You have a ticket ID (e.g., TCK-00391).",
         "priority_reads": [
-          "documents/reviews/CI_EXPECTATIONS.md"
+          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
         ],
         "supplementary_reads": [
           "README.md",

@@ -1,9 +1,9 @@
-//! CI status PR comment: single-post updater.
+//! CI status PR comment: synced projection updater.
 //!
 //! Projects all CI gate results to a single machine-readable YAML PR comment
-//! with marker `apm2-ci-status:v1`. The comment is created **once** when the
-//! pipeline completes — no intermediate edits — to minimise GitHub API calls
-//! and avoid rate-limit exhaustion.
+//! with marker `apm2-ci-status:v1`. The comment is created on first update and
+//! then patched in place so orchestrators can observe gate progress and
+//! terminal failures from GitHub projections.
 //!
 //! # Security boundary
 //!
@@ -23,6 +23,7 @@
 //! written to private logs under `~/.apm2/` and surfaced via
 //! `apm2 fac logs --pr <N>`.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -149,6 +150,15 @@ pub fn find_status_comment(
     let comments: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse comment response: {e}"))?;
 
+    Ok(latest_status_comment_for_sha(&comments, sha))
+}
+
+fn latest_status_comment_for_sha(
+    comments: &[serde_json::Value],
+    sha: &str,
+) -> Option<(u64, CiStatus)> {
+    let mut latest_match: Option<(u64, CiStatus)> = None;
+
     for comment in comments {
         let body = comment
             .get("body")
@@ -157,29 +167,33 @@ pub fn find_status_comment(
         if !body.contains(&format!("<!-- {STATUS_MARKER} -->")) {
             continue;
         }
-        // Extract YAML block between ```yaml and ```.
-        if let Some(yaml_str) = extract_yaml_block(body) {
-            if let Ok(status) = serde_yaml::from_str::<CiStatus>(yaml_str) {
-                if status.sha == sha {
-                    let comment_id = comment
-                        .get("id")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    return Ok(Some((comment_id, status)));
-                }
-            }
+
+        let Some(yaml_str) = extract_yaml_block(body) else {
+            continue;
+        };
+        let Ok(status) = serde_yaml::from_str::<CiStatus>(yaml_str) else {
+            continue;
+        };
+        if status.sha != sha {
+            continue;
         }
+
+        let comment_id = comment
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        latest_match = Some((comment_id, status));
     }
 
-    Ok(None)
+    latest_match
 }
 
-/// Post a single CI status comment on a PR (no find+edit, just POST).
+/// Post a single CI status comment on a PR and return the created comment id.
 pub fn create_status_comment(
     owner_repo: &str,
     pr_number: u32,
     status: &CiStatus,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let body = status.to_comment_body();
     let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
 
@@ -198,6 +212,41 @@ pub fn create_status_comment(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("status comment POST failed: {stderr}"));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("failed to parse status comment POST response: {e}"))?;
+    let comment_id = value
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "status comment POST response missing id".to_string())?;
+    Ok(comment_id)
+}
+
+/// Update an existing CI status comment in place.
+pub fn update_status_comment(
+    owner_repo: &str,
+    comment_id: u64,
+    status: &CiStatus,
+) -> Result<(), String> {
+    let body = status.to_comment_body();
+    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
+
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "-X",
+            "PATCH",
+            &endpoint,
+            "-f",
+            &format!("body={body}"),
+        ])
+        .output()
+        .map_err(|e| format!("failed to PATCH status comment: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("status comment PATCH failed: {stderr}"));
     }
     Ok(())
 }
@@ -224,15 +273,15 @@ fn extract_yaml_block(body: &str) -> Option<&str> {
 
 // ── Deferred updater ─────────────────────────────────────────────────────────
 
-/// Deferred single-post wrapper around `create_status_comment`.
+/// Synced update wrapper around CI status projection comments.
 ///
-/// `update()` is a no-op that only records the latest status in memory.
-/// `force_update()` posts one comment with the final state — this is the
-/// only call that touches the GitHub API, avoiding rate-limit exhaustion
-/// from repeated find+edit cycles.
+/// `update()` ensures a per-SHA status comment exists and then patches it with
+/// the latest gate projection state. `force_update()` performs the same sync
+/// operation and is kept for call-site readability at terminal boundaries.
 pub struct ThrottledUpdater {
     owner_repo: String,
     pr_number: u32,
+    comment_id: Cell<Option<u64>>,
 }
 
 impl ThrottledUpdater {
@@ -241,23 +290,41 @@ impl ThrottledUpdater {
         Self {
             owner_repo: owner_repo.to_string(),
             pr_number,
+            comment_id: Cell::new(None),
         }
     }
 
-    /// Record latest status locally (no API call).
-    ///
-    /// Callers still pass their `CiStatus` here so the call-sites don't
-    /// need to change — the status struct itself is the in-memory
-    /// accumulator.
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    pub fn update(&self, _status: &CiStatus) -> bool {
-        // No-op: we post once at the end via force_update().
-        false
+    fn sync_status_comment(&self, status: &CiStatus) -> Result<(), String> {
+        let comment_id = if let Some(id) = self.comment_id.get() {
+            id
+        } else if let Some((existing_id, _existing_status)) =
+            find_status_comment(&self.owner_repo, self.pr_number, &status.sha)?
+        {
+            self.comment_id.set(Some(existing_id));
+            existing_id
+        } else {
+            let created_id = create_status_comment(&self.owner_repo, self.pr_number, status)?;
+            self.comment_id.set(Some(created_id));
+            return Ok(());
+        };
+
+        update_status_comment(&self.owner_repo, comment_id, status)
     }
 
-    /// Post the final CI status comment (single POST, no find+edit).
+    /// Sync the current status projection to GitHub.
+    pub fn update(&self, status: &CiStatus) -> bool {
+        match self.sync_status_comment(status) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("WARNING: ci_status update failed: {e}");
+                false
+            },
+        }
+    }
+
+    /// Sync the final CI status projection to GitHub.
     pub fn force_update(&self, status: &CiStatus) -> bool {
-        match create_status_comment(&self.owner_repo, self.pr_number, status) {
+        match self.sync_status_comment(status) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("WARNING: ci_status final post failed: {e}");
@@ -366,29 +433,42 @@ mod tests {
         assert!(yaml.starts_with("sha:"), "should skip # comment line");
     }
 
-    // ── ThrottledUpdater contract ───────────────────────────────────────
-
     #[test]
-    fn test_update_never_makes_api_call() {
-        // update() must always return false (no-op).
-        let updater = ThrottledUpdater::new("owner/repo", 1);
-        let s = CiStatus::new("abc", 1);
-        assert!(!updater.update(&s), "update() must be a no-op");
-        assert!(
-            !updater.update(&s),
-            "update() must remain a no-op on repeat"
-        );
+    fn test_latest_status_comment_for_sha_returns_latest_match() {
+        let c1 = serde_json::json!({
+            "id": 100_u64,
+            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:00Z\ngates:\n  rustfmt:\n    status: PASS\n    duration_secs: 1\n```\n"
+        });
+        let c2 = serde_json::json!({
+            "id": 101_u64,
+            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: other-sha\npr: 7\nupdated_at: 2026-02-11T00:00:01Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 1\n```\n"
+        });
+        let c3 = serde_json::json!({
+            "id": 102_u64,
+            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:02Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 2\n```\n"
+        });
+
+        let comments = vec![c1, c2, c3];
+        let (id, status) = latest_status_comment_for_sha(&comments, "deadbeef")
+            .expect("should find latest status comment");
+        assert_eq!(id, 102);
+        assert_eq!(status.gates["rustfmt"].status, "FAIL");
+        assert_eq!(status.gates["rustfmt"].duration_secs, Some(2));
     }
 
     #[test]
-    fn test_update_is_idempotent_no_side_effects() {
-        // Call update() many times — must never panic or change behavior.
-        let updater = ThrottledUpdater::new("owner/repo", 42);
-        let mut s = CiStatus::new("sha123", 42);
-        for i in 0..100 {
-            s.set_result(&format!("gate_{i}"), true, i);
-            assert!(!updater.update(&s));
-        }
+    fn test_latest_status_comment_for_sha_ignores_invalid_entries() {
+        let missing_marker = serde_json::json!({
+            "id": 10_u64,
+            "body": "```yaml\nsha: deadbeef\n```\n"
+        });
+        let invalid_yaml = serde_json::json!({
+            "id": 11_u64,
+            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\nthis: is: not: valid: yaml\n```\n"
+        });
+
+        let comments = vec![missing_marker, invalid_yaml];
+        assert!(latest_status_comment_for_sha(&comments, "deadbeef").is_none());
     }
 
     // ── Security boundary: no sensitive data in comment body ────────────

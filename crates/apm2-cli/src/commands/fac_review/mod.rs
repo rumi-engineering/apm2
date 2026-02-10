@@ -596,6 +596,7 @@ pub fn run_logs(pr_number: Option<u32>, json_output: bool) -> u8 {
 
 pub fn run_gates(
     force: bool,
+    quick: bool,
     timeout_seconds: u64,
     memory_max: &str,
     pids_max: u64,
@@ -604,6 +605,7 @@ pub fn run_gates(
 ) -> u8 {
     gates::run_gates(
         force,
+        quick,
         timeout_seconds,
         memory_max,
         pids_max,
