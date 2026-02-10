@@ -205,10 +205,11 @@ pub use conformance::{
 pub use contract_registry::{
     CAC_CANONICALIZER_VECTORS_REF, CAC_DIGEST_ALGORITHM_BLAKE3, CAC_DIGEST_FIELD_OBJECT,
     CAC_VALIDATION_ORDER, CacCompatibilityState, CacDefect, CacDefectClass, CacFreshnessStatus,
-    CacObject, CacPredicateStatus, CacSignatureStatus, CacValidationResult, CacValidationStep,
-    ContractObjectRegistry, ContractObjectRegistryEntry, EscalationAction, MAX_CAC_DEFECTS,
-    MAX_CONTRACT_REGISTRY_ENTRIES, RegistryDefect, RoleSpecContextBinding,
-    RoleSpecContextBindingError, Tier2EscalationPolicy, validate_cac_contract,
+    CacObject, CacPredicateStatus, CacSignatureStatus, CacSnapshotValidationResult,
+    CacValidationResult, CacValidationStep, ContractObjectRegistry, ContractObjectRegistryEntry,
+    EscalationAction, MAX_CAC_DEFECTS, MAX_CONTRACT_REGISTRY_ENTRIES, RegistryDefect,
+    RoleSpecContextBinding, RoleSpecContextBindingError, Tier2EscalationPolicy,
+    validate_cac_contract, validate_cac_snapshot,
 };
 pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,

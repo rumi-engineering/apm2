@@ -7,7 +7,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::marker::PhantomData;
 
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+use super::traceability_overlay::{
+    OverlayDefect, OverlayDefectClass, TrcFacClaim, default_overlay_requirements,
+    validate_overlay_requirements,
+};
 use crate::determinism::{CANONICALIZER_ID, CANONICALIZER_VERSION};
 
 /// Maximum number of contract rows allowed in a registry.
@@ -690,6 +694,31 @@ impl CacValidationResult {
     }
 
     /// Returns `true` only when the object is fully compatible.
+    #[must_use]
+    pub fn is_admissible(&self) -> bool {
+        self.recompute_compatibility_state().is_admissible()
+    }
+}
+
+/// Aggregate result from validating a CAC snapshot payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacSnapshotValidationResult {
+    /// Aggregate compatibility state across per-schema and overlay checks.
+    pub compatibility_state: CacCompatibilityState,
+    /// Consolidated defect list, including overlay-derived defects.
+    pub defects: Vec<CacDefect>,
+    /// Per-schema validation results keyed by `schema_id`.
+    pub validation_results: BTreeMap<String, CacValidationResult>,
+}
+
+impl CacSnapshotValidationResult {
+    /// Recomputes compatibility-state refinement from defects.
+    #[must_use]
+    pub fn recompute_compatibility_state(&self) -> CacCompatibilityState {
+        recompute_compatibility_state_from_defects(&self.defects)
+    }
+
+    /// Returns `true` only when the full snapshot is fully compatible.
     #[must_use]
     pub fn is_admissible(&self) -> bool {
         self.recompute_compatibility_state().is_admissible()
@@ -1377,6 +1406,87 @@ pub fn validate_cac_contract(
     }
 }
 
+const fn map_overlay_defect_class(defect_class: OverlayDefectClass) -> CacDefectClass {
+    match defect_class {
+        OverlayDefectClass::MissingRequiredSchema => CacDefectClass::SchemaUnresolved,
+        OverlayDefectClass::SchemaValidationFailed
+        | OverlayDefectClass::Tier2EscalationTriggered => CacDefectClass::PredicateExecutionFailed,
+        OverlayDefectClass::IncompleteDigestSet => CacDefectClass::DigestIncomplete,
+        OverlayDefectClass::CanonicalizerBindingMismatch => {
+            CacDefectClass::CanonicalizerVectorMismatch
+        },
+        OverlayDefectClass::SignatureFreshnessFailed => CacDefectClass::SignatureFreshnessFailed,
+    }
+}
+
+fn overlay_defect_to_cac_defect(defect: &OverlayDefect) -> CacDefect {
+    CacDefect::new(
+        map_overlay_defect_class(defect.defect_class),
+        CacValidationStep::PredicateExecution,
+        format!(
+            "overlay {:?} {:?}: {}",
+            defect.claim, defect.defect_class, defect.detail
+        ),
+    )
+}
+
+/// Validates a CAC snapshot payload and enforces promotion-critical overlay
+/// requirements for active TRC-FAC claims.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn validate_cac_snapshot(
+    registry: &ContractObjectRegistry,
+    objects: &[CacObject],
+    active_claims: &[TrcFacClaim],
+) -> CacSnapshotValidationResult {
+    let mut defects = Vec::new();
+    let mut compatibility_state = CacCompatibilityState::Compatible;
+    let mut validation_results = HashMap::with_capacity(objects.len());
+
+    for object in objects {
+        let result = validate_cac_contract(registry, object);
+        compatibility_state = compatibility_state.max(result.recompute_compatibility_state());
+        for defect in &result.defects {
+            update_with_defect(&mut defects, &mut compatibility_state, defect.clone());
+        }
+
+        if validation_results
+            .insert(object.schema_id.clone(), result)
+            .is_some()
+        {
+            update_with_defect(
+                &mut defects,
+                &mut compatibility_state,
+                CacDefect::new(
+                    CacDefectClass::SchemaRegistryDriftAmbiguous,
+                    CacValidationStep::SchemaResolution,
+                    format!(
+                        "duplicate validation result for schema_id '{}' in snapshot payload",
+                        object.schema_id
+                    ),
+                ),
+            );
+        }
+    }
+
+    let overlay = default_overlay_requirements();
+    let overlay_defects =
+        validate_overlay_requirements(active_claims, &validation_results, &overlay);
+    for overlay_defect in overlay_defects {
+        update_with_defect(
+            &mut defects,
+            &mut compatibility_state,
+            overlay_defect_to_cac_defect(&overlay_defect),
+        );
+    }
+
+    CacSnapshotValidationResult {
+        compatibility_state: recompute_compatibility_state_from_defects(&defects),
+        defects,
+        validation_results: validation_results.into_iter().collect(),
+    }
+}
+
 fn update_with_defect(
     defects: &mut Vec<CacDefect>,
     compatibility_state: &mut CacCompatibilityState,
@@ -1978,6 +2088,16 @@ mod tests {
         object
     }
 
+    fn sample_admissible_object_for_schema(
+        registry: &ContractObjectRegistry,
+        schema_id: &str,
+    ) -> CacObject {
+        let entry = registry.lookup_by_schema_id(schema_id).unwrap_or_else(|| {
+            panic!("schema_id '{schema_id}' should resolve in default registry")
+        });
+        sample_admissible_object(entry)
+    }
+
     #[test]
     fn test_default_registry_complete() {
         let registry = ContractObjectRegistry::default_registry();
@@ -2197,6 +2317,72 @@ mod tests {
                 .iter()
                 .any(|defect| defect.class == CacDefectClass::SchemaUnresolved)
         );
+    }
+
+    #[test]
+    fn test_overlay_enforcement_blocks_promotion_on_missing_schema() {
+        let registry = ContractObjectRegistry::default_registry();
+        let objects = vec![sample_admissible_object_for_schema(
+            &registry,
+            "apm2.authority_kernel_decision.v1",
+        )];
+
+        let result = validate_cac_snapshot(&registry, &objects, &[TrcFacClaim::TrcFac01]);
+
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(result.defects.iter().any(|defect| {
+            defect.class == CacDefectClass::SchemaUnresolved
+                && defect.detail.contains("overlay")
+                && defect.detail.contains("MissingRequiredSchema")
+                && defect.detail.contains("apm2.pcac_snapshot_report.v1")
+        }));
+    }
+
+    #[test]
+    fn test_overlay_enforcement_passes_when_all_schemas_compatible() {
+        let registry = ContractObjectRegistry::default_registry();
+        let objects = vec![
+            sample_admissible_object_for_schema(&registry, "apm2.pcac_snapshot_report.v1"),
+            sample_admissible_object_for_schema(&registry, "apm2.authority_kernel_decision.v1"),
+        ];
+
+        let result = validate_cac_snapshot(&registry, &objects, &[TrcFacClaim::TrcFac01]);
+
+        assert_eq!(
+            result.compatibility_state,
+            CacCompatibilityState::Compatible
+        );
+        assert!(
+            result.defects.is_empty(),
+            "unexpected defects: {:?}",
+            result.defects
+        );
+    }
+
+    #[test]
+    fn test_overlay_tier2_escalation_blocks_validation() {
+        let registry = ContractObjectRegistry::default_registry();
+        let objects = vec![sample_admissible_object_for_schema(
+            &registry,
+            "apm2.revocation_frontier_snapshot.v1",
+        )];
+
+        let result = validate_cac_snapshot(&registry, &objects, &[TrcFacClaim::TrcFac16]);
+
+        assert!(
+            result
+                .validation_results
+                .values()
+                .all(CacValidationResult::is_admissible),
+            "object-level defects should not drive this failure: {:?}",
+            result.validation_results
+        );
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(result.defects.iter().any(|defect| {
+            defect.class == CacDefectClass::PredicateExecutionFailed
+                && defect.detail.contains("overlay")
+                && defect.detail.contains("Tier2EscalationTriggered")
+        }));
     }
 
     #[test]
