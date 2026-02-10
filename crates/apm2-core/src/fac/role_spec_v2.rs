@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -233,13 +234,13 @@ impl DenyReasonCode {
     }
 
     #[must_use]
-    fn from_wire_or_restrictive(value: &str) -> Self {
+    fn from_wire(value: &str) -> Option<Self> {
         match value {
-            "MISSING_AUTHORITY" => Self::MissingAuthority,
-            "STALE_AUTHORITY" => Self::StaleAuthority,
-            "UNKNOWN_ROLE" => Self::UnknownRole,
-            // Unknown values default to the most restrictive class.
-            _ => Self::UnverifiableContext,
+            "MISSING_AUTHORITY" => Some(Self::MissingAuthority),
+            "STALE_AUTHORITY" => Some(Self::StaleAuthority),
+            "UNKNOWN_ROLE" => Some(Self::UnknownRole),
+            "UNVERIFIABLE_CONTEXT" => Some(Self::UnverifiableContext),
+            _ => None,
         }
     }
 }
@@ -265,7 +266,8 @@ impl<'de> Deserialize<'de> for DenyReasonCode {
         D: Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        Ok(Self::from_wire_or_restrictive(&raw))
+        Self::from_wire(&raw)
+            .ok_or_else(|| D::Error::custom(format!("unknown deny reason code: {raw}")))
     }
 }
 
@@ -954,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_deny_reason_code_defaults_restrictive_and_fails_mapping() {
+    fn unknown_deny_reason_code_rejected_at_deserialization() {
         let mut value = serde_json::to_value(valid_role_spec_v2()).unwrap();
         value
             .get_mut("deny_taxonomy")
@@ -968,15 +970,30 @@ mod tests {
                 serde_json::Value::String("NOT_A_REAL_CODE".to_string()),
             );
 
-        let parsed: RoleSpecV2 = serde_json::from_value(value).unwrap();
-        let err = parsed.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            RoleSpecV2Error::DenyTaxonomyMismatch {
-                condition: DenyCondition::MissingAuthorityContext,
-                ..
-            }
-        ));
+        let parsed: Result<RoleSpecV2, _> = serde_json::from_value(value);
+        let err = parsed.expect_err("unknown deny reason code must fail deserialization");
+        assert!(err.to_string().contains("unknown deny reason code"));
+    }
+
+    #[test]
+    fn unknown_deny_reason_code_rejected_for_unverifiable_context_hash() {
+        let mut value = serde_json::to_value(valid_role_spec_v2()).unwrap();
+        value
+            .get_mut("deny_taxonomy")
+            .unwrap()
+            .get_mut("unverifiable_context_hash")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "code".to_string(),
+                serde_json::Value::String("GARBAGE_WIRE_CODE".to_string()),
+            );
+
+        let parsed: Result<RoleSpecV2, _> = serde_json::from_value(value);
+        let err =
+            parsed.expect_err("unknown deny reason code for unverifiable context hash must fail");
+        assert!(err.to_string().contains("unknown deny reason code"));
     }
 
     #[test]
