@@ -26567,6 +26567,488 @@ mod tests {
     }
 
     // ========================================================================
+    // TCK-00448: Adversarial lineage denial tests
+    // ========================================================================
+    mod tck_00448_lineage_denials {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
+        use super::*;
+
+        const LINEAGE_TEST_ARTIFACT_CONTENT: &[u8] = b"tck-00448-lineage-artifact";
+
+        fn test_peer_credentials() -> PeerCredentials {
+            PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }
+        }
+
+        fn setup_spawn_lineage_fixture(
+            work_id: &str,
+            lease_id: &str,
+            mutate_policy: impl FnOnce(&Arc<MemoryCas>, &mut PolicyResolution),
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            SpawnEpisodeRequest,
+            String,
+        ) {
+            let peer_creds = test_peer_credentials();
+            let actor_id = derive_actor_id(&peer_creds);
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &actor_id, WorkRole::Implementer, 0);
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &actor_id,
+                WorkRole::Implementer,
+                &policy_resolution,
+            );
+            mutate_policy(&cas, &mut policy_resolution);
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("lineage test claim registration must succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id.to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None,
+            };
+
+            (dispatcher, ctx, request, work_id.to_string())
+        }
+
+        fn setup_receipt_lineage_fixture(
+            work_id: &str,
+            lease_id: &str,
+            receipt_id: &str,
+            mutate_policy: impl FnOnce(&Arc<MemoryCas>, &mut PolicyResolution),
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            IngestReviewReceiptRequest,
+            String,
+        ) {
+            let peer_creds = test_peer_credentials();
+            let actor_id = derive_actor_id(&peer_creds);
+            let cas = Arc::new(MemoryCas::default());
+            let artifact_bundle_hash = cas
+                .store(LINEAGE_TEST_ARTIFACT_CONTENT)
+                .expect("lineage test artifact bundle should store in CAS")
+                .hash
+                .to_vec();
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                "gate-tck-00448-lineage",
+                &actor_id,
+            );
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id,
+                    work_id,
+                    gate_id: "gate-tck-00448-lineage",
+                    executor_actor_id: &actor_id,
+                    policy_hash: [0u8; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &actor_id, WorkRole::Reviewer, 0);
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            mutate_policy(&cas, &mut policy_resolution);
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    actor_id: actor_id.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("lineage test review claim registration must succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            let request = IngestReviewReceiptRequest {
+                lease_id: lease_id.to_string(),
+                receipt_id: receipt_id.to_string(),
+                reviewer_actor_id: actor_id,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash,
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+
+            (dispatcher, ctx, request, work_id.to_string())
+        }
+
+        fn review_receipt_event_count(dispatcher: &PrivilegedDispatcher, work_id: &str) -> usize {
+            dispatcher
+                .event_emitter
+                .get_events_by_work_id(work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "review_receipt_recorded")
+                .count()
+        }
+
+        #[test]
+        fn test_missing_role_spec_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-MISSING-ROLE",
+                "lease-tck-00448-missing-role",
+                "RR-TCK-00448-MISSING-ROLE",
+                |_cas, policy| {
+                    policy.role_spec_hash = [0u8; 32];
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PolicyResolutionMissing as i32
+                    );
+                    assert!(
+                        err.message.contains("missing_authority_context"),
+                        "deny message should include missing_authority_context, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("claim role_spec_hash is zero"),
+                        "deny message should include claim role_spec_hash zero detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected authority-context deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "missing role_spec_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "missing role_spec_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_mismatched_role_spec_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-MISMATCH-ROLE",
+                "lease-tck-00448-mismatch-role",
+                "RR-TCK-00448-MISMATCH-ROLE",
+                |cas, policy| {
+                    let wrong_hash = cas
+                        .store(b"tck-00448-mismatched-role-spec")
+                        .expect("mismatched role hash preimage should store in CAS")
+                        .hash;
+                    policy.role_spec_hash = wrong_hash;
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("unknown_role_profile"),
+                        "deny message should include unknown_role_profile, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("does not match authoritative hash"),
+                        "deny message should include authoritative hash mismatch, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected unknown-role-profile deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "mismatched role_spec_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "mismatched role_spec_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_missing_context_pack_recipe_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-MISSING-RECIPE",
+                "lease-tck-00448-missing-recipe",
+                "RR-TCK-00448-MISSING-RECIPE",
+                |_cas, policy| {
+                    policy.context_pack_recipe_hash = [0u8; 32];
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PolicyResolutionMissing as i32
+                    );
+                    assert!(
+                        err.message.contains("missing_authority_context"),
+                        "deny message should include missing_authority_context, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message
+                            .contains("claim context_pack_recipe_hash is zero"),
+                        "deny message should include claim context_pack_recipe_hash zero detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected authority-context deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "missing context_pack_recipe_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "missing context_pack_recipe_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_stale_context_pack_recipe_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-STALE-RECIPE",
+                "lease-tck-00448-stale-recipe",
+                "RR-TCK-00448-STALE-RECIPE",
+                |cas, policy| {
+                    let stale_recipe = build_policy_context_pack_recipe(
+                        "W-TCK-00448-LEGACY",
+                        "actor:legacy",
+                        policy.role_spec_hash,
+                        policy.context_pack_hash,
+                    )
+                    .expect("stale recipe should compile");
+                    let stale_recipe_bytes = stale_recipe
+                        .recipe
+                        .canonical_bytes()
+                        .expect("stale recipe canonicalization should succeed");
+                    let stale_hash = *blake3::hash(&stale_recipe_bytes).as_bytes();
+                    cas.store(&stale_recipe_bytes)
+                        .expect("stale recipe preimage should store in CAS");
+                    assert_ne!(
+                        stale_hash, policy.context_pack_recipe_hash,
+                        "precondition: stale hash must differ from authoritative recipe hash"
+                    );
+                    policy.context_pack_recipe_hash = stale_hash;
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("stale_authority_context"),
+                        "deny message should include stale_authority_context, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("does not match authoritative hash"),
+                        "deny message should include stale recipe authoritative mismatch detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected stale-authority deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "stale context_pack_recipe_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "stale context_pack_recipe_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_unknown_role_profile_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-UNKNOWN-ROLE",
+                "lease-tck-00448-unknown-role",
+                "RR-TCK-00448-UNKNOWN-ROLE",
+                |_cas, policy| {
+                    policy.role_spec_hash =
+                        *blake3::hash(b"tck-00448-unknown-role-profile").as_bytes();
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("unknown_role_profile"),
+                        "deny message should include unknown_role_profile, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("does not match authoritative hash"),
+                        "deny message should include role hash mismatch detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected unknown-role-profile deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "unknown role profile denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "unknown role profile denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_valid_lineage_accepted() {
+            let (dispatcher, ctx, request, work_id) = setup_spawn_lineage_fixture(
+                "W-TCK-00448-VALID",
+                "L-TCK-00448-VALID",
+                |_cas, _policy| {},
+            );
+            let baseline_event_count = dispatcher
+                .event_emitter
+                .get_events_by_work_id(&work_id)
+                .len();
+
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(
+                        !resp.session_id.is_empty(),
+                        "valid lineage acceptance must return a session_id"
+                    );
+                    assert!(
+                        !resp.ephemeral_handle.is_empty(),
+                        "valid lineage acceptance must return an ephemeral_handle"
+                    );
+                },
+                other => panic!("expected SpawnEpisode success, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_some(),
+                "valid lineage acceptance must persist a session"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_events_by_work_id(&work_id)
+                    .len()
+                    > baseline_event_count,
+                "valid lineage acceptance must emit spawn lifecycle ledger events"
+            );
+        }
+    }
+
+    // ========================================================================
     // TCK-00340: Serde fail-closed default tests
     // ========================================================================
     mod serde_fail_closed {
