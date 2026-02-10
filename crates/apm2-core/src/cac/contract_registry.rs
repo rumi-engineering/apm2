@@ -8,8 +8,11 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::determinism::{CANONICALIZER_ID, CANONICALIZER_VERSION};
@@ -19,6 +22,8 @@ pub const MAX_CONTRACT_REGISTRY_ENTRIES: usize = 128;
 
 /// Maximum number of defects retained in validation outputs.
 pub const MAX_CAC_DEFECTS: usize = 128;
+
+const MAX_STRING_LENGTH: usize = 4_096;
 
 /// Digest algorithm used by CAC snapshot contract rows.
 pub const CAC_DIGEST_ALGORITHM_BLAKE3: &str = "blake3";
@@ -52,16 +57,19 @@ pub enum RegistryDefect {
     /// A required schema was not present in the registry.
     MissingRequiredSchema {
         /// Missing schema identifier.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         schema_id: String,
     },
     /// Multiple entries claim the same schema identifier.
     DuplicateSchemaId {
         /// Duplicated schema identifier.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         schema_id: String,
     },
     /// Multiple entries claim the same schema stable identifier.
     DuplicateStableId {
         /// Duplicated schema stable identifier.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         schema_stable_id: String,
     },
     /// Registry exceeds the configured maximum row count.
@@ -78,30 +86,41 @@ pub enum RegistryDefect {
 #[serde(deny_unknown_fields)]
 pub struct ContractObjectRegistryEntry {
     /// Stable object identifier in the snapshot contract row.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub object_id: String,
     /// Semantic object kind (`snapshot.report`, `time.envelope`, etc.).
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub kind: String,
     /// Schema identifier (`apm2.*.v1`, `cac.*.v1`).
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub schema_id: String,
     /// Schema major version used for compatibility checks.
     pub schema_major: u32,
     /// Stable schema identifier across versions.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub schema_stable_id: String,
     /// Required digest algorithm for this object.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub digest_algorithm: String,
     /// Field name used to bind object digest values.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub digest_field: String,
     /// Whether digest presence is mandatory for this object.
     pub digest_required: bool,
     /// Required canonicalizer identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_id: String,
     /// Required canonicalizer semantic version.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_version: String,
     /// Reference to canonicalizer vectors required for compatibility.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_vectors_ref: String,
     /// Signature set binding requirement reference.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub signature_set_ref: String,
     /// Window/TTL freshness binding requirement reference.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub window_or_ttl_ref: String,
 }
 
@@ -109,6 +128,7 @@ pub struct ContractObjectRegistryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractObjectRegistry {
+    #[serde(deserialize_with = "deserialize_registry_entries")]
     entries: Vec<ContractObjectRegistryEntry>,
 }
 
@@ -239,6 +259,7 @@ pub const CAC_VALIDATION_ORDER: [CacValidationStep; 5] = [
     CacValidationStep::DigestCompleteness,
     CacValidationStep::PredicateExecution,
 ];
+const MAX_VALIDATION_STEPS: usize = CAC_VALIDATION_ORDER.len();
 
 /// CAC defect classes for snapshot contract validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -322,6 +343,7 @@ pub struct CacDefect {
     /// Compatibility-state impact for this defect.
     pub compatibility_state: CacCompatibilityState,
     /// Human-readable defect detail.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub detail: String,
 }
 
@@ -395,6 +417,7 @@ pub enum RoleSpecContextBindingError {
     #[error("hash field '{field}' must be non-zero")]
     ZeroHash {
         /// Name of the zero hash field.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         field: String,
     },
 }
@@ -431,14 +454,18 @@ impl RoleSpecContextBinding {
 #[serde(deny_unknown_fields)]
 pub struct CacObject {
     /// Snapshot object identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub object_id: String,
     /// Snapshot object kind.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub kind: String,
     /// Object schema identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub schema_id: String,
     /// Object schema major version.
     pub schema_major: u32,
     /// Object schema stable identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub schema_stable_id: String,
     /// Object digest value when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,12 +474,16 @@ pub struct CacObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_digest: Option<[u8; 32]>,
     /// Digest algorithm used for this object.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub digest_algorithm: String,
     /// Canonicalizer identifier used by object encoding.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_id: String,
     /// Canonicalizer version used by object encoding.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_version: String,
     /// Canonicalizer vectors reference for object encoding.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_vectors_ref: String,
     /// Signature verification status.
     pub signature_status: CacSignatureStatus,
@@ -461,7 +492,11 @@ pub struct CacObject {
     /// Predicate execution status.
     pub predicate_status: CacPredicateStatus,
     /// Optional declared order emitted by caller for order-integrity checks.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_declared_validation_order"
+    )]
     pub declared_validation_order: Vec<CacValidationStep>,
     /// Optional deterministic `RoleSpec` context injection binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,8 +536,10 @@ pub struct CacValidationResult {
     /// Aggregate compatibility state after all executed checks.
     pub compatibility_state: CacCompatibilityState,
     /// Bounded defect list emitted during validation.
+    #[serde(deserialize_with = "deserialize_cac_defects")]
     pub defects: Vec<CacDefect>,
     /// Steps executed before completion or short-circuit.
+    #[serde(deserialize_with = "deserialize_executed_steps")]
     pub executed_steps: Vec<CacValidationStep>,
     /// Whether validation short-circuited on a blocked defect.
     pub short_circuited: bool,
@@ -593,6 +630,115 @@ impl Tier2EscalationPolicy {
             EscalationAction::FreezePromotionPaths
         }
     }
+}
+
+fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX_STRING_LENGTH {
+        return Err(de::Error::custom(format!(
+            "string exceeds maximum length ({} > {MAX_STRING_LENGTH})",
+            value.len()
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    max: usize,
+    field_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        max: usize,
+        field_name: &'static str,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence for '{}' with at most {} entries",
+                self.field_name, self.max
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max));
+            while values.len() < self.max {
+                match seq.next_element::<T>()? {
+                    Some(value) => values.push(value),
+                    None => return Ok(values),
+                }
+            }
+
+            if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom(format!(
+                    "{} exceeds maximum size ({})",
+                    self.field_name, self.max
+                )));
+            }
+
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        max,
+        field_name,
+        _phantom: PhantomData,
+    })
+}
+
+fn deserialize_registry_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ContractObjectRegistryEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_CONTRACT_REGISTRY_ENTRIES, "entries")
+}
+
+fn deserialize_declared_validation_order<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CacValidationStep>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_VALIDATION_STEPS,
+        "declared_validation_order",
+    )
+}
+
+fn deserialize_cac_defects<'de, D>(deserializer: D) -> Result<Vec<CacDefect>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_CAC_DEFECTS, "defects")
+}
+
+fn deserialize_executed_steps<'de, D>(deserializer: D) -> Result<Vec<CacValidationStep>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_VALIDATION_STEPS, "executed_steps")
 }
 
 /// Validates a CAC object against deterministic contract checks.
@@ -788,7 +934,10 @@ pub fn validate_cac_contract(
                     }
 
                     if let Some(expected_digest) = object.expected_digest {
-                        if object.object_digest != Some(expected_digest) {
+                        let digest_mismatch = object.object_digest.is_none_or(|object_digest| {
+                            bool::from(object_digest.ct_ne(&expected_digest))
+                        });
+                        if digest_mismatch {
                             update_with_defect(
                                 &mut defects,
                                 &mut compatibility_state,
@@ -882,7 +1031,7 @@ fn ensure_non_zero_hash(field: &str, hash: &[u8; 32]) -> Result<(), RoleSpecCont
 }
 
 fn is_zero_hash(hash: &[u8; 32]) -> bool {
-    hash.iter().all(|byte| *byte == 0)
+    bool::from(hash.ct_eq(&[0; 32]))
 }
 
 fn default_registry_entry(
@@ -1529,6 +1678,132 @@ mod tests {
                 .defects
                 .iter()
                 .any(|defect| defect.class == CacDefectClass::SchemaUnresolved)
+        );
+    }
+
+    #[test]
+    fn test_registry_defect_deserialize_rejects_oversized_string() {
+        let value = serde_json::json!({
+            "kind": "missing_required_schema",
+            "schema_id": "x".repeat(MAX_STRING_LENGTH + 1),
+        });
+
+        let error = serde_json::from_value::<RegistryDefect>(value)
+            .expect_err("oversized schema_id should fail during deserialization");
+
+        assert!(error.to_string().contains("string exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_contract_object_registry_entry_deserialize_rejects_oversized_string() {
+        let value = serde_json::json!({
+            "object_id": "x".repeat(MAX_STRING_LENGTH + 1),
+            "kind": "snapshot.report",
+            "schema_id": "apm2.pcac_snapshot_report.v1",
+            "schema_major": 1,
+            "schema_stable_id": "dcp://apm2.local/schemas/apm2.pcac_snapshot_report.v1@v1",
+            "digest_algorithm": "blake3",
+            "digest_field": "object_digest",
+            "digest_required": true,
+            "canonicalizer_id": CANONICALIZER_ID,
+            "canonicalizer_version": CANONICALIZER_VERSION,
+            "canonicalizer_vectors_ref": CAC_CANONICALIZER_VECTORS_REF,
+            "signature_set_ref": SIGNATURE_SET_REQUIRED_REF,
+            "window_or_ttl_ref": WINDOW_OR_TTL_NOT_REQUIRED_REF,
+        });
+
+        let error = serde_json::from_value::<ContractObjectRegistryEntry>(value)
+            .expect_err("oversized object_id should fail during deserialization");
+
+        assert!(error.to_string().contains("string exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_contract_object_registry_deserialize_rejects_oversized_entries() {
+        let baseline_entry = ContractObjectRegistry::default_registry()
+            .entries()
+            .first()
+            .cloned()
+            .expect("default registry should contain at least one entry");
+        let entry_value =
+            serde_json::to_value(baseline_entry).expect("registry entry should serialize");
+        let oversized_entries = vec![entry_value; MAX_CONTRACT_REGISTRY_ENTRIES + 1];
+        let value = serde_json::json!({
+            "entries": oversized_entries,
+        });
+
+        let error = serde_json::from_value::<ContractObjectRegistry>(value)
+            .expect_err("oversized entries should fail during deserialization");
+
+        assert!(error.to_string().contains("entries exceeds maximum size"));
+    }
+
+    #[test]
+    fn test_cac_object_deserialize_rejects_oversized_declared_validation_order() {
+        let registry = ContractObjectRegistry::default_registry();
+        let entry = registry
+            .entries()
+            .first()
+            .expect("default registry should contain at least one entry");
+        let object = CacObject::from_registry_entry(entry);
+        let mut value = serde_json::to_value(object).expect("object should serialize");
+        value["declared_validation_order"] = serde_json::Value::Array(
+            std::iter::repeat_n(
+                serde_json::Value::String("schema_resolution".to_string()),
+                MAX_VALIDATION_STEPS + 1,
+            )
+            .collect(),
+        );
+
+        let error = serde_json::from_value::<CacObject>(value)
+            .expect_err("oversized declared_validation_order should fail during deserialization");
+
+        assert!(
+            error
+                .to_string()
+                .contains("declared_validation_order exceeds maximum size")
+        );
+    }
+
+    #[test]
+    fn test_cac_validation_result_deserialize_rejects_oversized_defects() {
+        let defect = serde_json::json!({
+            "class": "digest_mismatch",
+            "step": "digest_completeness",
+            "compatibility_state": "blocked",
+            "detail": "digest mismatch",
+        });
+        let value = serde_json::json!({
+            "compatibility_state": "blocked",
+            "defects": vec![defect; MAX_CAC_DEFECTS + 1],
+            "executed_steps": ["schema_resolution"],
+            "short_circuited": true,
+        });
+
+        let error = serde_json::from_value::<CacValidationResult>(value)
+            .expect_err("oversized defects should fail during deserialization");
+
+        assert!(error.to_string().contains("defects exceeds maximum size"));
+    }
+
+    #[test]
+    fn test_cac_validation_reports_digest_mismatch() {
+        let registry = ContractObjectRegistry::default_registry();
+        let entry = registry
+            .lookup_by_schema_id("apm2.pcac_snapshot_report.v1")
+            .expect("schema should resolve for digest mismatch test");
+        let mut object = CacObject::from_registry_entry(entry);
+        object.object_digest = Some([0x11; 32]);
+        object.expected_digest = Some([0x22; 32]);
+        object.declared_validation_order = CAC_VALIDATION_ORDER.to_vec();
+
+        let result = validate_cac_contract(&registry, &object);
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(
+            result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::DigestMismatch)
         );
     }
 }
