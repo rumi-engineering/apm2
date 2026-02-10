@@ -34,7 +34,7 @@ fn review_run_dir_for_home(home: &Path, pr_number: u32, review_type: &str) -> Pa
         .join(review_type)
 }
 
-fn review_run_state_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
+pub fn review_run_state_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
     review_run_dir_for_home(home, pr_number, review_type).join("state.json")
 }
 
@@ -95,6 +95,7 @@ fn legacy_pulse_file_path(review_type: &str) -> Result<PathBuf, String> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewRunStateLoad {
     Present(ReviewRunState),
     Missing {
@@ -134,7 +135,7 @@ fn review_run_state_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
-fn load_review_run_state_for_home(
+pub fn load_review_run_state_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -239,6 +240,15 @@ pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String>
     Ok(path)
 }
 
+pub fn write_review_run_state_for_home(
+    home: &Path,
+    state: &ReviewRunState,
+) -> Result<PathBuf, String> {
+    let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
+    write_review_run_state_to_path(&path, state)?;
+    Ok(path)
+}
+
 pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Result<(), String> {
     ensure_parent_dir(path)?;
     let payload = serde_json::to_vec_pretty(state)
@@ -258,7 +268,7 @@ pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Re
     Ok(())
 }
 
-fn next_review_sequence_number_for_home(
+pub fn next_review_sequence_number_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -479,6 +489,20 @@ pub fn is_process_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn parse_process_start_time(stat_content: &str) -> Option<u64> {
+    // /proc/<pid>/stat field layout keeps comm in parentheses (field 2),
+    // so split from the last ') ' to avoid whitespace/paren ambiguity.
+    let (_, tail) = stat_content.rsplit_once(") ")?;
+    // tail starts at field 3 ("state"), so field 22 (starttime) is index 19.
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+pub fn get_process_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let stat_content = fs::read_to_string(stat_path).ok()?;
+    parse_process_start_time(&stat_content)
+}
+
 // ── Pulse files ─────────────────────────────────────────────────────────────
 
 pub fn write_pulse_file(pr_number: u32, review_type: &str, head_sha: &str) -> Result<(), String> {
@@ -565,8 +589,9 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewRunStateLoad, build_review_run_id, load_review_run_state_for_home,
-        load_review_run_state_strict_for_home, next_review_sequence_number_for_home,
+        ReviewRunStateLoad, build_review_run_id, get_process_start_time,
+        load_review_run_state_for_home, load_review_run_state_strict_for_home,
+        next_review_sequence_number_for_home, parse_process_start_time,
         review_run_state_path_for_home, write_review_run_state_to_path,
     };
     use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
@@ -591,8 +616,27 @@ mod tests {
             backend_id: Some("codex".to_string()),
             restart_count: 1,
             sequence_number: 3,
+            previous_run_id: None,
+            previous_head_sha: None,
             pid: Some(12345),
+            proc_start_time: Some(987_654_321),
         }
+    }
+
+    #[test]
+    fn test_parse_process_start_time_extracts_field_22() {
+        let stat =
+            "12345 (apm2 worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 21 22";
+        assert_eq!(parse_process_start_time(stat), Some(424_242));
+    }
+
+    #[test]
+    fn test_get_process_start_time_current_pid() {
+        let current_pid = std::process::id();
+        assert!(
+            get_process_start_time(current_pid).is_some(),
+            "expected /proc start time for current process"
+        );
     }
 
     #[test]

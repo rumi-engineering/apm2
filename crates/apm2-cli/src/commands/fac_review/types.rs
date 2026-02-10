@@ -27,6 +27,7 @@ pub const PROVIDER_SLOT_WAIT_JITTER_MS: u64 = 250;
 pub const PROVIDER_BACKOFF_BASE_SECS: u64 = 2;
 pub const PROVIDER_BACKOFF_MAX_SECS: u64 = 30;
 pub const PROVIDER_BACKOFF_JITTER_MS: u64 = 750;
+pub const DISPATCH_LOCK_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ── Path / marker constants ─────────────────────────────────────────────────
 
@@ -34,6 +35,10 @@ pub const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT
 pub const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.md";
 pub const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
 pub const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
+pub const TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP: &str = "ambiguous_dispatch_ownership";
+pub const TERMINAL_STALE_HEAD_AMBIGUITY: &str = "stale_head_ambiguity";
+pub const TERMINAL_SHA_DRIFT_SUPERSEDED: &str = "sha_drift_superseded";
+pub const TERMINAL_DISPATCH_LOCK_TIMEOUT: &str = "dispatch_lock_timeout";
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 
@@ -131,6 +136,71 @@ impl ReviewKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchIdempotencyKey {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub review_type: String,
+    pub head_sha: String,
+}
+
+impl DispatchIdempotencyKey {
+    pub fn new(owner_repo: &str, pr_number: u32, review_type: &str, head_sha: &str) -> Self {
+        Self {
+            owner_repo: owner_repo.trim().to_ascii_lowercase(),
+            pr_number,
+            review_type: normalize_dispatch_review_type(review_type),
+            head_sha: head_sha.trim().to_ascii_lowercase(),
+        }
+    }
+
+    pub fn canonical_path_segment(&self) -> String {
+        let safe_repo = sanitize_for_path(&self.owner_repo);
+        let safe_type = sanitize_for_path(&self.review_type);
+        let safe_head = sanitize_for_path(&self.head_sha);
+        format!("{safe_repo}-pr{}-{safe_type}-{safe_head}", self.pr_number)
+    }
+
+    pub fn canonical_scope_segment(&self) -> String {
+        let safe_repo = sanitize_for_path(&self.owner_repo);
+        let safe_type = sanitize_for_path(&self.review_type);
+        format!("{safe_repo}-pr{}-{safe_type}", self.pr_number)
+    }
+
+    pub fn lock_path(&self, base_dir: &Path) -> PathBuf {
+        base_dir.join(format!("{}.lock", self.canonical_path_segment()))
+    }
+
+    pub fn scope_lock_path(&self, base_dir: &Path) -> PathBuf {
+        base_dir.join(format!("{}.lock", self.canonical_scope_segment()))
+    }
+
+    pub fn pending_path(&self, base_dir: &Path) -> PathBuf {
+        base_dir.join(format!("{}.json", self.canonical_path_segment()))
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        split_owner_repo(&self.owner_repo)?;
+        validate_expected_head_sha(&self.head_sha)?;
+        match self.review_type.as_str() {
+            "security" | "quality" => Ok(()),
+            other => Err(format!(
+                "invalid review type for idempotency key: {other} (expected security|quality)"
+            )),
+        }
+    }
+}
+
+fn normalize_dispatch_review_type(review_type: &str) -> String {
+    let normalized = review_type.trim().to_ascii_lowercase();
+    if normalized == "code-quality" {
+        "quality".to_string()
+    } else {
+        normalized
+    }
+}
+
 // ── Data structs ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,7 +277,13 @@ pub struct ReviewRunState {
     pub restart_count: u32,
     pub sequence_number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,6 +340,8 @@ pub struct PendingDispatchEntry {
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_time: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
