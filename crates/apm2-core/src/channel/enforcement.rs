@@ -323,7 +323,7 @@ pub fn decode_channel_context_token(
     daemon_verifying_key: &VerifyingKey,
     expected_lease_id: &str,
     current_time_secs: u64,
-    expected_request_id: Option<&str>,
+    expected_request_id: &str,
 ) -> Result<ChannelBoundaryCheck, ChannelContextTokenError> {
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LEN {
         return Err(ChannelContextTokenError::TokenTooLong {
@@ -383,13 +383,11 @@ pub fn decode_channel_context_token(
             actual: payload.payload.lease_id,
         });
     }
-    if let Some(expected_request_id) = expected_request_id {
-        if payload.payload.request_id != expected_request_id {
-            return Err(ChannelContextTokenError::RequestIdMismatch {
-                expected: expected_request_id.to_string(),
-                actual: payload.payload.request_id,
-            });
-        }
+    if payload.payload.request_id != expected_request_id {
+        return Err(ChannelContextTokenError::RequestIdMismatch {
+            expected: expected_request_id.to_string(),
+            actual: payload.payload.request_id,
+        });
     }
 
     let token_age_secs = current_time_secs.saturating_sub(payload.payload.issued_at_secs);
@@ -712,7 +710,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         )
         .expect("token should decode");
         assert_eq!(decoded, check);
@@ -771,7 +769,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         );
         assert_eq!(
             result,
@@ -793,7 +791,7 @@ mod tests {
             &daemon_signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         );
         assert_eq!(
             result,
@@ -823,7 +821,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         );
         assert_eq!(
             result,
@@ -843,7 +841,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-b",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         );
         assert_eq!(
             result,
@@ -866,7 +864,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-a",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         )
         .expect("matching lease must pass");
         assert_eq!(decoded, check);
@@ -894,7 +892,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         );
         assert!(
             matches!(result, Err(ChannelContextTokenError::ExpiredToken { .. })),
@@ -903,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_id_mismatch_rejected() {
+    fn test_mismatched_request_id_rejected() {
         let check = baseline_check();
         let signer = Signer::generate();
         let token = issue_channel_context_token(&check, "lease-1", "REQ-A", now_secs(), &signer)
@@ -914,7 +912,7 @@ mod tests {
             &signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-B"),
+            "REQ-B",
         );
         assert_eq!(
             result,
@@ -926,21 +924,30 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_fresh_token_accepted() {
+    fn test_replay_with_same_request_id_accepted() {
         let check = baseline_check();
         let signer = Signer::generate();
         let token =
             issue_channel_context_token(&check, "lease-1", "REQ-FRESH-1", now_secs(), &signer)
                 .expect("token should encode");
 
-        let decoded = decode_channel_context_token(
+        let first = decode_channel_context_token(
             &token,
             &signer.verifying_key(),
             "lease-1",
             now_secs(),
-            Some("REQ-FRESH-1"),
+            "REQ-FRESH-1",
         )
         .expect("fresh token with matching request must decode");
-        assert_eq!(decoded, check);
+        let second = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-FRESH-1",
+        )
+        .expect("replayed token with same request must remain idempotent");
+        assert_eq!(first, check);
+        assert_eq!(second, check);
     }
 }

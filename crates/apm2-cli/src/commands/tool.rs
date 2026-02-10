@@ -221,7 +221,8 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
                 if let Some(ref token) = request_response.channel_context_token {
                     println!("  Channel Context Token:  {token}");
                     println!(
-                        "  Use with: apm2 fac role-launch ... --channel-context-token <token>"
+                        "  Use with: apm2 fac role-launch ... --channel-context-token <token> --request-id {}",
+                        request_response.request_id
                     );
                 }
             }

@@ -35,6 +35,8 @@ const MAX_WORK_ID_LENGTH: usize = 512;
 const MAX_ROLE_LENGTH: usize = 128;
 /// Maximum supported `lease_id` length.
 const MAX_LEASE_ID_LENGTH: usize = 256;
+/// Maximum supported `request_id` length.
+const MAX_REQUEST_ID_LENGTH: usize = 256;
 /// Maximum accepted channel context token length.
 const MAX_CHANNEL_CONTEXT_TOKEN_LENGTH: usize = 8192;
 /// Maximum number of defect details surfaced in deny payloads.
@@ -66,8 +68,11 @@ pub struct RoleLaunchArgs {
     /// Optional lease ID for authorization.
     #[arg(long)]
     pub lease_id: Option<String>,
+    /// Optional daemon-issued request ID bound to the channel context token.
+    #[arg(long, requires = "channel_context_token")]
+    pub request_id: Option<String>,
     /// Optional daemon-issued base64 channel context token.
-    #[arg(long)]
+    #[arg(long, requires = "request_id")]
     pub channel_context_token: Option<String>,
 }
 
@@ -389,6 +394,9 @@ fn resolve_channel_context(
     let Some(expected_lease_id) = args.lease_id.as_deref() else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
+    let Some(expected_request_id) = args.request_id.as_deref() else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
     let Ok(current_time_secs) = UNIX_EPOCH.elapsed().map(|duration| duration.as_secs()) else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
@@ -402,7 +410,7 @@ fn resolve_channel_context(
         daemon_verifying_key,
         expected_lease_id,
         current_time_secs,
-        None,
+        expected_request_id,
     ) else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
@@ -435,6 +443,9 @@ fn execute_role_launch_with_channel_context(
     validate_required_bounded("role", &args.role, MAX_ROLE_LENGTH)?;
     if let Some(lease_id) = &args.lease_id {
         validate_optional_bounded("lease_id", lease_id, MAX_LEASE_ID_LENGTH)?;
+    }
+    if let Some(request_id) = &args.request_id {
+        validate_optional_bounded("request_id", request_id, MAX_REQUEST_ID_LENGTH)?;
     }
 
     let hashes = ParsedHashes {
@@ -1492,6 +1503,7 @@ mod tests {
             capability_manifest_hash: capability_manifest_hash_hex,
             policy_hash: hex::encode(policy_hash),
             lease_id: Some("L-TEST-001".to_string()),
+            request_id: None,
             channel_context_token: None,
         };
 
@@ -1868,6 +1880,7 @@ mod tests {
         let mut env = setup_test_env();
         let signer = Signer::generate();
         let daemon_verifying_key = signer.verifying_key();
+        let request_id = "REQ-TEST-ROLE-LAUNCH-1";
         let check = ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
             channel_source_witness: Some(derive_channel_source_witness(
@@ -1878,11 +1891,12 @@ mod tests {
             context_firewall_verified: true,
             policy_ledger_verified: true,
         };
+        env.args.request_id = Some(request_id.to_string());
         env.args.channel_context_token = Some(
             issue_channel_context_token(
                 &check,
                 "L-TEST-001",
-                "REQ-TEST-ROLE-LAUNCH-1",
+                request_id,
                 UNIX_EPOCH
                     .elapsed()
                     .expect("current time should be after unix epoch")
@@ -1908,6 +1922,7 @@ mod tests {
         let mut env = setup_test_env();
         let signer = Signer::generate();
         let daemon_verifying_key = signer.verifying_key();
+        env.args.request_id = Some("REQ-TEST-ROLE-LAUNCH-INVALID".to_string());
         env.args.channel_context_token = Some("not-base64-token".to_string());
 
         let error = execute_role_launch_with_daemon_verifying_key(
@@ -1935,6 +1950,7 @@ mod tests {
         let mut env = setup_test_env();
         let signer = Signer::generate();
         let daemon_verifying_key = signer.verifying_key();
+        let request_id = "REQ-TEST-ROLE-LAUNCH-2";
         let check = ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
             channel_source_witness: Some(derive_channel_source_witness(
@@ -1945,11 +1961,12 @@ mod tests {
             context_firewall_verified: true,
             policy_ledger_verified: true,
         };
+        env.args.request_id = Some(request_id.to_string());
         env.args.channel_context_token = Some(
             issue_channel_context_token(
                 &check,
                 "L-OTHER",
-                "REQ-TEST-ROLE-LAUNCH-2",
+                request_id,
                 UNIX_EPOCH
                     .elapsed()
                     .expect("current time should be after unix epoch")
@@ -1973,6 +1990,56 @@ mod tests {
                 assert!(
                     violations.contains(&ChannelViolationClass::UnknownChannelSource),
                     "mismatched lease token must fail closed to unknown source"
+                );
+            },
+            other => panic!("expected channel-boundary denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_channel_context_token_with_wrong_request_id_fails_closed() {
+        let mut env = setup_test_env();
+        let signer = Signer::generate();
+        let daemon_verifying_key = signer.verifying_key();
+        let check = ChannelBoundaryCheck {
+            source: ChannelSource::TypedToolIntent,
+            channel_source_witness: Some(derive_channel_source_witness(
+                ChannelSource::TypedToolIntent,
+            )),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+        };
+        env.args.request_id = Some("REQ-TEST-ROLE-LAUNCH-WRONG".to_string());
+        env.args.channel_context_token = Some(
+            issue_channel_context_token(
+                &check,
+                "L-TEST-001",
+                "REQ-TEST-ROLE-LAUNCH-ACTUAL",
+                UNIX_EPOCH
+                    .elapsed()
+                    .expect("current time should be after unix epoch")
+                    .as_secs(),
+                &signer,
+            )
+            .expect("token issuance should succeed"),
+        );
+
+        let error = execute_role_launch_with_daemon_verifying_key(
+            &env.args,
+            &env.ledger_path,
+            &env.cas_path,
+            Some(&daemon_verifying_key),
+        )
+        .expect_err("token bound to a different request id must fail closed");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations, .. },
+            } => {
+                assert!(
+                    violations.contains(&ChannelViolationClass::UnknownChannelSource),
+                    "mismatched request-id token must fail closed to unknown source"
                 );
             },
             other => panic!("expected channel-boundary denial, got {other:?}"),

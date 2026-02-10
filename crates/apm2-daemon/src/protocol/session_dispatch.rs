@@ -5707,7 +5707,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
                 .as_secs(),
-            Some("REQ-1"),
+            "REQ-1",
         )
         .expect("token should decode");
         assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
