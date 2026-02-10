@@ -6,11 +6,11 @@
 //! filesystem fallback.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -24,6 +24,12 @@ pub const CONTEXT_PACK_RECIPE_SCHEMA: &str = "apm2.context_pack_recipe.v1";
 /// Schema version for `ContextPackRecipe`.
 pub const CONTEXT_PACK_RECIPE_VERSION: &str = "1.0.0";
 
+/// Maximum length for schema fields.
+pub const MAX_SCHEMA_FIELD_LENGTH: usize = 128;
+
+/// Maximum length for schema version fields.
+pub const MAX_SCHEMA_VERSION_LENGTH: usize = 32;
+
 /// Maximum number of required read paths.
 pub const MAX_REQUIRED_READ_PATHS: usize = 10_000;
 
@@ -32,6 +38,9 @@ pub const MAX_REQUIRED_READ_PATH_LENGTH: usize = 4_096;
 
 /// Maximum number of path components in a required read path.
 pub const MAX_REQUIRED_READ_PATH_COMPONENTS: usize = 256;
+
+/// Maximum number of hash-pinned required-read digests.
+pub const MAX_REQUIRED_READ_DIGESTS: usize = MAX_REQUIRED_READ_PATHS;
 
 /// Maximum allowed length of the workspace root path.
 pub const MAX_WORKSPACE_ROOT_LENGTH: usize = 4_096;
@@ -43,6 +52,11 @@ pub struct ContextPackSelectorInput {
     pub role_spec_hash: [u8; 32],
     /// Deterministic set of files required for context reads.
     pub required_read_paths: BTreeSet<String>,
+    /// Hash-pinned digest set for required reads.
+    ///
+    /// Keys are normalized workspace-relative paths. Values are BLAKE3 digests
+    /// of the corresponding read artifact bytes.
+    pub required_read_digests: BTreeMap<String, [u8; 32]>,
     /// Hash of the `ContextPackManifest`.
     pub context_manifest_hash: [u8; 32],
     /// Hash of the budget profile.
@@ -103,8 +117,16 @@ pub enum RecipeCompilerReasonCode {
     UnsortedRequiredReadPaths,
     /// Required read paths contain duplicates.
     DuplicateRequiredReadPath,
-    /// Required read digest does not match required paths.
+    /// Selector contains too many required-read digest entries.
+    TooManyRequiredReadDigests,
+    /// A required read path is not hash-pinned in the digest set.
+    MissingRequiredReadDigest,
+    /// The selector contains digest entries that are not required reads.
+    UnexpectedRequiredReadDigest,
+    /// Required-read digest set hash does not match required digests.
     RequiredReadDigestMismatch,
+    /// Observed filesystem dependency is not hash-pinned by selector digests.
+    AmbientReadNotHashPinned,
     /// Missing role hash artifact in CAS.
     MissingCasRoleHash,
     /// Missing required-read digest artifact in CAS.
@@ -152,7 +174,11 @@ impl std::fmt::Display for RecipeCompilerReasonCode {
             Self::InvalidRecipeVersion => "invalid_recipe_version",
             Self::UnsortedRequiredReadPaths => "unsorted_required_read_paths",
             Self::DuplicateRequiredReadPath => "duplicate_required_read_path",
+            Self::TooManyRequiredReadDigests => "too_many_required_read_digests",
+            Self::MissingRequiredReadDigest => "missing_required_read_digest",
+            Self::UnexpectedRequiredReadDigest => "unexpected_required_read_digest",
             Self::RequiredReadDigestMismatch => "required_read_digest_mismatch",
+            Self::AmbientReadNotHashPinned => "ambient_read_not_hash_pinned",
             Self::MissingCasRoleHash => "missing_cas_role_hash",
             Self::MissingCasRequiredReadDigest => "missing_cas_required_read_digest",
             Self::MissingCasContextManifestHash => "missing_cas_context_manifest_hash",
@@ -245,6 +271,7 @@ impl RecipeCompilerError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPackRecipeCompiler {
     workspace_root: PathBuf,
+    default_compiled_at_tick: u64,
 }
 
 impl ContextPackRecipeCompiler {
@@ -285,6 +312,7 @@ impl ContextPackRecipeCompiler {
 
         Ok(Self {
             workspace_root: canonical_root,
+            default_compiled_at_tick: 0,
         })
     }
 
@@ -292,6 +320,13 @@ impl ContextPackRecipeCompiler {
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Sets the default `compiled_at_tick` used by [`Self::compile`].
+    #[must_use]
+    pub const fn with_default_compiled_at_tick(mut self, tick: u64) -> Self {
+        self.default_compiled_at_tick = tick;
+        self
     }
 
     /// Compiles selector input into a deterministic recipe and drift
@@ -305,24 +340,63 @@ impl ContextPackRecipeCompiler {
         &self,
         selector: &ContextPackSelectorInput,
     ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
-        let normalized_paths = self.validate_selector_closure(&selector.required_read_paths)?;
-        let required_read_digest = compute_required_read_digest(&normalized_paths)?;
+        self.compile_at_tick(selector, self.default_compiled_at_tick)
+    }
+
+    /// Compiles selector input at an explicit `compiled_at_tick`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] on selector closure, canonicalization,
+    /// or validation failure.
+    pub fn compile_at_tick(
+        &self,
+        selector: &ContextPackSelectorInput,
+        compiled_at_tick: u64,
+    ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
+        self.compile_with_observed_reads(selector, &BTreeSet::new(), compiled_at_tick)
+    }
+
+    /// Compiles selector input with explicit observed filesystem dependencies.
+    ///
+    /// Any `observed_read_paths` entry not hash-pinned in
+    /// `selector.required_read_digests` fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] when closure validation or
+    /// ambient-read validation fails.
+    pub fn compile_with_observed_reads(
+        &self,
+        selector: &ContextPackSelectorInput,
+        observed_read_paths: &BTreeSet<String>,
+        compiled_at_tick: u64,
+    ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
+        let normalized_paths = self.validate_selector_closure(
+            &selector.required_read_paths,
+            &selector.required_read_digests,
+        )?;
+        let required_read_digest_set_hash =
+            compute_required_read_digest_set_hash(&selector.required_read_digests)?;
 
         let recipe = ContextPackRecipe::new(
             selector.role_spec_hash,
             normalized_paths,
-            required_read_digest,
+            selector.required_read_digests.clone(),
+            required_read_digest_set_hash,
             selector.context_manifest_hash,
             selector.budget_profile_hash,
         )?;
+        self.enforce_observed_dependencies_hash_pinned(observed_read_paths, &recipe)?;
         let recipe_hash = recipe.recipe_hash()?;
 
         let fingerprint = DriftFingerprint {
             role_hash: selector.role_spec_hash,
-            required_read_digest,
+            required_read_digest_set_hash,
             context_manifest_hash: selector.context_manifest_hash,
             budget_profile_hash: selector.budget_profile_hash,
             recipe_hash,
+            compiled_at_tick,
         };
 
         Ok(CompiledContextPackRecipe {
@@ -334,6 +408,7 @@ impl ContextPackRecipeCompiler {
     fn validate_selector_closure(
         &self,
         required_read_paths: &BTreeSet<String>,
+        required_read_digests: &BTreeMap<String, [u8; 32]>,
     ) -> Result<Vec<String>, RecipeCompilerError> {
         if required_read_paths.is_empty() {
             return Err(RecipeCompilerError::SelectorClosure {
@@ -349,6 +424,17 @@ impl ContextPackRecipeCompiler {
                     "required_read_paths exceeds maximum size ({} > {})",
                     required_read_paths.len(),
                     MAX_REQUIRED_READ_PATHS
+                ),
+                path: None,
+            });
+        }
+        if required_read_digests.len() > MAX_REQUIRED_READ_DIGESTS {
+            return Err(RecipeCompilerError::SelectorClosure {
+                code: RecipeCompilerReasonCode::TooManyRequiredReadDigests,
+                message: format!(
+                    "required_read_digests exceeds maximum size ({} > {})",
+                    required_read_digests.len(),
+                    MAX_REQUIRED_READ_DIGESTS
                 ),
                 path: None,
             });
@@ -370,8 +456,68 @@ impl ContextPackRecipeCompiler {
             normalized.push(normalized_path);
         }
 
+        let mut normalized_digest_map: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+        for (raw_path, digest) in required_read_digests {
+            let normalized_path = self.validate_required_read_path(raw_path)?;
+            if normalized_digest_map
+                .insert(normalized_path.clone(), *digest)
+                .is_some()
+            {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::DuplicateNormalizedRequiredReadPath,
+                    message: "required read digests collapse to duplicate normalized path"
+                        .to_string(),
+                    path: Some(normalized_path),
+                });
+            }
+        }
+
+        for path in &normalized {
+            if !normalized_digest_map.contains_key(path) {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::MissingRequiredReadDigest,
+                    message: "required read path is not hash-pinned in required_read_digests"
+                        .to_string(),
+                    path: Some(path.clone()),
+                });
+            }
+        }
+        for digest_path in normalized_digest_map.keys() {
+            if !dedupe.contains(digest_path) {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::UnexpectedRequiredReadDigest,
+                    message: "required_read_digests contains a path not in required_read_paths"
+                        .to_string(),
+                    path: Some(digest_path.clone()),
+                });
+            }
+        }
+
         normalized.sort_unstable();
         Ok(normalized)
+    }
+
+    fn enforce_observed_dependencies_hash_pinned(
+        &self,
+        observed_read_paths: &BTreeSet<String>,
+        recipe: &ContextPackRecipe,
+    ) -> Result<(), RecipeCompilerError> {
+        for observed in observed_read_paths {
+            let normalized_observed = self.validate_required_read_path(observed)?;
+            if !recipe
+                .required_read_digests
+                .contains_key(&normalized_observed)
+            {
+                return Err(RecipeCompilerError::SelectorClosure {
+                    code: RecipeCompilerReasonCode::AmbientReadNotHashPinned,
+                    message:
+                        "observed filesystem dependency is not hash-pinned by selector digest set"
+                            .to_string(),
+                    path: Some(observed.clone()),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn validate_required_read_path(&self, raw_path: &str) -> Result<String, RecipeCompilerError> {
@@ -469,16 +615,22 @@ impl ContextPackRecipeCompiler {
 #[serde(deny_unknown_fields)]
 pub struct ContextPackRecipe {
     /// Recipe schema identifier.
+    #[serde(deserialize_with = "deserialize_schema_field")]
     pub schema: String,
     /// Recipe schema version.
+    #[serde(deserialize_with = "deserialize_schema_version_field")]
     pub schema_version: String,
     /// Hash of the `RoleSpec v2` contract.
     pub role_spec_hash: [u8; 32],
     /// Canonically sorted required read paths.
     #[serde(deserialize_with = "deserialize_required_read_paths")]
     pub required_read_paths: Vec<String>,
-    /// Digest of `required_read_paths`.
-    pub required_read_digest: [u8; 32],
+    /// Hash-pinned digest entries for required reads.
+    #[serde(deserialize_with = "deserialize_required_read_digests")]
+    pub required_read_digests: BTreeMap<String, [u8; 32]>,
+    /// Digest of canonical required-read digest set.
+    #[serde(alias = "required_read_digest")]
+    pub required_read_digest_set_hash: [u8; 32],
     /// Hash of the `ContextPackManifest`.
     pub context_manifest_hash: [u8; 32],
     /// Hash of the budget profile.
@@ -500,7 +652,8 @@ impl ContextPackRecipe {
     pub fn new(
         role_spec_hash: [u8; 32],
         required_read_paths: Vec<String>,
-        required_read_digest: [u8; 32],
+        required_read_digests: BTreeMap<String, [u8; 32]>,
+        required_read_digest_set_hash: [u8; 32],
         context_manifest_hash: [u8; 32],
         budget_profile_hash: [u8; 32],
     ) -> Result<Self, RecipeCompilerError> {
@@ -509,7 +662,8 @@ impl ContextPackRecipe {
             schema_version: CONTEXT_PACK_RECIPE_VERSION.to_string(),
             role_spec_hash,
             required_read_paths,
-            required_read_digest,
+            required_read_digests,
+            required_read_digest_set_hash,
             context_manifest_hash,
             budget_profile_hash,
         };
@@ -561,6 +715,16 @@ impl ContextPackRecipe {
         for path in &self.required_read_paths {
             validate_required_read_path_shape(path)?;
         }
+        if self.required_read_digests.len() > MAX_REQUIRED_READ_DIGESTS {
+            return Err(RecipeCompilerError::RecipeValidation {
+                code: RecipeCompilerReasonCode::TooManyRequiredReadDigests,
+                message: format!(
+                    "required_read_digests exceeds maximum size ({} > {})",
+                    self.required_read_digests.len(),
+                    MAX_REQUIRED_READ_DIGESTS
+                ),
+            });
+        }
 
         for pair in self.required_read_paths.windows(2) {
             match pair[0].cmp(&pair[1]) {
@@ -580,13 +744,37 @@ impl ContextPackRecipe {
             }
         }
 
-        let computed_digest = compute_required_read_digest(&self.required_read_paths)?;
-        if computed_digest != self.required_read_digest {
+        for digest_path in self.required_read_digests.keys() {
+            validate_required_read_path_shape(digest_path)?;
+        }
+        for path in &self.required_read_paths {
+            if !self.required_read_digests.contains_key(path) {
+                return Err(RecipeCompilerError::RecipeValidation {
+                    code: RecipeCompilerReasonCode::MissingRequiredReadDigest,
+                    message: format!("required read path '{path}' is not hash-pinned"),
+                });
+            }
+        }
+        for digest_path in self.required_read_digests.keys() {
+            if self.required_read_paths.binary_search(digest_path).is_err() {
+                return Err(RecipeCompilerError::RecipeValidation {
+                    code: RecipeCompilerReasonCode::UnexpectedRequiredReadDigest,
+                    message: format!(
+                        "required_read_digests path '{digest_path}' is not in required_read_paths"
+                    ),
+                });
+            }
+        }
+
+        let computed_digest_set_hash =
+            compute_required_read_digest_set_hash(&self.required_read_digests)?;
+        if computed_digest_set_hash != self.required_read_digest_set_hash {
             return Err(RecipeCompilerError::HashMismatch {
                 code: RecipeCompilerReasonCode::RequiredReadDigestMismatch,
-                expected_hex: hex::encode(self.required_read_digest),
-                actual_hex: hex::encode(computed_digest),
-                message: "required_read_digest does not match required_read_paths".to_string(),
+                expected_hex: hex::encode(self.required_read_digest_set_hash),
+                actual_hex: hex::encode(computed_digest_set_hash),
+                message: "required_read_digest_set_hash does not match required_read_digests"
+                    .to_string(),
             });
         }
 
@@ -625,13 +813,24 @@ impl ContextPackRecipe {
         Ok(*blake3::hash(&bytes).as_bytes())
     }
 
-    /// Returns the canonical payload used to compute `required_read_digest`.
+    /// Returns the canonical payload used to compute
+    /// `required_read_digest_set_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if payload encoding fails.
+    pub fn required_read_digest_set_payload(&self) -> Result<Vec<u8>, RecipeCompilerError> {
+        build_required_read_digest_set_payload(&self.required_read_digests)
+    }
+
+    /// Backward-compatible alias for
+    /// [`required_read_digest_set_payload`](Self::required_read_digest_set_payload).
     ///
     /// # Errors
     ///
     /// Returns [`RecipeCompilerError`] if payload encoding fails.
     pub fn required_read_digest_payload(&self) -> Result<Vec<u8>, RecipeCompilerError> {
-        build_required_read_digest_payload(&self.required_read_paths)
+        self.required_read_digest_set_payload()
     }
 }
 
@@ -641,14 +840,18 @@ impl ContextPackRecipe {
 pub struct DriftFingerprint {
     /// `RoleSpec` hash binding.
     pub role_hash: [u8; 32],
-    /// Digest of sorted required read paths.
-    pub required_read_digest: [u8; 32],
+    /// Digest of canonical required-read digest set.
+    #[serde(alias = "required_read_digest")]
+    pub required_read_digest_set_hash: [u8; 32],
     /// Context manifest hash binding.
     pub context_manifest_hash: [u8; 32],
     /// Budget profile hash binding.
     pub budget_profile_hash: [u8; 32],
     /// Compiled recipe hash binding.
     pub recipe_hash: [u8; 32],
+    /// HTF tick at which compilation occurred.
+    #[serde(default)]
+    pub compiled_at_tick: u64,
 }
 
 impl Canonicalize for DriftFingerprint {
@@ -680,9 +883,19 @@ impl DriftFingerprint {
     /// # Errors
     ///
     /// Returns [`RecipeCompilerError`] if canonicalization fails.
-    pub fn fingerprint_hash(&self) -> Result<[u8; 32], RecipeCompilerError> {
+    pub fn compute_fingerprint(&self) -> Result<[u8; 32], RecipeCompilerError> {
         let bytes = self.canonical_bytes()?;
         Ok(*blake3::hash(&bytes).as_bytes())
+    }
+
+    /// Backward-compatible alias for
+    /// [`compute_fingerprint`](Self::compute_fingerprint).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecipeCompilerError`] if canonicalization fails.
+    pub fn fingerprint_hash(&self) -> Result<[u8; 32], RecipeCompilerError> {
+        self.compute_fingerprint()
     }
 }
 
@@ -708,7 +921,7 @@ pub fn reconstruct_from_receipts(
     )?;
     ensure_hash_exists(
         cas,
-        &fingerprint.required_read_digest,
+        &fingerprint.required_read_digest_set_hash,
         RecipeCompilerReasonCode::MissingCasRequiredReadDigest,
     )?;
     ensure_hash_exists(
@@ -755,13 +968,13 @@ pub fn reconstruct_from_receipts(
 
     let recipe_bindings = (
         recipe.role_spec_hash,
-        recipe.required_read_digest,
+        recipe.required_read_digest_set_hash,
         recipe.context_manifest_hash,
         recipe.budget_profile_hash,
     );
     let fingerprint_bindings = (
         fingerprint.role_hash,
-        fingerprint.required_read_digest,
+        fingerprint.required_read_digest_set_hash,
         fingerprint.context_manifest_hash,
         fingerprint.budget_profile_hash,
     );
@@ -887,26 +1100,59 @@ fn path_to_forward_slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn build_required_read_digest_payload(
-    required_read_paths: &[String],
+fn build_required_read_digest_set_payload(
+    required_read_digests: &BTreeMap<String, [u8; 32]>,
 ) -> Result<Vec<u8>, RecipeCompilerError> {
     let mut payload = Vec::new();
-    for path in required_read_paths {
+    for (path, digest) in required_read_digests {
         let length = u32::try_from(path.len()).map_err(|_| RecipeCompilerError::Serialization {
             code: RecipeCompilerReasonCode::IntegerOverflow,
             message: "required read path length exceeds u32 range".to_string(),
         })?;
         payload.extend_from_slice(&length.to_be_bytes());
         payload.extend_from_slice(path.as_bytes());
+        payload.extend_from_slice(digest);
     }
     Ok(payload)
 }
 
-fn compute_required_read_digest(
-    required_read_paths: &[String],
+fn compute_required_read_digest_set_hash(
+    required_read_digests: &BTreeMap<String, [u8; 32]>,
 ) -> Result<[u8; 32], RecipeCompilerError> {
-    let payload = build_required_read_digest_payload(required_read_paths)?;
+    let payload = build_required_read_digest_set_payload(required_read_digests)?;
     Ok(*blake3::hash(&payload).as_bytes())
+}
+
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > max_len {
+        return Err(de::Error::custom(format!(
+            "{field_name} exceeds maximum length ({} > {max_len})",
+            value.len()
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_schema_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SCHEMA_FIELD_LENGTH, "schema")
+}
+
+fn deserialize_schema_version_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SCHEMA_VERSION_LENGTH, "schema_version")
 }
 
 fn deserialize_required_read_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -953,6 +1199,55 @@ where
     deserializer.deserialize_seq(RequiredReadPathsVisitor)
 }
 
+fn deserialize_required_read_digests<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, [u8; 32]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RequiredReadDigestsVisitor;
+
+    impl<'de> Visitor<'de> for RequiredReadDigestsVisitor {
+        type Value = BTreeMap<String, [u8; 32]>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a map of at most {MAX_REQUIRED_READ_DIGESTS} required-read digests"
+            )
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((path, digest)) = map.next_entry::<String, [u8; 32]>()? {
+                if path.len() > MAX_REQUIRED_READ_PATH_LENGTH {
+                    return Err(de::Error::custom(format!(
+                        "required read path exceeds maximum length ({} > {})",
+                        path.len(),
+                        MAX_REQUIRED_READ_PATH_LENGTH
+                    )));
+                }
+                if values.len() >= MAX_REQUIRED_READ_DIGESTS {
+                    return Err(de::Error::custom(format!(
+                        "required_read_digests exceeds maximum size ({MAX_REQUIRED_READ_DIGESTS})"
+                    )));
+                }
+                if values.insert(path, digest).is_some() {
+                    return Err(de::Error::custom(
+                        "duplicate required_read_digests key encountered",
+                    ));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(RequiredReadDigestsVisitor)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -977,6 +1272,8 @@ mod tests {
             .expect("README.md should be created");
         fs::write(workspace.path().join("docs/spec.md"), b"spec\n")
             .expect("docs/spec.md should be created");
+        fs::write(workspace.path().join("src/ambient.rs"), b"ambient\n")
+            .expect("src/ambient.rs should be created");
         workspace
     }
 
@@ -987,13 +1284,17 @@ mod tests {
         paths: &[&str],
     ) -> ContextPackSelectorInput {
         let mut required_read_paths = BTreeSet::new();
+        let mut required_read_digests = BTreeMap::new();
         for path in paths {
-            required_read_paths.insert((*path).to_string());
+            let owned = (*path).to_string();
+            required_read_paths.insert(owned.clone());
+            required_read_digests.insert(owned.clone(), *blake3::hash(owned.as_bytes()).as_bytes());
         }
 
         ContextPackSelectorInput {
             role_spec_hash,
             required_read_paths,
+            required_read_digests,
             context_manifest_hash,
             budget_profile_hash,
         }
@@ -1046,6 +1347,17 @@ mod tests {
         assert_eq!(first.fingerprint.role_hash, [0x11; 32]);
         assert_eq!(first.fingerprint.context_manifest_hash, [0x22; 32]);
         assert_eq!(first.fingerprint.budget_profile_hash, [0x33; 32]);
+        assert_eq!(first.fingerprint.compiled_at_tick, 0);
+        assert_eq!(
+            first
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute"),
+            second
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute")
+        );
     }
 
     #[test]
@@ -1106,6 +1418,46 @@ mod tests {
     }
 
     #[test]
+    fn selector_closure_rejects_missing_required_digest() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let mut selector = selector_with_paths(
+            [0x01; 32],
+            [0x02; 32],
+            [0x03; 32],
+            &["README.md", "src/lib.rs"],
+        );
+        selector.required_read_digests.remove("src/lib.rs");
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("missing required digest should fail selector closure");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::MissingRequiredReadDigest
+        );
+    }
+
+    #[test]
+    fn ambient_read_denial_rejects_unpinned_observed_dependency() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+        let selector = selector_with_paths([0x11; 32], [0x22; 32], [0x33; 32], &["README.md"]);
+
+        let mut observed = BTreeSet::new();
+        observed.insert("src/ambient.rs".to_string());
+        let error = compiler
+            .compile_with_observed_reads(&selector, &observed, 42)
+            .expect_err("unhash-pinned observed dependency must be rejected");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::AmbientReadNotHashPinned
+        );
+    }
+
+    #[test]
     fn drift_fingerprint_changes_when_selector_changes() {
         let workspace = setup_workspace();
         let compiler =
@@ -1129,8 +1481,18 @@ mod tests {
         assert_eq!(first.fingerprint, second.fingerprint);
         assert_ne!(first.fingerprint, changed.fingerprint);
         assert_ne!(
-            first.fingerprint.required_read_digest,
-            changed.fingerprint.required_read_digest
+            first.fingerprint.required_read_digest_set_hash,
+            changed.fingerprint.required_read_digest_set_hash
+        );
+        assert_ne!(
+            first
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute"),
+            changed
+                .fingerprint
+                .compute_fingerprint()
+                .expect("fingerprint hash should compute")
         );
     }
 
@@ -1171,7 +1533,7 @@ mod tests {
             .expect("required digest payload should store");
         assert_eq!(
             required_store.hash,
-            compilation.fingerprint.required_read_digest
+            compilation.fingerprint.required_read_digest_set_hash
         );
 
         let recipe_bytes = compilation
@@ -1220,7 +1582,7 @@ mod tests {
             .canonical_bytes()
             .expect("recipe canonical bytes should serialize");
         cas.store(&recipe_bytes).expect("recipe should store");
-        // Intentionally skip storing required_read_digest payload.
+        // Intentionally skip storing required_read_digest_set payload.
 
         let error = reconstruct_from_receipts(&cas, &compilation.fingerprint)
             .expect_err("missing CAS digest entry must fail closed");
