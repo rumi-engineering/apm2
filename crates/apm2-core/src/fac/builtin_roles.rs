@@ -47,9 +47,17 @@
 //! println!("Code Quality Reviewer role hash: {}", hex::encode(hash));
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::role_spec::{
     RequiredOutputSchema, RoleBudgets, RoleSpecV1, RoleType, ToolAllowlist, ToolBudget,
 };
+pub use super::role_spec_v2::FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID;
+use super::role_spec_v2::{
+    DenyCondition, DenyReason, DenyReasonCode, OutputFieldType, OutputSchemaField, OutputSchemaV2,
+    ROLE_SPEC_V2_SCHEMA, RoleSpecV2, RoleSpecV2Error, ToolBudgetV2,
+};
+use crate::evidence::ContentAddressedStore;
 
 // =============================================================================
 // Role Spec Constants
@@ -616,6 +624,213 @@ pub fn dependency_updater_role() -> RoleSpecV1 {
 }
 
 // =============================================================================
+// RoleSpec v2 WorkObject Implementor Contract
+// =============================================================================
+
+fn workobject_implementor_tool_allowlists() -> BTreeSet<String> {
+    let mut tool_allowlists = BTreeSet::new();
+    tool_allowlists.insert("kernel.artifact.fetch".to_string());
+    tool_allowlists.insert("kernel.fs.list".to_string());
+    tool_allowlists.insert("kernel.fs.search".to_string());
+    tool_allowlists.insert("kernel.fs.read".to_string());
+    tool_allowlists.insert("kernel.fs.write".to_string());
+    tool_allowlists.insert("kernel.fs.edit".to_string());
+    tool_allowlists.insert("kernel.shell.exec".to_string());
+    tool_allowlists.insert("kernel.evidence.publish".to_string());
+    tool_allowlists.insert("kernel.event.emit".to_string());
+    tool_allowlists
+}
+
+fn workobject_implementor_tool_budgets() -> BTreeMap<String, ToolBudgetV2> {
+    let mut tool_budgets = BTreeMap::new();
+    tool_budgets.insert(
+        "kernel.artifact.fetch".to_string(),
+        ToolBudgetV2::new(64, 180_000),
+    );
+    tool_budgets.insert(
+        "kernel.fs.list".to_string(),
+        ToolBudgetV2::new(120, 120_000),
+    );
+    tool_budgets.insert(
+        "kernel.fs.search".to_string(),
+        ToolBudgetV2::new(120, 220_000),
+    );
+    tool_budgets.insert(
+        "kernel.fs.read".to_string(),
+        ToolBudgetV2::new(160, 300_000),
+    );
+    tool_budgets.insert(
+        "kernel.fs.write".to_string(),
+        ToolBudgetV2::new(64, 180_000),
+    );
+    tool_budgets.insert("kernel.fs.edit".to_string(), ToolBudgetV2::new(80, 220_000));
+    tool_budgets.insert(
+        "kernel.shell.exec".to_string(),
+        ToolBudgetV2::new(32, 480_000),
+    );
+    tool_budgets.insert(
+        "kernel.evidence.publish".to_string(),
+        ToolBudgetV2::new(48, 120_000),
+    );
+    tool_budgets.insert(
+        "kernel.event.emit".to_string(),
+        ToolBudgetV2::new(64, 80_000),
+    );
+    tool_budgets
+}
+
+fn workobject_implementor_output_schema() -> OutputSchemaV2 {
+    OutputSchemaV2::new("apm2.fac_workobject_implementor_output.v2")
+        .with_field(
+            "status",
+            OutputSchemaField::required(OutputFieldType::String),
+        )
+        .with_field(
+            "work_id",
+            OutputSchemaField::required(OutputFieldType::String),
+        )
+        .with_field(
+            "role_spec_hash",
+            OutputSchemaField::required(OutputFieldType::String),
+        )
+        .with_field(
+            "changeset_bundle_hash",
+            OutputSchemaField::required(OutputFieldType::String),
+        )
+        .with_field(
+            "evidence_refs",
+            OutputSchemaField::optional(OutputFieldType::Array),
+        )
+        .with_field(
+            "summary",
+            OutputSchemaField::optional(OutputFieldType::String),
+        )
+}
+
+fn workobject_implementor_deny_taxonomy() -> BTreeMap<DenyCondition, DenyReason> {
+    let mut deny_taxonomy = BTreeMap::new();
+    deny_taxonomy.insert(
+        DenyCondition::MissingAuthorityContext,
+        DenyReason::new(
+            DenyReasonCode::MissingAuthority,
+            "authority context missing for WorkObject execution",
+        ),
+    );
+    deny_taxonomy.insert(
+        DenyCondition::StaleAuthorityContext,
+        DenyReason::new(
+            DenyReasonCode::StaleAuthority,
+            "authority context stale relative to active gate window",
+        ),
+    );
+    deny_taxonomy.insert(
+        DenyCondition::UnknownRoleProfile,
+        DenyReason::new(
+            DenyReasonCode::UnknownRole,
+            "role profile hash does not resolve to registered RoleSpec contract",
+        ),
+    );
+    deny_taxonomy.insert(
+        DenyCondition::UnverifiableContextHash,
+        DenyReason::new(
+            DenyReasonCode::UnverifiableContext,
+            "context hash cannot be verified against authoritative source",
+        ),
+    );
+    deny_taxonomy
+}
+
+fn workobject_implementor_required_capabilities() -> BTreeMap<String, u8> {
+    let mut required_capabilities = BTreeMap::new();
+    required_capabilities.insert("artifact.fetch".to_string(), 0);
+    required_capabilities.insert("fs.read".to_string(), 0);
+    required_capabilities.insert("fs.write".to_string(), 1);
+    required_capabilities.insert("shell.exec".to_string(), 1);
+    required_capabilities.insert("evidence.publish".to_string(), 1);
+    required_capabilities
+}
+
+/// Creates the `fac_workobject_implementor_v2` `RoleSpec` contract artifact.
+///
+/// This contract is the v2 foundation for `WorkObject` implementor execution
+/// and encodes explicit tool budgets, allowlists, output schema fields, and
+/// deny taxonomy bindings.
+///
+/// # Panics
+///
+/// Panics if internal contract constants are malformed and fail validation.
+#[must_use]
+pub fn fac_workobject_implementor_v2_role_contract() -> RoleSpecV2 {
+    let contract = RoleSpecV2 {
+        schema: ROLE_SPEC_V2_SCHEMA.to_string(),
+        role_id: FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID.to_string(),
+        role_name: "FAC WorkObject Implementor".to_string(),
+        role_type: RoleType::Implementer,
+        description: "WorkObject-focused implementor contract with explicit deny taxonomy and per-tool budgets.".to_string(),
+        tool_allowlists: workobject_implementor_tool_allowlists(),
+        tool_budgets: workobject_implementor_tool_budgets(),
+        output_schema: workobject_implementor_output_schema(),
+        deny_taxonomy: workobject_implementor_deny_taxonomy(),
+        required_capabilities: workobject_implementor_required_capabilities(),
+    };
+    contract
+        .validate()
+        .expect("fac_workobject_implementor_v2 contract should be valid");
+    contract
+}
+
+/// Returns all built-in `RoleSpec` v2 contracts.
+#[must_use]
+pub fn all_builtin_role_contracts_v2() -> Vec<RoleSpecV2> {
+    vec![fac_workobject_implementor_v2_role_contract()]
+}
+
+/// Looks up a built-in `RoleSpec` v2 contract by role id.
+#[must_use]
+pub fn get_builtin_role_contract_v2(role_id: &str) -> Option<RoleSpecV2> {
+    match role_id {
+        FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID => {
+            Some(fac_workobject_implementor_v2_role_contract())
+        },
+        _ => None,
+    }
+}
+
+/// Computes deterministic hash registry for built-in `RoleSpec` v2 contracts.
+///
+/// The map key is `role_id` and value is canonical CAS hash.
+///
+/// # Errors
+///
+/// Returns [`RoleSpecV2Error`] if canonicalization or hash computation fails.
+pub fn builtin_role_contract_hash_registry_v2()
+-> Result<BTreeMap<String, [u8; 32]>, RoleSpecV2Error> {
+    let mut registry = BTreeMap::new();
+    for contract in all_builtin_role_contracts_v2() {
+        let hash = contract.compute_cas_hash()?;
+        registry.insert(contract.role_id.clone(), hash);
+    }
+    Ok(registry)
+}
+
+/// Stores built-in `RoleSpec` v2 contracts in CAS and returns role->hash map.
+///
+/// # Errors
+///
+/// Returns [`RoleSpecV2Error`] if contract validation, canonicalization, or CAS
+/// persistence fails.
+pub fn seed_builtin_role_contracts_v2_in_cas(
+    cas: &dyn ContentAddressedStore,
+) -> Result<BTreeMap<String, [u8; 32]>, RoleSpecV2Error> {
+    let mut registry = BTreeMap::new();
+    for contract in all_builtin_role_contracts_v2() {
+        let hash = contract.store_in_cas(cas)?;
+        registry.insert(contract.role_id.clone(), hash);
+    }
+    Ok(registry)
+}
+
+// =============================================================================
 // Registry Functions
 // =============================================================================
 
@@ -868,6 +1083,62 @@ mod tests {
         assert!(get_builtin_role(CODE_QUALITY_REVIEWER_ROLE_ID).is_some());
         assert!(get_builtin_role(SECURITY_REVIEWER_ROLE_ID).is_some());
         assert!(get_builtin_role("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_fac_workobject_implementor_v2_contract_valid() {
+        let contract = fac_workobject_implementor_v2_role_contract();
+        assert!(contract.validate().is_ok());
+        assert_eq!(contract.schema, ROLE_SPEC_V2_SCHEMA);
+        assert_eq!(contract.role_id, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID);
+        assert_eq!(contract.role_type, RoleType::Implementer);
+        assert!(!contract.tool_allowlists.is_empty());
+        assert!(!contract.tool_budgets.is_empty());
+        assert!(!contract.output_schema.fields.is_empty());
+        assert!(!contract.deny_taxonomy.is_empty());
+    }
+
+    #[test]
+    fn test_all_builtin_role_contracts_v2_registered() {
+        let contracts = all_builtin_role_contracts_v2();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].role_id, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID);
+    }
+
+    #[test]
+    fn test_get_builtin_role_contract_v2() {
+        assert!(get_builtin_role_contract_v2(FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID).is_some());
+        assert!(get_builtin_role_contract_v2("not_registered").is_none());
+    }
+
+    #[test]
+    fn test_builtin_role_contract_hash_registry_v2_deterministic() {
+        let registry_a = builtin_role_contract_hash_registry_v2().unwrap();
+        let registry_b = builtin_role_contract_hash_registry_v2().unwrap();
+        assert_eq!(registry_a, registry_b);
+
+        let contract = fac_workobject_implementor_v2_role_contract();
+        let expected_hash = contract.compute_cas_hash().unwrap();
+        assert_eq!(
+            registry_a
+                .get(FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID)
+                .copied(),
+            Some(expected_hash)
+        );
+    }
+
+    #[test]
+    fn test_seed_builtin_role_contracts_v2_in_cas_roundtrip() {
+        let cas = MemoryCas::new();
+        let registry = seed_builtin_role_contracts_v2_in_cas(&cas).unwrap();
+        let hash = registry
+            .get(FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID)
+            .copied()
+            .expect("role contract hash must be seeded");
+
+        let loaded = RoleSpecV2::load_from_cas(&cas, &hash).unwrap();
+        assert_eq!(loaded.role_id, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID);
+        assert_eq!(loaded.compute_cas_hash().unwrap(), hash);
     }
 
     #[test]
