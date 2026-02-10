@@ -1,42 +1,45 @@
-//! Launch liveness pulse and bounded restart policy primitives (RFC-0020).
+//! Launch liveness heartbeat and bounded restart policy primitives (RFC-0020).
 //!
-//! This module defines deterministic pulse receipts, bounded restart decisions,
-//! and fail-closed authoritative gate checks.
+//! This module defines deterministic heartbeat receipts, bounded restart
+//! decisions, and fail-closed authoritative gate checks.
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
-pub mod pulse;
+pub mod heartbeat;
 pub mod restart_policy;
 
-pub use pulse::{
-    HealthVerdict, LivenessPulseReceiptV1, MAX_PULSE_DETAIL_LENGTH, MAX_RUN_ID_LENGTH,
+pub use heartbeat::{
+    HealthVerdict, LivenessHeartbeatReceiptV1, MAX_HEARTBEAT_DETAIL_LENGTH, MAX_RUN_ID_LENGTH,
 };
-pub use restart_policy::{RestartController, RestartDecision, RestartPolicyConfig, TerminalReason};
+pub use restart_policy::{
+    MAX_CIRCUIT_BREAKER_FAILURES, MAX_RESTARTS_LIMIT, RestartController, RestartDecision,
+    RestartPolicyConfig, RestartPolicyConfigError, TerminalReason,
+};
 
 /// Maximum length for liveness gate denial detail.
-pub const MAX_LIVENESS_DENIAL_DETAIL_LENGTH: usize = MAX_PULSE_DETAIL_LENGTH;
+pub const MAX_LIVENESS_DENIAL_DETAIL_LENGTH: usize = MAX_HEARTBEAT_DETAIL_LENGTH;
 
 /// Check if liveness state allows authoritative progression.
 ///
-/// Fail-closed: `Ambiguous`/`Stalled`/`Crashed` verdicts, stale pulses, and
+/// Fail-closed: `Ambiguous`/`Stalled`/`Crashed` verdicts, stale heartbeats, and
 /// restart-limit violations deny progression.
 ///
 /// # Errors
 ///
 /// Returns [`LivenessGateDenial`] when progression must be denied.
 pub fn check_liveness_for_progression(
-    latest_pulse: &LivenessPulseReceiptV1,
+    latest_heartbeat: &LivenessHeartbeatReceiptV1,
     current_tick: u64,
-    max_pulse_age_ticks: u64,
+    max_heartbeat_age_ticks: u64,
 ) -> Result<(), LivenessGateDenial> {
-    if !latest_pulse.has_valid_bounds() {
+    if !latest_heartbeat.has_valid_bounds() {
         return Err(LivenessGateDenial::new(
             LivenessDenialReason::AmbiguousState,
-            "liveness pulse contains out-of-bounds string fields",
+            "liveness heartbeat contains out-of-bounds string fields",
         ));
     }
 
-    match latest_pulse.health_verdict {
+    match latest_heartbeat.health_verdict {
         HealthVerdict::Healthy => {},
         HealthVerdict::Stalled => {
             return Err(LivenessGateDenial::new(
@@ -58,20 +61,22 @@ pub fn check_liveness_for_progression(
         },
     }
 
-    let pulse_age = current_tick.saturating_sub(latest_pulse.emitted_at_tick);
-    if pulse_age > max_pulse_age_ticks {
+    let heartbeat_age = current_tick.saturating_sub(latest_heartbeat.emitted_at_tick);
+    if heartbeat_age > max_heartbeat_age_ticks {
         return Err(LivenessGateDenial::new(
-            LivenessDenialReason::StalePulse,
-            format!("pulse age {pulse_age} exceeds max age {max_pulse_age_ticks} ticks"),
+            LivenessDenialReason::StaleHeartbeat,
+            format!(
+                "heartbeat age {heartbeat_age} exceeds max age {max_heartbeat_age_ticks} ticks"
+            ),
         ));
     }
 
-    if latest_pulse.restart_count > latest_pulse.max_restarts {
+    if latest_heartbeat.restart_count > latest_heartbeat.max_restarts {
         return Err(LivenessGateDenial::new(
             LivenessDenialReason::RestartLimitExceeded,
             format!(
                 "restart count {} exceeds max restarts {}",
-                latest_pulse.restart_count, latest_pulse.max_restarts
+                latest_heartbeat.restart_count, latest_heartbeat.max_restarts
             ),
         ));
     }
@@ -112,8 +117,8 @@ impl LivenessGateDenial {
 pub enum LivenessDenialReason {
     /// Health verdict is not `Healthy`.
     UnhealthyVerdict,
-    /// Pulse is too old (exceeds `max_pulse_age_ticks`).
-    StalePulse,
+    /// Heartbeat is too old (exceeds `max_heartbeat_age_ticks`).
+    StaleHeartbeat,
     /// Restart limit exceeded.
     RestartLimitExceeded,
     /// Ambiguous state — cannot determine liveness.
@@ -138,8 +143,8 @@ where
 mod tests {
     use super::*;
 
-    fn sample_pulse(health_verdict: HealthVerdict) -> LivenessPulseReceiptV1 {
-        LivenessPulseReceiptV1 {
+    fn sample_heartbeat(health_verdict: HealthVerdict) -> LivenessHeartbeatReceiptV1 {
+        LivenessHeartbeatReceiptV1 {
             run_id: "run-123".to_string(),
             episode_id: [1; 32],
             emitted_at_tick: 100,
@@ -148,7 +153,7 @@ mod tests {
             restart_count: 0,
             max_restarts: 3,
             uptime_ms: 42_000,
-            detail: Some("pulse ok".to_string()),
+            detail: Some("heartbeat ok".to_string()),
         }
     }
 
@@ -163,49 +168,50 @@ mod tests {
     }
 
     #[test]
-    fn test_healthy_pulse_allows_progression() {
-        let pulse = sample_pulse(HealthVerdict::Healthy);
-        let result = check_liveness_for_progression(&pulse, 105, 10);
+    fn test_healthy_heartbeat_allows_progression() {
+        let heartbeat = sample_heartbeat(HealthVerdict::Healthy);
+        let result = check_liveness_for_progression(&heartbeat, 105, 10);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_stalled_verdict_denies_progression() {
-        let pulse = sample_pulse(HealthVerdict::Stalled);
-        let denial = check_liveness_for_progression(&pulse, 105, 10)
+        let heartbeat = sample_heartbeat(HealthVerdict::Stalled);
+        let denial = check_liveness_for_progression(&heartbeat, 105, 10)
             .expect_err("stalled verdict must deny progression");
         assert_eq!(denial.reason, LivenessDenialReason::UnhealthyVerdict);
     }
 
     #[test]
     fn test_crashed_verdict_denies_progression() {
-        let pulse = sample_pulse(HealthVerdict::Crashed);
-        let denial = check_liveness_for_progression(&pulse, 105, 10)
+        let heartbeat = sample_heartbeat(HealthVerdict::Crashed);
+        let denial = check_liveness_for_progression(&heartbeat, 105, 10)
             .expect_err("crashed verdict must deny progression");
         assert_eq!(denial.reason, LivenessDenialReason::UnhealthyVerdict);
     }
 
     #[test]
     fn test_ambiguous_verdict_denies_progression() {
-        let pulse = sample_pulse(HealthVerdict::Ambiguous);
-        let denial = check_liveness_for_progression(&pulse, 105, 10)
+        let heartbeat = sample_heartbeat(HealthVerdict::Ambiguous);
+        let denial = check_liveness_for_progression(&heartbeat, 105, 10)
             .expect_err("ambiguous verdict must deny progression");
         assert_eq!(denial.reason, LivenessDenialReason::AmbiguousState);
     }
 
     #[test]
-    fn test_stale_pulse_denies_progression() {
-        let mut pulse = sample_pulse(HealthVerdict::Healthy);
-        pulse.emitted_at_tick = 10;
+    fn test_stale_heartbeat_denies_progression() {
+        let mut heartbeat = sample_heartbeat(HealthVerdict::Healthy);
+        heartbeat.emitted_at_tick = 10;
 
-        let denial = check_liveness_for_progression(&pulse, 30, 5)
-            .expect_err("stale pulse must deny progression");
-        assert_eq!(denial.reason, LivenessDenialReason::StalePulse);
+        let denial = check_liveness_for_progression(&heartbeat, 30, 5)
+            .expect_err("stale heartbeat must deny progression");
+        assert_eq!(denial.reason, LivenessDenialReason::StaleHeartbeat);
     }
 
     #[test]
     fn test_restart_within_limits_allowed() {
-        let mut controller = RestartController::new(sample_restart_config());
+        let mut controller =
+            RestartController::new(sample_restart_config()).expect("valid config should succeed");
         let decision = controller.record_restart(100);
         assert_eq!(decision, RestartDecision::Allow { attempt: 1 });
     }
@@ -219,7 +225,7 @@ mod tests {
             circuit_breaker_max_failures: 10,
             stall_timeout_ticks: 8,
         };
-        let mut controller = RestartController::new(config);
+        let mut controller = RestartController::new(config).expect("valid config should succeed");
 
         assert_eq!(
             controller.record_restart(100),
@@ -246,7 +252,7 @@ mod tests {
             circuit_breaker_max_failures: 3,
             stall_timeout_ticks: 8,
         };
-        let mut controller = RestartController::new(config);
+        let mut controller = RestartController::new(config).expect("valid config should succeed");
 
         assert_eq!(
             controller.record_restart(100),
@@ -272,13 +278,15 @@ mod tests {
 
     #[test]
     fn test_stall_timeout_detection() {
-        let controller = RestartController::new(sample_restart_config());
+        let controller =
+            RestartController::new(sample_restart_config()).expect("valid config should succeed");
         assert!(controller.check_stall(10, 18));
     }
 
     #[test]
     fn test_clean_exit_is_terminal() {
-        let mut controller = RestartController::new(sample_restart_config());
+        let mut controller =
+            RestartController::new(sample_restart_config()).expect("valid config should succeed");
         assert_eq!(
             controller.record_terminal(TerminalReason::CleanExit),
             RestartDecision::Deny {
@@ -298,12 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pulse_receipt_serialization() {
-        let pulse = sample_pulse(HealthVerdict::Healthy);
-        let encoded = serde_json::to_string(&pulse).expect("pulse should serialize");
-        let decoded: LivenessPulseReceiptV1 =
-            serde_json::from_str(&encoded).expect("pulse should deserialize");
-        assert_eq!(pulse, decoded);
+    fn test_heartbeat_receipt_serialization() {
+        let heartbeat = sample_heartbeat(HealthVerdict::Healthy);
+        let encoded = serde_json::to_string(&heartbeat).expect("heartbeat should serialize");
+        let decoded: LivenessHeartbeatReceiptV1 =
+            serde_json::from_str(&encoded).expect("heartbeat should deserialize");
+        assert_eq!(heartbeat, decoded);
     }
 
     #[test]
@@ -317,13 +325,13 @@ mod tests {
 
     #[test]
     fn test_liveness_denial_includes_detail() {
-        let mut pulse = sample_pulse(HealthVerdict::Healthy);
-        pulse.emitted_at_tick = 1;
+        let mut heartbeat = sample_heartbeat(HealthVerdict::Healthy);
+        heartbeat.emitted_at_tick = 1;
 
-        let denial = check_liveness_for_progression(&pulse, 15, 3)
-            .expect_err("stale pulse should deny with detail");
-        assert_eq!(denial.reason, LivenessDenialReason::StalePulse);
-        assert!(denial.detail.contains("pulse age"));
+        let denial = check_liveness_for_progression(&heartbeat, 15, 3)
+            .expect_err("stale heartbeat should deny with detail");
+        assert_eq!(denial.reason, LivenessDenialReason::StaleHeartbeat);
+        assert!(denial.detail.contains("heartbeat age"));
         assert!(!denial.detail.trim().is_empty());
     }
 }

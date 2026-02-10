@@ -38,6 +38,9 @@ use apm2_core::htf::{
     BoundedWallInterval, Canonicalizable, ClockProfile, Hlc, LedgerTime, MonotonicReading,
     MonotonicSource, TimeEnvelope, WallTimeSource,
 };
+use apm2_core::liveness::{
+    LivenessGateDenial, LivenessHeartbeatReceiptV1, check_liveness_for_progression,
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -620,6 +623,8 @@ pub struct GateOrchestratorConfig {
     pub max_concurrent_orchestrations: usize,
     /// Gate execution timeout in milliseconds.
     pub gate_timeout_ms: u64,
+    /// Maximum accepted heartbeat age for authoritative progression checks.
+    pub max_heartbeat_age_ticks: u64,
     /// Gate types to execute for each terminated session.
     pub gate_types: Vec<GateType>,
     /// Issuer actor ID for gate leases.
@@ -635,6 +640,7 @@ impl Default for GateOrchestratorConfig {
         Self {
             max_concurrent_orchestrations: MAX_CONCURRENT_ORCHESTRATIONS,
             gate_timeout_ms: DEFAULT_GATE_TIMEOUT_MS,
+            max_heartbeat_age_ticks: 10,
             gate_types: GateType::all().to_vec(),
             issuer_actor_id: "daemon-gate-orchestrator".to_string(),
             resolver_actor_id: "daemon-policy-resolver".to_string(),
@@ -758,6 +764,15 @@ impl GateOrchestrator {
     #[must_use]
     pub const fn config(&self) -> &GateOrchestratorConfig {
         &self.config
+    }
+
+    /// Check liveness state before allowing gate progression.
+    pub fn check_liveness_gate(
+        &self,
+        heartbeat: &LivenessHeartbeatReceiptV1,
+        current_tick: u64,
+    ) -> Result<(), LivenessGateDenial> {
+        check_liveness_for_progression(heartbeat, current_tick, self.config.max_heartbeat_age_ticks)
     }
 
     /// Returns the number of active orchestrations.

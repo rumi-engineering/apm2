@@ -1,6 +1,34 @@
 //! Bounded restart policy with reason-coded transitions.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Maximum allowed restart attempts in [`RestartPolicyConfig::max_restarts`].
+pub const MAX_RESTARTS_LIMIT: u32 = 1000;
+
+/// Maximum allowed circuit breaker failures.
+pub const MAX_CIRCUIT_BREAKER_FAILURES: u32 = 100;
+
+/// Validation error for [`RestartPolicyConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RestartPolicyConfigError {
+    /// `max_restarts` exceeds the configured hard limit.
+    #[error("max_restarts exceeds allowed limit: {actual} > {limit}")]
+    MaxRestartsExceedsLimit {
+        /// Requested `max_restarts` value.
+        actual: u32,
+        /// Maximum allowed value.
+        limit: u32,
+    },
+    /// `circuit_breaker_max_failures` exceeds the configured hard limit.
+    #[error("circuit_breaker_max_failures exceeds allowed limit: {actual} > {limit}")]
+    CircuitBreakerFailuresExceedsLimit {
+        /// Requested `circuit_breaker_max_failures` value.
+        actual: u32,
+        /// Maximum allowed value.
+        limit: u32,
+    },
+}
 
 /// Terminal reason taxonomy for launch lifecycle outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -52,6 +80,34 @@ pub struct RestartPolicyConfig {
     pub stall_timeout_ticks: u64,
 }
 
+impl RestartPolicyConfig {
+    /// Validates policy bounds at configuration admission time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestartPolicyConfigError`] when a field exceeds the allowed
+    /// guardrail limits.
+    pub const fn validate(&self) -> Result<(), RestartPolicyConfigError> {
+        if self.max_restarts > MAX_RESTARTS_LIMIT {
+            return Err(RestartPolicyConfigError::MaxRestartsExceedsLimit {
+                actual: self.max_restarts,
+                limit: MAX_RESTARTS_LIMIT,
+            });
+        }
+
+        if self.circuit_breaker_max_failures > MAX_CIRCUIT_BREAKER_FAILURES {
+            return Err(
+                RestartPolicyConfigError::CircuitBreakerFailuresExceedsLimit {
+                    actual: self.circuit_breaker_max_failures,
+                    limit: MAX_CIRCUIT_BREAKER_FAILURES,
+                },
+            );
+        }
+
+        Ok(())
+    }
+}
+
 /// Bounded restart controller state.
 #[derive(Debug, Clone)]
 pub struct RestartController {
@@ -66,14 +122,19 @@ pub struct RestartController {
 
 impl RestartController {
     /// Creates a new restart controller for the provided policy configuration.
-    #[must_use]
-    pub const fn new(config: RestartPolicyConfig) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestartPolicyConfigError`] when `config` violates admission
+    /// limits.
+    pub fn new(config: RestartPolicyConfig) -> Result<Self, RestartPolicyConfigError> {
+        config.validate()?;
+        Ok(Self {
             config,
             restart_ticks: Vec::new(),
             circuit_breaker_open: false,
             terminal_reason: None,
-        }
+        })
     }
 
     /// Record a restart and return the decision.
@@ -121,8 +182,8 @@ impl RestartController {
 
     /// Check if stall timeout has been exceeded.
     #[must_use]
-    pub const fn check_stall(&self, last_pulse_tick: u64, current_tick: u64) -> bool {
-        current_tick.saturating_sub(last_pulse_tick) >= self.config.stall_timeout_ticks
+    pub const fn check_stall(&self, last_heartbeat_tick: u64, current_tick: u64) -> bool {
+        current_tick.saturating_sub(last_heartbeat_tick) >= self.config.stall_timeout_ticks
     }
 
     /// Get the terminal reason if the controller has decided to stop.
@@ -163,5 +224,38 @@ impl RestartController {
         u32::try_from(self.restart_ticks.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> RestartPolicyConfig {
+        RestartPolicyConfig {
+            max_restarts: 3,
+            window_ticks: 50,
+            circuit_breaker_threshold_ticks: 5,
+            circuit_breaker_max_failures: 3,
+            stall_timeout_ticks: 10,
+        }
+    }
+
+    #[test]
+    fn test_too_many_restarts_rejected() {
+        let config = RestartPolicyConfig {
+            max_restarts: MAX_RESTARTS_LIMIT + 1,
+            ..valid_config()
+        };
+
+        let error =
+            RestartController::new(config).expect_err("config above max_restarts must fail");
+        assert_eq!(
+            error,
+            RestartPolicyConfigError::MaxRestartsExceedsLimit {
+                actual: MAX_RESTARTS_LIMIT + 1,
+                limit: MAX_RESTARTS_LIMIT
+            }
+        );
     }
 }
