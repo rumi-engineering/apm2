@@ -44,6 +44,9 @@ use apm2_core::fac::{
     seed_builtin_role_contracts_v2_in_cas, validate_receipt_attestation,
 };
 use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
+use apm2_core::liveness::{
+    HealthVerdict, LivenessHeartbeatReceiptV1, MAX_RESTARTS_LIMIT, MAX_RUN_ID_LENGTH,
+};
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, DeterminismClass as PcacDeterminismClass,
     IdentityEvidenceLevel, RiskTier as PcacRiskTier,
@@ -4526,6 +4529,37 @@ pub fn generate_lease_id() -> String {
     // RFC-0016 HTF compliance: Use UUID v4 instead of SystemTime::now()
     let uuid = uuid::Uuid::new_v4();
     format!("L-{uuid}")
+}
+
+/// Build a deterministic liveness heartbeat receipt for daemon progression
+/// checks.
+#[must_use]
+pub fn build_liveness_heartbeat(
+    episode_id: &[u8; 32],
+    run_id: &str,
+    current_tick: u64,
+    health: HealthVerdict,
+) -> LivenessHeartbeatReceiptV1 {
+    let mut run_id = run_id.to_string();
+    if run_id.len() > MAX_RUN_ID_LENGTH {
+        let mut truncation_index = MAX_RUN_ID_LENGTH;
+        while !run_id.is_char_boundary(truncation_index) {
+            truncation_index = truncation_index.saturating_sub(1);
+        }
+        run_id.truncate(truncation_index);
+    }
+
+    LivenessHeartbeatReceiptV1 {
+        run_id,
+        episode_id: *episode_id,
+        emitted_at_tick: current_tick,
+        time_envelope_ref: *episode_id,
+        health_verdict: health,
+        restart_count: 0,
+        max_restarts: MAX_RESTARTS_LIMIT,
+        uptime_ms: 0,
+        detail: None,
+    }
 }
 
 fn decode_hash32_hex(field: &str, value: &str) -> Result<[u8; 32], String> {

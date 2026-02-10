@@ -60,6 +60,7 @@ pub mod htf;
 pub mod impact_map;
 pub mod lease;
 pub mod ledger;
+pub mod liveness;
 pub mod log;
 pub mod model_router;
 pub mod pcac;
