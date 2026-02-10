@@ -861,22 +861,41 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
         stage: &'static str,
     ) -> Result<(), Box<AuthorityDenyV1>> {
-        if !Self::requires_sovereignty_check(cert) {
+        let sovereignty_mode = pcac_policy
+            .map(|p| p.tier2_sovereignty_mode)
+            .unwrap_or_default();
+
+        if !Self::requires_sovereignty_check(cert)
+            || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
+        {
             return Ok(());
         }
 
         match (&self.sovereignty_checker, sovereignty_state) {
-            (Some(checker), Some(sov_state)) => checker
-                .check_revalidate(
+            (Some(checker), Some(sov_state)) => {
+                if let Err(deny) = checker.check_revalidate(
                     cert,
                     sov_state,
                     current_tick,
                     current_time_envelope_ref,
                     current_ledger_anchor,
-                )
-                .inspect_err(|deny| self.actuate_containment(stage, deny)),
+                ) {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            deny_class = %deny.deny_class,
+                            "Sovereignty violation observed (monitor mode)"
+                        );
+                    } else {
+                        self.actuate_containment(stage, &deny);
+                        return Err(deny);
+                    }
+                }
+                Ok(())
+            },
             (Some(_), None) => {
                 let deny = Box::new(AuthorityDenyV1 {
                     deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
@@ -889,8 +908,17 @@ impl LifecycleGate {
                     denied_at_tick: current_tick,
                     containment_action: Some(FreezeAction::HardFreeze),
                 });
-                self.actuate_containment(stage, &deny);
-                Err(deny)
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                    warn!(
+                        stage = stage,
+                        deny_class = %deny.deny_class,
+                        "Sovereignty state missing (monitor mode)"
+                    );
+                    Ok(())
+                } else {
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                }
             },
             (None, _) => Ok(()),
         }
@@ -903,22 +931,41 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
         stage: &'static str,
     ) -> Result<(), Box<AuthorityDenyV1>> {
-        if !Self::requires_sovereignty_check(cert) {
+        let sovereignty_mode = pcac_policy
+            .map(|p| p.tier2_sovereignty_mode)
+            .unwrap_or_default();
+
+        if !Self::requires_sovereignty_check(cert)
+            || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
+        {
             return Ok(());
         }
 
         match (&self.sovereignty_checker, sovereignty_state) {
-            (Some(checker), Some(sov_state)) => checker
-                .check_consume(
+            (Some(checker), Some(sov_state)) => {
+                if let Err(deny) = checker.check_consume(
                     cert,
                     sov_state,
                     current_tick,
                     current_time_envelope_ref,
                     current_ledger_anchor,
-                )
-                .inspect_err(|deny| self.actuate_containment(stage, deny)),
+                ) {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            deny_class = %deny.deny_class,
+                            "Sovereignty violation observed (monitor mode)"
+                        );
+                    } else {
+                        self.actuate_containment(stage, &deny);
+                        return Err(deny);
+                    }
+                }
+                Ok(())
+            },
             (Some(_), None) => {
                 let deny = Box::new(AuthorityDenyV1 {
                     deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
@@ -930,8 +977,17 @@ impl LifecycleGate {
                     denied_at_tick: current_tick,
                     containment_action: Some(FreezeAction::HardFreeze),
                 });
-                self.actuate_containment(stage, &deny);
-                Err(deny)
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                    warn!(
+                        stage = stage,
+                        deny_class = %deny.deny_class,
+                        "Sovereignty state missing (monitor mode)"
+                    );
+                    Ok(())
+                } else {
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                }
             },
             (None, _) => Ok(()),
         }
@@ -965,6 +1021,7 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
         let cert = self.join_and_revalidate(
             input,
@@ -978,6 +1035,7 @@ impl LifecycleGate {
             current_ledger_anchor,
             sovereignty_state,
             current_tick,
+            pcac_policy,
             "revalidate-before-decision",
         )?;
         Ok(cert)
@@ -1010,6 +1068,7 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         self.revalidate_before_execution(
             cert,
@@ -1023,6 +1082,7 @@ impl LifecycleGate {
             current_ledger_anchor,
             sovereignty_state,
             current_tick,
+            pcac_policy,
             "revalidate-before-execution",
         )
     }
@@ -1055,6 +1115,7 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         self.check_consume_sovereignty(
             cert,
@@ -1062,6 +1123,7 @@ impl LifecycleGate {
             current_ledger_anchor,
             sovereignty_state,
             current_tick,
+            pcac_policy,
             "consume-before-effect",
         )?;
         self.consume_before_effect(
@@ -1089,6 +1151,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             None,
             0,
+            None,
         )
     }
 

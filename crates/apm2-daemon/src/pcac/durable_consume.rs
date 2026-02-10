@@ -941,6 +941,7 @@ mod tests {
             determinism_class: DeterminismClass::Deterministic,
             time_envelope_ref: test_hash(0x07),
             as_of_ledger_anchor: test_hash(0x08),
+            pointer_only_waiver_hash: None,
         }
     }
 

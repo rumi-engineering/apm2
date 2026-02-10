@@ -67,6 +67,7 @@ use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::Hash;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+use apm2_core::pcac::{PcacPolicyKnobs, PointerOnlyWaiver};
 use apm2_core::tool::{self, tool_request as tool_req};
 use apm2_holon::defect::{
     DefectContext as HolonDefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType,
@@ -763,7 +764,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
 struct PendingPcacAuthority {
     gate: Arc<crate::pcac::LifecycleGate>,
     certificate: apm2_core::pcac::AuthorityJoinCertificateV1,
-    intent_digest: Hash,
+    intent_digest: [u8; 32],
+    pcac_policy: PcacPolicyKnobs,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -2277,6 +2279,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 determinism_class,
                 time_envelope_ref,
                 as_of_ledger_anchor,
+                pointer_only_waiver_hash: None,
             };
 
             let (current_time_envelope_ref, current_ledger_anchor, current_revocation_head) =
@@ -2348,6 +2351,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 gate: Arc::clone(pcac_gate),
                 certificate,
                 intent_digest,
+                pcac_policy: pcac_policy.clone(),
             })
         } else if self.is_authoritative_mode() {
             // BLOCKER 4 FIX: Authoritative mode requires mandatory PCAC gate wiring.
@@ -2917,6 +2921,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             current_revocation_head,
                             sovereignty_state_ref,
                             fresh_tick,
+                            Some(&pending_pcac.pcac_policy),
                         )
                     {
                         let containment_action = deny.containment_action;
@@ -2970,6 +2975,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             current_revocation_head,
                             sovereignty_state_ref,
                             fresh_tick,
+                            Some(&pending_pcac.pcac_policy),
                         ) {
                         Ok(receipts) => receipts,
                         Err(deny) => {
@@ -4015,6 +4021,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             work_id: String::new(),
             role: 0, // UNSPECIFIED
             episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             tool_calls: 0,
             events_emitted: 0,
             started_at_ns: 0,
@@ -6070,6 +6078,8 @@ mod tests {
                         lease_id: "lease-001".to_string(),
                         ephemeral_handle: "handle-pcac-order".to_string(),
                         policy_resolved_ref: "policy-head-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
                         capability_manifest_hash: blake3::hash(b"pcac-order-manifest")
                             .as_bytes()
                             .to_vec(),
@@ -6318,6 +6328,8 @@ mod tests {
                     // TCK-00426: PCAC gate requires non-empty manifest hash
                     // and policy_resolved_ref in authoritative mode.
                     policy_resolved_ref: "test-policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
                     capability_manifest_hash: blake3::hash(b"test-manifest").as_bytes().to_vec(),
                     episode_id: Some(session_id.to_string()),
                 })
@@ -7509,6 +7521,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -7702,6 +7716,8 @@ mod tests {
                     // TCK-00426: PCAC gate requires non-empty manifest hash and
                     // policy_resolved_ref in authoritative mode.
                     policy_resolved_ref: "test-policy-ref".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
                     capability_manifest_hash: blake3::hash(b"e2e-read-manifest")
                         .as_bytes()
                         .to_vec(),
@@ -7891,6 +7907,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8103,6 +8121,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8169,6 +8189,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8216,6 +8238,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             let session2 = SessionState {
                 session_id: "s2".to_string(),
@@ -8226,6 +8250,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
 
             registry.register_session(session1).unwrap();
@@ -8286,6 +8312,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 
@@ -8407,6 +8435,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 

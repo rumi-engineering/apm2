@@ -2481,12 +2481,16 @@ mod tests {
     fn test_policy_resolution() -> PolicyResolution {
         PolicyResolution {
             policy_resolved_ref: "test-resolved".to_string(),
+            pcac_policy: None,
+            pointer_only_waiver: None,
             resolved_policy_hash: [0u8; 32],
             capability_manifest_hash: [0u8; 32],
             context_pack_hash: [0u8; 32],
             resolved_risk_tier: 0,
             resolved_scope_baseline: None,
             expected_adapter_profile_hash: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
         }
     }
 
