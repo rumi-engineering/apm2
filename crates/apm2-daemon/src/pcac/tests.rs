@@ -3,11 +3,12 @@
 
 use std::sync::Arc;
 
-use apm2_core::crypto::Hash;
+use apm2_core::crypto::{Hash, Signer};
 use apm2_core::pcac::{
     ArbitrationOutcome, AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel,
-    BoundaryIntentClass, DeterminismClass, EvaluatorTuple, IdentityEvidenceLevel, PcacPolicyKnobs,
-    RiskTier, SovereigntyEnforcementMode, TemporalArbitrationReceiptV1, TemporalPredicateId,
+    BoundaryIntentClass, DeterminismClass, EvaluatorTuple, IdentityEvidenceLevel,
+    MAX_REASON_LENGTH, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
+    TemporalArbitrationReceiptV1, TemporalPredicateId,
 };
 
 use super::durable_consume::DurableConsumeIndex;
@@ -107,6 +108,7 @@ fn temporal_receipt(
     arbitrated_at_tick: u64,
     time_envelope_ref: Hash,
 ) -> TemporalArbitrationReceiptV1 {
+    let signer = Signer::from_bytes(&[0x5A; 32]).expect("deterministic temporal signer");
     let deny_reason =
         (outcome != ArbitrationOutcome::AgreedAllow).then(|| "stale freshness witness".to_string());
 
@@ -125,7 +127,7 @@ fn temporal_receipt(
         ..tuple_a.clone()
     };
 
-    TemporalArbitrationReceiptV1 {
+    let mut receipt = TemporalArbitrationReceiptV1 {
         predicate_id,
         evaluators: vec![tuple_a, tuple_b],
         aggregate_outcome: outcome,
@@ -133,7 +135,33 @@ fn temporal_receipt(
         arbitrated_at_tick,
         deadline_tick,
         content_digest: test_hash(0xA6),
-    }
+        signer_id: [0u8; 32],
+        signature: [0u8; 64],
+    };
+    receipt.sign(&signer);
+    receipt
+}
+
+fn temporal_receipts_both_allow(
+    time_envelope_ref: Hash,
+    tick: u64,
+) -> Vec<TemporalArbitrationReceiptV1> {
+    vec![
+        temporal_receipt(
+            ArbitrationOutcome::AgreedAllow,
+            TemporalPredicateId::TpEio29001,
+            None,
+            tick,
+            time_envelope_ref,
+        ),
+        temporal_receipt(
+            ArbitrationOutcome::AgreedAllow,
+            TemporalPredicateId::TpEio29008,
+            None,
+            tick,
+            time_envelope_ref,
+        ),
+    ]
 }
 
 // =============================================================================
@@ -751,6 +779,104 @@ fn test_tier2_revalidate_denies_unverifiable_membership() {
 }
 
 #[test]
+fn test_tier2_denies_without_temporal_receipt() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before temporal receipt check");
+
+    let policy = PcacPolicyKnobs {
+        lifecycle_enforcement: true,
+        min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
+        freshness_max_age_ticks: 300,
+        tier2_sovereignty_mode: SovereigntyEnforcementMode::Disabled,
+    };
+    let err = gate
+        .revalidate_before_execution_with_sovereignty_membership(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            Some(&policy),
+            None,
+            true,
+        )
+        .expect_err("tier2+ revalidate must deny when temporal receipt is missing");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            ref outcome, ..
+        } if outcome == "missing_receipt"
+    ));
+}
+
+#[test]
+fn test_membership_detail_bounded() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before membership detail check");
+
+    let principal_id = "p".repeat(MAX_REASON_LENGTH * 2);
+    let sovereignty_state = super::sovereignty::SovereigntyState {
+        epoch: None,
+        principal_id,
+        revocation_head_known: true,
+        autonomy_ceiling: None,
+        active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+    };
+
+    let err = gate
+        .revalidate_before_execution_with_sovereignty_membership(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            Some(&sovereignty_state),
+            100,
+            Some(&strict_sovereignty_policy()),
+            None,
+            false,
+        )
+        .expect_err("membership unverifiable detail must deny");
+
+    match err.deny_class {
+        AuthorityDenyClass::IdentityMembershipUnverifiable { detail } => {
+            assert!(
+                detail.len() <= MAX_REASON_LENGTH,
+                "membership detail length {} exceeds bound {}",
+                detail.len(),
+                MAX_REASON_LENGTH
+            );
+            assert!(
+                detail.starts_with("membership unverifiable: principal="),
+                "unexpected detail format: {detail}"
+            );
+        },
+        other => panic!("expected IdentityMembershipUnverifiable, got: {other:?}"),
+    }
+}
+
+#[test]
 fn lifecycle_gate_prevents_effect_without_consume() {
     // Verify that same-tick replay of the same input is denied (Law 1).
     let kernel = Arc::new(InProcessKernel::new(100));
@@ -902,8 +1028,14 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
     use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
     let checker = checker();
-    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+    let gate = LifecycleGate::with_tick_kernel_and_sovereignty(
+        kernel_trait,
+        Arc::clone(&kernel),
+        checker,
+        Arc::new(crate::episode::preactuation::StopAuthority::new()),
+    );
 
     let mut input = valid_input();
     input.risk_tier = RiskTier::Tier2Plus;
@@ -918,6 +1050,7 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
+    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
 
     let result = gate.execute_with_sovereignty(
         &input,
@@ -926,6 +1059,7 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
         input.directory_head_hash,
         Some(&sov_state),
         100,
+        &temporal_receipts,
     );
     assert!(
         result.is_ok(),
@@ -965,6 +1099,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
             input.directory_head_hash,
             Some(&sov_state),
             200, // tick 200, epoch at 10 -> drift 190 > threshold 50
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -988,8 +1123,14 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
     use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
     let checker = checker();
-    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+    let gate = LifecycleGate::with_tick_kernel_and_sovereignty(
+        kernel_trait,
+        Arc::clone(&kernel),
+        checker,
+        Arc::new(crate::episode::preactuation::StopAuthority::new()),
+    );
 
     let mut input = valid_input();
     input.risk_tier = RiskTier::Tier2Plus;
@@ -1013,6 +1154,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1031,8 +1173,14 @@ fn lifecycle_gate_with_sovereignty_tier1_bypasses_bad_state() {
     use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
     let checker = checker();
-    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+    let gate = LifecycleGate::with_tick_kernel_and_sovereignty(
+        kernel_trait,
+        Arc::clone(&kernel),
+        checker,
+        Arc::new(crate::episode::preactuation::StopAuthority::new()),
+    );
 
     let input = valid_input(); // risk_tier is Tier1
 
@@ -1052,6 +1200,7 @@ fn lifecycle_gate_with_sovereignty_tier1_bypasses_bad_state() {
         input.directory_head_hash,
         Some(&sov_state),
         200,
+        &[],
     );
     assert!(
         result.is_ok(),
@@ -1083,6 +1232,7 @@ fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
             input.directory_head_hash,
             None,
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1207,6 +1357,7 @@ fn lifecycle_gate_without_sovereignty_state_passes_tier1() {
         input.directory_head_hash,
         None,
         100,
+        &[],
     );
     assert!(
         result.is_ok(),
@@ -1221,8 +1372,14 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
     use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
     let checker = checker();
-    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+    let gate = LifecycleGate::with_tick_kernel_and_sovereignty(
+        kernel_trait,
+        Arc::clone(&kernel),
+        checker,
+        Arc::new(crate::episode::preactuation::StopAuthority::new()),
+    );
 
     let mut input = valid_input();
     input.risk_tier = RiskTier::Tier2Plus;
@@ -1238,6 +1395,7 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
+    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
 
     let err = gate
         .execute_with_sovereignty(
@@ -1247,6 +1405,7 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &temporal_receipts,
         )
         .unwrap_err();
     assert!(
@@ -1295,6 +1454,7 @@ fn lifecycle_gate_sovereignty_uncertainty_carries_freeze_signal() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
 
@@ -1566,8 +1726,14 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
     use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
     let checker = checker();
-    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+    let gate = LifecycleGate::with_tick_kernel_and_sovereignty(
+        kernel_trait,
+        Arc::clone(&kernel),
+        checker,
+        Arc::new(crate::episode::preactuation::StopAuthority::new()),
+    );
 
     let mut input = valid_input();
     input.risk_tier = RiskTier::Tier2Plus;
@@ -1583,6 +1749,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
+    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
 
     // First attempt: denied by sovereignty consume check.
     let err = gate
@@ -1593,6 +1760,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &temporal_receipts,
         )
         .unwrap_err();
     assert!(
@@ -1616,7 +1784,6 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
-
     let result = gate.execute_with_sovereignty(
         &input,
         input.time_envelope_ref,
@@ -1624,6 +1791,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
         input.directory_head_hash,
         Some(&good_sov_state),
         100,
+        &temporal_receipts,
     );
     assert!(
         result.is_ok(),
@@ -1678,6 +1846,7 @@ fn epoch_with_invalid_signature_denied() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1731,6 +1900,7 @@ fn epoch_with_untrusted_signer_denied() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1800,6 +1970,7 @@ fn sovereignty_hard_freeze_actuates_emergency_stop() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1870,6 +2041,7 @@ fn sovereignty_soft_freeze_actuates_governance_stop() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1935,6 +2107,7 @@ fn post_hard_freeze_blocks_subsequent_valid_requests() {
             input.directory_head_hash,
             Some(&bad_state),
             100,
+            &[],
         )
         .unwrap_err();
 
@@ -2024,6 +2197,7 @@ fn lifecycle_gate_denies_future_dated_epoch() {
             input.directory_head_hash,
             Some(&sov_state),
             100,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -2069,8 +2243,14 @@ fn production_signer_key_accepts_valid_epoch() {
     let sovereignty_trusted_signer_key = daemon_signing_key.verifying_key().to_bytes();
 
     let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
     let checker = SovereigntyChecker::new(sovereignty_trusted_signer_key);
-    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+    let gate = LifecycleGate::with_tick_kernel_and_sovereignty(
+        kernel_trait,
+        Arc::clone(&kernel),
+        checker,
+        Arc::new(crate::episode::preactuation::StopAuthority::new()),
+    );
 
     let principal_id = "production-principal";
     let epoch_id = "epoch-production";
@@ -2103,6 +2283,7 @@ fn production_signer_key_accepts_valid_epoch() {
 
     let mut input = valid_input();
     input.risk_tier = RiskTier::Tier2Plus;
+    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
 
     let result = gate.execute_with_sovereignty(
         &input,
@@ -2111,6 +2292,7 @@ fn production_signer_key_accepts_valid_epoch() {
         input.directory_head_hash,
         Some(&sov_state),
         100,
+        &temporal_receipts,
     );
     assert!(
         result.is_ok(),
