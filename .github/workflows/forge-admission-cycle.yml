@@ -99,6 +99,12 @@ jobs:
       - fac-ovh
     timeout-minutes: 90
     steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
       - name: Kickoff trusted FAC projection dispatch
         run: |
           set -euo pipefail
