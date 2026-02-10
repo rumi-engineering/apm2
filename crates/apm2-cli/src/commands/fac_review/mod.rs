@@ -36,6 +36,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apm2_daemon::telemetry::reviewer::{ProjectionSummary, ProjectionSummaryEmitter};
 use barrier::{
     emit_barrier_decision_event, enforce_barrier, ensure_gh_cli_ready, resolve_fac_event_context,
 };
@@ -696,6 +697,7 @@ fn run_kickoff_inner(
     let mut after_seq = 0_u64;
     let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
     let mut terminal_state = "failure:timeout".to_string();
+    let mut summary_emitter = ProjectionSummaryEmitter::default();
 
     loop {
         let projection = run_project_inner(
@@ -704,7 +706,16 @@ fn run_kickoff_inner(
             Some(dispatch.dispatch_epoch),
             after_seq,
         )?;
-        println!("{}", projection.line);
+        let summary = ProjectionSummary::from_projection(
+            projection.sha.clone(),
+            projection.current_head_sha.clone(),
+            projection.security.clone(),
+            projection.quality.clone(),
+            projection.recent_events.clone(),
+        );
+        if let Some(line) = summary_emitter.emit_if_due(Instant::now(), &summary) {
+            println!("{line}");
+        }
         for error in &projection.errors {
             if public_projection_only {
                 eprintln!(
