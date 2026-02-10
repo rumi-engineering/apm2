@@ -125,11 +125,32 @@ pub struct ContractObjectRegistryEntry {
 }
 
 /// Contract object registry containing schema-qualified snapshot rows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractObjectRegistry {
     #[serde(deserialize_with = "deserialize_registry_entries")]
     entries: Vec<ContractObjectRegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContractObjectRegistryRaw {
+    #[serde(deserialize_with = "deserialize_registry_entries")]
+    entries: Vec<ContractObjectRegistryEntry>,
+}
+
+impl<'de> Deserialize<'de> for ContractObjectRegistry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = ContractObjectRegistryRaw::deserialize(deserializer)?;
+        Self::new(raw.entries).map_err(|defects| {
+            de::Error::custom(format!(
+                "contract object registry invariant validation failed: {defects:?}"
+            ))
+        })
+    }
 }
 
 impl ContractObjectRegistry {
@@ -530,7 +551,7 @@ impl CacObject {
 }
 
 /// Result from deterministic CAC contract validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacValidationResult {
     /// Aggregate compatibility state after all executed checks.
@@ -545,11 +566,51 @@ pub struct CacValidationResult {
     pub short_circuited: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacValidationResultRaw {
+    compatibility_state: CacCompatibilityState,
+    #[serde(deserialize_with = "deserialize_cac_defects")]
+    defects: Vec<CacDefect>,
+    #[serde(deserialize_with = "deserialize_executed_steps")]
+    executed_steps: Vec<CacValidationStep>,
+    short_circuited: bool,
+}
+
+impl<'de> Deserialize<'de> for CacValidationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = CacValidationResultRaw::deserialize(deserializer)?;
+        let recomputed_state = recompute_compatibility_state_from_defects(&raw.defects);
+        if raw.compatibility_state != recomputed_state {
+            return Err(de::Error::custom(format!(
+                "compatibility_state {:?} does not match recomputed state {:?}",
+                raw.compatibility_state, recomputed_state
+            )));
+        }
+
+        Ok(Self {
+            compatibility_state: recomputed_state,
+            defects: raw.defects,
+            executed_steps: raw.executed_steps,
+            short_circuited: raw.short_circuited,
+        })
+    }
+}
+
 impl CacValidationResult {
+    /// Recomputes compatibility-state refinement from defects.
+    #[must_use]
+    pub fn recompute_compatibility_state(&self) -> CacCompatibilityState {
+        recompute_compatibility_state_from_defects(&self.defects)
+    }
+
     /// Returns `true` only when the object is fully compatible.
     #[must_use]
-    pub const fn is_admissible(&self) -> bool {
-        self.compatibility_state.is_admissible()
+    pub fn is_admissible(&self) -> bool {
+        self.recompute_compatibility_state().is_admissible()
     }
 }
 
@@ -739,6 +800,14 @@ where
     D: Deserializer<'de>,
 {
     deserialize_bounded_vec(deserializer, MAX_VALIDATION_STEPS, "executed_steps")
+}
+
+fn recompute_compatibility_state_from_defects(defects: &[CacDefect]) -> CacCompatibilityState {
+    defects
+        .iter()
+        .map(|defect| defect.compatibility_state)
+        .max()
+        .unwrap_or(CacCompatibilityState::Compatible)
 }
 
 /// Validates a CAC object against deterministic contract checks.
@@ -997,7 +1066,7 @@ pub fn validate_cac_contract(
     }
 
     CacValidationResult {
-        compatibility_state,
+        compatibility_state: recompute_compatibility_state_from_defects(&defects),
         defects,
         executed_steps,
         short_circuited,
@@ -1739,6 +1808,24 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_invalid_registry_rejected() {
+        let mut value = serde_json::to_value(ContractObjectRegistry::default_registry())
+            .expect("default registry should serialize");
+        let entries = value["entries"]
+            .as_array_mut()
+            .expect("entries should be an array");
+        let duplicate_entry = entries
+            .first()
+            .cloned()
+            .expect("default registry should contain at least one entry");
+        entries.push(duplicate_entry);
+
+        let error = serde_json::from_value::<ContractObjectRegistry>(value)
+            .expect_err("duplicate schema_id should fail invariant validation");
+        assert!(error.to_string().contains("DuplicateSchemaId"));
+    }
+
+    #[test]
     fn test_cac_object_deserialize_rejects_oversized_declared_validation_order() {
         let registry = ContractObjectRegistry::default_registry();
         let entry = registry
@@ -1784,6 +1871,46 @@ mod tests {
             .expect_err("oversized defects should fail during deserialization");
 
         assert!(error.to_string().contains("defects exceeds maximum size"));
+    }
+
+    #[test]
+    fn test_forged_compatible_state_with_blocked_defects_rejected() {
+        let forged_result = CacValidationResult {
+            compatibility_state: CacCompatibilityState::Compatible,
+            defects: vec![sample_blocked_defect()],
+            executed_steps: vec![CacValidationStep::SchemaResolution],
+            short_circuited: false,
+        };
+
+        assert_eq!(
+            forged_result.recompute_compatibility_state(),
+            CacCompatibilityState::Blocked
+        );
+        assert!(!forged_result.is_admissible());
+    }
+
+    #[test]
+    fn test_cac_validation_result_deserialize_rejects_incoherent_compatibility_state() {
+        let value = serde_json::json!({
+            "compatibility_state": "compatible",
+            "defects": [{
+                "class": "schema_unresolved",
+                "step": "schema_resolution",
+                "compatibility_state": "blocked",
+                "detail": "forged blocked defect",
+            }],
+            "executed_steps": ["schema_resolution"],
+            "short_circuited": true,
+        });
+
+        let error = serde_json::from_value::<CacValidationResult>(value)
+            .expect_err("incoherent compatibility_state should fail during deserialization");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match recomputed state")
+        );
     }
 
     #[test]
