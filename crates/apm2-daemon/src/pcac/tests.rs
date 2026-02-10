@@ -1063,6 +1063,78 @@ fn test_membership_detail_bounded() {
 }
 
 #[test]
+fn test_multibyte_principal_id_does_not_panic() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before membership detail check");
+
+    let principal_tail = "🦀".repeat(MAX_REASON_LENGTH);
+    let principal_id = ["", "é", "界", "é界", "界é"]
+        .iter()
+        .find_map(|prefix| {
+            let candidate = format!("{prefix}{principal_tail}");
+            let detail = format!(
+                "membership unverifiable: principal={candidate}, ajc={}",
+                hex::encode(&cert.ajc_id[..8])
+            );
+            (detail.len() > MAX_REASON_LENGTH && !detail.is_char_boundary(MAX_REASON_LENGTH))
+                .then_some(candidate)
+        })
+        .expect("test setup must select a principal that truncates at a non-char boundary");
+
+    let sovereignty_state = super::sovereignty::SovereigntyState {
+        epoch: None,
+        principal_id,
+        revocation_head_known: true,
+        autonomy_ceiling: None,
+        active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+    };
+
+    let err = gate
+        .revalidate_before_execution_with_sovereignty_membership(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            Some(&sovereignty_state),
+            100,
+            Some(&strict_sovereignty_policy()),
+            None,
+            false,
+        )
+        .expect_err("membership unverifiable detail must deny");
+
+    match err.deny_class {
+        AuthorityDenyClass::IdentityMembershipUnverifiable { detail } => {
+            assert!(
+                detail.len() <= MAX_REASON_LENGTH,
+                "membership detail length {} exceeds bound {}",
+                detail.len(),
+                MAX_REASON_LENGTH
+            );
+            assert!(
+                std::str::from_utf8(detail.as_bytes()).is_ok(),
+                "membership detail must remain valid UTF-8"
+            );
+            assert!(
+                detail.starts_with("membership unverifiable: principal="),
+                "unexpected detail format: {detail}"
+            );
+        },
+        other => panic!("expected IdentityMembershipUnverifiable, got: {other:?}"),
+    }
+}
+
+#[test]
 fn lifecycle_gate_prevents_effect_without_consume() {
     // Verify that same-tick replay of the same input is denied (Law 1).
     let kernel = Arc::new(InProcessKernel::new(100));
