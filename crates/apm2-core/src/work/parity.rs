@@ -256,7 +256,7 @@ impl ReplayEquivalenceChecker {
         let mut seen_fingerprints = HashSet::new();
         let mut deduplicated_event_count = 0usize;
         let mut applied_event_count = 0usize;
-        let duplicate_side_effects = 0usize;
+        let mut duplicate_side_effects = 0usize;
 
         for event in events {
             let fingerprint = event_fingerprint(event);
@@ -269,8 +269,15 @@ impl ReplayEquivalenceChecker {
             let ctx = ReducerContext::new(event.seq_id.unwrap_or(0));
             self.reducer.apply(event, &ctx)?;
 
-            if event.event_type.starts_with("work.") && self.reducer.state() != &state_before {
-                applied_event_count += 1;
+            if event.event_type.starts_with("work.") {
+                if self.reducer.state() == &state_before {
+                    // Event has a unique fingerprint but did not mutate state.
+                    // This indicates a duplicate side effect - the same logical
+                    // transition was already applied from a different event source.
+                    duplicate_side_effects += 1;
+                } else {
+                    applied_event_count += 1;
+                }
             }
         }
 

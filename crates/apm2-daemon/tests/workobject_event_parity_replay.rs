@@ -131,6 +131,25 @@ fn dotted_transition_event(
     )
 }
 
+fn dotted_pr_associated_event(
+    work_id: &str,
+    actor_id: &str,
+    pr_number: u64,
+    commit_sha: &str,
+    timestamp_ns: u64,
+    seq_id: u64,
+) -> EventRecord {
+    let payload = helpers::work_pr_associated_payload(work_id, pr_number, commit_sha);
+    event_record(
+        "work.pr_associated",
+        work_id,
+        actor_id,
+        payload,
+        timestamp_ns,
+        seq_id,
+    )
+}
+
 fn dotted_completed_event(
     work_id: &str,
     actor_id: &str,
@@ -534,4 +553,58 @@ fn promotion_gate_blocks_on_parity_failures_and_emits_defect_records() {
 
     let emitted_events = emitter.get_all_events();
     assert_eq!(emitted_events.len(), 2);
+}
+
+#[test]
+fn duplicate_side_effects_block_promotion_gate() {
+    let work_id = "W-DUPE-SE-001";
+    let actor_id = "actor:dupe-se";
+    let pr_number = 501u64;
+    let commit_sha = "cafebabe123";
+
+    // Build a normal sequence to InProgress with PR association.
+    let base_events = vec![
+        dotted_opened_event(work_id, actor_id, 8_000, 1),
+        dotted_transition_event(work_id, actor_id, "OPEN", "CLAIMED", "claim", 0, 8_100, 2),
+        dotted_transition_event(
+            work_id,
+            actor_id,
+            "CLAIMED",
+            "IN_PROGRESS",
+            "start",
+            1,
+            8_200,
+            3,
+        ),
+        dotted_pr_associated_event(work_id, actor_id, pr_number, commit_sha, 8_300, 4),
+    ];
+
+    let expected_state = reduce_expected_state(&base_events);
+
+    // Same logical PR association with a unique fingerprint (different
+    // timestamp/seq). Reducer accepts it but state should remain unchanged.
+    let mut events_with_dupe_se = base_events;
+    events_with_dupe_se.push(dotted_pr_associated_event(
+        work_id, actor_id, pr_number, commit_sha, 8_400, 5,
+    ));
+
+    let result = EventFamilyPromotionGate::evaluate(&events_with_dupe_se, &expected_state)
+        .expect("promotion gate evaluation should execute");
+
+    let replay = result
+        .replay_result
+        .as_ref()
+        .expect("replay result must be present");
+    assert!(
+        replay.duplicate_side_effects > 0,
+        "duplicate side effects must be detected and non-zero"
+    );
+    assert!(
+        !result.replay_passed,
+        "replay must fail when duplicate side effects exist"
+    );
+    assert!(
+        !result.allowed,
+        "promotion must be blocked when duplicate side effects exist"
+    );
 }

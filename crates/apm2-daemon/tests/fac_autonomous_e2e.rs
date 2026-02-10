@@ -549,6 +549,8 @@ async fn test_fac_autonomous_full_lifecycle() {
         gate_outcomes: outcomes,
         policy_resolution,
         actor_id: harness.actor_id(),
+        work_events: vec![],
+        expected_reducer_state: None,
     };
 
     let mock_adapter = MockSuccessGitHubAdapter::new("abc123def456");
@@ -927,6 +929,8 @@ async fn test_gate_failure_halts_lifecycle() {
         gate_outcomes: outcomes,
         policy_resolution,
         actor_id: "merge-actor".to_string(),
+        work_events: vec![],
+        expected_reducer_state: None,
     };
 
     let mock_adapter = MockSuccessGitHubAdapter::new("should-not-be-used");
@@ -984,6 +988,8 @@ async fn test_merge_conflict_produces_review_blocked() {
         gate_outcomes,
         policy_resolution,
         actor_id: "merge-actor".to_string(),
+        work_events: vec![],
+        expected_reducer_state: None,
     };
 
     // Use the conflict adapter
