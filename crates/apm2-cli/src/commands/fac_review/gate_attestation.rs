@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use apm2_core::determinism::canonicalize_json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -87,6 +88,14 @@ fn short_error_context(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).trim().to_string()
 }
 
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    match serde_json::to_string(value) {
+        Ok(json) => canonicalize_json(&json)
+            .map_or_else(|_| json.into_bytes(), std::string::String::into_bytes),
+        Err(err) => format!("serialize_error:{err}").into_bytes(),
+    }
+}
+
 fn run_cmd_capture(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output();
     match output {
@@ -141,7 +150,7 @@ fn policy_digest() -> String {
         "require_evidence_digest",
         "quick_receipt_replay_disabled_for_full_runs",
     ];
-    let canonical = serde_json::to_vec(&facts).unwrap_or_default();
+    let canonical = canonical_json_bytes(&facts);
     sha256_hex(&canonical)
 }
 
@@ -166,12 +175,12 @@ fn command_digest(gate_name: &str, command: &[String]) -> String {
         command,
         env: env_map,
     };
-    let canonical = serde_json::to_vec(&facts).unwrap_or_default();
+    let canonical = canonical_json_bytes(&facts);
     sha256_hex(&canonical)
 }
 
 fn environment_digest() -> String {
-    let canonical = serde_json::to_vec(environment_facts()).unwrap_or_default();
+    let canonical = canonical_json_bytes(environment_facts());
     sha256_hex(&canonical)
 }
 
@@ -228,12 +237,12 @@ fn input_digest(workspace_root: &Path, gate_name: &str) -> String {
 
     gate_inputs.sort_by(|a, b| a.0.cmp(&b.0));
     let facts = InputFacts { tree, gate_inputs };
-    let canonical = serde_json::to_vec(&facts).unwrap_or_default();
+    let canonical = canonical_json_bytes(&facts);
     sha256_hex(&canonical)
 }
 
 fn resource_digest(policy: &GateResourcePolicy) -> String {
-    let canonical = serde_json::to_vec(policy).unwrap_or_default();
+    let canonical = canonical_json_bytes(policy);
     sha256_hex(&canonical)
 }
 
@@ -362,7 +371,12 @@ pub const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
 
 #[cfg(test)]
 mod tests {
-    use super::{GateResourcePolicy, compute_gate_attestation, gate_command_for_attestation};
+    use serde_json::{Map, Value, json};
+
+    use super::{
+        GateResourcePolicy, canonical_json_bytes, compute_gate_attestation,
+        gate_command_for_attestation,
+    };
 
     #[test]
     fn attestation_is_stable_for_same_inputs() {
@@ -389,5 +403,20 @@ mod tests {
         .expect("attestation two");
 
         assert_eq!(one.attestation_digest, two.attestation_digest);
+    }
+
+    #[test]
+    fn canonical_json_bytes_normalizes_object_key_order() {
+        let mut left = Map::new();
+        left.insert("b".to_string(), json!(1));
+        left.insert("a".to_string(), json!(2));
+
+        let mut right = Map::new();
+        right.insert("a".to_string(), json!(2));
+        right.insert("b".to_string(), json!(1));
+
+        let left_bytes = canonical_json_bytes(&Value::Object(left));
+        let right_bytes = canonical_json_bytes(&Value::Object(right));
+        assert_eq!(left_bytes, right_bytes);
     }
 }

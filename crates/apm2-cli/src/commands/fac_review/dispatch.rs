@@ -2180,7 +2180,7 @@ mod tests {
         );
         assert_eq!(
             key.canonical_path_segment(),
-            "owner_repo-pr7-quality-0123456789abcdef0123456789abcdef01234567"
+            "owner~2Frepo-pr7-quality-0123456789abcdef0123456789abcdef01234567"
         );
     }
 }

@@ -530,15 +530,35 @@ pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn hex_nibble_to_upper(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'A' + (nibble - 10)),
+        _ => '?',
+    }
+}
+
+fn push_escaped_byte(out: &mut String, byte: u8) {
+    out.push('~');
+    out.push(hex_nibble_to_upper(byte >> 4));
+    out.push(hex_nibble_to_upper(byte & 0x0F));
+}
+
 pub fn sanitize_for_path(input: &str) -> String {
+    if input.is_empty() {
+        return "unknown".to_string();
+    }
+
     let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
+    for &byte in input.as_bytes() {
+        let ch = char::from(byte);
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
             out.push(ch);
         } else {
-            out.push('_');
+            push_escaped_byte(&mut out, byte);
         }
     }
+
     if out.is_empty() {
         "unknown".to_string()
     } else {
@@ -571,5 +591,29 @@ pub fn entry_pr_number(entry: &ReviewStateEntry) -> Option<u32> {
         Some(entry.pr_number)
     } else {
         parse_pr_url(&entry.pr_url).ok().map(|(_, number)| number)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_for_path;
+
+    #[test]
+    fn sanitize_for_path_disambiguates_slash_and_underscore() {
+        let slash = sanitize_for_path("owner/repo");
+        let underscore = sanitize_for_path("owner_repo");
+        assert_eq!(slash, "owner~2Frepo");
+        assert_eq!(underscore, "owner_repo");
+        assert_ne!(slash, underscore);
+    }
+
+    #[test]
+    fn sanitize_for_path_escapes_special_bytes() {
+        assert_eq!(sanitize_for_path("a~b c"), "a~7Eb~20c");
+    }
+
+    #[test]
+    fn sanitize_for_path_empty_returns_unknown() {
+        assert_eq!(sanitize_for_path(""), "unknown");
     }
 }

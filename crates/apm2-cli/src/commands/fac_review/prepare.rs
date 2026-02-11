@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(
             path,
             std::path::PathBuf::from(
-                "/tmp/review-root/guardian-intelligence_apm2/pr17/abcdef0123456789abcdef0123456789abcdef01"
+                "/tmp/review-root/guardian-intelligence~2Fapm2/pr17/abcdef0123456789abcdef0123456789abcdef01"
             )
         );
     }
