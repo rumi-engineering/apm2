@@ -41,6 +41,8 @@ fn authoritative_input(seed: u8, risk_tier: RiskTier) -> AuthorityJoinInputV1 {
         freshness_witness_tick: 1_000,
         stop_budget_profile_digest: test_hash(seed.wrapping_add(7)),
         pre_actuation_receipt_hashes: vec![],
+        leakage_witness_hash: test_hash(seed.wrapping_add(10)),
+        timing_witness_hash: test_hash(seed.wrapping_add(11)),
         risk_tier,
         determinism_class: DeterminismClass::Deterministic,
         time_envelope_ref: test_hash(seed.wrapping_add(8)),
