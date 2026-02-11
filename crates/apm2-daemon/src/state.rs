@@ -870,11 +870,14 @@ impl DispatcherState {
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
+            let lease_validator = Arc::new(SqliteLeaseValidator::new_with_signing_key(
+                Arc::clone(&conn),
+                signing_key.clone(),
+            ));
             let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
                 Arc::clone(&conn),
                 signing_key,
             ));
-            let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
 
             // TCK-00319 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
             // All file/execute handlers MUST use rooted factories that receive the
@@ -1256,11 +1259,14 @@ impl DispatcherState {
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
         let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
+        let lease_validator = Arc::new(SqliteLeaseValidator::new_with_signing_key(
+            Arc::clone(&sqlite_conn),
+            signing_key.clone(),
+        ));
         let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
             Arc::clone(&sqlite_conn),
             signing_key,
         ));
-        let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&sqlite_conn)));
 
         // TCK-00316: Initialize EpisodeRuntime with CAS and handlers
         // Use safe production defaults:

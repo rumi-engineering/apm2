@@ -3242,8 +3242,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Derive a PCAC ledger anchor from the current persisted chain tip.
     ///
-    /// Startup validates full-chain integrity; request-time derivation must
-    /// stay O(1) by using the latest persisted `event_hash` value.
+    /// Startup performs checkpoint-based incremental integrity validation;
+    /// request-time derivation must stay O(1) by using the latest persisted
+    /// `event_hash` value.
     fn derive_pcac_ledger_anchor(ledger: &dyn LedgerEventEmitter) -> Result<Hash, String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pcac-ledger-anchor-v1");
@@ -11366,6 +11367,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments_b,
+                1_700_000_000_000_000_123,
                 Some(policy_hash),
             )
             .expect("intent-mismatch boundary-flow runtime state should build");

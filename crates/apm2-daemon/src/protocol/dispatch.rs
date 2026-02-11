@@ -704,6 +704,14 @@ pub trait LedgerEventEmitter: Send + Sync {
         Ok(prev_hash)
     }
 
+    /// Performs an explicit full-chain integrity audit from genesis.
+    ///
+    /// This maintenance path is intentionally separate from startup/checkpoint
+    /// validation and is intended for operator/admin integrity audits.
+    fn verify_chain_admin(&self) -> Result<String, String> {
+        self.derive_event_chain_hash()
+    }
+
     /// Emits an authoritative receipt-consumption ledger event.
     ///
     /// Default implementation emits through `emit_session_event` to preserve
@@ -1430,6 +1438,12 @@ pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_
 
 /// Domain separation prefix for `StopFlagsMutated` ledger events (TCK-00351).
 pub const STOP_FLAGS_MUTATED_DOMAIN_PREFIX: &[u8] = b"apm2.event.stop_flags_mutated:";
+
+/// Domain separation prefix for `gate_lease_issued` ledger events.
+///
+/// Lease issuance events are authority-bearing and must be signed with a
+/// dedicated domain prefix so signature verification can fail-closed.
+pub const GATE_LEASE_ISSUED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.gate_lease_issued:";
 
 /// Ledger indexing key for daemon stop-flag mutation events.
 pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
@@ -8469,6 +8483,14 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn lease_validator(&self) -> &Arc<dyn LeaseValidator> {
         &self.lease_validator
+    }
+
+    /// Runs an explicit full-chain ledger verification audit.
+    ///
+    /// This is an operator/admin maintenance path and is never called
+    /// automatically during startup.
+    pub fn verify_ledger_chain_admin(&self) -> Result<String, String> {
+        self.event_emitter.verify_chain_admin()
     }
 
     /// Returns a reference to the token minter.
@@ -23483,6 +23505,7 @@ mod tests {
                 DEFECT_RECORDED_DOMAIN_PREFIX,
                 EPISODE_EVENT_DOMAIN_PREFIX,
                 EPISODE_RUN_ATTRIBUTED_PREFIX,
+                GATE_LEASE_ISSUED_LEDGER_DOMAIN_PREFIX,
                 SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
             ];
 
@@ -29678,10 +29701,11 @@ mod tests {
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
             let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
                 Arc::clone(&conn),
-                signing_key,
+                signing_key.clone(),
             ));
-            let lease_validator: Arc<dyn LeaseValidator> =
-                Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+            let lease_validator: Arc<dyn LeaseValidator> = Arc::new(
+                SqliteLeaseValidator::new_with_signing_key(Arc::clone(&conn), signing_key),
+            );
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
             let clock = Arc::new(

@@ -848,23 +848,6 @@ async fn async_main(args: Args) -> Result<()> {
     // Write PID file
     write_pid_file(&daemon_config.pid_path)?;
 
-    // Initialize persistent ledger if configured (TCK-00289)
-    // TCK-00387: Moved BEFORE crash recovery so that LEASE_REVOKED events can
-    // be emitted to the ledger during recovery.
-    let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
-        info!("Opening ledger database at {:?}", path);
-        let conn = Connection::open(path).context("failed to open ledger database")?;
-
-        // Initialize schemas
-        SqliteLedgerEventEmitter::init_schema(&conn)
-            .context("failed to init ledger events schema")?;
-        SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
-
-        Some(Arc::new(Mutex::new(conn)))
-    } else {
-        None
-    };
-
     // Security Review v5 MAJOR 2: Create ONE ledger signing key per daemon
     // lifecycle. This key is shared between crash recovery (LEASE_REVOKED
     // events) and the dispatcher (session events). Previously, recovery and
@@ -875,6 +858,25 @@ async fn async_main(args: Args) -> Result<()> {
         ed25519_dalek::SigningKey::generate(&mut OsRng)
     };
     let lifecycle_signing_key_bytes = ledger_signing_key.to_bytes();
+
+    // Initialize persistent ledger if configured (TCK-00289)
+    // TCK-00387: Moved BEFORE crash recovery so that LEASE_REVOKED events can
+    // be emitted to the ledger during recovery.
+    let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
+        info!("Opening ledger database at {:?}", path);
+        let conn = Connection::open(path).context("failed to open ledger database")?;
+
+        // Initialize schemas and perform startup checkpoint validation using
+        // the trusted daemon verifying key.
+        let verifying_key = ledger_signing_key.verifying_key();
+        SqliteLedgerEventEmitter::init_schema_with_verifying_key(&conn, &verifying_key)
+            .context("failed to init ledger events schema")?;
+        SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
+
+        Some(Arc::new(Mutex::new(conn)))
+    } else {
+        None
+    };
 
     // TCK-00387: Crash recovery on startup
     // Before accepting new connections, recover any sessions from persistent state,
