@@ -502,6 +502,68 @@ pub struct WorkListResponse {
     #[prost(message, repeated, tag = "1")]
     pub work_items: ::prost::alloc::vec::Vec<WorkStatusResponse>,
 }
+/// IPC-PRIV-020: AuditorLaunchProjection (TCK-00452)
+/// Return launch-lineage and boundary-conformance projection for auditors.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct AuditorLaunchProjectionRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AuditorLaunchProjectionResponse {
+    /// BLAKE3 digest of canonical_projection_json.
+    #[prost(bytes = "vec", tag = "1")]
+    pub projection_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Canonical JSON bytes of the projection payload (JCS).
+    #[prost(bytes = "vec", tag = "2")]
+    pub canonical_projection_json: ::prost::alloc::vec::Vec<u8>,
+    /// True when all authoritative receipts provide complete lineage evidence.
+    #[prost(bool, tag = "3")]
+    pub lineage_complete: bool,
+    /// True when all authoritative receipts satisfy boundary conformance checks.
+    #[prost(bool, tag = "4")]
+    pub boundary_conformant: bool,
+    /// Number of authoritative receipt events used by the projection.
+    #[prost(uint32, tag = "5")]
+    pub authoritative_receipt_count: u32,
+    /// Number of receipts with complete lineage fields.
+    #[prost(uint32, tag = "6")]
+    pub complete_lineage_receipt_count: u32,
+    /// Number of receipts that satisfy boundary-conformance checks.
+    #[prost(uint32, tag = "7")]
+    pub boundary_conformant_receipt_count: u32,
+    /// Fail-closed uncertainty classification.
+    #[prost(enumeration = "ProjectionUncertaintyFlag", repeated, tag = "8")]
+    pub uncertainty_flags: ::prost::alloc::vec::Vec<i32>,
+    /// Authoritative admissibility verdict (false on any uncertainty).
+    #[prost(bool, tag = "9")]
+    pub admissible: bool,
+}
+/// IPC-PRIV-027: OrchestratorLaunchProjection (TCK-00452)
+/// Return launch liveness/restart projection for orchestrator consumers.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct OrchestratorLaunchProjectionRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OrchestratorLaunchProjectionResponse {
+    /// BLAKE3 digest of canonical_projection_json.
+    #[prost(bytes = "vec", tag = "1")]
+    pub projection_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Canonical JSON bytes of the projection payload (JCS).
+    #[prost(bytes = "vec", tag = "2")]
+    pub canonical_projection_json: ::prost::alloc::vec::Vec<u8>,
+    /// Number of currently active runs.
+    #[prost(uint32, tag = "3")]
+    pub active_runs: u32,
+    /// Most recent authoritative receipt tick, when available.
+    #[prost(uint64, optional, tag = "4")]
+    pub last_authoritative_receipt_tick: ::core::option::Option<u64>,
+    /// Aggregate restart count derived from lifecycle evidence.
+    #[prost(uint32, tag = "5")]
+    pub restart_count: u32,
+    /// Fail-closed uncertainty classification.
+    #[prost(enumeration = "ProjectionUncertaintyFlag", repeated, tag = "6")]
+    pub uncertainty_flags: ::prost::alloc::vec::Vec<i32>,
+    /// Authoritative admissibility verdict (false on any uncertainty).
+    #[prost(bool, tag = "7")]
+    pub admissible: bool,
+}
 /// Request to publish a changeset bundle.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PublishChangeSetRequest {
@@ -1971,6 +2033,68 @@ impl WorkRole {
             "GATE_EXECUTOR" => Some(Self::GateExecutor),
             "REVIEWER" => Some(Self::Reviewer),
             "COORDINATOR" => Some(Self::Coordinator),
+            _ => None,
+        }
+    }
+}
+/// Projection uncertainty classification for fail-closed consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProjectionUncertaintyFlag {
+    Unspecified = 0,
+    /// Required lineage evidence is missing or malformed.
+    MissingLineageEvidence = 1,
+    /// Required boundary-conformance evidence is missing or malformed.
+    BoundaryConformanceUnverifiable = 2,
+    /// Liveness evidence is missing or malformed.
+    MissingLivenessEvidence = 3,
+    /// No authoritative receipt tick is available.
+    MissingAuthoritativeReceiptTick = 4,
+    /// Projection replay used a bounded recent-history window.
+    TruncatedHistory = 5,
+}
+impl ProjectionUncertaintyFlag {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PROJECTION_UNCERTAINTY_FLAG_UNSPECIFIED",
+            Self::MissingLineageEvidence => {
+                "PROJECTION_UNCERTAINTY_FLAG_MISSING_LINEAGE_EVIDENCE"
+            }
+            Self::BoundaryConformanceUnverifiable => {
+                "PROJECTION_UNCERTAINTY_FLAG_BOUNDARY_CONFORMANCE_UNVERIFIABLE"
+            }
+            Self::MissingLivenessEvidence => {
+                "PROJECTION_UNCERTAINTY_FLAG_MISSING_LIVENESS_EVIDENCE"
+            }
+            Self::MissingAuthoritativeReceiptTick => {
+                "PROJECTION_UNCERTAINTY_FLAG_MISSING_AUTHORITATIVE_RECEIPT_TICK"
+            }
+            Self::TruncatedHistory => "PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROJECTION_UNCERTAINTY_FLAG_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROJECTION_UNCERTAINTY_FLAG_MISSING_LINEAGE_EVIDENCE" => {
+                Some(Self::MissingLineageEvidence)
+            }
+            "PROJECTION_UNCERTAINTY_FLAG_BOUNDARY_CONFORMANCE_UNVERIFIABLE" => {
+                Some(Self::BoundaryConformanceUnverifiable)
+            }
+            "PROJECTION_UNCERTAINTY_FLAG_MISSING_LIVENESS_EVIDENCE" => {
+                Some(Self::MissingLivenessEvidence)
+            }
+            "PROJECTION_UNCERTAINTY_FLAG_MISSING_AUTHORITATIVE_RECEIPT_TICK" => {
+                Some(Self::MissingAuthoritativeReceiptTick)
+            }
+            "PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY" => {
+                Some(Self::TruncatedHistory)
+            }
             _ => None,
         }
     }

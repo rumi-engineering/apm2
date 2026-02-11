@@ -157,6 +157,8 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.consensus.metrics"
         | "hsi.work.status"
         | "hsi.work.list"
+        | "hsi.launch.auditor_projection"
+        | "hsi.launch.orchestrator_projection"
         | "hsi.credential.list"
         | "hsi.pulse.subscribe"
         | "hsi.pulse.unsubscribe"
@@ -187,6 +189,8 @@ mod tests {
             "hsi.stop.update_flags",
             "hsi.session.status",
             "hsi.changeset.publish",
+            "hsi.launch.auditor_projection",
+            "hsi.launch.orchestrator_projection",
         ];
         for route in &known_routes {
             assert!(
@@ -236,6 +240,8 @@ mod tests {
             "hsi.consensus.metrics",
             "hsi.work.status",
             "hsi.work.list",
+            "hsi.launch.auditor_projection",
+            "hsi.launch.orchestrator_projection",
             "hsi.credential.list",
             "hsi.pulse.subscribe",
             "hsi.pulse.unsubscribe",
@@ -262,6 +268,8 @@ mod tests {
             "hsi.consensus.status",
             "hsi.work.status",
             "hsi.work.list",
+            "hsi.launch.auditor_projection",
+            "hsi.launch.orchestrator_projection",
             "hsi.telemetry.stream",
             "hsi.session.status",
         ];

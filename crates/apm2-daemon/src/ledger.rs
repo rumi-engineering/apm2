@@ -26,11 +26,11 @@ use tracing::{info, warn};
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, PrivilegedPcacLifecycleArtifacts, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
-    STOP_FLAGS_MUTATED_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent,
-    StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim,
-    WorkRegistry, WorkRegistryError, WorkTransition, append_privileged_pcac_lifecycle_fields,
-    build_session_started_payload,
+    LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
+    SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
+    STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
+    append_privileged_pcac_lifecycle_fields, build_session_started_payload,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -118,22 +118,21 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'SubleaseIssued'",
             [],
         )?;
-        // SECURITY (v13 Finding 2 — Receipt Uniqueness Constraint):
+        // SECURITY (TCK-00407 — Receipt Identity Constraints):
         //
-        // Enforce at-most-once semantics for review receipt events at the
-        // database level. The `receipt_id` is stored as a field in the JSON
-        // payload. A partial unique index on `json_extract(payload, '$.receipt_id')`
-        // for review receipt event types prevents concurrent duplicate
-        // `IngestReviewReceipt` calls from creating multiple receipt events.
-        // This converts the check-then-act pattern into defense-in-depth:
-        // application-level `get_event_by_receipt_id` provides the fast-path,
-        // while the database constraint provides the authoritative uniqueness
-        // guarantee.
+        // Enforce two complementary receipt constraints:
+        // - transport-level uniqueness by `receipt_id` (global uniqueness)
+        // - semantic identity uniqueness by tuple `(receipt_id, lease_id, work_id,
+        //   changeset_digest)`
+        //
+        // `work_id` in the semantic tuple is sourced from the payload field
+        // and falls back to the row's `work_id` column for legacy rows that
+        // predate canonical tuple persistence.
         //
         // MIGRATION: Quarantine historical duplicate `receipt_id` rows before
-        // creating the unique index. Quarantine entries are keyed by stable
-        // `event_id` (never persistent `rowid`) so startup replays are safe
-        // even if SQLite rowids are recycled over time.
+        // creating `idx_unique_receipt_id`. Quarantine entries are keyed by
+        // stable `event_id` (never persistent `rowid`) so startup replays are
+        // safe even if SQLite rowids are recycled over time.
         //
         // The migration is idempotent:
         // - quarantine table is created with `IF NOT EXISTS`
@@ -171,6 +170,17 @@ impl SqliteLedgerEventEmitter {
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
              ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_semantic_identity \
+             ON ledger_events( \
+                 json_extract(CAST(payload AS TEXT), '$.receipt_id'), \
+                 json_extract(CAST(payload AS TEXT), '$.lease_id'), \
+                 COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id), \
+                 json_extract(CAST(payload AS TEXT), '$.changeset_digest') \
+             ) \
              WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
             [],
         )?;
@@ -946,6 +956,192 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .flatten()
     }
 
+    fn get_authoritative_receipt_event_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+
+        let Ok(count) = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return 0;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = count as usize;
+        count
+    }
+
+    fn get_authoritative_receipt_events(&self) -> Vec<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let projection_limit = i64::try_from(MAX_PROJECTION_EVENTS).unwrap_or(i64::MAX);
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM (
+                 SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')
+                 ORDER BY rowid DESC
+                 LIMIT ?1
+             ) recent
+             ORDER BY timestamp_ns ASC, rowid ASC",
+        ) else {
+            return Vec::new();
+        };
+
+        let rows = stmt.query_map(params![projection_limit], |row| {
+            Ok(SignedLedgerEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                work_id: row.get(2)?,
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get(6)?,
+            })
+        });
+
+        rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn get_launch_liveness_projection_event_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+
+        let Ok(count) = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events
+             WHERE event_type IN (
+                 'session_started',
+                 'session_terminated',
+                 'review_receipt_recorded',
+                 'review_blocked_recorded'
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return 0;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = count as usize;
+        count
+    }
+
+    fn get_launch_liveness_projection_events(&self) -> Vec<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let projection_limit = i64::try_from(MAX_PROJECTION_EVENTS).unwrap_or(i64::MAX);
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM (
+                 SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type IN (
+                     'session_started',
+                     'session_terminated',
+                     'review_receipt_recorded',
+                     'review_blocked_recorded'
+                 )
+                 ORDER BY rowid DESC
+                 LIMIT ?1
+             ) recent
+             ORDER BY timestamp_ns ASC, rowid ASC",
+        ) else {
+            return Vec::new();
+        };
+
+        let rows = stmt.query_map(params![projection_limit], |row| {
+            Ok(SignedLedgerEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                work_id: row.get(2)?,
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get(6)?,
+            })
+        });
+
+        rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn get_event_by_receipt_identity(
+        &self,
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?2 \
+             AND COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id) = ?3 \
+             AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') = ?4 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![receipt_id, lease_id, work_id, changeset_digest_hex],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    fn get_event_by_changeset_identity(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type = 'changeset_published' \
+             AND work_id = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') = ?2 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![work_id, changeset_digest_hex],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
         let Ok(conn) = self.conn.lock() else {
             return 0;
@@ -1052,7 +1248,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
     fn emit_review_receipt(
         &self,
-        episode_id: &str,
+        lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -1097,8 +1294,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "event_type".to_string(),
             serde_json::json!("review_receipt_recorded"),
         );
-        payload_map.insert("episode_id".to_string(), serde_json::json!(episode_id));
-        payload_map.insert("lease_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("episode_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -1160,7 +1358,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_receipt_recorded".to_string(),
-            work_id: episode_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes.clone(),
             signature: signature.to_bytes().to_vec(),
@@ -1193,7 +1391,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         info!(
             event_id = %event_id,
-            episode_id = %episode_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             time_envelope_ref = %time_envelope_ref,
             "Persisted ReviewReceiptRecorded event"
@@ -1206,6 +1405,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
     fn emit_review_blocked_receipt(
         &self,
         lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -1245,6 +1445,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             serde_json::json!("review_blocked_recorded"),
         );
         payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -1313,7 +1514,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_blocked_recorded".to_string(),
-            work_id: receipt_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes.clone(),
             signature: signature.to_bytes().to_vec(),
@@ -1345,6 +1546,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         info!(
             event_id = %event_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             reason_code = %reason_code,
             time_envelope_ref = %time_envelope_ref,
@@ -2606,6 +2809,117 @@ mod tests {
         }
     }
 
+    fn insert_projection_event(
+        emitter: &SqliteLedgerEventEmitter,
+        idx: usize,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) {
+        let payload_bytes = serde_json::to_vec(payload).expect("payload should serialize");
+        let conn = emitter
+            .conn
+            .lock()
+            .expect("sqlite lock should be available");
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                format!("EVT-PROJ-{idx:08}"),
+                event_type,
+                format!("W-PROJ-{idx:08}"),
+                "actor:test",
+                payload_bytes,
+                vec![0u8; 64],
+                i64::try_from(idx).expect("idx should fit i64"),
+            ],
+        )
+        .expect("projection seed event should insert");
+    }
+
+    #[test]
+    fn authoritative_projection_query_is_bounded_to_recent_receipts() {
+        let emitter = test_emitter();
+        let total = MAX_PROJECTION_EVENTS + 3;
+
+        for idx in 0..total {
+            insert_projection_event(
+                &emitter,
+                idx,
+                "review_receipt_recorded",
+                &serde_json::json!({
+                    "receipt_id": format!("RCP-PROJ-{idx:08}"),
+                }),
+            );
+        }
+
+        assert_eq!(
+            emitter.get_authoritative_receipt_event_count(),
+            total,
+            "authoritative receipt count should report full history"
+        );
+
+        let events = emitter.get_authoritative_receipt_events();
+        assert_eq!(
+            events.len(),
+            MAX_PROJECTION_EVENTS,
+            "authoritative projection query must cap returned rows"
+        );
+
+        let expected_first = total - MAX_PROJECTION_EVENTS;
+        assert_eq!(
+            events.first().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{expected_first:08}")),
+            "bounded query must keep the most recent receipt window"
+        );
+        assert_eq!(
+            events.last().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{:08}", total - 1)),
+            "bounded query must include newest receipt event"
+        );
+    }
+
+    #[test]
+    fn liveness_projection_query_is_bounded_to_recent_events() {
+        let emitter = test_emitter();
+        let total = MAX_PROJECTION_EVENTS + 4;
+
+        for idx in 0..total {
+            insert_projection_event(
+                &emitter,
+                idx,
+                "session_started",
+                &serde_json::json!({
+                    "session_id": format!("SESS-PROJ-{idx:08}"),
+                }),
+            );
+        }
+
+        assert_eq!(
+            emitter.get_launch_liveness_projection_event_count(),
+            total,
+            "liveness event count should report full history"
+        );
+
+        let events = emitter.get_launch_liveness_projection_events();
+        assert_eq!(
+            events.len(),
+            MAX_PROJECTION_EVENTS,
+            "liveness projection query must cap returned rows"
+        );
+
+        let expected_first = total - MAX_PROJECTION_EVENTS;
+        assert_eq!(
+            events.first().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{expected_first:08}")),
+            "bounded liveness query must keep the most recent event window"
+        );
+        assert_eq!(
+            events.last().map(|event| event.work_id.clone()),
+            Some(format!("W-PROJ-{:08}", total - 1)),
+            "bounded liveness query must include newest event"
+        );
+    }
+
     /// FIX-SEC-BLOCKER: Events with equal timestamps are retrieved in
     /// deterministic (rowid) order.
     #[test]
@@ -3227,7 +3541,8 @@ mod tests {
         let identity_proof = [0x99u8; 32];
         let event1 = emitter
             .emit_review_receipt(
-                "episode-001",
+                "lease-001",
+                "work-001",
                 "RR-IDEMP-001",
                 &changeset,
                 &artifact,
@@ -3277,6 +3592,7 @@ mod tests {
         let blocked_event = emitter
             .emit_review_blocked_receipt(
                 "lease-blocked-001",
+                "work-blocked-001",
                 "RR-BLOCKED-001",
                 &changeset_digest,
                 &artifact_bundle_hash,
@@ -3442,7 +3758,7 @@ mod tests {
         )
         .unwrap();
 
-        let duplicate_payload = br#"{"receipt_id":"RR-DUPE-001"}"#;
+        let duplicate_payload = br#"{"receipt_id":"RR-DUPE-001","lease_id":"L-DUPE-001","work_id":"W-DUPE-001","changeset_digest":"abc123"}"#;
         conn.execute(
             "INSERT INTO ledger_events
                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
@@ -3532,6 +3848,69 @@ mod tests {
         );
     }
 
+    /// Regression: `receipt_id` uniqueness is enforced at the `SQLite` boundary
+    /// even when semantic tuple fields differ.
+    #[test]
+    fn init_schema_restores_global_receipt_id_uniqueness() {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let has_receipt_id_unique_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_unique_receipt_id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_receipt_id_unique_index,
+            "init_schema must restore idx_unique_receipt_id for DB-level race protection"
+        );
+
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-unique-base",
+                "review_receipt_recorded",
+                "work-base",
+                "actor-base",
+                br#"{"receipt_id":"RR-UNIQUE-001","lease_id":"lease-base","work_id":"work-base","changeset_digest":"digest-base"}"#.as_slice(),
+                b"sig-base".as_slice(),
+                101_i64
+            ],
+        )
+        .unwrap();
+
+        let duplicate_err = conn
+            .execute(
+                "INSERT INTO ledger_events
+                    (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "receipt-unique-duplicate",
+                    "review_blocked_recorded",
+                    "work-other",
+                    "actor-other",
+                    br#"{"receipt_id":"RR-UNIQUE-001","lease_id":"lease-other","work_id":"work-other","changeset_digest":"digest-other"}"#.as_slice(),
+                    b"sig-other".as_slice(),
+                    102_i64
+                ],
+            )
+            .expect_err("duplicate receipt_id must be rejected by unique index");
+
+        let duplicate_err_text = duplicate_err.to_string();
+        assert!(
+            duplicate_err_text.contains("idx_unique_receipt_id")
+                || duplicate_err_text.contains("UNIQUE constraint failed"),
+            "expected UNIQUE failure for idx_unique_receipt_id, got: {duplicate_err_text}"
+        );
+    }
+
     /// Verifies that `emit_review_blocked_receipt` includes replay-critical
     /// blocked fields and identity binding in the signed payload.
     #[test]
@@ -3545,6 +3924,7 @@ mod tests {
         let event = emitter
             .emit_review_blocked_receipt(
                 "lease-blocked-iph",
+                "work-blocked-iph",
                 "RR-BLOCKED-IPH",
                 &changeset_digest,
                 &artifact_bundle_hash,
@@ -3572,6 +3952,11 @@ mod tests {
             artifact_hash.as_str().unwrap(),
             hex::encode(artifact_bundle_hash),
             "artifact_bundle_hash in blocked event payload must match the input"
+        );
+        assert_eq!(
+            payload.get("work_id").and_then(serde_json::Value::as_str),
+            Some("work-blocked-iph"),
+            "blocked payload must include canonical work_id binding"
         );
 
         let blocked_reason_code = payload

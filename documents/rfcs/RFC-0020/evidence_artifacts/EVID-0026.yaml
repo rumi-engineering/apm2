@@ -1,0 +1,64 @@
+evidence_artifact:
+  schema_version: "2026-02-10"
+  id: "EVID-0026"
+  title: "Attestation overhead contract and fallback safety evidence"
+  category: "OVERHEAD_CONTRACT_RESULT"
+  status: "PASS"
+  description: |
+    Evidence for REQ-0026 and TCK-00372.
+
+    The attestation overhead harness validates the `<1%` p99 CPU/network
+    overhead contract for batched verification versus direct verification at
+    directly measured scales `10^3`, `10^4`, and `10^5`. Higher scales
+    (`10^6`, `10^8`) use a bootstrap statistical model from measured
+    per-batch samples, with `10^12` derived via the projection model.
+
+    The ticket also verifies automatic batch->direct fallback behavior for:
+    - degradation (overhead gate breach),
+    - integrity failures, and
+    - freshness failures,
+
+    with fail-closed semantics when fallback material is absent or mismatched.
+  requirement_ids:
+    - "REQ-0026"
+  source_refs:
+    - "documents/rfcs/RFC-0020/requirements/REQ-0026.yaml"
+    - "crates/apm2-core/src/consensus/attestation_overhead.rs"
+    - "crates/apm2-daemon/src/identity/receipt_pointer.rs"
+    - "crates/apm2-daemon/tests/tck_00372_attestation_overhead.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Integrated attestation overhead and fallback harness (TCK-00372):
+        - tck_00372_attestation_overhead_contract_scales_and_projection
+        - tck_00372_integrity_failure_triggers_automatic_direct_fallback
+        - tck_00372_freshness_and_degradation_fallback_are_fail_closed
+        - tck_00372_quorum_batch_fallback_still_fail_closed_when_direct_material_mismatched
+      ref:
+        - "cargo test -p apm2-daemon --test tck_00372_attestation_overhead -- --nocapture"
+    - type: "measurement_log"
+      description: |
+        Captured p99 measurement output and normalized snapshot for:
+        - direct-measurement scales (`10^3`, `10^4`, `10^5`) with elapsed-time runs,
+        - bootstrap-modeled p99 envelopes (`10^6`, `10^8`),
+        - network overhead ratios and `10^12` projection gate evaluation.
+      ref:
+        - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_attestation_overhead.log"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/measurement_snapshot.json"
+    - type: "test_output"
+      description: |
+        Receipt-pointer fallback verifier unit coverage:
+        - verify_batch_falls_back_to_direct_on_integrity_failure
+        - verify_batch_falls_back_to_direct_on_freshness_failure
+        - verify_batch_falls_back_to_direct_on_degradation_overhead_gate
+        - verify_batch_fail_closed_when_fallback_is_unavailable
+        - verify_batch_fail_closed_when_fallback_receipt_mismatches
+      ref:
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::verify_batch_falls_back_to_direct_on_ -- --nocapture"
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::verify_batch_fail_closed_when_ -- --nocapture"
+    - type: "log_bundle"
+      description: "Fallback activation and fail-closed execution logs."
+      ref:
+        - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_fallback_activation.log"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_fail_closed_fallback.log"
+        - "evidence/rfc/RFC-0020/perf/tck_00372/fallback_summary.json"

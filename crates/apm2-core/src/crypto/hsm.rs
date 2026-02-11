@@ -88,6 +88,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::sign::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE, Signature, Signer};
@@ -196,7 +197,8 @@ pub enum HsmError {
 pub type HsmResult<T> = Result<T, HsmError>;
 
 /// HSM provider type enumeration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HsmProviderType {
     /// Software-based provider for development and testing.
     Software,

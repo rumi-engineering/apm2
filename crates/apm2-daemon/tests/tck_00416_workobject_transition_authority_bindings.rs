@@ -1189,7 +1189,8 @@ fn test_emit_review_receipt_includes_outcome_fields() {
     let emitter = StubLedgerEventEmitter::new();
     let event = emitter
         .emit_review_receipt(
-            "episode-001",
+            "lease-001",
+            "W-REVIEW-EMIT-001",
             receipt_id,
             &changeset_digest,
             &artifact_bundle_hash,
@@ -1254,6 +1255,7 @@ fn test_emit_review_blocked_receipt_includes_outcome_fields() {
     let event = emitter
         .emit_review_blocked_receipt(
             "lease-blocked-001",
+            "W-REVIEW-BLOCKED-001",
             receipt_id,
             &changeset_digest,
             &artifact_bundle_hash,

@@ -182,9 +182,165 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# Test 4: FAC preflight authorization policy regression fixtures
+# Test 4: check_runtime_closure waiver binding hardening
 # ---------------------------------------------------------------------------
-echo "Test 4: fac_preflight_authorization.sh"
+echo "Test 4: check_runtime_closure.sh waiver bindings"
+runtime_repo="$(mktemp -d)"
+waiver_file="${runtime_repo}/documents/work/waivers/WVR-9999.yaml"
+
+(
+    cd "${runtime_repo}"
+    git init -q
+    git config user.email "guardrail-fixtures@example.invalid"
+    git config user.name "Guardrail Fixtures"
+
+    mkdir -p \
+        documents/reviews \
+        documents/work/waivers \
+        crates/apm2-core/src/fac \
+        crates/apm2-daemon/src/protocol
+
+    cat > documents/reviews/RUNTIME_CLOSURE_CHECKLIST.json <<'JSON'
+{
+  "schema": "apm2.runtime_closure_checklist.v1",
+  "schema_version": "1.0.0",
+  "gate_id": "GATE-RUNTIME-CLOSURE-TCK-00406",
+  "security_modules": [
+    {
+      "path": "crates/apm2-core/src/fac/taint.rs",
+      "required_production_callsites": [
+        "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+      ]
+    }
+  ],
+  "waiver": {
+    "directory": "documents/work/waivers"
+  }
+}
+JSON
+
+    printf 'baseline\n' > crates/apm2-core/src/fac/taint.rs
+    printf 'baseline callsite\n' > crates/apm2-daemon/src/protocol/session_dispatch.rs
+
+    git add documents/reviews/RUNTIME_CLOSURE_CHECKLIST.json \
+        crates/apm2-core/src/fac/taint.rs \
+        crates/apm2-daemon/src/protocol/session_dispatch.rs
+    git commit -q -m "base fixture"
+
+    printf 'changed\n' >> crates/apm2-core/src/fac/taint.rs
+    git add crates/apm2-core/src/fac/taint.rs
+    git commit -q -m "security module change"
+)
+
+runtime_head_sha="$(git -C "${runtime_repo}" rev-parse HEAD)"
+runtime_parent_sha="$(git -C "${runtime_repo}" rev-parse HEAD~1)"
+runtime_base_ref="${runtime_parent_sha}"
+
+run_runtime_closure_check() {
+    local reviewed_sha="${1:-${runtime_head_sha}}"
+    (
+        cd "${runtime_repo}"
+        env \
+            APM2_DIFF_BASE="${runtime_base_ref}" \
+            APM2_REVIEW_HEAD_SHA="${reviewed_sha}" \
+            APM2_PR_NUMBER="569" \
+            APM2_PR_CATEGORY="SECURITY" \
+            APM2_SECURITY_QCP="YES" \
+            "${REPO_ROOT}/scripts/ci/check_runtime_closure.sh"
+    )
+}
+
+write_runtime_waiver() {
+    local commit_sha="$1"
+    local pr_number="$2"
+    local category="$3"
+    local include_commit="$4"
+    cat > "${waiver_file}" <<EOF
+waiver:
+  id: WVR-9999
+  status: ACTIVE
+  expires: "2099-12-31"
+  scope:
+    gate_ids:
+      - "GATE-RUNTIME-CLOSURE-TCK-00406"
+  references:
+EOF
+    if [[ "${include_commit}" == "yes" ]]; then
+        cat >> "${waiver_file}" <<EOF
+    commit_sha: "${commit_sha}"
+EOF
+    fi
+    cat >> "${waiver_file}" <<EOF
+    pr_number: ${pr_number}
+    category: "${category}"
+EOF
+}
+
+write_runtime_waiver "${runtime_head_sha}" 569 "SECURITY" "no"
+if expect_fail run_runtime_closure_check; then
+    log_pass "waiver missing references.commit_sha is rejected"
+else
+    log_fail "waiver without commit_sha unexpectedly passed"
+fi
+
+write_runtime_waiver "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 569 "SECURITY" "yes"
+if expect_fail run_runtime_closure_check; then
+    log_pass "waiver with mismatched commit_sha is rejected"
+else
+    log_fail "waiver with mismatched commit_sha unexpectedly passed"
+fi
+
+write_runtime_waiver "${runtime_head_sha}" 999 "SECURITY" "yes"
+if expect_fail run_runtime_closure_check; then
+    log_pass "waiver with mismatched PR number is rejected"
+else
+    log_fail "waiver with mismatched PR number unexpectedly passed"
+fi
+
+write_runtime_waiver "${runtime_head_sha}" 569 "NON_MATCHING_CATEGORY" "yes"
+if expect_fail run_runtime_closure_check; then
+    log_pass "waiver with mismatched category is rejected"
+else
+    log_fail "waiver with mismatched category unexpectedly passed"
+fi
+
+write_runtime_waiver "${runtime_parent_sha}" 569 "SECURITY" "yes"
+if expect_fail run_runtime_closure_check; then
+    log_pass "parent-SHA waiver with non-waiver reviewed HEAD commit is rejected"
+else
+    log_fail "parent-SHA waiver with non-waiver reviewed HEAD commit unexpectedly passed"
+fi
+
+write_runtime_waiver "${runtime_head_sha}" 569 "SECURITY" "yes"
+if run_runtime_closure_check >/dev/null 2>&1; then
+    log_pass "waiver bound to reviewed HEAD commit is accepted"
+else
+    log_fail "waiver bound to reviewed HEAD commit was rejected"
+fi
+
+runtime_waiver_only_parent_sha="${runtime_head_sha}"
+(
+    cd "${runtime_repo}"
+    printf 'waiver-only fixture commit\n' > documents/work/waivers/fixture-note.txt
+    git add documents/work/waivers/fixture-note.txt
+    git commit -q -m "waiver-only head commit"
+)
+runtime_waiver_only_head_sha="$(git -C "${runtime_repo}" rev-parse HEAD)"
+
+write_runtime_waiver "${runtime_waiver_only_parent_sha}" 569 "SECURITY" "yes"
+if run_runtime_closure_check "${runtime_waiver_only_head_sha}" >/dev/null 2>&1; then
+    log_pass "parent-SHA waiver with waiver-only reviewed HEAD commit is accepted"
+else
+    log_fail "parent-SHA waiver with waiver-only reviewed HEAD commit was rejected"
+fi
+
+rm -rf "${runtime_repo}"
+echo
+
+# ---------------------------------------------------------------------------
+# Test 5: FAC preflight authorization policy regression fixtures
+# ---------------------------------------------------------------------------
+echo "Test 5: fac_preflight_authorization.sh"
 if "${REPO_ROOT}/scripts/ci/test_fac_preflight_fixtures.sh"; then
     log_pass "FAC preflight policy fixtures passed"
 else
@@ -193,9 +349,9 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# Test 5: FAC credential hardening regression fixtures
+# Test 6: FAC credential hardening regression fixtures
 # ---------------------------------------------------------------------------
-echo "Test 5: credential_hardening.sh"
+echo "Test 6: credential_hardening.sh"
 if "${REPO_ROOT}/scripts/ci/test_credential_hardening_fixtures.sh"; then
     log_pass "Credential hardening fixtures passed"
 else

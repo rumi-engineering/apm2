@@ -1,15 +1,16 @@
 // AGENT-AUTHORED
 //! Tests for PCAC lifecycle gate (TCK-00423).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use apm2_core::crypto::{Hash, Signer};
 use apm2_core::pcac::{
     ArbitrationOutcome, AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel,
     BoundaryIntentClass, DeterminismClass, EvaluatorTuple, IdentityEvidenceLevel,
-    MAX_REASON_LENGTH, PcacPolicyKnobs, PointerOnlyWaiver, RiskTier, SovereigntyEnforcementMode,
-    TemporalArbitrationReceiptV1, TemporalPredicateId,
+    MAX_REASON_LENGTH, PCAC_EVIDENCE_EXPORT_ROOT_ENV, PcacPolicyKnobs, PointerOnlyWaiver, RiskTier,
+    SovereigntyEnforcementMode, TemporalArbitrationReceiptV1, TemporalPredicateId,
 };
+use tempfile::TempDir;
 
 use super::durable_consume::DurableConsumeIndex;
 use super::lifecycle_gate::{InProcessKernel, LifecycleGate};
@@ -181,6 +182,43 @@ fn temporal_receipts_both_allow(
             signer,
         ),
     ]
+}
+
+#[allow(unsafe_code)] // Required for env var mutation in this test helper.
+fn with_pcac_export_root_env<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock poisoned");
+
+    let previous = std::env::var_os(PCAC_EVIDENCE_EXPORT_ROOT_ENV);
+    // SAFETY: This helper serializes process-wide env mutation with ENV_LOCK
+    // and restores the previous value before releasing the lock.
+    unsafe {
+        std::env::set_var(PCAC_EVIDENCE_EXPORT_ROOT_ENV, root);
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    match previous {
+        Some(value) => {
+            // SAFETY: guarded by ENV_LOCK; previous value restoration is paired
+            // with the mutation above before lock release.
+            unsafe {
+                std::env::set_var(PCAC_EVIDENCE_EXPORT_ROOT_ENV, value);
+            }
+        },
+        None => {
+            // SAFETY: guarded by ENV_LOCK; clearing the variable restores the
+            // original process state before lock release.
+            unsafe {
+                std::env::remove_var(PCAC_EVIDENCE_EXPORT_ROOT_ENV);
+            }
+        },
+    }
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 // =============================================================================
@@ -646,6 +684,67 @@ fn consume_denies_double_consume() {
         err.deny_class,
         AuthorityDenyClass::AlreadyConsumed { .. }
     ));
+}
+
+#[test]
+fn consume_export_failure_does_not_deny_after_successful_consume() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            &PcacPolicyKnobs::default(),
+        )
+        .expect("join+revalidate should succeed");
+
+    let temp_dir = TempDir::new().expect("tempdir must be created");
+    let invalid_root = temp_dir.path().join("not-a-directory");
+    std::fs::write(&invalid_root, b"not a directory").expect("sentinel file must be written");
+
+    with_pcac_export_root_env(&invalid_root, || {
+        let (first_witness, first_record) = gate
+            .consume_before_effect_with_sovereignty_receipts(
+                &cert,
+                input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                input.directory_head_hash,
+                None,
+                100,
+                None,
+                &[],
+            )
+            .expect("export failure must not deny once consume succeeds");
+        assert_eq!(first_witness.ajc_id, cert.ajc_id);
+        assert_eq!(first_record.ajc_id, cert.ajc_id);
+
+        let second_err = gate
+            .consume_before_effect_with_sovereignty_receipts(
+                &cert,
+                input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                input.directory_head_hash,
+                None,
+                100,
+                None,
+                &[],
+            )
+            .expect_err("single-consume invariant must still apply");
+        assert!(matches!(
+            second_err.deny_class,
+            AuthorityDenyClass::AlreadyConsumed { .. }
+        ));
+    });
 }
 
 fn assert_authoritative_class_satisfies_consume(intent_class: BoundaryIntentClass) {

@@ -66,6 +66,7 @@
 //! ```
 
 pub mod anti_entropy;
+pub mod attestation_overhead;
 pub mod batch_epoch;
 pub mod bft;
 pub mod bft_machine;
@@ -75,6 +76,7 @@ pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
 pub mod fact_root;
+pub mod formal_artifacts;
 pub mod functor;
 pub mod genesis;
 pub mod handlers;
@@ -97,6 +99,11 @@ pub use anti_entropy::{
     MAX_SYNC_BATCH_SIZE, RATE_LIMIT_INTERVAL, RangeDigestResult, RangeQuery, SyncEvent,
     SyncRateLimiter, SyncSession, event_record_to_sync_event, verify_events_with_proof,
     verify_sync_catchup, verify_sync_events,
+};
+pub use attestation_overhead::{
+    AttestationOverheadError, AttestationOverheadGate, AttestationProjectionModel,
+    AttestationScaleMeasurement, DEFAULT_MAX_P99_OVERHEAD_RATIO, SCALE_EFFECTS_10E6,
+    SCALE_EFFECTS_10E8, SCALE_EFFECTS_10E12,
 };
 // BatchEpochRootV1 hierarchical batch forests (TCK-00371)
 pub use batch_epoch::{
@@ -149,6 +156,11 @@ pub use fact_root::{
     CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
     MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
     MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof, compute_qc_anchor_hash,
+};
+pub use formal_artifacts::{
+    AntiEntropyArtifactStatus, FORMAL_BISIMULATION_MAX_DEPTH, FormalArtifactDefect,
+    FormalGateArtifactError, FormalGateArtifactResult, FormalGateArtifactSet, FormalGateClass,
+    ModelCheckedInvariantReport,
 };
 // Functorial observation law checks for admitted rewrites (TCK-00368)
 pub use functor::{

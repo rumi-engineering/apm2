@@ -88,6 +88,7 @@ mod lease;
 pub mod merge_receipt;
 pub mod policy_inheritance;
 mod policy_resolution;
+pub mod projection;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
 mod receipt;
@@ -228,6 +229,12 @@ pub use policy_resolution::{
     DeterminismClass, MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES,
     PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
     PolicyResolvedForChangeSetProto, RiskTier,
+};
+// Re-export projection contract types (TCK-00452).
+pub use projection::{
+    AuditorLaunchProjectionV1, OrchestratorLaunchProjectionV1, ProjectionContractError,
+    ProjectionDigestEnvelopeV1, ProjectionUncertainty, canonical_projection_json,
+    compute_projection_digest, digest_first_projection,
 };
 // Re-export projection receipt recorded types
 pub use projection_receipt_recorded::{

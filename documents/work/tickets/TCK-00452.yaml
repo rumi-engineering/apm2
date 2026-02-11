@@ -12,10 +12,8 @@ ticket_meta:
       - requirement_id: "REQ-0040"
         requirement_ref: "documents/rfcs/RFC-0020/requirements/REQ-0040.yaml#requirement"
     evidence_artifacts:
-      - evidence_id: "EVID-0030"
-        artifact_ref: "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0030.yaml#evidence_artifact"
-      - evidence_id: "EVID-0014"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0014.yaml#evidence_artifact"
+      - evidence_id: "EVID-0040"
+        artifact_ref: "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0040.yaml#evidence_artifact"
   custody:
     agent_roles:
       - "AGENT_IMPLEMENTER"
@@ -49,8 +47,7 @@ ticket_meta:
       - "Run required checks."
   definition_of_done:
     evidence_ids:
-      - "EVID-0030"
-      - "EVID-0014"
+      - "EVID-0040"
     criteria:
       - "Auditor projection reports lineage completeness and boundary-conformance from receipt-backed data."
       - "Orchestrator projection reports liveness/uncertainty state for dispatch control decisions."

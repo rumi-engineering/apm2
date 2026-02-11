@@ -41,11 +41,13 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
-    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
-    DenyCondition, DenyReasonCode, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID,
-    REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
-    builtin_profiles, fac_workobject_implementor_v2_role_contract,
-    seed_builtin_role_contracts_v2_in_cas, validate_receipt_attestation,
+    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, AuditorLaunchProjectionV1,
+    CHANGESET_PUBLISHED_PREFIX, DenyCondition, DenyReasonCode,
+    FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID, OrchestratorLaunchProjectionV1, ProjectionUncertainty,
+    REVIEW_BLOCKED_RECORDED_PREFIX, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
+    ReceiptKind, RiskTier, SelectionDecision, builtin_profiles, digest_first_projection,
+    fac_workobject_implementor_v2_role_contract, seed_builtin_role_contracts_v2_in_cas,
+    validate_receipt_attestation,
 };
 use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
 use apm2_core::liveness::{
@@ -67,6 +69,8 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     AddCredentialRequest,
     AddCredentialResponse,
+    AuditorLaunchProjectionRequest,
+    AuditorLaunchProjectionResponse,
     BoundedDecode,
     ClaimWorkRequest,
     ClaimWorkResponse,
@@ -98,6 +102,8 @@ use super::messages::{
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    OrchestratorLaunchProjectionRequest,
+    OrchestratorLaunchProjectionResponse,
     PatternRejection,
     PrivilegedError,
     PrivilegedErrorCode,
@@ -105,6 +111,7 @@ use super::messages::{
     ProcessStateEnum,
     ProcessStatusRequest,
     ProcessStatusResponse,
+    ProjectionUncertaintyFlag,
     // TCK-00394: ChangeSet publishing types
     PublishChangeSetRequest,
     PublishChangeSetResponse,
@@ -348,6 +355,12 @@ pub struct StopFlagsMutation<'a> {
     pub request_context: &'a serde_json::Value,
 }
 
+/// Maximum number of ledger events loaded into launch projections per request.
+///
+/// Projection endpoints must replay a bounded recent-history window to prevent
+/// unbounded CPU and memory consumption as the append-only ledger grows.
+pub const MAX_PROJECTION_EVENTS: usize = 10_000;
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -544,6 +557,101 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
+    /// Returns the total number of authoritative receipt events used by launch
+    /// projections.
+    fn get_authoritative_receipt_event_count(&self) -> usize {
+        self.get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .count()
+    }
+
+    /// Queries authoritative receipt events used by launch projections.
+    ///
+    /// Implementations should return at most [`MAX_PROJECTION_EVENTS`] events
+    /// in deterministic replay order. Retrieval MUST prefer the most recent
+    /// events to avoid replaying unbounded historical ledgers per request.
+    fn get_authoritative_receipt_events(&self) -> Vec<SignedLedgerEvent> {
+        let events: Vec<SignedLedgerEvent> = self
+            .get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .collect();
+
+        let start = events.len().saturating_sub(MAX_PROJECTION_EVENTS);
+        events.into_iter().skip(start).collect()
+    }
+
+    /// Returns the total number of liveness-relevant launch events used by
+    /// orchestrator projections.
+    fn get_launch_liveness_projection_event_count(&self) -> usize {
+        self.get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "session_started"
+                    || event.event_type == "session_terminated"
+                    || event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .count()
+    }
+
+    /// Queries liveness-relevant launch events used by orchestrator
+    /// projections.
+    ///
+    /// Implementations should return at most [`MAX_PROJECTION_EVENTS`] events
+    /// in deterministic replay order. Retrieval MUST prefer the most recent
+    /// events to avoid replaying unbounded historical ledgers per request.
+    fn get_launch_liveness_projection_events(&self) -> Vec<SignedLedgerEvent> {
+        let events: Vec<SignedLedgerEvent> = self
+            .get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "session_started"
+                    || event.event_type == "session_terminated"
+                    || event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .collect();
+
+        let start = events.len().saturating_sub(MAX_PROJECTION_EVENTS);
+        events.into_iter().skip(start).collect()
+    }
+
+    /// Queries a review-receipt event by semantic identity tuple.
+    ///
+    /// Canonical tuple: `(receipt_id, lease_id, work_id,
+    /// changeset_digest_hex)`. Implementations should use this lookup for
+    /// semantic idempotency in `IngestReviewReceipt`.
+    fn get_event_by_receipt_identity(
+        &self,
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let _ = (receipt_id, lease_id, work_id, changeset_digest_hex);
+        None
+    }
+
+    /// Queries a `changeset_published` event by semantic identity tuple.
+    ///
+    /// Canonical tuple: `(work_id, changeset_digest_hex)`.
+    fn get_event_by_changeset_identity(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let _ = (work_id, changeset_digest_hex);
+        None
+    }
+
     /// Emits an episode lifecycle event to the ledger (TCK-00321).
     ///
     /// Per REQ-0005, episode events must be streamed directly to the ledger
@@ -600,7 +708,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - The episode that produced this receipt
+    /// * `lease_id` - Gate lease identifier associated with this receipt
+    /// * `work_id` - Canonical work identifier bound to the lease
     /// * `receipt_id` - Unique receipt identifier
     /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
     /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
@@ -623,7 +732,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn emit_review_receipt(
         &self,
-        episode_id: &str,
+        lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -646,6 +756,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// # Arguments
     ///
     /// * `lease_id` - Gate lease identifier associated with this review
+    /// * `work_id` - Canonical work identifier bound to the lease
     /// * `receipt_id` - Unique receipt identifier (used as `blocked_id`)
     /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
     /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
@@ -670,6 +781,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     fn emit_review_blocked_receipt(
         &self,
         lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -1055,7 +1167,7 @@ pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] = CHANGESET_PUBLISHED_
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting review blocked events to the ledger.
-pub const REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX: &[u8] = b"apm2.event.review_blocked_recorded:";
+pub const REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX: &[u8] = REVIEW_BLOCKED_RECORDED_PREFIX;
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
@@ -1252,6 +1364,10 @@ fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn build_permeability_receipt_payload(
     work_id: &str,
     bindings: &TransitionAuthorityBindings,
@@ -1445,7 +1561,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 4. Validate permeability_receipt_hash is non-zero and CAS-resolvable
-    if bindings.permeability_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.permeability_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.permeability_receipt_hash) {
@@ -1459,7 +1575,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 5. Validate capability_manifest_hash is non-zero and CAS-resolvable
-    if bindings.capability_manifest_hash == [0u8; 32] {
+    if bool::from(bindings.capability_manifest_hash.ct_eq(&[0u8; 32])) {
         violations.push("capability_manifest_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.capability_manifest_hash) {
@@ -1473,7 +1589,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 6. Validate context_pack_hash is non-zero and CAS-resolvable
-    if bindings.context_pack_hash == [0u8; 32] {
+    if bool::from(bindings.context_pack_hash.ct_eq(&[0u8; 32])) {
         violations.push("context_pack_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.context_pack_hash) {
@@ -1487,7 +1603,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 7. Validate stop_condition_hash is non-zero and CAS-resolvable
-    if bindings.stop_condition_hash == [0u8; 32] {
+    if bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32])) {
         violations.push("stop_condition_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.stop_condition_hash) {
@@ -1501,7 +1617,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 8. Validate typed_budget_hash is non-zero and CAS-resolvable
-    if bindings.typed_budget_hash == [0u8; 32] {
+    if bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32])) {
         violations.push("typed_budget_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.typed_budget_hash) {
@@ -1524,8 +1640,8 @@ pub fn validate_transition_authority_bindings(
 
     // 10. Re-derive hashes and verify they match (tamper detection)
     let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
-    if bindings.stop_condition_hash != [0u8; 32]
-        && bindings.stop_condition_hash != recomputed_stop_hash
+    if !bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32]))
+        && !bool::from(bindings.stop_condition_hash.ct_eq(&recomputed_stop_hash))
     {
         violations.push(format!(
             "stop_condition_hash mismatch: declared={} recomputed={}",
@@ -1538,8 +1654,8 @@ pub fn validate_transition_authority_bindings(
         canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
     {
         let recomputed_budget_hash = hash_bytes(&budget_payload);
-        if bindings.typed_budget_hash != [0u8; 32]
-            && bindings.typed_budget_hash != recomputed_budget_hash
+        if !bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32]))
+            && !bool::from(bindings.typed_budget_hash.ct_eq(&recomputed_budget_hash))
         {
             violations.push(format!(
                 "typed_budget_hash mismatch: declared={} recomputed={}",
@@ -1588,7 +1704,7 @@ pub fn validate_review_outcome_bindings(
     let mut violations: Vec<String> = Vec::new();
 
     // 1. view_commitment_hash
-    if bindings.view_commitment_hash == [0u8; 32] {
+    if bool::from(bindings.view_commitment_hash.ct_eq(&[0u8; 32])) {
         violations.push("view_commitment_hash is zero (unset)".to_string());
     } else {
         match cas.exists(&bindings.view_commitment_hash) {
@@ -1602,7 +1718,7 @@ pub fn validate_review_outcome_bindings(
     }
 
     // 2. tool_log_index_hash
-    if bindings.tool_log_index_hash == [0u8; 32] {
+    if bool::from(bindings.tool_log_index_hash.ct_eq(&[0u8; 32])) {
         violations.push("tool_log_index_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.tool_log_index_hash) {
@@ -1616,7 +1732,7 @@ pub fn validate_review_outcome_bindings(
     }
 
     // 3. summary_receipt_hash
-    if bindings.summary_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.summary_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("summary_receipt_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.summary_receipt_hash) {
@@ -2173,19 +2289,19 @@ pub fn validate_and_store_transition_authority(
     // capability_manifest_hash and context_pack_hash are mandatory per
     // REQ-HEF-0013 -- zero values indicate missing policy resolution and
     // MUST be rejected (fail-closed).
-    if bindings.permeability_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.permeability_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
     }
-    if bindings.capability_manifest_hash == [0u8; 32] {
+    if bool::from(bindings.capability_manifest_hash.ct_eq(&[0u8; 32])) {
         violations.push("capability_manifest_hash is zero (unset)".to_string());
     }
-    if bindings.context_pack_hash == [0u8; 32] {
+    if bool::from(bindings.context_pack_hash.ct_eq(&[0u8; 32])) {
         violations.push("context_pack_hash is zero (unset)".to_string());
     }
-    if bindings.stop_condition_hash == [0u8; 32] {
+    if bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32])) {
         violations.push("stop_condition_hash is zero (unset)".to_string());
     }
-    if bindings.typed_budget_hash == [0u8; 32] {
+    if bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32])) {
         violations.push("typed_budget_hash is zero (unset)".to_string());
     }
 
@@ -2208,7 +2324,7 @@ pub fn validate_and_store_transition_authority(
         ("stop_condition_hash", bindings.stop_condition_hash),
         ("typed_budget_hash", bindings.typed_budget_hash),
     ] {
-        if hash != [0u8; 32] && violations.len() < MAX_BINDING_VIOLATIONS {
+        if !bool::from(hash.ct_eq(&[0u8; 32])) && violations.len() < MAX_BINDING_VIOLATIONS {
             match cas.exists(&hash) {
                 Ok(true) => {},
                 Ok(false) => violations.push(format!(
@@ -2230,8 +2346,8 @@ pub fn validate_and_store_transition_authority(
 
     // Hash integrity: re-derive and verify
     let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
-    if bindings.stop_condition_hash != [0u8; 32]
-        && bindings.stop_condition_hash != recomputed_stop_hash
+    if !bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32]))
+        && !bool::from(bindings.stop_condition_hash.ct_eq(&recomputed_stop_hash))
     {
         violations.push(format!(
             "stop_condition_hash mismatch: declared={} recomputed={}",
@@ -2244,8 +2360,8 @@ pub fn validate_and_store_transition_authority(
         canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
     {
         let recomputed_budget_hash = hash_bytes(&budget_payload);
-        if bindings.typed_budget_hash != [0u8; 32]
-            && bindings.typed_budget_hash != recomputed_budget_hash
+        if !bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32]))
+            && !bool::from(bindings.typed_budget_hash.ct_eq(&recomputed_budget_hash))
         {
             violations.push(format!(
                 "typed_budget_hash mismatch: declared={} recomputed={}",
@@ -2317,7 +2433,7 @@ pub fn append_privileged_pcac_lifecycle_fields(
 /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
 /// eviction. This prevents denial-of-service via memory exhaustion from
 /// unbounded event emission.
-pub const MAX_LEDGER_EVENTS: usize = 10_000;
+pub const MAX_LEDGER_EVENTS: usize = MAX_PROJECTION_EVENTS;
 
 /// Stub ledger event emitter for testing.
 ///
@@ -2978,6 +3094,57 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         None
     }
 
+    fn get_event_by_receipt_identity(
+        &self,
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        guard.1.values().find_map(|event| {
+            if event.event_type != "review_receipt_recorded"
+                && event.event_type != "review_blocked_recorded"
+            {
+                return None;
+            }
+            let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+            let payload_receipt_id = payload.get("receipt_id")?.as_str()?;
+            let payload_lease_id = payload.get("lease_id")?.as_str()?;
+            let payload_work_id = payload.get("work_id")?.as_str()?;
+            let payload_changeset_digest = payload.get("changeset_digest")?.as_str()?;
+            if payload_receipt_id == receipt_id
+                && payload_lease_id == lease_id
+                && payload_work_id == work_id
+                && payload_changeset_digest == changeset_digest_hex
+            {
+                Some(event.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn get_event_by_changeset_identity(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        guard.1.values().find_map(|event| {
+            if event.event_type != "changeset_published" || event.work_id != work_id {
+                return None;
+            }
+            let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+            let payload_changeset_digest = payload.get("changeset_digest")?.as_str()?;
+            if payload_changeset_digest == changeset_digest_hex {
+                Some(event.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
@@ -3088,7 +3255,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
     fn emit_review_receipt(
         &self,
-        episode_id: &str,
+        lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -3131,8 +3299,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "event_type".to_string(),
             serde_json::json!("review_receipt_recorded"),
         );
-        payload_map.insert("episode_id".to_string(), serde_json::json!(episode_id));
-        payload_map.insert("lease_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("episode_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -3202,7 +3371,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_receipt_recorded".to_string(),
-            work_id: episode_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes,
             signature: signature.to_bytes().to_vec(),
@@ -3236,14 +3405,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             order.push(event_id.clone());
             events.insert(event_id.clone(), signed_event.clone());
             events_by_work
-                .entry(episode_id.to_string())
+                .entry(work_id.to_string())
                 .or_default()
                 .push(event_id);
         }
 
         info!(
             event_id = %signed_event.event_id,
-            episode_id = %episode_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             "ReviewReceiptRecorded event signed and persisted"
         );
@@ -3255,6 +3425,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     fn emit_review_blocked_receipt(
         &self,
         lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -3294,6 +3465,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             serde_json::json!("review_blocked_recorded"),
         );
         payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -3368,7 +3540,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_blocked_recorded".to_string(),
-            work_id: receipt_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes,
             signature: signature.to_bytes().to_vec(),
@@ -3401,13 +3573,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             order.push(event_id.clone());
             events.insert(event_id.clone(), signed_event.clone());
             events_by_work
-                .entry(receipt_id.to_string())
+                .entry(work_id.to_string())
                 .or_default()
                 .push(event_id);
         }
 
         info!(
             event_id = %signed_event.event_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             reason_code = %reason_code,
             "ReviewBlockedRecorded event signed and persisted"
@@ -3846,10 +4020,12 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
-        let payload_bytes =
-            serde_json::to_vec(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("payload serialization failed: {e}"),
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
             })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
 
         let mut canonical_bytes =
             Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
@@ -4618,6 +4794,7 @@ fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiptReplayBindings {
     lease_id: String,
+    work_id: String,
     changeset_digest: [u8; 32],
     verdict: String,
     identity_proof_hash: [u8; 32],
@@ -4664,6 +4841,14 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
         .ok_or_else(|| "missing lease_id".to_string())?;
     if lease_id.is_empty() {
         return Err("lease_id is empty".to_string());
+    }
+    let work_id = lookup_field("work_id")
+        .or_else(|| lookup_field("lease_id"))
+        .or_else(|| lookup_field("episode_id"))
+        .map(str::to_owned)
+        .ok_or_else(|| "missing work_id".to_string())?;
+    if work_id.is_empty() {
+        return Err("work_id is empty".to_string());
     }
 
     let changeset_digest_hex =
@@ -4722,6 +4907,7 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
 
     Ok(ReceiptReplayBindings {
         lease_id,
+        work_id,
         changeset_digest,
         verdict,
         identity_proof_hash,
@@ -4911,7 +5097,7 @@ impl ConnectionContext {
         &mut self,
         profile_hash: [u8; 32],
     ) -> Result<(), crate::identity::IdentityProofError> {
-        if profile_hash == [0u8; 32] {
+        if bool::from(profile_hash.ct_eq(&[0u8; 32])) {
             return Err(crate::identity::IdentityProofError::InvalidField {
                 field: "identity_proof_profile_hash",
                 reason: "must be non-zero".to_string(),
@@ -5078,6 +5264,8 @@ pub enum PrivilegedMessageType {
     UpdateStopFlags     = 18,
     /// `WorkList` request (IPC-PRIV-019, TCK-00415)
     WorkList            = 19,
+    /// `AuditorLaunchProjection` request (IPC-PRIV-020, TCK-00452)
+    AuditorLaunchProjection = 20,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -5091,6 +5279,8 @@ pub enum PrivilegedMessageType {
     SwitchCredential    = 25,
     /// `LoginCredential` request (IPC-PRIV-026)
     LoginCredential     = 26,
+    /// `OrchestratorLaunchProjection` request (IPC-PRIV-027, TCK-00452)
+    OrchestratorLaunchProjection = 27,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse      = 64,
@@ -5137,6 +5327,8 @@ impl PrivilegedMessageType {
             18 => Some(Self::UpdateStopFlags),
             // TCK-00415: projection-backed work listing
             19 => Some(Self::WorkList),
+            // TCK-00452: auditor projection
+            20 => Some(Self::AuditorLaunchProjection),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -5144,6 +5336,8 @@ impl PrivilegedMessageType {
             24 => Some(Self::RefreshCredential),
             25 => Some(Self::SwitchCredential),
             26 => Some(Self::LoginCredential),
+            // TCK-00452: orchestrator projection
+            27 => Some(Self::OrchestratorLaunchProjection),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -5190,12 +5384,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt,
             Self::UpdateStopFlags,
             Self::WorkList,
+            Self::AuditorLaunchProjection,
             Self::ListCredentials,
             Self::AddCredential,
             Self::RemoveCredential,
             Self::RefreshCredential,
             Self::SwitchCredential,
             Self::LoginCredential,
+            Self::OrchestratorLaunchProjection,
             Self::SubscribePulse,
             Self::UnsubscribePulse,
             Self::PublishChangeSet,
@@ -5236,12 +5432,14 @@ impl PrivilegedMessageType {
             | Self::IngestReviewReceipt
             | Self::UpdateStopFlags
             | Self::WorkList
+            | Self::AuditorLaunchProjection
             | Self::ListCredentials
             | Self::AddCredential
             | Self::RemoveCredential
             | Self::RefreshCredential
             | Self::SwitchCredential
             | Self::LoginCredential
+            | Self::OrchestratorLaunchProjection
             | Self::SubscribePulse
             | Self::UnsubscribePulse
             | Self::PublishChangeSet
@@ -5278,12 +5476,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "hsi.review.ingest_receipt",
             Self::UpdateStopFlags => "hsi.stop.update_flags",
             Self::WorkList => "hsi.work.list",
+            Self::AuditorLaunchProjection => "hsi.launch.auditor_projection",
             Self::ListCredentials => "hsi.credential.list",
             Self::AddCredential => "hsi.credential.add",
             Self::RemoveCredential => "hsi.credential.remove",
             Self::RefreshCredential => "hsi.credential.refresh",
             Self::SwitchCredential => "hsi.credential.switch",
             Self::LoginCredential => "hsi.credential.login",
+            Self::OrchestratorLaunchProjection => "hsi.launch.orchestrator_projection",
             Self::SubscribePulse => "hsi.pulse.subscribe",
             Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
             Self::PublishChangeSet => "hsi.changeset.publish",
@@ -5315,12 +5515,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "INGEST_REVIEW_RECEIPT",
             Self::UpdateStopFlags => "UPDATE_STOP_FLAGS",
             Self::WorkList => "WORK_LIST",
+            Self::AuditorLaunchProjection => "AUDITOR_LAUNCH_PROJECTION",
             Self::ListCredentials => "LIST_CREDENTIALS",
             Self::AddCredential => "ADD_CREDENTIAL",
             Self::RemoveCredential => "REMOVE_CREDENTIAL",
             Self::RefreshCredential => "REFRESH_CREDENTIAL",
             Self::SwitchCredential => "SWITCH_CREDENTIAL",
             Self::LoginCredential => "LOGIN_CREDENTIAL",
+            Self::OrchestratorLaunchProjection => "ORCHESTRATOR_LAUNCH_PROJECTION",
             Self::SubscribePulse => "SUBSCRIBE_PULSE",
             Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
             Self::PublishChangeSet => "PUBLISH_CHANGESET",
@@ -5352,12 +5554,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_request.v1",
             Self::UpdateStopFlags => "apm2.update_stop_flags_request.v1",
             Self::WorkList => "apm2.work_list_request.v1",
+            Self::AuditorLaunchProjection => "apm2.auditor_launch_projection_request.v1",
             Self::ListCredentials => "apm2.list_credentials_request.v1",
             Self::AddCredential => "apm2.add_credential_request.v1",
             Self::RemoveCredential => "apm2.remove_credential_request.v1",
             Self::RefreshCredential => "apm2.refresh_credential_request.v1",
             Self::SwitchCredential => "apm2.switch_credential_request.v1",
             Self::LoginCredential => "apm2.login_credential_request.v1",
+            Self::OrchestratorLaunchProjection => "apm2.orchestrator_launch_projection_request.v1",
             Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
@@ -5389,12 +5593,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_response.v1",
             Self::UpdateStopFlags => "apm2.update_stop_flags_response.v1",
             Self::WorkList => "apm2.work_list_response.v1",
+            Self::AuditorLaunchProjection => "apm2.auditor_launch_projection_response.v1",
             Self::ListCredentials => "apm2.list_credentials_response.v1",
             Self::AddCredential => "apm2.add_credential_response.v1",
             Self::RemoveCredential => "apm2.remove_credential_response.v1",
             Self::RefreshCredential => "apm2.refresh_credential_response.v1",
             Self::SwitchCredential => "apm2.switch_credential_response.v1",
             Self::LoginCredential => "apm2.login_credential_response.v1",
+            Self::OrchestratorLaunchProjection => "apm2.orchestrator_launch_projection_response.v1",
             Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
@@ -5438,6 +5644,10 @@ pub enum PrivilegedResponse {
     WorkStatus(WorkStatusResponse),
     /// Successful `WorkList` response (TCK-00415).
     WorkList(WorkListResponse),
+    /// Successful `AuditorLaunchProjection` response (TCK-00452).
+    AuditorLaunchProjection(AuditorLaunchProjectionResponse),
+    /// Successful `OrchestratorLaunchProjection` response (TCK-00452).
+    OrchestratorLaunchProjection(OrchestratorLaunchProjectionResponse),
     /// Successful `EndSession` response (TCK-00395).
     EndSession(EndSessionResponse),
     /// Successful `IngestReviewReceipt` response (TCK-00389).
@@ -5555,6 +5765,14 @@ impl PrivilegedResponse {
             },
             Self::WorkList(resp) => {
                 buf.push(PrivilegedMessageType::WorkList.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::AuditorLaunchProjection(resp) => {
+                buf.push(PrivilegedMessageType::AuditorLaunchProjection.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::OrchestratorLaunchProjection(resp) => {
+                buf.push(PrivilegedMessageType::OrchestratorLaunchProjection.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::EndSession(resp) => {
@@ -7713,7 +7931,7 @@ impl PrivilegedDispatcher {
         let envelope_canonical_hash = envelope
             .canonical_hash()
             .map_err(|e| format!("failed to canonicalize time envelope: {e}"))?;
-        if envelope_canonical_hash != envelope_hash {
+        if !bool::from(envelope_canonical_hash.ct_eq(&envelope_hash)) {
             return Err(format!(
                 "time_envelope_ref hash mismatch: ref={} actual={}",
                 hex::encode(envelope_hash),
@@ -7732,7 +7950,7 @@ impl PrivilegedDispatcher {
         let profile_canonical_hash = clock_profile
             .canonical_hash()
             .map_err(|e| format!("failed to canonicalize clock profile: {e}"))?;
-        if profile_canonical_hash != clock_profile_hash {
+        if !bool::from(profile_canonical_hash.ct_eq(&clock_profile_hash)) {
             return Err(format!(
                 "clock_profile_hash mismatch: envelope={} actual={}",
                 hex::encode(clock_profile_hash),
@@ -7919,6 +8137,14 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
             // TCK-00415: Projection-backed work listing
             PrivilegedMessageType::WorkList => self.handle_work_list(payload, ctx),
+            // TCK-00452: Launch lineage projection for auditor consumers
+            PrivilegedMessageType::AuditorLaunchProjection => {
+                self.handle_auditor_launch_projection(payload, ctx)
+            },
+            // TCK-00452: Launch liveness projection for orchestrator consumers
+            PrivilegedMessageType::OrchestratorLaunchProjection => {
+                self.handle_orchestrator_launch_projection(payload, ctx)
+            },
             // TCK-00395: EndSession for session termination with ledger event
             PrivilegedMessageType::EndSession => self.handle_end_session(payload, ctx),
             // TCK-00389: IngestReviewReceipt for external reviewer results
@@ -7973,6 +8199,11 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
                 // TCK-00415
                 PrivilegedMessageType::WorkList => "WorkList",
+                // TCK-00452
+                PrivilegedMessageType::AuditorLaunchProjection => "AuditorLaunchProjection",
+                PrivilegedMessageType::OrchestratorLaunchProjection => {
+                    "OrchestratorLaunchProjection"
+                },
                 // TCK-00395
                 PrivilegedMessageType::EndSession => "EndSession",
                 // TCK-00389
@@ -9450,6 +9681,12 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        let mut delegated_gate_inputs: Option<(
+            [u8; 32],
+            apm2_core::policy::permeability::AuthorityVector,
+            u64,
+        )> = None;
+
         if let Some(ref receipt_hash_bytes) = request.permeability_receipt_hash {
             use apm2_core::policy::permeability::ConsumptionContext;
 
@@ -9472,7 +9709,7 @@ impl PrivilegedDispatcher {
             receipt_hash.copy_from_slice(receipt_hash_bytes);
 
             // Fail-closed: receipt hash must be non-zero.
-            if receipt_hash == [0u8; 32] {
+            if bool::from(receipt_hash.ct_eq(&[0u8; 32])) {
                 warn!(
                     work_id = %request.work_id,
                     "SpawnEpisode rejected: permeability_receipt_hash is zero"
@@ -9499,7 +9736,7 @@ impl PrivilegedDispatcher {
 
             // Verify the receipt content hash matches the declared hash.
             let actual_hash = receipt.content_hash();
-            if actual_hash != receipt_hash {
+            if !bool::from(actual_hash.ct_eq(&receipt_hash)) {
                 warn!(
                     work_id = %request.work_id,
                     expected = %hex::encode(receipt_hash),
@@ -9612,6 +9849,8 @@ impl PrivilegedDispatcher {
                     format!("permeability consumption binding failed: {e}"),
                 ));
             }
+
+            delegated_gate_inputs = Some((receipt_hash, required_authority, now_ms));
 
             info!(
                 work_id = %request.work_id,
@@ -10049,6 +10288,153 @@ impl PrivilegedDispatcher {
         // Generate session ID and ephemeral handle
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
         let ephemeral_handle = EphemeralHandle::generate();
+
+        // TCK-00406: Build authoritative V1 envelope and enforce spawn gate
+        // in the production dispatch path BEFORE any session-state mutation.
+        let Some(envelope_risk_tier) =
+            crate::episode::RiskTier::from_u8(claim.policy_resolution.resolved_risk_tier)
+        else {
+            warn!(
+                work_id = %request.work_id,
+                resolved_risk_tier = claim.policy_resolution.resolved_risk_tier,
+                "SpawnEpisode rejected: invalid resolved_risk_tier for envelope gate (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "invalid resolved_risk_tier {} for envelope gate (fail-closed)",
+                    claim.policy_resolution.resolved_risk_tier
+                ),
+            ));
+        };
+
+        let mut view_commitment_hasher = blake3::Hasher::new();
+        view_commitment_hasher.update(b"apm2.spawn.view_commitment.v1");
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(session_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(claim.work_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(claim.lease_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(claim.actor_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.resolved_policy_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.capability_manifest_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.context_pack_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&adapter_profile_hash);
+        view_commitment_hasher.update(b"\0");
+        if let Some(hash) = role_spec_hash {
+            view_commitment_hasher.update(&hash);
+            view_commitment_hasher.update(b"\0");
+        }
+        let view_commitment_hash: [u8; 32] = view_commitment_hasher.finalize().into();
+
+        let mut freshness_pinset_hasher = blake3::Hasher::new();
+        freshness_pinset_hasher.update(b"apm2.spawn.freshness_pinset.v1");
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(claim.work_id.as_bytes());
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(claim.lease_id.as_bytes());
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_hash);
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        freshness_pinset_hasher.update(b"\0");
+        let freshness_pinset_hash: [u8; 32] = freshness_pinset_hasher.finalize().into();
+
+        let pinned_snapshot = crate::episode::PinnedSnapshot::builder()
+            .repo_hash(claim.policy_resolution.context_pack_hash)
+            .policy_hash(claim.policy_resolution.resolved_policy_hash)
+            .model_profile_hash(adapter_profile_hash)
+            .build();
+
+        let context_refs = crate::episode::ContextRefs {
+            context_pack_hash: claim.policy_resolution.context_pack_hash.to_vec(),
+            dcp_refs: vec![claim.policy_resolution.policy_resolved_ref.clone()],
+        };
+
+        let mut envelope_builder = crate::episode::EpisodeEnvelopeV1::builder()
+            .episode_id(&session_id)
+            .actor_id(&claim.actor_id)
+            .work_id(&claim.work_id)
+            .lease_id(&claim.lease_id)
+            .capability_manifest_hash(claim.policy_resolution.capability_manifest_hash)
+            .budget(crate::episode::EpisodeBudget::default())
+            .stop_conditions(resolved_stop_conditions.clone())
+            .pinned_snapshot(pinned_snapshot)
+            .risk_tier(envelope_risk_tier)
+            .context_refs(context_refs)
+            .view_commitment_hash(view_commitment_hash)
+            .freshness_pinset_hash(freshness_pinset_hash);
+
+        if let Some((receipt_hash, _, _)) = delegated_gate_inputs.as_ref() {
+            envelope_builder = envelope_builder.permeability_receipt_hash(*receipt_hash);
+        }
+
+        let authoritative_envelope = match envelope_builder.build() {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: failed to build authoritative envelope (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("authoritative envelope build failed: {e}"),
+                ));
+            },
+        };
+
+        if let Some((_, required_authority, now_ms)) = delegated_gate_inputs.as_ref() {
+            let Some(receipt) = claim.permeability_receipt.as_ref() else {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: delegated gate inputs present without receipt (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "delegated gate inputs present without claim permeability receipt (fail-closed)",
+                ));
+            };
+
+            if let Err(e) = crate::episode::validate_delegated_spawn_gate(
+                Some(&authoritative_envelope),
+                receipt,
+                required_authority,
+                *now_ms,
+            ) {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: delegated envelope gate failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("delegated envelope gate failed: {e}"),
+                ));
+            }
+        } else if let Err(e) =
+            crate::episode::validate_spawn_gate(Some(&authoritative_envelope), false)
+        {
+            warn!(
+                work_id = %request.work_id,
+                error = %e,
+                "SpawnEpisode rejected: envelope gate failed"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("envelope gate failed: {e}"),
+            ));
+        }
+
+        let authoritative_envelope_hash = authoritative_envelope.envelope_hash();
 
         // TCK-00384 security fix: Transactional session + telemetry registration
         // with guaranteed rollback on any failure path.
@@ -10654,23 +11040,7 @@ impl PrivilegedDispatcher {
         // workspace directory. The episode must be started BEFORE returning
         // to the client so that tool handlers are properly initialized.
         //
-        // Generate envelope hash from session_id + work_id + lease_id for uniqueness.
-        // Null-byte delimiters prevent collision between fields (MAJOR-2 security fix).
-        // adapter/role/context lineage hashes are included in the envelope hash
-        // so runtime identity reflects authoritative policy bindings.
-        // TODO(TCK-00397): migrate to EpisodeEnvelopeBuilder for structured
-        // envelope construction once the full EpisodeEnvelope lifecycle is wired.
-        let envelope_data = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            session_id,
-            request.work_id,
-            claim.lease_id,
-            hex::encode(adapter_profile_hash),
-            role_spec_hash_log,
-            context_pack_hash_component,
-            context_pack_recipe_hash_component,
-        );
-        let envelope_hash: [u8; 32] = blake3::hash(envelope_data.as_bytes()).into();
+        let envelope_hash = authoritative_envelope_hash;
 
         // Try to create and start the episode. This requires a Tokio runtime.
         // In unit tests without a runtime, we skip episode creation but still
@@ -11565,6 +11935,298 @@ impl PrivilegedDispatcher {
         }
     }
 
+    /// Handles `AuditorLaunchProjection` requests (IPC-PRIV-020, TCK-00452).
+    ///
+    /// Returns launch-lineage completeness and boundary-conformance indicators
+    /// backed by authoritative receipt events.
+    fn handle_auditor_launch_projection(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        AuditorLaunchProjectionRequest::decode_bounded(payload, &self.decode_config).map_err(
+            |error| ProtocolError::Serialization {
+                reason: format!("invalid AuditorLaunchProjectionRequest: {error}"),
+            },
+        )?;
+
+        let projection = self.build_auditor_launch_projection();
+        let envelope = match digest_first_projection(&projection) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                warn!(error = %error, "auditor projection digest generation failed closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("auditor projection digest generation failed: {error}"),
+                ));
+            },
+        };
+
+        Ok(PrivilegedResponse::AuditorLaunchProjection(
+            AuditorLaunchProjectionResponse {
+                projection_digest: envelope.projection_digest.to_vec(),
+                canonical_projection_json: envelope.canonical_projection_json,
+                lineage_complete: projection.lineage_complete,
+                boundary_conformant: projection.boundary_conformant,
+                authoritative_receipt_count: projection.authoritative_receipt_count,
+                complete_lineage_receipt_count: projection.complete_lineage_receipt_count,
+                boundary_conformant_receipt_count: projection.boundary_conformant_receipt_count,
+                uncertainty_flags: projection
+                    .uncertainty_flags
+                    .into_iter()
+                    .map(Self::projection_uncertainty_to_proto)
+                    .collect(),
+                admissible: projection.admissible,
+            },
+        ))
+    }
+
+    /// Handles `OrchestratorLaunchProjection` requests (IPC-PRIV-027,
+    /// TCK-00452).
+    ///
+    /// Returns active-run/liveness projection fields for orchestrator control
+    /// loops.
+    fn handle_orchestrator_launch_projection(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        OrchestratorLaunchProjectionRequest::decode_bounded(payload, &self.decode_config).map_err(
+            |error| ProtocolError::Serialization {
+                reason: format!("invalid OrchestratorLaunchProjectionRequest: {error}"),
+            },
+        )?;
+
+        let projection = self.build_orchestrator_launch_projection();
+        let envelope = match digest_first_projection(&projection) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                warn!(error = %error, "orchestrator projection digest generation failed closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("orchestrator projection digest generation failed: {error}"),
+                ));
+            },
+        };
+
+        Ok(PrivilegedResponse::OrchestratorLaunchProjection(
+            OrchestratorLaunchProjectionResponse {
+                projection_digest: envelope.projection_digest.to_vec(),
+                canonical_projection_json: envelope.canonical_projection_json,
+                active_runs: projection.active_runs,
+                last_authoritative_receipt_tick: projection.last_authoritative_receipt_tick,
+                restart_count: projection.restart_count,
+                uncertainty_flags: projection
+                    .uncertainty_flags
+                    .into_iter()
+                    .map(Self::projection_uncertainty_to_proto)
+                    .collect(),
+                admissible: projection.admissible,
+            },
+        ))
+    }
+
+    fn build_auditor_launch_projection(&self) -> AuditorLaunchProjectionV1 {
+        let total_receipts = self.event_emitter.get_authoritative_receipt_event_count();
+        let receipt_events = self.event_emitter.get_authoritative_receipt_events();
+        let considered_receipts = receipt_events.len();
+        let mut complete_lineage_receipt_count = 0usize;
+        let mut boundary_conformant_receipt_count = 0usize;
+        let mut uncertainty_flags = Vec::new();
+
+        for event in &receipt_events {
+            let Some(payload) = Self::parse_event_payload_json(event) else {
+                uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
+                uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
+                continue;
+            };
+
+            if Self::payload_has_complete_lineage(&payload) {
+                complete_lineage_receipt_count += 1;
+            } else {
+                uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
+            }
+
+            if Self::payload_has_boundary_conformance(&payload) {
+                boundary_conformant_receipt_count += 1;
+            } else {
+                uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
+            }
+        }
+
+        if total_receipts > considered_receipts {
+            uncertainty_flags.push(ProjectionUncertainty::TruncatedHistory);
+        }
+
+        if considered_receipts == 0 {
+            uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
+            uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
+        }
+
+        let lineage_complete =
+            considered_receipts > 0 && complete_lineage_receipt_count == considered_receipts;
+        let boundary_conformant =
+            considered_receipts > 0 && boundary_conformant_receipt_count == considered_receipts;
+
+        AuditorLaunchProjectionV1::new(
+            saturating_u32(considered_receipts),
+            saturating_u32(complete_lineage_receipt_count),
+            saturating_u32(boundary_conformant_receipt_count),
+            lineage_complete,
+            boundary_conformant,
+            uncertainty_flags,
+        )
+    }
+
+    fn build_orchestrator_launch_projection(&self) -> OrchestratorLaunchProjectionV1 {
+        let total_events = self
+            .event_emitter
+            .get_launch_liveness_projection_event_count();
+        let events = self.event_emitter.get_launch_liveness_projection_events();
+        let mut uncertainty_flags = Vec::new();
+        let mut active_sessions = BTreeSet::new();
+        let mut restart_count = 0u32;
+        let mut has_liveness_evidence = false;
+        let mut has_receipt_event = false;
+        let mut last_authoritative_receipt_tick: Option<u64> = None;
+
+        for event in &events {
+            match event.event_type.as_str() {
+                "session_started" => {
+                    let Some(payload) = Self::parse_event_payload_json(event) else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                        continue;
+                    };
+                    if let Some(session_id) = Self::payload_nonempty_string(&payload, "session_id")
+                    {
+                        has_liveness_evidence = true;
+                        active_sessions.insert(session_id.to_string());
+                    } else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                    }
+                },
+                "session_terminated" => {
+                    let Some(payload) = Self::parse_event_payload_json(event) else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                        continue;
+                    };
+
+                    if let Some(session_id) = Self::payload_nonempty_string(&payload, "session_id")
+                    {
+                        has_liveness_evidence = true;
+                        active_sessions.remove(session_id);
+                    } else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                    }
+
+                    if payload
+                        .get("exit_code")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|exit_code| exit_code != 0)
+                    {
+                        restart_count = restart_count.saturating_add(1);
+                    }
+                },
+                "review_receipt_recorded" | "review_blocked_recorded" => {
+                    has_receipt_event = true;
+
+                    let Some(payload) = Self::parse_event_payload_json(event) else {
+                        uncertainty_flags
+                            .push(ProjectionUncertainty::MissingAuthoritativeReceiptTick);
+                        continue;
+                    };
+
+                    if let Some(tick) = payload
+                        .get("consume_tick")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        last_authoritative_receipt_tick = Some(
+                            last_authoritative_receipt_tick
+                                .map_or(tick, |current| current.max(tick)),
+                        );
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        if total_events > events.len() {
+            uncertainty_flags.push(ProjectionUncertainty::TruncatedHistory);
+        }
+        if !has_liveness_evidence {
+            uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+        }
+        if !has_receipt_event || last_authoritative_receipt_tick.is_none() {
+            uncertainty_flags.push(ProjectionUncertainty::MissingAuthoritativeReceiptTick);
+        }
+
+        OrchestratorLaunchProjectionV1::new(
+            saturating_u32(active_sessions.len()),
+            last_authoritative_receipt_tick,
+            restart_count,
+            uncertainty_flags,
+        )
+    }
+
+    fn parse_event_payload_json(event: &SignedLedgerEvent) -> Option<serde_json::Value> {
+        serde_json::from_slice::<serde_json::Value>(&event.payload).ok()
+    }
+
+    fn payload_has_complete_lineage(payload: &serde_json::Value) -> bool {
+        const REQUIRED_HASH_FIELDS: [&str; 5] = [
+            "changeset_digest",
+            "artifact_bundle_hash",
+            "capability_manifest_hash",
+            "context_pack_hash",
+            "role_spec_hash",
+        ];
+
+        REQUIRED_HASH_FIELDS
+            .iter()
+            .all(|field| Self::payload_has_hash32(payload, field))
+            && Self::payload_nonempty_string(payload, "receipt_id").is_some()
+    }
+
+    fn payload_has_boundary_conformance(payload: &serde_json::Value) -> bool {
+        Self::payload_has_hash32(payload, "identity_proof_hash")
+            && Self::payload_nonempty_string(payload, "time_envelope_ref").is_some()
+            && Self::payload_nonempty_string(payload, "lease_id").is_some()
+    }
+
+    fn payload_has_hash32(payload: &serde_json::Value, field: &str) -> bool {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| decode_hash32_hex(field, value).is_ok())
+    }
+
+    fn payload_nonempty_string<'a>(payload: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    const fn projection_uncertainty_to_proto(flag: ProjectionUncertainty) -> i32 {
+        match flag {
+            ProjectionUncertainty::MissingLineageEvidence => {
+                ProjectionUncertaintyFlag::MissingLineageEvidence as i32
+            },
+            ProjectionUncertainty::BoundaryConformanceUnverifiable => {
+                ProjectionUncertaintyFlag::BoundaryConformanceUnverifiable as i32
+            },
+            ProjectionUncertainty::MissingLivenessEvidence => {
+                ProjectionUncertaintyFlag::MissingLivenessEvidence as i32
+            },
+            ProjectionUncertainty::MissingAuthoritativeReceiptTick => {
+                ProjectionUncertaintyFlag::MissingAuthoritativeReceiptTick as i32
+            },
+            ProjectionUncertainty::TruncatedHistory => {
+                ProjectionUncertaintyFlag::TruncatedHistory as i32
+            },
+        }
+    }
+
     /// Returns the shared projection-backed work authority (TCK-00415).
     ///
     /// The authority is instantiated once during dispatcher construction and
@@ -12290,6 +12952,7 @@ impl PrivilegedDispatcher {
             ));
         }
         let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
+        let authoritative_work_id = lease_for_receipt.work_id.clone();
         let Some(claim_for_receipt) = self.work_registry.get_claim(&lease_for_receipt.work_id)
         else {
             return Ok(deny_response_for_authority_context(
@@ -12300,6 +12963,15 @@ impl PrivilegedDispatcher {
                 ),
             ));
         };
+        if claim_for_receipt.work_id != authoritative_work_id {
+            return Ok(deny_response_for_authority_context(
+                DenyCondition::MissingAuthorityContext,
+                format!(
+                    "lease work_id '{}' does not match authoritative claim work_id '{}'",
+                    authoritative_work_id, claim_for_receipt.work_id
+                ),
+            ));
+        }
         let claim_role_spec_hash = match Self::validate_claim_authority_context_lineage(
             &claim_for_receipt,
             cas.as_ref(),
@@ -12390,6 +13062,7 @@ impl PrivilegedDispatcher {
             .as_slice()
             .try_into()
             .expect("validated to be 32 bytes above");
+        let request_changeset_digest_hex = hex::encode(request_changeset_digest_arr);
         let request_verdict = match verdict {
             ReviewReceiptVerdict::Approve => "APPROVE",
             ReviewReceiptVerdict::Blocked => "BLOCKED",
@@ -12405,17 +13078,18 @@ impl PrivilegedDispatcher {
         } else {
             None
         };
-        let request_blocked_log_hash_arr = if verdict == ReviewReceiptVerdict::Blocked {
-            Some(
-                request
-                    .blocked_log_hash
-                    .as_slice()
-                    .try_into()
-                    .expect("validated to be 32 bytes above"),
-            )
-        } else {
-            None
-        };
+        let request_blocked_log_hash_arr: Option<[u8; 32]> =
+            if verdict == ReviewReceiptVerdict::Blocked {
+                Some(
+                    request
+                        .blocked_log_hash
+                        .as_slice()
+                        .try_into()
+                        .expect("validated to be 32 bytes above"),
+                )
+            } else {
+                None
+            };
 
         let to_response_event_type = |event_type: &str| -> String {
             match event_type {
@@ -12444,6 +13118,22 @@ impl PrivilegedDispatcher {
                 ));
             }
 
+            if original.work_id != authoritative_work_id {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_work_id = %original.work_id,
+                    requested_work_id = %authoritative_work_id,
+                    "Idempotent review receipt replay rejected: work_id mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted for work '{}', not '{}'",
+                    request.receipt_id,
+                    original.work_id,
+                    authoritative_work_id.as_str()
+                ));
+            }
+
             if !bool::from(
                 original
                     .identity_proof_hash
@@ -12464,7 +13154,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.changeset_digest != request_changeset_digest_arr {
+            if !bool::from(
+                original
+                    .changeset_digest
+                    .ct_eq(&request_changeset_digest_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -12494,7 +13188,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.artifact_bundle_hash != request_artifact_bundle_hash_arr {
+            if !bool::from(
+                original
+                    .artifact_bundle_hash
+                    .ct_eq(&request_artifact_bundle_hash_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -12533,7 +13231,11 @@ impl PrivilegedDispatcher {
             if let Some(original_blocked_log_hash) = original.blocked_log_hash {
                 let requested_blocked_log_hash = request_blocked_log_hash_arr
                     .map_or_else(|| "<missing>".to_string(), hex::encode);
-                if Some(original_blocked_log_hash) != request_blocked_log_hash_arr {
+                let blocked_log_hash_matches =
+                    request_blocked_log_hash_arr.is_some_and(|request_blocked_log_hash| {
+                        bool::from(original_blocked_log_hash.ct_eq(&request_blocked_log_hash))
+                    });
+                if !blocked_log_hash_matches {
                     warn!(
                         receipt_id = %request.receipt_id,
                         existing_event_id = %existing.event_id,
@@ -12598,10 +13300,7 @@ impl PrivilegedDispatcher {
             // Full validation: non-zero + CAS resolvability
             if let Err(auth_err) = validate_review_outcome_bindings(&bindings, cas.as_ref()) {
                 let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
-                let work_id = self
-                    .lease_validator
-                    .get_lease_work_id(&request.lease_id)
-                    .unwrap_or_else(|| format!("unknown-for-lease-{}", request.lease_id));
+                let work_id = authoritative_work_id.clone();
                 emit_authority_binding_defect(
                     self.event_emitter.as_ref(),
                     &work_id,
@@ -12622,12 +13321,39 @@ impl PrivilegedDispatcher {
             bindings
         };
 
-        // ---- Phase 2: Idempotency check ----
-        //
-        // SECURITY (v10 MAJOR 1 -- receipt_id idempotency fix):
-        //
-        // Use `get_event_by_receipt_id` to look up existing events by the
-        // caller-supplied `receipt_id` embedded in the event payload.
+        // ---- Phase 2: Semantic idempotency check ----
+        if let Some(existing) = self.event_emitter.get_event_by_receipt_identity(
+            &request.receipt_id,
+            &request.lease_id,
+            &authoritative_work_id,
+            &request_changeset_digest_hex,
+        ) {
+            if let Err(message) = validate_receipt_replay(&existing) {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    message,
+                ));
+            }
+
+            info!(
+                receipt_id = %request.receipt_id,
+                lease_id = %request.lease_id,
+                work_id = %authoritative_work_id,
+                existing_event_id = %existing.event_id,
+                "Duplicate semantic review identity detected - returning existing event"
+            );
+
+            return Ok(PrivilegedResponse::IngestReviewReceipt(
+                IngestReviewReceiptResponse {
+                    receipt_id: request.receipt_id.clone(),
+                    event_type: to_response_event_type(&existing.event_type),
+                    event_id: existing.event_id,
+                },
+            ));
+        }
+
+        // If the transport-level receipt_id already exists under a different
+        // semantic tuple, fail closed with a conflict.
         if let Some(existing) = self
             .event_emitter
             .get_event_by_receipt_id(&request.receipt_id)
@@ -12638,12 +13364,6 @@ impl PrivilegedDispatcher {
                     message,
                 ));
             }
-
-            info!(
-                receipt_id = %request.receipt_id,
-                existing_event_id = %existing.event_id,
-                "Duplicate receipt_id detected with matching replay bindings - returning existing event"
-            );
 
             return Ok(PrivilegedResponse::IngestReviewReceipt(
                 IngestReviewReceiptResponse {
@@ -12812,6 +13532,7 @@ impl PrivilegedDispatcher {
                 "ReviewReceiptRecorded".to_string(),
                 self.event_emitter.emit_review_receipt(
                     &request.lease_id,
+                    &authoritative_work_id,
                     &request.receipt_id,
                     &request_changeset_digest_arr,
                     &request_artifact_bundle_hash_arr,
@@ -12833,6 +13554,7 @@ impl PrivilegedDispatcher {
                     "ReviewBlockedRecorded".to_string(),
                     self.event_emitter.emit_review_blocked_receipt(
                         &request.lease_id,
+                        &authoritative_work_id,
                         &request.receipt_id,
                         &request_changeset_digest_arr,
                         &request_artifact_bundle_hash_arr,
@@ -12858,21 +13580,37 @@ impl PrivilegedDispatcher {
             Err(e) if e.to_string().contains("UNIQUE constraint") => {
                 warn!(
                     receipt_id = %request.receipt_id,
+                    lease_id = %request.lease_id,
+                    work_id = %authoritative_work_id,
                     verdict = %request_verdict,
                     error = %e,
-                    "Concurrent duplicate receipt_id detected by UNIQUE constraint"
+                    "Concurrent duplicate review receipt detected by UNIQUE constraint"
                 );
 
-                let Some(existing) = self
+                let existing = self
                     .event_emitter
-                    .get_event_by_receipt_id(&request.receipt_id)
-                else {
+                    .get_event_by_receipt_identity(
+                        &request.receipt_id,
+                        &request.lease_id,
+                        &authoritative_work_id,
+                        &request_changeset_digest_hex,
+                    )
+                    .or_else(|| {
+                        self.event_emitter
+                            .get_event_by_receipt_id(&request.receipt_id)
+                    });
+
+                let Some(existing) = existing else {
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
                         format!(
-                            "receipt_id '{}' hit a uniqueness race, but the existing event \
+                            "receipt identity tuple (receipt_id='{}', lease_id='{}', work_id='{}', \
+                             changeset_digest='{}') hit a uniqueness race, but the existing event \
                              could not be resolved",
-                            request.receipt_id
+                            request.receipt_id,
+                            request.lease_id,
+                            authoritative_work_id.as_str(),
+                            request_changeset_digest_hex
                         ),
                     ));
                 };
@@ -13592,7 +14330,7 @@ impl PrivilegedDispatcher {
         // digest mismatches before any side effects.
         let computed_changeset_digest = bundle.compute_digest();
         let provided_changeset_digest = bundle.changeset_digest();
-        if computed_changeset_digest != provided_changeset_digest {
+        if !bool::from(computed_changeset_digest.ct_eq(&provided_changeset_digest)) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!(
@@ -13728,19 +14466,12 @@ impl PrivilegedDispatcher {
         work_id: &str,
         changeset_digest_hex: &str,
     ) -> Option<(String, String)> {
-        self.event_emitter
-            .get_events_by_work_id(work_id)
-            .into_iter()
-            .filter(|event| event.event_type == "changeset_published")
-            .find_map(|event| {
-                let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
-                let persisted_digest = payload.get("changeset_digest")?.as_str()?;
-                if persisted_digest != changeset_digest_hex {
-                    return None;
-                }
-                let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
-                Some((event.event_id, persisted_cas_hash))
-            })
+        let event = self
+            .event_emitter
+            .get_event_by_changeset_identity(work_id, changeset_digest_hex)?;
+        let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+        let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
+        Some((event.event_id, persisted_cas_hash))
     }
 
     // =========================================================================
@@ -14200,7 +14931,9 @@ impl PrivilegedDispatcher {
         }
 
         // Lineage binding prerequisites for delegated paths.
-        if parent_lease.changeset_digest == [0u8; 32] || parent_lease.policy_hash == [0u8; 32] {
+        if bool::from(parent_lease.changeset_digest.ct_eq(&[0u8; 32]))
+            || bool::from(parent_lease.policy_hash.ct_eq(&[0u8; 32]))
+        {
             let deny_class = AuthorityDenyClass::InvalidDelegationChain;
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -14469,8 +15202,8 @@ impl PrivilegedDispatcher {
                     && existing.gate_id == sublease.gate_id
                     && existing.executor_actor_id == sublease.executor_actor_id
                     && existing.expires_at == sublease.expires_at
-                    && existing.changeset_digest == sublease.changeset_digest
-                    && existing.policy_hash == sublease.policy_hash
+                    && bool::from(existing.changeset_digest.ct_eq(&sublease.changeset_digest))
+                    && bool::from(existing.policy_hash.ct_eq(&sublease.policy_hash))
                     && existing.issuer_actor_id == sublease.issuer_actor_id;
 
                 if !fields_match {
@@ -15797,6 +16530,26 @@ pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
 #[must_use]
 pub fn encode_work_list_request(request: &WorkListRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::WorkList.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `AuditorLaunchProjection` request to bytes for sending
+/// (TCK-00452).
+#[must_use]
+pub fn encode_auditor_launch_projection_request(request: &AuditorLaunchProjectionRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::AuditorLaunchProjection.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `OrchestratorLaunchProjection` request to bytes for sending
+/// (TCK-00452).
+#[must_use]
+pub fn encode_orchestrator_launch_projection_request(
+    request: &OrchestratorLaunchProjectionRequest,
+) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::OrchestratorLaunchProjection.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -25559,9 +26312,7 @@ mod tests {
             }
 
             // Verify only ONE event was created in the ledger (not two)
-            let events = dispatcher
-                .event_emitter
-                .get_events_by_work_id("lease-dup-001");
+            let events = dispatcher.event_emitter.get_events_by_work_id("W-DUP-001");
             let receipt_event_count = events
                 .iter()
                 .filter(|e| e.event_type == "review_receipt_recorded")
@@ -25569,6 +26320,17 @@ mod tests {
             assert_eq!(
                 receipt_event_count, 1,
                 "Duplicate receipt_id submission must NOT create a second event"
+            );
+
+            let semantic_event = dispatcher.event_emitter.get_event_by_receipt_identity(
+                "RR-DUP-001",
+                "lease-dup-001",
+                "W-DUP-001",
+                &hex::encode([0x42u8; 32]),
+            );
+            assert!(
+                semantic_event.is_some(),
+                "receipt replay identity tuple must resolve to the canonical persisted event"
             );
         }
 
@@ -28241,7 +29003,7 @@ mod tests {
             let review_events = state
                 .privileged_dispatcher()
                 .event_emitter()
-                .get_events_by_work_id("pcac-review-lease-ok");
+                .get_events_by_work_id("W-PCAC-RR-OK");
             let review_event_count = review_events
                 .iter()
                 .filter(|event| event.event_type == "review_receipt_recorded")
@@ -28330,7 +29092,7 @@ mod tests {
             let blocked_events = state
                 .privileged_dispatcher()
                 .event_emitter()
-                .get_events_by_work_id("RR-PCAC-BLOCKED-OK");
+                .get_events_by_work_id("W-PCAC-RR-BLOCKED-OK");
             let blocked_event_count = blocked_events
                 .iter()
                 .filter(|event| event.event_type == "review_blocked_recorded")
@@ -28931,7 +29693,7 @@ mod tests {
             let review_events = state
                 .privileged_dispatcher()
                 .event_emitter()
-                .get_events_by_work_id("pcac-review-rollout-off");
+                .get_events_by_work_id("W-PCAC-RR-ROLLOUT-OFF");
             let review_event_count = review_events
                 .iter()
                 .filter(|event| event.event_type == "review_receipt_recorded")

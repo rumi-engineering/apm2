@@ -1959,9 +1959,6 @@ impl LifecycleGate {
     /// (production wiring via `with_tick_kernel[_and_sovereignty]`), it
     /// enforces full economics bounds. Without that wiring, Tier2+ fails
     /// closed because economics cannot be proven.
-    ///
-    /// TODO(TCK-ANTI-ENTROPY-RUNTIME): Call this from the daemon's anti-entropy
-    /// sync runtime path once catch-up transport is wired in `apm2-daemon`.
     #[allow(clippy::too_many_arguments)]
     pub fn enforce_anti_entropy_economics(
         &self,
@@ -2018,6 +2015,43 @@ impl LifecycleGate {
             })
         })?;
 
+        self.enforce_anti_entropy_economics_sample(
+            timed.elapsed_us,
+            timed.proof_check_count,
+            risk_tier,
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
+    }
+
+    /// Enforces anti-entropy verifier-economics bounds for an already
+    /// measured verification sample.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enforce_anti_entropy_economics_sample(
+        &self,
+        elapsed_us: u64,
+        proof_check_count: u64,
+        risk_tier: RiskTier,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if let Some(ref tick_kernel) = self.tick_kernel {
+            return tick_kernel.enforce_verifier_economics_sample(
+                VerifierOperation::AntiEntropy,
+                elapsed_us,
+                proof_check_count,
+                risk_tier,
+                ajc_id,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            );
+        }
+
         if matches!(risk_tier, RiskTier::Tier2Plus) {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: AuthorityDenyClass::UnknownState {
@@ -2035,8 +2069,8 @@ impl LifecycleGate {
 
         record_verifier_metrics(
             VerifierOperation::AntiEntropy,
-            timed.elapsed_us,
-            timed.proof_check_count,
+            elapsed_us,
+            proof_check_count,
         );
         Ok(())
     }
@@ -2665,7 +2699,7 @@ impl LifecycleGate {
             Self::requires_temporal_arbitration(cert),
             "consume-before-effect",
         )?;
-        self.consume_before_effect(
+        let consume_result = self.consume_before_effect(
             cert,
             intent_digest,
             boundary_intent_class,
@@ -2673,7 +2707,36 @@ impl LifecycleGate {
             current_time_envelope_ref,
             current_revocation_head_hash,
             resolved_policy,
-        )
+        )?;
+
+        let lifecycle_evidence =
+            apm2_core::pcac::PcacLifecycleEvidenceState::from_successful_consume(
+                cert,
+                &consume_result.0,
+                &consume_result.1,
+            );
+        match apm2_core::pcac::maybe_export_runtime_bundle(&lifecycle_evidence) {
+            Ok(
+                apm2_core::pcac::PcacRuntimeExportOutcome::Disabled
+                | apm2_core::pcac::PcacRuntimeExportOutcome::Admissible,
+            ) => {},
+            Ok(apm2_core::pcac::PcacRuntimeExportOutcome::NonAdmissible { reason }) => {
+                warn!(
+                    reason = %reason,
+                    ajc_id = %hex::encode(cert.ajc_id),
+                    "pcac objective/gate evidence exported as non-admissible lifecycle snapshot; continuing to avoid authority burn"
+                );
+            },
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    ajc_id = %hex::encode(cert.ajc_id),
+                    "pcac objective/gate evidence export failed after consume; continuing to avoid authority burn"
+                );
+            },
+        }
+
+        Ok(consume_result)
     }
 
     /// Executes the full lifecycle:

@@ -51,6 +51,7 @@ pub mod episode;
 pub mod evidence;
 pub mod gate;
 pub mod governance;
+pub mod governance_channel;
 pub mod hmp;
 pub mod hsi_contract;
 pub mod htf;
