@@ -436,7 +436,7 @@ const MAX_ERROR_MESSAGE_LEN: usize = 256;
 const BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES: &[u8] =
     b"apm2.canonicalizer.jcs|1.0.0|dcp://apm2.cac/canonicalizer/vectors@v1";
 const DEFAULT_LEAKAGE_CONFIDENCE_LABEL: &str = "runtime-default";
-const DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT: bool = false;
+const DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT: bool = true;
 
 /// Sanitizes an error message for safe return over the protocol.
 ///
@@ -699,20 +699,16 @@ impl BoundaryChannelQuarantineState {
         session_id: String,
         reason: String,
         since_ns: u64,
-    ) {
+    ) -> bool {
         if let Some(existing) = self.channels.get_mut(&channel_key) {
             existing.session_id = session_id;
             existing.reason = reason;
             existing.since_ns = since_ns;
-            return;
+            return true;
         }
 
         if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
-            while let Some(evicted) = self.insertion_order.pop_front() {
-                if self.channels.remove(&evicted).is_some() {
-                    break;
-                }
-            }
+            return false;
         }
 
         self.insertion_order.push_back(channel_key.clone());
@@ -724,6 +720,7 @@ impl BoundaryChannelQuarantineState {
                 reason,
             },
         );
+        true
     }
 }
 
@@ -923,9 +920,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     taint_policy: Arc<TaintPolicy>,
     /// Policy switch for strict boundary witness enforcement.
     ///
-    /// When enabled, strict leakage/timing witness enforcement is only applied
-    /// if authoritative witness sources are available. If authoritative sources
-    /// are unavailable, this path degrades to monitor-only mode.
+    /// This defaults to `true` and enforces authoritative leakage/timing
+    /// witnesses on every boundary-enforced request.
     strict_boundary_authority_enforcement: bool,
     /// Quarantine state for boundary channels with leakage/timing violations.
     ///
@@ -1519,8 +1515,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Enables or disables strict boundary leakage/timing witness enforcement.
     ///
-    /// Strict mode only activates when authoritative witness sources are
-    /// available. Otherwise, the dispatcher runs monitor-only and logs defects.
+    /// Strict mode is fail-closed and consumes authoritative witnesses.
     #[must_use]
     pub const fn with_strict_boundary_authority_enforcement(mut self, enabled: bool) -> Self {
         self.strict_boundary_authority_enforcement = enabled;
@@ -2175,17 +2170,155 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    // KNOWN LIMITATION (TCK-00465):
-    // This resolves the "authoritative" policy digest from broker in-memory
-    // state (`active_policy_hash`) rather than from a ledger-rooted policy
-    // admission chain. This means policy verification below is currently
-    // self-referential to broker state. Full ledger-rooted policy verification
-    // requires a larger architectural change and is intentionally deferred.
+    fn parse_hash_hex(candidate: &str) -> Option<Hash> {
+        let trimmed = candidate.strip_prefix("0x").unwrap_or(candidate);
+        if trimmed.len() != 64 {
+            return None;
+        }
+        let bytes = hex::decode(trimmed).ok()?;
+        let hash: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        Some(hash)
+    }
+
+    fn parse_hash_array(candidate: &[serde_json::Value]) -> Option<Hash> {
+        if candidate.len() != 32 {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        for (index, value) in candidate.iter().enumerate() {
+            let byte = value.as_u64()?;
+            let byte = u8::try_from(byte).ok()?;
+            hash[index] = byte;
+        }
+        Some(hash)
+    }
+
+    fn parse_hash_value(candidate: &serde_json::Value) -> Option<Hash> {
+        match candidate {
+            serde_json::Value::String(value) => Self::parse_hash_hex(value),
+            serde_json::Value::Array(values) => Self::parse_hash_array(values),
+            _ => None,
+        }
+    }
+
+    fn extract_policy_root_digest_from_value(
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> Option<Hash> {
+        if depth > 4 {
+            return None;
+        }
+
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in [
+                    "policy_root_hash",
+                    "resolved_policy_hash",
+                    "policy_hash",
+                    "policy_digest",
+                    "admitted_policy_root_digest",
+                ] {
+                    if let Some(candidate) = map.get(key)
+                        && let Some(hash) = Self::parse_hash_value(candidate)
+                    {
+                        return Some(hash);
+                    }
+                }
+
+                if let Some(payload_hex) = map.get("payload").and_then(serde_json::Value::as_str)
+                    && let Ok(payload_bytes) = hex::decode(payload_hex)
+                    && let Ok(inner) = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+                    && let Some(hash) =
+                        Self::extract_policy_root_digest_from_value(&inner, depth + 1)
+                {
+                    return Some(hash);
+                }
+
+                for nested in map.values() {
+                    if let Some(hash) =
+                        Self::extract_policy_root_digest_from_value(nested, depth + 1)
+                    {
+                        return Some(hash);
+                    }
+                }
+                None
+            },
+            serde_json::Value::Array(values) => {
+                if let Some(hash) = Self::parse_hash_array(values) {
+                    return Some(hash);
+                }
+                for nested in values {
+                    if let Some(hash) =
+                        Self::extract_policy_root_digest_from_value(nested, depth + 1)
+                    {
+                        return Some(hash);
+                    }
+                }
+                None
+            },
+            _ => Self::parse_hash_value(value),
+        }
+    }
+
+    fn resolve_policy_root_digest_from_ledger(
+        ledger: &dyn LedgerEventEmitter,
+    ) -> Result<Option<Hash>, String> {
+        let Some(event) = ledger.get_latest_event() else {
+            return Ok(None);
+        };
+        let payload = serde_json::from_slice::<serde_json::Value>(&event.payload)
+            .map_err(|error| format!("ledger payload decode failed: {error}"))?;
+        let Some(hash) = Self::extract_policy_root_digest_from_value(&payload, 0) else {
+            return Ok(None);
+        };
+        Ok((hash != [0u8; 32]).then_some(hash))
+    }
+
     fn resolve_authoritative_policy_root_digest(
+        &self,
         broker: &SharedToolBroker<StubManifestLoader>,
     ) -> Option<Hash> {
-        let digest = broker.active_policy_hash();
-        (digest != [0u8; 32]).then_some(digest)
+        let broker_digest = broker.active_policy_hash();
+        if broker_digest == [0u8; 32] {
+            return None;
+        }
+
+        let Some(ledger) = self.ledger.as_ref() else {
+            return Some(broker_digest);
+        };
+
+        match Self::resolve_policy_root_digest_from_ledger(ledger.as_ref()) {
+            Ok(Some(ledger_digest)) => {
+                if !bool::from(ledger_digest.ct_eq(&broker_digest)) {
+                    warn!(
+                        broker_policy_root_digest = %hex::encode(broker_digest),
+                        ledger_policy_root_digest = %hex::encode(ledger_digest),
+                        "policy-root mismatch between broker and ledger authority; failing closed"
+                    );
+                    return None;
+                }
+                Some(ledger_digest)
+            },
+            Ok(None) => {
+                // TODO(security): TCK-XXXXX - replace heuristic ledger payload
+                // extraction with explicit ledger-rooted policy-root indexing.
+                warn!(
+                    broker_policy_root_digest = %hex::encode(broker_digest),
+                    "ledger policy-root resolution unavailable; continuing with broker root"
+                );
+                Some(broker_digest)
+            },
+            Err(error) => {
+                // TODO(security): TCK-XXXXX - replace heuristic ledger payload
+                // extraction with explicit ledger-rooted policy-root indexing.
+                warn!(
+                    broker_policy_root_digest = %hex::encode(broker_digest),
+                    error = %error,
+                    "ledger policy-root resolution failed; continuing with broker root"
+                );
+                Some(broker_digest)
+            },
+        }
     }
 
     fn tool_decision_policy_verified(
@@ -2291,7 +2424,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         channel_key: String,
         reason: String,
         since_ns: u64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut bounded_reason = reason;
         if bounded_reason.len() > MAX_BOUNDARY_QUARANTINE_REASON_LENGTH {
             bounded_reason.truncate(MAX_BOUNDARY_QUARANTINE_REASON_LENGTH);
@@ -2300,13 +2433,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .boundary_channel_quarantine
             .lock()
             .map_err(|_| "boundary channel quarantine lock poisoned".to_string())?;
-        state.quarantine(
+        let inserted = state.quarantine(
             channel_key,
             session_id.to_string(),
             bounded_reason,
             since_ns,
         );
-        Ok(())
+        if !inserted {
+            warn!(
+                session_id = %session_id,
+                capacity = MAX_QUARANTINED_BOUNDARY_CHANNELS,
+                "boundary quarantine capacity reached; refusing new quarantine insertion"
+            );
+        }
+        Ok(inserted)
     }
 
     fn extract_boundary_flow_hints(
@@ -2401,18 +2541,69 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    const fn resolve_authoritative_leakage_budget_receipt(
-        _session_id: &str,
-        _risk_tier: RiskTier,
-    ) -> Option<LeakageBudgetReceipt> {
-        None
+    const fn conservative_authoritative_leakage_budget_bits(tool_class: ToolClass) -> u64 {
+        match tool_class {
+            ToolClass::Read | ToolClass::ListFiles => 0,
+            ToolClass::Execute | ToolClass::Network => 1_024,
+            ToolClass::Write | ToolClass::Git => 256,
+            _ => 512,
+        }
     }
 
-    const fn resolve_authoritative_timing_channel_budget(
-        _session_id: &str,
-        _risk_tier: RiskTier,
-    ) -> Option<TimingChannelBudget> {
-        None
+    const fn conservative_authoritative_timing_budget_ticks(tool_class: ToolClass) -> u64 {
+        match tool_class {
+            ToolClass::Read | ToolClass::ListFiles => 100,
+            ToolClass::Execute | ToolClass::Network => 10_000,
+            _ => 1_000,
+        }
+    }
+
+    fn resolve_authoritative_leakage_budget_receipt(
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+        claimed_budget_bits: Option<u64>,
+    ) -> LeakageBudgetReceipt {
+        let policy_budget_bits = Self::leakage_budget_bits_for_tier(risk_tier);
+        let conservative_budget_bits =
+            Self::conservative_authoritative_leakage_budget_bits(tool_class);
+        let authoritative_budget_bits = conservative_budget_bits.min(policy_budget_bits).max(1);
+        let effective_budget_bits = claimed_budget_bits
+            .map_or(authoritative_budget_bits, |claimed| {
+                claimed.min(authoritative_budget_bits)
+            });
+
+        LeakageBudgetReceipt {
+            leakage_bits: if conservative_budget_bits == 0 {
+                0
+            } else {
+                authoritative_budget_bits
+            },
+            budget_bits: effective_budget_bits,
+            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+            confidence_bps: 10_000,
+            confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
+        }
+    }
+
+    fn resolve_authoritative_timing_channel_budget(
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+        claimed_budget_ticks: Option<u64>,
+    ) -> TimingChannelBudget {
+        let policy_budget_ticks = Self::timing_budget_ticks_for_tier(risk_tier);
+        let conservative_budget_ticks =
+            Self::conservative_authoritative_timing_budget_ticks(tool_class);
+        let authoritative_budget_ticks = conservative_budget_ticks.min(policy_budget_ticks).max(1);
+        let effective_budget_ticks = claimed_budget_ticks
+            .map_or(authoritative_budget_ticks, |claimed| {
+                claimed.min(authoritative_budget_ticks)
+            });
+
+        TimingChannelBudget {
+            release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
+            observed_variance_ticks: authoritative_budget_ticks,
+            budget_ticks: effective_budget_ticks,
+        }
     }
 
     fn redundancy_receipt_available_for_request(
@@ -2615,26 +2806,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         authoritative_policy_root_digest: Option<Hash>,
     ) -> Result<BoundaryFlowRuntimeState, String> {
         let risk_tier = risk_tier.unwrap_or(RiskTier::Tier4);
-        let strict_boundary_enforcement_requested = self.strict_boundary_authority_enforcement
+        let strict_boundary_enforcement = self.strict_boundary_authority_enforcement
             && (risk_tier.requires_sandbox()
                 || Self::requires_channel_boundary_enforcement(tool_class));
-        let authoritative_leakage_budget_receipt =
-            Self::resolve_authoritative_leakage_budget_receipt(session_id, risk_tier);
-        let authoritative_timing_channel_budget =
-            Self::resolve_authoritative_timing_channel_budget(session_id, risk_tier);
-        let strict_boundary_enforcement = strict_boundary_enforcement_requested
-            && authoritative_leakage_budget_receipt.is_some()
-            && authoritative_timing_channel_budget.is_some();
-        if strict_boundary_enforcement_requested && !strict_boundary_enforcement {
-            warn!(
-                session_id = %session_id,
-                tool_class = %tool_class,
-                risk_tier = ?risk_tier,
-                missing_authoritative_leakage = authoritative_leakage_budget_receipt.is_none(),
-                missing_authoritative_timing = authoritative_timing_channel_budget.is_none(),
-                "authoritative boundary witnesses unavailable; using monitor-only boundary-flow mode"
-            );
-        }
         let hints = Self::extract_boundary_flow_hints(request_arguments)?;
         let base_taint_allow = Self::taint_allow_for_tier(risk_tier, taint_assessment.tag.level);
         let base_classification_allow =
@@ -2697,13 +2871,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .and_then(|hints| hints.leakage_budget_receipt.as_ref())
             .map(|hint| hint.budget_bits);
         let leakage_budget_receipt = if strict_boundary_enforcement {
-            authoritative_leakage_budget_receipt.unwrap_or_else(|| LeakageBudgetReceipt {
-                leakage_bits: 0,
-                budget_bits: policy_leakage_budget_bits,
-                estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
-                confidence_bps: 10_000,
-                confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
-            })
+            Self::resolve_authoritative_leakage_budget_receipt(
+                tool_class,
+                risk_tier,
+                claimed_leakage_budget_bits,
+            )
         } else {
             hints
                 .as_ref()
@@ -2735,11 +2907,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .and_then(|hints| hints.timing_channel.as_ref())
             .map(|hint| hint.budget);
         let timing_channel_budget = if strict_boundary_enforcement {
-            authoritative_timing_channel_budget.unwrap_or_else(|| TimingChannelBudget {
-                release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
-                observed_variance_ticks: 0,
-                budget_ticks: policy_timing_budget_ticks,
-            })
+            Self::resolve_authoritative_timing_channel_budget(
+                tool_class,
+                risk_tier,
+                claimed_timing_budget_ticks,
+            )
         } else {
             hints
                 .as_ref()
@@ -4454,7 +4626,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
             ) {
             let authoritative_policy_root_digest =
-                Self::resolve_authoritative_policy_root_digest(&broker);
+                self.resolve_authoritative_policy_root_digest(&broker);
             let policy_ledger_verified =
                 Self::tool_decision_policy_verified(&decision, authoritative_policy_root_digest);
             let broker_verified = Self::tool_decision_broker_verified(&decision);
@@ -4528,22 +4700,33 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         .iter()
                         .any(|defect| defect.violation_class.requires_quarantine())
                     {
-                        if let Err(error) = self.quarantine_boundary_channel(
+                        match self.quarantine_boundary_channel(
                             &token.session_id,
                             boundary_channel_key,
                             defects_json.clone(),
                             timestamp_ns,
                         ) {
-                            error!(
-                                session_id = %token.session_id,
-                                tool_class = %tool_class,
-                                error = %error,
-                                "failed to quarantine boundary channel"
-                            );
-                            return Ok(SessionResponse::error(
-                                SessionErrorCode::SessionErrorInternal,
-                                format!("boundary quarantine failed: {error}"),
-                            ));
+                            Ok(true) => {},
+                            Ok(false) => {
+                                warn!(
+                                    session_id = %token.session_id,
+                                    tool_class = %tool_class,
+                                    capacity = MAX_QUARANTINED_BOUNDARY_CHANNELS,
+                                    "boundary quarantine full; denying request without evicting existing quarantines"
+                                );
+                            },
+                            Err(error) => {
+                                error!(
+                                    session_id = %token.session_id,
+                                    tool_class = %tool_class,
+                                    error = %error,
+                                    "failed to quarantine boundary channel"
+                                );
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    format!("boundary quarantine failed: {error}"),
+                                ));
+                            },
                         }
                     }
 
@@ -8188,7 +8371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_boundary_flow_hints_monitor_only_without_authoritative_witnesses() {
+    fn test_missing_boundary_flow_hints_use_strict_authoritative_witnesses() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
             .with_strict_boundary_authority_enforcement(true);
         let policy_hash = [0x41; 32];
@@ -8220,6 +8403,24 @@ mod tests {
                 Some(policy_hash),
             )
             .expect("boundary-flow runtime state should build");
+        let leakage_budget = &boundary_flow_state.leakage_budget_receipt;
+        assert_eq!(
+            leakage_budget.leakage_bits, 24,
+            "strict authoritative leakage witness should use conservative Tier0 budget",
+        );
+        assert_eq!(
+            leakage_budget.budget_bits, 24,
+            "strict authoritative leakage witness should enforce policy-bounded budget",
+        );
+        let timing_budget = &boundary_flow_state.timing_channel_budget;
+        assert_eq!(
+            timing_budget.observed_variance_ticks, 20,
+            "strict authoritative timing witness should use conservative Tier0 budget",
+        );
+        assert_eq!(
+            timing_budget.budget_ticks, 20,
+            "strict authoritative timing witness should enforce policy-bounded budget",
+        );
 
         let signer = apm2_core::crypto::Signer::generate();
         let result = channel_boundary_dispatcher()
@@ -8237,12 +8438,12 @@ mod tests {
             );
         assert!(
             result.is_ok(),
-            "missing authoritative leakage/timing witnesses must use monitor-only mode and allow the boundary-enforced request"
+            "strict mode with conservative authoritative witnesses must allow bounded requests"
         );
     }
 
     #[test]
-    fn test_forged_low_boundary_flow_hints_do_not_fail_on_missing_authoritative_metrics() {
+    fn test_forged_low_boundary_flow_hints_rejected_against_authoritative_budgets() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
             .with_strict_boundary_authority_enforcement(true);
         let policy_hash = [0x52; 32];
@@ -8302,19 +8503,23 @@ mod tests {
                 true,
                 boundary_flow_state,
             );
-        if let Err(defects) = result {
-            let has_leakage_or_timing_defect = defects.iter().any(|defect| {
-                matches!(
-                    defect.violation_class,
-                    apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
-                        | apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
-                )
-            });
-            assert!(
-                !has_leakage_or_timing_defect,
-                "missing authoritative witnesses must not synthesize leakage/timing deny defects in monitor-only mode: {defects:?}"
-            );
-        }
+        let defects = result.expect_err(
+            "forged low boundary-flow hints must be rejected against authoritative budgets",
+        );
+        assert!(
+            defects.iter().any(|defect| {
+                defect.violation_class
+                    == apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
+            }),
+            "forged low leakage hints must trigger leakage-budget defects: {defects:?}",
+        );
+        assert!(
+            defects.iter().any(|defect| {
+                defect.violation_class
+                    == apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
+            }),
+            "forged low timing hints must trigger timing-budget defects: {defects:?}",
+        );
     }
 
     #[test]
@@ -8440,8 +8645,8 @@ mod tests {
                         err.message
                     );
                     assert!(
-                        err.message.contains("budget_bits=24"),
-                        "effective leakage budget must clamp to Tier0 policy max (24 bits): {}",
+                        err.message.contains("policy_max_bits=24"),
+                        "leakage policy ceiling must clamp to Tier0 max (24 bits): {}",
                         err.message
                     );
                 },
@@ -8603,9 +8808,8 @@ mod tests {
                         err.message
                     );
                     assert!(
-                        err.message.contains("timing variance exceeds budget")
-                            && err.message.contains("budget=20"),
-                        "effective timing budget must fail closed against Tier0 policy max (20 ticks): {}",
+                        err.message.contains("policy_max_ticks=20"),
+                        "timing policy ceiling must clamp to Tier0 max (20 ticks): {}",
                         err.message
                     );
                 },
@@ -8675,14 +8879,17 @@ mod tests {
             ToolClass::Inference,
         );
         let quarantined_at_ns = 1_000;
-        dispatcher
-            .quarantine_boundary_channel(
-                "session-001",
-                channel_key.clone(),
-                "boundary quarantine test".to_string(),
-                quarantined_at_ns,
-            )
-            .expect("quarantine insertion should succeed");
+        assert!(
+            dispatcher
+                .quarantine_boundary_channel(
+                    "session-001",
+                    channel_key.clone(),
+                    "boundary quarantine test".to_string(),
+                    quarantined_at_ns,
+                )
+                .expect("quarantine insertion should succeed"),
+            "quarantine insertion should allocate a slot",
+        );
 
         assert!(
             dispatcher
@@ -8714,14 +8921,17 @@ mod tests {
         );
         let quarantined_at_ns = 100;
 
-        dispatcher
-            .quarantine_boundary_channel(
-                "session-001",
-                channel_key.clone(),
-                "boundary quarantine ttl".to_string(),
-                quarantined_at_ns,
-            )
-            .expect("quarantine insertion should succeed");
+        assert!(
+            dispatcher
+                .quarantine_boundary_channel(
+                    "session-001",
+                    channel_key.clone(),
+                    "boundary quarantine ttl".to_string(),
+                    quarantined_at_ns,
+                )
+                .expect("quarantine insertion should succeed"),
+            "quarantine insertion should allocate a slot",
+        );
 
         assert!(
             dispatcher
@@ -8740,6 +8950,83 @@ mod tests {
                 .expect("quarantine lookup should succeed")
                 .is_none(),
             "quarantine should expire at TTL and allow re-evaluation",
+        );
+    }
+
+    #[test]
+    fn test_boundary_channel_quarantine_capacity_refuses_new_insertions_without_eviction() {
+        use std::collections::HashSet;
+
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
+        for idx in 0..MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            let session_id = format!("session-{idx}");
+            let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+                &session_id,
+                ToolClass::Inference,
+            );
+            assert!(
+                dispatcher
+                    .quarantine_boundary_channel(
+                        &session_id,
+                        channel_key,
+                        format!("seed quarantine {idx}"),
+                        u64::try_from(idx).expect("index should fit in u64") + 1,
+                    )
+                    .expect("seed quarantine insertion should succeed"),
+                "quarantine insertion should succeed before capacity is reached",
+            );
+        }
+
+        let preserved_keys: HashSet<String> = {
+            let state = dispatcher
+                .boundary_channel_quarantine
+                .lock()
+                .expect("quarantine lock should not be poisoned");
+            assert_eq!(
+                state.channels.len(),
+                MAX_QUARANTINED_BOUNDARY_CHANNELS,
+                "quarantine should be filled to capacity",
+            );
+            state.channels.keys().cloned().collect()
+        };
+
+        let overflow_session_id = "session-overflow";
+        let overflow_channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            overflow_session_id,
+            ToolClass::Inference,
+        );
+        let inserted = dispatcher
+            .quarantine_boundary_channel(
+                overflow_session_id,
+                overflow_channel_key.clone(),
+                "overflow quarantine should be refused".to_string(),
+                9_999,
+            )
+            .expect("overflow quarantine attempt should not fail");
+        assert!(
+            !inserted,
+            "overflow quarantine insertion must be refused without evicting active quarantines",
+        );
+
+        let state = dispatcher
+            .boundary_channel_quarantine
+            .lock()
+            .expect("quarantine lock should not be poisoned");
+        assert_eq!(
+            state.channels.len(),
+            MAX_QUARANTINED_BOUNDARY_CHANNELS,
+            "capacity must remain constant after overflow insertion refusal",
+        );
+        assert!(
+            !state.channels.contains_key(&overflow_channel_key),
+            "overflow channel must not be inserted when quarantine is full",
+        );
+        assert!(
+            state
+                .channels
+                .keys()
+                .all(|key| preserved_keys.contains(key)),
+            "existing quarantines must be preserved; overflow insertion cannot evict",
         );
     }
 
