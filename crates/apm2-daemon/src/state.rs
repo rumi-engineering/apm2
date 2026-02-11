@@ -17,10 +17,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use apm2_core::config::{AdapterRotationConfig, AdapterRotationStrategyConfig, EcosystemConfig};
+use apm2_core::consensus::{MerkleProof, SyncEvent};
 use apm2_core::credentials::{AuthMethod, CredentialProfile, CredentialStore, ProfileId, Provider};
+use apm2_core::crypto::Hash;
 use apm2_core::fac::{
     AdapterSelectionPolicy, AdapterSelectionStrategy, CLAUDE_CODE_PROFILE_ID, CODEX_CLI_PROFILE_ID,
     GEMINI_CLI_PROFILE_ID, LOCAL_INFERENCE_PROFILE_ID, ProfileWeight, all_builtin_profiles,
+};
+use apm2_core::pcac::{
+    AuthorityDenyClass, AuthorityDenyV1, RiskTier, record_anti_entropy_event_metrics,
+    timed_anti_entropy_verification,
 };
 use apm2_core::process::ProcessId;
 use apm2_core::process::runner::ProcessRunner;
@@ -567,6 +573,9 @@ pub struct DispatcherState {
     /// `time_envelope_ref` hashes stored during `issue_gate_lease` are
     /// resolvable by the dispatcher during receipt ingestion.
     evidence_cas: Option<Arc<dyn apm2_core::evidence::ContentAddressedStore>>,
+
+    /// Runtime anti-entropy economics hook wired to the production PCAC gate.
+    anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>>,
 }
 
 impl DispatcherState {
@@ -676,6 +685,7 @@ impl DispatcherState {
             stop_authority: None,
             governance_freshness_monitor: None,
             evidence_cas: None,
+            anti_entropy_pcac_gate: None,
         }
     }
 
@@ -765,6 +775,7 @@ impl DispatcherState {
             stop_authority: None,
             governance_freshness_monitor: None,
             evidence_cas: None,
+            anti_entropy_pcac_gate: None,
         }
     }
 
@@ -1046,6 +1057,7 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store);
+        let mut anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>> = None;
 
         let sovereignty_trusted_signer_key = sovereignty_trusted_signer_key.unwrap_or([0u8; 32]);
         if let Some(conn) = sqlite_conn_for_pcac {
@@ -1084,9 +1096,7 @@ impl DispatcherState {
                             Arc::clone(&stop_authority),
                         ),
                     );
-                    // TODO(TCK-ANTI-ENTROPY-RUNTIME): when daemon anti-entropy
-                    // catch-up is wired, route verification through
-                    // `pcac_gate.enforce_anti_entropy_economics(...)`.
+                    anti_entropy_pcac_gate = Some(Arc::clone(&pcac_gate));
                     privileged_dispatcher =
                         privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
@@ -1117,6 +1127,7 @@ impl DispatcherState {
             // TCK-00418: No evidence CAS in non-durable path; gate
             // orchestrator will need a fallback MemoryCas if wired here.
             evidence_cas: None,
+            anti_entropy_pcac_gate,
         })
     }
 
@@ -1466,9 +1477,7 @@ impl DispatcherState {
                 Arc::clone(&stop_authority),
             ),
         );
-        // TODO(TCK-ANTI-ENTROPY-RUNTIME): when daemon anti-entropy catch-up is
-        // wired, route verification through
-        // `pcac_gate.enforce_anti_entropy_economics(...)`.
+        let anti_entropy_pcac_gate = Arc::clone(&pcac_gate);
         privileged_dispatcher =
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
         let mut session_dispatcher =
@@ -1504,6 +1513,7 @@ impl DispatcherState {
             // orchestrator writes time-envelope artifacts into the same
             // store the dispatcher reads during `validate_lease_time_authority`.
             evidence_cas: Some(evidence_cas),
+            anti_entropy_pcac_gate: Some(anti_entropy_pcac_gate),
         })
     }
 
@@ -1778,6 +1788,75 @@ impl DispatcherState {
     #[must_use]
     pub const fn governance_freshness_monitor(&self) -> Option<&Arc<GovernanceFreshnessMonitor>> {
         self.governance_freshness_monitor.as_ref()
+    }
+
+    /// Verifies anti-entropy catch-up input and enforces verifier-economics
+    /// bounds in the daemon runtime path.
+    ///
+    /// This is the runtime integration stub until anti-entropy transport
+    /// wiring lands in a dedicated daemon loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enforce_anti_entropy_catchup(
+        &self,
+        risk_tier: RiskTier,
+        local_digest: Option<&Hash>,
+        remote_digest: Option<&Hash>,
+        events: &[SyncEvent],
+        expected_prev_hash: &Hash,
+        expected_start_seq_id: Option<u64>,
+        proof: Option<&MerkleProof>,
+        proof_root: Option<&Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        let Some(pcac_gate) = self.anti_entropy_pcac_gate.as_deref() else {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::UnknownState {
+                    description: "anti-entropy economics enforcement unavailable: \
+                         DispatcherState has no runtime PCAC gate wiring"
+                        .to_string(),
+                },
+                ajc_id: None,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+                containment_action: None,
+            }));
+        };
+
+        let timed = timed_anti_entropy_verification(
+            local_digest,
+            remote_digest,
+            events,
+            expected_prev_hash,
+            expected_start_seq_id,
+            proof,
+            proof_root,
+        );
+        record_anti_entropy_event_metrics(timed.event_count);
+        timed.result.map_err(|error| {
+            Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::UnknownState {
+                    description: format!("anti-entropy verification failed: {error}"),
+                },
+                ajc_id: None,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+                containment_action: None,
+            })
+        })?;
+
+        pcac_gate.enforce_anti_entropy_economics_sample(
+            timed.elapsed_us,
+            timed.proof_check_count,
+            risk_tier,
+            None,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
     }
 }
 

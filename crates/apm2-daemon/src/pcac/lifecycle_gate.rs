@@ -1959,9 +1959,6 @@ impl LifecycleGate {
     /// (production wiring via `with_tick_kernel[_and_sovereignty]`), it
     /// enforces full economics bounds. Without that wiring, Tier2+ fails
     /// closed because economics cannot be proven.
-    ///
-    /// TODO(TCK-ANTI-ENTROPY-RUNTIME): Call this from the daemon's anti-entropy
-    /// sync runtime path once catch-up transport is wired in `apm2-daemon`.
     #[allow(clippy::too_many_arguments)]
     pub fn enforce_anti_entropy_economics(
         &self,
@@ -2018,6 +2015,43 @@ impl LifecycleGate {
             })
         })?;
 
+        self.enforce_anti_entropy_economics_sample(
+            timed.elapsed_us,
+            timed.proof_check_count,
+            risk_tier,
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
+    }
+
+    /// Enforces anti-entropy verifier-economics bounds for an already
+    /// measured verification sample.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enforce_anti_entropy_economics_sample(
+        &self,
+        elapsed_us: u64,
+        proof_check_count: u64,
+        risk_tier: RiskTier,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if let Some(ref tick_kernel) = self.tick_kernel {
+            return tick_kernel.enforce_verifier_economics_sample(
+                VerifierOperation::AntiEntropy,
+                elapsed_us,
+                proof_check_count,
+                risk_tier,
+                ajc_id,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            );
+        }
+
         if matches!(risk_tier, RiskTier::Tier2Plus) {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: AuthorityDenyClass::UnknownState {
@@ -2035,8 +2069,8 @@ impl LifecycleGate {
 
         record_verifier_metrics(
             VerifierOperation::AntiEntropy,
-            timed.elapsed_us,
-            timed.proof_check_count,
+            elapsed_us,
+            proof_check_count,
         );
         Ok(())
     }

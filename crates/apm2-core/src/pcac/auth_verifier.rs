@@ -526,7 +526,7 @@ fn proof_checks_for_receipt_auth(auth: &ReceiptAuthentication) -> u64 {
             let proof_depth = u64::try_from(merkle_inclusion_proof.len()).unwrap_or(u64::MAX);
             2_u64.saturating_add(proof_depth)
         },
-        ReceiptAuthentication::Direct { .. } | ReceiptAuthentication::PointerUnbatched { .. } => 0,
+        ReceiptAuthentication::Direct { .. } | ReceiptAuthentication::PointerUnbatched { .. } => 1,
     }
 }
 
@@ -871,4 +871,84 @@ fn check_stage_ordering(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::merkle;
+
+    const fn test_hash(byte: u8) -> Hash {
+        [byte; 32]
+    }
+
+    #[test]
+    fn proof_checks_for_receipt_auth_direct_counts_one() {
+        let auth = ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x11),
+        };
+
+        let timed = timed_verify_receipt_authentication(
+            &auth,
+            &test_hash(0x11),
+            None,
+            test_hash(0x12),
+            test_hash(0x13),
+            100,
+        );
+        assert!(timed.result.is_ok(), "direct auth should verify");
+        assert_eq!(timed.proof_check_count, 1);
+    }
+
+    #[test]
+    fn proof_checks_for_receipt_auth_pointer_unbatched_counts_one() {
+        let receipt_hash = test_hash(0x21);
+        let auth = ReceiptAuthentication::PointerUnbatched {
+            receipt_hash,
+            authority_seal_hash: test_hash(0x22),
+        };
+
+        let timed = timed_verify_receipt_authentication(
+            &auth,
+            &test_hash(0x22),
+            Some(&receipt_hash),
+            test_hash(0x23),
+            test_hash(0x24),
+            200,
+        );
+        assert!(timed.result.is_ok(), "pointer-unbatched auth should verify");
+        assert_eq!(timed.proof_check_count, 1);
+    }
+
+    #[test]
+    fn proof_checks_for_receipt_auth_pointer_batched_counts_depth_plus_two() {
+        let receipt_hash = test_hash(0x31);
+        let authority_seal_hash = test_hash(0x32);
+        let merkle_inclusion_proof = vec![test_hash(0x33), test_hash(0x34), test_hash(0x35)];
+        let expected_proof_checks =
+            2_u64.saturating_add(u64::try_from(merkle_inclusion_proof.len()).unwrap_or(u64::MAX));
+
+        let mut receipt_batch_root_hash = merkle::hash_leaf(&receipt_hash);
+        for sibling in &merkle_inclusion_proof {
+            receipt_batch_root_hash = merkle::hash_internal(&receipt_batch_root_hash, sibling);
+        }
+
+        let auth = ReceiptAuthentication::PointerBatched {
+            receipt_hash,
+            authority_seal_hash,
+            merkle_inclusion_proof,
+            receipt_batch_root_hash,
+        };
+
+        let timed = timed_verify_receipt_authentication(
+            &auth,
+            &authority_seal_hash,
+            Some(&receipt_batch_root_hash),
+            test_hash(0x36),
+            test_hash(0x37),
+            300,
+        );
+        assert!(timed.result.is_ok(), "pointer-batched auth should verify");
+        assert_eq!(timed.proof_check_count, expected_proof_checks);
+    }
 }
