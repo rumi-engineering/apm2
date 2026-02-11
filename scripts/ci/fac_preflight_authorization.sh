@@ -69,6 +69,7 @@ if ! jq -e '
     (.trusted_fork_pr_numbers | type == "array") and
     (.trusted_fork_head_repositories | type == "array") and
     (.trusted_fork_labels | type == "array") and
+    (.trusted_app_actors | type == "array") and
     (.credential_posture | type == "object") and
     ((.credential_posture.projection_credential_source // "") == "github_token") and
     (.credential_posture.allow_personal_access_tokens == false) and
@@ -82,6 +83,7 @@ readarray -t trusted_base_refs < <(jq -r '.trusted_base_refs[]' "$policy_path")
 readarray -t trusted_fork_pr_numbers < <(jq -r '.trusted_fork_pr_numbers[] | tostring' "$policy_path")
 readarray -t trusted_fork_head_repositories < <(jq -r '.trusted_fork_head_repositories[]' "$policy_path")
 readarray -t trusted_fork_labels < <(jq -r '.trusted_fork_labels[]' "$policy_path")
+readarray -t trusted_app_actors < <(jq -r '.trusted_app_actors[]' "$policy_path")
 credential_source_policy="$(jq -r '.credential_posture.projection_credential_source // empty' "$policy_path")"
 allow_pat_policy="$(jq -r '.credential_posture.allow_personal_access_tokens // empty' "$policy_path")"
 allow_argv_policy="$(jq -r '.credential_posture.allow_argv_credentials // empty' "$policy_path")"
@@ -153,10 +155,9 @@ author_association="$(jq -r '.author_association // empty' <<<"$pr_json")"
 if [[ -z "$author_association" ]]; then
     deny "actor_association" "missing_author_association" "pr=${pr_number}"
 fi
-if contains_exact "$author_association" "${allowed_associations[@]}"; then
-    allow "actor_association" "pr=${pr_number} association=${author_association}"
-else
-    deny "actor_association" "unauthorized_author_association" "pr=${pr_number} association=${author_association}"
+actor_is_trusted_app="false"
+if contains_exact "$actor" "${trusted_app_actors[@]}"; then
+    actor_is_trusted_app="true"
 fi
 
 base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
@@ -250,6 +251,17 @@ if [[ "$is_fork" == "true" ]]; then
     allow "fork_trust" "pr=${pr_number} fork=true trust_grant=${trust_grant}"
 else
     allow "fork_trust" "pr=${pr_number} fork=false"
+fi
+
+# Default: author association must be explicitly allowlisted.
+# Narrow exception: trusted app actors may proceed with NONE association only
+# for same-repo, non-fork PRs.
+if contains_exact "$author_association" "${allowed_associations[@]}"; then
+    allow "actor_association" "pr=${pr_number} association=${author_association}"
+elif [[ "$actor_is_trusted_app" == "true" && "$author_association" == "NONE" && "$is_fork" == "false" ]]; then
+    allow "actor_association" "pr=${pr_number} actor=${actor} grant=trusted_app_actor_same_repo_none association=${author_association}"
+else
+    deny "actor_association" "unauthorized_author_association" "pr=${pr_number} association=${author_association} actor=${actor}"
 fi
 
 allow "overall" "event=${event_name} pr=${pr_number} actor=${actor} association=${author_association} base_ref=${base_ref} fork=${is_fork}"

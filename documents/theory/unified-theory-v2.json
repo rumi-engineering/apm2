@@ -42,7 +42,7 @@
   "payload": {
     "doc": {
       "id": "APM2-HOLONIC-UNIFIED-THEORY-0002",
-      "title": "Grand Unified Theory of Agent-Native Holonic Software (APM2) - PASM v2",
+      "title": "Proof-Admitted Stigmergic Morphogenesis (PASM) - a theory of agent-native software (APM2)",
       "status": "draft",
       "effective_date": "2026-02-09",
       "audience": [
@@ -587,9 +587,16 @@
             "name": "Markov Blanket Seal",
             "statement": "A holon's private kernel state K_h is not data-plane observable by its parent, peers, or children. All cross-boundary information exchange occurs exclusively through typed boundary channels Ch_h. Side-channel leakage (timing, resource usage, error patterns) is addressed by a separate side-channel mitigation policy.",
             "formal_predicate": "forall h: K_h intersect direct_data_observable(parent(h)) = empty. forall h: K_h intersect direct_data_observable(peers(h)) = empty. forall h, forall h' in children(h): K_{h'} intersect direct_data_observable(h) = empty. All information exchange crosses boundary via Ch_h.",
-            "axiom_refs": ["AXIOM-BOUNDARY"],
-            "bridge_predicate_refs": ["BP-BND-04"],
-            "law_refs": ["LAW-05", "LAW-16"],
+            "axiom_refs": [
+              "AXIOM-BOUNDARY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-BND-04"
+            ],
+            "law_refs": [
+              "LAW-05",
+              "LAW-16"
+            ],
             "machine_check": "no_kernel_state_in_boundary_messages AND boundary_channel_only_exchange_verified AND side_channel_policy_declared",
             "side_channel_scope_note": "Data-plane observability seal only. Side-channel leakage (timing, resource, error) is out of scope for this invariant and MUST be addressed by threat_model.side_channel_policy (currently PLANNED).",
             "node_class": "NORMATIVE"
@@ -598,9 +605,16 @@
             "name": "Bounded Revocation Propagation",
             "statement": "Revocation of authority (capabilities, keys, policy grants) MUST propagate to all affected holons within a bounded latency SLO determined by the revoked capability's tier. Use of stale (revoked) authority after the SLO deadline is a stop-the-line defect for S0/S1 tiers. Revocation-wins semantics: under network partitions, revocation dominates grant.",
             "formal_predicate": "forall revocation r of capability c at time t: forall h in affected_set(r): revocation_received(h, r) within SLO(tier(c)) where SLO(S0) < SLO(S1) < SLO(S2). forall actuation a by h using c after t + SLO(tier(c)): denied(a) AND defect_emitted(POLICY_VIOLATION). forall partition P: revocation(c) received on either side of P implies c is denied on both sides upon partition heal.",
-            "axiom_refs": ["AXIOM-AUTHORITY"],
-            "bridge_predicate_refs": ["BP-AUT-05"],
-            "law_refs": ["LAW-05", "LAW-18"],
+            "axiom_refs": [
+              "AXIOM-AUTHORITY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-AUT-05"
+            ],
+            "law_refs": [
+              "LAW-05",
+              "LAW-18"
+            ],
             "machine_check": "revocation_propagation_receipted AND coverage_set_complete_check AND latency_within_tier_slo AND post_revocation_actuation_denied",
             "node_class": "NORMATIVE"
           },
@@ -608,9 +622,18 @@
             "name": "Bounded Progress Under Partial Synchrony",
             "statement": "Well-formed work with sufficient budget reaches a terminal state (pass, fail, or escalate) within bounded time under partial synchrony. Liveness holds when: (1) fewer than f of n nodes are Byzantine with f < n/3 and n >= 4, (2) network partitions heal within GST (declared per deployment as policy.max_message_delay), (3) governance decisions resolve within policy.governance_timeout. Before GST, safety holds but liveness may not. This invariant is S2_LIVENESS tier and never overrides S0/S1 safety properties.",
             "formal_predicate": "forall well_formed_work w with Bud_w > 0 in all dims: exists terminal_time t <= SLO(tier(w)) such that state(w, t) in {PASS, FAIL, ESCALATED}, given: byzantine_count < n/3 AND n >= 4 AND partition_duration <= policy.max_message_delay AND governance_latency <= policy.governance_timeout. NOT holds_before(GST).",
-            "axiom_refs": ["AXIOM-CLOSURE", "AXIOM-AUTHORITY"],
-            "bridge_predicate_refs": ["BP-AUT-03", "BP-CLS-01"],
-            "law_refs": ["LAW-12", "LAW-19"],
+            "axiom_refs": [
+              "AXIOM-CLOSURE",
+              "AXIOM-AUTHORITY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-AUT-03",
+              "BP-CLS-01"
+            ],
+            "law_refs": [
+              "LAW-12",
+              "LAW-19"
+            ],
             "machine_check": "terminal_state_reached_within_slo AND non_termination_emits_defect AND partial_synchrony_assumptions_declared",
             "dominance_tier": "S2_LIVENESS — this invariant MUST NOT override INV-F-14 dominance ordering. If liveness conflicts with containment or correctness, containment/correctness wins and the work is terminated with an escalation receipt.",
             "node_class": "NORMATIVE"

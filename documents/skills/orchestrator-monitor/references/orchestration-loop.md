@@ -2,16 +2,31 @@ title: Orchestrator Monitor — Parallel PR Control Loop
 
 decision_tree:
   entrypoint: START
-  nodes[8]:
+  nodes[9]:
     - id: START
       purpose: "Initialize scope and verify prerequisites before any side effects."
       steps[6]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <...> placeholders with concrete values."
+        - id: DISCOVER_RELEVANT_FAC_HELP
+          action: |
+            Discovery phase is mandatory. Run this exact help checklist before command execution:
+            (1) `apm2 fac --help`
+            (2) `apm2 fac pr --help`
+            (3) `apm2 fac pr auth-check --help`
+            (4) `apm2 fac review --help`
+            (5) `apm2 fac review status --help`
+            (6) `apm2 fac review project --help`
+            (7) `apm2 fac review tail --help`
+            (8) `apm2 fac logs --help`
+            (9) `apm2 fac gates --help`
+            (10) `apm2 fac push --help`
+            (11) `apm2 fac restart --help`
+            Help output is authoritative for names/flags.
         - id: VERIFY_REPO_AUTH
-          action: "Run resolve_repo_root and auth_check from references/commands.md."
+          action: "Run `apm2 fac pr auth-check`."
         - id: RESOLVE_PR_SCOPE
-          action: "If explicit PR numbers were provided, use them. Otherwise run list_open_prs."
+          action: "If explicit PR numbers were provided, use them. Otherwise run fac_review_status (global) and infer active PR scope from FAC review entries/recent events."
         - id: ENFORCE_SCOPE_BOUND
           action: "If scoped open PR count >20, pause and request wave partitioning."
         - id: LOAD_PROFILE
@@ -20,9 +35,14 @@ decision_tree:
 
     - id: HEARTBEAT_LOOP
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
-      steps[4]:
+      steps[5]:
         - id: SNAPSHOT
-          action: "Capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use pr_state_json + commit_statuses for metadata/projection cross-checks; use fac_review_tail for recent event stream."
+          action: "Capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use fac_logs and fac_review_tail for diagnosis context."
+        - id: COLLECT_FINDINGS_FROM_FAC
+          action: |
+            For each PR, fetch structured findings via FAC:
+            `apm2 fac review findings --repo <OWNER/REPO> --pr <PR_NUMBER> --json`
+            Use this output as the source for BLOCKER/MAJOR/MINOR/NIT findings in implementor handoff.
         - id: CLASSIFY
           action: |
             For each PR, assign exactly one state:
@@ -40,22 +60,20 @@ decision_tree:
       purpose: "Apply bounded actions while preventing duplicate workers per PR."
       steps[6]:
         - id: READY_TO_MERGE_ACTION
-          action: "For READY_TO_MERGE PRs, run enable_auto_merge."
+          action: "For READY_TO_MERGE PRs, keep monitoring. `apm2 fac push` already enables auto-merge on each implementor push."
         - id: REVIEW_MONITOR_ACTION
           action: |
             For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
             Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac review project --pr <N> --emit-errors`.
             If reviews have not started within 2 minutes of the push, use `apm2 fac restart --pr <PR_NUMBER>` as recovery.
-            If restart also fails, use `gh workflow run forge-admission-cycle.yml` as last-resort fallback.
         - id: FIX_AGENT_ACTION
           action: |
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent
             with `/implementor-default <TICKET_ID or PR_CONTEXT>`.
-            Inject @documents/skills/implementor-default/SKILL.md, references/common-review-findings.md,
-            and references/daemon-implementation-patterns.md in its context.
+            Inject @documents/skills/implementor-default/SKILL.md in its context.
             Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
         - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run fac_review_status and fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
+          action: "For PRs with active reviews, run fac_review_status + fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE
@@ -70,18 +88,18 @@ decision_tree:
         - id: IDLE_AGENT_RECOVERY
           action: "If an implementor has no progress signal beyond profile idle threshold, replace with fresh agent."
         - id: SATURATION_CHECK
-          action: "Use list_review_processes to ensure process fanout remains within profile caps."
-      next: EMIT_TICK_EVIDENCE
+          action: "Use fac_review_status (global) to ensure active FAC review runs remain within profile caps."
+      next: SYNC_TICK_FACTS
 
-    - id: EMIT_TICK_EVIDENCE
-      purpose: "Record why decisions were taken, not only what was taken."
+    - id: SYNC_TICK_FACTS
+      purpose: "Sync machine-verifiable orchestration facts."
       steps[3]:
-        - id: EMIT_STATUS_DASHBOARD
-          action: "Emit current PR states and gate status per PR."
-        - id: EMIT_DISPATCH_PLAN
-          action: "Emit actions executed this tick and skipped actions with reason (slot cap, conservative gate, stale SHA)."
-        - id: EMIT_BLOCKER_LEDGER
-          action: "Emit BLOCKED_UNKNOWN entries with evidence needed to unblock."
+        - id: SYNC_PR_STATE_FACTS
+          action: "Persist current PR states and gate states in FAC projections/log artifacts."
+        - id: SYNC_ACTION_FACTS
+          action: "Persist executed/skipped action facts keyed by PR, SHA, and scheduler slot."
+        - id: SYNC_BLOCKER_FACTS
+          action: "Persist BLOCKED_UNKNOWN facts with evidence selectors required for unblock."
       next: STOP_OR_CONTINUE
 
     - id: STOP_OR_CONTINUE
@@ -90,12 +108,12 @@ decision_tree:
         - id: SUCCESS_STOP
           if: "all scoped PRs are MERGED"
           then:
-            stop: "SUCCESS"
+            next: STOP
 
         - id: PARTIAL_STOP
           if: "all remaining PRs are BLOCKED_UNKNOWN for >=3 consecutive ticks"
           then:
-            stop: "PARTIAL_STOP_WITH_BLOCKERS"
+            next: STOP
 
         - id: CONTINUE
           if: "otherwise"
@@ -104,34 +122,40 @@ decision_tree:
 
     - id: FIX_AGENT_PROMPT_CONTRACT
       purpose: "Ensure implementor agent briefs are consistent and conservatively gated."
-      steps[7]:
+      steps[9]:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
           action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
+        - id: REQUIRE_FINDINGS_SOURCE
+          action: "Build explicit findings list from `apm2 fac review findings --repo <OWNER/REPO> --pr <PR_NUMBER> --json` output and include it in handoff."
         - id: INCLUDE_REQUIRED_CONTEXT
           action: |
             Include PR number, branch, HEAD SHA, explicit findings list, and required references:
             @documents/skills/implementor-default/SKILL.md,
-            references/common-review-findings.md, references/daemon-implementation-patterns.md,
-            documents/reviews/CI_EXPECTATIONS.md.
+            documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md.
         - id: REQUIRE_BRANCH_SYNC_BEFORE_EDIT
           action: |
-            Use this first action sequence before any code edits:
-            (1) git fetch origin main
-            (2) git rebase origin/main (or git merge origin/main if project policy requires merge commits)
-            (3) git diff --name-only --diff-filter=U
-            If unmerged files exist, resolve all conflicts first, then continue coding.
+            Require implementor-owned worktree health loop before any code edits:
+            (1) choose/create the intended worktree path,
+            (2) synchronize branch ancestry with current mainline policy,
+            (3) reduce merge-conflict count to zero,
+            (4) proceed only when worktree is conflict-free.
+            Do NOT prescribe raw git/gh commands in orchestrator prompts.
         - id: REQUIRE_CONFLICT_EVIDENCE
           action: |
-            Ask the subagent to report branch hygiene evidence in output:
-            base commit before sync, new base after sync, conflict file list (or explicit 'none').
+            Require branch hygiene facts to be verifiable from FAC artifacts:
+            worktree path, base commit before sync, base commit after sync, conflict file list (or explicit 'none').
         - id: ENFORCE_BRANCH_HYGIENE_GATE
           action: |
-            If subagent output omits branch sync evidence or reports unresolved conflicts,
-            treat the output as incomplete and redispatch a fresh fix subagent.
+            If branch sync facts are missing from artifacts or unresolved conflicts remain,
+            redispatch a fresh fix subagent.
         - id: REQUIRE_PRE_COMMIT_ORDER
-          action: "Run in order: cargo fmt --all; cargo clippy --workspace --all-targets --all-features -- -D warnings; cargo doc --workspace --no-deps; cargo test --workspace."
+          action: |
+            During active edits, run `apm2 fac gates --quick` for short-loop validation.
+            Immediately before push, run `apm2 fac gates` and preserve per-gate outcomes in FAC artifacts.
+        - id: REQUIRE_FAC_PUSH
+          action: "Push only via `apm2 fac push` (`--ticket` preferred, `--branch` fallback)."
         - id: REQUIRE_EVIDENCE
-          action: "Include exact command results and changed file list in implementor response."
+          action: "Require exact command and diff facts in artifacts; do not rely on narrative explanations."
       next: HEARTBEAT_LOOP
 
     - id: REVIEW_GATE_DEFINITION
@@ -140,7 +164,13 @@ decision_tree:
         - id: GATE_RULE
           action: |
             READY_TO_MERGE iff all are true on current HEAD SHA:
-            (1) Forge Admission Cycle=success,
-            (2) PR mergeable state is not CONFLICTING,
-            (3) PR is open and non-draft.
+            (1) `apm2 fac review project --pr <PR_NUMBER> --emit-errors` reports terminal pass state,
+            (2) no FAC projection error lines indicate CI/review failure,
+            (3) PR is still observed in FAC lifecycle projections.
       next: HEARTBEAT_LOOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

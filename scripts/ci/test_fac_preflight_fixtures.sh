@@ -113,6 +113,65 @@ expect_fail "Fork without trust grant denied" \
 expect_fail "Non-main base ref denied" \
     "${FIXTURE_DIR}/event_non_main_base_denied.json" \
     "untrusted_base_ref"
+
+# Trusted app actor: NONE association allowed when actor is in trusted_app_actors
+set +e
+output="$(
+    env -u GH_TOKEN -u GH_PAT -u GITHUB_PAT -u APM2_GITHUB_PAT -u APM2_FAC_PAT \
+        APM2_PREFLIGHT_EVENT_NAME="pull_request_target" \
+        APM2_PREFLIGHT_EVENT_PATH="${FIXTURE_DIR}/event_trusted_app_actor_allowed.json" \
+        APM2_PREFLIGHT_REPOSITORY="guardian-intelligence/apm2" \
+        APM2_PREFLIGHT_ACTOR="forge-admission-cycle-projector[bot]" \
+        APM2_PREFLIGHT_REF_NAME="main" \
+        APM2_PREFLIGHT_TRUST_POLICY_PATH="${POLICY_FIXTURE}" \
+        APM2_CREDENTIAL_HARDENING_CMDLINE_PATH="${CREDENTIAL_FIXTURE_DIR}/cmdline_safe.txt" \
+        GITHUB_TOKEN="ghs_fac_fixture_token_123456789012345678901234567890" \
+            "${PREFLIGHT_SCRIPT}" 2>&1
+)"
+status=$?
+set -e
+if [[ ${status} -ne 0 ]]; then
+    log_fail "Trusted app actor NONE association allowed: expected success, got exit=${status}"
+    echo "${output}" >&2
+elif ! grep -q 'fac-preflight: check=overall decision=ALLOW' <<<"${output}"; then
+    log_fail "Trusted app actor NONE association allowed: missing overall ALLOW decision line"
+    echo "${output}" >&2
+elif ! grep -q 'grant=trusted_app_actor' <<<"${output}"; then
+    log_fail "Trusted app actor NONE association allowed: missing trusted_app_actor grant"
+    echo "${output}" >&2
+else
+    log_pass "Trusted app actor NONE association allowed"
+fi
+
+# Trusted app actor should not bypass NONE association on trusted forks.
+set +e
+output="$(
+    env -u GH_TOKEN -u GH_PAT -u GITHUB_PAT -u APM2_GITHUB_PAT -u APM2_FAC_PAT \
+        APM2_PREFLIGHT_EVENT_NAME="pull_request_target" \
+        APM2_PREFLIGHT_EVENT_PATH="${FIXTURE_DIR}/event_trusted_app_actor_fork_denied.json" \
+        APM2_PREFLIGHT_REPOSITORY="guardian-intelligence/apm2" \
+        APM2_PREFLIGHT_ACTOR="forge-admission-cycle-projector[bot]" \
+        APM2_PREFLIGHT_REF_NAME="main" \
+        APM2_PREFLIGHT_TRUST_POLICY_PATH="${POLICY_FIXTURE}" \
+        APM2_CREDENTIAL_HARDENING_CMDLINE_PATH="${CREDENTIAL_FIXTURE_DIR}/cmdline_safe.txt" \
+        GITHUB_TOKEN="ghs_fac_fixture_token_123456789012345678901234567890" \
+            "${PREFLIGHT_SCRIPT}" 2>&1
+)"
+status=$?
+set -e
+if [[ ${status} -eq 0 ]]; then
+    log_fail "Trusted app actor fork NONE association denied: expected failure, got success"
+    echo "${output}" >&2
+elif ! grep -q 'reason=unauthorized_author_association' <<<"${output}"; then
+    log_fail "Trusted app actor fork NONE association denied: expected unauthorized_author_association"
+    echo "${output}" >&2
+elif ! grep -q 'fac-preflight: check=overall decision=DENY' <<<"${output}"; then
+    log_fail "Trusted app actor fork NONE association denied: missing overall DENY decision line"
+    echo "${output}" >&2
+else
+    log_pass "Trusted app actor fork NONE association denied"
+fi
+
 expect_fail "Policy missing credential posture denied" \
     "${FIXTURE_DIR}/event_owner_allowed.json" \
     "invalid_policy_schema" \

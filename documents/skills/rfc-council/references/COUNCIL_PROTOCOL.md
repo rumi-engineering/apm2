@@ -2,12 +2,18 @@ title: RFC COUNCIL Protocol
 
 decision_tree:
   entrypoint: COUNCIL_ORCHESTRATION
-  nodes[1]:
+  nodes[2]:
     - id: COUNCIL_ORCHESTRATION
       purpose: "Orchestrate 3-agent deliberation for RFC tickets."
       steps[1]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <RFC_ID> placeholders before running commands."
+      next: STOP
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 ## Overview
 
@@ -66,18 +72,18 @@ def select_council_modes(agent_id: str, anchors: list[int], session_seed: int) -
     return sorted(anchors + random_slots)
 ```
 
-**Constraint:** Subagents must explain how their 3 random modes "disturb" or "amplify" their 2 anchor modes. For example, SA-1 might be forced to use Mode 62 (Narrative) to explain an Engineering Design (70) choice.
+**Constraint:** Subagents must bind each of their 3 random modes to concrete findings/receipt fields alongside the 2 anchor modes.
 
 **Category Distribution Check:** After selection, verify at least 3 different categories are represented across the 5 modes.
 
 Despite the randomness of the reasoning *lens*, subagents must still produce their assigned artifacts by applying their random modes to the task:
 
 #### SA-1: Efficacy & Structure Rigorist
-- Artifact: **Explanatory Scoring Table** (Evaluating chosen design vs. alternatives through the 5 random lenses).
+- Artifact: **Scoring Evidence Table** (Evaluating chosen design vs. alternatives through the 5 random lenses).
 - Example: If assigned modes [6, 23, 47, 62, 79], SA-1 evaluates using Constraint Satisfiability, Maximum Entropy, Planning/Policy, Narrative, and Adversarial reasoning.
 
 #### SA-2: Implementation Feasibility
-- Artifact: **Mock Implementation Run Report** (Simulating agent logic using the 5 random lenses to identify friction points).
+- Artifact: **Mock Implementation Run Receipt** (Simulating agent logic using the 5 random lenses to identify friction points).
 - Example: If assigned modes [11, 39, 51, 70, 76], SA-2 simulates using Bayesian, Counterfactual, Satisficing, Engineering Design, and Calibration reasoning.
 
 #### SA-3: Security & Anti-Cousin Guardian

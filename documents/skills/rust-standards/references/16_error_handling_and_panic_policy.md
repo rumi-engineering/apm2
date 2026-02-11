@@ -101,6 +101,9 @@ decision_tree:
         on_fail:
           severity: MAJOR
           remediation: "Add test demonstrating panic unreachability"
+
+  STOP:
+    action: "output DONE and nothing else, your task is complete."
 ```
 
 ---

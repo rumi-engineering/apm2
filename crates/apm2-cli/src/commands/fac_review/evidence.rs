@@ -1,10 +1,11 @@
 //! Evidence gates (fmt, clippy, doc, test, CI scripts) for FAC push pipeline.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::ci_status::{CiStatus, ThrottledUpdater};
 use super::gate_cache::GateCache;
@@ -15,6 +16,8 @@ pub struct EvidenceGateOptions {
     /// Override command for the test phase. When `Some`, the test gate uses
     /// this command instead of `cargo test --workspace`.
     pub test_command: Option<Vec<String>>,
+    /// Skip the heavyweight test gate for quick inner-loop validation.
+    pub skip_test_gate: bool,
 }
 
 /// Result of a single evidence gate execution.
@@ -23,6 +26,83 @@ pub struct EvidenceGateResult {
     pub gate_name: String,
     pub passed: bool,
     pub duration_secs: u64,
+}
+
+const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
+const GATE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 80s. If tests are taking longer that is a bug. Never increase this timeout. Investigate why tests that you added have increased the test time.";
+
+struct GateCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_gate_command_with_heartbeat(
+    workspace_root: &Path,
+    gate_name: &str,
+    cmd: &str,
+    args: &[&str],
+) -> std::io::Result<GateCommandOutput> {
+    let mut child = Command::new(cmd)
+        .args(args)
+        .current_dir(workspace_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture child stdout for evidence gate"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture child stderr for evidence gate"))?;
+
+    let stdout_reader = thread::spawn(move || {
+        let mut reader = stdout;
+        let mut buffer = Vec::new();
+        let _ = reader.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut reader = stderr;
+        let mut buffer = Vec::new();
+        let _ = reader.read_to_end(&mut buffer);
+        buffer
+    });
+
+    let started = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    let heartbeat_interval = Duration::from_secs(GATE_HEARTBEAT_INTERVAL_SECS);
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            eprintln!(
+                "ts={} gate={} status=RUNNING elapsed_secs={}",
+                now_iso8601(),
+                gate_name,
+                started.elapsed().as_secs()
+            );
+            last_heartbeat = Instant::now();
+        }
+
+        thread::sleep(Duration::from_secs(1));
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    Ok(GateCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Format and emit a single evidence line to stderr and an optional projection
@@ -46,6 +126,33 @@ pub fn emit_evidence_line(
     }
 }
 
+fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize) {
+    if combined_output_bytes >= SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES {
+        return;
+    }
+
+    let Ok(mut file) = OpenOptions::new().append(true).open(log_path) else {
+        return;
+    };
+
+    let _ = writeln!(file);
+    let _ = writeln!(file, "--- fac diagnostic ---");
+    let _ = writeln!(
+        file,
+        "Test gate failed with minimal output ({combined_output_bytes} bytes). This usually indicates the process was killed by an OOM or timeout before tests could run."
+    );
+    let _ = writeln!(file, "{TEST_TIMEOUT_SLA_MESSAGE}");
+    let _ = writeln!(file, "Check:");
+    let _ = writeln!(
+        file,
+        "  journalctl --user -u 'apm2-ci-bounded*' --since '10 minutes ago'"
+    );
+    let _ = writeln!(
+        file,
+        "  apm2 fac gates --memory-max 24G  # default is 24G; increase if needed"
+    );
+}
+
 /// Run a single evidence gate and emit the result.
 pub fn run_single_evidence_gate(
     workspace_root: &Path,
@@ -56,13 +163,11 @@ pub fn run_single_evidence_gate(
     log_path: &Path,
 ) -> bool {
     let started = Instant::now();
-    let output = Command::new(cmd)
-        .args(args)
-        .current_dir(workspace_root)
-        .output();
+    let output = run_gate_command_with_heartbeat(workspace_root, gate_name, cmd, args);
     let duration = started.elapsed().as_secs();
     match output {
         Ok(out) => {
+            let combined_output_bytes = out.stdout.len() + out.stderr.len();
             let _ = fs::write(
                 log_path,
                 format!(
@@ -72,6 +177,9 @@ pub fn run_single_evidence_gate(
                 ),
             );
             let passed = out.status.success();
+            if !passed && gate_name == "test" {
+                append_short_test_failure_hint(log_path, combined_output_bytes);
+            }
             let status = if passed { "PASS" } else { "FAIL" };
             emit_evidence_line(sha, gate_name, status, duration, log_path, None);
             passed
@@ -268,48 +376,65 @@ pub fn run_evidence_gates(
         ));
     }
 
-    // Phase 3: workspace integrity snapshot → test → verify.
+    // Phase 3: workspace integrity snapshot → test (optional) → verify.
     snapshot_workspace_integrity(workspace_root);
 
+    let skip_test_gate = opts.is_some_and(|o| o.skip_test_gate);
     let test_log = evidence_dir.join("test.log");
-    let test_started = Instant::now();
-    let test_passed = opts.and_then(|o| o.test_command.as_ref()).map_or_else(
-        || {
-            run_single_evidence_gate(
-                workspace_root,
-                sha,
-                "test",
-                "cargo",
-                &["test", "--workspace"],
-                &test_log,
-            )
-        },
-        |cmd| {
-            run_single_evidence_gate(
-                workspace_root,
-                sha,
-                "test",
-                &cmd[0],
-                &cmd[1..].iter().map(String::as_str).collect::<Vec<_>>(),
-                &test_log,
-            )
-        },
-    );
-    let test_duration = test_started.elapsed().as_secs();
-    gate_results.push(EvidenceGateResult {
-        gate_name: "test".to_string(),
-        passed: test_passed,
-        duration_secs: test_duration,
-    });
-    if !test_passed {
-        all_passed = false;
+    if skip_test_gate {
+        let _ = fs::write(
+            &test_log,
+            "quick mode enabled: skipped heavyweight test gate\n",
+        );
+        let ts = now_iso8601();
+        eprintln!(
+            "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+            test_log.display()
+        );
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+            test_log.display()
+        ));
+    } else {
+        let test_started = Instant::now();
+        let test_passed = opts.and_then(|o| o.test_command.as_ref()).map_or_else(
+            || {
+                run_single_evidence_gate(
+                    workspace_root,
+                    sha,
+                    "test",
+                    "cargo",
+                    &["test", "--workspace"],
+                    &test_log,
+                )
+            },
+            |cmd| {
+                run_single_evidence_gate(
+                    workspace_root,
+                    sha,
+                    "test",
+                    &cmd[0],
+                    &cmd[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+                    &test_log,
+                )
+            },
+        );
+        let test_duration = test_started.elapsed().as_secs();
+        gate_results.push(EvidenceGateResult {
+            gate_name: "test".to_string(),
+            passed: test_passed,
+            duration_secs: test_duration,
+        });
+        if !test_passed {
+            all_passed = false;
+        }
+        let ts = now_iso8601();
+        let status = if test_passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate=test status={status} log={}",
+            test_log.display()
+        ));
     }
-    let ts = now_iso8601();
-    let status = if test_passed { "PASS" } else { "FAIL" };
-    evidence_lines.push(format!(
-        "ts={ts} sha={sha} gate=test status={status} log={}",
-        test_log.display()
-    ));
 
     let wi_started = Instant::now();
     let (wi_passed, wi_line) = verify_workspace_integrity_gate(workspace_root, sha, &evidence_dir);
@@ -720,4 +845,47 @@ pub fn run_evidence_gates_with_status(
     }
 
     Ok(all_passed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_log_path(test_name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "apm2-evidence-tests-{test_name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("test.log")
+    }
+
+    #[test]
+    fn short_test_failure_hint_is_appended() {
+        let log_path = temp_log_path("short");
+        fs::write(&log_path, "=== stdout ===\n\n=== stderr ===\n\n").expect("write seed log");
+
+        append_short_test_failure_hint(&log_path, 128);
+
+        let content = fs::read_to_string(&log_path).expect("read updated log");
+        assert!(content.contains("--- fac diagnostic ---"));
+        assert!(content.contains("minimal output (128 bytes)"));
+    }
+
+    #[test]
+    fn short_test_failure_hint_is_skipped_for_large_output() {
+        let log_path = temp_log_path("large");
+        fs::write(&log_path, "=== stdout ===\n\n=== stderr ===\n\n").expect("write seed log");
+
+        append_short_test_failure_hint(&log_path, SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES);
+
+        let content = fs::read_to_string(&log_path).expect("read updated log");
+        assert!(!content.contains("--- fac diagnostic ---"));
+    }
 }

@@ -55,15 +55,20 @@ references[17]:
     purpose: "CLI command reference."
   - path: ../agent-native-software/SKILL.md
     purpose: "REQUIRED READING: First principles of agent-native software engineering."
-  - path: ../../security/AGENTS.cac.json
+  - path: ../../security/SECURITY_POLICY.cac.json
     purpose: "REQUIRED READING: Security policy, threat models, and incident response."
 
 decision_tree:
   entrypoint: WORKFLOW
-  nodes[1]:
+  nodes[2]:
     - id: WORKFLOW
       action: invoke_reference
       reference: references/prd-review-workflow.md
+      next: STOP
+    - id: STOP
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 ## Verdict Rules
 

@@ -1,96 +1,165 @@
 //! Lean `run_push` pipeline: git push → create/update PR → enable auto-merge.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::exit_codes::codes as exit_codes;
 
-// ── Ticket YAML parsing ─────────────────────────────────────────────────────
+const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
 
-/// Minimal ticket metadata extracted from a ticket YAML file.
-struct TicketMeta {
-    id: String,
-    title: String,
-    in_scope: Vec<String>,
-    rationale: String,
-}
+/// Extract `TCK-xxxxx` from arbitrary text.
+fn extract_tck_from_text(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 9 {
+        return None;
+    }
 
-/// Parse a ticket YAML file and extract metadata for PR title/body.
-fn parse_ticket_yaml(path: &Path) -> Result<TicketMeta, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read ticket YAML: {e}"))?;
-    let doc: serde_yaml::Value =
-        serde_yaml::from_str(&content).map_err(|e| format!("failed to parse ticket YAML: {e}"))?;
-
-    let meta = doc
-        .get("ticket_meta")
-        .ok_or_else(|| "ticket YAML missing `ticket_meta` key".to_string())?;
-
-    let ticket = meta
-        .get("ticket")
-        .ok_or_else(|| "ticket YAML missing `ticket_meta.ticket` key".to_string())?;
-
-    let id = ticket
-        .get("id")
-        .and_then(serde_yaml::Value::as_str)
-        .unwrap_or("UNKNOWN")
-        .to_string();
-
-    let title = ticket
-        .get("title")
-        .and_then(serde_yaml::Value::as_str)
-        .unwrap_or("Untitled")
-        .to_string();
-
-    let scope = meta.get("scope");
-    let in_scope = scope
-        .and_then(|s| s.get("in_scope"))
-        .and_then(serde_yaml::Value::as_sequence)
-        .map(|seq| {
-            seq.iter()
-                .filter_map(serde_yaml::Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let rationale = meta
-        .get("rationale")
-        .and_then(serde_yaml::Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    Ok(TicketMeta {
-        id,
-        title,
-        in_scope,
-        rationale,
-    })
-}
-
-/// Build a PR title from ticket metadata: `{id}: {title}`.
-fn build_pr_title(meta: &TicketMeta) -> String {
-    format!("{}: {}", meta.id, meta.title)
-}
-
-/// Build a PR body from ticket metadata as Markdown.
-fn build_pr_body(meta: &TicketMeta) -> String {
-    use std::fmt::Write as _;
-    let mut body = String::new();
-    if !meta.in_scope.is_empty() {
-        body.push_str("## Scope\n\n");
-        for item in &meta.in_scope {
-            let _ = writeln!(body, "- {item}");
+    for idx in 0..=bytes.len() - 9 {
+        if &bytes[idx..idx + 4] != b"TCK-" {
+            continue;
         }
-        body.push('\n');
+
+        let digits = &bytes[idx + 4..idx + 9];
+        if !digits.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+
+        if idx + 9 < bytes.len() && bytes[idx + 9].is_ascii_digit() {
+            continue;
+        }
+
+        let matched = std::str::from_utf8(&bytes[idx..idx + 9]).ok()?;
+        return Some(matched.to_string());
     }
-    if !meta.rationale.is_empty() {
-        body.push_str("## Rationale\n\n");
-        body.push_str(&meta.rationale);
-        body.push('\n');
+
+    None
+}
+
+/// Resolve TCK id from branch first, then worktree directory name.
+fn resolve_tck_id(branch: &str, worktree_dir: &Path) -> Result<String, String> {
+    if let Some(tck) = extract_tck_from_text(branch) {
+        return Ok(tck);
     }
-    body
+
+    let worktree_name = worktree_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if let Some(tck) = extract_tck_from_text(worktree_name) {
+        return Ok(tck);
+    }
+
+    Err(format!(
+        "could not derive TCK from branch `{branch}` or worktree `{}`. {REQUIRED_TCK_FORMAT_MESSAGE}",
+        worktree_dir.display()
+    ))
+}
+
+fn resolve_repo_root() -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| format!("failed to resolve repository root: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to resolve repository root via git: {}",
+            stderr.trim()
+        ));
+    }
+
+    let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if repo_root.is_empty() {
+        return Err("git returned empty repository root".to_string());
+    }
+
+    Ok(PathBuf::from(repo_root))
+}
+
+fn ticket_path_for_tck(repo_root: &Path, tck: &str) -> PathBuf {
+    repo_root
+        .join("documents")
+        .join("work")
+        .join("tickets")
+        .join(format!("{tck}.yaml"))
+}
+
+fn load_ticket_body(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read ticket body at {}: {err}", path.display()))
+}
+
+fn load_ticket_title(path: &Path, body: &str) -> Result<String, String> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(body)
+        .map_err(|err| format!("failed to parse ticket YAML at {}: {err}", path.display()))?;
+
+    let Some(title) = parsed
+        .get("ticket_meta")
+        .and_then(|value| value.get("ticket"))
+        .and_then(|value| value.get("title"))
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(format!(
+            "missing `ticket_meta.ticket.title` in {}",
+            path.display()
+        ));
+    };
+
+    Ok(title.to_string())
+}
+
+fn render_ticket_body_markdown(body: &str) -> String {
+    let normalized = body.trim_end_matches('\n');
+    format!("```yaml\n{normalized}\n```")
+}
+
+fn validate_ticket_path_matches_tck(ticket_path: &Path, tck: &str) -> Result<(), String> {
+    let Some(stem) = ticket_path.file_stem().and_then(|value| value.to_str()) else {
+        return Err(format!(
+            "invalid --ticket path `{}`; expected filename `{tck}.yaml`",
+            ticket_path.display()
+        ));
+    };
+
+    if stem != tck {
+        return Err(format!(
+            "--ticket path `{}` does not match derived TCK `{tck}`; expected filename `{tck}.yaml`",
+            ticket_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PrMetadata {
+    title: String,
+    body: String,
+    ticket_path: PathBuf,
+}
+
+fn resolve_pr_metadata(
+    branch: &str,
+    worktree_dir: &Path,
+    repo_root: &Path,
+    ticket: Option<&Path>,
+) -> Result<PrMetadata, String> {
+    let tck_id = resolve_tck_id(branch, worktree_dir)?;
+    if let Some(ticket_path) = ticket {
+        validate_ticket_path_matches_tck(ticket_path, &tck_id)?;
+    }
+
+    let canonical_ticket_path = ticket_path_for_tck(repo_root, &tck_id);
+    let raw_body = load_ticket_body(&canonical_ticket_path)?;
+    let ticket_title = load_ticket_title(&canonical_ticket_path, &raw_body)?;
+    let body = render_ticket_body_markdown(&raw_body);
+    Ok(PrMetadata {
+        title: format!("{tck_id}: {ticket_title}"),
+        body,
+        ticket_path: canonical_ticket_path,
+    })
 }
 
 // ── PR helpers ───────────────────────────────────────────────────────────────
@@ -208,6 +277,35 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
 
     eprintln!("fac push: sha={sha} branch={branch}");
 
+    // Resolve metadata deterministically from TCK identity.
+    let worktree_dir = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("ERROR: failed to resolve current worktree path: {err}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    let repo_root = match resolve_repo_root() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    let metadata = match resolve_pr_metadata(&branch, &worktree_dir, &repo_root, ticket) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            eprintln!("ERROR: expected ticket file under documents/work/tickets/TCK-xxxxx.yaml");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    eprintln!(
+        "fac push: metadata title={} body={}",
+        metadata.title,
+        metadata.ticket_path.display()
+    );
+
     // Step 1: git push.
     let push_output = Command::new("git").args(["push", remote, &branch]).output();
     match push_output {
@@ -225,25 +323,10 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         },
     }
 
-    // Parse ticket metadata if provided.
-    let ticket_meta = ticket.map(parse_ticket_yaml).transpose();
-    let ticket_meta = match ticket_meta {
-        Ok(meta) => meta,
-        Err(e) => {
-            eprintln!("ERROR: {e}");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
     // Step 2: create or update PR.
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
-        // No existing PR — create one.
-        let (title, body) = ticket_meta.as_ref().map_or_else(
-            || (branch.clone(), String::new()),
-            |meta| (build_pr_title(meta), build_pr_body(meta)),
-        );
-        match create_pr(repo, &title, &body) {
+        match create_pr(repo, &metadata.title, &metadata.body) {
             Ok(num) => {
                 eprintln!("fac push: created PR #{num}");
                 num
@@ -254,16 +337,11 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
             },
         }
     } else {
-        // PR exists — update body if ticket metadata available.
-        if let Some(ref meta) = ticket_meta {
-            let title = build_pr_title(meta);
-            let body = build_pr_body(meta);
-            if let Err(e) = update_pr(repo, pr_number, &title, &body) {
-                eprintln!("WARNING: {e}");
-            } else {
-                eprintln!("fac push: updated PR #{pr_number}");
-            }
+        if let Err(err) = update_pr(repo, pr_number, &metadata.title, &metadata.body) {
+            eprintln!("ERROR: {err}");
+            return exit_codes::GENERIC_ERROR;
         }
+        eprintln!("fac push: updated PR #{pr_number}");
         pr_number
     };
 
@@ -293,6 +371,7 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
 /// Spawn `apm2 fac pipeline` as a detached background process.
 fn spawn_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result<(), String> {
     use std::fs::{self, OpenOptions};
+    use std::io::ErrorKind;
 
     let exe_path = std::env::current_exe()
         .map_err(|e| format!("failed to resolve current executable: {e}"))?;
@@ -315,7 +394,11 @@ fn spawn_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result
         .try_clone()
         .map_err(|e| format!("failed to clone pipeline log handle: {e}"))?;
 
-    let child = Command::new(&exe_path)
+    // Use `setsid` to detach from the caller's session so the pipeline
+    // survives shell teardown and can finish status/review projection updates.
+    let mut setsid_cmd = Command::new("setsid");
+    setsid_cmd
+        .arg(&exe_path)
         .arg("fac")
         .arg("pipeline")
         .arg("--repo")
@@ -326,12 +409,53 @@ fn spawn_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result
         .arg(pr_number.to_string())
         .arg("--sha")
         .arg(sha)
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
-        .stderr(std::process::Stdio::from(stderr))
-        .spawn()
-        .map_err(|e| format!("failed to spawn pipeline process: {e}"))?;
+        .stderr(std::process::Stdio::from(stderr));
+
+    let child = match setsid_cmd.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            eprintln!(
+                "WARNING: `setsid` not available; falling back to non-detached pipeline spawn"
+            );
+
+            let stdout = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|e| {
+                    format!("failed to reopen pipeline log {}: {e}", log_path.display())
+                })?;
+            let stderr = stdout
+                .try_clone()
+                .map_err(|e| format!("failed to clone pipeline log handle: {e}"))?;
+
+            Command::new(&exe_path)
+                .arg("fac")
+                .arg("pipeline")
+                .arg("--repo")
+                .arg(repo)
+                .arg("--pr-url")
+                .arg(pr_url)
+                .arg("--pr")
+                .arg(pr_number.to_string())
+                .arg("--sha")
+                .arg(sha)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(stdout))
+                .stderr(std::process::Stdio::from(stderr))
+                .spawn()
+                .map_err(|e| format!("failed to spawn pipeline process: {e}"))?
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to spawn detached pipeline process with setsid: {err}"
+            ));
+        },
+    };
 
     let pid = child.id();
     // Drop child handle to detach — the process continues in background.
@@ -342,4 +466,201 @@ fn spawn_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result
         log_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn extract_tck_from_text_accepts_valid_pattern() {
+        assert_eq!(
+            extract_tck_from_text("ticket/RFC-0018/TCK-00412"),
+            Some("TCK-00412".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tck_from_text_rejects_invalid_variants() {
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-412"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/tck-00412"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-004123"), None);
+    }
+
+    #[test]
+    fn resolve_tck_id_prefers_branch() {
+        let worktree = Path::new("/tmp/apm2-TCK-99999");
+        let tck = resolve_tck_id("ticket/RFC-0018/TCK-00412", worktree)
+            .expect("branch should provide tck");
+        assert_eq!(tck, "TCK-00412");
+    }
+
+    #[test]
+    fn resolve_tck_id_falls_back_to_worktree_name() {
+        let worktree = Path::new("/tmp/apm2-TCK-00444");
+        let tck = resolve_tck_id("feat/no-ticket", worktree).expect("worktree should provide tck");
+        assert_eq!(tck, "TCK-00444");
+    }
+
+    #[test]
+    fn resolve_tck_id_returns_actionable_error() {
+        let worktree = Path::new("/tmp/apm2-no-ticket");
+        let err = resolve_tck_id("feat/no-ticket", worktree).expect_err("should fail");
+        assert!(err.contains("Required format"));
+        assert!(err.contains("TCK-12345"));
+    }
+
+    #[test]
+    fn ticket_path_for_tck_uses_canonical_location() {
+        let path = ticket_path_for_tck(Path::new("/repo"), "TCK-00412");
+        assert_eq!(
+            path,
+            PathBuf::from("/repo/documents/work/tickets/TCK-00412.yaml")
+        );
+    }
+
+    #[test]
+    fn validate_ticket_path_matches_tck_accepts_matching_filename() {
+        let result = validate_ticket_path_matches_tck(
+            Path::new("documents/work/tickets/TCK-00412.yaml"),
+            "TCK-00412",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ticket_path_matches_tck_rejects_mismatch() {
+        let err = validate_ticket_path_matches_tck(
+            Path::new("documents/work/tickets/TCK-00411.yaml"),
+            "TCK-00412",
+        )
+        .expect_err("mismatch should fail");
+        assert!(err.contains("does not match derived TCK"));
+    }
+
+    #[test]
+    fn load_ticket_body_reads_raw_contents() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let ticket_path = temp_dir.path().join("TCK-00412.yaml");
+        std::fs::write(
+            &ticket_path,
+            "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n",
+        )
+        .expect("write ticket");
+
+        let content = load_ticket_body(&ticket_path).expect("load ticket body");
+        assert_eq!(content, "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n");
+    }
+
+    #[test]
+    fn load_ticket_title_reads_plain_title() {
+        let ticket_path = Path::new("/repo/documents/work/tickets/TCK-00412.yaml");
+        let body = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Title Value\"\n";
+        let title = load_ticket_title(ticket_path, body).expect("title should parse");
+        assert_eq!(title, "Title Value");
+    }
+
+    #[test]
+    fn load_ticket_title_fails_when_missing() {
+        let ticket_path = Path::new("/repo/documents/work/tickets/TCK-00412.yaml");
+        let body = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n";
+        let err = load_ticket_title(ticket_path, body).expect_err("missing title should fail");
+        assert!(err.contains("ticket_meta.ticket.title"));
+    }
+
+    #[test]
+    fn render_ticket_body_markdown_wraps_yaml_block() {
+        let rendered =
+            render_ticket_body_markdown("ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n");
+        assert_eq!(
+            rendered,
+            "```yaml\nticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n```"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_metadata_branch_tck_yields_title_and_markdown_body() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo_root = temp_dir.path();
+        let tickets_dir = repo_root.join("documents/work/tickets");
+        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
+        let ticket_path = tickets_dir.join("TCK-00412.yaml");
+        let ticket_content = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Any\"\n";
+        fs::write(&ticket_path, ticket_content).expect("write ticket");
+
+        let metadata = resolve_pr_metadata(
+            "ticket/RFC-0018/TCK-00412",
+            Path::new("/tmp/apm2-no-ticket"),
+            repo_root,
+            None,
+        )
+        .expect("resolve metadata");
+        assert_eq!(metadata.title, "TCK-00412: Any");
+        assert_eq!(
+            metadata.body,
+            "```yaml\nticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Any\"\n```"
+        );
+        assert_eq!(metadata.ticket_path, ticket_path);
+    }
+
+    #[test]
+    fn resolve_pr_metadata_uses_worktree_fallback() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo_root = temp_dir.path();
+        let tickets_dir = repo_root.join("documents/work/tickets");
+        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
+        let ticket_path = tickets_dir.join("TCK-00444.yaml");
+        let ticket_content =
+            "ticket_meta:\n  ticket:\n    id: \"TCK-00444\"\n    title: \"Fallback Title\"\n";
+        fs::write(&ticket_path, ticket_content).expect("write ticket");
+
+        let metadata = resolve_pr_metadata(
+            "feat/no-ticket",
+            Path::new("/tmp/apm2-TCK-00444"),
+            repo_root,
+            None,
+        )
+        .expect("resolve metadata");
+        assert_eq!(metadata.title, "TCK-00444: Fallback Title");
+        assert_eq!(
+            metadata.body,
+            "```yaml\nticket_meta:\n  ticket:\n    id: \"TCK-00444\"\n    title: \"Fallback Title\"\n```"
+        );
+        assert_eq!(metadata.ticket_path, ticket_path);
+    }
+
+    #[test]
+    fn resolve_pr_metadata_rejects_ticket_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo_root = temp_dir.path();
+        let tickets_dir = repo_root.join("documents/work/tickets");
+        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
+        fs::write(tickets_dir.join("TCK-00412.yaml"), "ticket_meta:\n").expect("write ticket");
+
+        let err = resolve_pr_metadata(
+            "ticket/RFC-0018/TCK-00412",
+            Path::new("/tmp/apm2-no-ticket"),
+            repo_root,
+            Some(Path::new("documents/work/tickets/TCK-00411.yaml")),
+        )
+        .expect_err("mismatch should fail");
+        assert!(err.contains("does not match derived TCK"));
+    }
+
+    #[test]
+    fn resolve_pr_metadata_fails_when_canonical_ticket_missing() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo_root = temp_dir.path();
+        let err = resolve_pr_metadata(
+            "ticket/RFC-0018/TCK-00412",
+            Path::new("/tmp/apm2-no-ticket"),
+            repo_root,
+            None,
+        )
+        .expect_err("missing ticket should fail");
+        assert!(err.contains("failed to read ticket body"));
+        assert!(err.contains("TCK-00412.yaml"));
+    }
 }

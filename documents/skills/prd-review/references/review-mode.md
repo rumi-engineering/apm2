@@ -2,9 +2,9 @@
 
 decision_tree:
   entrypoint: REVIEW_AND_REFINE
-  nodes[1]:
+  nodes[2]:
     - id: REVIEW_AND_REFINE
-      purpose: "Execute formal review gates with iterative refinement and emit findings."
+      purpose: "Execute formal review gates with iterative refinement and persist findings artifacts."
       steps[7]:
         - id: ITERATIVE_GATE_EXECUTION
           action: |
@@ -51,8 +51,14 @@ decision_tree:
         - id: CRITICAL_FAILURE
           if: "any gate status is FAILED after refinement"
           then:
-            stop: true
+            next: STOP
         - id: COMPLETED
           if: "all gates executed and refined"
           then:
-            stop: true
+            next: STOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

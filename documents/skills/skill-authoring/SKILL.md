@@ -24,8 +24,14 @@ references[2]:
 
 decision_tree:
   entrypoint: STANDARD
-  nodes[1]:
+  nodes[2]:
     - id: STANDARD
       purpose: "Load the canonical authoring standard before writing or editing any skill instructions."
       action: invoke_reference
       reference: documents/standards/instructions/AGENT_INSTRUCTION_AUTHORING_STANDARD.md
+      next: STOP
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

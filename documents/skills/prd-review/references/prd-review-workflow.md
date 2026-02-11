@@ -2,7 +2,7 @@
 
 decision_tree:
   entrypoint: VALIDATE_AND_CLASSIFY
-  nodes[1]:
+  nodes[2]:
     - id: VALIDATE_AND_CLASSIFY
       purpose: "Validate inputs and branch to the correct mode."
       steps[5]:
@@ -28,3 +28,9 @@ decision_tree:
           if: "mode is REVIEW"
           then:
             next_reference: references/review-mode.md
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

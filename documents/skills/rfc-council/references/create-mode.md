@@ -2,7 +2,7 @@ title: RFC CREATE Mode
 
 decision_tree:
   entrypoint: CREATE_FLOW
-  nodes[1]:
+  nodes[2]:
     - id: CREATE_FLOW
       purpose: "Generate RFC and tickets from PRD."
       steps[6]:
@@ -60,7 +60,13 @@ decision_tree:
         - id: FINISHED
           if: "always"
           then:
-            stop: true
+            next: STOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 ---
 
