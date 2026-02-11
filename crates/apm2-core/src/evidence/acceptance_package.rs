@@ -193,14 +193,12 @@ impl AcceptancePackageV1 {
                 .then_with(|| {
                     left.cas_address
                         .as_deref()
-                        .unwrap_or("")
-                        .cmp(right.cas_address.as_deref().unwrap_or(""))
+                        .cmp(&right.cas_address.as_deref())
                 })
                 .then_with(|| {
                     left.ledger_event_id
                         .as_deref()
-                        .unwrap_or("")
-                        .cmp(right.ledger_event_id.as_deref().unwrap_or(""))
+                        .cmp(&right.ledger_event_id.as_deref())
                 })
         });
 

@@ -92,8 +92,9 @@ use apm2_core::fac::taint::{
     TaintLevel as RuntimeTaintLevel, TaintPolicy, TaintViolation, evaluate_tool_argument_ingress,
 };
 use apm2_core::pcac::{
-    ArbitrationOutcome, EvaluatorTuple, PcacPolicyKnobs, TemporalArbitrationReceiptV1,
-    TemporalPredicateId, check_freshness_dominance, check_revocation_dominance,
+    ArbitrationOutcome, AuthorityConsumeRecordV1, EvaluatorTuple, PcacPolicyKnobs,
+    TemporalArbitrationReceiptV1, TemporalPredicateId, check_freshness_dominance,
+    check_revocation_dominance,
 };
 use apm2_core::tool::{self, tool_request as tool_req};
 use apm2_holon::defect::{
@@ -3679,6 +3680,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         request_arguments: &[u8],
         boundary_flow_state: &BoundaryFlowRuntimeState,
         pending_pcac: Option<&PendingPcacAuthority>,
+        consume_record: Option<&AuthorityConsumeRecordV1>,
         timestamp_ns: u64,
     ) -> Result<(), String> {
         struct PreparedReceipt {
@@ -3694,6 +3696,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let Some(pending_pcac) = pending_pcac else {
             return Err(
                 "promotion-critical request missing PCAC lifecycle authority (fail-closed)"
+                    .to_string(),
+            );
+        };
+
+        let Some(consume_record) = consume_record else {
+            return Err(
+                "promotion-critical request missing kernel consume record (fail-closed)"
                     .to_string(),
             );
         };
@@ -3763,7 +3772,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "session_id": session_id,
             "lease_id": lease_id,
             "request_id": request_id,
-            "certificate": &pending_pcac.certificate,
+            "ajc_id": hex::encode(consume_record.ajc_id),
+            "consumed_time_envelope_ref": hex::encode(consume_record.consumed_time_envelope_ref),
+            "consumed_at_tick": consume_record.consumed_at_tick,
+            "effect_selector_digest": hex::encode(consume_record.effect_selector_digest),
             "pre_actuation_receipt_hashes": &pending_pcac.pre_actuation_receipt_hashes,
             "temporal_arbitration_receipts": &pending_pcac.temporal_arbitration_receipts,
             "timestamp_ns": timestamp_ns,
@@ -7532,6 +7544,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             LeakageWitnessV1,
             TimingWitnessV1,
         )> = None;
+        let mut boundary_flow_state_for_package: Option<BoundaryFlowRuntimeState> = None;
         let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class)
             && matches!(
                 &decision,
@@ -7605,7 +7618,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             };
-            let boundary_flow_state_for_package = boundary_flow_state.clone();
+            boundary_flow_state_for_package = Some(boundary_flow_state.clone());
             if self.non_strict_boundary_mode_for_tier(tool_class, risk_tier) {
                 let Some(waiver_hash) = non_strict_waiver_hash else {
                     return Ok(SessionResponse::error(
@@ -7634,29 +7647,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     boundary_flow_state,
                 ) {
                 Ok(context_token) => {
-                    if let Err(error) = self.emit_portable_acceptance_package(
-                        &token.session_id,
-                        &token.lease_id,
-                        &request_id,
-                        tool_class,
-                        risk_tier,
-                        &request_arguments,
-                        &boundary_flow_state_for_package,
-                        pending_pcac.as_ref(),
-                        timestamp_ns,
-                    ) {
-                        warn!(
-                            session_id = %token.session_id,
-                            tool_class = %tool_class,
-                            request_id = %request_id,
-                            error = %error,
-                            "RequestTool denied: portable acceptance evidence reverification failed (fail-closed)"
-                        );
-                        return Ok(SessionResponse::error(
-                            SessionErrorCode::SessionErrorToolNotAllowed,
-                            format!("portable acceptance evidence verification failed: {error}"),
-                        ));
-                    }
+                    // Evidence emission relocated to handle_broker_decision
+                    // (after successful consume) per Finding-001 review fix.
                     Some(context_token)
                 },
                 Err(defects) => {
@@ -7739,7 +7731,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let mut response = self.handle_broker_decision(
             decision,
             &token.session_id,
+            &token.lease_id,
             tool_class,
+            risk_tier,
             &request_arguments,
             actuation_timestamp,
             &episode_id,
@@ -7748,6 +7742,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             toctou_verification_required,
             pending_pcac,
             channel_context_token,
+            boundary_flow_state_for_package.as_ref(),
         );
 
         if !defects.is_empty() {
@@ -7868,7 +7863,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
         session_id: &str,
+        lease_id: &str,
         tool_class: ToolClass,
+        risk_tier: RiskTier,
         request_arguments: &[u8],
         actuation_timestamp: ReplayTimestamp,
         episode_id: &EpisodeId,
@@ -7877,6 +7874,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         toctou_verification_required: bool,
         pending_pcac: Option<PendingPcacAuthority>,
         channel_context_token: Option<String>,
+        boundary_flow_state_for_package: Option<&BoundaryFlowRuntimeState>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -8347,6 +8345,37 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             return Ok(SessionResponse::error(
                                 SessionErrorCode::SessionErrorToolNotAllowed,
                                 "PCAC authority denied before effect: redundancy receipt already consumed or invalid".to_string(),
+                            ));
+                        }
+                    }
+
+                    // Finding-001 fix: emit portable acceptance evidence AFTER
+                    // successful consume, using the kernel-produced consume record
+                    // instead of synthesizing from join-time certificate state.
+                    if let Some(bfs) = boundary_flow_state_for_package {
+                        if let Err(error) = self.emit_portable_acceptance_package(
+                            session_id,
+                            lease_id,
+                            &request_id,
+                            tool_class,
+                            risk_tier,
+                            request_arguments,
+                            bfs,
+                            Some(&pending_pcac),
+                            Some(&consume_record),
+                            timestamp_ns,
+                        ) {
+                            warn!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                error = %error,
+                                "RequestTool denied: portable acceptance evidence reverification failed (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!(
+                                    "portable acceptance evidence verification failed: {error}"
+                                ),
                             ));
                         }
                     }
@@ -15732,13 +15761,16 @@ mod tests {
                 .handle_broker_decision(
                     Ok(decision),
                     "session-001",
+                    "lease-001",
                     ToolClass::Read,
+                    RiskTier::Tier0,
                     b"{}",
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
                     Some(&receipt),
                     None,
                     false,
+                    None,
                     None,
                     None,
                 )
@@ -16423,7 +16455,9 @@ mod tests {
                 .handle_broker_decision(
                     decision,
                     "session-001",
+                    "lease-001",
                     ToolClass::Read,
+                    RiskTier::Tier0,
                     b"{}",
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
@@ -16431,6 +16465,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                 )
                 .expect("handle_broker_decision should return application-level response");
@@ -16592,7 +16627,9 @@ mod tests {
                 .handle_broker_decision(
                     decision,
                     session_id,
+                    "lease-001",
                     ToolClass::Read,
+                    RiskTier::Tier0,
                     request_arguments,
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
@@ -16600,6 +16637,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                 )
                 .expect("handle_broker_decision should return application-level response");
@@ -16759,7 +16797,9 @@ mod tests {
                 .handle_broker_decision(
                     decision,
                     session_id,
+                    "lease-001",
                     ToolClass::Read,
+                    RiskTier::Tier0,
                     request_arguments,
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
@@ -16767,6 +16807,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                 )
                 .expect("handle_broker_decision should return application-level response");
@@ -16894,7 +16935,9 @@ mod tests {
                 .handle_broker_decision(
                     Ok(decision),
                     session_id,
+                    "lease-001",
                     ToolClass::Read,
+                    RiskTier::Tier0,
                     request_arguments,
                     actuation_timestamp,
                     &episode_id,
@@ -16902,6 +16945,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                 )
                 .expect("dispatch should return application-level response");
@@ -17041,7 +17085,9 @@ mod tests {
                 .handle_broker_decision(
                     Ok(decision),
                     session_id,
+                    "lease-001",
                     ToolClass::Read,
+                    RiskTier::Tier0,
                     request_arguments,
                     actuation_timestamp,
                     &episode_id,
@@ -17049,6 +17095,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                 )
                 .expect("dispatch should return application-level response");
