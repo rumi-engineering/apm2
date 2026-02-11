@@ -31,15 +31,13 @@ notes:
   - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces, including findings retrieval via `apm2 fac review findings --pr <N> --json`."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
 
-references[7]:
+references[6]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
     purpose: "CI and validation contract for implementation completion."
   - path: "references/orchestration-loop.md"
     purpose: "Primary decision tree for 1-20 PR control-loop orchestration."
-  - path: "references/scaling-profiles.md"
-    purpose: "Concurrency budgets, queue limits, and anti-stall thresholds by PR count."
   - path: "@documents/skills/implementor-default/SKILL.md"
     purpose: "Default implementor skill; use this for all fix-agent dispatches."
   - path: "@documents/reviews/SECURITY_REVIEW_PROMPT.md"
@@ -47,47 +45,13 @@ references[7]:
   - path: "@documents/reviews/CODE_QUALITY_PROMPT.md"
     purpose: "Code-quality review prompt contract used by FAC review dispatch."
 
-implementor_warm_handoff_required_reads[17]:
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "REQUIRED READING: APM2 terminology and ontology."
-  - path: "@documents/skills/implementor-default/SKILL.md"
-    purpose: "Default implementor execution contract and 5-Whys-derived gates."
-  - path: "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json"
-    purpose: "Mode #07: Type-Theoretic Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/49-robust-worst-case.json"
-    purpose: "Mode #49: Robust / Worst-Case Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json"
-    purpose: "Mode #08: Counterexample-Guided Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/65-deontic.json"
-    purpose: "Mode #65: Deontic (Authority) Reasoning"
-  - path: "@documents/security/SECURITY_POLICY.cac.json"
-    purpose: "Security Documentation"
-  - path: "@documents/security/THREAT_MODEL.cac.json"
-    purpose: "Threat model context and trust-boundary assumptions."
-  - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
-    purpose: "RS-15: Errors, Panics, Diagnostics"
-  - path: "@documents/skills/rust-standards/references/20_testing_evidence_and_ci.md"
-    purpose: "RS-20: Testing Evidence and CI"
-  - path: "@documents/skills/rust-standards/references/25_api_design_stdlib_quality.md"
-    purpose: "RS-25: API Design"
-  - path: "@documents/skills/rust-standards/references/27_collections_allocation_models.md"
-    purpose: "RS-27: Collections and Allocation"
-  - path: "@documents/skills/rust-standards/references/30_paths_filesystem_os.md"
-    purpose: "RS-30: Paths and Filesystem"
-  - path: "@documents/skills/rust-standards/references/31_io_protocol_boundaries.md"
-    purpose: "RS-31: I/O and Protocol Boundaries"
-  - path: "@documents/skills/rust-standards/references/34_security_adjacent_rust.md"
-    purpose: "RS-34: Security-Adjacent Rust"
-  - path: "@documents/skills/rust-standards/references/39_hazard_catalog_checklists.md"
-    purpose: "RS-39: Hazard Catalog"
-  - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
-    purpose: "RS-41: Safe Patterns"
-
-implementor_warm_handoff_required_payload[4]:
+implementor_warm_handoff_required_payload[5]:
   - field: implementor_skill_invocation
     requirement: "Dispatch prompt MUST begin with `/implementor-default <TICKET_ID or PR_CONTEXT>`; `/ticket` is deprecated."
-  - field: required_reads
-    requirement: "Include implementor_warm_handoff_required_reads and explicitly instruct REQUIRED READING before editing."
+  - field: implementor_core_instruction_source
+    requirement: "State that `@documents/skills/implementor-default/SKILL.md` and its `references[...]` are the primary execution contract for implementation."
+  - field: prompt_scope_boundary
+    requirement: "Keep orchestrator-authored prompt content narrow: include only PR/ticket-specific deltas (current SHA, findings, blockers, required evidence, worktree path) and avoid duplicating generic workflow already defined in implementor-default."
   - field: latest_review_findings
     requirement: "Include complete findings from the latest review cycle, covering BLOCKER, MAJOR, MINOR, and NIT severities."
   - field: worktree
@@ -169,6 +133,7 @@ invariants[15]:
   - "Fix subagents resolve merge conflicts to zero before making code changes."
   - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
+  - "Implementor handoff prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
   - "Prefer fresh fix agents after failed review rounds or stalled progress."
   - "Record every dispatch decision with observed evidence keys (head SHA, CI, review status, action id)."
   - "Throughput optimization should be paired with quality countermetrics (reopen rate, rollback count, repeat BLOCKER rate)."
