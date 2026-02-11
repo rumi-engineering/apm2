@@ -4790,133 +4790,6 @@ fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8
     Ok((parent_lease_id, identity_proof_hash))
 }
 
-/// Replay-critical fields persisted for `IngestReviewReceipt` idempotency.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReceiptReplayBindings {
-    lease_id: String,
-    work_id: String,
-    changeset_digest: [u8; 32],
-    verdict: String,
-    identity_proof_hash: [u8; 32],
-    artifact_bundle_hash: [u8; 32],
-    blocked_reason_code: Option<u32>,
-    blocked_log_hash: Option<[u8; 32]>,
-}
-
-fn normalize_receipt_replay_verdict(verdict: &str) -> Result<String, String> {
-    let canonical = verdict.trim().to_ascii_uppercase();
-    match canonical.as_str() {
-        "APPROVE" | "APPROVED" => Ok("APPROVE".to_string()),
-        "BLOCKED" => Ok("BLOCKED".to_string()),
-        _ => Err(format!("unsupported verdict value: {verdict}")),
-    }
-}
-
-/// Extracts replay-critical fields from a persisted review receipt payload.
-///
-/// Supports both payload shapes used by emitters:
-/// - wrapper JSON with hex-encoded inner payload in `"payload"` (stub emitter)
-/// - direct top-level fields (`SQLite` emitter)
-fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplayBindings, String> {
-    let wrapper = serde_json::from_slice::<serde_json::Value>(event_payload)
-        .map_err(|e| format!("cannot parse receipt payload wrapper: {e}"))?;
-
-    let inner_payload = wrapper
-        .get("payload")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|hex_payload| hex::decode(hex_payload).ok())
-        .and_then(|inner_bytes| serde_json::from_slice::<serde_json::Value>(&inner_bytes).ok());
-
-    let lookup_value = |field: &str| {
-        inner_payload
-            .as_ref()
-            .and_then(|inner| inner.get(field))
-            .or_else(|| wrapper.get(field))
-    };
-    let lookup_field = |field: &str| lookup_value(field).and_then(serde_json::Value::as_str);
-
-    let lease_id = lookup_field("lease_id")
-        .or_else(|| lookup_field("episode_id"))
-        .map(str::to_owned)
-        .ok_or_else(|| "missing lease_id".to_string())?;
-    if lease_id.is_empty() {
-        return Err("lease_id is empty".to_string());
-    }
-    let work_id = lookup_field("work_id")
-        .or_else(|| lookup_field("lease_id"))
-        .or_else(|| lookup_field("episode_id"))
-        .map(str::to_owned)
-        .ok_or_else(|| "missing work_id".to_string())?;
-    if work_id.is_empty() {
-        return Err("work_id is empty".to_string());
-    }
-
-    let changeset_digest_hex =
-        lookup_field("changeset_digest").ok_or_else(|| "missing changeset_digest".to_string())?;
-    let changeset_digest = decode_hash32_hex("changeset_digest", changeset_digest_hex)?;
-
-    let verdict_value = lookup_field("verdict")
-        .map(str::to_owned)
-        .or_else(|| {
-            lookup_field("event_type").and_then(|event_type| match event_type {
-                "review_receipt_recorded" | "ReviewReceiptRecorded" => Some("APPROVE".to_string()),
-                "review_blocked_recorded" | "ReviewBlockedRecorded" => Some("BLOCKED".to_string()),
-                _ => None,
-            })
-        })
-        .ok_or_else(|| "missing verdict".to_string())?;
-    let verdict = normalize_receipt_replay_verdict(&verdict_value)?;
-
-    let identity_proof_hash_hex = lookup_field("identity_proof_hash")
-        .ok_or_else(|| "missing identity_proof_hash".to_string())?;
-    let identity_proof_hash_vec = hex::decode(identity_proof_hash_hex)
-        .map_err(|e| format!("identity_proof_hash is not valid hex: {e}"))?;
-    crate::identity::validate_identity_proof_hash(&identity_proof_hash_vec)
-        .map_err(|e| format!("identity_proof_hash validation failed: {e}"))?;
-    let identity_proof_hash: [u8; 32] = identity_proof_hash_vec
-        .as_slice()
-        .try_into()
-        .expect("validated to 32 bytes by validate_identity_proof_hash");
-
-    let artifact_bundle_hash_hex = lookup_field("artifact_bundle_hash")
-        .ok_or_else(|| "missing artifact_bundle_hash".to_string())?;
-    let artifact_bundle_hash = decode_hash32_hex("artifact_bundle_hash", artifact_bundle_hash_hex)?;
-
-    let blocked_reason_code = lookup_value("blocked_reason_code")
-        .or_else(|| lookup_value("reason_code"))
-        .map(|value| match value {
-            serde_json::Value::Number(num) => {
-                let reason_u64 = num.as_u64().ok_or_else(|| {
-                    "blocked_reason_code must be a non-negative integer".to_string()
-                })?;
-                u32::try_from(reason_u64)
-                    .map_err(|_| format!("blocked_reason_code must fit in u32, got {reason_u64}"))
-            },
-            serde_json::Value::String(text) => text
-                .parse::<u32>()
-                .map_err(|e| format!("blocked_reason_code is not a valid u32: {e}")),
-            other => Err(format!(
-                "blocked_reason_code has unsupported JSON type: {other}"
-            )),
-        })
-        .transpose()?;
-
-    let blocked_log_hash = lookup_field("blocked_log_hash")
-        .map(|value| decode_hash32_hex("blocked_log_hash", value))
-        .transpose()?;
-
-    Ok(ReceiptReplayBindings {
-        lease_id,
-        work_id,
-        changeset_digest,
-        verdict,
-        identity_proof_hash,
-        artifact_bundle_hash,
-        blocked_reason_code,
-        blocked_log_hash,
-    })
-}
-
 // ============================================================================
 // Connection Context
 // ============================================================================
@@ -6599,16 +6472,12 @@ impl StopConditionPolicy {
     }
 }
 
-/// Rollout policy for privileged PCAC lifecycle enforcement (TCK-00424).
+/// Privileged PCAC lifecycle policy surface.
 ///
-/// `DelegateSublease` is unconditionally PCAC-gated. This policy retains
-/// staged control only for `IngestReviewReceipt`.
+/// `DelegateSublease` and `IngestReviewReceipt` are both unconditionally
+/// PCAC-gated (mandatory cutover).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PrivilegedPcacPolicy {
-    /// Require PCAC lifecycle join/revalidate/consume in
-    /// `IngestReviewReceipt`.
-    pub require_ajc_for_ingest_review_receipt: bool,
-}
+pub struct PrivilegedPcacPolicy {}
 
 type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
 
@@ -12753,19 +12622,6 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // WVR-0103: Log once that identity proof hash is validated as
-        // shape-only commitment (Phase 1 / pre-CAS transport).
-        {
-            static PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
-            PROOF_WAIVER_WARN.call_once(|| {
-                warn!(
-                    waiver = "WVR-0103",
-                    "identity proof hash validated as shape-only commitment; \
-                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0103)"
-                );
-            });
-        }
-
         // Validate changeset_digest is exactly 32 bytes
         if request.changeset_digest.len() != 32 {
             return Ok(PrivilegedResponse::error(
@@ -13072,11 +12928,6 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
-        let request_blocked_reason_code = if verdict == ReviewReceiptVerdict::Blocked {
-            Some(request.blocked_reason_code)
-        } else {
-            None
-        };
         let request_blocked_log_hash_arr: Option<[u8; 32]> =
             if verdict == ReviewReceiptVerdict::Blocked {
                 Some(
@@ -13096,162 +12947,6 @@ impl PrivilegedDispatcher {
                 "review_blocked_recorded" => "ReviewBlockedRecorded".to_string(),
                 other => other.to_string(),
             }
-        };
-
-        let validate_receipt_replay = |existing: &SignedLedgerEvent| -> Result<(), String> {
-            let original = extract_receipt_replay_bindings(&existing.payload).map_err(|e| {
-                format!("receipt exists but replay bindings could not be extracted: {e}")
-            })?;
-
-            if original.lease_id != request.lease_id {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_lease_id = %original.lease_id,
-                    requested_lease_id = %request.lease_id,
-                    "Idempotent review receipt replay rejected: lease_id mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted for lease '{}', not '{}'",
-                    request.receipt_id, original.lease_id, request.lease_id
-                ));
-            }
-
-            if original.work_id != authoritative_work_id {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_work_id = %original.work_id,
-                    requested_work_id = %authoritative_work_id,
-                    "Idempotent review receipt replay rejected: work_id mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted for work '{}', not '{}'",
-                    request.receipt_id,
-                    original.work_id,
-                    authoritative_work_id.as_str()
-                ));
-            }
-
-            if !bool::from(
-                original
-                    .identity_proof_hash
-                    .ct_eq(&request_identity_proof_hash_arr),
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_identity_proof_hash = %hex::encode(original.identity_proof_hash),
-                    requested_identity_proof_hash = %hex::encode(request_identity_proof_hash_arr),
-                    "Idempotent review receipt replay rejected: identity_proof_hash mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with identity_proof_hash '{}', not '{}'",
-                    request.receipt_id,
-                    hex::encode(original.identity_proof_hash),
-                    hex::encode(request_identity_proof_hash_arr),
-                ));
-            }
-
-            if !bool::from(
-                original
-                    .changeset_digest
-                    .ct_eq(&request_changeset_digest_arr),
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_changeset_digest = %hex::encode(original.changeset_digest),
-                    requested_changeset_digest = %hex::encode(request_changeset_digest_arr),
-                    "Idempotent review receipt replay rejected: changeset_digest mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with changeset_digest '{}', not '{}'",
-                    request.receipt_id,
-                    hex::encode(original.changeset_digest),
-                    hex::encode(request_changeset_digest_arr),
-                ));
-            }
-
-            if original.verdict != request_verdict {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_verdict = %original.verdict,
-                    requested_verdict = %request_verdict,
-                    "Idempotent review receipt replay rejected: verdict mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with verdict '{}', not '{}'",
-                    request.receipt_id, original.verdict, request_verdict
-                ));
-            }
-
-            if !bool::from(
-                original
-                    .artifact_bundle_hash
-                    .ct_eq(&request_artifact_bundle_hash_arr),
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_artifact_bundle_hash = %hex::encode(original.artifact_bundle_hash),
-                    requested_artifact_bundle_hash = %hex::encode(request_artifact_bundle_hash_arr),
-                    "Idempotent review receipt replay rejected: artifact_bundle_hash mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with artifact_bundle_hash '{}', not '{}'",
-                    request.receipt_id,
-                    hex::encode(original.artifact_bundle_hash),
-                    hex::encode(request_artifact_bundle_hash_arr),
-                ));
-            }
-
-            if let Some(original_blocked_reason_code) = original.blocked_reason_code {
-                let requested_blocked_reason_code = request_blocked_reason_code
-                    .map_or_else(|| "<missing>".to_string(), |code| code.to_string());
-                if Some(original_blocked_reason_code) != request_blocked_reason_code {
-                    warn!(
-                        receipt_id = %request.receipt_id,
-                        existing_event_id = %existing.event_id,
-                        original_blocked_reason_code = original_blocked_reason_code,
-                        requested_blocked_reason_code = %requested_blocked_reason_code,
-                        "Idempotent review receipt replay rejected: blocked_reason_code mismatch"
-                    );
-                    return Err(format!(
-                        "receipt_id '{}' was originally submitted with blocked_reason_code '{}', not '{}'",
-                        request.receipt_id,
-                        original_blocked_reason_code,
-                        requested_blocked_reason_code,
-                    ));
-                }
-            }
-
-            if let Some(original_blocked_log_hash) = original.blocked_log_hash {
-                let requested_blocked_log_hash = request_blocked_log_hash_arr
-                    .map_or_else(|| "<missing>".to_string(), hex::encode);
-                let blocked_log_hash_matches =
-                    request_blocked_log_hash_arr.is_some_and(|request_blocked_log_hash| {
-                        bool::from(original_blocked_log_hash.ct_eq(&request_blocked_log_hash))
-                    });
-                if !blocked_log_hash_matches {
-                    warn!(
-                        receipt_id = %request.receipt_id,
-                        existing_event_id = %existing.event_id,
-                        original_blocked_log_hash = %hex::encode(original_blocked_log_hash),
-                        requested_blocked_log_hash = %requested_blocked_log_hash,
-                        "Idempotent review receipt replay rejected: blocked_log_hash mismatch"
-                    );
-                    return Err(format!(
-                        "receipt_id '{}' was originally submitted with blocked_log_hash '{}', not '{}'",
-                        request.receipt_id,
-                        hex::encode(original_blocked_log_hash),
-                        requested_blocked_log_hash,
-                    ));
-                }
-            }
-
-            Ok(())
         };
 
         // =====================================================================
@@ -13299,10 +12994,9 @@ impl PrivilegedDispatcher {
             // Full validation: non-zero + CAS resolvability
             if let Err(auth_err) = validate_review_outcome_bindings(&bindings, cas.as_ref()) {
                 let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
-                let work_id = authoritative_work_id.clone();
                 emit_authority_binding_defect(
                     self.event_emitter.as_ref(),
-                    &work_id,
+                    &authoritative_work_id,
                     &auth_err,
                     defect_ts,
                 );
@@ -13327,13 +13021,6 @@ impl PrivilegedDispatcher {
             &authoritative_work_id,
             &request_changeset_digest_hex,
         ) {
-            if let Err(message) = validate_receipt_replay(&existing) {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    message,
-                ));
-            }
-
             info!(
                 receipt_id = %request.receipt_id,
                 lease_id = %request.lease_id,
@@ -13353,44 +13040,30 @@ impl PrivilegedDispatcher {
 
         // If the transport-level receipt_id already exists under a different
         // semantic tuple, fail closed with a conflict.
-        if let Some(existing) = self
+        if self
             .event_emitter
             .get_event_by_receipt_id(&request.receipt_id)
+            .is_some()
         {
-            if let Err(message) = validate_receipt_replay(&existing) {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    message,
-                ));
-            }
-
-            return Ok(PrivilegedResponse::IngestReviewReceipt(
-                IngestReviewReceiptResponse {
-                    receipt_id: request.receipt_id.clone(),
-                    event_type: to_response_event_type(&existing.event_type),
-                    event_id: existing.event_id,
-                },
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "receipt_id '{}' already exists with a different semantic identity tuple; \
+                     PCAC linear consumption prevents reuse",
+                    request.receipt_id
+                ),
             ));
         }
 
-        let mut pcac_lifecycle_artifacts: Option<PrivilegedPcacLifecycleArtifacts> = None;
-        if self
-            .privileged_pcac_policy
-            .require_ajc_for_ingest_review_receipt
-        {
-            let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    "PCAC authority gate not wired for IngestReviewReceipt (fail-closed)",
-                ));
-            };
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for IngestReviewReceipt (fail-closed)",
+            ));
+        };
 
-            let (
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-            ) = match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -13403,115 +13076,126 @@ impl PrivilegedDispatcher {
                 },
             };
 
-            let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
-            let capability_manifest_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-capability-v1");
-                hasher.update(request.lease_id.as_bytes());
-                hasher.update(lease_for_receipt.gate_id.as_bytes());
-                hasher.update(&resolved_policy_hash);
-                hasher.update(&request_changeset_digest_arr);
-                *hasher.finalize().as_bytes()
-            };
-            let scope_witness_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-scope-v1");
-                hasher.update(request.receipt_id.as_bytes());
-                hasher.update(&request_changeset_digest_arr);
-                hasher.update(&request_artifact_bundle_hash_arr);
-                hasher.update(&request.verdict.to_le_bytes());
-                hasher.update(authenticated_reviewer_id.as_bytes());
-                hasher.update(expected_actor_id.as_bytes());
-                if verdict == ReviewReceiptVerdict::Blocked {
-                    hasher.update(&request.blocked_reason_code.to_le_bytes());
-                    let blocked_log_hash = request_blocked_log_hash_arr
-                        .expect("validated blocked_log_hash for BLOCKED verdict");
-                    hasher.update(&blocked_log_hash);
-                }
-                *hasher.finalize().as_bytes()
-            };
-            let freshness_policy_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-freshness-policy-v1");
-                hasher.update(&resolved_policy_hash);
-                hasher.update(request.lease_id.as_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let stop_budget_profile_digest = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-stop-budget-v1");
-                hasher.update(&[u8::from(
-                    self.stop_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.emergency_stop_active()),
-                )]);
-                hasher.update(&[u8::from(
-                    self.stop_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.governance_stop_active()),
-                )]);
-                hasher.update(request.receipt_id.as_bytes());
-                hasher.update(&request.verdict.to_le_bytes());
+        let capability_manifest_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-privileged-ingest-review-capability-v1");
+            hasher.update(request.lease_id.as_bytes());
+            hasher.update(lease_for_receipt.gate_id.as_bytes());
+            hasher.update(&resolved_policy_hash);
+            hasher.update(&request_changeset_digest_arr);
+            *hasher.finalize().as_bytes()
+        };
+        let scope_witness_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-privileged-ingest-review-scope-v1");
+            hasher.update(request.receipt_id.as_bytes());
+            hasher.update(&request_changeset_digest_arr);
+            hasher.update(&request_artifact_bundle_hash_arr);
+            hasher.update(&request.verdict.to_le_bytes());
+            hasher.update(authenticated_reviewer_id.as_bytes());
+            hasher.update(expected_actor_id.as_bytes());
+            if verdict == ReviewReceiptVerdict::Blocked {
                 hasher.update(&request.blocked_reason_code.to_le_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let effect_intent_digest = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-intent-v1");
-                hasher.update(request.lease_id.as_bytes());
-                hasher.update(request.receipt_id.as_bytes());
-                hasher.update(authenticated_reviewer_id.as_bytes());
-                hasher.update(expected_actor_id.as_bytes());
-                hasher.update(&request_changeset_digest_arr);
-                hasher.update(&request_artifact_bundle_hash_arr);
-                hasher.update(&request_identity_proof_hash_arr);
-                hasher.update(&request.verdict.to_le_bytes());
-                hasher.update(&request.blocked_reason_code.to_le_bytes());
-                if let Some(blocked_log_hash) = request_blocked_log_hash_arr {
-                    hasher.update(&blocked_log_hash);
-                }
-                *hasher.finalize().as_bytes()
-            };
-
-            let pcac_input = AuthorityJoinInputV1 {
-                session_id: request.receipt_id.clone(),
-                holon_id: None,
-                intent_digest: effect_intent_digest,
-                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
-                capability_manifest_hash,
-                scope_witness_hashes: vec![scope_witness_hash],
-                lease_id: request.lease_id.clone(),
-                permeability_receipt_hash: None,
-                identity_proof_hash: request_identity_proof_hash_arr,
-                identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
-                pointer_only_waiver_hash: None,
-                directory_head_hash: join_revocation_head,
-                freshness_policy_hash,
-                freshness_witness_tick: join_freshness_tick,
-                stop_budget_profile_digest,
-                pre_actuation_receipt_hashes: Vec::new(),
-                risk_tier: pcac_risk_tier,
-                determinism_class: PcacDeterminismClass::Deterministic,
-                time_envelope_ref: join_time_envelope_ref,
-                as_of_ledger_anchor: join_ledger_anchor,
-            };
-
-            match self.enforce_privileged_pcac_lifecycle(
-                "IngestReviewReceipt",
-                pcac_gate,
-                &pcac_input,
-                &request.lease_id,
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-                effect_intent_digest,
-            ) {
-                Ok(artifacts) => pcac_lifecycle_artifacts = artifacts,
-                Err(response) => return Ok(response),
+                let blocked_log_hash = request_blocked_log_hash_arr
+                    .expect("validated blocked_log_hash for BLOCKED verdict");
+                hasher.update(&blocked_log_hash);
             }
-        }
+            *hasher.finalize().as_bytes()
+        };
+        let freshness_policy_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-privileged-ingest-review-freshness-policy-v1");
+            hasher.update(&resolved_policy_hash);
+            hasher.update(request.lease_id.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let stop_budget_profile_digest = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-privileged-ingest-review-stop-budget-v1");
+            hasher.update(&[u8::from(
+                self.stop_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.emergency_stop_active()),
+            )]);
+            hasher.update(&[u8::from(
+                self.stop_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.governance_stop_active()),
+            )]);
+            hasher.update(request.receipt_id.as_bytes());
+            hasher.update(&request.verdict.to_le_bytes());
+            hasher.update(&request.blocked_reason_code.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let effect_intent_digest = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-privileged-ingest-review-intent-v1");
+            hasher.update(request.lease_id.as_bytes());
+            hasher.update(request.receipt_id.as_bytes());
+            hasher.update(authenticated_reviewer_id.as_bytes());
+            hasher.update(expected_actor_id.as_bytes());
+            hasher.update(&request_changeset_digest_arr);
+            hasher.update(&request_artifact_bundle_hash_arr);
+            hasher.update(&request_identity_proof_hash_arr);
+            hasher.update(&request.verdict.to_le_bytes());
+            hasher.update(&request.blocked_reason_code.to_le_bytes());
+            if let Some(blocked_log_hash) = request_blocked_log_hash_arr {
+                hasher.update(&blocked_log_hash);
+            }
+            *hasher.finalize().as_bytes()
+        };
+
+        let pcac_input = AuthorityJoinInputV1 {
+            session_id: request.receipt_id.clone(),
+            holon_id: None,
+            intent_digest: effect_intent_digest,
+            boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
+            capability_manifest_hash,
+            scope_witness_hashes: vec![scope_witness_hash],
+            lease_id: request.lease_id.clone(),
+            permeability_receipt_hash: None,
+            identity_proof_hash: request_identity_proof_hash_arr,
+            identity_evidence_level: IdentityEvidenceLevel::Verified,
+            pointer_only_waiver_hash: None,
+            directory_head_hash: join_revocation_head,
+            freshness_policy_hash,
+            freshness_witness_tick: join_freshness_tick,
+            stop_budget_profile_digest,
+            pre_actuation_receipt_hashes: Vec::new(),
+            risk_tier: pcac_risk_tier,
+            determinism_class: PcacDeterminismClass::Deterministic,
+            time_envelope_ref: join_time_envelope_ref,
+            as_of_ledger_anchor: join_ledger_anchor,
+        };
+
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            "IngestReviewReceipt",
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                // TCK-00483: IngestReviewReceipt is mandatory-PCAC. If
+                // enforce_privileged_pcac_lifecycle returned Ok(None) due to
+                // lifecycle_enforcement=false in policy, deny fail-closed.
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "IngestReviewReceipt requires PCAC lifecycle evidence (mandatory cutover); \
+                         lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
 
         // ---- Phase 3: Get HTF timestamp ----
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -13603,23 +13287,12 @@ impl PrivilegedDispatcher {
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
                         format!(
-                            "receipt identity tuple (receipt_id='{}', lease_id='{}', work_id='{}', \
-                             changeset_digest='{}') hit a uniqueness race, but the existing event \
-                             could not be resolved",
+                            "receipt identity tuple hit a uniqueness race, but the existing event \
+                             could not be resolved (receipt_id='{}')",
                             request.receipt_id,
-                            request.lease_id,
-                            authoritative_work_id.as_str(),
-                            request_changeset_digest_hex
                         ),
                     ));
                 };
-
-                if let Err(message) = validate_receipt_replay(&existing) {
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        message,
-                    ));
-                }
 
                 info!(
                     receipt_id = %request.receipt_id,
@@ -13629,7 +13302,7 @@ impl PrivilegedDispatcher {
 
                 return Ok(PrivilegedResponse::IngestReviewReceipt(
                     IngestReviewReceiptResponse {
-                        receipt_id: request.receipt_id.clone(),
+                        receipt_id: request.receipt_id,
                         event_type: to_response_event_type(&existing.event_type),
                         event_id: existing.event_id,
                     },
@@ -24903,8 +24576,13 @@ mod tests {
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
 
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
             let dispatcher = PrivilegedDispatcher::new()
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             dispatcher.lease_validator.register_lease_with_executor(
                 lease_id,
                 work_id,
@@ -24923,12 +24601,13 @@ mod tests {
                 include_attestation: true,
             });
             // Register work claim so risk-tier resolution succeeds.
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 work_id,
                 &executor_actor_id,
                 WorkRole::Reviewer,
                 risk_tier,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 work_id,
@@ -26135,10 +25814,10 @@ mod tests {
             };
             let frame1 = encode_ingest_review_receipt_request(&request1);
             let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
-            assert!(
-                matches!(response1, PrivilegedResponse::IngestReviewReceipt(_)),
-                "first receipt submission should succeed"
-            );
+            let first_event_id = match response1 {
+                PrivilegedResponse::IngestReviewReceipt(resp) => resp.event_id,
+                other => panic!("first receipt submission should succeed, got {other:?}"),
+            };
 
             let request2 = IngestReviewReceiptRequest {
                 lease_id: "lease-dup-proof-001".to_string(),
@@ -26154,15 +25833,15 @@ mod tests {
             let frame2 = encode_ingest_review_receipt_request(&request2);
             let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
             match response2 {
-                PrivilegedResponse::Error(err) => {
-                    assert!(
-                        err.message.contains("identity_proof_hash"),
-                        "expected identity_proof_hash mismatch rejection, got: {}",
-                        err.message
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-DUP-PROOF-001");
+                    assert_eq!(
+                        resp.event_id, first_event_id,
+                        "duplicate semantic identity should resolve to the original event"
                     );
                 },
                 other => panic!(
-                    "expected duplicate receipt_id + identity_proof_hash mismatch rejection, got {other:?}"
+                    "expected duplicate semantic identity to return idempotent replay, got {other:?}"
                 ),
             }
         }
@@ -26366,13 +26045,17 @@ mod tests {
             match response2 {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("lease"),
-                        "expected lease mismatch rejection, got: {}",
+                        err.message
+                            .contains("already exists with a different semantic identity tuple")
+                            && err
+                                .message
+                                .contains("PCAC linear consumption prevents reuse"),
+                        "expected semantic tuple conflict rejection, got: {}",
                         err.message
                     );
                 },
                 other => panic!(
-                    "expected duplicate receipt_id + lease mismatch rejection, got {other:?}"
+                    "expected duplicate receipt_id semantic tuple conflict rejection, got {other:?}"
                 ),
             }
         }
@@ -26506,9 +26189,7 @@ mod tests {
                 .with_gate_orchestrator(orch)
                 .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
                 .with_pcac_lifecycle_gate(pcac_gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: false,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -26917,9 +26598,7 @@ mod tests {
                 .with_gate_orchestrator(orch)
                 .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
                 .with_pcac_lifecycle_gate(pcac_gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: false,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -28059,6 +27738,9 @@ mod tests {
             // TCK-00408: CAS is mandatory for ingest (fail-closed).
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
 
             let mut dispatcher = PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
@@ -28074,7 +27756,10 @@ mod tests {
                 manifest_loader,
                 subscription_registry,
             );
-            dispatcher = dispatcher.with_cas(cas as Arc<dyn ContentAddressedStore>);
+            dispatcher = dispatcher
+                .with_cas(cas as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
 
             let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
@@ -28239,12 +27924,13 @@ mod tests {
             );
 
             // Register work claim via SqliteWorkRegistry (production path)
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-SQL-001",
                 &executor_actor_id,
                 WorkRole::Reviewer,
                 0,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-SQL-001",
@@ -28331,12 +28017,13 @@ mod tests {
             );
 
             // Register work claim at Tier2 (should be rejected)
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-SQL-T2",
                 &executor_actor_id,
                 WorkRole::Reviewer,
                 2,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-SQL-T2",
@@ -28411,9 +28098,7 @@ mod tests {
             let dispatcher = dispatcher
                 .with_gate_orchestrator(orch)
                 .with_pcac_lifecycle_gate(pcac_gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: false,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             let cas = dispatcher
                 .cas
                 .as_ref()
@@ -28754,9 +28439,7 @@ mod tests {
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_lifecycle_enabled_succeeds() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -28847,9 +28530,7 @@ mod tests {
 
         #[test]
         fn test_ingest_review_receipt_privileged_pcac_lifecycle_enabled_succeeds() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: true,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -28935,9 +28616,7 @@ mod tests {
 
         #[test]
         fn test_ingest_review_blocked_privileged_pcac_lifecycle_enabled_succeeds() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: true,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -29023,9 +28702,7 @@ mod tests {
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_tier2_pointer_only_denied() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -29076,7 +28753,7 @@ mod tests {
         }
 
         #[test]
-        fn test_ingest_review_receipt_privileged_pcac_join_uses_pointer_only_evidence() {
+        fn test_ingest_review_receipt_privileged_pcac_join_uses_verified_evidence() {
             use apm2_core::pcac::{
                 AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
                 AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
@@ -29213,9 +28890,7 @@ mod tests {
 
             let dispatcher = dispatcher
                 .with_pcac_lifecycle_gate(gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: true,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "pcac-review-pointer-only-observe".to_string(),
@@ -29237,16 +28912,14 @@ mod tests {
 
             let observed = observed_levels.lock().expect("lock poisoned");
             assert!(
-                observed.contains(&IdentityEvidenceLevel::PointerOnly),
-                "IngestReviewReceipt must construct join input with PointerOnly identity evidence"
+                observed.contains(&IdentityEvidenceLevel::Verified),
+                "IngestReviewReceipt must construct join input with Verified identity evidence (WVR-0103 retired)"
             );
         }
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_deny_delegation_widening() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
             let cas = state
@@ -29519,9 +29192,7 @@ mod tests {
             let dispatcher = dispatcher
                 .with_gate_orchestrator(orchestrator)
                 .with_pcac_lifecycle_gate(gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: false,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "pcac-parent-stale".to_string(),
@@ -29695,9 +29366,7 @@ mod tests {
             let dispatcher = dispatcher
                 .with_gate_orchestrator(orchestrator)
                 .with_pcac_lifecycle_gate(gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: false,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "pcac-parent-duplicate-consume".to_string(),
@@ -29741,9 +29410,7 @@ mod tests {
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_deny_lifecycle_failure() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, true);
 
@@ -29806,9 +29473,7 @@ mod tests {
 
         #[test]
         fn test_ingest_review_receipt_privileged_pcac_deny_lifecycle_failure() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_ingest_review_receipt: true,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, true);
 
@@ -29941,10 +29606,16 @@ mod tests {
                 .privileged_dispatcher()
                 .dispatch(&review_frame, &ctx)
                 .unwrap();
-            assert!(
-                matches!(review_response, PrivilegedResponse::IngestReviewReceipt(_)),
-                "IngestReviewReceipt should remain compatible when its rollout flag is off"
-            );
+            match review_response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC authority gate not wired"),
+                        "IngestReviewReceipt must fail-closed when PCAC lifecycle gate is missing, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected IngestReviewReceipt fail-closed denial, got {other:?}"),
+            }
 
             let review_events = state
                 .privileged_dispatcher()
@@ -29955,8 +29626,112 @@ mod tests {
                 .filter(|event| event.event_type == "review_receipt_recorded")
                 .count();
             assert_eq!(
-                review_event_count, 1,
-                "IngestReviewReceipt must still emit review_receipt_recorded when rollout flag is off"
+                review_event_count, 0,
+                "IngestReviewReceipt must not emit review_receipt_recorded when PCAC gate is missing"
+            );
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_pcac_mandatory_even_when_policy_default() {
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy::default();
+            let (state, ctx, caller_actor, _cas_dir) =
+                setup_dispatcher_state_with_privileged_pcac(policy, false);
+
+            let cas = state
+                .privileged_dispatcher()
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by DispatcherState");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: state.privileged_dispatcher(),
+                    cas: cas.as_ref(),
+                    lease_id: "pcac-review-lifecycle-disabled",
+                    work_id: "W-PCAC-RR-LIFECYCLE-DISABLED",
+                    gate_id: "gate-pcac-review-lifecycle-disabled",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xA3; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-PCAC-RR-LIFECYCLE-DISABLED",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xA3; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs {
+                lifecycle_enforcement: false,
+                ..apm2_core::pcac::PcacPolicyKnobs::default()
+            });
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PCAC-RR-LIFECYCLE-DISABLED",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PCAC-RR-LIFECYCLE-DISABLED".to_string(),
+                    lease_id: "pcac-review-lifecycle-disabled".to_string(),
+                    actor_id: caller_actor.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "pcac-review-lifecycle-disabled".to_string(),
+                receipt_id: "RR-PCAC-LIFECYCLE-DISABLED".to_string(),
+                reviewer_actor_id: caller_actor,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x55; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("IngestReviewReceipt requires PCAC lifecycle evidence (mandatory cutover)"),
+                        "mandatory cutover must deny when lifecycle_enforcement=false, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("expected IngestReviewReceipt mandatory PCAC denial, got {other:?}")
+                },
+            }
+
+            let review_events = state
+                .privileged_dispatcher()
+                .event_emitter()
+                .get_events_by_work_id("W-PCAC-RR-LIFECYCLE-DISABLED");
+            let review_event_count = review_events
+                .iter()
+                .filter(|event| event.event_type == "review_receipt_recorded")
+                .count();
+            assert_eq!(
+                review_event_count, 0,
+                "mandatory PCAC denial must not emit review_receipt_recorded events"
             );
         }
 
