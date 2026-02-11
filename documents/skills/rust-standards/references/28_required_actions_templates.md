@@ -166,3 +166,61 @@ receipt_schema:
 
 **Verdict:** FAIL
 ```
+
+---
+
+## PCAC: When to Use It
+
+```yaml
+pcac_required_for_handlers:
+  predicate: |
+    handler performs authority-bearing side effects
+  examples:
+    - "issues/delegates/revokes capabilities or leases"
+    - "records authoritative review/security receipts"
+    - "executes tool/process/network effects under privileged authority"
+    - "writes authoritative ledger events that change admission state"
+  required_lifecycle:
+    - join
+    - revalidate
+    - consume
+    - effect
+  reviewer_default:
+    missing_lifecycle_severity: MAJOR
+    finding_text: "Handler has authority-bearing side effects but no AJC lifecycle."
+```
+
+---
+
+## PCAC Pre-Commit Template (Authority-Bearing Handlers)
+
+```yaml
+pre_commit_pcac_checklist:
+  1_builder:
+    required: true
+    check: "Use PrivilegedPcacInputBuilder (or module-equivalent canonical builder) for join input assembly."
+
+  2_lifecycle_calls:
+    required: true
+    check: "Run canonical lifecycle before effect: join -> revalidate -> consume."
+
+  3_fail_closed_wiring:
+    required: true
+    check: "If PCAC gate/policy/freshness inputs are missing, deny request (no bypass)."
+
+  4_intent_equality:
+    required: true
+    check: "Recompute effect intent at consume boundary and deny on mismatch."
+
+  5_durable_evidence:
+    required: true
+    check: "Persist lifecycle selectors (e.g., ajc_id, consume_tick, selector digest) on authoritative event payload."
+
+  6_test_obligations:
+    required: true
+    check:
+      - "test: missing gate wiring denies"
+      - "test: stale/missing revalidation input denies"
+      - "test: duplicate consume/replay denies"
+      - "test: intent mismatch denies"
+```
