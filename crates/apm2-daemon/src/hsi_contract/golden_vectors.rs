@@ -62,7 +62,7 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // advisory to authoritative with receipt_required per RFC-0020 section 1.3
     // (they perform real side effects). SubscribePulse and UnsubscribePulse
     // added to SessionMessageType::all_request_variants() (deduplicated).
-    expected_hash: "c4edad4f4977bf83619803dc1167bd92913b592113d441aaf71a58080fcf6942",
+    expected_hash: "a7a8ffa941c507ace06c73d5ce27ef39a9e267390c0c820c16466aa3b2ac41a7",
 };
 
 /// Golden vector: minimal manifest with a single route.
