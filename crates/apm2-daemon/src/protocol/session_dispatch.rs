@@ -66,12 +66,17 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use apm2_core::channel::{
-    BoundaryFlowPolicyBinding, DeclassificationIntentScope, LeakageBudgetReceipt,
-    LeakageEstimatorFamily, RedundancyDeclassificationReceipt, TimingChannelBudget,
+    BoundaryFlowPolicyBinding, DeclassificationIntentScope, DisclosurePolicyBinding,
+    LeakageBudgetReceipt, LeakageEstimatorFamily, RedundancyDeclassificationReceipt,
+    TimingChannelBudget,
 };
 use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::{Hash, Signer as CryptoSigner};
+use apm2_core::disclosure::{
+    DisclosureChannelClass, DisclosurePolicyMode, DisclosurePolicySnapshot,
+    phase_disclosure_profile, validate_disclosure_policy,
+};
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 #[cfg(test)]
 use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
@@ -454,6 +459,7 @@ const BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES: &[u8] =
     b"apm2.canonicalizer.jcs|1.0.0|dcp://apm2.cac/canonicalizer/vectors@v1";
 const DEFAULT_LEAKAGE_CONFIDENCE_LABEL: &str = "runtime-default";
 const DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT: bool = true;
+const DISCLOSURE_POLICY_MAX_AGE_NS: u64 = 86_400_000_000_000;
 
 /// Primary environment variable for GH-DIRECT stage policy selection.
 const GH_DIRECT_STAGE_ENV_PRIMARY: &str = "APM2_GH_DIRECT_STAGE";
@@ -1061,6 +1067,10 @@ struct PendingPcacAuthority {
 struct BoundaryFlowHints {
     #[serde(default)]
     declassification: Option<BoundaryDeclassificationHints>,
+    #[serde(default)]
+    disclosure_channel_class: Option<DisclosureChannelClass>,
+    #[serde(default)]
+    disclosure_policy_snapshot: Option<DisclosurePolicySnapshot>,
     #[serde(default)]
     leakage_budget_receipt: Option<LeakageBudgetHints>,
     #[serde(default)]
@@ -2463,6 +2473,130 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    const fn disclosure_phase_id_for_tier(risk_tier: RiskTier) -> &'static str {
+        match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 => "pre_federation",
+            RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => "replication_oriented",
+        }
+    }
+
+    const fn requires_disclosure_policy_interlock(
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+    ) -> bool {
+        risk_tier.requires_enhanced_evidence()
+            && !matches!(
+                tool_class,
+                ToolClass::Read | ToolClass::ListFiles | ToolClass::Search
+            )
+    }
+
+    const fn default_disclosure_channel_class(_tool_class: ToolClass) -> DisclosureChannelClass {
+        DisclosureChannelClass::Internal
+    }
+
+    fn synthesize_disclosure_policy_snapshot(
+        &self,
+        expected_mode: DisclosurePolicyMode,
+        phase_id: &str,
+        policy_digest: Hash,
+        current_time_ns: u64,
+    ) -> DisclosurePolicySnapshot {
+        let mut snapshot = DisclosurePolicySnapshot {
+            mode: expected_mode,
+            epoch: 1,
+            phase_id: phase_id.to_string(),
+            policy_digest,
+            signature: Vec::new(),
+            issuer_verifying_key: [0u8; 32],
+            issued_at_ns: current_time_ns,
+            expires_at_ns: current_time_ns.saturating_add(DISCLOSURE_POLICY_MAX_AGE_NS),
+        };
+        snapshot.sign(self.channel_context_signer.as_ref());
+        snapshot
+    }
+
+    fn resolve_disclosure_policy_binding(
+        &self,
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+        hints: Option<&BoundaryFlowHints>,
+        authoritative_policy_root_digest: Option<Hash>,
+        current_time_ns: u64,
+    ) -> DisclosurePolicyBinding {
+        let phase_id = Self::disclosure_phase_id_for_tier(risk_tier);
+        let expected_mode = phase_disclosure_profile(phase_id);
+        let attempted_channel = hints
+            .and_then(|hints| hints.disclosure_channel_class)
+            .unwrap_or_else(|| Self::default_disclosure_channel_class(tool_class));
+        let required_for_effect = Self::requires_disclosure_policy_interlock(tool_class, risk_tier);
+
+        let mut snapshot = hints.and_then(|hints| hints.disclosure_policy_snapshot.clone());
+        if required_for_effect
+            && snapshot.is_none()
+            && let Some(policy_root_digest) = authoritative_policy_root_digest
+        {
+            snapshot = Some(self.synthesize_disclosure_policy_snapshot(
+                expected_mode,
+                phase_id,
+                policy_root_digest,
+                current_time_ns,
+            ));
+        }
+
+        if let Some(snapshot) = snapshot {
+            let validation = validate_disclosure_policy(&snapshot, phase_id, current_time_ns, None);
+            let state_valid = validation.is_ok();
+            let state_reason = validation
+                .err()
+                .map_or_else(|| "valid".to_string(), |error| error.to_string());
+
+            return DisclosurePolicyBinding {
+                required_for_effect,
+                state_valid,
+                active_mode: snapshot.mode,
+                expected_mode,
+                attempted_channel,
+                policy_snapshot_digest: snapshot.policy_digest,
+                admitted_policy_epoch_root_digest: authoritative_policy_root_digest
+                    .unwrap_or(snapshot.policy_digest),
+                policy_epoch: snapshot.epoch,
+                phase_id: snapshot.phase_id,
+                state_reason,
+            };
+        }
+
+        if !required_for_effect {
+            return DisclosurePolicyBinding {
+                required_for_effect,
+                state_valid: true,
+                active_mode: expected_mode,
+                expected_mode,
+                attempted_channel,
+                policy_snapshot_digest: authoritative_policy_root_digest.unwrap_or([0x44; 32]),
+                admitted_policy_epoch_root_digest: authoritative_policy_root_digest
+                    .unwrap_or([0x44; 32]),
+                policy_epoch: 0,
+                phase_id: phase_id.to_string(),
+                state_reason: "not required".to_string(),
+            };
+        }
+
+        DisclosurePolicyBinding {
+            required_for_effect,
+            state_valid: false,
+            active_mode: expected_mode,
+            expected_mode,
+            attempted_channel,
+            policy_snapshot_digest: [0u8; 32],
+            admitted_policy_epoch_root_digest: authoritative_policy_root_digest
+                .unwrap_or([0u8; 32]),
+            policy_epoch: 0,
+            phase_id: phase_id.to_string(),
+            state_reason: "missing disclosure policy snapshot".to_string(),
+        }
+    }
+
     fn derive_policy_binding(
         decision: &Result<ToolDecision, crate::episode::BrokerError>,
         authoritative_policy_root_digest: Option<Hash>,
@@ -2742,6 +2876,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         risk_tier: Option<RiskTier>,
         taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
         request_arguments: &[u8],
+        current_time_ns: u64,
         // When Some, this is the broker's active policy hash admitted as
         // authoritative because the PCAC kernel validated the full authority
         // chain (including `as_of_ledger_anchor`) via AJC issuance.
@@ -2872,6 +3007,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     },
                 )
         };
+        let disclosure_policy_binding = self.resolve_disclosure_policy_binding(
+            tool_class,
+            risk_tier,
+            hints.as_ref(),
+            authoritative_policy_root_digest,
+            current_time_ns,
+        );
 
         Ok(BoundaryFlowRuntimeState {
             taint_allow: base_taint_allow,
@@ -2882,6 +3024,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             policy_binding: Self::derive_policy_binding(decision, authoritative_policy_root_digest),
             leakage_budget_receipt,
             timing_channel_budget,
+            disclosure_policy_binding,
             leakage_budget_policy_max_bits: policy_leakage_budget_bits,
             claimed_leakage_budget_bits,
             timing_budget_policy_max_ticks: policy_timing_budget_ticks,
@@ -6153,6 +6296,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 Some(risk_tier),
                 &taint_assessment,
                 &request_arguments,
+                timestamp_ns,
                 if pending_pcac.is_some() {
                     Some(broker.active_policy_hash())
                 } else {
@@ -10415,6 +10559,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("first boundary-flow runtime state should build");
@@ -10461,6 +10606,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("second boundary-flow runtime state should build");
@@ -10574,6 +10720,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("first boundary-flow runtime state should build");
@@ -10606,6 +10753,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("second boundary-flow runtime state should build");
@@ -10646,6 +10794,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("boundary-flow runtime state should build");
@@ -10731,6 +10880,7 @@ mod tests {
                 Some(RiskTier::Tier3),
                 &taint_assessment,
                 &request_arguments,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("boundary-flow runtime state should build");
@@ -10765,6 +10915,228 @@ mod tests {
                     == apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
             }),
             "forged low timing hints must trigger timing-budget defects: {defects:?}",
+        );
+    }
+
+    #[test]
+    fn test_tier2_missing_disclosure_policy_snapshot_denied_fail_closed() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
+        let policy_hash = [0x61; 32];
+        let now_ns: u64 = 1_700_000_000_000_000_000;
+        let decision = Ok(ToolDecision::Allow {
+            request_id: "REQ-MISSING-DISCLOSURE".to_string(),
+            capability_id: "cap-inference-tier2".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let request_arguments = serde_json::to_vec(&serde_json::json!({ "prompt": "hello" }))
+            .expect("arguments serialization");
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+
+        let boundary_flow_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                "session-001",
+                "lease-001",
+                "REQ-MISSING-DISCLOSURE",
+                ToolClass::Inference,
+                &decision,
+                Some(RiskTier::Tier2),
+                &taint_assessment,
+                &request_arguments,
+                now_ns,
+                None,
+            )
+            .expect("boundary-flow runtime state should build");
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let result = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                "lease-001",
+                "REQ-MISSING-DISCLOSURE",
+                1_700_000_000,
+                &ToolClass::Inference,
+                true,
+                true,
+                true,
+                true,
+                boundary_flow_state,
+            );
+
+        let defects = result.expect_err(
+            "Tier2+ authoritative requests must fail-closed on missing disclosure policy snapshot",
+        );
+        assert!(
+            defects.iter().any(|defect| {
+                defect.violation_class
+                    == apm2_core::channel::ChannelViolationClass::DisclosurePolicyStateInvalid
+            }),
+            "missing snapshot must emit disclosure state defect: {defects:?}",
+        );
+    }
+
+    #[test]
+    fn test_tier2_stale_disclosure_policy_snapshot_denied_fail_closed() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
+        let policy_hash = [0x62; 32];
+        let now_ns: u64 = 1_700_000_000_000_000_000;
+        let signer = apm2_core::crypto::Signer::generate();
+        let mut stale_snapshot = DisclosurePolicySnapshot {
+            mode: DisclosurePolicyMode::TradeSecretOnly,
+            epoch: 4,
+            phase_id: "replication_oriented".to_string(),
+            policy_digest: policy_hash,
+            signature: Vec::new(),
+            issuer_verifying_key: [0u8; 32],
+            issued_at_ns: now_ns.saturating_sub(DISCLOSURE_POLICY_MAX_AGE_NS.saturating_mul(2)),
+            expires_at_ns: now_ns.saturating_sub(1),
+        };
+        stale_snapshot.sign(&signer);
+
+        let decision = Ok(ToolDecision::Allow {
+            request_id: "REQ-STALE-DISCLOSURE".to_string(),
+            capability_id: "cap-inference-tier2".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let request_arguments = serde_json::to_vec(&serde_json::json!({
+            "prompt": "hello",
+            "boundary_flow": {
+                "disclosure_channel_class": "internal",
+                "disclosure_policy_snapshot": stale_snapshot
+            }
+        }))
+        .expect("arguments serialization");
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+
+        let boundary_flow_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                "session-001",
+                "lease-001",
+                "REQ-STALE-DISCLOSURE",
+                ToolClass::Inference,
+                &decision,
+                Some(RiskTier::Tier2),
+                &taint_assessment,
+                &request_arguments,
+                now_ns,
+                Some(policy_hash),
+            )
+            .expect("boundary-flow runtime state should build");
+
+        let validation_signer = apm2_core::crypto::Signer::generate();
+        let result = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token_with_flow(
+                &validation_signer,
+                "lease-001",
+                "REQ-STALE-DISCLOSURE",
+                1_700_000_000,
+                &ToolClass::Inference,
+                true,
+                true,
+                true,
+                true,
+                boundary_flow_state,
+            );
+
+        let defects = result.expect_err(
+            "Tier2+ authoritative requests must fail-closed on stale disclosure policy snapshot",
+        );
+        assert!(
+            defects.iter().any(|defect| {
+                defect.violation_class
+                    == apm2_core::channel::ChannelViolationClass::DisclosurePolicyStateInvalid
+                    && defect.detail.contains("expired")
+            }),
+            "stale snapshot must emit expiry disclosure state defect: {defects:?}",
+        );
+    }
+
+    #[test]
+    fn test_trade_secret_mode_denies_patent_channel_with_structured_defect() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
+        let policy_hash = [0x63; 32];
+        let now_ns: u64 = 1_700_000_000_000_000_000;
+        let signer = apm2_core::crypto::Signer::generate();
+        let mut snapshot = DisclosurePolicySnapshot {
+            mode: DisclosurePolicyMode::TradeSecretOnly,
+            epoch: 9,
+            phase_id: "replication_oriented".to_string(),
+            policy_digest: policy_hash,
+            signature: Vec::new(),
+            issuer_verifying_key: [0u8; 32],
+            issued_at_ns: now_ns.saturating_sub(1_000),
+            expires_at_ns: now_ns.saturating_add(DISCLOSURE_POLICY_MAX_AGE_NS),
+        };
+        snapshot.sign(&signer);
+
+        let decision = Ok(ToolDecision::Allow {
+            request_id: "REQ-PATENT-DENY".to_string(),
+            capability_id: "cap-inference-tier2".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let request_arguments = serde_json::to_vec(&serde_json::json!({
+            "prompt": "patent workflow",
+            "boundary_flow": {
+                "disclosure_channel_class": "patent_filing",
+                "disclosure_policy_snapshot": snapshot
+            }
+        }))
+        .expect("arguments serialization");
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+
+        let boundary_flow_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                "session-001",
+                "lease-001",
+                "REQ-PATENT-DENY",
+                ToolClass::Inference,
+                &decision,
+                Some(RiskTier::Tier2),
+                &taint_assessment,
+                &request_arguments,
+                now_ns,
+                Some(policy_hash),
+            )
+            .expect("boundary-flow runtime state should build");
+
+        let validation_signer = apm2_core::crypto::Signer::generate();
+        let result = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token_with_flow(
+                &validation_signer,
+                "lease-001",
+                "REQ-PATENT-DENY",
+                1_700_000_000,
+                &ToolClass::Inference,
+                true,
+                true,
+                true,
+                true,
+                boundary_flow_state,
+            );
+
+        let defects =
+            result.expect_err("trade-secret mode must deny patent/provisional disclosure channels");
+        assert!(
+            defects.iter().any(|defect| {
+                defect.violation_class
+                    == apm2_core::channel::ChannelViolationClass::DisclosureChannelNotAdmitted
+                    && defect.detail.contains("attempted_channel=PatentFiling")
+            }),
+            "patent channel deny must emit structured disclosure defect: {defects:?}",
         );
     }
 

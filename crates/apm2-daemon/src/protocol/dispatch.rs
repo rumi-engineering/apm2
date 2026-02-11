@@ -32,14 +32,16 @@ use std::time::{Duration, SystemTime};
 
 use apm2_core::channel::{
     BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource,
-    ChannelViolationClass, DeclassificationIntentScope, LeakageBudgetReceipt,
-    LeakageEstimatorFamily, RedundancyDeclassificationReceipt, TimingChannelBudget,
-    derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
+    ChannelViolationClass, DeclassificationIntentScope, DisclosurePolicyBinding,
+    LeakageBudgetReceipt, LeakageEstimatorFamily, RedundancyDeclassificationReceipt,
+    TimingChannelBudget, derive_channel_source_witness, issue_channel_context_token,
+    validate_channel_boundary,
 };
 use apm2_core::credentials::{
     AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
 };
 use apm2_core::determinism::canonicalize_json;
+use apm2_core::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
 use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
@@ -7344,6 +7346,8 @@ pub struct BoundaryFlowRuntimeState {
     pub leakage_budget_receipt: LeakageBudgetReceipt,
     /// Timing-channel release-bucketing witness.
     pub timing_channel_budget: TimingChannelBudget,
+    /// Disclosure-control policy interlock binding.
+    pub disclosure_policy_binding: DisclosurePolicyBinding,
     /// Policy-derived leakage budget ceiling for the request risk tier.
     pub leakage_budget_policy_max_bits: u64,
     /// Client-claimed leakage budget before policy clamping.
@@ -7388,6 +7392,18 @@ impl BoundaryFlowRuntimeState {
                 release_bucket_ticks: 1,
                 observed_variance_ticks: 0,
                 budget_ticks: 1,
+            },
+            disclosure_policy_binding: DisclosurePolicyBinding {
+                required_for_effect: false,
+                state_valid: true,
+                active_mode: DisclosurePolicyMode::TradeSecretOnly,
+                expected_mode: DisclosurePolicyMode::TradeSecretOnly,
+                attempted_channel: DisclosureChannelClass::Internal,
+                policy_snapshot_digest: [0x44; 32],
+                admitted_policy_epoch_root_digest: [0x44; 32],
+                policy_epoch: 1,
+                phase_id: "pre_federation".to_string(),
+                state_reason: "not required".to_string(),
             },
             leakage_budget_policy_max_bits: 8,
             claimed_leakage_budget_bits: None,
@@ -7476,6 +7492,7 @@ impl PrivilegedDispatcher {
             boundary_flow_policy_binding: Some(boundary_flow.policy_binding),
             leakage_budget_receipt: Some(boundary_flow.leakage_budget_receipt),
             timing_channel_budget: Some(boundary_flow.timing_channel_budget),
+            disclosure_policy_binding: Some(boundary_flow.disclosure_policy_binding),
             leakage_budget_policy_max_bits: Some(boundary_flow.leakage_budget_policy_max_bits),
             declared_leakage_budget_bits: boundary_flow.claimed_leakage_budget_bits,
             timing_budget_policy_max_ticks: Some(boundary_flow.timing_budget_policy_max_ticks),
