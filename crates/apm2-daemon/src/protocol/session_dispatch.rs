@@ -891,6 +891,9 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     ///
     /// Violating channels are denied fail-closed until mitigation/clearance.
     boundary_channel_quarantine: Arc<Mutex<BoundaryChannelQuarantineState>>,
+    /// Tracks consumed redundancy declassification receipts to enforce
+    /// single-use semantics across request boundaries.
+    consumed_redundancy_receipts: Arc<Mutex<HashMap<String, ConsumedRedundancyReceiptBinding>>>,
 }
 
 #[derive(Clone)]
@@ -981,11 +984,21 @@ struct AuthoritativeRedundancyReceiptPayload {
     lease_id: String,
     work_id: String,
     #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    tool_class: Option<String>,
+    #[serde(default)]
     declassification_intent: Option<DeclassificationIntentHint>,
     #[serde(default)]
     scoped_fragment_only: Option<bool>,
     #[serde(default)]
     plaintext_semantics_exposed: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ConsumedRedundancyReceiptBinding {
+    request_id: String,
+    tool_class: String,
 }
 
 #[cfg(not(test))]
@@ -1046,6 +1059,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1080,6 +1094,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1119,6 +1134,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1158,6 +1174,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1213,6 +1230,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2326,12 +2344,49 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         None
     }
 
+    fn redundancy_receipt_available_for_request(
+        &self,
+        receipt_id: &str,
+        request_id: &str,
+        tool_class: ToolClass,
+    ) -> bool {
+        let Ok(consumed) = self.consumed_redundancy_receipts.lock() else {
+            return false;
+        };
+        let Some(binding) = consumed.get(receipt_id) else {
+            return true;
+        };
+        binding.request_id == request_id && binding.tool_class == tool_class.to_string()
+    }
+
+    fn consume_redundancy_receipt(
+        &self,
+        receipt_id: &str,
+        request_id: &str,
+        tool_class: ToolClass,
+    ) -> bool {
+        let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() else {
+            return false;
+        };
+        consumed.insert(
+            receipt_id.to_string(),
+            ConsumedRedundancyReceiptBinding {
+                request_id: request_id.to_string(),
+                tool_class: tool_class.to_string(),
+            },
+        );
+        true
+    }
+
     fn resolve_authoritative_redundancy_receipt(
         &self,
         session_id: &str,
         lease_id: &str,
-        receipt_id: &str,
+        request_id: &str,
+        tool_class: ToolClass,
+        declassification: &BoundaryDeclassificationHints,
     ) -> Option<RedundancyDeclassificationReceipt> {
+        let receipt_id = declassification.receipt_id.as_deref().unwrap_or_default();
         if receipt_id.is_empty()
             || receipt_id.len() > apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
         {
@@ -2363,17 +2418,44 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         ) {
             return None;
         }
+        if payload
+            .request_id
+            .as_deref()
+            .is_some_and(|bound_request_id| bound_request_id != request_id)
+        {
+            return None;
+        }
+        if payload
+            .tool_class
+            .as_deref()
+            .is_some_and(|bound_tool_class| ToolClass::parse(bound_tool_class) != Some(tool_class))
+        {
+            return None;
+        }
+        if !self.redundancy_receipt_available_for_request(receipt_id, request_id, tool_class) {
+            return None;
+        }
 
         let receipt = RedundancyDeclassificationReceipt {
             receipt_id: payload.receipt_id,
             scoped_fragment_only: payload.scoped_fragment_only?,
             plaintext_semantics_exposed: payload.plaintext_semantics_exposed?,
         };
+        let claim_mismatch = declassification
+            .scoped_fragment_only
+            .is_some_and(|claimed| claimed != receipt.scoped_fragment_only)
+            || declassification
+                .plaintext_semantics_exposed
+                .is_some_and(|claimed| claimed != receipt.plaintext_semantics_exposed);
         if receipt.receipt_id.is_empty()
             || receipt.receipt_id.len() > apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
             || !receipt.scoped_fragment_only
             || receipt.plaintext_semantics_exposed
+            || claim_mismatch
         {
+            return None;
+        }
+        if !self.consume_redundancy_receipt(receipt_id, request_id, tool_class) {
             return None;
         }
         Some(receipt)
@@ -2384,6 +2466,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         &self,
         session_id: &str,
         lease_id: &str,
+        request_id: &str,
+        tool_class: ToolClass,
         decision: &Result<ToolDecision, crate::episode::BrokerError>,
         risk_tier: Option<RiskTier>,
         taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
@@ -2391,7 +2475,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         authoritative_policy_root_digest: Option<Hash>,
     ) -> Result<BoundaryFlowRuntimeState, String> {
         let risk_tier = risk_tier.unwrap_or(RiskTier::Tier4);
-        let strict_boundary_enforcement = risk_tier.requires_sandbox();
+        let strict_boundary_enforcement =
+            risk_tier.requires_sandbox() || Self::requires_channel_boundary_enforcement(tool_class);
         let hints = Self::extract_boundary_flow_hints(request_arguments)?;
         let base_taint_allow = Self::taint_allow_for_tier(risk_tier, taint_assessment.tag.level);
         let base_classification_allow =
@@ -2419,23 +2504,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 declassification_intent,
                 DeclassificationIntentScope::RedundancyPurpose
             ) {
-                let claimed_receipt_id = declassification.receipt_id.clone().unwrap_or_default();
-                let mut authoritative_receipt = self.resolve_authoritative_redundancy_receipt(
+                let authoritative_receipt = self.resolve_authoritative_redundancy_receipt(
                     session_id,
                     lease_id,
-                    &claimed_receipt_id,
+                    request_id,
+                    tool_class,
+                    declassification,
                 );
-                if let Some(receipt) = authoritative_receipt.as_ref() {
-                    let claim_mismatch = declassification
-                        .scoped_fragment_only
-                        .is_some_and(|claimed| claimed != receipt.scoped_fragment_only)
-                        || declassification
-                            .plaintext_semantics_exposed
-                            .is_some_and(|claimed| claimed != receipt.plaintext_semantics_exposed);
-                    if claim_mismatch {
-                        authoritative_receipt = None;
-                    }
-                }
                 redundancy_receipt = authoritative_receipt;
                 declass_receipt_valid = redundancy_receipt.is_some();
                 if declass_receipt_valid {
@@ -4227,6 +4302,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let boundary_flow_state = match self.build_boundary_flow_runtime_state(
                 &token.session_id,
                 &token.lease_id,
+                &request_id,
+                tool_class,
                 &decision,
                 Some(risk_tier),
                 &taint_assessment,
@@ -6417,6 +6494,383 @@ mod tests {
         }))
     }
 
+    #[derive(Debug)]
+    struct StaticReceiptLookupLedger {
+        inner: crate::protocol::dispatch::StubLedgerEventEmitter,
+        events_by_receipt_id: HashMap<String, crate::protocol::dispatch::SignedLedgerEvent>,
+    }
+
+    impl StaticReceiptLookupLedger {
+        fn new(events: Vec<crate::protocol::dispatch::SignedLedgerEvent>) -> Self {
+            let events_by_receipt_id = events
+                .into_iter()
+                .filter_map(|event| {
+                    let payload =
+                        serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+                    let receipt_id = payload.get("receipt_id")?.as_str()?;
+                    Some((receipt_id.to_string(), event))
+                })
+                .collect();
+
+            Self {
+                inner: crate::protocol::dispatch::StubLedgerEventEmitter::new(),
+                events_by_receipt_id,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    impl crate::protocol::dispatch::LedgerEventEmitter for StaticReceiptLookupLedger {
+        fn emit_work_claimed(
+            &self,
+            claim: &crate::protocol::dispatch::WorkClaim,
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_work_claimed(claim, timestamp_ns)
+        }
+
+        fn emit_session_started(
+            &self,
+            session_id: &str,
+            work_id: &str,
+            lease_id: &str,
+            actor_id: &str,
+            adapter_profile_hash: &[u8; 32],
+            role_spec_hash: Option<&[u8; 32]>,
+            timestamp_ns: u64,
+            contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+            identity_proof_profile_hash: Option<&[u8; 32]>,
+            selection_decision: Option<&apm2_core::fac::SelectionDecision>,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_session_started(
+                session_id,
+                work_id,
+                lease_id,
+                actor_id,
+                adapter_profile_hash,
+                role_spec_hash,
+                timestamp_ns,
+                contract_binding,
+                identity_proof_profile_hash,
+                selection_decision,
+            )
+        }
+
+        fn emit_session_event(
+            &self,
+            session_id: &str,
+            event_type: &str,
+            payload: &[u8],
+            actor_id: &str,
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner
+                .emit_session_event(session_id, event_type, payload, actor_id, timestamp_ns)
+        }
+
+        fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+            self.inner.verifying_key()
+        }
+
+        fn emit_stop_flags_mutated(
+            &self,
+            mutation: &crate::protocol::dispatch::StopFlagsMutation<'_>,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_stop_flags_mutated(mutation)
+        }
+
+        fn emit_defect_recorded(
+            &self,
+            defect: &DefectRecorded,
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_defect_recorded(defect, timestamp_ns)
+        }
+
+        fn get_event(
+            &self,
+            event_id: &str,
+        ) -> Option<crate::protocol::dispatch::SignedLedgerEvent> {
+            self.events_by_receipt_id
+                .values()
+                .find(|event| event.event_id == event_id)
+                .cloned()
+                .or_else(|| self.inner.get_event(event_id))
+        }
+
+        fn get_events_by_work_id(
+            &self,
+            work_id: &str,
+        ) -> Vec<crate::protocol::dispatch::SignedLedgerEvent> {
+            let mut events = self.inner.get_events_by_work_id(work_id);
+            events.extend(
+                self.events_by_receipt_id
+                    .values()
+                    .filter(|event| event.work_id == work_id)
+                    .cloned(),
+            );
+            events
+        }
+
+        fn get_all_events(&self) -> Vec<crate::protocol::dispatch::SignedLedgerEvent> {
+            let mut events = self.inner.get_all_events();
+            events.extend(self.events_by_receipt_id.values().cloned());
+            events
+        }
+
+        fn get_event_by_receipt_id(
+            &self,
+            receipt_id: &str,
+        ) -> Option<crate::protocol::dispatch::SignedLedgerEvent> {
+            self.events_by_receipt_id
+                .get(receipt_id)
+                .cloned()
+                .or_else(|| self.inner.get_event_by_receipt_id(receipt_id))
+        }
+
+        fn emit_episode_event(
+            &self,
+            episode_id: &str,
+            event_type: &str,
+            payload: &[u8],
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner
+                .emit_episode_event(episode_id, event_type, payload, timestamp_ns)
+        }
+
+        fn emit_review_receipt(
+            &self,
+            lease_id: &str,
+            work_id: &str,
+            receipt_id: &str,
+            changeset_digest: &[u8; 32],
+            artifact_bundle_hash: &[u8; 32],
+            capability_manifest_hash: &[u8; 32],
+            context_pack_hash: &[u8; 32],
+            role_spec_hash: &[u8; 32],
+            reviewer_actor_id: &str,
+            timestamp_ns: u64,
+            identity_proof_hash: &[u8; 32],
+            time_envelope_ref: &str,
+            pcac_lifecycle: Option<&crate::protocol::dispatch::PrivilegedPcacLifecycleArtifacts>,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_review_receipt(
+                lease_id,
+                work_id,
+                receipt_id,
+                changeset_digest,
+                artifact_bundle_hash,
+                capability_manifest_hash,
+                context_pack_hash,
+                role_spec_hash,
+                reviewer_actor_id,
+                timestamp_ns,
+                identity_proof_hash,
+                time_envelope_ref,
+                pcac_lifecycle,
+            )
+        }
+
+        fn emit_review_blocked_receipt(
+            &self,
+            lease_id: &str,
+            work_id: &str,
+            receipt_id: &str,
+            changeset_digest: &[u8; 32],
+            artifact_bundle_hash: &[u8; 32],
+            capability_manifest_hash: &[u8; 32],
+            context_pack_hash: &[u8; 32],
+            role_spec_hash: &[u8; 32],
+            reason_code: u32,
+            blocked_log_hash: &[u8; 32],
+            reviewer_actor_id: &str,
+            timestamp_ns: u64,
+            identity_proof_hash: &[u8; 32],
+            time_envelope_ref: &str,
+            pcac_lifecycle: Option<&crate::protocol::dispatch::PrivilegedPcacLifecycleArtifacts>,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_review_blocked_receipt(
+                lease_id,
+                work_id,
+                receipt_id,
+                changeset_digest,
+                artifact_bundle_hash,
+                capability_manifest_hash,
+                context_pack_hash,
+                role_spec_hash,
+                reason_code,
+                blocked_log_hash,
+                reviewer_actor_id,
+                timestamp_ns,
+                identity_proof_hash,
+                time_envelope_ref,
+                pcac_lifecycle,
+            )
+        }
+
+        fn get_work_transition_count(&self, work_id: &str) -> u32 {
+            self.inner.get_work_transition_count(work_id)
+        }
+
+        fn emit_work_transitioned(
+            &self,
+            transition: &crate::protocol::dispatch::WorkTransition<'_>,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_work_transitioned(transition)
+        }
+
+        fn emit_session_terminated(
+            &self,
+            session_id: &str,
+            work_id: &str,
+            exit_code: i32,
+            termination_reason: &str,
+            actor_id: &str,
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_session_terminated(
+                session_id,
+                work_id,
+                exit_code,
+                termination_reason,
+                actor_id,
+                timestamp_ns,
+            )
+        }
+
+        fn emit_episode_run_attributed(
+            &self,
+            work_id: &str,
+            episode_id: &str,
+            session_id: &str,
+            adapter_profile_hash: &[u8; 32],
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_episode_run_attributed(
+                work_id,
+                episode_id,
+                session_id,
+                adapter_profile_hash,
+                timestamp_ns,
+            )
+        }
+
+        fn emit_changeset_published(
+            &self,
+            work_id: &str,
+            changeset_digest: &[u8; 32],
+            cas_hash: &[u8; 32],
+            actor_id: &str,
+            timestamp_ns: u64,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_changeset_published(
+                work_id,
+                changeset_digest,
+                cas_hash,
+                actor_id,
+                timestamp_ns,
+            )
+        }
+    }
+
+    fn make_authoritative_redundancy_receipt_event(
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        request_id: Option<&str>,
+        tool_class: Option<ToolClass>,
+    ) -> crate::protocol::dispatch::SignedLedgerEvent {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "event_type".to_string(),
+            serde_json::Value::String("review_receipt_recorded".to_string()),
+        );
+        payload.insert(
+            "receipt_id".to_string(),
+            serde_json::Value::String(receipt_id.to_string()),
+        );
+        payload.insert(
+            "lease_id".to_string(),
+            serde_json::Value::String(lease_id.to_string()),
+        );
+        payload.insert(
+            "work_id".to_string(),
+            serde_json::Value::String(work_id.to_string()),
+        );
+        payload.insert(
+            "declassification_intent".to_string(),
+            serde_json::Value::String("redundancy_purpose".to_string()),
+        );
+        payload.insert(
+            "scoped_fragment_only".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        payload.insert(
+            "plaintext_semantics_exposed".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        if let Some(request_id) = request_id {
+            payload.insert(
+                "request_id".to_string(),
+                serde_json::Value::String(request_id.to_string()),
+            );
+        }
+        if let Some(tool_class) = tool_class {
+            payload.insert(
+                "tool_class".to_string(),
+                serde_json::Value::String(tool_class.to_string()),
+            );
+        }
+
+        crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: format!("EVT-{}", uuid::Uuid::new_v4()),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: "test-authority".to_string(),
+            payload: serde_json::to_vec(&serde_json::Value::Object(payload))
+                .expect("receipt payload serialization"),
+            signature: vec![0u8; 64],
+            timestamp_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
     // ========================================================================
     // INT-002: Session endpoint routing (TCK-00252)
     // Test name matches verification command: cargo test -p apm2-daemon
@@ -7160,11 +7614,167 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_boundary_flow_hints_fail_closed_for_tier3_enforcement() {
+    fn test_redundancy_declassification_receipt_single_use_denies_second_request() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let receipt_id = "RR-REPLAY-001";
+        let session_id = "session-001";
+        let lease_id = "lease-001";
+        let work_id = "W-RECEIPT-REPLAY";
+        let policy_hash = [0xAB; 32];
+
+        let ledger_event = make_authoritative_redundancy_receipt_event(
+            receipt_id,
+            lease_id,
+            work_id,
+            None,
+            Some(ToolClass::Read),
+        );
+        let ledger: Arc<dyn LedgerEventEmitter> =
+            Arc::new(StaticReceiptLookupLedger::new(vec![ledger_event]));
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: "handle-receipt-replay".to_string(),
+                policy_resolved_ref: "policy-resolved-ref-replay".to_string(),
+                capability_manifest_hash: blake3::hash(b"receipt-replay-manifest")
+                    .as_bytes()
+                    .to_vec(),
+                episode_id: Some(session_id.to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("session registration should succeed");
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_ledger(ledger)
+            .with_session_registry(registry_dyn);
+
+        let request_arguments = serde_json::to_vec(&serde_json::json!({
+            "prompt": "safe read request",
+            "boundary_flow": {
+                "declassification": {
+                    "intent": "redundancy_purpose",
+                    "receipt_id": receipt_id,
+                    "scoped_fragment_only": true,
+                    "plaintext_semantics_exposed": false
+                }
+            }
+        }))
+        .expect("arguments serialization");
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+
+        let first_request_id = "REQ-REPLAY-FIRST";
+        let first_decision = Ok(ToolDecision::Allow {
+            request_id: first_request_id.to_string(),
+            capability_id: "cap-read-replay".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let first_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                session_id,
+                lease_id,
+                first_request_id,
+                ToolClass::Read,
+                &first_decision,
+                Some(RiskTier::Tier0),
+                &taint_assessment,
+                &request_arguments,
+                Some(policy_hash),
+            )
+            .expect("first boundary-flow runtime state should build");
+        assert!(
+            first_state.declass_receipt_valid,
+            "first request should admit valid authoritative declassification receipt"
+        );
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let first_result = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                lease_id,
+                first_request_id,
+                1_700_000_001,
+                &ToolClass::Read,
+                true,
+                true,
+                true,
+                true,
+                first_state,
+            );
+        assert!(
+            first_result.is_ok(),
+            "first request should pass channel-boundary admission with a fresh receipt"
+        );
+
+        let second_request_id = "REQ-REPLAY-SECOND";
+        let second_decision = Ok(ToolDecision::Allow {
+            request_id: second_request_id.to_string(),
+            capability_id: "cap-read-replay".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let second_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                session_id,
+                lease_id,
+                second_request_id,
+                ToolClass::Read,
+                &second_decision,
+                Some(RiskTier::Tier0),
+                &taint_assessment,
+                &request_arguments,
+                Some(policy_hash),
+            )
+            .expect("second boundary-flow runtime state should build");
+
+        let second_result = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                lease_id,
+                second_request_id,
+                1_700_000_002,
+                &ToolClass::Read,
+                true,
+                true,
+                true,
+                true,
+                second_state,
+            );
+        match second_result {
+            Err(defects) => {
+                assert!(
+                    defects.iter().any(|defect| {
+                        defect.violation_class
+                            == apm2_core::channel::ChannelViolationClass::DeclassificationReceiptInvalid
+                    }),
+                    "second request must deny reused receipt via structured declassification defect: {defects:?}"
+                );
+            },
+            Ok(_) => panic!("second request must deny replayed declassification receipt"),
+        }
+    }
+
+    #[test]
+    fn test_missing_boundary_flow_hints_fail_closed_for_boundary_enforced_tool_class() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
         let policy_hash = [0x41; 32];
+        let request_id = "REQ-MISSING-HINTS";
         let decision = Ok(ToolDecision::Allow {
-            request_id: "REQ-MISSING-HINTS".to_string(),
+            request_id: request_id.to_string(),
             capability_id: "cap-inference-tier3".to_string(),
             rule_id: Some("rule-allow".to_string()),
             policy_hash,
@@ -7181,8 +7791,10 @@ mod tests {
             .build_boundary_flow_runtime_state(
                 "session-001",
                 "lease-001",
+                request_id,
+                ToolClass::Inference,
                 &decision,
-                Some(RiskTier::Tier3),
+                Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments,
                 Some(policy_hash),
@@ -7194,7 +7806,7 @@ mod tests {
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
                 "lease-001",
-                "REQ-MISSING-HINTS",
+                request_id,
                 1_700_000_000,
                 &ToolClass::Inference,
                 true,
@@ -7210,17 +7822,17 @@ mod tests {
                         defect.violation_class
                             == apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
                     }),
-                    "missing hints must fail closed on leakage witness: {defects:?}"
+                    "missing hints must fail closed on leakage witness for boundary-enforced classes: {defects:?}"
                 );
                 assert!(
                     defects.iter().any(|defect| {
                         defect.violation_class
                             == apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
                     }),
-                    "missing hints must fail closed on timing witness: {defects:?}"
+                    "missing hints must fail closed on timing witness for boundary-enforced classes: {defects:?}"
                 );
             },
-            Ok(_) => panic!("missing Tier3 hints must be denied fail-closed"),
+            Ok(_) => panic!("missing boundary_flow hints must be denied fail-closed"),
         }
     }
 
@@ -7260,6 +7872,8 @@ mod tests {
             .build_boundary_flow_runtime_state(
                 "session-001",
                 "lease-001",
+                "REQ-FORGED-LOW",
+                ToolClass::Inference,
                 &decision,
                 Some(RiskTier::Tier3),
                 &taint_assessment,
@@ -7589,8 +8203,9 @@ mod tests {
                         err.message
                     );
                     assert!(
-                        err.message.contains("observed=40 > budget=20"),
-                        "effective timing budget must clamp to Tier0 policy max (20 ticks): {}",
+                        err.message.contains("timing variance exceeds budget")
+                            && err.message.contains("budget=20"),
+                        "effective timing budget must fail closed against Tier0 policy max (20 ticks): {}",
                         err.message
                     );
                 },
