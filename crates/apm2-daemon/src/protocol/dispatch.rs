@@ -14675,6 +14675,29 @@ impl PrivilegedDispatcher {
         // Resolve parent risk tier for delegated PCAC join input construction.
         let (parent_risk_tier, _) =
             self.resolve_risk_tier_for_lease(&request.parent_lease_id, parent_lease.policy_hash);
+
+        // ---- Phase 2b: Parent lease HTF authority validation ----
+        //
+        // Authoritative sublease delegation is denied unless the parent lease
+        // has a resolvable CAS-hosted time envelope with an admissible pinned
+        // clock profile for the lease's risk tier.
+        //
+        // NOTE: This is a pre-PCAC admission gate. PCAC revalidation checks
+        // freshness/expiry but does not verify CAS envelope admissibility
+        // per risk tier.
+        if let Err(e) = self.validate_lease_time_authority(&parent_lease, parent_risk_tier) {
+            warn!(
+                parent_lease_id = %request.parent_lease_id,
+                risk_tier = ?parent_risk_tier,
+                error = %e,
+                "Parent lease HTF authority validation failed"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("parent lease HTF authority validation failed: {e}"),
+            ));
+        }
+
         // `requested_expiry_ns` must be carried into both PCAC scope witnesses
         // and delegated sublease issuance.
         let expiry_millis = request.requested_expiry_ns / 1_000_000;
@@ -14691,6 +14714,25 @@ impl PrivilegedDispatcher {
                     ));
                 },
             };
+
+        // ---- Phase 2d: Lineage binding prerequisites ----
+        //
+        // SECURITY: Delegation from a parent with missing/zero lineage bindings
+        // is denied fail-closed. Zero changeset_digest or policy_hash indicates
+        // an uninitialized or corrupted parent lease that must not propagate
+        // authority.
+        if bool::from(parent_lease.changeset_digest.ct_eq(&[0u8; 32]))
+            || bool::from(parent_lease.policy_hash.ct_eq(&[0u8; 32]))
+        {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (parent lease lineage bindings are missing)"
+                ),
+            ));
+        }
 
         let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
             return Ok(PrivilegedResponse::error(
@@ -14817,7 +14859,19 @@ impl PrivilegedDispatcher {
             join_revocation_head,
             effect_intent_digest,
         ) {
-            Ok(artifacts) => artifacts,
+            Ok(artifacts) => {
+                // TCK-00482: DelegateSublease is mandatory-PCAC. If
+                // enforce_privileged_pcac_lifecycle returned Ok(None) due to
+                // lifecycle_enforcement=false in policy, deny fail-closed.
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "DelegateSublease requires PCAC lifecycle evidence (mandatory cutover); \
+                         lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
             Err(response) => return Ok(response),
         };
 
