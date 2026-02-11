@@ -2922,6 +2922,166 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    /// Extracts the raw receipt payload from a ledger event's JSON envelope.
+    ///
+    /// Ledger events store a JSON envelope with the format:
+    /// `{"event_type": "...", "session_id": "...", "actor_id": "...",
+    /// "payload": "<hex>"}` The `payload` field contains the hex-encoded
+    /// raw receipt bytes. This method parses the envelope and returns the
+    /// decoded raw bytes.
+    fn extract_receipt_payload_from_ledger_event(envelope_bytes: &[u8]) -> Option<Vec<u8>> {
+        let envelope: serde_json::Value = serde_json::from_slice(envelope_bytes).ok()?;
+        let hex_payload = envelope.get("payload")?.as_str()?;
+        hex::decode(hex_payload).ok()
+    }
+
+    fn parse_cas_receipt_locator(locator: &str) -> Result<Hash, String> {
+        let Some(encoded_digest) = locator.strip_prefix("cas://") else {
+            return Err(format!("invalid CAS receipt locator scheme: {locator}"));
+        };
+        let decoded = hex::decode(encoded_digest)
+            .map_err(|error| format!("invalid CAS receipt locator hex `{locator}`: {error}"))?;
+        decoded
+            .try_into()
+            .map_err(|_| format!("invalid CAS receipt locator digest length for `{locator}`"))
+    }
+
+    fn build_receipt_providers_from_durable_store(
+        &self,
+        request_id: &str,
+        receipt_pointers: &[AcceptanceReceiptPointer],
+    ) -> Result<(CasReceiptProvider, LedgerReceiptProvider), String> {
+        let mut cas_provider = CasReceiptProvider::new();
+        let mut ledger_provider = LedgerReceiptProvider::new();
+
+        for pointer in receipt_pointers {
+            let cas_address = pointer.cas_address.as_deref();
+            if cas_address.is_some_and(str::is_empty) {
+                return Err(format!(
+                    "receipt pointer for {:?} has empty cas_address (request_id={request_id})",
+                    pointer.receipt_type
+                ));
+            }
+            let ledger_event_id = pointer.ledger_event_id.as_deref();
+            if ledger_event_id.is_some_and(str::is_empty) {
+                return Err(format!(
+                    "receipt pointer for {:?} has empty ledger_event_id (request_id={request_id})",
+                    pointer.receipt_type
+                ));
+            }
+
+            #[allow(clippy::useless_let_if_seq)]
+            let mut fallback_bytes = None;
+
+            if let Some(cas_address) = cas_address.filter(|value| !value.is_empty()) {
+                let cas = self.cas.as_ref().ok_or_else(|| {
+                    format!(
+                        "receipt pointer for {:?} includes cas_address but CAS backend is unavailable (request_id={request_id})",
+                        pointer.receipt_type
+                    )
+                })?;
+                let cas_hash = Self::parse_cas_receipt_locator(cas_address)?;
+                let receipt_bytes = cas.retrieve(&cas_hash).ok_or_else(|| {
+                    format!(
+                        "CAS receipt retrieval failed for {:?} at {} (request_id={request_id})",
+                        pointer.receipt_type, cas_address
+                    )
+                })?;
+                let resolved_digest = EventHasher::hash_content(&receipt_bytes);
+                if resolved_digest != pointer.receipt_digest {
+                    return Err(format!(
+                        "CAS receipt digest mismatch for {:?}: expected {}, got {} (request_id={request_id})",
+                        pointer.receipt_type,
+                        hex::encode(pointer.receipt_digest),
+                        hex::encode(resolved_digest)
+                    ));
+                }
+                cas_provider.insert_with_address(cas_address.to_string(), receipt_bytes.clone());
+                fallback_bytes = Some(receipt_bytes);
+            }
+
+            if let Some(ledger_event_id) = ledger_event_id.filter(|value| !value.is_empty()) {
+                let ledger = self.ledger.as_ref().ok_or_else(|| {
+                    format!(
+                        "receipt pointer for {:?} includes ledger_event_id but ledger backend is unavailable (request_id={request_id})",
+                        pointer.receipt_type
+                    )
+                })?;
+                let ledger_event = ledger.get_event(ledger_event_id).ok_or_else(|| {
+                    format!(
+                        "ledger receipt retrieval failed for {:?} at {} (request_id={request_id})",
+                        pointer.receipt_type, ledger_event_id
+                    )
+                })?;
+                // Ledger events store a JSON envelope with the raw payload
+                // hex-encoded in the "payload" field. Extract the inner receipt
+                // bytes from the envelope for digest verification.
+                let receipt_bytes =
+                    Self::extract_receipt_payload_from_ledger_event(&ledger_event.payload)
+                        .unwrap_or_else(|| ledger_event.payload.clone());
+                let resolved_digest = EventHasher::hash_content(&receipt_bytes);
+                if resolved_digest != pointer.receipt_digest {
+                    return Err(format!(
+                        "ledger receipt digest mismatch for {:?}: expected {}, got {} (request_id={request_id})",
+                        pointer.receipt_type,
+                        hex::encode(pointer.receipt_digest),
+                        hex::encode(resolved_digest)
+                    ));
+                }
+                ledger_provider
+                    .insert_with_event_id(ledger_event_id.to_string(), receipt_bytes.clone());
+                if fallback_bytes.is_none() {
+                    fallback_bytes = Some(receipt_bytes);
+                }
+            }
+
+            if cas_address.is_none() && ledger_event_id.is_none() {
+                return Err(format!(
+                    "receipt pointer for {:?} has no locator (request_id={request_id})",
+                    pointer.receipt_type
+                ));
+            }
+
+            // Digest-only fallback is only used when a provider-specific locator
+            // is absent for this pointer.
+            if cas_address.is_none() {
+                if let Some(bytes) = fallback_bytes.as_ref() {
+                    cas_provider.insert_with_digest(pointer.receipt_digest, bytes.clone());
+                }
+            }
+            if ledger_event_id.is_none() {
+                if let Some(bytes) = fallback_bytes.as_ref() {
+                    ledger_provider.insert_with_digest(pointer.receipt_digest, bytes.clone());
+                }
+            }
+        }
+
+        Ok((cas_provider, ledger_provider))
+    }
+
+    fn compute_subject_effect_id(
+        session_id: &str,
+        lease_id: &str,
+        request_id: &str,
+        tool_class_label: &str,
+        effect_digest: &Hash,
+    ) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.acceptance_package.subject_effect_id.v1");
+        for field in [
+            session_id.as_bytes(),
+            lease_id.as_bytes(),
+            request_id.as_bytes(),
+            tool_class_label.as_bytes(),
+            effect_digest,
+        ] {
+            let length = u32::try_from(field.len()).unwrap_or(u32::MAX);
+            hasher.update(&length.to_be_bytes());
+            hasher.update(field);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_portable_acceptance_package(
         &self,
@@ -2984,7 +3144,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "session_id": session_id,
             "lease_id": lease_id,
             "request_id": request_id,
-            "tool_class": tool_class_label,
+            "tool_class": &tool_class_label,
             "risk_tier": risk_tier.tier(),
             "verdict": "admitted",
             "timestamp_ns": timestamp_ns,
@@ -3023,7 +3183,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "session_id": session_id,
             "lease_id": lease_id,
             "request_id": request_id,
-            "tool_class": tool_class.to_string(),
+            "tool_class": &tool_class_label,
             "intent_digest": hex::encode(effect_digest),
             "boundary_intent_class": pending_pcac.boundary_intent_class,
             "timestamp_ns": timestamp_ns,
@@ -3070,8 +3230,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        let mut cas_provider = CasReceiptProvider::new();
-        let mut ledger_provider = LedgerReceiptProvider::new();
         let mut receipt_pointers = Vec::with_capacity(receipt_payloads.len());
 
         for (receipt_type, payload) in receipt_payloads {
@@ -3090,10 +3248,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 }
                 let address = format!("cas://{}", hex::encode(stored_hash));
-                cas_provider.insert_with_address(address.clone(), payload.clone());
                 cas_address = Some(address);
-            } else {
-                cas_provider.insert_with_digest(receipt_digest, payload.clone());
             }
 
             if let Some(ledger) = self.ledger.as_ref() {
@@ -3111,10 +3266,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             "failed to persist {event_type} ledger evidence for request {request_id}: {error}"
                         )
                     })?;
-                ledger_provider.insert_with_event_id(event.event_id.clone(), event.payload);
                 ledger_event_id = Some(event.event_id);
-            } else {
-                ledger_provider.insert_with_digest(receipt_digest, payload.clone());
             }
 
             if cas_address.is_none() && ledger_event_id.is_none() {
@@ -3132,16 +3284,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             });
         }
 
-        let subject_effect_id = {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"apm2.acceptance_package.subject_effect_id.v1");
-            hasher.update(session_id.as_bytes());
-            hasher.update(lease_id.as_bytes());
-            hasher.update(request_id.as_bytes());
-            hasher.update(tool_class.to_string().as_bytes());
-            hasher.update(&effect_digest);
-            *hasher.finalize().as_bytes()
-        };
+        let (cas_provider, ledger_provider) =
+            self.build_receipt_providers_from_durable_store(request_id, &receipt_pointers)?;
+
+        let subject_effect_id = Self::compute_subject_effect_id(
+            session_id,
+            lease_id,
+            request_id,
+            &tool_class_label,
+            &effect_digest,
+        );
 
         let mut package = AcceptancePackageV1 {
             version: AcceptancePackageV1::current_version(),
@@ -8741,6 +8893,148 @@ mod tests {
             gid: 1000,
             pid: Some(12345),
         }))
+    }
+
+    #[test]
+    fn subject_effect_id_length_framing_prevents_adjacent_field_collisions() {
+        let effect_digest = EventHasher::hash_content(br#"{"effect":"digest"}"#);
+        let first = SessionDispatcher::<InMemoryManifestStore>::compute_subject_effect_id(
+            "session-ab",
+            "lease-c",
+            "request-001",
+            "read",
+            &effect_digest,
+        );
+        let second = SessionDispatcher::<InMemoryManifestStore>::compute_subject_effect_id(
+            "session-a",
+            "lease-bc",
+            "request-001",
+            "read",
+            &effect_digest,
+        );
+        assert_ne!(
+            first, second,
+            "length-framed subject_effect_id must differ when adjacent fields are repartitioned"
+        );
+    }
+
+    #[test]
+    fn durable_receipt_readback_matches_write_buffer_verification() {
+        use crate::cas::{DurableCas, DurableCasConfig};
+        use crate::protocol::dispatch::StubLedgerEventEmitter;
+
+        let minter = test_minter();
+        let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+        let temp_dir = tempfile::TempDir::new().expect("temp dir creation should succeed");
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
+        let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+            Arc::new(DurableCas::new(cas_config).expect("DurableCas creation should succeed"));
+        let dispatcher = SessionDispatcher::new(minter)
+            .with_ledger(Arc::clone(&ledger))
+            .with_cas(Arc::clone(&cas));
+
+        let receipt_payloads = vec![
+            (
+                AcceptanceReceiptType::GateAdmission,
+                br#"{"kind":"gate_admission","verdict":"admitted"}"#.to_vec(),
+            ),
+            (
+                AcceptanceReceiptType::Boundary,
+                br#"{"kind":"boundary","classification_allow":true}"#.to_vec(),
+            ),
+            (
+                AcceptanceReceiptType::Consume,
+                br#"{"kind":"consume","receipt":"consume-001"}"#.to_vec(),
+            ),
+            (
+                AcceptanceReceiptType::Effect,
+                br#"{"kind":"effect","request_id":"request-001"}"#.to_vec(),
+            ),
+        ];
+
+        let mut write_buffer_cas_provider = CasReceiptProvider::new();
+        let mut write_buffer_ledger_provider = LedgerReceiptProvider::new();
+        let mut pointers = Vec::new();
+
+        for (receipt_type, payload) in receipt_payloads {
+            let receipt_digest = EventHasher::hash_content(&payload);
+            let stored_hash = cas.store(&payload);
+            assert_eq!(
+                stored_hash, receipt_digest,
+                "stored hash must equal pointer digest for fixture data"
+            );
+            let cas_address = format!("cas://{}", hex::encode(stored_hash));
+            write_buffer_cas_provider.insert_with_address(cas_address.clone(), payload.clone());
+
+            let ledger_event = ledger
+                .emit_session_event(
+                    "session-readback-001",
+                    SessionDispatcher::<InMemoryManifestStore>::acceptance_receipt_event_type(
+                        receipt_type,
+                    ),
+                    &payload,
+                    "pcac:test",
+                    1_700_000_000_000_000_000,
+                )
+                .expect("ledger fixture event emission should succeed");
+            write_buffer_ledger_provider
+                .insert_with_event_id(ledger_event.event_id.clone(), payload.clone());
+
+            pointers.push(AcceptanceReceiptPointer {
+                receipt_type,
+                receipt_digest,
+                cas_address: Some(cas_address),
+                ledger_event_id: Some(ledger_event.event_id),
+            });
+        }
+
+        let mut package = AcceptancePackageV1 {
+            version: AcceptancePackageV1::current_version(),
+            package_id: [0u8; 32],
+            subject_effect_id: EventHasher::hash_content(b"subject-effect-readback"),
+            receipt_set_digest: AcceptancePackageV1::compute_receipt_set_digest(&pointers),
+            receipt_pointers: pointers,
+            policy_snapshot_hash: [0xA1; 32],
+            time_authority_ref: [0xB2; 32],
+            verdict: AcceptanceAdmissionVerdict::Admitted,
+            issuer_signature: Vec::new(),
+            issuer_verifying_key: [0u8; 32],
+        };
+        let signer = CryptoSigner::from_bytes(&[0x33; 32]).expect("test signer bytes should parse");
+        package
+            .sign_with(&signer)
+            .expect("acceptance package signing should succeed");
+
+        let (readback_cas_provider, readback_ledger_provider) = dispatcher
+            .build_receipt_providers_from_durable_store(
+                "REQ-READBACK-001",
+                &package.receipt_pointers,
+            )
+            .expect("durable read-back provider reconstruction should succeed");
+
+        let write_buffer_cas_result =
+            verify_acceptance_package(&package, &write_buffer_cas_provider);
+        let readback_cas_result = verify_acceptance_package(&package, &readback_cas_provider);
+        assert!(
+            readback_cas_result.verified,
+            "durable read-back CAS verification must pass: {readback_cas_result:?}"
+        );
+        assert_eq!(
+            write_buffer_cas_result, readback_cas_result,
+            "durable CAS read-back verification must match write-buffer verification"
+        );
+
+        let write_buffer_ledger_result =
+            verify_acceptance_package(&package, &write_buffer_ledger_provider);
+        let readback_ledger_result = verify_acceptance_package(&package, &readback_ledger_provider);
+        assert!(
+            readback_ledger_result.verified,
+            "durable read-back ledger verification must pass: {readback_ledger_result:?}"
+        );
+        assert_eq!(
+            write_buffer_ledger_result, readback_ledger_result,
+            "durable ledger read-back verification must match write-buffer verification"
+        );
     }
 
     #[derive(Debug)]

@@ -1,71 +1,118 @@
-# Fix Task: PR #593 (TCK-00468) — Review Round 2
+# Fix Task: PR #597 (TCK-00466) — Round 2: Security Review Findings
 
-## Context
-You are fixing security review findings for PR #593 (TCK-00468: RFC-0028 REQ-0008 projection isolation and direct-GitHub authority elimination).
+Branch: `ticket/RFC-0028/TCK-00466`, worktree: `/home/ubuntu/Projects/apm2-TCK-00466`
+HEAD: `e4bdc53b`
 
-Branch: `ticket/RFC-0028/TCK-00468`
-Worktree: `/home/ubuntu/Projects/apm2-TCK-00468`
-Current HEAD: `657239d8`
+## REQUIRED READING (read ALL before editing any code)
 
-## Review Results
-- **Quality Review: PASS** — no action needed
-- **Security Review: FAIL** — 2 MAJOR, 1 MINOR
+- `documents/security/AGENTS.cac.json`
+- `documents/security/THREAT_MODEL.cac.json`
+- `documents/skills/rust-standards/references/34_security_adjacent_rust.md`
+- `documents/skills/rust-standards/references/39_hazard_catalog_checklists.md`
+- `documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md`
 
-## MAJOR 1: Panic-on-input in deny path (UTF-8 byte slicing)
+You MUST pass ALL CI checks. Before committing, run IN ORDER:
+1. `cargo fmt --all`
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` — fix ALL warnings
+3. `cargo doc --workspace --no-deps` — fix any doc warnings
+4. `cargo test -p apm2-core` — core tests
+5. `cargo test -p apm2-daemon` — daemon tests (timeout 260s)
 
-**Path:** `crates/apm2-daemon/src/protocol/session_dispatch.rs` — `truncate_attempt_detail` function
+After all checks pass: `git add -A && git commit -m "fix(TCK-00466): durable receipt retrieval for verifier concordance, length-framed subject_effect_id" && git push`
 
-**Problem:** `truncate_attempt_detail` slices UTF-8 strings by byte index (`&detail[..truncated_len]`). A crafted long non-ASCII command/URL (e.g., direct `gh` attempt with multibyte payload) can trigger a non-char-boundary slice panic before deny response/defect emission.
+---
 
-**Required Fix:**
-1. Replace byte slicing with char-boundary-safe truncation
-2. Use `char_indices` to find the last valid char boundary before the truncation point
-3. Example: `detail.char_indices().take_while(|(i, _)| *i < max_len).last().map(|(i, c)| &detail[..i + c.len_utf8()]).unwrap_or("")`
-4. Add tests covering multibyte Unicode command/URL truncation on direct GitHub deny paths
+## Fix 1 (MAJOR): Build verifier inputs from durable retrieval, not in-memory clones
 
-## MAJOR 2: Direct GitHub deny logic bypassable via shell/program indirection
+**File:** `crates/apm2-daemon/src/protocol/session_dispatch.rs` (around line 3073, 3165)
+**File:** `crates/apm2-core/src/evidence/acceptance_package.rs` (around line 358)
 
-**Path:** `crates/apm2-daemon/src/protocol/session_dispatch.rs` — `command_invokes_gh_cli_inner` and `command_targets_github_api`
+**Problem:** `emit_portable_acceptance_package` populates both CAS and Ledger receipt providers from in-memory payload bytes (`payload.clone()` / returned event payload) and immediately verifies those maps. The `ReceiptProvider` falls back to digest lookup even when pointer locators are present, masking locator resolution failures. This means local reverification passes even when durable receipt pointers are not actually replay-resolvable by independent counterparties.
 
-**Problem:** Command-text heuristics use `split_whitespace` and literal host substring checks. Commands using shell substitution/indirection or interpreter-mediated invocation can bypass these heuristics.
+**Required fix (3 parts):**
 
-**Required Fix:**
-1. **Keep the existing command-text detection as a defense-in-depth layer** (do NOT remove it)
-2. Add adversarial tests for substitution/interpreter indirection patterns:
-   - `bash -c "$(echo gh) api /repos"` (command substitution)
-   - `eval "gh api /repos"` (eval indirection)
-   - Shell variable expansion: `cmd=gh; $cmd api /repos`
-3. Acknowledge in code comments that command-text detection is a heuristic layer — primary security boundary is RoleSpec capability rejection at the capability/egress boundary
-4. Consider adding an additional check: scan all argument strings (not just the primary command) for GitHub API hostnames
+### Part A: Read-back verification from durable storage
 
-## MINOR: Freshness evidence can be omitted while stage remains permissive
+After persisting receipts to CAS/ledger, build verifier inputs by reading back from the durable store, not from the in-memory write buffer:
 
-**Path:** `crates/apm2-daemon/src/protocol/session_dispatch.rs`
+For each `ReceiptPointer` in the acceptance package:
+1. If `cas_address` is `Some`, retrieve from CAS via that address
+2. If `ledger_event_id` is `Some`, retrieve from ledger via that event ID
+3. Verify the retrieved content matches the `receipt_digest`
+4. Fail closed if retrieval fails or digest mismatches
 
-**Problem:** Stage evaluation treats `refreshed_at_ns` as optional. When unset, Stage0/Stage1 can remain active without freshness enforcement.
+### Part B: Remove or gate digest-only fallback
 
-**Required Fix:**
-1. For production stages (Stage0/Stage1), require freshness timestamp
-2. If `refreshed_at_ns` is missing in production, fail closed to Stage2 (hard deny)
-3. Add test: missing freshness → Stage2
+When a `ReceiptPointer` has a `cas_address` or `ledger_event_id` locator field, the verifier MUST use that locator to retrieve the receipt. Only fall back to digest-based lookup when NO locator is present. If a locator is present but retrieval fails, that is an error (fail closed), not a fallback to digest.
 
-## MANDATORY Pre-Commit Steps (in this exact order)
-
-You MUST run ALL of these and fix any issues BEFORE committing:
-```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --workspace --no-deps
-cargo test -p apm2-core -p apm2-daemon
+```rust
+// In ReceiptProvider implementations:
+fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Result<Vec<u8>, ReceiptResolutionError> {
+    // If locator present, MUST resolve via locator
+    if let Some(ref cas_addr) = pointer.cas_address {
+        let content = self.cas.retrieve(cas_addr)
+            .ok_or(ReceiptResolutionError::LocatorNotFound {
+                locator: cas_addr.clone()
+            })?;
+        // Verify digest matches
+        let actual_digest = blake3::hash(&content);
+        if actual_digest.as_bytes() != &pointer.receipt_digest {
+            return Err(ReceiptResolutionError::DigestMismatch);
+        }
+        return Ok(content);
+    }
+    // Only fall back to digest when no locator present
+    self.digest_map.get(&pointer.receipt_digest)
+        .cloned()
+        .ok_or(ReceiptResolutionError::NotFound)
+}
 ```
 
-You MUST pass ALL CI checks. Do not push code that fails any of these.
+### Part C: Add regression tests
 
-## Push Workflow
+Add tests verifying:
+1. **Locator-present but retrieval fails → deny** (not fallback to digest)
+2. **Locator-present, retrieval succeeds but digest mismatches → deny**
+3. **No locator, digest-only lookup succeeds → pass**
+4. **Read-back from durable store produces same verification result as write-buffer** (concordance with real CAS/ledger)
 
-After all pre-commit steps pass:
-```bash
-git add -A
-git commit -m "fix(TCK-00468): char-safe truncation, freshness enforcement, adversarial bypass tests"
-apm2 fac push --ticket documents/work/tickets/TCK-00468.yaml
+---
+
+## Fix 2 (MINOR): Length-framed subject_effect_id hashing
+
+**File:** `crates/apm2-daemon/src/protocol/session_dispatch.rs` (around line 3135)
+
+**Problem:** `subject_effect_id` is computed by concatenating variable-length fields (`session_id || lease_id || request_id || tool_class || effect_digest`) without length prefixes. This allows tuple-collision constructions if component formats change.
+
+**Required fix:** Add explicit length framing:
+
+```rust
+// Length-prefix each field before hashing
+let mut hasher = blake3::Hasher::new();
+for field in &[
+    session_id.as_bytes(),
+    lease_id.as_bytes(),
+    request_id.as_bytes(),
+    tool_class.as_bytes(),
+    &effect_digest,
+] {
+    let len = (field.len() as u32).to_be_bytes();
+    hasher.update(&len);
+    hasher.update(field);
+}
+let subject_effect_id = *hasher.finalize().as_bytes();
 ```
+
+Add a test verifying that swapping parts of adjacent field values produces a different `subject_effect_id`.
+
+---
+
+## CRITICAL: Pre-commit checklist
+
+After ALL fixes:
+1. `cargo fmt --all`
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` — fix ALL warnings
+3. `cargo doc --workspace --no-deps`
+4. `cargo test -p apm2-core`
+5. `cargo test -p apm2-daemon` — ALL daemon tests must pass (timeout 260s)
+6. `git add -A && git commit -m "fix(TCK-00466): durable receipt retrieval for verifier concordance, length-framed subject_effect_id" && git push`

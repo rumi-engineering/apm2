@@ -316,7 +316,33 @@ pub enum FindingSeverity {
 /// producing identical verification results.
 pub trait ReceiptProvider: Send + Sync {
     /// Resolves the raw receipt bytes for a pointer.
-    fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Option<Vec<u8>>;
+    ///
+    /// # Errors
+    /// Returns [`ReceiptResolutionError`] when a locator cannot be resolved,
+    /// when digest validation fails, or when digest fallback lookup fails.
+    fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Result<Vec<u8>, ReceiptResolutionError>;
+}
+
+/// Error returned when resolving receipt bytes from a pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptResolutionError {
+    /// A locator was present on the pointer, but no receipt was found for it.
+    LocatorNotFound {
+        /// Pointer locator value.
+        locator: String,
+    },
+    /// Resolved receipt bytes did not match the pointer digest.
+    DigestMismatch {
+        /// Expected digest from the pointer.
+        expected: Hash,
+        /// Actual digest computed over resolved bytes.
+        actual: Hash,
+    },
+    /// Digest-based fallback lookup failed.
+    NotFound {
+        /// Missing digest value.
+        digest: Hash,
+    },
 }
 
 /// CAS-oriented receipt provider implementation.
@@ -356,18 +382,34 @@ impl CasReceiptProvider {
 }
 
 impl ReceiptProvider for CasReceiptProvider {
-    fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Option<Vec<u8>> {
+    fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Result<Vec<u8>, ReceiptResolutionError> {
         if let Some(address) = pointer
             .cas_address
             .as_deref()
             .filter(|value| !value.is_empty())
-            && let Some(receipt) = self.receipts_by_address.get(address)
         {
-            return Some(receipt.clone());
+            let receipt = self
+                .receipts_by_address
+                .get(address)
+                .cloned()
+                .ok_or_else(|| ReceiptResolutionError::LocatorNotFound {
+                    locator: address.to_string(),
+                })?;
+            let resolved_digest = EventHasher::hash_content(&receipt);
+            if resolved_digest != pointer.receipt_digest {
+                return Err(ReceiptResolutionError::DigestMismatch {
+                    expected: pointer.receipt_digest,
+                    actual: resolved_digest,
+                });
+            }
+            return Ok(receipt);
         }
         self.receipts_by_digest
             .get(&pointer.receipt_digest)
             .cloned()
+            .ok_or(ReceiptResolutionError::NotFound {
+                digest: pointer.receipt_digest,
+            })
     }
 }
 
@@ -407,18 +449,34 @@ impl LedgerReceiptProvider {
 }
 
 impl ReceiptProvider for LedgerReceiptProvider {
-    fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Option<Vec<u8>> {
+    fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Result<Vec<u8>, ReceiptResolutionError> {
         if let Some(event_id) = pointer
             .ledger_event_id
             .as_deref()
             .filter(|value| !value.is_empty())
-            && let Some(receipt) = self.receipts_by_event_id.get(event_id)
         {
-            return Some(receipt.clone());
+            let receipt = self
+                .receipts_by_event_id
+                .get(event_id)
+                .cloned()
+                .ok_or_else(|| ReceiptResolutionError::LocatorNotFound {
+                    locator: event_id.to_string(),
+                })?;
+            let resolved_digest = EventHasher::hash_content(&receipt);
+            if resolved_digest != pointer.receipt_digest {
+                return Err(ReceiptResolutionError::DigestMismatch {
+                    expected: pointer.receipt_digest,
+                    actual: resolved_digest,
+                });
+            }
+            return Ok(receipt);
         }
         self.receipts_by_digest
             .get(&pointer.receipt_digest)
             .cloned()
+            .ok_or(ReceiptResolutionError::NotFound {
+                digest: pointer.receipt_digest,
+            })
     }
 }
 
@@ -625,16 +683,6 @@ fn verify_receipts(
             continue;
         }
 
-        if !has_locator(pointer) {
-            findings.push(VerificationFinding::error(
-                "ACPT_RECEIPT_LOCATOR_MISSING",
-                format!(
-                    "receipt pointer for {:?} must include cas_address or ledger_event_id",
-                    pointer.receipt_type
-                ),
-            ));
-        }
-
         if !seen.insert((pointer.receipt_type, pointer.receipt_digest)) {
             findings.push(VerificationFinding::error(
                 "ACPT_DUPLICATE_RECEIPT_POINTER",
@@ -647,7 +695,7 @@ fn verify_receipts(
         }
 
         match receipt_provider.resolve_receipt(pointer) {
-            Some(receipt_bytes) => {
+            Ok(receipt_bytes) => {
                 let resolved_digest = EventHasher::hash_content(&receipt_bytes);
                 if resolved_digest != pointer.receipt_digest {
                     findings.push(VerificationFinding::error(
@@ -661,27 +709,38 @@ fn verify_receipts(
                     ));
                 }
             },
-            None => findings.push(VerificationFinding::error(
-                "ACPT_RECEIPT_MISSING",
-                format!(
-                    "receipt bytes unavailable for {:?} digest {}",
-                    pointer.receipt_type,
-                    hex::encode(pointer.receipt_digest)
-                ),
-            )),
+            Err(ReceiptResolutionError::LocatorNotFound { locator }) => {
+                findings.push(VerificationFinding::error(
+                    "ACPT_RECEIPT_MISSING",
+                    format!(
+                        "receipt bytes unavailable for {:?} via locator {}",
+                        pointer.receipt_type, locator
+                    ),
+                ));
+            },
+            Err(ReceiptResolutionError::DigestMismatch { expected, actual }) => {
+                findings.push(VerificationFinding::error(
+                    "ACPT_RECEIPT_DIGEST_MISMATCH",
+                    format!(
+                        "receipt digest mismatch for {:?}: expected {}, got {}",
+                        pointer.receipt_type,
+                        hex::encode(expected),
+                        hex::encode(actual)
+                    ),
+                ));
+            },
+            Err(ReceiptResolutionError::NotFound { digest }) => {
+                findings.push(VerificationFinding::error(
+                    "ACPT_RECEIPT_MISSING",
+                    format!(
+                        "receipt bytes unavailable for {:?} digest {}",
+                        pointer.receipt_type,
+                        hex::encode(digest)
+                    ),
+                ));
+            },
         }
     }
-}
-
-fn has_locator(pointer: &ReceiptPointer) -> bool {
-    pointer
-        .cas_address
-        .as_deref()
-        .is_some_and(|address| !address.is_empty())
-        || pointer
-            .ledger_event_id
-            .as_deref()
-            .is_some_and(|event_id| !event_id.is_empty())
 }
 
 #[cfg(test)]
@@ -793,6 +852,17 @@ mod tests {
         provider
     }
 
+    fn build_digest_only_provider(fixtures: &[ReceiptFixture]) -> CasReceiptProvider {
+        let mut provider = CasReceiptProvider::new();
+        for fixture in fixtures {
+            provider.insert_with_digest(
+                fixture.pointer.receipt_digest,
+                fixture.receipt_bytes.clone(),
+            );
+        }
+        provider
+    }
+
     #[test]
     fn verify_acceptance_package_valid_package_passes() {
         let (package, fixtures) = build_fixture_package();
@@ -843,6 +913,31 @@ mod tests {
     }
 
     #[test]
+    fn verify_acceptance_package_locator_present_but_retrieval_fails_denies() {
+        let (package, fixtures) = build_fixture_package();
+        let mut cas_provider = build_cas_provider(&fixtures);
+        let first_address = fixtures[0]
+            .pointer
+            .cas_address
+            .clone()
+            .expect("fixture pointer should have address");
+        cas_provider.remove_by_address(&first_address);
+
+        let result = verify_acceptance_package(&package, &cas_provider);
+        assert!(
+            !result.verified,
+            "missing locator-targeted receipt must deny: {result:?}"
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.code == "ACPT_RECEIPT_MISSING"),
+            "missing-receipt finding must be present: {result:?}"
+        );
+    }
+
+    #[test]
     fn verify_acceptance_package_receipt_digest_mismatch_denies() {
         let (package, fixtures) = build_fixture_package();
         let mut cas_provider = build_cas_provider(&fixtures);
@@ -864,6 +959,25 @@ mod tests {
                 .iter()
                 .any(|finding| finding.code == "ACPT_RECEIPT_DIGEST_MISMATCH"),
             "digest mismatch finding must be present: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_acceptance_package_digest_only_lookup_without_locator_passes() {
+        let (mut package, fixtures) = build_fixture_package();
+        for pointer in &mut package.receipt_pointers {
+            pointer.cas_address = None;
+            pointer.ledger_event_id = None;
+        }
+        package
+            .sign_with(&deterministic_signer())
+            .expect("re-signing package without locators should succeed");
+        let digest_provider = build_digest_only_provider(&fixtures);
+
+        let result = verify_acceptance_package(&package, &digest_provider);
+        assert!(
+            result.verified,
+            "digest-only lookup without locators must pass: {result:?}"
         );
     }
 
@@ -907,6 +1021,76 @@ mod tests {
         assert_eq!(
             cas_result, ledger_result,
             "independent verifiers must produce identical deterministic results"
+        );
+    }
+
+    #[test]
+    fn verify_acceptance_package_durable_readback_concordance_matches_write_buffer() {
+        let (package, fixtures) = build_fixture_package();
+
+        let write_buffer_cas_provider = build_cas_provider(&fixtures);
+        let write_buffer_ledger_provider = build_ledger_provider(&fixtures);
+
+        let mut durable_cas = HashMap::new();
+        let mut durable_ledger = HashMap::new();
+        for fixture in &fixtures {
+            let cas_address = fixture
+                .pointer
+                .cas_address
+                .clone()
+                .expect("fixture pointer should have CAS address");
+            let ledger_event_id = fixture
+                .pointer
+                .ledger_event_id
+                .clone()
+                .expect("fixture pointer should have ledger event ID");
+            durable_cas.insert(cas_address, fixture.receipt_bytes.clone());
+            durable_ledger.insert(ledger_event_id, fixture.receipt_bytes.clone());
+        }
+
+        let mut readback_cas_provider = CasReceiptProvider::new();
+        let mut readback_ledger_provider = LedgerReceiptProvider::new();
+        for pointer in &package.receipt_pointers {
+            if let Some(address) = pointer.cas_address.as_deref() {
+                let receipt_bytes = durable_cas
+                    .get(address)
+                    .cloned()
+                    .expect("durable CAS retrieval should succeed");
+                assert_eq!(
+                    EventHasher::hash_content(&receipt_bytes),
+                    pointer.receipt_digest,
+                    "durable CAS read-back digest must match pointer digest"
+                );
+                readback_cas_provider.insert_with_address(address.to_string(), receipt_bytes);
+            }
+            if let Some(event_id) = pointer.ledger_event_id.as_deref() {
+                let receipt_bytes = durable_ledger
+                    .get(event_id)
+                    .cloned()
+                    .expect("durable ledger retrieval should succeed");
+                assert_eq!(
+                    EventHasher::hash_content(&receipt_bytes),
+                    pointer.receipt_digest,
+                    "durable ledger read-back digest must match pointer digest"
+                );
+                readback_ledger_provider.insert_with_event_id(event_id.to_string(), receipt_bytes);
+            }
+        }
+
+        let write_buffer_cas_result =
+            verify_acceptance_package(&package, &write_buffer_cas_provider);
+        let readback_cas_result = verify_acceptance_package(&package, &readback_cas_provider);
+        assert_eq!(
+            write_buffer_cas_result, readback_cas_result,
+            "CAS durable read-back verifier result must match write-buffer verifier result"
+        );
+
+        let write_buffer_ledger_result =
+            verify_acceptance_package(&package, &write_buffer_ledger_provider);
+        let readback_ledger_result = verify_acceptance_package(&package, &readback_ledger_provider);
+        assert_eq!(
+            write_buffer_ledger_result, readback_ledger_result,
+            "ledger durable read-back verifier result must match write-buffer verifier result"
         );
     }
 
