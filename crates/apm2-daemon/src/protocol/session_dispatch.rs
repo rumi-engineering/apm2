@@ -94,12 +94,15 @@ use apm2_holon::defect::{
     DefectContext as HolonDefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType,
 };
 use bytes::Bytes;
+use ed25519_dalek::Verifier;
 use prost::Message;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use super::dispatch::{
-    BoundaryFlowRuntimeState, ConnectionContext, LedgerEventEmitter, PrivilegedDispatcher,
+    BoundaryFlowRuntimeState, ConnectionContext, EventTypeClass, LedgerEventEmitter,
+    PrivilegedDispatcher, classify_event_type, is_governance_policy_actor,
+    is_governance_policy_event_type,
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
@@ -1054,6 +1057,7 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
 struct PendingPcacAuthority {
     gate: Arc<crate::pcac::LifecycleGate>,
     certificate: apm2_core::pcac::AuthorityJoinCertificateV1,
+    authoritative_policy_root_digest: Option<Hash>,
     intent_digest: Hash,
     boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
     requires_authoritative_acceptance: bool,
@@ -2277,10 +2281,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         )
     }
 
-    fn policy_ledger_verified_from_ajc(
+    fn policy_ledger_anchor_verified_from_ajc(
         certificate: Option<&apm2_core::pcac::AuthorityJoinCertificateV1>,
     ) -> bool {
         certificate.is_some_and(|cert| cert.as_of_ledger_anchor != [0u8; 32])
+    }
+
+    fn tool_decision_policy_verified(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+        certificate: Option<&apm2_core::pcac::AuthorityJoinCertificateV1>,
+        authoritative_policy_root_digest: Option<Hash>,
+    ) -> bool {
+        let Some(authoritative_policy_root_digest) = authoritative_policy_root_digest else {
+            return false;
+        };
+        let Some(presented_policy_digest) = Self::presented_policy_digest(decision) else {
+            return false;
+        };
+        Self::policy_ledger_anchor_verified_from_ajc(certificate)
+            && presented_policy_digest == authoritative_policy_root_digest
     }
 
     const fn presented_policy_digest(
@@ -2294,6 +2313,143 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ) => Some(*policy_hash),
             _ => None,
         }
+    }
+
+    fn resolve_authoritative_policy_root_digest(&self) -> Option<Hash> {
+        let ledger = self.ledger.as_ref()?;
+        Self::resolve_authoritative_policy_root_digest_from_ledger(ledger.as_ref())
+    }
+
+    fn resolve_authoritative_policy_root_digest_from_ledger(
+        ledger: &dyn LedgerEventEmitter,
+    ) -> Option<Hash> {
+        let event = ledger.get_latest_governance_policy_event()?;
+        if classify_event_type(&event.event_type, &event.actor_id) != EventTypeClass::Governance {
+            return None;
+        }
+        if !is_governance_policy_event_type(&event.event_type)
+            || !is_governance_policy_actor(&event.actor_id)
+        {
+            return None;
+        }
+        if !Self::governance_event_signature_verified(ledger, &event) {
+            return None;
+        }
+        Self::extract_policy_root_digest_from_governance_event(&event)
+    }
+
+    fn governance_event_signature_verified(
+        ledger: &dyn LedgerEventEmitter,
+        event: &crate::protocol::dispatch::SignedLedgerEvent,
+    ) -> bool {
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+        if event.signature.len() != 64 {
+            return false;
+        }
+        let Ok(signature) = ed25519_dalek::Signature::try_from(event.signature.as_slice()) else {
+            return false;
+        };
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_EVENT_DOMAIN_PREFIX.len() + event.payload.len());
+        canonical_bytes.extend_from_slice(SESSION_EVENT_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&event.payload);
+        ledger
+            .verifying_key()
+            .verify(canonical_bytes.as_slice(), &signature)
+            .is_ok()
+    }
+
+    fn extract_policy_root_digest_from_governance_event(
+        event: &crate::protocol::dispatch::SignedLedgerEvent,
+    ) -> Option<Hash> {
+        let wrapper = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+        if wrapper
+            .get("event_type")
+            .and_then(serde_json::Value::as_str)
+            != Some(event.event_type.as_str())
+        {
+            return None;
+        }
+
+        let inner_payload = wrapper
+            .get("payload")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|inner_hex| hex::decode(inner_hex).ok())
+            .and_then(|inner_bytes| serde_json::from_slice::<serde_json::Value>(&inner_bytes).ok());
+
+        inner_payload
+            .as_ref()
+            .and_then(Self::extract_policy_root_digest_from_value)
+            .or_else(|| Self::extract_policy_root_digest_from_value(&wrapper))
+    }
+
+    fn extract_policy_root_digest_from_value(value: &serde_json::Value) -> Option<Hash> {
+        if let Some(hash) = Self::extract_hash_field(value, "policy_hash") {
+            return Some(hash);
+        }
+        if let Some(hash) = Self::extract_hash_field(value, "resolved_policy_hash") {
+            return Some(hash);
+        }
+        if let Some(hash) = Self::extract_hash_field(value, "policy_root_hash") {
+            return Some(hash);
+        }
+
+        let object = value.as_object()?;
+        for key in [
+            "PolicyResolved",
+            "PolicyRootPublished",
+            "PolicyUpdated",
+            "GateConfigurationUpdated",
+        ] {
+            if let Some(inner) = object.get(key)
+                && let Some(hash) = Self::extract_policy_root_digest_from_value(inner)
+            {
+                return Some(hash);
+            }
+        }
+        None
+    }
+
+    fn extract_hash_field(value: &serde_json::Value, field: &str) -> Option<Hash> {
+        let raw = value.as_object()?.get(field)?;
+        if let Some(hex_hash) = raw.as_str() {
+            let bytes = hex::decode(hex_hash).ok()?;
+            let hash: Hash = bytes.try_into().ok()?;
+            return Some(hash);
+        }
+        let items = raw.as_array()?;
+        if items.len() != 32 {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        for (index, item) in items.iter().enumerate() {
+            let value = item.as_u64()?;
+            let byte = u8::try_from(value).ok()?;
+            hash[index] = byte;
+        }
+        Some(hash)
+    }
+
+    fn chain_capability_manifest_hash_to_policy_root(
+        base_capability_manifest_hash: Hash,
+        authoritative_policy_root_digest: Hash,
+    ) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-capability-manifest-policy-root-chain-v1");
+        hasher.update(&base_capability_manifest_hash);
+        hasher.update(&authoritative_policy_root_digest);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn chain_freshness_policy_hash_to_policy_root(
+        policy_resolved_ref: &str,
+        authoritative_policy_root_digest: Hash,
+    ) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-freshness-policy-policy-root-chain-v1");
+        hasher.update(policy_resolved_ref.as_bytes());
+        hasher.update(&authoritative_policy_root_digest);
+        *hasher.finalize().as_bytes()
     }
 
     fn format_channel_boundary_defects(
@@ -2934,9 +3090,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
         request_arguments: &[u8],
         current_time_ns: u64,
-        // When Some, this is the broker's active policy hash admitted as
-        // authoritative because the PCAC kernel validated the full authority
-        // chain (including `as_of_ledger_anchor`) via AJC issuance.
+        // When Some, this is the ledger-rooted governance policy digest
+        // admitted as authoritative after governance namespace filtering and
+        // signature-provenance verification.
         // When None, no ledger-rooted policy authority was established.
         authoritative_policy_root_digest: Option<Hash>,
     ) -> Result<BoundaryFlowRuntimeState, String> {
@@ -5664,7 +5820,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     .clone_from(&session_state.pointer_only_waiver);
             }
 
-            let capability_manifest_hash: Hash =
+            let base_capability_manifest_hash: Hash =
                 if let Ok(hash) = session_state.capability_manifest_hash.as_slice().try_into() {
                     hash
                 } else {
@@ -5695,12 +5851,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
             let directory_head_hash =
                 *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
-            let freshness_policy_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-freshness-policy-v1");
-                hasher.update(session_state.policy_resolved_ref.as_bytes());
-                *hasher.finalize().as_bytes()
-            };
             let freshness_witness_tick = hlc.wall_ns / 1_000_000_000;
             if freshness_witness_tick == 0 {
                 warn!(
@@ -5785,6 +5935,40 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let requires_authoritative_acceptance = !matches!(
                 boundary_intent_class,
                 apm2_core::pcac::BoundaryIntentClass::Observe
+            );
+            let authoritative_policy_root_digest =
+                Self::resolve_authoritative_policy_root_digest_from_ledger(ledger.as_ref());
+            if requires_authoritative_acceptance && authoritative_policy_root_digest.is_none() {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    "PCAC denied: authoritative governance policy root unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: authoritative governance policy root unavailable (fail-closed)",
+                ));
+            }
+            let capability_manifest_hash =
+                authoritative_policy_root_digest.map_or(base_capability_manifest_hash, |digest| {
+                    Self::chain_capability_manifest_hash_to_policy_root(
+                        base_capability_manifest_hash,
+                        digest,
+                    )
+                });
+            let freshness_policy_hash = authoritative_policy_root_digest.map_or_else(
+                || {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"pcac-freshness-policy-v1");
+                    hasher.update(session_state.policy_resolved_ref.as_bytes());
+                    *hasher.finalize().as_bytes()
+                },
+                |digest| {
+                    Self::chain_freshness_policy_hash_to_policy_root(
+                        &session_state.policy_resolved_ref,
+                        digest,
+                    )
+                },
             );
 
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
@@ -5956,6 +6140,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Some(PendingPcacAuthority {
                 gate: Arc::clone(pcac_gate),
                 certificate,
+                authoritative_policy_root_digest,
                 intent_digest,
                 boundary_intent_class,
                 requires_authoritative_acceptance,
@@ -6335,12 +6520,31 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 &decision,
                 Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
             ) {
-            // AJC-rooted authority: if the PCAC kernel issued an
-            // AuthorityJoinCertificate with a validated `as_of_ledger_anchor`,
-            // the tool decision is ledger-rooted.
-            let policy_ledger_verified = Self::policy_ledger_verified_from_ajc(
+            let authoritative_policy_root_digest = pending_pcac
+                .as_ref()
+                .and_then(|pcac| pcac.authoritative_policy_root_digest)
+                .or_else(|| self.resolve_authoritative_policy_root_digest());
+            let policy_ledger_verified = Self::tool_decision_policy_verified(
+                &decision,
                 pending_pcac.as_ref().map(|pcac| &pcac.certificate),
+                authoritative_policy_root_digest,
             );
+            if !policy_ledger_verified
+                && self.strict_boundary_authority_enforcement
+                && (risk_tier.requires_sandbox()
+                    || Self::requires_channel_boundary_enforcement(tool_class))
+            {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    risk_tier = ?risk_tier,
+                    "RequestTool denied: authoritative governance policy root unavailable or mismatched (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "authoritative governance policy root unavailable or mismatched (fail-closed)",
+                ));
+            }
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
@@ -6354,11 +6558,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 &taint_assessment,
                 &request_arguments,
                 timestamp_ns,
-                if pending_pcac.is_some() {
-                    Some(broker.active_policy_hash())
-                } else {
-                    None
-                },
+                authoritative_policy_root_digest,
             ) {
                 Ok(state) => state,
                 Err(error) => {
@@ -8572,6 +8772,8 @@ mod tests {
     struct StaticReceiptLookupLedger {
         inner: crate::protocol::dispatch::StubLedgerEventEmitter,
         events_by_receipt_id: HashMap<String, crate::protocol::dispatch::SignedLedgerEvent>,
+        governance_policy_event: Option<crate::protocol::dispatch::SignedLedgerEvent>,
+        verifying_key_override: Option<ed25519_dalek::VerifyingKey>,
     }
 
     impl StaticReceiptLookupLedger {
@@ -8589,7 +8791,22 @@ mod tests {
             Self {
                 inner: crate::protocol::dispatch::StubLedgerEventEmitter::new(),
                 events_by_receipt_id,
+                governance_policy_event: None,
+                verifying_key_override: None,
             }
+        }
+
+        fn with_governance_policy_event(
+            mut self,
+            event: crate::protocol::dispatch::SignedLedgerEvent,
+        ) -> Self {
+            self.governance_policy_event = Some(event);
+            self
+        }
+
+        fn with_verifying_key_override(mut self, key: ed25519_dalek::VerifyingKey) -> Self {
+            self.verifying_key_override = Some(key);
+            self
         }
     }
 
@@ -8652,7 +8869,8 @@ mod tests {
         }
 
         fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
-            self.inner.verifying_key()
+            self.verifying_key_override
+                .unwrap_or_else(|| self.inner.verifying_key())
         }
 
         fn emit_stop_flags_mutated(
@@ -8705,6 +8923,14 @@ mod tests {
             let mut events = self.inner.get_all_events();
             events.extend(self.events_by_receipt_id.values().cloned());
             events
+        }
+
+        fn get_latest_governance_policy_event(
+            &self,
+        ) -> Option<crate::protocol::dispatch::SignedLedgerEvent> {
+            self.governance_policy_event
+                .clone()
+                .or_else(|| self.inner.get_latest_governance_policy_event())
         }
 
         fn get_event_by_receipt_id(
@@ -10199,14 +10425,38 @@ mod tests {
                 HolonicClock::new(ClockConfig::default(), None)
                     .expect("default clock should initialize"),
             );
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-DOWNGRADE".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            governance_ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(governance_ledger);
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
 
             let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                 .with_broker(broker)
                 .with_clock(clock)
+                .with_ledger(ledger)
                 .with_session_registry(registry_dyn)
                 .with_telemetry_store(telemetry)
                 .with_preactuation_gate(gate)
-                .with_stop_authority(authority);
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
             let request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
@@ -10349,14 +10599,39 @@ mod tests {
                 HolonicClock::new(ClockConfig::default(), None)
                     .expect("default clock should initialize"),
             );
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+            let governance_payload = serde_json::to_vec(
+                &crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                },
+            )
+            .expect("governance payload serialization");
+            governance_ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(governance_ledger);
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
 
             let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                 .with_broker(broker)
                 .with_clock(clock)
+                .with_ledger(ledger)
                 .with_session_registry(registry_dyn)
                 .with_telemetry_store(telemetry)
                 .with_preactuation_gate(gate)
-                .with_stop_authority(authority);
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
             let request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
@@ -11547,14 +11822,38 @@ mod tests {
                 HolonicClock::new(ClockConfig::default(), None)
                     .expect("default clock should initialize"),
             );
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            governance_ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(governance_ledger);
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
 
             let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                 .with_broker(broker)
                 .with_clock(clock)
+                .with_ledger(ledger)
                 .with_session_registry(registry_dyn)
                 .with_telemetry_store(telemetry)
                 .with_preactuation_gate(gate)
-                .with_stop_authority(authority);
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
             let leakage_overrun_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
@@ -11712,14 +12011,38 @@ mod tests {
                 HolonicClock::new(ClockConfig::default(), None)
                     .expect("default clock should initialize"),
             );
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-TIMING".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            governance_ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(governance_ledger);
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
 
             let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                 .with_broker(broker)
                 .with_clock(clock)
+                .with_ledger(ledger)
                 .with_session_registry(registry_dyn)
                 .with_telemetry_store(telemetry)
                 .with_preactuation_gate(gate)
-                .with_stop_authority(authority);
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
             let timing_overrun_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
@@ -12134,11 +12457,15 @@ mod tests {
                 &decision
             )
         );
-        assert!(!SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(None));
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::policy_ledger_anchor_verified_from_ajc(
+                None
+            )
+        );
     }
 
     #[test]
-    fn test_policy_ledger_verified_uses_ajc_authority() {
+    fn test_policy_ledger_anchor_verified_uses_ajc_authority() {
         use apm2_core::pcac::{
             AuthorityJoinCertificateV1, BoundaryIntentClass, IdentityEvidenceLevel, RiskTier,
         };
@@ -12159,19 +12486,167 @@ mod tests {
         };
 
         assert!(
-            SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(Some(
-                &cert
-            ))
+            SessionDispatcher::<InMemoryManifestStore>::policy_ledger_anchor_verified_from_ajc(
+                Some(&cert)
+            )
         );
 
         let mut cert_no_anchor = cert;
         cert_no_anchor.as_of_ledger_anchor = [0u8; 32];
         assert!(
-            !SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(Some(
-                &cert_no_anchor
-            ))
+            !SessionDispatcher::<InMemoryManifestStore>::policy_ledger_anchor_verified_from_ajc(
+                Some(&cert_no_anchor)
+            )
         );
-        assert!(!SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(None));
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::policy_ledger_anchor_verified_from_ajc(
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn test_authoritative_policy_root_lookup_rejects_session_namespace_event() {
+        let ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+        let forged_policy_hash = [0xE1; 32];
+        let forged_payload = serde_json::json!({
+            "policy_hash": forged_policy_hash,
+            "note": "attacker-controlled session payload"
+        });
+        let forged_payload_bytes = serde_json::to_vec(&forged_payload).unwrap();
+        ledger
+            .emit_session_event(
+                "session-001",
+                "session.custom",
+                &forged_payload_bytes,
+                "session-001",
+                1_000_000_000,
+            )
+            .expect("session event emit should succeed");
+
+        let resolved = SessionDispatcher::<InMemoryManifestStore>::resolve_authoritative_policy_root_digest_from_ledger(&ledger);
+        assert!(
+            resolved.is_none(),
+            "session-originated events must never satisfy authoritative policy-root lookup"
+        );
+    }
+
+    #[test]
+    fn test_authoritative_policy_root_lookup_accepts_signed_governance_event() {
+        let ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+        let expected_policy_hash = [0xC2; 32];
+        let governance_payload =
+            serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                work_id: "work-001".to_string(),
+                policy_hash: expected_policy_hash,
+                timestamp_ms: 1,
+            })
+            .expect("gate payload serialization should succeed");
+        ledger
+            .emit_session_event(
+                "session-001",
+                "gate.policy_resolved",
+                &governance_payload,
+                "orchestrator:gate-lifecycle",
+                1_000_000_001,
+            )
+            .expect("governance event emit should succeed");
+
+        let resolved = SessionDispatcher::<InMemoryManifestStore>::resolve_authoritative_policy_root_digest_from_ledger(&ledger);
+        assert_eq!(
+            resolved,
+            Some(expected_policy_hash),
+            "governance event with valid provenance must satisfy authoritative policy-root lookup"
+        );
+    }
+
+    #[test]
+    fn test_authoritative_policy_root_lookup_rejects_invalid_signature() {
+        let source_ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+        let expected_policy_hash = [0xD3; 32];
+        let governance_payload =
+            serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                work_id: "work-002".to_string(),
+                policy_hash: expected_policy_hash,
+                timestamp_ms: 2,
+            })
+            .expect("gate payload serialization should succeed");
+        let mut event = source_ledger
+            .emit_session_event(
+                "session-002",
+                "gate.policy_resolved",
+                &governance_payload,
+                "orchestrator:gate-lifecycle",
+                1_000_000_002,
+            )
+            .expect("governance event emit should succeed");
+        event.signature[0] ^= 0xFF;
+
+        let lookup_ledger = StaticReceiptLookupLedger::new(Vec::new())
+            .with_governance_policy_event(event)
+            .with_verifying_key_override(source_ledger.verifying_key());
+        let resolved = SessionDispatcher::<InMemoryManifestStore>::resolve_authoritative_policy_root_digest_from_ledger(&lookup_ledger);
+        assert!(
+            resolved.is_none(),
+            "invalid governance signature must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_authoritative_policy_root_lookup_missing_governance_event_returns_none() {
+        let ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+        let resolved = SessionDispatcher::<InMemoryManifestStore>::resolve_authoritative_policy_root_digest_from_ledger(&ledger);
+        assert!(
+            resolved.is_none(),
+            "missing governance event must not resolve an authoritative policy root"
+        );
+    }
+
+    #[test]
+    fn test_tool_decision_policy_verified_never_falls_back_to_broker_hash() {
+        use apm2_core::pcac::{
+            AuthorityJoinCertificateV1, BoundaryIntentClass, IdentityEvidenceLevel, RiskTier,
+        };
+
+        let cert = AuthorityJoinCertificateV1 {
+            ajc_id: [0x11; 32],
+            authority_join_hash: [0x22; 32],
+            intent_digest: [0x33; 32],
+            boundary_intent_class: BoundaryIntentClass::Actuate,
+            risk_tier: RiskTier::Tier1,
+            issued_time_envelope_ref: [0x44; 32],
+            as_of_ledger_anchor: [0x55; 32],
+            expires_at_tick: u64::MAX,
+            issued_at_tick: 1,
+            revocation_head_hash: [0x66; 32],
+            identity_evidence_level: IdentityEvidenceLevel::Verified,
+            admission_capacity_token: None,
+        };
+        let decision = Ok(ToolDecision::Allow {
+            request_id: "REQ-POLICY-CHECK".to_string(),
+            capability_id: "cap-read".to_string(),
+            rule_id: Some("rule-read".to_string()),
+            policy_hash: [0xAB; 32],
+            budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+            credential: None,
+        });
+
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(
+                &decision,
+                Some(&cert),
+                None,
+            ),
+            "missing authoritative governance root must fail closed even when broker policy hash exists"
+        );
+        assert!(
+            SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(
+                &decision,
+                Some(&cert),
+                Some([0xAB; 32]),
+            ),
+            "matching authoritative governance root should verify successfully"
+        );
     }
 
     // ========================================================================
@@ -13671,6 +14146,7 @@ mod tests {
             let pending_pcac = PendingPcacAuthority {
                 gate: pcac_gate,
                 certificate: certificate.clone(),
+                authoritative_policy_root_digest: Some([0xA1; 32]),
                 intent_digest: certificate.intent_digest,
                 boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
                 requires_authoritative_acceptance: true,
@@ -13827,6 +14303,7 @@ mod tests {
             let pending_pcac = PendingPcacAuthority {
                 gate: pcac_gate,
                 certificate,
+                authoritative_policy_root_digest: Some([0xA2; 32]),
                 intent_digest: effect_intent_digest,
                 boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
                 requires_authoritative_acceptance: true,
@@ -13982,6 +14459,7 @@ mod tests {
             let pending_pcac = PendingPcacAuthority {
                 gate: pcac_gate,
                 certificate,
+                authoritative_policy_root_digest: Some([0xA3; 32]),
                 intent_digest: effect_intent_digest,
                 boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
                 requires_authoritative_acceptance: true,
@@ -14116,6 +14594,7 @@ mod tests {
             let pending_pcac = PendingPcacAuthority {
                 gate: Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel)),
                 certificate: cert,
+                authoritative_policy_root_digest: Some([0xA4; 32]),
                 intent_digest: [0xAA; 32],
                 boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Observe,
                 requires_authoritative_acceptance: false,
@@ -14251,6 +14730,7 @@ mod tests {
             let pending_pcac = PendingPcacAuthority {
                 gate: Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel)),
                 certificate: cert,
+                authoritative_policy_root_digest: Some([0xA5; 32]),
                 intent_digest,
                 boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Observe,
                 requires_authoritative_acceptance: false,
