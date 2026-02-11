@@ -743,7 +743,6 @@ const MAX_BOUNDARY_CHANNEL_KEY_LENGTH: usize = 256;
 const MAX_BOUNDARY_QUARANTINE_REASON_LENGTH: usize = 1024;
 const QUARANTINE_TTL_SECS: u64 = 300;
 const QUARANTINE_TTL_NS: u64 = QUARANTINE_TTL_SECS * 1_000_000_000;
-const MAX_CONSUMED_RECEIPTS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 struct QuarantinedBoundaryChannel {
@@ -840,37 +839,6 @@ impl BoundaryChannelQuarantineState {
             },
         );
         true
-    }
-}
-
-#[derive(Debug, Default)]
-struct ConsumedRedundancyReceiptCache {
-    bindings: HashMap<String, ConsumedRedundancyReceiptBinding>,
-    insertion_order: VecDeque<String>,
-}
-
-impl ConsumedRedundancyReceiptCache {
-    fn get(&self, receipt_id: &str) -> Option<&ConsumedRedundancyReceiptBinding> {
-        self.bindings.get(receipt_id)
-    }
-
-    fn insert(&mut self, receipt_id: String, binding: ConsumedRedundancyReceiptBinding) {
-        if let Some(existing) = self.bindings.get_mut(&receipt_id) {
-            *existing = binding;
-            return;
-        }
-
-        while self.bindings.len() >= MAX_CONSUMED_RECEIPTS {
-            let Some(oldest_receipt_id) = self.insertion_order.pop_front() else {
-                break;
-            };
-            if self.bindings.remove(&oldest_receipt_id).is_some() {
-                break;
-            }
-        }
-
-        self.insertion_order.push_back(receipt_id.clone());
-        self.bindings.insert(receipt_id, binding);
     }
 }
 
@@ -1046,11 +1014,6 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     ///
     /// Violating channels are denied fail-closed until mitigation/clearance.
     boundary_channel_quarantine: Arc<Mutex<BoundaryChannelQuarantineState>>,
-    /// Fast-path cache of consumed redundancy declassification receipts.
-    ///
-    /// Authoritative single-use state is persisted in the ledger; this cache
-    /// avoids repeated scans for recently consumed receipts.
-    consumed_redundancy_receipts: Arc<Mutex<ConsumedRedundancyReceiptCache>>,
 }
 
 #[derive(Clone)]
@@ -1067,6 +1030,21 @@ struct PendingPcacAuthority {
     temporal_arbitration_receipts: Vec<TemporalArbitrationReceiptV1>,
     pre_actuation_required: bool,
     pre_actuation_receipt_hashes: Vec<Hash>,
+    pending_redundancy_receipt: Option<PendingRedundancyReceiptConsumption>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRedundancyReceiptConsumption {
+    receipt_id: String,
+    intent_digest: Hash,
+    argument_content_digest: Hash,
+    channel_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthoritativeRedundancyReceiptAuthority {
+    receipt: RedundancyDeclassificationReceipt,
+    receipt_hash: Hash,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1152,12 +1130,6 @@ struct AuthoritativeRedundancyReceiptPayload {
     plaintext_semantics_exposed: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
-struct ConsumedRedundancyReceiptBinding {
-    request_id: String,
-    tool_class: String,
-}
-
 #[cfg(not(test))]
 fn default_runtime_taint_policy() -> TaintPolicy {
     TaintPolicy::default()
@@ -1217,9 +1189,6 @@ impl SessionDispatcher<InMemoryManifestStore> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(
-                ConsumedRedundancyReceiptCache::default(),
-            )),
         }
     }
 
@@ -1254,9 +1223,6 @@ impl SessionDispatcher<InMemoryManifestStore> {
             strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
-            )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(
-                ConsumedRedundancyReceiptCache::default(),
             )),
         }
     }
@@ -1298,9 +1264,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(
-                ConsumedRedundancyReceiptCache::default(),
-            )),
         }
     }
 
@@ -1340,9 +1303,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
-            )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(
-                ConsumedRedundancyReceiptCache::default(),
             )),
         }
     }
@@ -1399,9 +1359,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
-            )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(
-                ConsumedRedundancyReceiptCache::default(),
             )),
         }
     }
@@ -2892,45 +2849,34 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    fn redundancy_receipt_available_for_request(
+    fn redundancy_receipt_available_for_intent(
         &self,
         receipt_id: &str,
-        request_id: &str,
-        tool_class: ToolClass,
+        request_scope_intent_digest: &Hash,
     ) -> bool {
-        let tool_class = tool_class.to_string();
-        let Ok(consumed) = self.consumed_redundancy_receipts.lock() else {
-            return false;
-        };
-        if let Some(binding) = consumed.get(receipt_id)
-            && (binding.request_id != request_id || binding.tool_class != tool_class)
-        {
-            return false;
-        }
-        drop(consumed);
-
         let Some(ledger) = self.ledger.as_ref() else {
             return false;
         };
-        let authoritative_binding = ledger.get_redundancy_receipt_consumption(receipt_id);
-        let Some(authoritative_binding) = authoritative_binding else {
+        let Some(existing) = ledger.get_redundancy_receipt_consumption(receipt_id) else {
             return true;
         };
 
-        if let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() {
-            consumed.insert(
-                receipt_id.to_string(),
-                ConsumedRedundancyReceiptBinding {
-                    request_id: authoritative_binding.request_id.clone(),
-                    tool_class: authoritative_binding.tool_class.clone(),
-                },
-            );
-        } else {
+        // Fail-closed: legacy consumption entries without explicit intent
+        // binding are considered consumed with unknown scope.
+        if existing.intent_digest.is_none() {
             return false;
         }
 
-        authoritative_binding.request_id == request_id
-            && authoritative_binding.tool_class == tool_class
+        // Single-use semantics remain strict: any persisted consumption
+        // record makes the receipt unavailable. Keep explicit equality check
+        // to surface intent-binding mismatches in diagnostics.
+        if existing
+            .intent_digest
+            .is_some_and(|digest| digest != *request_scope_intent_digest)
+        {
+            return false;
+        }
+        false
     }
 
     fn htf_wall_ns_for_ledger_event(&self) -> Option<u64> {
@@ -2939,60 +2885,74 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn consume_redundancy_receipt(
         &self,
         session_id: &str,
         receipt_id: &str,
         request_id: &str,
         tool_class: ToolClass,
+        request_scope_intent_digest: Hash,
+        argument_content_digest: Hash,
+        channel_key: &str,
     ) -> bool {
         let Some(ledger) = self.ledger.as_ref() else {
             return false;
         };
-        let tool_class = tool_class.to_string();
-        if let Some(existing) = ledger.get_redundancy_receipt_consumption(receipt_id) {
-            if existing.request_id != request_id || existing.tool_class != tool_class {
-                return false;
-            }
-            let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() else {
-                return false;
-            };
-            consumed.insert(
-                receipt_id.to_string(),
-                ConsumedRedundancyReceiptBinding {
-                    request_id: request_id.to_string(),
-                    tool_class,
-                },
-            );
-            return true;
+        if ledger
+            .get_redundancy_receipt_consumption(receipt_id)
+            .is_some()
+        {
+            return false;
         }
 
         let Some(timestamp_ns) = self.htf_wall_ns_for_ledger_event() else {
             return false;
         };
+        let tool_class = tool_class.to_string();
         let persisted = ledger.emit_redundancy_receipt_consumed(
             session_id,
             receipt_id,
             request_id,
             &tool_class,
+            &request_scope_intent_digest,
+            &argument_content_digest,
+            channel_key,
             session_id,
             timestamp_ns,
         );
-        if persisted.is_err() {
-            return false;
-        }
+        persisted.is_ok()
+    }
 
-        let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() else {
-            return false;
-        };
-        consumed.insert(
-            receipt_id.to_string(),
-            ConsumedRedundancyReceiptBinding {
-                request_id: request_id.to_string(),
-                tool_class,
-            },
-        );
-        true
+    fn derive_request_scope_intent_digest(
+        tool_class: ToolClass,
+        channel_key: &str,
+        argument_content_digest: Hash,
+    ) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-request-scope-intent-v1");
+        let tool_class_name = tool_class.to_string();
+        hasher.update(tool_class_name.as_bytes());
+        hasher.update(channel_key.as_bytes());
+        hasher.update(&argument_content_digest);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn derive_declassification_receipt_hash(
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        scoped_fragment_only: bool,
+        plaintext_semantics_exposed: bool,
+    ) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-declassification-receipt-v1");
+        hasher.update(receipt_id.as_bytes());
+        hasher.update(lease_id.as_bytes());
+        hasher.update(work_id.as_bytes());
+        hasher.update(&[u8::from(scoped_fragment_only)]);
+        hasher.update(&[u8::from(plaintext_semantics_exposed)]);
+        *hasher.finalize().as_bytes()
     }
 
     fn resolve_authoritative_redundancy_receipt(
@@ -3001,8 +2961,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         lease_id: &str,
         request_id: &str,
         tool_class: ToolClass,
+        request_scope_intent_digest: Hash,
         declassification: &BoundaryDeclassificationHints,
-    ) -> Option<RedundancyDeclassificationReceipt> {
+    ) -> Option<AuthoritativeRedundancyReceiptAuthority> {
         let receipt_id = declassification.receipt_id.as_deref().unwrap_or_default();
         if receipt_id.is_empty()
             || receipt_id.len() > apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
@@ -3049,7 +3010,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         {
             return None;
         }
-        if !self.redundancy_receipt_available_for_request(receipt_id, request_id, tool_class) {
+        if !self.redundancy_receipt_available_for_intent(receipt_id, &request_scope_intent_digest) {
             return None;
         }
 
@@ -3072,10 +3033,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         {
             return None;
         }
-        if !self.consume_redundancy_receipt(session_id, receipt_id, request_id, tool_class) {
-            return None;
-        }
-        Some(receipt)
+        let receipt_hash = Self::derive_declassification_receipt_hash(
+            &receipt.receipt_id,
+            &payload.lease_id,
+            &payload.work_id,
+            receipt.scoped_fragment_only,
+            receipt.plaintext_semantics_exposed,
+        );
+        Some(AuthoritativeRedundancyReceiptAuthority {
+            receipt,
+            receipt_hash,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3110,6 +3078,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let mut declass_receipt_valid = base_classification_allow;
         let mut declassification_intent = DeclassificationIntentScope::None;
         let mut redundancy_receipt = None;
+        let boundary_channel_key = Self::boundary_channel_key(session_id, tool_class);
+        let argument_content_digest = *blake3::hash(request_arguments).as_bytes();
+        let request_scope_intent_digest = Self::derive_request_scope_intent_digest(
+            tool_class,
+            &boundary_channel_key,
+            argument_content_digest,
+        );
 
         if let Some(declassification) = hints
             .as_ref()
@@ -3132,9 +3107,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     lease_id,
                     request_id,
                     tool_class,
+                    request_scope_intent_digest,
                     declassification,
                 );
-                redundancy_receipt = authoritative_receipt;
+                redundancy_receipt = authoritative_receipt.map(|authority| authority.receipt);
                 declass_receipt_valid = redundancy_receipt.is_some();
                 if declass_receipt_valid {
                     classification_allow = true;
@@ -5729,6 +5705,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
+        let argument_content_digest = *blake3::hash(&request.arguments).as_bytes();
+        let request_scope_intent_digest = Self::derive_request_scope_intent_digest(
+            tool_class,
+            &boundary_channel_key,
+            argument_content_digest,
+        );
+
         // TCK-00423/TCK-00426: Stage 1 and Stage 2 of PCAC lifecycle.
         // join -> revalidate-before-decision
         //
@@ -5902,7 +5886,68 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 *hasher.finalize().as_bytes()
             };
 
-            let intent_digest = *blake3::hash(&request.arguments).as_bytes();
+            let intent_digest = request_scope_intent_digest;
+            let boundary_hints = match Self::extract_boundary_flow_hints(&request.arguments) {
+                Ok(hints) => hints,
+                Err(error) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        error = %error,
+                        "PCAC denied: invalid boundary-flow hints (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("PCAC authority denied: invalid boundary-flow hints: {error}"),
+                    ));
+                },
+            };
+
+            let redundancy_receipt_authority = match boundary_hints
+                .as_ref()
+                .and_then(|hints| hints.declassification.as_ref())
+            {
+                Some(declassification)
+                    if matches!(
+                        declassification.intent,
+                        DeclassificationIntentHint::RedundancyPurpose
+                    ) =>
+                {
+                    let authority = self.resolve_authoritative_redundancy_receipt(
+                        &token.session_id,
+                        &token.lease_id,
+                        &request_id,
+                        tool_class,
+                        request_scope_intent_digest,
+                        declassification,
+                    );
+                    if authority.is_none() {
+                        warn!(
+                            session_id = %token.session_id,
+                            tool_class = %tool_class,
+                            request_id = %request_id,
+                            "PCAC denied: redundancy-purpose declassification receipt unavailable/invalid at join time"
+                        );
+                    }
+                    authority
+                },
+                Some(declassification)
+                    if matches!(declassification.intent, DeclassificationIntentHint::Unknown) =>
+                {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        request_id = %request_id,
+                        "PCAC denied: unknown declassification intent hint at join time"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "PCAC authority denied: unknown declassification intent (fail-closed)",
+                    ));
+                },
+                _ => None,
+            };
+
             let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
             let as_of_ledger_anchor = match Self::derive_pcac_ledger_anchor(ledger.as_ref()) {
                 Ok(anchor) => anchor,
@@ -5970,6 +6015,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     )
                 },
             );
+            let mut scope_witness_hashes =
+                Self::derive_scope_witness_hashes(tool_class, &request.arguments);
+            let request_scope_witness = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"pcac-request-scope-witness-v1");
+                hasher.update(token.lease_id.as_bytes());
+                hasher.update(session_state.work_id.as_bytes());
+                hasher.update(&argument_content_digest);
+                *hasher.finalize().as_bytes()
+            };
+            scope_witness_hashes.push(request_scope_witness);
+            if let Some(authority) = &redundancy_receipt_authority {
+                scope_witness_hashes.push(authority.receipt_hash);
+            }
 
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
                 session_id: token.session_id.clone(),
@@ -5977,10 +6036,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 intent_digest,
                 boundary_intent_class,
                 capability_manifest_hash,
-                scope_witness_hashes: Self::derive_scope_witness_hashes(
-                    tool_class,
-                    &request.arguments,
-                ),
+                scope_witness_hashes,
                 lease_id: token.lease_id.clone(),
                 permeability_receipt_hash: None,
                 identity_proof_hash: *blake3::hash(token.session_id.as_bytes()).as_bytes(),
@@ -6150,6 +6206,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 temporal_arbitration_receipts: Vec::new(),
                 pre_actuation_required,
                 pre_actuation_receipt_hashes,
+                pending_redundancy_receipt: redundancy_receipt_authority.map(|authority| {
+                    PendingRedundancyReceiptConsumption {
+                        receipt_id: authority.receipt.receipt_id,
+                        intent_digest: request_scope_intent_digest,
+                        argument_content_digest,
+                        channel_key: boundary_channel_key.clone(),
+                    }
+                }),
             })
         } else if self.is_authoritative_mode() {
             // BLOCKER 4 FIX: Authoritative mode requires mandatory PCAC gate wiring.
@@ -6183,7 +6247,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let timestamp_ns = actuation_timestamp.wall_ns;
 
         // Build BrokerToolRequest
-        let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
 
         // BLOCKER 1 FIX (TCK-00290): Fail-closed if session ID is not valid for
         // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
@@ -6205,7 +6268,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         let dedupe_key = DedupeKey::new(&request.dedupe_key);
-        let args_hash = *blake3::hash(&request.arguments).as_bytes();
+        let args_hash = argument_content_digest;
 
         // Derive risk tier from validated capability policy (fail-closed).
         let Some(risk_tier) = self
@@ -7067,9 +7130,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         ));
                     }
 
-                    // TCK-00423: Enforce intent digest equality at consume time
-                    // against the concrete effect arguments.
-                    let effect_intent_digest = *blake3::hash(request_arguments).as_bytes();
+                    // TCK-00423: Enforce intent digest equality at consume
+                    // time against the request-scoped payload
+                    // (`tool_class + channel_key + argument_digest`).
+                    let argument_content_digest = *blake3::hash(request_arguments).as_bytes();
+                    let boundary_channel_key = Self::boundary_channel_key(session_id, tool_class);
+                    let effect_intent_digest = Self::derive_request_scope_intent_digest(
+                        tool_class,
+                        &boundary_channel_key,
+                        argument_content_digest,
+                    );
                     if effect_intent_digest != pending_pcac.intent_digest {
                         let deny_class =
                             apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
@@ -7229,6 +7299,29 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         consume_record_hash = %hex::encode(consume_record_hash),
                         "PCAC consume completed and ToolActuation event persisted before effect execution"
                     );
+
+                    if let Some(redundancy_receipt) = &pending_pcac.pending_redundancy_receipt {
+                        if !self.consume_redundancy_receipt(
+                            session_id,
+                            &redundancy_receipt.receipt_id,
+                            &request_id,
+                            tool_class,
+                            redundancy_receipt.intent_digest,
+                            redundancy_receipt.argument_content_digest,
+                            &redundancy_receipt.channel_key,
+                        ) {
+                            warn!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                receipt_id = %redundancy_receipt.receipt_id,
+                                "RequestTool denied: redundancy receipt consumption failed"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                "PCAC authority denied before effect: redundancy receipt already consumed or invalid".to_string(),
+                            ));
+                        }
+                    }
                 }
 
                 // TCK-00316: Execute tool via EpisodeRuntime
@@ -10918,6 +11011,29 @@ mod tests {
             first_result.is_ok(),
             "first request should pass channel-boundary admission with a fresh receipt"
         );
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            session_id,
+            ToolClass::Read,
+        );
+        let first_argument_digest = *blake3::hash(&request_arguments).as_bytes();
+        let first_intent_digest =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                first_argument_digest,
+            );
+        assert!(
+            dispatcher.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                first_request_id,
+                ToolClass::Read,
+                first_intent_digest,
+                first_argument_digest,
+                &channel_key,
+            ),
+            "first request must consume redundancy receipt after boundary admission",
+        );
 
         let second_request_id = "REQ-REPLAY-SECOND";
         let second_decision = Ok(ToolDecision::Allow {
@@ -11058,11 +11174,34 @@ mod tests {
             .expect("first boundary-flow runtime state should build");
         assert!(
             first_state.declass_receipt_valid,
-            "first request should consume authoritative receipt"
+            "first request should admit authoritative declassification receipt"
+        );
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            session_id,
+            ToolClass::Read,
+        );
+        let first_argument_digest = *blake3::hash(&request_arguments).as_bytes();
+        let first_intent_digest =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                first_argument_digest,
+            );
+        assert!(
+            dispatcher_before_restart.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-RESTART-FIRST",
+                ToolClass::Read,
+                first_intent_digest,
+                first_argument_digest,
+                &channel_key,
+            ),
+            "first request must persist receipt consumption before restart simulation",
         );
 
-        // Simulate daemon restart: a new dispatcher instance with empty
-        // in-memory cache but the same ledger backend.
+        // Simulate daemon restart: a new dispatcher instance with the same
+        // ledger backend (durable consume evidence must still deny reuse).
         let dispatcher_after_restart =
             SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
                 .with_ledger(ledger)
@@ -11093,6 +11232,147 @@ mod tests {
         assert!(
             !second_state.declass_receipt_valid,
             "second request after restart must be denied via ledger-authoritative receipt consumption"
+        );
+    }
+
+    #[test]
+    fn test_redundancy_receipt_intent_mismatch_denied() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState};
+
+        let receipt_id = "RR-INTENT-MISMATCH-001";
+        let session_id = "session-001";
+        let lease_id = "lease-001";
+        let work_id = "W-INTENT-MISMATCH";
+        let policy_hash = [0xC4; 32];
+
+        let ledger_event = make_authoritative_redundancy_receipt_event(
+            receipt_id,
+            lease_id,
+            work_id,
+            None,
+            Some(ToolClass::Read),
+        );
+        let ledger: Arc<dyn LedgerEventEmitter> =
+            Arc::new(StaticReceiptLookupLedger::new(vec![ledger_event]));
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: "handle-intent-mismatch".to_string(),
+                policy_resolved_ref: "policy-resolved-ref-intent".to_string(),
+                capability_manifest_hash: blake3::hash(b"intent-mismatch-manifest")
+                    .as_bytes()
+                    .to_vec(),
+                episode_id: Some(session_id.to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("session registration should succeed");
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default clock should initialize"),
+        );
+
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_ledger(ledger)
+            .with_session_registry(registry_dyn)
+            .with_clock(clock);
+
+        let request_arguments_a = serde_json::to_vec(&serde_json::json!({
+            "prompt": "first request",
+            "boundary_flow": {
+                "declassification": {
+                    "intent": "redundancy_purpose",
+                    "receipt_id": receipt_id,
+                    "scoped_fragment_only": true,
+                    "plaintext_semantics_exposed": false
+                }
+            }
+        }))
+        .expect("arguments serialization");
+
+        let request_arguments_b = serde_json::to_vec(&serde_json::json!({
+            "prompt": "different request payload",
+            "boundary_flow": {
+                "declassification": {
+                    "intent": "redundancy_purpose",
+                    "receipt_id": receipt_id,
+                    "scoped_fragment_only": true,
+                    "plaintext_semantics_exposed": false
+                }
+            }
+        }))
+        .expect("arguments serialization");
+
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            session_id,
+            ToolClass::Read,
+        );
+        let digest_a = *blake3::hash(&request_arguments_a).as_bytes();
+        let digest_b = *blake3::hash(&request_arguments_b).as_bytes();
+        let intent_a =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                digest_a,
+            );
+        let intent_b =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                digest_b,
+            );
+
+        assert_ne!(
+            intent_a, intent_b,
+            "test setup requires distinct intent digests"
+        );
+        assert!(
+            dispatcher.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-INTENT-A",
+                ToolClass::Read,
+                intent_a,
+                digest_a,
+                &channel_key,
+            ),
+            "first intent must persist receipt consumption",
+        );
+
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments_b, &TaintPolicy::default());
+        let second_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                session_id,
+                lease_id,
+                "REQ-INTENT-B",
+                ToolClass::Read,
+                &Ok(ToolDecision::Allow {
+                    request_id: "REQ-INTENT-B".to_string(),
+                    capability_id: "cap-read-intent".to_string(),
+                    rule_id: Some("rule-allow".to_string()),
+                    policy_hash,
+                    budget_delta: crate::episode::BudgetDelta::single_call(),
+                    credential: None,
+                }),
+                Some(RiskTier::Tier0),
+                &taint_assessment,
+                &request_arguments_b,
+                Some(policy_hash),
+            )
+            .expect("intent-mismatch boundary-flow runtime state should build");
+
+        assert!(
+            !second_state.declass_receipt_valid,
+            "receipt consumed under one intent must be denied for a mismatched intent",
         );
     }
 
@@ -14162,6 +14442,7 @@ mod tests {
                 temporal_arbitration_receipts: Vec::new(),
                 pre_actuation_required: false,
                 pre_actuation_receipt_hashes: Vec::new(),
+                pending_redundancy_receipt: None,
             };
 
             let decision = Ok(ToolDecision::Allow {
@@ -14266,7 +14547,17 @@ mod tests {
                 .with_stop_authority(Arc::clone(&stop_authority));
 
             let request_arguments = br#"{"type":"read","path":"/tmp/in"}"#;
-            let effect_intent_digest = *blake3::hash(request_arguments).as_bytes();
+            let argument_content_digest = *blake3::hash(request_arguments).as_bytes();
+            let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+                session_id,
+                ToolClass::Read,
+            );
+            let effect_intent_digest =
+                SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                    ToolClass::Read,
+                    &channel_key,
+                    argument_content_digest,
+                );
             let current_ledger_anchor =
                 SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
                     ledger.as_ref(),
@@ -14319,6 +14610,7 @@ mod tests {
                 temporal_arbitration_receipts: vec![bad_receipt],
                 pre_actuation_required: false,
                 pre_actuation_receipt_hashes: Vec::new(),
+                pending_redundancy_receipt: None,
             };
 
             let decision = Ok(ToolDecision::Allow {
@@ -14440,7 +14732,17 @@ mod tests {
                     .expect("fresh revalidation inputs");
 
             let request_arguments = br#"{"type":"read","path":"/tmp/in"}"#;
-            let effect_intent_digest = *blake3::hash(request_arguments).as_bytes();
+            let argument_content_digest = *blake3::hash(request_arguments).as_bytes();
+            let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+                session_id,
+                ToolClass::Read,
+            );
+            let effect_intent_digest =
+                SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                    ToolClass::Read,
+                    &channel_key,
+                    argument_content_digest,
+                );
             let certificate = AuthorityJoinCertificateV1 {
                 ajc_id: [0x41; 32],
                 authority_join_hash: [0x42; 32],
@@ -14475,6 +14777,7 @@ mod tests {
                 temporal_arbitration_receipts: Vec::new(),
                 pre_actuation_required: false,
                 pre_actuation_receipt_hashes: Vec::new(),
+                pending_redundancy_receipt: None,
             };
 
             let decision = Ok(ToolDecision::Allow {
@@ -14610,6 +14913,7 @@ mod tests {
                 temporal_arbitration_receipts: Vec::new(),
                 pre_actuation_required: true,
                 pre_actuation_receipt_hashes: vec![[0x55; 32]],
+                pending_redundancy_receipt: None,
             };
 
             let decision = ToolDecision::Allow {
@@ -14700,7 +15004,17 @@ mod tests {
                 .with_session_registry(registry_dyn);
 
             let request_arguments = br#"{"type":"read","path":"/tmp/in"}"#;
-            let intent_digest = *blake3::hash(request_arguments).as_bytes();
+            let argument_content_digest = *blake3::hash(request_arguments).as_bytes();
+            let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+                session_id,
+                ToolClass::Read,
+            );
+            let intent_digest =
+                SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                    ToolClass::Read,
+                    &channel_key,
+                    argument_content_digest,
+                );
             let episode_id = EpisodeId::new(session_id).expect("valid episode id");
             let actuation_timestamp = ReplayTimestamp::new(1_000_000_000, 0);
 
@@ -14746,6 +15060,7 @@ mod tests {
                 temporal_arbitration_receipts: Vec::new(),
                 pre_actuation_required: true,
                 pre_actuation_receipt_hashes: vec![],
+                pending_redundancy_receipt: None,
             };
 
             let decision = ToolDecision::Allow {
