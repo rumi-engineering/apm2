@@ -125,8 +125,11 @@ impl DisclosurePolicySnapshot {
         Ok(())
     }
 
-    fn verify_signature(&self) -> Result<(), DisclosurePolicyError> {
-        let verifying_key = parse_verifying_key(&self.issuer_verifying_key).map_err(|error| {
+    fn verify_signature(
+        &self,
+        trusted_issuer_verifying_key: &[u8; PUBLIC_KEY_SIZE],
+    ) -> Result<(), DisclosurePolicyError> {
+        let verifying_key = parse_verifying_key(trusted_issuer_verifying_key).map_err(|error| {
             DisclosurePolicyError::InvalidIssuerVerifyingKey {
                 reason: error.to_string(),
             }
@@ -260,6 +263,7 @@ pub const fn phase_disclosure_profile(_phase_id: &str) -> DisclosurePolicyMode {
 /// or epoch checks fail.
 pub fn validate_disclosure_policy(
     snapshot: &DisclosurePolicySnapshot,
+    trusted_issuer_verifying_key: &[u8; PUBLIC_KEY_SIZE],
     current_phase_id: &str,
     current_time_ns: u64,
     last_known_epoch: Option<u64>,
@@ -278,7 +282,7 @@ pub fn validate_disclosure_policy(
     }
 
     snapshot.validate_shape()?;
-    snapshot.verify_signature()?;
+    snapshot.verify_signature(trusted_issuer_verifying_key)?;
 
     if snapshot.phase_id != current_phase_id {
         return Err(DisclosurePolicyError::PhaseMismatch {
@@ -353,7 +357,14 @@ mod tests {
         let signer = Signer::generate();
         let now_ns = 1_700_000_000_000_000_000;
         let snapshot = valid_snapshot(&signer, now_ns);
-        let result = validate_disclosure_policy(&snapshot, "pre_federation", now_ns, None);
+        let trusted_issuer_key = signer.public_key_bytes();
+        let result = validate_disclosure_policy(
+            &snapshot,
+            &trusted_issuer_key,
+            "pre_federation",
+            now_ns,
+            None,
+        );
         assert!(result.is_ok(), "valid snapshot should pass: {result:?}");
     }
 
@@ -364,7 +375,14 @@ mod tests {
         let mut snapshot = valid_snapshot(&signer, now_ns);
         snapshot.expires_at_ns = now_ns.saturating_sub(1);
         snapshot.sign(&signer);
-        let result = validate_disclosure_policy(&snapshot, "pre_federation", now_ns, None);
+        let trusted_issuer_key = signer.public_key_bytes();
+        let result = validate_disclosure_policy(
+            &snapshot,
+            &trusted_issuer_key,
+            "pre_federation",
+            now_ns,
+            None,
+        );
         assert!(
             matches!(result, Err(DisclosurePolicyError::Expired { .. })),
             "expired snapshot must deny, got: {result:?}"
@@ -377,7 +395,14 @@ mod tests {
         let now_ns = 1_700_000_000_000_000_000;
         let mut snapshot = valid_snapshot(&signer, now_ns);
         snapshot.phase_id = "tampered-phase".to_string();
-        let result = validate_disclosure_policy(&snapshot, "pre_federation", now_ns, None);
+        let trusted_issuer_key = signer.public_key_bytes();
+        let result = validate_disclosure_policy(
+            &snapshot,
+            &trusted_issuer_key,
+            "pre_federation",
+            now_ns,
+            None,
+        );
         assert!(
             matches!(
                 result,
@@ -392,7 +417,9 @@ mod tests {
         let signer = Signer::generate();
         let now_ns = 1_700_000_000_000_000_000;
         let snapshot = valid_snapshot(&signer, now_ns);
-        let result = validate_disclosure_policy(&snapshot, "replication", now_ns, None);
+        let trusted_issuer_key = signer.public_key_bytes();
+        let result =
+            validate_disclosure_policy(&snapshot, &trusted_issuer_key, "replication", now_ns, None);
         assert!(
             matches!(result, Err(DisclosurePolicyError::PhaseMismatch { .. })),
             "phase mismatch must deny, got: {result:?}"
@@ -406,7 +433,14 @@ mod tests {
         let mut snapshot = valid_snapshot(&signer, now_ns);
         snapshot.policy_digest = [0u8; 32];
         snapshot.sign(&signer);
-        let result = validate_disclosure_policy(&snapshot, "pre_federation", now_ns, None);
+        let trusted_issuer_key = signer.public_key_bytes();
+        let result = validate_disclosure_policy(
+            &snapshot,
+            &trusted_issuer_key,
+            "pre_federation",
+            now_ns,
+            None,
+        );
         assert!(
             matches!(result, Err(DisclosurePolicyError::ZeroPolicyDigest)),
             "zero digest must deny, got: {result:?}"
@@ -418,10 +452,40 @@ mod tests {
         let signer = Signer::generate();
         let now_ns = 1_700_000_000_000_000_000;
         let snapshot = valid_snapshot(&signer, now_ns);
-        let result = validate_disclosure_policy(&snapshot, "pre_federation", now_ns, Some(1));
+        let trusted_issuer_key = signer.public_key_bytes();
+        let result = validate_disclosure_policy(
+            &snapshot,
+            &trusted_issuer_key,
+            "pre_federation",
+            now_ns,
+            Some(1),
+        );
         assert!(
             matches!(result, Err(DisclosurePolicyError::NonMonotonicEpoch { .. })),
             "non-monotonic epoch must deny, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_denies_snapshot_signed_by_unauthorized_issuer() {
+        let trusted_signer = Signer::generate();
+        let rogue_signer = Signer::generate();
+        let now_ns = 1_700_000_000_000_000_000;
+        let snapshot = valid_snapshot(&rogue_signer, now_ns);
+        let trusted_issuer_key = trusted_signer.public_key_bytes();
+        let result = validate_disclosure_policy(
+            &snapshot,
+            &trusted_issuer_key,
+            "pre_federation",
+            now_ns,
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(DisclosurePolicyError::SignatureVerificationFailed { .. })
+            ),
+            "snapshot signed by an unauthorized issuer must deny, got: {result:?}"
         );
     }
 }

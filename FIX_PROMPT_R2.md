@@ -1,71 +1,154 @@
-# Fix Task: PR #593 (TCK-00468) — Review Round 2
+# Fix Task: PR #598 (TCK-00467) — Round 2: Security + Quality Review Findings
 
-## Context
-You are fixing security review findings for PR #593 (TCK-00468: RFC-0028 REQ-0008 projection isolation and direct-GitHub authority elimination).
+Branch: `ticket/RFC-0028/TCK-00467`, worktree: `/home/ubuntu/Projects/apm2-TCK-00467`
+HEAD: `f0060a4f`
 
-Branch: `ticket/RFC-0028/TCK-00468`
-Worktree: `/home/ubuntu/Projects/apm2-TCK-00468`
-Current HEAD: `657239d8`
+## REQUIRED READING (read ALL before editing any code)
 
-## Review Results
-- **Quality Review: PASS** — no action needed
-- **Security Review: FAIL** — 2 MAJOR, 1 MINOR
+- `documents/security/AGENTS.cac.json`
+- `documents/security/THREAT_MODEL.cac.json`
+- `documents/skills/rust-standards/references/34_security_adjacent_rust.md`
+- `documents/skills/rust-standards/references/39_hazard_catalog_checklists.md`
+- `documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md`
 
-## MAJOR 1: Panic-on-input in deny path (UTF-8 byte slicing)
+You MUST pass ALL CI checks. Before committing, run IN ORDER:
+1. `cargo fmt --all`
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` — fix ALL warnings
+3. `cargo doc --workspace --no-deps` — fix any doc warnings
+4. `cargo test -p apm2-core` — core tests
+5. `cargo test -p apm2-daemon` — daemon tests (timeout 260s)
 
-**Path:** `crates/apm2-daemon/src/protocol/session_dispatch.rs` — `truncate_attempt_detail` function
+After all checks pass: `git add -A && git commit -m "fix(TCK-00467): fail-closed disclosure evidence, authority-bound snapshot issuer" && git push`
 
-**Problem:** `truncate_attempt_detail` slices UTF-8 strings by byte index (`&detail[..truncated_len]`). A crafted long non-ASCII command/URL (e.g., direct `gh` attempt with multibyte payload) can trigger a non-char-boundary slice panic before deny response/defect emission.
+---
 
-**Required Fix:**
-1. Replace byte slicing with char-boundary-safe truncation
-2. Use `char_indices` to find the last valid char boundary before the truncation point
-3. Example: `detail.char_indices().take_while(|(i, _)| *i < max_len).last().map(|(i, c)| &detail[..i + c.len_utf8()]).unwrap_or("")`
-4. Add tests covering multibyte Unicode command/URL truncation on direct GitHub deny paths
+## Fix 1 (BLOCKER): Remove fail-open on missing disclosure evidence for Tier2+
 
-## MAJOR 2: Direct GitHub deny logic bypassable via shell/program indirection
+**Both security and quality reviews flagged this independently.**
 
-**Path:** `crates/apm2-daemon/src/protocol/session_dispatch.rs` — `command_invokes_gh_cli_inner` and `command_targets_github_api`
+**Files:**
+- `crates/apm2-daemon/src/protocol/session_dispatch.rs:2494, 2534, 2539`
 
-**Problem:** Command-text heuristics use `split_whitespace` and literal host substring checks. Commands using shell substitution/indirection or interpreter-mediated invocation can bypass these heuristics.
+**Problem:** When `required_for_effect == true` (Tier2+ authoritative effects), the code:
+1. Defaults `disclosure_channel_class` to `Internal` when missing — untrusted requester omits the field and bypasses policy checks
+2. Synthesizes a disclosure policy snapshot (`synthesize_disclosure_policy_snapshot`) when not supplied — auto-generating evidence defeats external evidence requirement
+3. Falls back to `snapshot.policy_digest` when `authoritative_policy_root_digest` is absent — accepting caller-controlled digest as admitted policy
 
-**Required Fix:**
-1. **Keep the existing command-text detection as a defense-in-depth layer** (do NOT remove it)
-2. Add adversarial tests for substitution/interpreter indirection patterns:
-   - `bash -c "$(echo gh) api /repos"` (command substitution)
-   - `eval "gh api /repos"` (eval indirection)
-   - Shell variable expansion: `cmd=gh; $cmd api /repos`
-3. Acknowledge in code comments that command-text detection is a heuristic layer — primary security boundary is RoleSpec capability rejection at the capability/egress boundary
-4. Consider adding an additional check: scan all argument strings (not just the primary command) for GitHub API hostnames
+**Required fix (3 parts):**
 
-## MINOR: Freshness evidence can be omitted while stage remains permissive
+### Part A: Remove implicit Internal default for required_for_effect
 
-**Path:** `crates/apm2-daemon/src/protocol/session_dispatch.rs`
+When `required_for_effect == true`, deny on missing `disclosure_channel_class`:
 
-**Problem:** Stage evaluation treats `refreshed_at_ns` as optional. When unset, Stage0/Stage1 can remain active without freshness enforcement.
-
-**Required Fix:**
-1. For production stages (Stage0/Stage1), require freshness timestamp
-2. If `refreshed_at_ns` is missing in production, fail closed to Stage2 (hard deny)
-3. Add test: missing freshness → Stage2
-
-## MANDATORY Pre-Commit Steps (in this exact order)
-
-You MUST run ALL of these and fix any issues BEFORE committing:
-```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --workspace --no-deps
-cargo test -p apm2-core -p apm2-daemon
+```rust
+let disclosure_channel_class = if required_for_effect {
+    boundary_flow.disclosure_channel_class
+        .ok_or_else(|| /* emit structured defect + deny */)?
+} else {
+    boundary_flow.disclosure_channel_class
+        .unwrap_or(DisclosureChannelClass::Internal)
+};
 ```
 
-You MUST pass ALL CI checks. Do not push code that fails any of these.
+### Part B: Remove snapshot synthesis fallback for required_for_effect
 
-## Push Workflow
+When `required_for_effect == true`, deny on missing disclosure snapshot:
 
-After all pre-commit steps pass:
-```bash
-git add -A
-git commit -m "fix(TCK-00468): char-safe truncation, freshness enforcement, adversarial bypass tests"
-apm2 fac push --ticket documents/work/tickets/TCK-00468.yaml
+```rust
+let disclosure_snapshot = if required_for_effect {
+    boundary_flow.disclosure_policy_snapshot
+        .ok_or_else(|| /* emit structured defect + deny */)?
+} else {
+    boundary_flow.disclosure_policy_snapshot
+        .unwrap_or_else(|| synthesize_disclosure_policy_snapshot(/* ... */))
+};
 ```
+
+### Part C: Remove `unwrap_or(snapshot.policy_digest)` fallback for admitted digest
+
+When `required_for_effect == true`, deny on missing authoritative policy root:
+
+```rust
+let admitted_policy_digest = if required_for_effect {
+    authoritative_policy_root_digest
+        .ok_or_else(|| /* emit structured defect + deny */)?
+} else {
+    authoritative_policy_root_digest
+        .unwrap_or(snapshot.policy_digest)
+};
+```
+
+### Regression tests (CRITICAL)
+
+Add these tests:
+1. **Missing channel class + required_for_effect → DENY** (not default to Internal)
+2. **Missing snapshot + required_for_effect → DENY** (not synthesized)
+3. **Missing authoritative digest + required_for_effect → DENY** (not caller-controlled)
+4. **All present + required_for_effect → PASS** (happy path)
+5. **Non-required: missing fields → use defaults** (existing behavior preserved)
+
+---
+
+## Fix 2 (MAJOR): Bind snapshot issuer to trusted authority key set
+
+**Both security and quality reviews flagged this independently.**
+
+**Files:**
+- `crates/apm2-core/src/disclosure.rs:128, 261`
+- `crates/apm2-daemon/src/protocol/session_dispatch.rs:2548`
+
+**Problem:** `validate_disclosure_policy` reads the verifying key from the snapshot itself (`snapshot.issuer_verifying_key`) and verifies the signature against it. Any actor can generate a keypair, sign arbitrary disclosure state, and pass validation. The signature is correct but the issuer is not authorized.
+
+**Required fix:**
+
+### Part A: Accept trusted issuer key as parameter
+
+Change `validate_disclosure_policy` to accept a trusted issuer verifying key from the caller (from authoritative policy state), NOT from the snapshot itself:
+
+```rust
+pub fn validate_disclosure_policy(
+    snapshot: &DisclosurePolicySnapshot,
+    trusted_issuer_key: &[u8; 32],  // From daemon signing identity or PCAC authority
+    current_phase_id: &str,
+    current_time_ns: u64,
+) -> Result<(), DisclosurePolicyError> {
+    // Verify signature against TRUSTED key, not snapshot's self-declared key
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(trusted_issuer_key)
+        .map_err(|_| DisclosurePolicyError::InvalidIssuerKey)?;
+    // ... verify canonical bytes against this key
+}
+```
+
+### Part B: Wire trusted key from daemon identity
+
+In session_dispatch.rs where `validate_disclosure_policy` is called, pass the daemon's own verifying key (or the PCAC authority key) as the trusted issuer:
+
+```rust
+let trusted_key = self.verifying_key().to_bytes();
+validate_disclosure_policy(&snapshot, &trusted_key, phase_id, current_time_ns)?;
+```
+
+### Part C: Add negative test for unauthorized issuer
+
+```rust
+#[test]
+fn test_unauthorized_issuer_snapshot_denied() {
+    let rogue_signing = ed25519_dalek::SigningKey::generate(&mut OsRng);
+    let rogue_snapshot = /* sign snapshot with rogue key */;
+    let trusted_key = /* daemon's actual verifying key */;
+    let result = validate_disclosure_policy(&rogue_snapshot, &trusted_key, phase_id, now);
+    assert!(result.is_err(), "unauthorized issuer must be denied");
+}
+```
+
+---
+
+## CRITICAL: Pre-commit checklist
+
+After ALL fixes:
+1. `cargo fmt --all`
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` — fix ALL warnings
+3. `cargo doc --workspace --no-deps`
+4. `cargo test -p apm2-core`
+5. `cargo test -p apm2-daemon` — ALL daemon tests must pass (timeout 260s)
+6. `git add -A && git commit -m "fix(TCK-00467): fail-closed disclosure evidence, authority-bound snapshot issuer" && git push`
