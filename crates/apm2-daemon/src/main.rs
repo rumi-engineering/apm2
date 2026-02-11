@@ -1625,21 +1625,38 @@ async fn async_main(args: Args) -> Result<()> {
                                     );
                                 }
 
+                                let emit_trace_event =
+                                    |event_type: &str,
+                                     payload: &[u8],
+                                     actor_id: &str,
+                                     timestamp_ns: u64| {
+                                        match emitter.emit_session_event(
+                                            "divergence-watchdog",
+                                            event_type,
+                                            payload,
+                                            actor_id,
+                                            timestamp_ns,
+                                        ) {
+                                            Ok(_) => true,
+                                            Err(error) => {
+                                                error!(
+                                                    event_type = %event_type,
+                                                    error = %error,
+                                                    "Failed to persist divergence watchdog trace event"
+                                                );
+                                                false
+                                            },
+                                        }
+                                    };
+
                                 match serde_json::to_vec(&result.freeze) {
                                     Ok(freeze_payload) => {
-                                        if let Err(e) = emitter.emit_session_event(
-                                            "divergence-watchdog",
+                                        if emit_trace_event(
                                             "intervention.freeze",
                                             &freeze_payload,
                                             &result.freeze.gate_actor_id,
                                             result.freeze.frozen_at,
                                         ) {
-                                            error!(
-                                                error = %e,
-                                                freeze_id = %result.freeze.freeze_id,
-                                                "Failed to persist InterventionFreeze transition event"
-                                            );
-                                        } else {
                                             info!(
                                                 freeze_id = %result.freeze.freeze_id,
                                                 "Persisted divergence InterventionFreeze transition event"
@@ -1652,6 +1669,60 @@ async fn async_main(args: Args) -> Result<()> {
                                             "Failed to serialize InterventionFreeze transition payload"
                                         );
                                     },
+                                }
+
+                                if let Ok(payload) = serde_json::to_vec(&result.compromise_signal) {
+                                    emit_trace_event(
+                                        "projection.compromise.signal",
+                                        &payload,
+                                        &result.compromise_signal.issuer_actor_id,
+                                        result.compromise_signal.quarantined_at_ns,
+                                    );
+                                } else {
+                                    error!(
+                                        "Failed to serialize projection compromise signal payload"
+                                    );
+                                }
+
+                                if let Ok(payload) =
+                                    serde_json::to_vec(&result.source_trust_snapshot)
+                                {
+                                    emit_trace_event(
+                                        "projection.source.trust_snapshot",
+                                        &payload,
+                                        &result.freeze.gate_actor_id,
+                                        result.freeze.frozen_at,
+                                    );
+                                } else {
+                                    error!(
+                                        "Failed to serialize projection source trust snapshot payload"
+                                    );
+                                }
+
+                                if let Ok(payload) =
+                                    serde_json::to_vec(&result.sink_identity_snapshot)
+                                {
+                                    emit_trace_event(
+                                        "projection.sink.identity_snapshot",
+                                        &payload,
+                                        &result.freeze.gate_actor_id,
+                                        result.freeze.frozen_at,
+                                    );
+                                } else {
+                                    error!(
+                                        "Failed to serialize projection sink identity snapshot payload"
+                                    );
+                                }
+
+                                if let Ok(payload) = serde_json::to_vec(&result.replay_receipt) {
+                                    emit_trace_event(
+                                        "projection.replay.receipt",
+                                        &payload,
+                                        &result.replay_receipt.signer_actor_id,
+                                        result.freeze.frozen_at,
+                                    );
+                                } else {
+                                    error!("Failed to serialize projection replay receipt payload");
                                 }
                             }
 

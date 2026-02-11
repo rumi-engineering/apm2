@@ -755,16 +755,33 @@ const MAX_BOUNDARY_QUARANTINE_REASON_LENGTH: usize = 1024;
 const QUARANTINE_TTL_SECS: u64 = 300;
 const QUARANTINE_TTL_NS: u64 = QUARANTINE_TTL_SECS * 1_000_000_000;
 
+const fn is_zero_hash(value: &Hash) -> bool {
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 struct QuarantinedBoundaryChannel {
     session_id: String,
     since_ns: u64,
     reason: String,
+    time_authority_ref: Hash,
+    window_ref: Hash,
 }
 
 impl QuarantinedBoundaryChannel {
     const fn is_expired(&self, now_ns: u64) -> bool {
         now_ns.saturating_sub(self.since_ns) >= QUARANTINE_TTL_NS
+    }
+
+    const fn has_valid_temporal_refs(&self) -> bool {
+        !is_zero_hash(&self.time_authority_ref) && !is_zero_hash(&self.window_ref)
     }
 }
 
@@ -816,11 +833,15 @@ impl BoundaryChannelQuarantineState {
         session_id: String,
         reason: String,
         since_ns: u64,
+        time_authority_ref: Hash,
+        window_ref: Hash,
     ) -> bool {
         if let Some(existing) = self.channels.get_mut(&channel_key) {
             existing.session_id = session_id;
             existing.reason = reason;
             existing.since_ns = since_ns;
+            existing.time_authority_ref = time_authority_ref;
+            existing.window_ref = window_ref;
             return true;
         }
 
@@ -847,6 +868,8 @@ impl BoundaryChannelQuarantineState {
                 session_id,
                 since_ns,
                 reason,
+                time_authority_ref,
+                window_ref,
             },
         );
         true
@@ -2528,6 +2551,38 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         format!("boundary:{}", hex::encode(digest.as_bytes()))
     }
 
+    fn derive_boundary_quarantine_temporal_refs(
+        session_id: &str,
+        channel_key: &str,
+        since_ns: u64,
+    ) -> Result<(Hash, Hash), String> {
+        if since_ns == 0 {
+            return Err("boundary quarantine timestamp is zero".to_string());
+        }
+
+        let mut time_hasher = blake3::Hasher::new();
+        time_hasher.update(b"apm2.boundary_quarantine.time_authority_ref.v1");
+        time_hasher.update(session_id.as_bytes());
+        time_hasher.update(channel_key.as_bytes());
+        time_hasher.update(&since_ns.to_le_bytes());
+        let time_authority_ref = *time_hasher.finalize().as_bytes();
+        if is_zero_hash(&time_authority_ref) {
+            return Err("boundary quarantine time_authority_ref is invalid".to_string());
+        }
+
+        let window_start_ns = since_ns - (since_ns % QUARANTINE_TTL_NS);
+        let mut window_hasher = blake3::Hasher::new();
+        window_hasher.update(b"apm2.boundary_quarantine.window_ref.v1");
+        window_hasher.update(session_id.as_bytes());
+        window_hasher.update(&window_start_ns.to_le_bytes());
+        let window_ref = *window_hasher.finalize().as_bytes();
+        if is_zero_hash(&window_ref) {
+            return Err("boundary quarantine window_ref is invalid".to_string());
+        }
+
+        Ok((time_authority_ref, window_ref))
+    }
+
     fn quarantined_boundary_channel(
         &self,
         channel_key: &str,
@@ -2542,6 +2597,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             if record.is_expired(current_ns) {
                 state.remove(channel_key);
                 return Ok(None);
+            }
+            if !record.has_valid_temporal_refs() {
+                state.remove(channel_key);
+                return Err(
+                    "boundary quarantine temporal authority is missing or invalid".to_string(),
+                );
             }
             return Ok(Some(record));
         }
@@ -2583,6 +2644,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         reason: String,
         since_ns: u64,
     ) -> Result<bool, String> {
+        let (time_authority_ref, window_ref) =
+            Self::derive_boundary_quarantine_temporal_refs(session_id, &channel_key, since_ns)?;
         let mut bounded_reason = reason;
         if bounded_reason.len() > MAX_BOUNDARY_QUARANTINE_REASON_LENGTH {
             bounded_reason.truncate(MAX_BOUNDARY_QUARANTINE_REASON_LENGTH);
@@ -2596,6 +2659,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_id.to_string(),
             bounded_reason,
             since_ns,
+            time_authority_ref,
+            window_ref,
         );
         if !inserted {
             warn!(
@@ -6212,11 +6277,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         tool_class = %tool_class,
                         channel = %boundary_channel_key,
                         reason = %record.reason,
+                        time_authority_ref = %hex::encode(record.time_authority_ref),
+                        window_ref = %hex::encode(record.window_ref),
                         "RequestTool denied: boundary channel is quarantined"
                     );
                     return Ok(SessionResponse::error(
                         SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("boundary channel quarantined: {}", record.reason),
+                        format!(
+                            "boundary channel quarantined: {}; time_authority_ref={}; window_ref={}",
+                            record.reason,
+                            hex::encode(record.time_authority_ref),
+                            hex::encode(record.window_ref),
+                        ),
                     ));
                 },
                 Ok(None) => {},
@@ -14443,12 +14515,17 @@ mod tests {
             "quarantine insertion should allocate a slot",
         );
 
+        let quarantine_record = dispatcher
+            .quarantined_boundary_channel(&channel_key, quarantined_at_ns + 1)
+            .expect("quarantine lookup should succeed")
+            .expect("quarantine entry should exist before termination");
         assert!(
-            dispatcher
-                .quarantined_boundary_channel(&channel_key, quarantined_at_ns + 1)
-                .expect("quarantine lookup should succeed")
-                .is_some(),
-            "quarantine entry should exist before termination",
+            !is_zero_hash(&quarantine_record.time_authority_ref),
+            "time_authority_ref must be present"
+        );
+        assert!(
+            !is_zero_hash(&quarantine_record.window_ref),
+            "window_ref must be present"
         );
 
         dispatcher
@@ -14502,6 +14579,26 @@ mod tests {
                 .expect("quarantine lookup should succeed")
                 .is_none(),
             "quarantine should expire at TTL and allow re-evaluation",
+        );
+    }
+
+    #[test]
+    fn test_boundary_channel_quarantine_rejects_zero_timestamp() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            "session-zero",
+            ToolClass::Inference,
+        );
+
+        let result = dispatcher.quarantine_boundary_channel(
+            "session-zero",
+            channel_key,
+            "boundary quarantine zero timestamp".to_string(),
+            0,
+        );
+        assert!(
+            matches!(result, Err(error) if error.contains("timestamp is zero")),
+            "zero timestamp must fail closed with temporal authority error",
         );
     }
 

@@ -89,6 +89,7 @@ pub mod merge_receipt;
 pub mod policy_inheritance;
 mod policy_resolution;
 pub mod projection;
+pub mod projection_compromise;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
 mod receipt;
@@ -184,9 +185,11 @@ pub use domain_separator::{
     AAT_RESULT_REUSED_PREFIX, CHANGESET_PUBLISHED_PREFIX, CI_IMPORT_ATTESTATION_PREFIX,
     GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX,
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX,
-    LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX,
-    PROJECTION_RECEIPT_RECORDED_PREFIX, QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX,
-    REVIEW_RECEIPT_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
+    LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX,
+    PROJECTION_COMPROMISE_SIGNAL_PREFIX, PROJECTION_RECEIPT_PREFIX,
+    PROJECTION_RECEIPT_RECORDED_PREFIX, PROJECTION_REPLAY_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX,
+    REVIEW_BLOCKED_RECORDED_PREFIX, REVIEW_RECEIPT_RECORDED_PREFIX, sign_with_domain,
+    verify_with_domain,
 };
 // Re-export echo-trap detection types
 pub use echo_trap::{
@@ -235,6 +238,13 @@ pub use projection::{
     AuditorLaunchProjectionV1, OrchestratorLaunchProjectionV1, ProjectionContractError,
     ProjectionDigestEnvelopeV1, ProjectionUncertainty, canonical_projection_json,
     compute_projection_digest, digest_first_projection,
+};
+// Re-export projection compromise controls (RFC-0028 REQ-0009).
+pub use projection_compromise::{
+    DivergenceEvidence, ProjectionChannel, ProjectionCompromiseError, ProjectionCompromiseSignalV1,
+    ProjectionDivergence, ProjectionReplayReceiptV1, ProjectionSurfaceType, QuarantineStatus,
+    ReconstructedProjectionState, SinkIdentitySnapshotV1, SourceTrustSnapshotV1,
+    detect_projection_divergence, quarantine_channel, reconstruct_projection_state,
 };
 // Re-export projection receipt recorded types
 pub use projection_receipt_recorded::{

@@ -83,20 +83,24 @@
 //! }
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use apm2_core::crypto::{Signer, VerifyingKey};
+use apm2_core::crypto::{Hash, Signer, VerifyingKey};
 use apm2_core::events::{
     DefectRecorded, DefectSource, InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
 };
 use apm2_core::fac::{
-    INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
+    INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, ProjectionChannel,
+    ProjectionCompromiseSignalV1, ProjectionReplayReceiptV1, ProjectionSurfaceType,
+    ReconstructedProjectionState, SinkIdentitySnapshotV1, SourceTrustSnapshotV1,
+    detect_projection_divergence, quarantine_channel, reconstruct_projection_state,
+    sign_with_domain, verify_with_domain,
 };
-use apm2_holon::defect::DefectRecord;
+use apm2_holon::defect::{DefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -371,6 +375,22 @@ pub struct DivergenceResult {
     pub defect: DefectRecord,
     /// The defect event to emit to the ledger.
     pub defect_event: DefectRecorded,
+    /// Signed compromise signal bound to source/sink snapshots.
+    pub compromise_signal: ProjectionCompromiseSignalV1,
+    /// Source trust snapshot (CAS+ledger rooted expectation).
+    pub source_trust_snapshot: SourceTrustSnapshotV1,
+    /// Sink identity snapshot (observed projection identity).
+    pub sink_identity_snapshot: SinkIdentitySnapshotV1,
+    /// Durable replay receipt for reconstruction checks.
+    pub replay_receipt: ProjectionReplayReceiptV1,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionRecoveryState {
+    channel_id: String,
+    source_snapshot: SourceTrustSnapshotV1,
+    sink_snapshot: SinkIdentitySnapshotV1,
+    receipts: Vec<ProjectionReplayReceiptV1>,
 }
 
 /// Default poll interval for divergence checks (30 seconds).
@@ -393,6 +413,10 @@ pub enum DivergenceError {
     /// Invalid configuration.
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
+
+    /// Projection compromise validation failed.
+    #[error("projection compromise validation failed: {0}")]
+    ProjectionCompromiseValidationFailed(String),
 
     /// The freeze signature is invalid.
     #[error("invalid freeze signature: {0}")]
@@ -447,6 +471,10 @@ pub enum DivergenceError {
         /// The existing freeze ID for this scope.
         existing_freeze_id: String,
     },
+
+    /// Replay recovery failed during post-containment unfreeze checks.
+    #[error("projection replay recovery failed: {0}")]
+    ProjectionRecoveryFailed(String),
 }
 
 // =============================================================================
@@ -2031,6 +2059,9 @@ pub struct DivergenceWatchdog<T: TimeSource = SystemTimeSource> {
     defect_counter: std::sync::atomic::AtomicU64,
     /// Time source for obtaining current time.
     time_source: T,
+    /// Per-freeze replay recovery state used for post-containment
+    /// reconstruction checks before unfreeze.
+    projection_recovery_state: std::sync::Mutex<HashMap<String, ProjectionRecoveryState>>,
 }
 
 impl DivergenceWatchdog<SystemTimeSource> {
@@ -2044,12 +2075,13 @@ impl DivergenceWatchdog<SystemTimeSource> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source: SystemTimeSource,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Creates a new divergence watchdog with a shared freeze registry.
     #[must_use]
-    pub const fn with_registry(
+    pub fn with_registry(
         signer: Signer,
         config: DivergenceWatchdogConfig,
         registry: Arc<FreezeRegistry>,
@@ -2061,6 +2093,7 @@ impl DivergenceWatchdog<SystemTimeSource> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source: SystemTimeSource,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -2083,13 +2116,14 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Creates a new divergence watchdog with a shared registry and custom time
     /// source.
     #[must_use]
-    pub const fn with_registry_and_time_source(
+    pub fn with_registry_and_time_source(
         signer: Signer,
         config: DivergenceWatchdogConfig,
         registry: Arc<FreezeRegistry>,
@@ -2102,6 +2136,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2145,6 +2180,37 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     fn generate_time_envelope_ref(&self) -> String {
         self.time_source
             .time_envelope_ref(&self.config.time_envelope_pattern)
+    }
+
+    /// Derives signed temporal authority hash for compromise decisions.
+    fn derive_time_authority_ref(&self, time_envelope_ref: &str, timestamp_ns: u64) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.time_authority_ref.v1");
+        hasher.update(time_envelope_ref.as_bytes());
+        hasher.update(self.config.repo_id.as_bytes());
+        hasher.update(&timestamp_ns.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Derives HTF window reference hash for compromise decisions.
+    fn derive_window_ref(&self, timestamp_ns: u64) -> Hash {
+        // 5-minute windows match active quarantine TTL granularity in the daemon.
+        const WINDOW_NS: u64 = 300 * 1_000_000_000;
+        let window_start = timestamp_ns - (timestamp_ns % WINDOW_NS);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.window_ref.v1");
+        hasher.update(self.config.repo_id.as_bytes());
+        hasher.update(&window_start.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Derives a digest binding sink identity metadata.
+    fn derive_sink_identity_digest(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.sink_identity.v1");
+        hasher.update(self.config.repo_id.as_bytes());
+        hasher.update(self.config.actor_id.as_bytes());
+        *hasher.finalize().as_bytes()
     }
 
     /// Checks for divergence between the merge receipt HEAD and external trunk
@@ -2230,16 +2296,129 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         let defect_id = self.generate_defect_id();
         let time_envelope_ref = self.generate_time_envelope_ref();
         let timestamp = self.time_source.now_nanos();
+        let time_authority_ref = self.derive_time_authority_ref(&time_envelope_ref, timestamp);
+        let window_ref = self.derive_window_ref(timestamp);
 
-        // Create the DefectRecord(PROJECTION_DIVERGENCE) first
-        let defect = DefectRecord::projection_divergence(
-            &defect_id,
-            &self.config.repo_id,
+        let mut channel = ProjectionChannel::new(
+            self.config.repo_id.clone(),
+            ProjectionSurfaceType::GitRepository,
             expected_head,
+        )
+        .map_err(|error| {
+            DivergenceError::ProjectionCompromiseValidationFailed(error.to_string())
+        })?;
+
+        let divergence = detect_projection_divergence(
+            &channel,
             actual_head,
+            expected_head,
+            expected_head,
+            time_authority_ref,
+            window_ref,
+        )
+        .map_err(|error| DivergenceError::ProjectionCompromiseValidationFailed(error.to_string()))?
+        .ok_or_else(|| {
+            DivergenceError::ProjectionCompromiseValidationFailed(
+                "mismatched heads did not produce divergence".to_string(),
+            )
+        })?;
+
+        let source_trust_snapshot = SourceTrustSnapshotV1 {
+            channel_id: self.config.repo_id.clone(),
+            cas_state_digest: expected_head,
+            ledger_state_digest: expected_head,
+            expected_projection_digest: expected_head,
+            time_authority_ref,
+            window_ref,
+        };
+        let sink_identity_snapshot = SinkIdentitySnapshotV1 {
+            channel_id: self.config.repo_id.clone(),
+            sink_identity_digest: self.derive_sink_identity_digest(),
+            observed_projection_digest: actual_head,
+            endpoint_binding_digest: self.derive_sink_identity_digest(),
+            time_authority_ref,
+            window_ref,
+        };
+
+        let compromise_signal = quarantine_channel(
+            &mut channel,
+            &divergence,
+            &source_trust_snapshot,
+            &sink_identity_snapshot,
+            format!("projection-compromise-{freeze_id}"),
+            self.config.actor_id.clone(),
+            &self.signer,
             timestamp,
         )
-        .map_err(|e| DivergenceError::InvalidConfiguration(format!("defect record error: {e}")))?;
+        .map_err(|error| {
+            DivergenceError::ProjectionCompromiseValidationFailed(error.to_string())
+        })?;
+
+        let replay_receipt = ProjectionReplayReceiptV1::create_signed(
+            format!("projection-replay-{freeze_id}-0"),
+            self.config.repo_id.clone(),
+            0,
+            expected_head,
+            time_authority_ref,
+            window_ref,
+            source_trust_snapshot.snapshot_digest(),
+            sink_identity_snapshot.snapshot_digest(),
+            self.config.actor_id.clone(),
+            &self.signer,
+        )
+        .map_err(|error| {
+            DivergenceError::ProjectionCompromiseValidationFailed(error.to_string())
+        })?;
+
+        {
+            let mut recovery_state = self.projection_recovery_state.lock().map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}"))
+            })?;
+            recovery_state.insert(
+                freeze_id.clone(),
+                ProjectionRecoveryState {
+                    channel_id: self.config.repo_id.clone(),
+                    source_snapshot: source_trust_snapshot.clone(),
+                    sink_snapshot: sink_identity_snapshot.clone(),
+                    receipts: vec![replay_receipt.clone()],
+                },
+            );
+        }
+
+        let defect_details = serde_json::json!({
+            "channel_id": divergence.channel_id,
+            "expected_digest": hex::encode(divergence.expected_digest),
+            "observed_digest": hex::encode(divergence.observed_digest),
+            "divergence_evidence_digest": hex::encode(divergence.evidence_digest()),
+            "source_trust_snapshot_digest": hex::encode(source_trust_snapshot.snapshot_digest()),
+            "sink_identity_snapshot_digest": hex::encode(sink_identity_snapshot.snapshot_digest()),
+            "time_authority_ref": hex::encode(time_authority_ref),
+            "window_ref": hex::encode(window_ref),
+        });
+
+        let defect = DefectRecord::builder(&defect_id, "PROJECTION_DIVERGENCE")
+            .severity(DefectSeverity::S0)
+            .work_id(&self.config.repo_id)
+            .detected_at(timestamp)
+            .signal(DefectSignal::new(
+                SignalType::ProjectionDivergence,
+                defect_details.to_string(),
+            ))
+            .context(
+                DefectContext::new()
+                    .with_actor_id(self.config.actor_id.clone())
+                    .with_requested_stable_id(self.config.repo_id.clone()),
+            )
+            .add_evidence(divergence.evidence_digest())
+            .add_evidence(source_trust_snapshot.snapshot_digest())
+            .add_evidence(sink_identity_snapshot.snapshot_digest())
+            .add_remediation("quarantine compromised projection channel")
+            .add_remediation("continue FAC authority using CAS+ledger trust roots")
+            .add_remediation("reconstruct projection state from durable receipts before unfreeze")
+            .build()
+            .map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("defect record error: {e}"))
+            })?;
 
         // Create the freeze event referencing the defect
         let freeze = InterventionFreezeBuilder::new(&freeze_id)
@@ -2267,31 +2446,6 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         // Use BLAKE3 for CAS hash (RFC-0018)
         let cas_hash = blake3::hash(&defect_bytes).as_bytes().to_vec();
 
-        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
-        // The time_envelope_ref is a URI like "htf:tick:{ts}", NOT a hex string.
-        // We need to derive a deterministic hash from it for the proto TimeEnvelopeRef.
-        //
-        // Strategy:
-        // 1. If it's valid hex (64 chars = 32 bytes), decode directly (future HTF
-        //    integration)
-        // 2. Otherwise, hash the URI string with BLAKE3 to get deterministic 32 bytes
-        //    that preserve temporal binding information
-        let time_ref_hash: Vec<u8> = if time_envelope_ref.len() == 64
-            && time_envelope_ref.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            // Valid 64-char hex string -> decode to 32 bytes
-            hex::decode(&time_envelope_ref).unwrap_or_else(|_| {
-                blake3::hash(time_envelope_ref.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            })
-        } else {
-            // URI format (e.g., "htf:tick:12345") -> hash to derive 32 bytes
-            blake3::hash(time_envelope_ref.as_bytes())
-                .as_bytes()
-                .to_vec()
-        };
-
         let defect_event = DefectRecorded {
             defect_id,
             defect_type: defect.defect_class().to_string(),
@@ -2301,7 +2455,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             severity: defect.severity().as_str().to_string(),
             detected_at: timestamp,
             time_envelope_ref: Some(TimeEnvelopeRef {
-                hash: time_ref_hash,
+                hash: time_authority_ref.to_vec(),
             }),
         };
 
@@ -2309,7 +2463,33 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             freeze,
             defect,
             defect_event,
+            compromise_signal,
+            source_trust_snapshot,
+            sink_identity_snapshot,
+            replay_receipt,
         })
+    }
+
+    fn verify_projection_recovery_state(
+        &self,
+        freeze_id: &str,
+    ) -> Result<ReconstructedProjectionState, DivergenceError> {
+        let recovery_state = self
+            .projection_recovery_state
+            .lock()
+            .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
+        let state = recovery_state.get(freeze_id).ok_or_else(|| {
+            DivergenceError::ProjectionRecoveryFailed(format!(
+                "missing recovery state for freeze_id={freeze_id}"
+            ))
+        })?;
+        reconstruct_projection_state(
+            &state.channel_id,
+            &state.receipts,
+            &state.source_snapshot,
+            &state.sink_snapshot,
+        )
+        .map_err(|error| DivergenceError::ProjectionRecoveryFailed(error.to_string()))
     }
 
     /// Creates an unfreeze event for a given freeze ID.
@@ -2368,6 +2548,11 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             });
         }
         drop(active);
+
+        // RFC-0028 REQ-0009: Post-containment projection replay must be
+        // reconstructable from durable receipts before unfreeze.
+        // Temporal ambiguity or receipt invalidity fails closed.
+        let _reconstructed = self.verify_projection_recovery_state(freeze_id)?;
 
         let time_envelope_ref = self.generate_time_envelope_ref();
 
@@ -2429,7 +2614,13 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     /// ```
     pub fn apply_unfreeze(&self, unfreeze: &InterventionUnfreeze) -> Result<(), DivergenceError> {
         self.registry
-            .unregister(unfreeze, &self.signer.verifying_key())
+            .unregister(unfreeze, &self.signer.verifying_key())?;
+        let mut recovery_state = self
+            .projection_recovery_state
+            .lock()
+            .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
+        recovery_state.remove(&unfreeze.freeze_id);
+        Ok(())
     }
 
     /// Checks if admission is allowed for the configured repository.
@@ -3697,6 +3888,16 @@ pub mod tests {
         // Now apply the unfreeze (simulating successful ledger persistence)
         // The signature is verified during apply_unfreeze
         watchdog.apply_unfreeze(&unfreeze).unwrap();
+        {
+            let recovery_state = watchdog
+                .projection_recovery_state
+                .lock()
+                .expect("projection recovery lock should not be poisoned");
+            assert!(
+                !recovery_state.contains_key(&freeze.freeze_id),
+                "projection recovery state should be removed after unfreeze apply",
+            );
+        }
 
         // Should allow admission after applying unfreeze
         assert!(watchdog.check_admission().is_ok());
@@ -3965,6 +4166,16 @@ pub mod tests {
         // 9. Apply unfreeze to registry after successful persistence
         // The signature is verified during apply_unfreeze
         watchdog.apply_unfreeze(&unfreeze).unwrap();
+        {
+            let recovery_state = watchdog
+                .projection_recovery_state
+                .lock()
+                .expect("projection recovery lock should not be poisoned");
+            assert!(
+                !recovery_state.contains_key(&freeze.freeze_id),
+                "projection recovery state should be removed after unfreeze apply",
+            );
+        }
 
         // 10. Admission is allowed again
         assert!(watchdog.check_admission().is_ok());
@@ -4016,12 +4227,30 @@ pub mod tests {
             result.defect.signal().signal_type(),
             apm2_holon::defect::SignalType::ProjectionDivergence
         );
+        let details: serde_json::Value =
+            serde_json::from_str(result.defect.signal().details()).expect("details must be JSON");
+        let expected_hex = hex::encode(expected_head);
+        let actual_hex = hex::encode(actual_head);
+        assert_eq!(details["channel_id"].as_str(), Some("test-repo"));
+        assert_eq!(
+            details["expected_digest"].as_str(),
+            Some(expected_hex.as_str())
+        );
+        assert_eq!(
+            details["observed_digest"].as_str(),
+            Some(actual_hex.as_str())
+        );
         assert!(
-            result
-                .defect
-                .signal()
-                .details()
-                .contains("divergence detected")
+            details["time_authority_ref"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "time_authority_ref must be present"
+        );
+        assert!(
+            details["window_ref"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "window_ref must be present"
         );
 
         // Verify the freeze references the defect
@@ -4037,5 +4266,41 @@ pub mod tests {
         assert_eq!(result.defect_event.work_id, "test-repo");
         assert_eq!(result.defect_event.severity, "S0");
         assert!(!result.defect_event.cas_hash.is_empty()); // Hash should be present
+        result
+            .compromise_signal
+            .verify_signature(&watchdog.verifying_key())
+            .expect("compromise signal must verify");
+        assert_eq!(result.source_trust_snapshot.channel_id, "test-repo");
+        assert_eq!(result.sink_identity_snapshot.channel_id, "test-repo");
+        result
+            .replay_receipt
+            .verify_signature()
+            .expect("replay receipt must verify");
+    }
+
+    #[test]
+    fn test_create_unfreeze_fails_closed_when_recovery_state_missing() {
+        let watchdog = create_test_watchdog();
+
+        let result = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should create freeze");
+        let freeze_id = result.freeze.freeze_id;
+        {
+            let mut recovery_state = watchdog
+                .projection_recovery_state
+                .lock()
+                .expect("projection recovery lock should not be poisoned");
+            recovery_state.remove(&freeze_id);
+        }
+
+        let error = watchdog
+            .create_unfreeze(&freeze_id, ResolutionType::Adjudication, Some("adj-001"))
+            .expect_err("missing recovery state must fail closed");
+        assert!(
+            matches!(error, DivergenceError::ProjectionRecoveryFailed(ref message) if message.contains("missing recovery state")),
+            "expected projection recovery failure, got {error:?}"
+        );
     }
 }
