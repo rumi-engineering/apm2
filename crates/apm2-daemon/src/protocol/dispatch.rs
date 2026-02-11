@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
+    BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource,
+    ChannelViolationClass, DeclassificationIntentScope, LeakageBudgetReceipt,
+    LeakageEstimatorFamily, RedundancyDeclassificationReceipt, TimingChannelBudget,
     derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
 };
 use apm2_core::credentials::{
@@ -6632,6 +6634,67 @@ pub struct PrivilegedPcacLifecycleArtifacts {
     pub consume_selector_digest: [u8; 32],
 }
 
+/// Runtime boundary-flow evidence used to evaluate RFC-0028 REQ-0004
+/// predicate closure at channel admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryFlowRuntimeState {
+    /// Dual-lattice taint admission predicate.
+    pub taint_allow: bool,
+    /// Dual-lattice confidentiality/classification admission predicate.
+    pub classification_allow: bool,
+    /// Declassification receipt validity predicate.
+    pub declass_receipt_valid: bool,
+    /// Declassification intent scope.
+    pub declassification_intent: DeclassificationIntentScope,
+    /// Optional redundancy-purpose receipt metadata.
+    pub redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
+    /// Policy digest + canonicalizer tuple binding witness.
+    pub policy_binding: BoundaryFlowPolicyBinding,
+    /// Typed leakage-budget receipt.
+    pub leakage_budget_receipt: LeakageBudgetReceipt,
+    /// Timing-channel release-bucketing witness.
+    pub timing_channel_budget: TimingChannelBudget,
+}
+
+impl BoundaryFlowRuntimeState {
+    /// Baseline pass-state used when call-sites have not provided
+    /// boundary-flow instrumentation.
+    #[must_use]
+    pub fn allow_all(policy_verified: bool) -> Self {
+        let policy_digest = if policy_verified {
+            [0x11; 32]
+        } else {
+            [0x22; 32]
+        };
+        let canonicalizer_digest = [0x33; 32];
+        Self {
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            policy_binding: BoundaryFlowPolicyBinding {
+                policy_digest,
+                admitted_policy_root_digest: policy_digest,
+                canonicalizer_tuple_digest: canonicalizer_digest,
+                admitted_canonicalizer_tuple_digest: canonicalizer_digest,
+            },
+            leakage_budget_receipt: LeakageBudgetReceipt {
+                leakage_bits: 0,
+                budget_bits: 8,
+                estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                confidence_bps: 10_000,
+                confidence_label: "default".to_string(),
+            },
+            timing_channel_budget: TimingChannelBudget {
+                release_bucket_ticks: 1,
+                observed_variance_ticks: 0,
+                budget_ticks: 1,
+            },
+        }
+    }
+}
+
 impl PrivilegedDispatcher {
     /// Builds a channel-boundary check from daemon-classified tool context.
     ///
@@ -6647,6 +6710,29 @@ impl PrivilegedDispatcher {
         broker_verified: bool,
         capability_verified: bool,
         context_firewall_verified: bool,
+    ) -> ChannelBoundaryCheck {
+        self.build_channel_boundary_check_with_flow(
+            tool_class,
+            policy_verified,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+            BoundaryFlowRuntimeState::allow_all(policy_verified),
+        )
+    }
+
+    /// Builds a channel-boundary check with explicit boundary-flow runtime
+    /// evidence for REQ-0004 enforcement.
+    #[must_use]
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn build_channel_boundary_check_with_flow(
+        &self,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+        boundary_flow: BoundaryFlowRuntimeState,
     ) -> ChannelBoundaryCheck {
         let source = match tool_class {
             ToolClass::Read
@@ -6680,6 +6766,14 @@ impl PrivilegedDispatcher {
             capability_verified,
             context_firewall_verified,
             policy_ledger_verified: policy_verified,
+            taint_allow: boundary_flow.taint_allow,
+            classification_allow: boundary_flow.classification_allow,
+            declass_receipt_valid: boundary_flow.declass_receipt_valid,
+            declassification_intent: boundary_flow.declassification_intent,
+            redundancy_declassification_receipt: boundary_flow.redundancy_declassification_receipt,
+            boundary_flow_policy_binding: Some(boundary_flow.policy_binding),
+            leakage_budget_receipt: Some(boundary_flow.leakage_budget_receipt),
+            timing_channel_budget: Some(boundary_flow.timing_channel_budget),
         }
     }
 
@@ -6701,12 +6795,43 @@ impl PrivilegedDispatcher {
         capability_verified: bool,
         context_firewall_verified: bool,
     ) -> Result<String, Vec<ChannelBoundaryDefect>> {
-        let check = self.build_channel_boundary_check(
+        self.validate_channel_boundary_and_issue_context_token_with_flow(
+            signer,
+            lease_id,
+            request_id,
+            issued_at_secs,
             tool_class,
             policy_verified,
             broker_verified,
             capability_verified,
             context_firewall_verified,
+            BoundaryFlowRuntimeState::allow_all(policy_verified),
+        )
+    }
+
+    /// Validates channel boundaries with explicit boundary-flow evidence and
+    /// issues a daemon-signed context token on success.
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+    pub fn validate_channel_boundary_and_issue_context_token_with_flow(
+        &self,
+        signer: &apm2_core::crypto::Signer,
+        lease_id: &str,
+        request_id: &str,
+        issued_at_secs: u64,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+        boundary_flow: BoundaryFlowRuntimeState,
+    ) -> Result<String, Vec<ChannelBoundaryDefect>> {
+        let check = self.build_channel_boundary_check_with_flow(
+            tool_class,
+            policy_verified,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+            boundary_flow,
         );
         let defects = validate_channel_boundary(&check);
         if !defects.is_empty() {

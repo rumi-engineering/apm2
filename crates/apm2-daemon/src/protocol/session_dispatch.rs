@@ -59,17 +59,24 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use apm2_core::channel::{
+    BoundaryFlowPolicyBinding, DeclassificationIntentScope, LeakageBudgetReceipt,
+    LeakageEstimatorFamily, RedundancyDeclassificationReceipt, TimingChannelBudget,
+};
 use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::{Hash, Signer as CryptoSigner};
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 #[cfg(test)]
 use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
-use apm2_core::fac::taint::{TaintPolicy, TaintViolation, evaluate_tool_argument_ingress};
+use apm2_core::fac::taint::{
+    TaintLevel as RuntimeTaintLevel, TaintPolicy, TaintViolation, evaluate_tool_argument_ingress,
+};
 use apm2_core::pcac::{
     ArbitrationOutcome, EvaluatorTuple, PcacPolicyKnobs, TemporalArbitrationReceiptV1,
     TemporalPredicateId, check_freshness_dominance, check_revocation_dominance,
@@ -80,9 +87,12 @@ use apm2_holon::defect::{
 };
 use bytes::Bytes;
 use prost::Message;
+use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use super::dispatch::{ConnectionContext, LedgerEventEmitter, PrivilegedDispatcher};
+use super::dispatch::{
+    BoundaryFlowRuntimeState, ConnectionContext, LedgerEventEmitter, PrivilegedDispatcher,
+};
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
@@ -422,6 +432,9 @@ pub const MAX_TOOL_ID_LEN: usize = 128;
 /// details, or configuration. Messages are truncated and potentially sensitive
 /// patterns are redacted before returning to clients.
 const MAX_ERROR_MESSAGE_LEN: usize = 256;
+const BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES: &[u8] =
+    b"apm2.canonicalizer.jcs|1.0.0|dcp://apm2.cac/canonicalizer/vectors@v1";
+const DEFAULT_LEAKAGE_CONFIDENCE_LABEL: &str = "runtime-default";
 
 /// Sanitizes an error message for safe return over the protocol.
 ///
@@ -616,6 +629,48 @@ fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
     DISPATCHER.get_or_init(PrivilegedDispatcher::new)
 }
 
+const MAX_QUARANTINED_BOUNDARY_CHANNELS: usize = 512;
+const MAX_BOUNDARY_CHANNEL_KEY_LENGTH: usize = 256;
+const MAX_BOUNDARY_QUARANTINE_REASON_LENGTH: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct QuarantinedBoundaryChannel {
+    since_ns: u64,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct BoundaryChannelQuarantineState {
+    channels: HashMap<String, QuarantinedBoundaryChannel>,
+    insertion_order: VecDeque<String>,
+}
+
+impl BoundaryChannelQuarantineState {
+    fn get(&self, channel_key: &str) -> Option<&QuarantinedBoundaryChannel> {
+        self.channels.get(channel_key)
+    }
+
+    fn quarantine(&mut self, channel_key: String, reason: String, since_ns: u64) {
+        if let Some(existing) = self.channels.get_mut(&channel_key) {
+            existing.reason = reason;
+            existing.since_ns = since_ns;
+            return;
+        }
+
+        if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            while let Some(evicted) = self.insertion_order.pop_front() {
+                if self.channels.remove(&evicted).is_some() {
+                    break;
+                }
+            }
+        }
+
+        self.insertion_order.push_back(channel_key.clone());
+        self.channels
+            .insert(channel_key, QuarantinedBoundaryChannel { since_ns, reason });
+    }
+}
+
 // ============================================================================
 // Dispatcher
 // ============================================================================
@@ -779,6 +834,10 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// TCK-00406: Production ingress paths must evaluate taint flow and deny
     /// forbidden flows before actuation.
     taint_policy: Arc<TaintPolicy>,
+    /// Quarantine state for boundary channels with leakage/timing violations.
+    ///
+    /// Violating channels are denied fail-closed until mitigation/clearance.
+    boundary_channel_quarantine: Arc<Mutex<BoundaryChannelQuarantineState>>,
 }
 
 #[derive(Clone)]
@@ -794,6 +853,60 @@ struct PendingPcacAuthority {
     temporal_arbitration_receipts: Vec<TemporalArbitrationReceiptV1>,
     pre_actuation_required: bool,
     pre_actuation_receipt_hashes: Vec<Hash>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct BoundaryFlowHints {
+    #[serde(default)]
+    declassification: Option<BoundaryDeclassificationHints>,
+    #[serde(default)]
+    leakage_budget_receipt: Option<LeakageBudgetHints>,
+    #[serde(default)]
+    timing_channel: Option<TimingChannelHints>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeclassificationIntentHint {
+    None,
+    RedundancyPurpose,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct BoundaryDeclassificationHints {
+    intent: DeclassificationIntentHint,
+    #[serde(default)]
+    receipt_id: Option<String>,
+    #[serde(default)]
+    scoped_fragment_only: Option<bool>,
+    #[serde(default)]
+    plaintext_semantics_exposed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct LeakageBudgetHints {
+    leakage_bits: u64,
+    budget_bits: u64,
+    estimator_family: LeakageEstimatorFamily,
+    confidence_bps: u16,
+    #[serde(default)]
+    confidence_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct TimingChannelHints {
+    #[serde(rename = "observed_variance_ticks")]
+    observed_variance: u64,
+    #[serde(rename = "budget_ticks")]
+    budget: u64,
+    #[serde(rename = "release_bucket_ticks")]
+    release_bucket: u64,
 }
 
 #[cfg(not(test))]
@@ -851,6 +964,9 @@ impl SessionDispatcher<InMemoryManifestStore> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            boundary_channel_quarantine: Arc::new(Mutex::new(
+                BoundaryChannelQuarantineState::default(),
+            )),
         }
     }
 
@@ -882,6 +998,9 @@ impl SessionDispatcher<InMemoryManifestStore> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            boundary_channel_quarantine: Arc::new(Mutex::new(
+                BoundaryChannelQuarantineState::default(),
+            )),
         }
     }
 }
@@ -918,6 +1037,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            boundary_channel_quarantine: Arc::new(Mutex::new(
+                BoundaryChannelQuarantineState::default(),
+            )),
         }
     }
 
@@ -954,6 +1076,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            boundary_channel_quarantine: Arc::new(Mutex::new(
+                BoundaryChannelQuarantineState::default(),
+            )),
         }
     }
 
@@ -1006,6 +1131,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            boundary_channel_quarantine: Arc::new(Mutex::new(
+                BoundaryChannelQuarantineState::default(),
+            )),
         }
     }
 
@@ -1571,6 +1699,106 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Ok(())
     }
 
+    fn emit_channel_boundary_defect(
+        &self,
+        session_id: &str,
+        channel_key: &str,
+        tool_class: ToolClass,
+        defect: &apm2_core::channel::ChannelBoundaryDefect,
+        fallback_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        let Some(ref ledger) = self.ledger else {
+            return Err("ledger unavailable for boundary-flow defect emission".to_string());
+        };
+
+        let defect_id = format!("DEF-BOUNDARY-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+            .unwrap_or(fallback_timestamp_ns);
+        let severity = if defect.violation_class.requires_quarantine() {
+            DefectSeverity::S1
+        } else {
+            DefectSeverity::S2
+        };
+
+        let defect_record = DefectRecord::builder(&defect_id, "BOUNDARY_FLOW_VIOLATION")
+            .severity(severity)
+            .work_id(session_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::UnplannedToolCall,
+                format!(
+                    "channel={} tool_class={} violation={:?} detail={}",
+                    channel_key, tool_class, defect.violation_class, defect.detail
+                ),
+            ))
+            .context(
+                HolonDefectContext::new()
+                    .with_session_id(session_id)
+                    .with_requested_stable_id(channel_key.to_string()),
+            )
+            .build()
+            .map_err(|e| format!("failed to build boundary-flow DefectRecord: {e}"))?;
+
+        let defect_json = serde_json::to_vec(&defect_record)
+            .map_err(|e| format!("failed to serialize boundary-flow DefectRecord: {e}"))?;
+        let cas_hash = self.cas.as_ref().map_or_else(
+            || blake3::hash(&defect_json).as_bytes().to_vec(),
+            |cas| cas.store(&defect_json).to_vec(),
+        );
+
+        let time_envelope_uri = format!("htf:boundary:{timestamp_ns}:{channel_key}");
+        let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: format!("BOUNDARY_FLOW_{:?}", defect.violation_class),
+            cas_hash,
+            source: DefectSource::ContextMiss as i32,
+            work_id: session_id.to_string(),
+            severity: severity.as_str().to_string(),
+            detected_at: timestamp_ns,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash,
+            }),
+        };
+
+        ledger
+            .emit_defect_recorded(&defect_event, timestamp_ns)
+            .map_err(|e| format!("failed to emit boundary-flow defect: {e}"))?;
+        Ok(())
+    }
+
+    fn emit_channel_boundary_defects(
+        &self,
+        session_id: &str,
+        channel_key: &str,
+        tool_class: ToolClass,
+        defects: &[apm2_core::channel::ChannelBoundaryDefect],
+        fallback_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        for defect in defects {
+            self.emit_channel_boundary_defect(
+                session_id,
+                channel_key,
+                tool_class,
+                defect,
+                fallback_timestamp_ns,
+            )
+            .map_err(|e| {
+                format!(
+                    "channel={channel_key} violation={:?} error={e}",
+                    defect.violation_class
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn ensure_session_terminated(&self, session_id: &str, rationale: &str) -> Result<(), String> {
         let Some(session_registry) = &self.session_registry else {
             return Err("session registry unavailable for mandatory termination".to_string());
@@ -1795,6 +2023,271 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             })
             .collect::<Vec<_>>();
         serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn boundary_channel_key(session_id: &str, tool_class: ToolClass) -> String {
+        let raw = format!("{session_id}::{tool_class}");
+        if raw.len() <= MAX_BOUNDARY_CHANNEL_KEY_LENGTH {
+            return raw;
+        }
+        let digest = blake3::hash(raw.as_bytes());
+        format!("boundary:{}", hex::encode(digest.as_bytes()))
+    }
+
+    fn quarantined_boundary_channel(
+        &self,
+        channel_key: &str,
+    ) -> Result<Option<QuarantinedBoundaryChannel>, String> {
+        let state = self
+            .boundary_channel_quarantine
+            .lock()
+            .map_err(|_| "boundary channel quarantine lock poisoned".to_string())?;
+        Ok(state.get(channel_key).cloned())
+    }
+
+    fn quarantine_boundary_channel(
+        &self,
+        channel_key: String,
+        reason: String,
+        since_ns: u64,
+    ) -> Result<(), String> {
+        let mut bounded_reason = reason;
+        if bounded_reason.len() > MAX_BOUNDARY_QUARANTINE_REASON_LENGTH {
+            bounded_reason.truncate(MAX_BOUNDARY_QUARANTINE_REASON_LENGTH);
+        }
+        let mut state = self
+            .boundary_channel_quarantine
+            .lock()
+            .map_err(|_| "boundary channel quarantine lock poisoned".to_string())?;
+        state.quarantine(channel_key, bounded_reason, since_ns);
+        Ok(())
+    }
+
+    fn extract_boundary_flow_hints(
+        request_arguments: &[u8],
+    ) -> Result<Option<BoundaryFlowHints>, String> {
+        let Ok(arguments_value) = serde_json::from_slice::<serde_json::Value>(request_arguments)
+        else {
+            return Ok(None);
+        };
+        let Some(boundary_flow) = arguments_value.get("boundary_flow") else {
+            return Ok(None);
+        };
+        serde_json::from_value::<BoundaryFlowHints>(boundary_flow.clone())
+            .map(Some)
+            .map_err(|error| format!("invalid boundary_flow hints: {error}"))
+    }
+
+    const fn leakage_budget_bits_for_tier(risk_tier: RiskTier) -> u64 {
+        match risk_tier {
+            RiskTier::Tier0 => 24,
+            RiskTier::Tier1 => 20,
+            RiskTier::Tier2 => 16,
+            RiskTier::Tier3 => 12,
+            RiskTier::Tier4 => 8,
+        }
+    }
+
+    const fn timing_budget_ticks_for_tier(risk_tier: RiskTier) -> u64 {
+        match risk_tier {
+            RiskTier::Tier0 => 20,
+            RiskTier::Tier1 => 16,
+            RiskTier::Tier2 => 12,
+            RiskTier::Tier3 => 8,
+            RiskTier::Tier4 => 6,
+        }
+    }
+
+    const fn release_bucket_ticks_for_tier(risk_tier: RiskTier) -> u64 {
+        match risk_tier {
+            RiskTier::Tier0 => 20,
+            RiskTier::Tier1 => 16,
+            RiskTier::Tier2 => 12,
+            RiskTier::Tier3 => 8,
+            RiskTier::Tier4 => 6,
+        }
+    }
+
+    const fn taint_allow_for_tier(risk_tier: RiskTier, level: RuntimeTaintLevel) -> bool {
+        if risk_tier.requires_sandbox() {
+            matches!(
+                level,
+                RuntimeTaintLevel::Trusted | RuntimeTaintLevel::Attested
+            )
+        } else {
+            true
+        }
+    }
+
+    const fn confidentiality_rank_for_taint(level: RuntimeTaintLevel) -> u8 {
+        match level {
+            RuntimeTaintLevel::Trusted => 1,
+            RuntimeTaintLevel::Attested => 2,
+            RuntimeTaintLevel::Untrusted => 3,
+            RuntimeTaintLevel::Adversarial => 4,
+        }
+    }
+
+    const fn classification_ceiling_for_tier(risk_tier: RiskTier) -> u8 {
+        match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 => 4,
+            RiskTier::Tier2 => 3,
+            RiskTier::Tier3 => 2,
+            RiskTier::Tier4 => 1,
+        }
+    }
+
+    fn derive_policy_binding(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+        policy_verified: bool,
+    ) -> BoundaryFlowPolicyBinding {
+        let policy_digest = match decision {
+            Ok(
+                ToolDecision::Allow { policy_hash, .. } | ToolDecision::Deny { policy_hash, .. },
+            ) => *policy_hash,
+            Ok(ToolDecision::DedupeCacheHit { request_id, .. }) => {
+                *blake3::hash(format!("dedupe-policy:{request_id}").as_bytes()).as_bytes()
+            },
+            Ok(ToolDecision::Terminate { request_id, .. }) => {
+                *blake3::hash(format!("terminate-policy:{request_id}").as_bytes()).as_bytes()
+            },
+            Err(error) => *blake3::hash(format!("broker-error:{error}").as_bytes()).as_bytes(),
+        };
+
+        let admitted_policy_root_digest = if policy_verified {
+            policy_digest
+        } else {
+            *blake3::hash(b"policy-unverified").as_bytes()
+        };
+        let canonicalizer_digest =
+            *blake3::hash(BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES).as_bytes();
+
+        BoundaryFlowPolicyBinding {
+            policy_digest,
+            admitted_policy_root_digest,
+            canonicalizer_tuple_digest: canonicalizer_digest,
+            admitted_canonicalizer_tuple_digest: canonicalizer_digest,
+        }
+    }
+
+    fn build_boundary_flow_runtime_state(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+        risk_tier: RiskTier,
+        taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
+        request_arguments: &[u8],
+        policy_verified: bool,
+    ) -> Result<BoundaryFlowRuntimeState, String> {
+        let hints = Self::extract_boundary_flow_hints(request_arguments)?;
+        let base_taint_allow = Self::taint_allow_for_tier(risk_tier, taint_assessment.tag.level);
+        let base_classification_allow =
+            Self::confidentiality_rank_for_taint(taint_assessment.tag.level)
+                <= Self::classification_ceiling_for_tier(risk_tier);
+
+        let mut classification_allow = base_classification_allow;
+        let mut declass_receipt_valid = base_classification_allow;
+        let mut declassification_intent = DeclassificationIntentScope::None;
+        let mut redundancy_receipt = None;
+
+        if let Some(declassification) = hints
+            .as_ref()
+            .and_then(|hints| hints.declassification.as_ref())
+        {
+            declassification_intent = match declassification.intent {
+                DeclassificationIntentHint::None => DeclassificationIntentScope::None,
+                DeclassificationIntentHint::RedundancyPurpose => {
+                    DeclassificationIntentScope::RedundancyPurpose
+                },
+                DeclassificationIntentHint::Unknown => DeclassificationIntentScope::Unknown,
+            };
+
+            if matches!(
+                declassification_intent,
+                DeclassificationIntentScope::RedundancyPurpose
+            ) {
+                let receipt_id = declassification.receipt_id.clone().unwrap_or_default();
+                let receipt = RedundancyDeclassificationReceipt {
+                    receipt_id,
+                    scoped_fragment_only: declassification.scoped_fragment_only.unwrap_or(false),
+                    plaintext_semantics_exposed: declassification
+                        .plaintext_semantics_exposed
+                        .unwrap_or(true),
+                };
+                declass_receipt_valid = !receipt.receipt_id.is_empty()
+                    && receipt.receipt_id.len()
+                        <= apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
+                    && receipt.scoped_fragment_only
+                    && !receipt.plaintext_semantics_exposed;
+                redundancy_receipt = Some(receipt);
+                if declass_receipt_valid {
+                    classification_allow = true;
+                }
+            } else if matches!(
+                declassification_intent,
+                DeclassificationIntentScope::Unknown
+            ) {
+                declass_receipt_valid = false;
+            }
+        }
+
+        if !classification_allow
+            && !matches!(
+                declassification_intent,
+                DeclassificationIntentScope::RedundancyPurpose
+            )
+        {
+            declass_receipt_valid = false;
+        }
+
+        let default_leakage_budget_bits = Self::leakage_budget_bits_for_tier(risk_tier);
+        let leakage_budget_receipt = hints
+            .as_ref()
+            .and_then(|hints| hints.leakage_budget_receipt.as_ref())
+            .map_or_else(
+                || LeakageBudgetReceipt {
+                    leakage_bits: 0,
+                    budget_bits: default_leakage_budget_bits,
+                    estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                    confidence_bps: 10_000,
+                    confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
+                },
+                |hint| LeakageBudgetReceipt {
+                    leakage_bits: hint.leakage_bits,
+                    budget_bits: hint.budget_bits,
+                    estimator_family: hint.estimator_family,
+                    confidence_bps: hint.confidence_bps,
+                    confidence_label: hint
+                        .confidence_label
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string()),
+                },
+            );
+
+        let timing_channel_budget = hints
+            .as_ref()
+            .and_then(|hints| hints.timing_channel.as_ref())
+            .map_or_else(
+                || TimingChannelBudget {
+                    release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
+                    observed_variance_ticks: 0,
+                    budget_ticks: Self::timing_budget_ticks_for_tier(risk_tier),
+                },
+                |hint| TimingChannelBudget {
+                    release_bucket_ticks: hint.release_bucket,
+                    observed_variance_ticks: hint.observed_variance,
+                    budget_ticks: hint.budget,
+                },
+            );
+
+        Ok(BoundaryFlowRuntimeState {
+            taint_allow: base_taint_allow,
+            classification_allow,
+            declass_receipt_valid,
+            declassification_intent,
+            redundancy_declassification_receipt: redundancy_receipt,
+            policy_binding: Self::derive_policy_binding(decision, policy_verified),
+            leakage_budget_receipt,
+            timing_channel_budget,
+        })
     }
 
     fn derive_pcac_risk_tier_from_policy(
@@ -2317,6 +2810,38 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("unknown tool class: {}", request.tool_id),
             ));
         };
+
+        let boundary_channel_key = Self::boundary_channel_key(&token.session_id, tool_class);
+        if Self::requires_channel_boundary_enforcement(tool_class) {
+            match self.quarantined_boundary_channel(&boundary_channel_key) {
+                Ok(Some(record)) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        channel = %boundary_channel_key,
+                        reason = %record.reason,
+                        "RequestTool denied: boundary channel is quarantined"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("boundary channel quarantined: {}", record.reason),
+                    ));
+                },
+                Ok(None) => {},
+                Err(error) => {
+                    error!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        error = %error,
+                        "failed to read boundary channel quarantine state"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("boundary quarantine state unavailable: {error}"),
+                    ));
+                },
+            }
+        }
 
         // TCK-00406: Runtime taint ingress enforcement on production request
         // path. Deny and emit durable defect evidence for forbidden flows.
@@ -3422,46 +3947,102 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Self::enforce_mandatory_defect_termination(decision, &token.session_id, &defects);
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
-        let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class) {
+        let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class)
+            && matches!(
+                &decision,
+                Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
+            ) {
             let policy_ledger_verified = Self::tool_decision_policy_verified(&decision);
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
-            let all_verification_flags_true = broker_verified
-                && capability_verified
-                && context_firewall_verified
-                && policy_ledger_verified;
+            let boundary_flow_state = match Self::build_boundary_flow_runtime_state(
+                &decision,
+                risk_tier,
+                &taint_assessment,
+                &request_arguments,
+                policy_ledger_verified,
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        error = %error,
+                        "RequestTool denied: invalid boundary-flow hints"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("boundary flow hint parse failed: {error}"),
+                    ));
+                },
+            };
 
-            if all_verification_flags_true {
-                match channel_boundary_dispatcher()
-                    .validate_channel_boundary_and_issue_context_token(
-                        self.channel_context_signer.as_ref(),
-                        &token.lease_id,
-                        &request_id,
-                        timestamp_ns / 1_000_000_000,
-                        &tool_class,
-                        policy_ledger_verified,
-                        broker_verified,
-                        capability_verified,
-                        context_firewall_verified,
+            match channel_boundary_dispatcher()
+                .validate_channel_boundary_and_issue_context_token_with_flow(
+                    self.channel_context_signer.as_ref(),
+                    &token.lease_id,
+                    &request_id,
+                    timestamp_ns / 1_000_000_000,
+                    &tool_class,
+                    policy_ledger_verified,
+                    broker_verified,
+                    capability_verified,
+                    context_firewall_verified,
+                    boundary_flow_state,
+                ) {
+                Ok(token) => Some(token),
+                Err(defects) => {
+                    let defects_json = Self::format_channel_boundary_defects(&defects);
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        defects = %defects_json,
+                        "RequestTool denied by channel-boundary enforcement"
+                    );
+
+                    if let Err(error) = self.emit_channel_boundary_defects(
+                        &token.session_id,
+                        &boundary_channel_key,
+                        tool_class,
+                        &defects,
+                        timestamp_ns,
                     ) {
-                    Ok(token) => Some(token),
-                    Err(defects) => {
-                        let defects_json = Self::format_channel_boundary_defects(&defects);
                         warn!(
                             session_id = %token.session_id,
                             tool_class = %tool_class,
-                            defects = %defects_json,
-                            "RequestTool denied by channel-boundary enforcement"
+                            error = %error,
+                            "boundary-flow defect emission unavailable; continuing fail-closed deny"
                         );
-                        return Ok(SessionResponse::error(
-                            SessionErrorCode::SessionErrorToolNotAllowed,
-                            format!("channel boundary validation failed: {defects_json}"),
-                        ));
-                    },
-                }
-            } else {
-                None
+                    }
+
+                    if defects
+                        .iter()
+                        .any(|defect| defect.violation_class.requires_quarantine())
+                    {
+                        if let Err(error) = self.quarantine_boundary_channel(
+                            boundary_channel_key,
+                            defects_json.clone(),
+                            timestamp_ns,
+                        ) {
+                            error!(
+                                session_id = %token.session_id,
+                                tool_class = %tool_class,
+                                error = %error,
+                                "failed to quarantine boundary channel"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                format!("boundary quarantine failed: {error}"),
+                            ));
+                        }
+                    }
+
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("channel boundary validation failed: {defects_json}"),
+                    ));
+                },
             }
         } else {
             None
@@ -6050,7 +6631,9 @@ mod tests {
                 tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Execute]);
             manifest_store.register("session-001", manifest.clone());
 
-            let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
             broker
                 .initialize_with_manifest(manifest)
                 .await
@@ -6159,6 +6742,448 @@ mod tests {
                     );
                 },
                 other => panic!("expected unknown tool denial, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_boundary_downgrade_without_declassification_receipt_denied() {
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::{
+            Capability, CapabilityManifestBuilder, CapabilityScope, InMemorySessionRegistry,
+            RiskTier as CapabilityRiskTier, ToolBroker, ToolBrokerConfig, ToolClass,
+        };
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let token = test_token(&minter);
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+            let tier3_manifest = CapabilityManifestBuilder::new("tier3-boundary-manifest")
+                .delegator("test-delegator")
+                .capability(Capability {
+                    capability_id: "cap-inference-tier3".to_string(),
+                    tool_class: ToolClass::Inference,
+                    scope: CapabilityScope::default(),
+                    risk_tier_required: CapabilityRiskTier::Tier0,
+                })
+                .tool_allowlist(vec![ToolClass::Inference])
+                .build()
+                .expect("tier3 capability manifest should build");
+
+            manifest_store.register("session-001", tier3_manifest.clone());
+
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
+            broker
+                .initialize_with_manifest(tier3_manifest)
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-BOUNDARY-DOWNGRADE".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-downgrade".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some("session-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        duration.as_nanos() as u64
+                    }
+                })
+                .unwrap_or(1);
+            telemetry
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "prompt": "sensitive",
+                    "boundary_flow": {
+                        "declassification": {
+                            "intent": "redundancy_purpose"
+                        }
+                    }
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-downgrade-deny".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher
+                .dispatch(&frame, &make_session_ctx())
+                .expect("dispatch should complete");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("channel boundary validation failed"),
+                        "boundary downgrade path must fail via channel boundary checks: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("declassification_receipt_invalid")
+                            || err.message.contains("classification_not_admitted"),
+                        "boundary downgrade denial must include declassification/classification defect: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected boundary-flow deny, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_leakage_overrun_quarantines_boundary_channel() {
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let token = test_token(&minter);
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest =
+                tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Inference]);
+            manifest_store.register("session-001", manifest.clone());
+
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
+            broker
+                .initialize_with_manifest(manifest)
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-leakage".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some("session-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        duration.as_nanos() as u64
+                    }
+                })
+                .unwrap_or(1);
+            telemetry
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority);
+
+            let leakage_overrun_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "prompt": "hello",
+                    "boundary_flow": {
+                        "leakage_budget_receipt": {
+                            "leakage_bits": 64,
+                            "budget_bits": 8,
+                            "estimator_family": "mutual_information_upper_bound",
+                            "confidence_bps": 9200,
+                            "confidence_label": "adversarial-overrun"
+                        }
+                    }
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-leakage-overrun".to_string(),
+                epoch_seal: None,
+            };
+            let first_response = dispatcher
+                .dispatch(
+                    &encode_request_tool_request(&leakage_overrun_request),
+                    &make_session_ctx(),
+                )
+                .expect("dispatch should complete");
+
+            match first_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("leakage_budget_exceeded"),
+                        "leakage overrun denial must include leakage defect: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected leakage overrun deny, got: {other:?}"),
+            }
+
+            let follow_up_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "prompt": "hello-again"
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-leakage-followup".to_string(),
+                epoch_seal: None,
+            };
+            let second_response = dispatcher
+                .dispatch(
+                    &encode_request_tool_request(&follow_up_request),
+                    &make_session_ctx(),
+                )
+                .expect("dispatch should complete");
+
+            match second_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("boundary channel quarantined"),
+                        "post-overrun request must be denied due to channel quarantine: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected quarantined channel deny, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_timing_overrun_quarantines_boundary_channel() {
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let token = test_token(&minter);
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest =
+                tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Inference]);
+            manifest_store.register("session-001", manifest.clone());
+
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
+            broker
+                .initialize_with_manifest(manifest)
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-BOUNDARY-TIMING".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-timing".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some("session-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        duration.as_nanos() as u64
+                    }
+                })
+                .unwrap_or(1);
+            telemetry
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority);
+
+            let timing_overrun_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "prompt": "hello",
+                    "boundary_flow": {
+                        "timing_channel": {
+                            "observed_variance_ticks": 40,
+                            "budget_ticks": 5,
+                            "release_bucket_ticks": 8
+                        }
+                    }
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-timing-overrun".to_string(),
+                epoch_seal: None,
+            };
+            let first_response = dispatcher
+                .dispatch(
+                    &encode_request_tool_request(&timing_overrun_request),
+                    &make_session_ctx(),
+                )
+                .expect("dispatch should complete");
+
+            match first_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("timing_channel_budget_exceeded"),
+                        "timing overrun denial must include timing defect: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected timing overrun deny, got: {other:?}"),
+            }
+
+            let follow_up_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "prompt": "hello-again"
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-timing-followup".to_string(),
+                epoch_seal: None,
+            };
+            let second_response = dispatcher
+                .dispatch(
+                    &encode_request_tool_request(&follow_up_request),
+                    &make_session_ctx(),
+                )
+                .expect("dispatch should complete");
+
+            match second_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("boundary channel quarantined"),
+                        "post-timing-overrun request must be denied due to channel quarantine: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected quarantined channel deny, got: {other:?}"),
             }
         });
     }
