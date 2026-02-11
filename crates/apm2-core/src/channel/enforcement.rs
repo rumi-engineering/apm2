@@ -3,6 +3,8 @@
 //! Restricts authoritative actuation to typed tool-intent channel events
 //! and emits structured defects for boundary violations.
 
+use std::sync::Once;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -684,13 +686,37 @@ pub fn validate_channel_boundary(check: &ChannelBoundaryCheck) -> Vec<ChannelBou
         ));
     }
 
-    validate_boundary_flow_policy_binding(check, &mut defects);
     validate_boundary_admit_predicate(check, &mut defects);
     validate_declassification_constraints(check, &mut defects);
-    validate_leakage_budget(check, &mut defects);
-    validate_timing_budget(check, &mut defects);
+    if is_legacy_v1_boundary_flow_absent(check) {
+        emit_legacy_v1_boundary_flow_deprecation_warning();
+    } else {
+        validate_boundary_flow_policy_binding(check, &mut defects);
+        validate_leakage_budget(check, &mut defects);
+        validate_timing_budget(check, &mut defects);
+    }
 
     defects
+}
+
+const fn is_legacy_v1_boundary_flow_absent(check: &ChannelBoundaryCheck) -> bool {
+    check.boundary_flow_policy_binding.is_none()
+        && check.leakage_budget_receipt.is_none()
+        && check.timing_channel_budget.is_none()
+        && check.leakage_budget_policy_max_bits.is_none()
+        && check.declared_leakage_budget_bits.is_none()
+        && check.timing_budget_policy_max_ticks.is_none()
+        && check.declared_timing_budget_ticks.is_none()
+}
+
+fn emit_legacy_v1_boundary_flow_deprecation_warning() {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            schema_id = CHANNEL_CONTEXT_TOKEN_SCHEMA_ID,
+            "legacy apm2.channel_context_token.v1 missing boundary-flow fields; skipping boundary-flow checks during rollout"
+        );
+    });
 }
 
 fn validate_boundary_flow_policy_binding(
@@ -1316,6 +1342,24 @@ mod tests {
                     .detail
                     .contains("declared timing budget exceeds policy ceiling")
         }));
+    }
+
+    #[test]
+    fn test_v1_legacy_missing_boundary_flow_fields_uses_compat_path() {
+        let mut check = baseline_check();
+        check.boundary_flow_policy_binding = None;
+        check.leakage_budget_receipt = None;
+        check.timing_channel_budget = None;
+        check.leakage_budget_policy_max_bits = None;
+        check.declared_leakage_budget_bits = None;
+        check.timing_budget_policy_max_ticks = None;
+        check.declared_timing_budget_ticks = None;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(
+            defects.is_empty(),
+            "v1 compatibility path should not deny solely for missing boundary-flow fields: {defects:?}"
+        );
     }
 
     #[test]
