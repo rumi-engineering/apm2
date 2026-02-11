@@ -2774,6 +2774,67 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    fn mark_gh_cli_variable_assignment(token: &str, gh_bound_variables: &mut HashSet<String>) {
+        let Some((name, value)) = Self::extract_shell_variable_assignment(token) else {
+            return;
+        };
+        let value_lower = value.to_ascii_lowercase();
+        if Self::is_gh_executable(&value_lower) {
+            gh_bound_variables.insert(name.to_string());
+        } else {
+            // Shell assignments are mutable; non-gh rebinds must clear stale bindings.
+            gh_bound_variables.remove(name);
+        }
+    }
+
+    fn collect_gh_cli_variable_assignments_from_segment(
+        tokens: &[&str],
+        gh_bound_variables: &mut HashSet<String>,
+    ) {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            for token in tokens {
+                Self::mark_gh_cli_variable_assignment(token, gh_bound_variables);
+            }
+            return;
+        };
+
+        for token in tokens.iter().take(exec_idx) {
+            Self::mark_gh_cli_variable_assignment(token, gh_bound_variables);
+        }
+
+        if Self::is_shell_assignment_builtin(&exec) {
+            for token in tokens.iter().skip(exec_idx + 1) {
+                Self::mark_gh_cli_variable_assignment(token, gh_bound_variables);
+            }
+        }
+    }
+
+    fn segment_invokes_gh_cli_via_shell_variable(
+        tokens: &[&str],
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            return false;
+        };
+
+        if Self::extract_shell_variable_reference(&exec)
+            .is_some_and(|name| gh_bound_variables.contains(name))
+        {
+            return true;
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, _wrapped_idx)) =
+                Self::extract_env_wrapped_executable(tokens, exec_idx + 1)
+            && Self::extract_shell_variable_reference(&wrapped_exec)
+                .is_some_and(|name| gh_bound_variables.contains(name))
+        {
+            return true;
+        }
+
+        false
+    }
+
     fn arguments_reference_github_api_variable<'a>(
         mut arguments: impl Iterator<Item = &'a str>,
         github_api_bound_variables: &HashSet<String>,
@@ -2845,24 +2906,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     fn command_invokes_gh_cli_via_shell_variable(command: &str) -> bool {
         let mut gh_bound_variables = HashSet::new();
-        for token in command.split_whitespace() {
-            let Some((name, value)) = Self::extract_shell_variable_assignment(token) else {
+        for segment in Self::split_shell_command_segments(command) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
                 continue;
-            };
-            let value_lower = value.to_ascii_lowercase();
-            if Self::is_gh_executable(&value_lower) {
-                gh_bound_variables.insert(name.to_string());
+            }
+            // Parse assignments in shell order so later segments can reference
+            // earlier bindings (`cmd=gh; $cmd api /repos`).
+            Self::collect_gh_cli_variable_assignments_from_segment(
+                &tokens,
+                &mut gh_bound_variables,
+            );
+            if gh_bound_variables.is_empty() {
+                continue;
+            }
+            if Self::segment_invokes_gh_cli_via_shell_variable(&tokens, &gh_bound_variables) {
+                return true;
             }
         }
-
-        if gh_bound_variables.is_empty() {
-            return false;
-        }
-
-        command.split_whitespace().any(|token| {
-            Self::extract_shell_variable_reference(token)
-                .is_some_and(|name| gh_bound_variables.contains(name))
-        })
+        false
     }
 
     fn command_substitution_contains_gh_reference(command: &str, depth: usize) -> bool {
@@ -7411,6 +7473,20 @@ mod tests {
         }
 
         #[test]
+        fn shell_variable_bound_to_gh_as_echo_argument_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({ "command": "cmd=gh; echo $cmd" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "variable references should only be flagged when used as executable position"
+            );
+        }
+
+        #[test]
         fn chained_and_operator_gh_api_attempt_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
                 "true && gh api /repos/owner/repo",
@@ -7621,6 +7697,7 @@ mod tests {
                 "projection-isolation-network-api-host-trailing-dot",
             );
         }
+
 
         #[test]
         fn direct_github_api_capability_surface_denied_with_defect() {
