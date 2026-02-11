@@ -2616,24 +2616,145 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Some(variable)
     }
 
+    fn is_shell_variable_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if first != '_' && !first.is_ascii_alphabetic() {
+            return false;
+        }
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    }
+
+    fn extract_shell_variable_assignment(token: &str) -> Option<(&str, &str)> {
+        let cleaned = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+        let (name, raw_value) = cleaned.split_once('=')?;
+        if !Self::is_shell_variable_name(name) {
+            return None;
+        }
+        let value = Self::trim_shell_word_boundary(raw_value);
+        if value.is_empty() {
+            return None;
+        }
+        Some((name, value))
+    }
+
+    fn is_shell_assignment_builtin(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "export" | "declare" | "readonly" | "typeset" | "local"
+        )
+    }
+
+    fn mark_github_api_variable_assignment(
+        token: &str,
+        github_api_bound_variables: &mut HashSet<String>,
+    ) {
+        if let Some((name, value)) = Self::extract_shell_variable_assignment(token)
+            && Self::argument_targets_github_api(value)
+        {
+            github_api_bound_variables.insert(name.to_string());
+        }
+    }
+
+    fn collect_github_api_variable_assignments_from_segment(
+        tokens: &[&str],
+        github_api_bound_variables: &mut HashSet<String>,
+    ) {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            for token in tokens {
+                Self::mark_github_api_variable_assignment(token, github_api_bound_variables);
+            }
+            return;
+        };
+
+        for token in tokens.iter().take(exec_idx) {
+            Self::mark_github_api_variable_assignment(token, github_api_bound_variables);
+        }
+
+        if Self::is_shell_assignment_builtin(&exec) {
+            for token in tokens.iter().skip(exec_idx + 1) {
+                Self::mark_github_api_variable_assignment(token, github_api_bound_variables);
+            }
+        }
+    }
+
+    fn arguments_reference_github_api_variable<'a>(
+        mut arguments: impl Iterator<Item = &'a str>,
+        github_api_bound_variables: &HashSet<String>,
+    ) -> bool {
+        arguments.any(|token| {
+            Self::extract_shell_variable_reference(token)
+                .is_some_and(|name| github_api_bound_variables.contains(name))
+        })
+    }
+
+    fn segment_uses_github_api_variable_with_network_client(
+        tokens: &[&str],
+        github_api_bound_variables: &HashSet<String>,
+    ) -> bool {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            return false;
+        };
+
+        if Self::is_http_client_executable(&exec) {
+            return Self::arguments_reference_github_api_variable(
+                tokens.iter().skip(exec_idx + 1).copied(),
+                github_api_bound_variables,
+            );
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, wrapped_idx)) =
+                Self::extract_env_wrapped_executable(tokens, exec_idx + 1)
+            && Self::is_http_client_executable(&wrapped_exec)
+        {
+            return Self::arguments_reference_github_api_variable(
+                tokens.iter().skip(wrapped_idx + 1).copied(),
+                github_api_bound_variables,
+            );
+        }
+
+        false
+    }
+
+    fn command_targets_github_api_via_shell_variable(command: &str) -> bool {
+        let mut github_api_bound_variables = HashSet::new();
+        for segment in Self::split_shell_command_segments(command) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Parse variable assignment segments in command order so values can
+            // propagate to later command segments (e.g., `url=...; curl "$url"`).
+            Self::collect_github_api_variable_assignments_from_segment(
+                &tokens,
+                &mut github_api_bound_variables,
+            );
+
+            if github_api_bound_variables.is_empty() {
+                continue;
+            }
+
+            if Self::segment_uses_github_api_variable_with_network_client(
+                &tokens,
+                &github_api_bound_variables,
+            ) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn command_invokes_gh_cli_via_shell_variable(command: &str) -> bool {
         let mut gh_bound_variables = HashSet::new();
         for token in command.split_whitespace() {
-            let cleaned = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
-            let Some((name, raw_value)) = cleaned.split_once('=') else {
+            let Some((name, value)) = Self::extract_shell_variable_assignment(token) else {
                 continue;
             };
-            if name.is_empty()
-                || !name
-                    .chars()
-                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-            {
-                continue;
-            }
-            let value = Self::trim_shell_word_boundary(raw_value);
-            if value.is_empty() {
-                continue;
-            }
             let value_lower = value.to_ascii_lowercase();
             if Self::is_gh_executable(&value_lower) {
                 gh_bound_variables.insert(name.to_string());
@@ -2675,6 +2796,29 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
 
             idx += 1;
+        }
+
+        let mut backtick_start: Option<usize> = None;
+        let mut backtick_idx = 0usize;
+        while backtick_idx < bytes.len() {
+            if bytes[backtick_idx] == b'`' {
+                let escaped = backtick_idx > 0 && bytes[backtick_idx - 1] == b'\\';
+                if !escaped {
+                    if let Some(start) = backtick_start.take() {
+                        if start <= backtick_idx {
+                            let inner = &command[start..backtick_idx];
+                            if Self::command_invokes_gh_cli_inner(inner, depth + 1)
+                                || Self::command_contains_gh_token(inner)
+                            {
+                                return true;
+                            }
+                        }
+                    } else {
+                        backtick_start = Some(backtick_idx + 1);
+                    }
+                }
+            }
+            backtick_idx += 1;
         }
 
         false
@@ -2751,8 +2895,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Self::command_invokes_gh_cli_inner(command, 0)
     }
 
+    fn normalize_host_for_github_api_match(host: &str) -> String {
+        host.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
     fn host_targets_github_api(host: &str) -> bool {
-        let lower = host.trim().to_ascii_lowercase();
+        let lower = Self::normalize_host_for_github_api_match(host);
         lower == "api.github.com" || lower.ends_with(".api.github.com")
     }
 
@@ -2779,10 +2927,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         let lower = normalized.to_ascii_lowercase();
-        if lower.contains("api.github.com") {
-            return true;
-        }
-
         if let Some(host_candidate) = lower.strip_prefix("host:")
             && Self::host_targets_github_api(host_candidate)
         {
@@ -2793,6 +2937,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             && let Some(host) = parsed_url.host_str()
             && Self::host_targets_github_api(host)
         {
+            return true;
+        }
+
+        if lower.contains("api.github.com") {
             return true;
         }
 
@@ -2807,6 +2955,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let command = Self::normalize_shell_token(command.trim());
         if command.is_empty() {
             return false;
+        }
+
+        // Fail-closed detection for shell variable indirection where a GitHub
+        // API URL is assigned then consumed by a network client command.
+        if Self::command_targets_github_api_via_shell_variable(command) {
+            return true;
         }
 
         let segments = Self::split_shell_command_segments(command);
@@ -7046,6 +7200,15 @@ mod tests {
         }
 
         #[test]
+        fn backtick_substitution_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=`echo gh`; $cmd api /repos",
+                "projection-isolation-backtick-subst-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
         fn eval_indirection_gh_api_attempt_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
                 "eval \"gh api /repos\"",
@@ -7129,10 +7292,44 @@ mod tests {
         }
 
         #[test]
+        fn documented_api_github_host_echo_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({
+                "command": "echo \"the URL api.github.com is documented here\""
+            });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "echo-only documentation text must not be flagged as direct API actuation"
+            );
+        }
+
+        #[test]
         fn curl_api_github_host_attempt_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
                 "curl https://api.github.com/repos/owner/repo",
                 "projection-isolation-curl-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn shell_variable_propagation_api_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "url=https://api.github.com/repos/example/repo; curl \"$url\"",
+                "projection-isolation-shell-var-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn curl_api_github_trailing_dot_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "curl https://api.github.com./repos/owner/repo",
+                "projection-isolation-curl-api-host-trailing-dot",
                 "github_api",
             );
         }
@@ -7194,6 +7391,14 @@ mod tests {
             assert_network_direct_github_attempt_denied(
                 &url,
                 "projection-isolation-unicode-network",
+            );
+        }
+
+        #[test]
+        fn network_url_api_github_trailing_dot_host_attempt_denied_with_structured_defect() {
+            assert_network_direct_github_attempt_denied(
+                "https://api.github.com./repos/owner/repo",
+                "projection-isolation-network-api-host-trailing-dot",
             );
         }
 
