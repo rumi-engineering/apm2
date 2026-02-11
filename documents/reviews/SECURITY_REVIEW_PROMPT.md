@@ -18,7 +18,7 @@ metadata_contract:
     - '"pr_number" MUST match the prepared PR number exactly.'
     - "Set reviewed_sha = headRefOid."
 
-references[18]:
+references[19]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "Truth/projection model, containment, and verification laws."
   - path: "@AGENTS.md"
@@ -51,6 +51,8 @@ references[18]:
     purpose: "Security hazard catalog."
   - path: "@documents/skills/rust-standards/references/42_distributed_security_invariants.md"
     purpose: "Distributed invariant checks."
+  - path: "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md"
+    purpose: "PCAC/AJC lifecycle integration checks for authority-bearing handlers."
 
 decision_tree:
   entrypoint: STEP_1_DISCOVERY
@@ -107,7 +109,7 @@ decision_tree:
 
     - id: STEP_4_ANALYZE
       purpose: "Run threat-focused analysis on changed boundaries."
-      threat_axes[7]:
+      threat_axes[8]:
         - axis: "Authentication/Authorization"
           focus: "Privilege checks, identity binding, allowlist integrity."
         - axis: "Input/Protocol Validation"
@@ -122,11 +124,13 @@ decision_tree:
           focus: "Deadlock, race, starvation, unbounded memory/cpu growth."
         - axis: "Policy and Gate Strictness"
           focus: "Any strictness decrease in policy, gate, or provenance logic."
+        - axis: "Authority Lifecycle Continuity (PCAC/AJC)"
+          focus: "Authority-bearing handlers MUST enforce join -> revalidate -> consume -> effect with fail-closed deny paths and durable lifecycle evidence."
       next: STEP_5_WRITE_FINDINGS
 
     - id: STEP_5_WRITE_FINDINGS
       purpose: "Write security findings body (no manual metadata block)."
-      steps[3]:
+      steps[4]:
         - action: write_file
           path: "$temp_dir/security_findings.md"
           required_structure:
@@ -139,6 +143,8 @@ decision_tree:
             - "### **WAIVED FINDINGS**"
         - action: quality_rule
           rule: "Each non-empty finding includes threat, exploit path, blast radius, and required remediation."
+        - action: structural_rule
+          rule: "If a handler has authority-bearing side effects but lacks AJC lifecycle enforcement (join -> revalidate -> consume -> effect), emit a MAJOR finding."
         - action: classify
           output: [blocker_count, major_count, minor_count, nit_count, verdict]
       next: STEP_6_PUBLISH
