@@ -106,6 +106,27 @@ pub const MAX_ACTOR_ID_LENGTH: usize = 256;
 /// Maximum length for receipt ID strings.
 pub const MAX_RECEIPT_ID_LENGTH: usize = 256;
 
+/// Canonical schema identifier for deterministic delegation meet receipts.
+pub const DELEGATION_MEET_SCHEMA_ID: &str = "apm2.delegation_meet_computation_receipt.v1";
+
+/// Canonical schema major for deterministic delegation meet receipts.
+pub const DELEGATION_MEET_SCHEMA_MAJOR: u16 = 1;
+
+/// Canonical algorithm identifier for delegation meet exactness checks.
+pub const DELEGATION_MEET_EXACT_V1_ALGORITHM_ID: &str = "delegation_meet_exact_v1";
+
+/// Canonical schema identifier for delegation satisfiability receipts.
+pub const DELEGATION_SATISFIABILITY_SCHEMA_ID: &str = "apm2.delegation_satisfiability_receipt.v1";
+
+/// Canonical schema major for delegation satisfiability receipts.
+pub const DELEGATION_SATISFIABILITY_SCHEMA_MAJOR: u16 = 1;
+
+/// Default deterministic budget for satisfiability evaluation.
+///
+/// This budget is intentionally small and integer-only (tick space) so
+/// admission remains deterministic and fail-closed under compute ambiguity.
+pub const DELEGATION_SATISFIABILITY_BUDGET_TICKS: u64 = 32;
+
 // =============================================================================
 // PermeabilityFacet
 // =============================================================================
@@ -533,6 +554,132 @@ pub fn lattice_meet(a: &AuthorityVector, b: &AuthorityVector) -> AuthorityVector
     }
 }
 
+/// Canonical deterministic meet algorithm required by RFC-0028 Section 4.
+///
+/// This is an explicit, versioned alias for the authority meet primitive used
+/// across promotion-critical delegation admission paths.
+#[must_use]
+pub fn delegation_meet_exact_v1(a: &AuthorityVector, b: &AuthorityVector) -> AuthorityVector {
+    lattice_meet(a, b)
+}
+
+/// Deterministic receipt describing an exact-meet computation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationMeetComputationReceiptV1 {
+    /// Canonical schema identifier.
+    pub schema_id: String,
+    /// Canonical schema major.
+    pub schema_major: u16,
+    /// Canonical algorithm identifier.
+    pub algorithm_id: String,
+    /// Content hash of the parent authority vector.
+    pub parent_authority_hash: [u8; 32],
+    /// Content hash of the overlay authority vector.
+    pub overlay_hash: [u8; 32],
+    /// Content hash of the delegated authority vector.
+    pub delegated_hash: [u8; 32],
+    /// Digest over the canonical meet computation tuple.
+    pub canonical_meet_digest: [u8; 32],
+}
+
+/// Deterministic receipt proving delegation satisfiability evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationSatisfiabilityReceiptV1 {
+    /// Canonical schema identifier.
+    pub schema_id: String,
+    /// Canonical schema major.
+    pub schema_major: u16,
+    /// Delegation depth evaluated.
+    pub delegation_depth: u32,
+    /// Evaluation budget in ticks.
+    pub budget_ticks: u64,
+    /// Ticks consumed by evaluation.
+    pub ticks_used: u64,
+    /// Whether at least one admissible workset remains.
+    pub admissible_workset_non_empty: bool,
+}
+
+fn delegation_meet_exact_v1_digest(
+    parent: &AuthorityVector,
+    overlay: &AuthorityVector,
+    delegated: &AuthorityVector,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.delegation_meet_exact_v1.digest");
+    hasher.update(DELEGATION_MEET_SCHEMA_ID.as_bytes());
+    hasher.update(&DELEGATION_MEET_SCHEMA_MAJOR.to_be_bytes());
+    hasher.update(DELEGATION_MEET_EXACT_V1_ALGORITHM_ID.as_bytes());
+    hasher.update(&parent.canonical_bytes());
+    hasher.update(&overlay.canonical_bytes());
+    hasher.update(&delegated.canonical_bytes());
+    hasher.finalize().into()
+}
+
+fn compute_meet_receipt(
+    parent: &AuthorityVector,
+    overlay: &AuthorityVector,
+) -> DelegationMeetComputationReceiptV1 {
+    let delegated = delegation_meet_exact_v1(parent, overlay);
+    DelegationMeetComputationReceiptV1 {
+        schema_id: DELEGATION_MEET_SCHEMA_ID.to_string(),
+        schema_major: DELEGATION_MEET_SCHEMA_MAJOR,
+        algorithm_id: DELEGATION_MEET_EXACT_V1_ALGORITHM_ID.to_string(),
+        parent_authority_hash: parent.content_hash(),
+        overlay_hash: overlay.content_hash(),
+        delegated_hash: delegated.content_hash(),
+        canonical_meet_digest: delegation_meet_exact_v1_digest(parent, overlay, &delegated),
+    }
+}
+
+fn compute_meet_receipt_independent(
+    parent: &AuthorityVector,
+    overlay: &AuthorityVector,
+) -> DelegationMeetComputationReceiptV1 {
+    // Independent recomputation path: avoid calling `lattice_meet` directly.
+    let delegated = AuthorityVector {
+        risk: if parent.risk <= overlay.risk {
+            parent.risk
+        } else {
+            overlay.risk
+        },
+        capability: if parent.capability <= overlay.capability {
+            parent.capability
+        } else {
+            overlay.capability
+        },
+        budget: if parent.budget <= overlay.budget {
+            parent.budget
+        } else {
+            overlay.budget
+        },
+        stop_predicate: if parent.stop_predicate <= overlay.stop_predicate {
+            parent.stop_predicate
+        } else {
+            overlay.stop_predicate
+        },
+        taint: if parent.taint <= overlay.taint {
+            parent.taint
+        } else {
+            overlay.taint
+        },
+        classification: if parent.classification <= overlay.classification {
+            parent.classification
+        } else {
+            overlay.classification
+        },
+    };
+
+    DelegationMeetComputationReceiptV1 {
+        schema_id: DELEGATION_MEET_SCHEMA_ID.to_string(),
+        schema_major: DELEGATION_MEET_SCHEMA_MAJOR,
+        algorithm_id: DELEGATION_MEET_EXACT_V1_ALGORITHM_ID.to_string(),
+        parent_authority_hash: parent.content_hash(),
+        overlay_hash: overlay.content_hash(),
+        delegated_hash: delegated.content_hash(),
+        canonical_meet_digest: delegation_meet_exact_v1_digest(parent, overlay, &delegated),
+    }
+}
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -552,6 +699,17 @@ pub enum PermeabilityError {
     /// Delegated authority does not match computed meet.
     #[error("delegated authority does not equal meet(parent, overlay)")]
     MeetMismatch,
+
+    /// Independent verifier recomputation disagrees with canonical meet.
+    #[error(
+        "independent verifier disagreement for delegation meet digest: expected {expected_digest}, got {actual_digest}"
+    )]
+    IndependentVerifierDisagreement {
+        /// Canonical meet digest from the primary implementation.
+        expected_digest: String,
+        /// Digest from independent verifier recomputation.
+        actual_digest: String,
+    },
 
     /// Delegation chain exceeds maximum depth.
     #[error("delegation chain depth {depth} exceeds maximum {max}")]
@@ -753,6 +911,31 @@ pub enum PermeabilityError {
         expected: String,
         /// Actual chain commitment (hex).
         actual: String,
+    },
+
+    /// Satisfiability evaluation exceeded deterministic tick budget.
+    #[error(
+        "delegation satisfiability budget exhausted: ticks_used={ticks_used}, budget_ticks={budget_ticks}"
+    )]
+    SatisfiabilityBudgetExceeded {
+        /// Ticks consumed during evaluation.
+        ticks_used: u64,
+        /// Allowed budget in ticks.
+        budget_ticks: u64,
+    },
+
+    /// Delegation is algebraically valid but vacuous (no admissible workset).
+    #[error("delegation satisfiability failure: {reason}")]
+    DelegationUnsatisfiable {
+        /// Machine-readable reason for unsatisfiability.
+        reason: String,
+    },
+
+    /// Deterministic tick arithmetic could not be computed safely.
+    #[error("non-computable delegation field: {reason}")]
+    NonComputableDelegation {
+        /// Description of the non-computable condition.
+        reason: String,
     },
 }
 
@@ -1064,6 +1247,11 @@ impl PermeabilityReceipt {
             });
         }
 
+        // RFC-0028 Section 4: algebraically-valid but vacuous delegation
+        // outputs are non-admissible, and satisfiability evaluation must stay
+        // within deterministic tick budget.
+        evaluate_delegation_satisfiability_v1(self, DELEGATION_SATISFIABILITY_BUDGET_TICKS)?;
+
         Ok(())
     }
 
@@ -1179,7 +1367,16 @@ impl PermeabilityReceipt {
 
     /// Validates that `delegated == meet(parent, overlay)` and strict-subset.
     fn validate_meet_and_subset(&self) -> Result<(), PermeabilityError> {
-        let expected_meet = lattice_meet(&self.parent_authority, &self.overlay);
+        let primary = compute_meet_receipt(&self.parent_authority, &self.overlay);
+        let independent = compute_meet_receipt_independent(&self.parent_authority, &self.overlay);
+        if independent.canonical_meet_digest != primary.canonical_meet_digest {
+            return Err(PermeabilityError::IndependentVerifierDisagreement {
+                expected_digest: hex::encode(primary.canonical_meet_digest),
+                actual_digest: hex::encode(independent.canonical_meet_digest),
+            });
+        }
+
+        let expected_meet = delegation_meet_exact_v1(&self.parent_authority, &self.overlay);
         if self.delegated != expected_meet {
             return Err(PermeabilityError::MeetMismatch);
         }
@@ -1191,6 +1388,14 @@ impl PermeabilityReceipt {
         }
         if !self.delegated.is_subset_of(&self.overlay) {
             return Err(PermeabilityError::OverlayWidening);
+        }
+        let delegated_digest =
+            delegation_meet_exact_v1_digest(&self.parent_authority, &self.overlay, &self.delegated);
+        if delegated_digest != primary.canonical_meet_digest {
+            return Err(PermeabilityError::IndependentVerifierDisagreement {
+                expected_digest: hex::encode(primary.canonical_meet_digest),
+                actual_digest: hex::encode(delegated_digest),
+            });
         }
         Ok(())
     }
@@ -1322,6 +1527,78 @@ pub fn compute_delegated_chain_commitment(
     hasher.update(parent_chain_commitment);
     hasher.update(receipt_content_hash);
     hasher.finalize().into()
+}
+
+fn checked_tick_add(ticks: &mut u64, delta: u64) -> Result<(), PermeabilityError> {
+    *ticks =
+        ticks
+            .checked_add(delta)
+            .ok_or_else(|| PermeabilityError::NonComputableDelegation {
+                reason: "tick arithmetic overflow while evaluating delegation satisfiability"
+                    .to_string(),
+            })?;
+    Ok(())
+}
+
+fn evaluate_delegation_satisfiability_v1(
+    receipt: &PermeabilityReceipt,
+    budget_ticks: u64,
+) -> Result<DelegationSatisfiabilityReceiptV1, PermeabilityError> {
+    let mut ticks_used = 0_u64;
+    let mut unsat_reasons: Vec<&'static str> = Vec::with_capacity(6);
+
+    checked_tick_add(&mut ticks_used, 1)?;
+    if receipt.delegated.capability == CapabilityLevel::None {
+        unsat_reasons.push("capability_none");
+    }
+
+    checked_tick_add(&mut ticks_used, 1)?;
+    if matches!(receipt.delegated.budget, BudgetLevel::Zero) {
+        unsat_reasons.push("budget_zero");
+    }
+
+    checked_tick_add(&mut ticks_used, 1)?;
+    if receipt.delegated.stop_predicate == StopPredicateLevel::Deny {
+        unsat_reasons.push("stop_predicate_deny");
+    }
+
+    checked_tick_add(&mut ticks_used, 1)?;
+    if receipt.expires_at_ms <= receipt.issued_at_ms {
+        unsat_reasons.push("empty_temporal_window");
+    }
+
+    checked_tick_add(&mut ticks_used, 1)?;
+    if receipt.delegation_depth > MAX_DELEGATION_DEPTH {
+        unsat_reasons.push("depth_exceeded");
+    }
+
+    checked_tick_add(&mut ticks_used, 1)?;
+    if receipt.delegated_hash == [0u8; 32] {
+        unsat_reasons.push("delegated_hash_zero");
+    }
+
+    if ticks_used > budget_ticks {
+        return Err(PermeabilityError::SatisfiabilityBudgetExceeded {
+            ticks_used,
+            budget_ticks,
+        });
+    }
+
+    let admissible_workset_non_empty = unsat_reasons.is_empty();
+    if !admissible_workset_non_empty {
+        return Err(PermeabilityError::DelegationUnsatisfiable {
+            reason: unsat_reasons.join("+"),
+        });
+    }
+
+    Ok(DelegationSatisfiabilityReceiptV1 {
+        schema_id: DELEGATION_SATISFIABILITY_SCHEMA_ID.to_string(),
+        schema_major: DELEGATION_SATISFIABILITY_SCHEMA_MAJOR,
+        delegation_depth: receipt.delegation_depth,
+        budget_ticks,
+        ticks_used,
+        admissible_workset_non_empty,
+    })
 }
 
 // =============================================================================
@@ -2539,7 +2816,14 @@ mod tests {
     #[test]
     fn test_consumption_binding_wrong_hash_rejected() {
         let parent = AuthorityVector::top();
-        let overlay = AuthorityVector::bottom();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
         let receipt = PermeabilityReceiptBuilder::new("receipt-wrong-hash", parent, overlay)
             .delegator_actor_id("alice")
             .delegate_actor_id("bob")
@@ -4636,6 +4920,88 @@ mod tests {
         assert!(
             receipt.validate_admission(2_000_000).is_ok(),
             "valid issued_at_ms must pass admission"
+        );
+    }
+
+    #[test]
+    fn test_delegation_meet_exact_v1_independent_digest_concordance() {
+        let parent = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(9000),
+            StopPredicateLevel::Override,
+            TaintCeiling::Adversarial,
+            ClassificationLevel::TopSecret,
+        );
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(3000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+
+        let primary = compute_meet_receipt(&parent, &overlay);
+        let independent = compute_meet_receipt_independent(&parent, &overlay);
+        assert_eq!(
+            primary.canonical_meet_digest, independent.canonical_meet_digest,
+            "independent verifier recomputation must match canonical meet digest"
+        );
+        assert_eq!(
+            primary.delegated_hash, independent.delegated_hash,
+            "independent verifier recomputation must match delegated output"
+        );
+    }
+
+    #[test]
+    fn test_vacuous_delegation_denied() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::bottom();
+        let receipt = PermeabilityReceiptBuilder::new("receipt-vacuous", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(2_000_000)
+            .build()
+            .expect("builder should succeed");
+
+        let result = receipt.validate_admission(1_500_000);
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::DelegationUnsatisfiable { .. })
+            ),
+            "vacuous delegation must be non-admissible, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_satisfiability_budget_exhaustion_denied() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("receipt-budget", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(2_000_000)
+            .build()
+            .expect("builder should succeed");
+
+        let result = evaluate_delegation_satisfiability_v1(&receipt, 2);
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::SatisfiabilityBudgetExceeded { .. })
+            ),
+            "budget exhaustion must deny, got: {result:?}"
         );
     }
 

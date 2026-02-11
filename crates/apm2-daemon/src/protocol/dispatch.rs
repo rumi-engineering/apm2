@@ -26,7 +26,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -1189,6 +1189,25 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// Per SEC-SCP-FAC-0020: caller-controlled free-form predicates must be
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
+
+/// Maximum supported delegation depth for `DelegateSublease` lineage.
+///
+/// Keep this aligned with the core delegation ceiling so recursion-depth
+/// laundering attempts fail-closed consistently across verifier surfaces.
+pub const MAX_SUBLEASE_DELEGATION_DEPTH: u32 =
+    apm2_core::policy::permeability::MAX_DELEGATION_DEPTH;
+
+/// Hard cap on lineage traversal iterations for delegation-depth computation.
+///
+/// This bounds event-store traversal and prevents unbounded recursion/cycles.
+pub const MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS: usize =
+    (MAX_SUBLEASE_DELEGATION_DEPTH as usize) + 1;
+
+/// Deterministic budget for sublease delegation satisfiability evaluation.
+///
+/// The budget is expressed in integer ticks and consumed by fixed-cost lineage
+/// traversal and binding checks.
+pub const SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS: u64 = 30;
 
 /// Builds the canonical JSON payload for a `SessionStarted` ledger event.
 ///
@@ -4788,6 +4807,66 @@ fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8
         .expect("validated to 32 bytes by validate_identity_proof_hash");
 
     Ok((parent_lease_id, identity_proof_hash))
+}
+
+/// Deterministically computes parent delegation depth and evaluation ticks for
+/// `DelegateSublease` admission.
+///
+/// Traverses persisted `SubleaseIssued` lineage by repeatedly reading the
+/// latest event for each lease ID and following its `parent_lease_id`.
+///
+/// Returns:
+/// - `depth`: number of sublease hops from `parent_lease_id` to the root lease
+/// - `ticks_used`: deterministic integer cost consumed by lineage evaluation
+fn compute_sublease_parent_depth_and_ticks(
+    event_emitter: &dyn LedgerEventEmitter,
+    parent_lease_id: &str,
+) -> Result<(u32, u64), String> {
+    let mut current_lease = parent_lease_id.to_string();
+    let mut visited = HashSet::with_capacity(MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS);
+    let mut depth = 0_u32;
+    let mut ticks_used = 0_u64;
+
+    for _ in 0..MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS {
+        ticks_used = ticks_used
+            .checked_add(1)
+            .ok_or_else(|| "delegation satisfiability tick overflow".to_string())?;
+
+        if !visited.insert(current_lease.clone()) {
+            return Err(format!(
+                "delegation lineage cycle detected at lease '{current_lease}'"
+            ));
+        }
+
+        let maybe_event = event_emitter
+            .get_events_by_work_id(&current_lease)
+            .into_iter()
+            .rev()
+            .find(|event| event.event_type == "SubleaseIssued");
+
+        let Some(sublease_event) = maybe_event else {
+            return Ok((depth, ticks_used));
+        };
+
+        ticks_used = ticks_used
+            .checked_add(1)
+            .ok_or_else(|| "delegation satisfiability tick overflow".to_string())?;
+
+        let (next_parent, _identity_proof_hash) =
+            extract_sublease_replay_bindings(&sublease_event.payload).map_err(|e| {
+                format!("invalid SubleaseIssued replay bindings for lease '{current_lease}': {e}")
+            })?;
+
+        depth = depth
+            .checked_add(1)
+            .ok_or_else(|| "delegation depth overflow".to_string())?;
+        current_lease = next_parent;
+    }
+
+    Err(format!(
+        "delegation lineage traversal exceeded hard step cap \
+         {MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS}"
+    ))
 }
 
 /// Replay-critical fields persisted for `IngestReviewReceipt` idempotency.
@@ -14608,7 +14687,8 @@ impl PrivilegedDispatcher {
         let Some(gate_orchestrator) = &self.gate_orchestrator else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "gate orchestrator not configured",
+                "gate orchestrator not configured; \
+                 deny_trace={\"reason_code\":\"missing_gate_orchestrator\",\"path\":\"delegate_sublease\"}",
             ));
         };
 
@@ -14913,7 +14993,56 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // ---- Phase 2d: Delegation narrowing and lineage binding checks ----
+        // ---- Phase 2d: Deterministic delegation depth + budget checks ----
+        let (parent_depth, depth_eval_ticks) = match compute_sublease_parent_depth_and_ticks(
+            self.event_emitter.as_ref(),
+            &request.parent_lease_id,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("sublease delegation denied: {deny_class} ({error})"),
+                ));
+            },
+        };
+
+        let Some(requested_depth) = parent_depth.checked_add(1) else {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (delegation depth overflow from parent_depth={parent_depth})"
+                ),
+            ));
+        };
+
+        if requested_depth > MAX_SUBLEASE_DELEGATION_DEPTH {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (requested_depth={requested_depth}, max_depth={MAX_SUBLEASE_DELEGATION_DEPTH})"
+                ),
+            ));
+        }
+
+        if depth_eval_ticks > SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (delegation_satisfiability_budget_ticks exhausted: ticks_used={depth_eval_ticks}, \
+                     budget_ticks={SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS})"
+                ),
+            ));
+        }
+
+        // ---- Phase 2e: Delegation narrowing and lineage binding checks ----
         let expiry_millis = request.requested_expiry_ns / 1_000_000;
 
         // Strict-subset narrowing is REQUIRED: equality/exceeding parent
@@ -14963,7 +15092,8 @@ impl PrivilegedDispatcher {
             let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    "PCAC authority gate not wired for DelegateSublease (fail-closed)",
+                    "PCAC authority gate not wired for DelegateSublease (fail-closed); \
+                     deny_trace={\"reason_code\":\"missing_pcac_lifecycle_gate\",\"path\":\"delegate_sublease\"}",
                 ));
             };
 
@@ -15115,6 +15245,18 @@ impl PrivilegedDispatcher {
         // nanosecond values through would cause temporal comparison mismatches
         // against parent lease bounds (which are in milliseconds).
         let issued_at_millis = timestamp_ns / 1_000_000;
+        let parent_issued_at_ms = parent_lease.issued_at;
+        if expiry_millis <= parent_issued_at_ms {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (vacuous delegation window: requested_expiry_ms={expiry_millis}, \
+                     parent_issued_at_ms={parent_issued_at_ms})"
+                ),
+            ));
+        }
         let sublease = match gate_orchestrator.issue_delegated_sublease(
             &parent_lease,
             &request.sublease_id,
@@ -26754,6 +26896,35 @@ mod tests {
             (dispatcher, ctx, parent_lease)
         }
 
+        fn seed_sublease_lineage(
+            dispatcher: &PrivilegedDispatcher,
+            leaf_lease_id: &str,
+            depth: u32,
+            actor_id: &str,
+        ) {
+            let mut current = leaf_lease_id.to_string();
+            for hop in 0..depth {
+                let next_parent = format!("{leaf_lease_id}-ancestor-{hop}");
+                let payload = serde_json::json!({
+                    "parent_lease_id": next_parent,
+                    "identity_proof_hash": hex::encode([0xA5; 32]),
+                });
+                let payload_bytes =
+                    serde_json::to_vec(&payload).expect("lineage payload serialization");
+                dispatcher
+                    .event_emitter()
+                    .emit_session_event(
+                        &current,
+                        "SubleaseIssued",
+                        &payload_bytes,
+                        actor_id,
+                        1_700_000_000 + u64::from(hop),
+                    )
+                    .expect("lineage event emission");
+                current = format!("{leaf_lease_id}-ancestor-{hop}");
+            }
+        }
+
         #[test]
         fn test_delegate_sublease_valid_succeeds() {
             let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
@@ -26867,6 +27038,131 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error for expiry overflow, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_depth_overflow_rejected() {
+            let parent_lease_id = "parent-depth-overflow";
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                parent_lease_id,
+                "W-DS-DEPTH-OVERFLOW",
+                "gate-quality",
+                "executor-001",
+            );
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            seed_sublease_lineage(
+                &dispatcher,
+                parent_lease_id,
+                MAX_SUBLEASE_DELEGATION_DEPTH,
+                &actor_id,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-depth-overflow".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-depth-overflow".to_string(),
+                identity_proof_hash: vec![0x77; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("requested_depth="),
+                        "depth overflow denial must include requested_depth, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("max_depth="),
+                        "depth overflow denial must include max_depth, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected depth overflow denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_satisfiability_budget_exhaustion_rejected() {
+            let parent_lease_id = "parent-budget-exhaust";
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                parent_lease_id,
+                "W-DS-BUDGET-EXHAUST",
+                "gate-quality",
+                "executor-001",
+            );
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            seed_sublease_lineage(
+                &dispatcher,
+                parent_lease_id,
+                MAX_SUBLEASE_DELEGATION_DEPTH - 1,
+                &actor_id,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-budget-exhaust".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-budget-exhaust".to_string(),
+                identity_proof_hash: vec![0x88; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("delegation_satisfiability_budget_ticks exhausted"),
+                        "budget exhaustion denial must be explicit, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected budget exhaustion denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_vacuous_window_rejected() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-vacuous-window",
+                "W-DS-VACUOUS",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-vacuous-window".to_string(),
+                delegatee_actor_id: "child-vacuous-window".to_string(),
+                requested_expiry_ns: 1, // deterministically <= issued_at at runtime
+                sublease_id: "sublease-vacuous-window".to_string(),
+                identity_proof_hash: vec![0x91; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("vacuous delegation window"),
+                        "vacuous window must be denied explicitly, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected vacuous-window denial, got {other:?}"),
             }
         }
 
