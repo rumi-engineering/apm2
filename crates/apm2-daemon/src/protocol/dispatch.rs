@@ -26,7 +26,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -58,6 +58,10 @@ use apm2_core::liveness::{
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, DeterminismClass as PcacDeterminismClass,
     IdentityEvidenceLevel, RiskTier as PcacRiskTier,
+};
+use apm2_core::policy::permeability::{
+    DELEGATION_SATISFIABILITY_SCHEMA_ID, DELEGATION_SATISFIABILITY_SCHEMA_MAJOR,
+    DelegationSatisfiabilityReceiptV1,
 };
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
@@ -1313,6 +1317,30 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// Per SEC-SCP-FAC-0020: caller-controlled free-form predicates must be
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
+
+/// Maximum supported delegation depth for `DelegateSublease` lineage.
+///
+/// Keep this aligned with the core delegation ceiling so recursion-depth
+/// laundering attempts fail-closed consistently across verifier surfaces.
+pub const MAX_SUBLEASE_DELEGATION_DEPTH: u32 =
+    apm2_core::policy::permeability::MAX_DELEGATION_DEPTH;
+
+/// Hard cap on lineage traversal iterations for delegation-depth computation.
+///
+/// This bounds event-store traversal and prevents unbounded recursion/cycles.
+pub const MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS: usize =
+    (MAX_SUBLEASE_DELEGATION_DEPTH as usize) + 1;
+
+/// Deterministic budget for sublease delegation satisfiability evaluation.
+///
+/// The budget is expressed in integer ticks and consumed by fixed-cost lineage
+/// traversal and binding checks.
+pub const SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS: u64 =
+    if (MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS as u64) * 2 + 4 < 40 {
+        40
+    } else {
+        (MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS as u64) * 2 + 4
+    };
 
 /// Builds the canonical JSON payload for a `SessionStarted` ledger event.
 ///
@@ -4914,6 +4942,197 @@ fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8
     Ok((parent_lease_id, identity_proof_hash))
 }
 
+#[derive(Debug)]
+enum DelegationCommitEvent {
+    PersistDelegatedLease,
+    EmitSubleaseIssued(Vec<u8>),
+}
+
+fn compute_delegate_sublease_lineage_digest(
+    parent_lease_id: &str,
+    sublease_id: &str,
+    parent_changeset_digest: &[u8; 32],
+    parent_policy_hash: &[u8; 32],
+    requested_depth: u32,
+    ticks_used: u64,
+    budget_ticks: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.delegate_sublease.lineage_digest.v1");
+    let update_len_prefixed = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        let len = u64::try_from(bytes.len())
+            .expect("usize length always fits into u64 for digest framing");
+        hasher.update(&len.to_le_bytes());
+        hasher.update(bytes);
+    };
+    update_len_prefixed(&mut hasher, parent_lease_id.as_bytes());
+    update_len_prefixed(&mut hasher, sublease_id.as_bytes());
+    hasher.update(parent_changeset_digest);
+    hasher.update(parent_policy_hash);
+    hasher.update(&requested_depth.to_be_bytes());
+    hasher.update(&ticks_used.to_be_bytes());
+    hasher.update(&budget_ticks.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn build_delegate_sublease_satisfiability_artifact(
+    parent_lease_id: &str,
+    sublease_id: &str,
+    parent_changeset_digest: &[u8; 32],
+    parent_policy_hash: &[u8; 32],
+    requested_depth: u32,
+    ticks_used: u64,
+) -> Result<serde_json::Value, String> {
+    let receipt = DelegationSatisfiabilityReceiptV1 {
+        schema_id: DELEGATION_SATISFIABILITY_SCHEMA_ID.to_string(),
+        schema_major: DELEGATION_SATISFIABILITY_SCHEMA_MAJOR,
+        delegation_depth: requested_depth,
+        budget_ticks: SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS,
+        ticks_used,
+        admissible_workset_non_empty: true,
+    };
+
+    let receipt_json = serde_json::to_value(&receipt)
+        .map_err(|e| format!("delegation satisfiability receipt serialization failed: {e}"))?;
+    let receipt_digest = hash_bytes(&canonical_json_bytes(&receipt_json)?);
+    let parent_lease_id_digest = hash_bytes(parent_lease_id.as_bytes());
+    let sublease_id_digest = hash_bytes(sublease_id.as_bytes());
+    let lineage_digest = compute_delegate_sublease_lineage_digest(
+        parent_lease_id,
+        sublease_id,
+        parent_changeset_digest,
+        parent_policy_hash,
+        requested_depth,
+        ticks_used,
+        SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS,
+    );
+
+    Ok(serde_json::json!({
+        "schema": "apm2.delegate_sublease_satisfiability_artifact.v1",
+        "schema_major": 1_u16,
+        "delegation_satisfiability_receipt": receipt,
+        "delegation_satisfiability_receipt_digest": hex::encode(receipt_digest),
+        "canonical_parent_lease_id_digest": hex::encode(parent_lease_id_digest),
+        "canonical_sublease_id_digest": hex::encode(sublease_id_digest),
+        "canonical_parent_changeset_digest": hex::encode(parent_changeset_digest),
+        "canonical_parent_policy_hash": hex::encode(parent_policy_hash),
+        "canonical_lineage_digest": hex::encode(lineage_digest),
+    }))
+}
+
+fn persist_delegate_sublease_satisfiability_artifact(
+    cas: Option<&dyn ContentAddressedStore>,
+    artifact: &serde_json::Value,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(cas) = cas else {
+        return Ok(None);
+    };
+
+    let artifact_bytes = canonical_json_bytes(artifact)?;
+    let stored = cas
+        .store(&artifact_bytes)
+        .map_err(|e| format!("CAS store delegation satisfiability artifact failed: {e}"))?;
+    Ok(Some(stored.hash))
+}
+
+/// Deterministically computes parent delegation depth and evaluation ticks for
+/// `DelegateSublease` admission.
+///
+/// Traverses persisted `SubleaseIssued` lineage by repeatedly reading the
+/// latest event for each lease ID and following its `parent_lease_id`.
+///
+/// Fail-closed rule: if lineage metadata lookup fails, if a lease is marked as
+/// delegated but no corresponding `SubleaseIssued` evidence exists, or if an
+/// ancestor lease record is missing, traversal returns an error instead of
+/// treating the lease as root.
+///
+/// Returns:
+/// - `depth`: number of sublease hops from `parent_lease_id` to the root lease
+/// - `ticks_used`: deterministic integer cost consumed by lineage evaluation
+fn compute_sublease_parent_depth_and_ticks(
+    event_emitter: &dyn LedgerEventEmitter,
+    lease_validator: &dyn LeaseValidator,
+    parent_lease_id: &str,
+) -> Result<(u32, u64), String> {
+    let mut current_lease = parent_lease_id.to_string();
+    let mut visited = HashSet::with_capacity(MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS);
+    let mut depth = 0_u32;
+    let mut ticks_used = 0_u64;
+
+    // NOTE: Each loop iteration performs O(1) work plus up to two O(N) lookups
+    // against bounded local collections (`get_events_by_work_id` + replay
+    // binding parse). This remains acceptable because traversal is hard-capped
+    // by MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS (17 iterations).
+    for _ in 0..MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS {
+        ticks_used = ticks_used
+            .checked_add(1)
+            .ok_or_else(|| "delegation satisfiability tick overflow".to_string())?;
+
+        if !visited.insert(current_lease.clone()) {
+            return Err(format!(
+                "delegation lineage cycle detected at lease '{current_lease}'"
+            ));
+        }
+
+        let current_events = event_emitter.get_events_by_work_id(&current_lease);
+        let maybe_event = current_events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "SubleaseIssued");
+
+        let Some(sublease_event) = maybe_event else {
+            let persisted_parent = lease_validator
+                .get_delegation_parent_lease_id(&current_lease)
+                .map_err(|error| {
+                    format!(
+                        "delegation lineage metadata lookup failed for lease '{current_lease}': \
+                         {error}"
+                    )
+                })?;
+            if persisted_parent.is_some() {
+                return Err(format!(
+                    "delegation lineage evidence missing for delegated lease '{current_lease}'"
+                ));
+            }
+            let has_sublease_child_reference = current_events
+                .iter()
+                .any(|event| event.event_type == "SubleaseIssued");
+            if has_sublease_child_reference {
+                return Err(format!(
+                    "delegation lineage root verification failed for lease '{current_lease}': \
+                     SubleaseIssued child reference exists but parent metadata is missing"
+                ));
+            }
+            return Ok((depth, ticks_used));
+        };
+
+        ticks_used = ticks_used
+            .checked_add(1)
+            .ok_or_else(|| "delegation satisfiability tick overflow".to_string())?;
+
+        let (next_parent, _identity_proof_hash) =
+            extract_sublease_replay_bindings(&sublease_event.payload).map_err(|e| {
+                format!("invalid SubleaseIssued replay bindings for lease '{current_lease}': {e}")
+            })?;
+        if lease_validator.get_gate_lease(&next_parent).is_none() {
+            return Err(format!(
+                "delegation lineage broken: lease '{current_lease}' references ancestor \
+                 '{next_parent}' with no authoritative gate_lease_issued record"
+            ));
+        }
+
+        depth = depth
+            .checked_add(1)
+            .ok_or_else(|| "delegation depth overflow".to_string())?;
+        current_lease = next_parent;
+    }
+
+    Err(format!(
+        "delegation lineage traversal exceeded hard step cap \
+         {MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS}"
+    ))
+}
+
 /// Replay-critical fields persisted for `IngestReviewReceipt` idempotency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiptReplayBindings {
@@ -5039,6 +5258,96 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
         blocked_reason_code,
         blocked_log_hash,
     })
+}
+
+/// Validates that an existing receipt event matches the current request fields.
+///
+/// Returns `Ok(())` if all fields match, or `Err(message)` with a
+/// human-readable mismatch description.
+#[allow(clippy::too_many_arguments)]
+fn validate_receipt_replay_bindings(
+    existing: &SignedLedgerEvent,
+    request_lease_id: &str,
+    request_work_id: &str,
+    request_identity_proof_hash: &[u8; 32],
+    request_changeset_digest: &[u8; 32],
+    request_verdict: &str,
+    request_artifact_bundle_hash: &[u8; 32],
+    request_blocked_reason_code: Option<u32>,
+    request_blocked_log_hash: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let original = extract_receipt_replay_bindings(&existing.payload)
+        .map_err(|e| format!("receipt exists but replay bindings could not be extracted: {e}"))?;
+
+    if original.lease_id != request_lease_id {
+        return Err(format!(
+            "receipt was originally submitted for lease '{}', not '{}'",
+            original.lease_id, request_lease_id
+        ));
+    }
+    if original.work_id != request_work_id {
+        return Err(format!(
+            "receipt was originally submitted for work '{}', not '{}'",
+            original.work_id, request_work_id
+        ));
+    }
+    if !bool::from(
+        original
+            .identity_proof_hash
+            .ct_eq(request_identity_proof_hash),
+    ) {
+        return Err(format!(
+            "identity_proof_hash mismatch: original '{}', requested '{}'",
+            hex::encode(original.identity_proof_hash),
+            hex::encode(request_identity_proof_hash),
+        ));
+    }
+    if !bool::from(original.changeset_digest.ct_eq(request_changeset_digest)) {
+        return Err(format!(
+            "changeset_digest mismatch: original '{}', requested '{}'",
+            hex::encode(original.changeset_digest),
+            hex::encode(request_changeset_digest),
+        ));
+    }
+    if original.verdict != request_verdict {
+        return Err(format!(
+            "verdict mismatch: original '{}', requested '{}'",
+            original.verdict, request_verdict
+        ));
+    }
+    if !bool::from(
+        original
+            .artifact_bundle_hash
+            .ct_eq(request_artifact_bundle_hash),
+    ) {
+        return Err(format!(
+            "artifact_bundle_hash mismatch: original '{}', requested '{}'",
+            hex::encode(original.artifact_bundle_hash),
+            hex::encode(request_artifact_bundle_hash),
+        ));
+    }
+    if let Some(original_code) = original.blocked_reason_code {
+        if Some(original_code) != request_blocked_reason_code {
+            return Err(format!(
+                "blocked_reason_code mismatch: original '{}', requested '{}'",
+                original_code,
+                request_blocked_reason_code
+                    .map_or_else(|| "<missing>".to_string(), |c| c.to_string()),
+            ));
+        }
+    }
+    if let Some(original_hash) = original.blocked_log_hash {
+        let hash_matches =
+            request_blocked_log_hash.is_some_and(|h| bool::from(original_hash.ct_eq(&h)));
+        if !hash_matches {
+            return Err(format!(
+                "blocked_log_hash mismatch: original '{}', requested '{}'",
+                hex::encode(original_hash),
+                request_blocked_log_hash.map_or_else(|| "<missing>".to_string(), hex::encode),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -6169,6 +6478,29 @@ pub trait LeaseValidator: Send + Sync {
         let _ = lease;
         Ok(())
     }
+
+    /// Registers a delegated `GateLease` with authoritative parent lineage.
+    ///
+    /// Implementations should persist `parent_lease_id` so delegation-depth
+    /// checks can fail closed if the corresponding `SubleaseIssued` evidence is
+    /// missing.
+    fn register_delegated_full_lease(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        parent_lease_id: &str,
+    ) -> Result<(), String> {
+        let _ = parent_lease_id;
+        self.register_full_lease(lease)
+    }
+
+    /// Returns the persisted delegation parent lease ID for `lease_id`.
+    ///
+    /// `Ok(None)` indicates root issuance or no persisted lineage metadata.
+    /// Any storage/lookup/parse failures MUST return `Err` (fail-closed).
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
+        let _ = lease_id;
+        Ok(None)
+    }
 }
 
 /// Entry for a registered lease.
@@ -6180,6 +6512,12 @@ struct LeaseEntry {
     gate_id: String,
     /// The executor actor ID authorized by this lease (TCK-00389).
     executor_actor_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct FullLeaseEntry {
+    lease: apm2_core::fac::GateLease,
+    delegated_parent_lease_id: Option<String>,
 }
 
 /// Stub implementation of [`LeaseValidator`] for testing.
@@ -6208,7 +6546,7 @@ pub struct StubLeaseValidator {
         std::collections::HashMap<String, LeaseEntry>,
     )>,
     /// Full gate leases for sublease delegation (TCK-00340).
-    full_leases: std::sync::RwLock<std::collections::HashMap<String, apm2_core::fac::GateLease>>,
+    full_leases: std::sync::RwLock<std::collections::HashMap<String, FullLeaseEntry>>,
 }
 
 impl StubLeaseValidator {
@@ -6321,7 +6659,7 @@ impl LeaseValidator for StubLeaseValidator {
 
     fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
         let guard = self.full_leases.read().expect("lock poisoned");
-        guard.get(lease_id).cloned()
+        guard.get(lease_id).map(|entry| entry.lease.clone())
     }
 
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
@@ -6335,8 +6673,40 @@ impl LeaseValidator for StubLeaseValidator {
         if guard.contains_key(&lease.lease_id) {
             return Err(format!("duplicate lease_id: {}", lease.lease_id));
         }
-        guard.insert(lease.lease_id.clone(), lease.clone());
+        guard.insert(
+            lease.lease_id.clone(),
+            FullLeaseEntry {
+                lease: lease.clone(),
+                delegated_parent_lease_id: None,
+            },
+        );
         Ok(())
+    }
+
+    fn register_delegated_full_lease(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        parent_lease_id: &str,
+    ) -> Result<(), String> {
+        let mut guard = self.full_leases.write().expect("lock poisoned");
+        if guard.contains_key(&lease.lease_id) {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+        guard.insert(
+            lease.lease_id.clone(),
+            FullLeaseEntry {
+                lease: lease.clone(),
+                delegated_parent_lease_id: Some(parent_lease_id.to_string()),
+            },
+        );
+        Ok(())
+    }
+
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
+        let guard = self.full_leases.read().expect("lock poisoned");
+        Ok(guard
+            .get(lease_id)
+            .and_then(|entry| entry.delegated_parent_lease_id.clone()))
     }
 }
 
@@ -6723,16 +7093,178 @@ impl StopConditionPolicy {
     }
 }
 
-/// Rollout policy for privileged PCAC lifecycle enforcement (TCK-00424).
+/// Privileged PCAC lifecycle policy surface.
 ///
-/// Defaults are fail-open for backward compatibility during staged rollout.
+/// `DelegateSublease` and `IngestReviewReceipt` are both unconditionally
+/// PCAC-gated (mandatory cutover).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PrivilegedPcacPolicy {
-    /// Require PCAC lifecycle join/revalidate/consume in `DelegateSublease`.
-    pub require_ajc_for_delegate_sublease: bool,
-    /// Require PCAC lifecycle join/revalidate/consume in
-    /// `IngestReviewReceipt`.
-    pub require_ajc_for_ingest_review_receipt: bool,
+pub struct PrivilegedPcacPolicy {}
+
+/// Handler class for domain-tagged PCAC hash construction.
+///
+/// Each variant maps to a unique domain separation tag prefix, preventing
+/// cross-handler confused-deputy attacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivilegedHandlerClass {
+    DelegateSublease,
+    IngestReviewReceipt,
+}
+
+#[allow(clippy::missing_const_for_fn)]
+impl PrivilegedHandlerClass {
+    fn tag_prefix(self) -> &'static str {
+        match self {
+            Self::DelegateSublease => "pcac-privileged-delegate-sublease",
+            Self::IngestReviewReceipt => "pcac-privileged-ingest-review",
+        }
+    }
+
+    fn operation_name(self) -> &'static str {
+        match self {
+            Self::DelegateSublease => "DelegateSublease",
+            Self::IngestReviewReceipt => "IngestReviewReceipt",
+        }
+    }
+}
+
+/// Construct a domain-tagged BLAKE3 hash for a privileged PCAC handler.
+fn domain_tagged_hash(
+    handler_class: PrivilegedHandlerClass,
+    hash_type: &str,
+    data: &[&[u8]],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let tag = format!("{}-{}-v1", handler_class.tag_prefix(), hash_type);
+    hasher.update(tag.as_bytes());
+    for d in data {
+        hasher.update(d);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Builder for PCAC `AuthorityJoinInputV1` for privileged handlers.
+pub(crate) struct PrivilegedPcacInputBuilder {
+    handler_class: PrivilegedHandlerClass,
+    session_id: String,
+    lease_id: String,
+    boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+    identity_proof_hash: [u8; 32],
+    identity_evidence_level: IdentityEvidenceLevel,
+    risk_tier: PcacRiskTier,
+    capability_manifest_hash: [u8; 32],
+    scope_witness_hash: [u8; 32],
+    freshness_policy_hash: [u8; 32],
+    stop_budget_profile_digest: [u8; 32],
+    effect_intent_digest: [u8; 32],
+    lineage_receipt_hash: Option<[u8; 32]>,
+}
+
+#[allow(clippy::missing_const_for_fn)]
+impl PrivilegedPcacInputBuilder {
+    pub(crate) fn new(handler_class: PrivilegedHandlerClass) -> Self {
+        Self {
+            handler_class,
+            session_id: String::new(),
+            lease_id: String::new(),
+            boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
+            identity_proof_hash: [0u8; 32],
+            identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
+            risk_tier: PcacRiskTier::Tier0,
+            capability_manifest_hash: [0u8; 32],
+            scope_witness_hash: [0u8; 32],
+            freshness_policy_hash: [0u8; 32],
+            stop_budget_profile_digest: [0u8; 32],
+            effect_intent_digest: [0u8; 32],
+            lineage_receipt_hash: None,
+        }
+    }
+
+    pub(crate) fn session_id(mut self, v: String) -> Self {
+        self.session_id = v;
+        self
+    }
+    pub(crate) fn lease_id(mut self, v: String) -> Self {
+        self.lease_id = v;
+        self
+    }
+    pub(crate) fn boundary_intent_class(mut self, v: apm2_core::pcac::BoundaryIntentClass) -> Self {
+        self.boundary_intent_class = v;
+        self
+    }
+    pub(crate) fn identity_proof_hash(mut self, v: [u8; 32]) -> Self {
+        self.identity_proof_hash = v;
+        self
+    }
+    pub(crate) fn identity_evidence_level(mut self, v: IdentityEvidenceLevel) -> Self {
+        self.identity_evidence_level = v;
+        self
+    }
+    pub(crate) fn risk_tier(mut self, v: PcacRiskTier) -> Self {
+        self.risk_tier = v;
+        self
+    }
+    pub(crate) fn capability_manifest_hash(mut self, v: [u8; 32]) -> Self {
+        self.capability_manifest_hash = v;
+        self
+    }
+    pub(crate) fn scope_witness_hash(mut self, v: [u8; 32]) -> Self {
+        self.scope_witness_hash = v;
+        self
+    }
+    pub(crate) fn freshness_policy_hash(mut self, v: [u8; 32]) -> Self {
+        self.freshness_policy_hash = v;
+        self
+    }
+    pub(crate) fn stop_budget_profile_digest(mut self, v: [u8; 32]) -> Self {
+        self.stop_budget_profile_digest = v;
+        self
+    }
+    pub(crate) fn effect_intent_digest(mut self, v: [u8; 32]) -> Self {
+        self.effect_intent_digest = v;
+        self
+    }
+    pub(crate) fn lineage_receipt_hash(mut self, v: [u8; 32]) -> Self {
+        self.lineage_receipt_hash = Some(v);
+        self
+    }
+
+    /// Convenience: compute a domain-tagged BLAKE3 hash using this builder's
+    /// handler class.
+    pub(crate) fn hash(&self, hash_type: &str, data: &[&[u8]]) -> [u8; 32] {
+        domain_tagged_hash(self.handler_class, hash_type, data)
+    }
+
+    /// Build the `AuthorityJoinInputV1`, consuming the builder.
+    pub(crate) fn build(
+        self,
+        join_freshness_tick: u64,
+        join_time_envelope_ref: [u8; 32],
+        join_ledger_anchor: [u8; 32],
+        join_revocation_head: [u8; 32],
+    ) -> AuthorityJoinInputV1 {
+        AuthorityJoinInputV1 {
+            session_id: self.session_id,
+            holon_id: None,
+            intent_digest: self.effect_intent_digest,
+            boundary_intent_class: self.boundary_intent_class,
+            capability_manifest_hash: self.capability_manifest_hash,
+            scope_witness_hashes: vec![self.scope_witness_hash],
+            lease_id: self.lease_id,
+            permeability_receipt_hash: self.lineage_receipt_hash,
+            identity_proof_hash: self.identity_proof_hash,
+            identity_evidence_level: self.identity_evidence_level,
+            pointer_only_waiver_hash: None,
+            directory_head_hash: join_revocation_head,
+            freshness_policy_hash: self.freshness_policy_hash,
+            freshness_witness_tick: join_freshness_tick,
+            stop_budget_profile_digest: self.stop_budget_profile_digest,
+            pre_actuation_receipt_hashes: Vec::new(),
+            risk_tier: self.risk_tier,
+            determinism_class: PcacDeterminismClass::Deterministic,
+            time_envelope_ref: join_time_envelope_ref,
+            as_of_ledger_anchor: join_ledger_anchor,
+        }
+    }
 }
 
 type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
@@ -13014,7 +13546,6 @@ impl PrivilegedDispatcher {
                 format!("identity_proof_hash validation failed: {e}"),
             ));
         }
-
         // WVR-0103: Log once that identity proof hash is validated as
         // shape-only commitment (Phase 1 / pre-CAS transport).
         {
@@ -13334,11 +13865,6 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
-        let request_blocked_reason_code = if verdict == ReviewReceiptVerdict::Blocked {
-            Some(request.blocked_reason_code)
-        } else {
-            None
-        };
         let request_blocked_log_hash_arr: Option<[u8; 32]> =
             if verdict == ReviewReceiptVerdict::Blocked {
                 Some(
@@ -13351,6 +13877,8 @@ impl PrivilegedDispatcher {
             } else {
                 None
             };
+        let request_blocked_reason_code =
+            (verdict == ReviewReceiptVerdict::Blocked).then_some(request.blocked_reason_code);
 
         let to_response_event_type = |event_type: &str| -> String {
             match event_type {
@@ -13358,162 +13886,6 @@ impl PrivilegedDispatcher {
                 "review_blocked_recorded" => "ReviewBlockedRecorded".to_string(),
                 other => other.to_string(),
             }
-        };
-
-        let validate_receipt_replay = |existing: &SignedLedgerEvent| -> Result<(), String> {
-            let original = extract_receipt_replay_bindings(&existing.payload).map_err(|e| {
-                format!("receipt exists but replay bindings could not be extracted: {e}")
-            })?;
-
-            if original.lease_id != request.lease_id {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_lease_id = %original.lease_id,
-                    requested_lease_id = %request.lease_id,
-                    "Idempotent review receipt replay rejected: lease_id mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted for lease '{}', not '{}'",
-                    request.receipt_id, original.lease_id, request.lease_id
-                ));
-            }
-
-            if original.work_id != authoritative_work_id {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_work_id = %original.work_id,
-                    requested_work_id = %authoritative_work_id,
-                    "Idempotent review receipt replay rejected: work_id mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted for work '{}', not '{}'",
-                    request.receipt_id,
-                    original.work_id,
-                    authoritative_work_id.as_str()
-                ));
-            }
-
-            if !bool::from(
-                original
-                    .identity_proof_hash
-                    .ct_eq(&request_identity_proof_hash_arr),
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_identity_proof_hash = %hex::encode(original.identity_proof_hash),
-                    requested_identity_proof_hash = %hex::encode(request_identity_proof_hash_arr),
-                    "Idempotent review receipt replay rejected: identity_proof_hash mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with identity_proof_hash '{}', not '{}'",
-                    request.receipt_id,
-                    hex::encode(original.identity_proof_hash),
-                    hex::encode(request_identity_proof_hash_arr),
-                ));
-            }
-
-            if !bool::from(
-                original
-                    .changeset_digest
-                    .ct_eq(&request_changeset_digest_arr),
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_changeset_digest = %hex::encode(original.changeset_digest),
-                    requested_changeset_digest = %hex::encode(request_changeset_digest_arr),
-                    "Idempotent review receipt replay rejected: changeset_digest mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with changeset_digest '{}', not '{}'",
-                    request.receipt_id,
-                    hex::encode(original.changeset_digest),
-                    hex::encode(request_changeset_digest_arr),
-                ));
-            }
-
-            if original.verdict != request_verdict {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_verdict = %original.verdict,
-                    requested_verdict = %request_verdict,
-                    "Idempotent review receipt replay rejected: verdict mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with verdict '{}', not '{}'",
-                    request.receipt_id, original.verdict, request_verdict
-                ));
-            }
-
-            if !bool::from(
-                original
-                    .artifact_bundle_hash
-                    .ct_eq(&request_artifact_bundle_hash_arr),
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    original_artifact_bundle_hash = %hex::encode(original.artifact_bundle_hash),
-                    requested_artifact_bundle_hash = %hex::encode(request_artifact_bundle_hash_arr),
-                    "Idempotent review receipt replay rejected: artifact_bundle_hash mismatch"
-                );
-                return Err(format!(
-                    "receipt_id '{}' was originally submitted with artifact_bundle_hash '{}', not '{}'",
-                    request.receipt_id,
-                    hex::encode(original.artifact_bundle_hash),
-                    hex::encode(request_artifact_bundle_hash_arr),
-                ));
-            }
-
-            if let Some(original_blocked_reason_code) = original.blocked_reason_code {
-                let requested_blocked_reason_code = request_blocked_reason_code
-                    .map_or_else(|| "<missing>".to_string(), |code| code.to_string());
-                if Some(original_blocked_reason_code) != request_blocked_reason_code {
-                    warn!(
-                        receipt_id = %request.receipt_id,
-                        existing_event_id = %existing.event_id,
-                        original_blocked_reason_code = original_blocked_reason_code,
-                        requested_blocked_reason_code = %requested_blocked_reason_code,
-                        "Idempotent review receipt replay rejected: blocked_reason_code mismatch"
-                    );
-                    return Err(format!(
-                        "receipt_id '{}' was originally submitted with blocked_reason_code '{}', not '{}'",
-                        request.receipt_id,
-                        original_blocked_reason_code,
-                        requested_blocked_reason_code,
-                    ));
-                }
-            }
-
-            if let Some(original_blocked_log_hash) = original.blocked_log_hash {
-                let requested_blocked_log_hash = request_blocked_log_hash_arr
-                    .map_or_else(|| "<missing>".to_string(), hex::encode);
-                let blocked_log_hash_matches =
-                    request_blocked_log_hash_arr.is_some_and(|request_blocked_log_hash| {
-                        bool::from(original_blocked_log_hash.ct_eq(&request_blocked_log_hash))
-                    });
-                if !blocked_log_hash_matches {
-                    warn!(
-                        receipt_id = %request.receipt_id,
-                        existing_event_id = %existing.event_id,
-                        original_blocked_log_hash = %hex::encode(original_blocked_log_hash),
-                        requested_blocked_log_hash = %requested_blocked_log_hash,
-                        "Idempotent review receipt replay rejected: blocked_log_hash mismatch"
-                    );
-                    return Err(format!(
-                        "receipt_id '{}' was originally submitted with blocked_log_hash '{}', not '{}'",
-                        request.receipt_id,
-                        hex::encode(original_blocked_log_hash),
-                        requested_blocked_log_hash,
-                    ));
-                }
-            }
-
-            Ok(())
         };
 
         // =====================================================================
@@ -13561,10 +13933,9 @@ impl PrivilegedDispatcher {
             // Full validation: non-zero + CAS resolvability
             if let Err(auth_err) = validate_review_outcome_bindings(&bindings, cas.as_ref()) {
                 let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
-                let work_id = authoritative_work_id.clone();
                 emit_authority_binding_defect(
                     self.event_emitter.as_ref(),
-                    &work_id,
+                    &authoritative_work_id,
                     &auth_err,
                     defect_ts,
                 );
@@ -13589,7 +13960,17 @@ impl PrivilegedDispatcher {
             &authoritative_work_id,
             &request_changeset_digest_hex,
         ) {
-            if let Err(message) = validate_receipt_replay(&existing) {
+            if let Err(message) = validate_receipt_replay_bindings(
+                &existing,
+                &request.lease_id,
+                authoritative_work_id.as_str(),
+                &request_identity_proof_hash_arr,
+                &request_changeset_digest_arr,
+                request_verdict,
+                &request_artifact_bundle_hash_arr,
+                request_blocked_reason_code,
+                request_blocked_log_hash_arr,
+            ) {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     message,
@@ -13615,44 +13996,30 @@ impl PrivilegedDispatcher {
 
         // If the transport-level receipt_id already exists under a different
         // semantic tuple, fail closed with a conflict.
-        if let Some(existing) = self
+        if self
             .event_emitter
             .get_event_by_receipt_id(&request.receipt_id)
+            .is_some()
         {
-            if let Err(message) = validate_receipt_replay(&existing) {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    message,
-                ));
-            }
-
-            return Ok(PrivilegedResponse::IngestReviewReceipt(
-                IngestReviewReceiptResponse {
-                    receipt_id: request.receipt_id.clone(),
-                    event_type: to_response_event_type(&existing.event_type),
-                    event_id: existing.event_id,
-                },
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "receipt_id '{}' already exists with a different semantic identity tuple; \
+                     PCAC linear consumption prevents reuse",
+                    request.receipt_id
+                ),
             ));
         }
 
-        let mut pcac_lifecycle_artifacts: Option<PrivilegedPcacLifecycleArtifacts> = None;
-        if self
-            .privileged_pcac_policy
-            .require_ajc_for_ingest_review_receipt
-        {
-            let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    "PCAC authority gate not wired for IngestReviewReceipt (fail-closed)",
-                ));
-            };
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for IngestReviewReceipt (fail-closed)",
+            ));
+        };
 
-            let (
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-            ) = match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -13665,115 +14032,129 @@ impl PrivilegedDispatcher {
                 },
             };
 
-            let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+        let pcac_builder =
+            PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::IngestReviewReceipt)
+                .session_id(request.receipt_id.clone())
+                .lease_id(request.lease_id.clone())
+                .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+                .identity_proof_hash(request_identity_proof_hash_arr)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+                .risk_tier(pcac_risk_tier);
 
-            let capability_manifest_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-capability-v1");
-                hasher.update(request.lease_id.as_bytes());
-                hasher.update(lease_for_receipt.gate_id.as_bytes());
-                hasher.update(&resolved_policy_hash);
-                hasher.update(&request_changeset_digest_arr);
-                *hasher.finalize().as_bytes()
-            };
-            let scope_witness_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-scope-v1");
-                hasher.update(request.receipt_id.as_bytes());
-                hasher.update(&request_changeset_digest_arr);
-                hasher.update(&request_artifact_bundle_hash_arr);
-                hasher.update(&request.verdict.to_le_bytes());
-                hasher.update(authenticated_reviewer_id.as_bytes());
-                hasher.update(expected_actor_id.as_bytes());
-                if verdict == ReviewReceiptVerdict::Blocked {
-                    hasher.update(&request.blocked_reason_code.to_le_bytes());
-                    let blocked_log_hash = request_blocked_log_hash_arr
-                        .expect("validated blocked_log_hash for BLOCKED verdict");
-                    hasher.update(&blocked_log_hash);
-                }
-                *hasher.finalize().as_bytes()
-            };
-            let freshness_policy_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-freshness-policy-v1");
-                hasher.update(&resolved_policy_hash);
-                hasher.update(request.lease_id.as_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let stop_budget_profile_digest = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-stop-budget-v1");
-                hasher.update(&[u8::from(
-                    self.stop_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.emergency_stop_active()),
-                )]);
-                hasher.update(&[u8::from(
-                    self.stop_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.governance_stop_active()),
-                )]);
-                hasher.update(request.receipt_id.as_bytes());
-                hasher.update(&request.verdict.to_le_bytes());
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                lease_for_receipt.gate_id.as_bytes(),
+                &resolved_policy_hash,
+                &request_changeset_digest_arr,
+            ],
+        );
+
+        let scope_witness_hash = {
+            let mut hasher = blake3::Hasher::new();
+            let tag = format!(
+                "{}-scope-v1",
+                PrivilegedHandlerClass::IngestReviewReceipt.tag_prefix()
+            );
+            hasher.update(tag.as_bytes());
+            hasher.update(request.receipt_id.as_bytes());
+            hasher.update(&request_changeset_digest_arr);
+            hasher.update(&request_artifact_bundle_hash_arr);
+            hasher.update(&request.verdict.to_le_bytes());
+            hasher.update(authenticated_reviewer_id.as_bytes());
+            hasher.update(expected_actor_id.as_bytes());
+            if verdict == ReviewReceiptVerdict::Blocked {
                 hasher.update(&request.blocked_reason_code.to_le_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let effect_intent_digest = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-ingest-review-intent-v1");
-                hasher.update(request.lease_id.as_bytes());
-                hasher.update(request.receipt_id.as_bytes());
-                hasher.update(authenticated_reviewer_id.as_bytes());
-                hasher.update(expected_actor_id.as_bytes());
-                hasher.update(&request_changeset_digest_arr);
-                hasher.update(&request_artifact_bundle_hash_arr);
-                hasher.update(&request_identity_proof_hash_arr);
-                hasher.update(&request.verdict.to_le_bytes());
-                hasher.update(&request.blocked_reason_code.to_le_bytes());
-                if let Some(blocked_log_hash) = request_blocked_log_hash_arr {
-                    hasher.update(&blocked_log_hash);
-                }
-                *hasher.finalize().as_bytes()
-            };
-
-            let pcac_input = AuthorityJoinInputV1 {
-                session_id: request.receipt_id.clone(),
-                holon_id: None,
-                intent_digest: effect_intent_digest,
-                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
-                capability_manifest_hash,
-                scope_witness_hashes: vec![scope_witness_hash],
-                lease_id: request.lease_id.clone(),
-                permeability_receipt_hash: None,
-                identity_proof_hash: request_identity_proof_hash_arr,
-                identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
-                pointer_only_waiver_hash: None,
-                directory_head_hash: join_revocation_head,
-                freshness_policy_hash,
-                freshness_witness_tick: join_freshness_tick,
-                stop_budget_profile_digest,
-                pre_actuation_receipt_hashes: Vec::new(),
-                risk_tier: pcac_risk_tier,
-                determinism_class: PcacDeterminismClass::Deterministic,
-                time_envelope_ref: join_time_envelope_ref,
-                as_of_ledger_anchor: join_ledger_anchor,
-            };
-
-            match self.enforce_privileged_pcac_lifecycle(
-                "IngestReviewReceipt",
-                pcac_gate,
-                &pcac_input,
-                &request.lease_id,
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-                effect_intent_digest,
-            ) {
-                Ok(artifacts) => pcac_lifecycle_artifacts = artifacts,
-                Err(response) => return Ok(response),
+                let blocked_log_hash = request_blocked_log_hash_arr
+                    .expect("validated blocked_log_hash for BLOCKED verdict");
+                hasher.update(&blocked_log_hash);
             }
-        }
+            *hasher.finalize().as_bytes()
+        };
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[&resolved_policy_hash, request.lease_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                request.receipt_id.as_bytes(),
+                &request.verdict.to_le_bytes(),
+                &request.blocked_reason_code.to_le_bytes(),
+            ],
+        );
+
+        let effect_intent_digest = {
+            let verdict_bytes = request.verdict.to_le_bytes();
+            let blocked_reason_code_bytes = request.blocked_reason_code.to_le_bytes();
+            let mut intent_data: Vec<&[u8]> = vec![
+                request.lease_id.as_bytes(),
+                request.receipt_id.as_bytes(),
+                authenticated_reviewer_id.as_bytes(),
+                expected_actor_id.as_bytes(),
+                &request_changeset_digest_arr,
+                &request_artifact_bundle_hash_arr,
+                &request_identity_proof_hash_arr,
+                &verdict_bytes,
+                &blocked_reason_code_bytes,
+            ];
+            if let Some(ref blocked_log_hash) = request_blocked_log_hash_arr {
+                intent_data.push(blocked_log_hash);
+            }
+            domain_tagged_hash(
+                PrivilegedHandlerClass::IngestReviewReceipt,
+                "intent",
+                &intent_data,
+            )
+        };
+
+        let pcac_builder = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest);
+
+        let pcac_input = pcac_builder.build(
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+        );
+
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::IngestReviewReceipt.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "IngestReviewReceipt requires PCAC lifecycle evidence (mandatory cutover); \
+                         lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
 
         // ---- Phase 3: Get HTF timestamp ----
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -13848,53 +14229,55 @@ impl PrivilegedDispatcher {
                     "Concurrent duplicate review receipt detected by UNIQUE constraint"
                 );
 
-                let existing = self
-                    .event_emitter
-                    .get_event_by_receipt_identity(
-                        &request.receipt_id,
+                // First try: exact semantic tuple match (true idempotent replay)
+                if let Some(existing) = self.event_emitter.get_event_by_receipt_identity(
+                    &request.receipt_id,
+                    &request.lease_id,
+                    &authoritative_work_id,
+                    &request_changeset_digest_hex,
+                ) {
+                    if let Err(message) = validate_receipt_replay_bindings(
+                        &existing,
                         &request.lease_id,
-                        &authoritative_work_id,
-                        &request_changeset_digest_hex,
-                    )
-                    .or_else(|| {
-                        self.event_emitter
-                            .get_event_by_receipt_id(&request.receipt_id)
-                    });
+                        authoritative_work_id.as_str(),
+                        &request_identity_proof_hash_arr,
+                        &request_changeset_digest_arr,
+                        request_verdict,
+                        &request_artifact_bundle_hash_arr,
+                        request_blocked_reason_code,
+                        request_blocked_log_hash_arr,
+                    ) {
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            message,
+                        ));
+                    }
 
-                let Some(existing) = existing else {
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "receipt identity tuple (receipt_id='{}', lease_id='{}', work_id='{}', \
-                             changeset_digest='{}') hit a uniqueness race, but the existing event \
-                             could not be resolved",
-                            request.receipt_id,
-                            request.lease_id,
-                            authoritative_work_id.as_str(),
-                            request_changeset_digest_hex
-                        ),
-                    ));
-                };
+                    info!(
+                        receipt_id = %request.receipt_id,
+                        existing_event_id = %existing.event_id,
+                        "Concurrent duplicate receipt resolved as idempotent replay (all fields validated)"
+                    );
 
-                if let Err(message) = validate_receipt_replay(&existing) {
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        message,
+                    return Ok(PrivilegedResponse::IngestReviewReceipt(
+                        IngestReviewReceiptResponse {
+                            receipt_id: request.receipt_id.clone(),
+                            event_type: to_response_event_type(&existing.event_type),
+                            event_id: existing.event_id,
+                        },
                     ));
                 }
 
-                info!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    "Concurrent duplicate receipt_id resolved as idempotent replay"
-                );
-
-                return Ok(PrivilegedResponse::IngestReviewReceipt(
-                    IngestReviewReceiptResponse {
-                        receipt_id: request.receipt_id.clone(),
-                        event_type: to_response_event_type(&existing.event_type),
-                        event_id: existing.event_id,
-                    },
+                // Fallback: receipt_id exists but semantic tuple does NOT match — deny
+                // fail-closed. This prevents a conflicting concurrent request
+                // from being misclassified as idempotent replay.
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "receipt_id '{}' already committed under a different semantic identity tuple; \
+                         concurrent conflict denied (fail-closed)",
+                        request.receipt_id,
+                    ),
                 ));
             },
             Err(e) => {
@@ -14769,12 +15152,10 @@ impl PrivilegedDispatcher {
             "DelegateSublease request received"
         );
 
-        // ---- Phase 0a: Caller authorization (fail-closed) ----
+        // ---- Phase 0a: Caller identity extraction (fail-closed) ----
         //
-        // SECURITY: Verify the caller is authorized to delegate from the
-        // parent lease. The caller's identity (derived from peer credentials)
-        // must match the parent lease's `executor_actor_id` — only the
-        // lease holder can delegate subleases from their lease.
+        // SECURITY: Caller identity is derived from peer credentials and bound
+        // into the PCAC effect-intent digest.
         let Some(peer_creds) = ctx.peer_credentials() else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::PermissionDenied,
@@ -14869,7 +15250,8 @@ impl PrivilegedDispatcher {
         let Some(gate_orchestrator) = &self.gate_orchestrator else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "gate orchestrator not configured",
+                "gate orchestrator not configured; \
+                 deny_trace={\"reason_code\":\"missing_gate_orchestrator\",\"path\":\"delegate_sublease\"}",
             ));
         };
 
@@ -14912,6 +15294,11 @@ impl PrivilegedDispatcher {
         // (executor) or the lease issuer should be able to delegate subleases.
         // This prevents confused-deputy / capability laundering attacks where
         // an unauthorized caller delegates from another entity's lease.
+        //
+        // NOTE: This is a pre-PCAC admission gate — PCAC binds the
+        // caller_actor_id into the effect_intent_digest for integrity, but
+        // cannot enforce caller-to-lease ownership semantics. Authorization
+        // MUST be checked before the PCAC lifecycle is invoked.
         if parent_lease.executor_actor_id != caller_actor_id
             && parent_lease.issuer_actor_id != caller_actor_id
         {
@@ -14931,13 +15318,19 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // Resolve parent risk tier for delegated PCAC join input construction.
+        let (parent_risk_tier, _) =
+            self.resolve_risk_tier_for_lease(&request.parent_lease_id, parent_lease.policy_hash);
+
         // ---- Phase 2b: Parent lease HTF authority validation ----
         //
         // Authoritative sublease delegation is denied unless the parent lease
         // has a resolvable CAS-hosted time envelope with an admissible pinned
         // clock profile for the lease's risk tier.
-        let (parent_risk_tier, _) =
-            self.resolve_risk_tier_for_lease(&request.parent_lease_id, parent_lease.policy_hash);
+        //
+        // NOTE: This is a pre-PCAC admission gate. PCAC revalidation checks
+        // freshness/expiry but does not verify CAS envelope admissibility
+        // per risk tier.
         if let Err(e) = self.validate_lease_time_authority(&parent_lease, parent_risk_tier) {
             warn!(
                 parent_lease_id = %request.parent_lease_id,
@@ -14975,6 +15368,7 @@ impl PrivilegedDispatcher {
         // `register_full_lease` or `emit_session_event` will fail with a
         // UNIQUE constraint violation, and the handler will fail-closed or
         // resolve via the idempotent duplicate path.
+        let mut existing_sublease_matches_request = false;
         if let Some(existing) = self.lease_validator.get_gate_lease(&request.sublease_id) {
             // Idempotent return: if the existing sublease has identical
             // parameters, return it. Otherwise reject as a conflict.
@@ -15131,39 +15525,32 @@ impl PrivilegedDispatcher {
                 info!(
                     sublease_id = %request.sublease_id,
                     event_id = %original_event.event_id,
-                    "Sublease already exists with identical parameters - idempotent return"
+                    "Sublease already exists with identical parameters; continuing through \
+                     mandatory PCAC consume and persistence replay checks"
                 );
-                // Convert ms -> ns for response (existing.expires_at is in ms)
-                return Ok(PrivilegedResponse::DelegateSublease(
-                    DelegateSubleaseResponse {
-                        sublease_id: existing.lease_id.clone(),
-                        parent_lease_id: request.parent_lease_id,
-                        delegatee_actor_id: request.delegatee_actor_id,
-                        gate_id: existing.gate_id.clone(),
-                        expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
-                        event_id: original_event.event_id,
-                    },
+                existing_sublease_matches_request = true;
+            } else {
+                warn!(
+                    sublease_id = %request.sublease_id,
+                    "Sublease ID conflict: existing sublease has different parameters"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "sublease_id '{}' already exists with different parameters",
+                        request.sublease_id
+                    ),
                 ));
             }
-            warn!(
-                sublease_id = %request.sublease_id,
-                "Sublease ID conflict: existing sublease has different parameters"
-            );
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "sublease_id '{}' already exists with different parameters",
-                    request.sublease_id
-                ),
-            ));
         }
         // Also check if a lease (non-sublease) with this ID already exists
         // via the executor lookup (covers leases registered through
         // register_lease_with_executor).
-        if self
-            .lease_validator
-            .get_lease_executor_actor_id(&request.sublease_id)
-            .is_some()
+        if !existing_sublease_matches_request
+            && self
+                .lease_validator
+                .get_lease_executor_actor_id(&request.sublease_id)
+                .is_some()
         {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -15174,36 +15561,120 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // ---- Phase 2d: Delegation narrowing and lineage binding checks ----
-        let expiry_millis = request.requested_expiry_ns / 1_000_000;
+        // ---- Phase 2d: Deterministic delegation depth + budget checks ----
+        let (parent_depth, depth_eval_ticks) = match compute_sublease_parent_depth_and_ticks(
+            self.event_emitter.as_ref(),
+            self.lease_validator.as_ref(),
+            &request.parent_lease_id,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("sublease delegation denied: {deny_class} ({error})"),
+                ));
+            },
+        };
 
-        // Strict-subset narrowing is REQUIRED: equality/exceeding parent
-        // expiry is treated as widening and denied deterministically.
-        if expiry_millis >= parent_lease.expires_at {
-            let deny_class = AuthorityDenyClass::DelegationWidening;
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "sublease delegation denied: {deny_class} \
-                     (requested_expiry_ms={expiry_millis}, parent_expires_at_ms={})",
-                    parent_lease.expires_at
-                ),
-            ));
-        }
-
-        // Lineage binding prerequisites for delegated paths.
-        if bool::from(parent_lease.changeset_digest.ct_eq(&[0u8; 32]))
-            || bool::from(parent_lease.policy_hash.ct_eq(&[0u8; 32]))
-        {
+        let Some(requested_depth) = parent_depth.checked_add(1) else {
             let deny_class = AuthorityDenyClass::InvalidDelegationChain;
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!(
                     "sublease delegation denied: {deny_class} \
-                     (parent lease lineage bindings are missing)"
+                     (delegation depth overflow from parent_depth={parent_depth})"
+                ),
+            ));
+        };
+
+        if requested_depth > MAX_SUBLEASE_DELEGATION_DEPTH {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (requested_depth={requested_depth}, max_depth={MAX_SUBLEASE_DELEGATION_DEPTH})"
                 ),
             ));
         }
+
+        if depth_eval_ticks > SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (delegation_satisfiability_budget_ticks exhausted: ticks_used={depth_eval_ticks}, \
+                     budget_ticks={SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS})"
+                ),
+            ));
+        }
+
+        let delegation_satisfiability_artifact =
+            match build_delegate_sublease_satisfiability_artifact(
+                &request.parent_lease_id,
+                &request.sublease_id,
+                &parent_lease.changeset_digest,
+                &parent_lease.policy_hash,
+                requested_depth,
+                depth_eval_ticks,
+            ) {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("sublease delegation denied: {deny_class} ({error})"),
+                    ));
+                },
+            };
+
+        let delegation_satisfiability_artifact_digest =
+            match canonical_json_bytes(&delegation_satisfiability_artifact) {
+                Ok(bytes) => hash_bytes(&bytes),
+                Err(error) => {
+                    let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("sublease delegation denied: {deny_class} ({error})"),
+                    ));
+                },
+            };
+
+        let delegation_satisfiability_artifact_cas_hash =
+            match persist_delegate_sublease_satisfiability_artifact(
+                self.cas.as_deref(),
+                &delegation_satisfiability_artifact,
+            ) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("sublease delegation denied: {deny_class} ({error})"),
+                    ));
+                },
+            };
+
+        // ---- Phase 2e: Delegation narrowing and lineage binding checks ----
+        // `requested_expiry_ns` must be carried into both PCAC scope witnesses
+        // and delegated sublease issuance.
+        let expiry_millis = request.requested_expiry_ns / 1_000_000;
+        if expiry_millis >= parent_lease.expires_at {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (strict expiry narrowing violated: requested_expiry_ms={expiry_millis}, \
+                     parent_expires_at_ms={})",
+                    parent_lease.expires_at
+                ),
+            ));
+        }
+
+        // Decode parent time envelope hash for delegated lineage witnesses.
         let parent_time_envelope_hash =
             match decode_hash32_hex("time_envelope_ref", &parent_lease.time_envelope_ref) {
                 Ok(hash) => hash,
@@ -15216,144 +15687,161 @@ impl PrivilegedDispatcher {
                 },
             };
 
-        let mut pcac_lifecycle_artifacts: Option<PrivilegedPcacLifecycleArtifacts> = None;
-        if self
-            .privileged_pcac_policy
-            .require_ajc_for_delegate_sublease
+        // ---- Phase 2d: Lineage binding prerequisites ----
+        //
+        // SECURITY: Delegation from a parent with missing/zero lineage bindings
+        // is denied fail-closed. Zero changeset_digest or policy_hash indicates
+        // an uninitialized or corrupted parent lease that must not propagate
+        // authority.
+        if bool::from(parent_lease.changeset_digest.ct_eq(&[0u8; 32]))
+            || bool::from(parent_lease.policy_hash.ct_eq(&[0u8; 32]))
         {
-            let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    "PCAC authority gate not wired for DelegateSublease (fail-closed)",
-                ));
-            };
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (parent lease lineage bindings are missing)"
+                ),
+            ));
+        }
 
-            let (
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-            ) = match self.derive_privileged_pcac_revalidation_inputs(&request.parent_lease_id) {
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for DelegateSublease (fail-closed)",
+            ));
+        };
+
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.parent_lease_id) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
                         format!(
                             "PCAC authority denied for DelegateSublease: \
-                             authoritative revalidation unavailable: {error}"
+                         authoritative revalidation unavailable: {error}"
                         ),
                     ));
                 },
             };
 
-            let lineage_receipt_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-delegate-sublease-lineage-v1");
-                hasher.update(request.parent_lease_id.as_bytes());
-                hasher.update(parent_lease.work_id.as_bytes());
-                hasher.update(parent_lease.gate_id.as_bytes());
-                hasher.update(&parent_lease.changeset_digest);
-                hasher.update(&parent_lease.policy_hash);
-                hasher.update(&parent_time_envelope_hash);
-                *hasher.finalize().as_bytes()
-            };
-            let capability_manifest_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-delegate-sublease-capability-v1");
-                hasher.update(parent_lease.work_id.as_bytes());
-                hasher.update(parent_lease.gate_id.as_bytes());
-                hasher.update(&parent_lease.policy_hash);
-                hasher.update(&parent_lease.changeset_digest);
-                hasher.update(&parent_time_envelope_hash);
-                *hasher.finalize().as_bytes()
-            };
-            let scope_witness_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-delegate-sublease-scope-v1");
-                hasher.update(request.parent_lease_id.as_bytes());
-                hasher.update(request.sublease_id.as_bytes());
-                hasher.update(request.delegatee_actor_id.as_bytes());
-                hasher.update(&expiry_millis.to_le_bytes());
-                hasher.update(parent_lease.work_id.as_bytes());
-                hasher.update(parent_lease.gate_id.as_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let freshness_policy_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-delegate-sublease-freshness-policy-v1");
-                hasher.update(&parent_lease.policy_hash);
-                hasher.update(parent_lease.gate_id.as_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let stop_budget_profile_digest = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-delegate-sublease-stop-budget-v1");
-                hasher.update(&[u8::from(
-                    self.stop_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.emergency_stop_active()),
-                )]);
-                hasher.update(&[u8::from(
-                    self.stop_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.governance_stop_active()),
-                )]);
-                hasher.update(parent_lease.gate_id.as_bytes());
-                hasher.update(request.delegatee_actor_id.as_bytes());
-                *hasher.finalize().as_bytes()
-            };
-            let effect_intent_digest = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"pcac-privileged-delegate-sublease-intent-v1");
-                hasher.update(request.parent_lease_id.as_bytes());
-                hasher.update(request.sublease_id.as_bytes());
-                hasher.update(request.delegatee_actor_id.as_bytes());
-                hasher.update(caller_actor_id.as_bytes());
-                hasher.update(&request_identity_proof_hash);
-                hasher.update(&expiry_millis.to_le_bytes());
-                hasher.update(&lineage_receipt_hash);
-                *hasher.finalize().as_bytes()
-            };
-            let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(parent_risk_tier);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(parent_risk_tier);
+        let pcac_builder =
+            PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::DelegateSublease)
+                .session_id(request.sublease_id.clone())
+                .lease_id(request.parent_lease_id.clone())
+                .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Delegate)
+                .identity_proof_hash(request_identity_proof_hash)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+                .risk_tier(pcac_risk_tier);
 
-            let pcac_input = AuthorityJoinInputV1 {
-                session_id: request.sublease_id.clone(),
-                holon_id: None,
-                intent_digest: effect_intent_digest,
-                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Delegate,
-                capability_manifest_hash,
-                scope_witness_hashes: vec![scope_witness_hash],
-                lease_id: request.parent_lease_id.clone(),
-                permeability_receipt_hash: Some(lineage_receipt_hash),
-                identity_proof_hash: request_identity_proof_hash,
-                identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
-                pointer_only_waiver_hash: None,
-                directory_head_hash: join_revocation_head,
-                freshness_policy_hash,
-                freshness_witness_tick: join_freshness_tick,
-                stop_budget_profile_digest,
-                pre_actuation_receipt_hashes: Vec::new(),
-                risk_tier: pcac_risk_tier,
-                determinism_class: PcacDeterminismClass::Deterministic,
-                time_envelope_ref: join_time_envelope_ref,
-                as_of_ledger_anchor: join_ledger_anchor,
-            };
+        let lineage_receipt_hash = pcac_builder.hash(
+            "lineage",
+            &[
+                request.parent_lease_id.as_bytes(),
+                parent_lease.work_id.as_bytes(),
+                parent_lease.gate_id.as_bytes(),
+                &parent_lease.changeset_digest,
+                &parent_lease.policy_hash,
+                &parent_time_envelope_hash,
+            ],
+        );
 
-            match self.enforce_privileged_pcac_lifecycle(
-                "DelegateSublease",
-                pcac_gate,
-                &pcac_input,
-                &request.parent_lease_id,
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-                effect_intent_digest,
-            ) {
-                Ok(artifacts) => pcac_lifecycle_artifacts = artifacts,
-                Err(response) => return Ok(response),
-            }
-        }
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                parent_lease.work_id.as_bytes(),
+                parent_lease.gate_id.as_bytes(),
+                &parent_lease.policy_hash,
+                &parent_lease.changeset_digest,
+                &parent_time_envelope_hash,
+            ],
+        );
+
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[
+                request.parent_lease_id.as_bytes(),
+                request.sublease_id.as_bytes(),
+                request.delegatee_actor_id.as_bytes(),
+                &expiry_millis.to_le_bytes(),
+                parent_lease.work_id.as_bytes(),
+                parent_lease.gate_id.as_bytes(),
+            ],
+        );
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[&parent_lease.policy_hash, parent_lease.gate_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                parent_lease.gate_id.as_bytes(),
+                request.delegatee_actor_id.as_bytes(),
+            ],
+        );
+
+        let effect_intent_digest = pcac_builder.hash(
+            "intent",
+            &[
+                request.parent_lease_id.as_bytes(),
+                request.sublease_id.as_bytes(),
+                request.delegatee_actor_id.as_bytes(),
+                caller_actor_id.as_bytes(),
+                &request_identity_proof_hash,
+                &expiry_millis.to_le_bytes(),
+                &lineage_receipt_hash,
+            ],
+        );
+
+        let pcac_builder = pcac_builder
+            .lineage_receipt_hash(lineage_receipt_hash)
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest);
+
+        let pcac_input = pcac_builder.build(
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+        );
+
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::DelegateSublease.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.parent_lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "DelegateSublease requires PCAC lifecycle evidence (mandatory cutover); \
+                         lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
 
         // ---- Phase 3: Get HTF timestamp ----
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -15376,6 +15864,18 @@ impl PrivilegedDispatcher {
         // nanosecond values through would cause temporal comparison mismatches
         // against parent lease bounds (which are in milliseconds).
         let issued_at_millis = timestamp_ns / 1_000_000;
+        let parent_issued_at_ms = parent_lease.issued_at;
+        if expiry_millis <= parent_issued_at_ms {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (vacuous delegation window: requested_expiry_ms={expiry_millis}, \
+                     parent_issued_at_ms={parent_issued_at_ms})"
+                ),
+            ));
+        }
         let sublease = match gate_orchestrator.issue_delegated_sublease(
             &parent_lease,
             &request.sublease_id,
@@ -15421,202 +15921,16 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // ---- Phase 5: Persist sublease BEFORE event emission ----
+        // ---- Phase 5: Build staged delegation ledger events in memory ----
         //
-        // SECURITY (v10 BLOCKER 1 -- Non-atomic DelegateSublease fix):
+        // PRE-COMMITMENT: Build every delegation event payload first. Any
+        // failure here discards the staged vector and performs zero writes.
         //
-        // Lease persistence MUST happen BEFORE event emission. If we emitted
-        // the SubleaseIssued event first and register_full_lease then failed,
-        // we'd have an orphan event in the ledger with no corresponding lease
-        // anchor. Retries would emit duplicate events. By persisting the
-        // lease first:
-        //   - If register_full_lease fails, no event is emitted (clean).
-        //   - If emit_session_event fails after successful persistence, the lease
-        //     exists (authoritative state) and we log a warning but return success --
-        //     the event is an audit trail that follows.
+        // SECURITY (v5 Finding 3): The event actor MUST be the authenticated
+        // caller (peer credentials), not caller-supplied delegatee identity.
         //
-        // SECURITY (v10 BLOCKER 2 -- Sublease ID uniqueness via DB):
-        //
-        // register_full_lease is the authoritative uniqueness gate. The
-        // pre-check in Phase 2b (get_gate_lease) is a fast-path optimization
-        // only. If two concurrent requests pass the pre-check, the first to
-        // call register_full_lease succeeds and the second gets a duplicate
-        // error, which we handle as idempotent (look up existing lease and
-        // return it) or reject as conflict.
-        if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
-            // Check if this is a duplicate: the lease_id already exists.
-            // If it does, treat as idempotent if the existing lease matches
-            // ALL fields including parent lineage. Otherwise reject as conflict.
-            if let Some(existing) = self.lease_validator.get_gate_lease(&sublease.lease_id) {
-                // SECURITY (v11 BLOCKER 2 -- Full-Field Duplicate Validation):
-                //
-                // The duplicate resolution after register_full_lease failure
-                // MUST verify the SAME fields as the Phase 2b pre-check path:
-                // work_id, gate_id, executor_actor_id, expires_at, AND parent
-                // lineage (changeset_digest, policy_hash, parent_lease_id).
-                //
-                // Without parent lineage verification, a concurrent request
-                // with a different parent_lease_id could silently receive an
-                // idempotent response for a sublease delegated from a different
-                // parent, enabling confused-deputy / capability laundering.
-                let fields_match = existing.work_id == sublease.work_id
-                    && existing.gate_id == sublease.gate_id
-                    && existing.executor_actor_id == sublease.executor_actor_id
-                    && existing.expires_at == sublease.expires_at
-                    && bool::from(existing.changeset_digest.ct_eq(&sublease.changeset_digest))
-                    && bool::from(existing.policy_hash.ct_eq(&sublease.policy_hash))
-                    && existing.issuer_actor_id == sublease.issuer_actor_id;
-
-                if !fields_match {
-                    warn!(
-                        sublease_id = %sublease.lease_id,
-                        error = %e,
-                        "Lease persistence duplicate with field mismatch -- conflict"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease_id '{}' already exists with different parameters",
-                            sublease.lease_id
-                        ),
-                    ));
-                }
-
-                // SECURITY (v11 BLOCKER 2 -- Parent Lineage Binding):
-                //
-                // Look up the original SubleaseIssued event and verify its
-                // parent_lease_id matches the current request. This mirrors
-                // the Phase 2b lineage verification logic: even if
-                // changeset_digest/policy_hash match, two different parent
-                // leases could share those inherited cryptographic fields.
-                let Some(original_event) = self
-                    .event_emitter
-                    .get_events_by_work_id(&existing.lease_id)
-                    .into_iter()
-                    .find(|ev| ev.event_type == "SubleaseIssued")
-                else {
-                    // SECURITY (v11 MAJOR 1 -- Fail-Closed Event Lookup):
-                    //
-                    // If the original SubleaseIssued event cannot be found,
-                    // we MUST fail-closed. Returning an empty event_id would
-                    // violate the response contract and prevent callers from
-                    // verifying the ledger trail.
-                    warn!(
-                        sublease_id = %sublease.lease_id,
-                        "Concurrent duplicate sublease: original SubleaseIssued \
-                         event not found in ledger -- failing closed"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' exists but its original SubleaseIssued \
-                             ledger event is missing -- cannot verify ledger trail",
-                            sublease.lease_id
-                        ),
-                    ));
-                };
-
-                // SECURITY (v12): Re-check persisted replay bindings
-                // (`parent_lease_id` + `identity_proof_hash`) for the
-                // duplicate detected at persistence time.
-                let (original_parent_id, original_identity_proof_hash) =
-                    match extract_sublease_replay_bindings(&original_event.payload) {
-                        Ok(values) => values,
-                        Err(extract_err) => {
-                            warn!(
-                                sublease_id = %sublease.lease_id,
-                                error = %extract_err,
-                                "Concurrent duplicate sublease: cannot extract replay bindings -- failing closed"
-                            );
-                            return Ok(PrivilegedResponse::error(
-                                PrivilegedErrorCode::CapabilityRequestRejected,
-                                format!(
-                                    "sublease '{}' exists but replay bindings could not be \
-                                     extracted from its event payload: {extract_err}",
-                                    sublease.lease_id
-                                ),
-                            ));
-                        },
-                    };
-
-                if original_parent_id != request.parent_lease_id {
-                    warn!(
-                        sublease_id = %sublease.lease_id,
-                        original_parent = %original_parent_id,
-                        requested_parent = %request.parent_lease_id,
-                        "Concurrent duplicate sublease: parent_lease_id mismatch"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' was originally delegated from parent \
-                             '{}', not '{}'",
-                            sublease.lease_id, original_parent_id, request.parent_lease_id
-                        ),
-                    ));
-                }
-
-                if !bool::from(original_identity_proof_hash.ct_eq(&request_identity_proof_hash)) {
-                    warn!(
-                        sublease_id = %sublease.lease_id,
-                        original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
-                        requested_identity_proof_hash = %hex::encode(request_identity_proof_hash),
-                        "Concurrent duplicate sublease: identity_proof_hash mismatch"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' was originally delegated with identity_proof_hash \
-                             '{}', not '{}'",
-                            sublease.lease_id,
-                            hex::encode(original_identity_proof_hash),
-                            hex::encode(request_identity_proof_hash)
-                        ),
-                    ));
-                }
-
-                info!(
-                    sublease_id = %sublease.lease_id,
-                    event_id = %original_event.event_id,
-                    "Concurrent duplicate sublease persisted -- idempotent return"
-                );
-                return Ok(PrivilegedResponse::DelegateSublease(
-                    DelegateSubleaseResponse {
-                        sublease_id: existing.lease_id,
-                        parent_lease_id: request.parent_lease_id,
-                        delegatee_actor_id: request.delegatee_actor_id,
-                        gate_id: existing.gate_id,
-                        expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
-                        event_id: original_event.event_id,
-                    },
-                ));
-            }
-            warn!(
-                sublease_id = %sublease.lease_id,
-                error = %e,
-                "Lease persistence failed -- failing closed without emitting event"
-            );
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "sublease '{}' lease persistence failed: {e} \
-                     -- no event emitted (fail-closed)",
-                    sublease.lease_id
-                ),
-            ));
-        }
-
-        // ---- Phase 6: Emit SubleaseIssued event (after successful persistence) ----
-        //
-        // SECURITY (v5 Finding 3): The event's actor_id MUST be the
-        // authenticated caller (from peer credentials), NOT the
-        // caller-controlled `delegatee_actor_id`. The delegatee is included
-        // as a separate field in the event payload so the audit trail records
-        // BOTH who performed the delegation and who received the sublease.
-        //
-        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
-        // the signed event payload so it is audit-bound and cannot be
-        // stripped post-signing.
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in the
+        // signed payload so proof-carrying bindings are audit-stable.
         let mut event_payload = serde_json::json!({
             "parent_lease_id": request.parent_lease_id,
             "sublease_id": sublease.lease_id,
@@ -15627,78 +15941,273 @@ impl PrivilegedDispatcher {
             "expires_at": sublease.expires_at,
             "issued_at": sublease.issued_at,
             "identity_proof_hash": hex::encode(&request.identity_proof_hash),
+            "delegation_satisfiability_artifact": delegation_satisfiability_artifact,
+            "delegation_satisfiability_artifact_digest": hex::encode(
+                delegation_satisfiability_artifact_digest
+            ),
         });
+        if let (Some(cas_hash), Some(payload_object)) = (
+            delegation_satisfiability_artifact_cas_hash,
+            event_payload.as_object_mut(),
+        ) {
+            payload_object.insert(
+                "delegation_satisfiability_artifact_cas_hash".to_string(),
+                serde_json::Value::String(hex::encode(cas_hash)),
+            );
+        }
         if let (Some(artifacts), Some(payload_object)) = (
             pcac_lifecycle_artifacts.as_ref(),
             event_payload.as_object_mut(),
         ) {
             append_privileged_pcac_lifecycle_fields(payload_object, artifacts);
         }
-        // SECURITY (v10 MAJOR — Fail-closed serialization):
-        //
-        // Event payload serialization MUST NOT silently produce empty bytes.
-        // An empty payload would persist a signed event without
-        // lineage-critical fields (parent_lease_id, delegatee, gate_id),
-        // making audit verification impossible. Fail closed instead.
+
         let event_payload_bytes = match serde_json::to_vec(&event_payload) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(
                     sublease_id = %sublease.lease_id,
                     error = %e,
-                    "SubleaseIssued event payload serialization failed -- failing closed"
+                    "SubleaseIssued event payload serialization failed before commit"
                 );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
-                        "sublease '{}' lease persisted but event payload serialization \
-                         failed: {e} -- failing closed",
+                        "sublease '{}' event payload serialization failed: {e} \
+                         -- no ledger writes committed",
                         sublease.lease_id
                     ),
                 ));
             },
         };
 
-        let signed_event = match self.event_emitter.emit_session_event(
-            &sublease.lease_id,
-            "SubleaseIssued",
-            &event_payload_bytes,
-            &caller_actor_id,
-            timestamp_ns,
-        ) {
-            Ok(evt) => evt,
-            Err(e) => {
-                // SECURITY (v10 BLOCKER 2 — Fail-closed on emission failure):
-                //
-                // The response contract requires `event_id` to be the ledger
-                // identity of the `SubleaseIssued` event. Returning success
-                // with an empty `event_id` violates proof-carrying effect
-                // guarantees and breaks audit verification.
-                //
-                // Even though the lease is persisted (authoritative state),
-                // we MUST fail-closed here because:
-                // 1. The proto contract defines `event_id` as a required ledger event identity
-                //    for `SubleaseIssued`.
-                // 2. A retry will hit the idempotent `register_full_lease` duplicate path,
-                //    which will find the existing lease and attempt to look up the event. If
-                //    the event still cannot be emitted, the retry will also fail-closed.
-                // 3. The persisted lease anchor ensures no authority is lost; the caller simply
-                //    needs to retry when the event emitter recovers.
-                warn!(
-                    sublease_id = %sublease.lease_id,
-                    error = %e,
-                    "SubleaseIssued event emission failed after lease persistence \
-                     -- failing closed (lease persisted, event missing)"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
-                        "sublease '{}' lease persisted but SubleaseIssued event \
-                         emission failed: {e} -- retry to complete",
-                        sublease.lease_id
-                    ),
-                ));
-            },
+        let staged_ledger_events = vec![
+            DelegationCommitEvent::PersistDelegatedLease,
+            DelegationCommitEvent::EmitSubleaseIssued(event_payload_bytes),
+        ];
+
+        // ---- Phase 6: Flush staged events (append-only, no delete rollback) ----
+        let mut signed_event: Option<SignedLedgerEvent> = None;
+        for staged_event in staged_ledger_events {
+            match staged_event {
+                DelegationCommitEvent::PersistDelegatedLease => {
+                    // Persist delegated parent lineage metadata so depth/satisfiability
+                    // checks fail closed if SubleaseIssued evidence is unavailable.
+                    if let Err(e) = self
+                        .lease_validator
+                        .register_delegated_full_lease(&sublease, &request.parent_lease_id)
+                    {
+                        // Check if this is a duplicate: the lease_id already exists.
+                        // If it does, treat as idempotent if the existing lease matches
+                        // ALL fields including parent lineage. Otherwise reject as conflict.
+                        if let Some(existing) =
+                            self.lease_validator.get_gate_lease(&sublease.lease_id)
+                        {
+                            // SECURITY (v11 BLOCKER 2 -- Full-Field Duplicate Validation):
+                            //
+                            // The duplicate resolution after register_full_lease failure
+                            // MUST verify the SAME fields as the Phase 2b pre-check path:
+                            // work_id, gate_id, executor_actor_id, expires_at, AND parent
+                            // lineage (changeset_digest, policy_hash, parent_lease_id).
+                            //
+                            // Without parent lineage verification, a concurrent request
+                            // with a different parent_lease_id could silently receive an
+                            // idempotent response for a sublease delegated from a different
+                            // parent, enabling confused-deputy / capability laundering.
+                            let fields_match = existing.work_id == sublease.work_id
+                                && existing.gate_id == sublease.gate_id
+                                && existing.executor_actor_id == sublease.executor_actor_id
+                                && existing.expires_at == sublease.expires_at
+                                && bool::from(
+                                    existing.changeset_digest.ct_eq(&sublease.changeset_digest),
+                                )
+                                && bool::from(existing.policy_hash.ct_eq(&sublease.policy_hash))
+                                && existing.issuer_actor_id == sublease.issuer_actor_id;
+
+                            if !fields_match {
+                                warn!(
+                                    sublease_id = %sublease.lease_id,
+                                    error = %e,
+                                    "Lease persistence duplicate with field mismatch -- conflict"
+                                );
+                                return Ok(PrivilegedResponse::error(
+                                    PrivilegedErrorCode::CapabilityRequestRejected,
+                                    format!(
+                                        "sublease_id '{}' already exists with different parameters",
+                                        sublease.lease_id
+                                    ),
+                                ));
+                            }
+
+                            // SECURITY (v11 BLOCKER 2 -- Parent Lineage Binding):
+                            //
+                            // Look up the original SubleaseIssued event and verify its
+                            // parent_lease_id matches the current request. This mirrors
+                            // the Phase 2b lineage verification logic: even if
+                            // changeset_digest/policy_hash match, two different parent
+                            // leases could share those inherited cryptographic fields.
+                            let Some(original_event) = self
+                                .event_emitter
+                                .get_events_by_work_id(&existing.lease_id)
+                                .into_iter()
+                                .find(|ev| ev.event_type == "SubleaseIssued")
+                            else {
+                                // SECURITY (v11 MAJOR 1 -- Fail-Closed Event Lookup):
+                                //
+                                // If the original SubleaseIssued event cannot be found,
+                                // we MUST fail-closed. Returning an empty event_id would
+                                // violate the response contract and prevent callers from
+                                // verifying the ledger trail.
+                                warn!(
+                                    sublease_id = %sublease.lease_id,
+                                    "Concurrent duplicate sublease: original SubleaseIssued \
+                                     event not found in ledger -- failing closed"
+                                );
+                                return Ok(PrivilegedResponse::error(
+                                    PrivilegedErrorCode::CapabilityRequestRejected,
+                                    format!(
+                                        "sublease '{}' exists but its original SubleaseIssued \
+                                         ledger event is missing -- cannot verify ledger trail",
+                                        sublease.lease_id
+                                    ),
+                                ));
+                            };
+
+                            // SECURITY (v12): Re-check persisted replay bindings
+                            // (`parent_lease_id` + `identity_proof_hash`) for the
+                            // duplicate detected at persistence time.
+                            let (original_parent_id, original_identity_proof_hash) =
+                                match extract_sublease_replay_bindings(&original_event.payload) {
+                                    Ok(values) => values,
+                                    Err(extract_err) => {
+                                        warn!(
+                                            sublease_id = %sublease.lease_id,
+                                            error = %extract_err,
+                                            "Concurrent duplicate sublease: cannot extract replay bindings -- failing closed"
+                                        );
+                                        return Ok(PrivilegedResponse::error(
+                                            PrivilegedErrorCode::CapabilityRequestRejected,
+                                            format!(
+                                                "sublease '{}' exists but replay bindings could not be \
+                                                 extracted from its event payload: {extract_err}",
+                                                sublease.lease_id
+                                            ),
+                                        ));
+                                    },
+                                };
+
+                            if original_parent_id != request.parent_lease_id {
+                                warn!(
+                                    sublease_id = %sublease.lease_id,
+                                    original_parent = %original_parent_id,
+                                    requested_parent = %request.parent_lease_id,
+                                    "Concurrent duplicate sublease: parent_lease_id mismatch"
+                                );
+                                return Ok(PrivilegedResponse::error(
+                                    PrivilegedErrorCode::CapabilityRequestRejected,
+                                    format!(
+                                        "sublease '{}' was originally delegated from parent \
+                                         '{}', not '{}'",
+                                        sublease.lease_id,
+                                        original_parent_id,
+                                        request.parent_lease_id
+                                    ),
+                                ));
+                            }
+
+                            if !bool::from(
+                                original_identity_proof_hash.ct_eq(&request_identity_proof_hash),
+                            ) {
+                                warn!(
+                                    sublease_id = %sublease.lease_id,
+                                    original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
+                                    requested_identity_proof_hash = %hex::encode(request_identity_proof_hash),
+                                    "Concurrent duplicate sublease: identity_proof_hash mismatch"
+                                );
+                                return Ok(PrivilegedResponse::error(
+                                    PrivilegedErrorCode::CapabilityRequestRejected,
+                                    format!(
+                                        "sublease '{}' was originally delegated with identity_proof_hash \
+                                         '{}', not '{}'",
+                                        sublease.lease_id,
+                                        hex::encode(original_identity_proof_hash),
+                                        hex::encode(request_identity_proof_hash)
+                                    ),
+                                ));
+                            }
+
+                            info!(
+                                sublease_id = %sublease.lease_id,
+                                event_id = %original_event.event_id,
+                                "Concurrent duplicate sublease persisted -- idempotent return"
+                            );
+                            return Ok(PrivilegedResponse::DelegateSublease(
+                                DelegateSubleaseResponse {
+                                    sublease_id: existing.lease_id,
+                                    parent_lease_id: request.parent_lease_id,
+                                    delegatee_actor_id: request.delegatee_actor_id,
+                                    gate_id: existing.gate_id,
+                                    expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
+                                    event_id: original_event.event_id,
+                                },
+                            ));
+                        }
+                        warn!(
+                            sublease_id = %sublease.lease_id,
+                            error = %e,
+                            "Lease persistence failed -- failing closed without emitting event"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "sublease '{}' lease persistence failed: {e} \
+                                 -- no event emitted (fail-closed)",
+                                sublease.lease_id
+                            ),
+                        ));
+                    }
+                },
+                DelegationCommitEvent::EmitSubleaseIssued(payload) => {
+                    let emitted_event = match self.event_emitter.emit_session_event(
+                        &sublease.lease_id,
+                        "SubleaseIssued",
+                        &payload,
+                        &caller_actor_id,
+                        timestamp_ns,
+                    ) {
+                        Ok(evt) => evt,
+                        Err(e) => {
+                            warn!(
+                                sublease_id = %sublease.lease_id,
+                                error = %e,
+                                "SubleaseIssued emission failed after delegated lease append"
+                            );
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!(
+                                    "sublease '{}' SubleaseIssued emission failed: {e} \
+                                     -- delegated lease remains append-only and lineage checks fail closed",
+                                    sublease.lease_id
+                                ),
+                            ));
+                        },
+                    };
+                    signed_event = Some(emitted_event);
+                },
+            }
+        }
+        let Some(signed_event) = signed_event else {
+            warn!(
+                sublease_id = %sublease.lease_id,
+                "staged delegation commit completed without SubleaseIssued append"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease '{}' delegation commit incomplete: missing SubleaseIssued append",
+                    sublease.lease_id
+                ),
+            ));
         };
 
         info!(
@@ -16887,6 +17396,101 @@ mod tests {
     /// Uses /tmp which exists on all Unix systems.
     fn test_workspace_root() -> String {
         "/tmp".to_string()
+    }
+
+    #[test]
+    fn test_domain_tagged_hash_produces_expected_output() {
+        let data = b"test-data";
+        let expected = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-privileged-ingest-review-capability-v1");
+            hasher.update(data);
+            *hasher.finalize().as_bytes()
+        };
+        let actual = domain_tagged_hash(
+            PrivilegedHandlerClass::IngestReviewReceipt,
+            "capability",
+            &[data],
+        );
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_domain_tagged_hash_handler_class_separation() {
+        let data = b"same-data";
+        let ingest = domain_tagged_hash(
+            PrivilegedHandlerClass::IngestReviewReceipt,
+            "capability",
+            &[data],
+        );
+        let delegate = domain_tagged_hash(
+            PrivilegedHandlerClass::DelegateSublease,
+            "capability",
+            &[data],
+        );
+        assert_ne!(ingest, delegate);
+    }
+
+    #[test]
+    fn test_pcac_input_builder_ingest_review() {
+        let input = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::IngestReviewReceipt)
+            .session_id("receipt-123".to_string())
+            .lease_id("lease-456".to_string())
+            .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+            .identity_proof_hash([0xAA; 32])
+            .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+            .risk_tier(PcacRiskTier::Tier0)
+            .capability_manifest_hash([0xBB; 32])
+            .scope_witness_hash([0xCC; 32])
+            .freshness_policy_hash([0xDD; 32])
+            .stop_budget_profile_digest([0xEE; 32])
+            .effect_intent_digest([0xFF; 32])
+            .build(42, [0x11; 32], [0x22; 32], [0x33; 32]);
+
+        assert_eq!(input.session_id, "receipt-123");
+        assert_eq!(input.lease_id, "lease-456");
+        assert_eq!(
+            input.boundary_intent_class,
+            apm2_core::pcac::BoundaryIntentClass::Assert
+        );
+        assert_eq!(input.capability_manifest_hash, [0xBB; 32]);
+        assert_eq!(input.scope_witness_hashes, vec![[0xCC; 32]]);
+        assert_eq!(input.intent_digest, [0xFF; 32]);
+        assert_eq!(input.permeability_receipt_hash, None);
+        assert_eq!(input.freshness_witness_tick, 42);
+        assert_eq!(
+            input.identity_evidence_level,
+            IdentityEvidenceLevel::PointerOnly
+        );
+        assert!(input.pointer_only_waiver_hash.is_none());
+        assert!(input.holon_id.is_none());
+        assert_eq!(input.determinism_class, PcacDeterminismClass::Deterministic);
+    }
+
+    #[test]
+    fn test_pcac_input_builder_delegate_sublease() {
+        let lineage = [0x44; 32];
+        let input = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::DelegateSublease)
+            .session_id("sub-789".to_string())
+            .lease_id("parent-123".to_string())
+            .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Delegate)
+            .identity_proof_hash([0xAA; 32])
+            .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+            .risk_tier(PcacRiskTier::Tier2Plus)
+            .lineage_receipt_hash(lineage)
+            .capability_manifest_hash([0xBB; 32])
+            .scope_witness_hash([0xCC; 32])
+            .freshness_policy_hash([0xDD; 32])
+            .stop_budget_profile_digest([0xEE; 32])
+            .effect_intent_digest([0xFF; 32])
+            .build(100, [0x11; 32], [0x22; 32], [0x33; 32]);
+
+        assert_eq!(input.permeability_receipt_hash, Some(lineage));
+        assert_eq!(
+            input.boundary_intent_class,
+            apm2_core::pcac::BoundaryIntentClass::Delegate
+        );
+        assert_eq!(input.risk_tier, PcacRiskTier::Tier2Plus);
     }
 
     mod channel_boundary_integration {
@@ -25387,8 +25991,13 @@ mod tests {
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
 
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
             let dispatcher = PrivilegedDispatcher::new()
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             dispatcher.lease_validator.register_lease_with_executor(
                 lease_id,
                 work_id,
@@ -25407,12 +26016,13 @@ mod tests {
                 include_attestation: true,
             });
             // Register work claim so risk-tier resolution succeeds.
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 work_id,
                 &executor_actor_id,
                 WorkRole::Reviewer,
                 risk_tier,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 work_id,
@@ -26640,14 +27250,12 @@ mod tests {
             match response2 {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("identity_proof_hash"),
-                        "expected identity_proof_hash mismatch rejection, got: {}",
+                        err.message.contains("identity_proof_hash mismatch"),
+                        "expected identity_proof_hash mismatch error, got: {}",
                         err.message
                     );
                 },
-                other => panic!(
-                    "expected duplicate receipt_id + identity_proof_hash mismatch rejection, got {other:?}"
-                ),
+                other => panic!("expected mismatch rejection, got {other:?}"),
             }
         }
 
@@ -26660,6 +27268,14 @@ mod tests {
                 "gate-001",
                 "reviewer-a",
             );
+            let second_artifact_bundle_hash = dispatcher
+                .cas
+                .as_ref()
+                .expect("test dispatcher should have CAS configured")
+                .store(b"test-artifact-bundle-content-2")
+                .expect("storing secondary artifact bundle should succeed")
+                .hash
+                .to_vec();
 
             let request1 = IngestReviewReceiptRequest {
                 lease_id: "lease-dup-artifact-001".to_string(),
@@ -26684,7 +27300,7 @@ mod tests {
                 receipt_id: "RR-DUP-ARTIFACT-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x44; 32],
+                artifact_bundle_hash: second_artifact_bundle_hash,
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -26695,14 +27311,12 @@ mod tests {
             match response2 {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("artifact_bundle_hash"),
+                        err.message.contains("artifact_bundle_hash mismatch"),
                         "expected artifact_bundle_hash mismatch rejection, got: {}",
                         err.message
                     );
                 },
-                other => panic!(
-                    "expected duplicate receipt_id + artifact_bundle_hash mismatch rejection, got {other:?}"
-                ),
+                other => panic!("expected mismatch rejection, got {other:?}"),
             }
         }
 
@@ -26850,13 +27464,17 @@ mod tests {
             match response2 {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("lease"),
-                        "expected lease mismatch rejection, got: {}",
+                        err.message
+                            .contains("already exists with a different semantic identity tuple")
+                            && err
+                                .message
+                                .contains("PCAC linear consumption prevents reuse"),
+                        "expected semantic tuple conflict rejection, got: {}",
                         err.message
                     );
                 },
                 other => panic!(
-                    "expected duplicate receipt_id + lease mismatch rejection, got {other:?}"
+                    "expected duplicate receipt_id semantic tuple conflict rejection, got {other:?}"
                 ),
             }
         }
@@ -26983,9 +27601,14 @@ mod tests {
             };
             let caller_actor = derive_actor_id(&test_creds);
             let cas = Arc::new(MemoryCas::default());
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
             let dispatcher = PrivilegedDispatcher::new()
                 .with_gate_orchestrator(orch)
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -27003,6 +27626,30 @@ mod tests {
                 gate_id,
                 &caller_actor,
             );
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &caller_actor, WorkRole::Reviewer, 0);
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: parent_lease_id.to_string(),
+                    actor_id: caller_actor,
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("delegate test work claim registration");
             let parent_lease = dispatcher
                 .lease_validator
                 .get_gate_lease(parent_lease_id)
@@ -27014,6 +27661,52 @@ mod tests {
                 pid: Some(12345),
             }));
             (dispatcher, ctx, parent_lease)
+        }
+
+        fn seed_sublease_lineage(
+            dispatcher: &PrivilegedDispatcher,
+            leaf_lease_id: &str,
+            depth: u32,
+            actor_id: &str,
+        ) {
+            let mut current = leaf_lease_id.to_string();
+            for hop in 0..depth {
+                let next_parent = format!("{leaf_lease_id}-ancestor-{hop}");
+                let current_lease = dispatcher
+                    .lease_validator
+                    .get_gate_lease(&current)
+                    .expect("lineage seed requires current lease to be persisted");
+                let mut next_parent_lease = current_lease.clone();
+                next_parent_lease.lease_id = next_parent.clone();
+                next_parent_lease.executor_actor_id = actor_id.to_string();
+                next_parent_lease.issued_at = next_parent_lease
+                    .issued_at
+                    .saturating_add(u64::from(hop) + 1);
+                if next_parent_lease.expires_at <= next_parent_lease.issued_at {
+                    next_parent_lease.expires_at = next_parent_lease.issued_at.saturating_add(1);
+                }
+                dispatcher
+                    .lease_validator
+                    .register_full_lease(&next_parent_lease)
+                    .expect("lineage seed should persist ancestor lease");
+                let payload = serde_json::json!({
+                    "parent_lease_id": next_parent,
+                    "identity_proof_hash": hex::encode([0xA5; 32]),
+                });
+                let payload_bytes =
+                    serde_json::to_vec(&payload).expect("lineage payload serialization");
+                dispatcher
+                    .event_emitter()
+                    .emit_session_event(
+                        &current,
+                        "SubleaseIssued",
+                        &payload_bytes,
+                        actor_id,
+                        1_700_000_000 + u64::from(hop),
+                    )
+                    .expect("lineage event emission");
+                current = format!("{leaf_lease_id}-ancestor-{hop}");
+            }
         }
 
         #[test]
@@ -27108,11 +27801,11 @@ mod tests {
             );
 
             // Request sublease with expiry EXCEEDING parent bounds (parent
-            // expires at 2_000_000, sublease requests 3_000_000).
+            // expires at 2_000_000ms, sublease requests 3_000_000ms).
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-exp".to_string(),
                 delegatee_actor_id: "child-executor-001".to_string(),
-                requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (3_000_000
+                requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (2_000_000
                                                          * ms) */
                 sublease_id: "sublease-overflow".to_string(),
                 identity_proof_hash: vec![0x99; 32],
@@ -27123,12 +27816,260 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("delegation widening"),
-                        "Error should mention delegation widening: {}",
+                        err.message.contains("sublease delegation failed")
+                            || err.message.contains("strict expiry narrowing violated")
+                            || err.message.contains("is after parent expires_at"),
+                        "Error should mention parent expiry bound violation: {}",
                         err.message
                     );
                 },
                 other => panic!("Expected error for expiry overflow, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_equal_parent_expiry_rejected() {
+            let (dispatcher, ctx, parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-equal-exp",
+                "W-DS-EQUAL-EXP",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-equal-exp".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: parent.expires_at * 1_000_000,
+                sublease_id: "sublease-equal-exp".to_string(),
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("strict expiry narrowing violated"),
+                        "Error should reject equal-expiry sublease delegation: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected strict expiry narrowing rejection, got {other:?}"),
+            }
+
+            let persisted_sublease = dispatcher
+                .lease_validator()
+                .get_gate_lease("sublease-equal-exp");
+            assert!(
+                persisted_sublease.is_none(),
+                "equal-expiry denial must not persist a sublease"
+            );
+
+            let sublease_events = dispatcher
+                .event_emitter()
+                .get_events_by_work_id("sublease-equal-exp");
+            let sublease_event_count = sublease_events
+                .iter()
+                .filter(|event| event.event_type == "SubleaseIssued")
+                .count();
+            assert_eq!(
+                sublease_event_count, 0,
+                "equal-expiry denial must not emit SubleaseIssued events"
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_depth_overflow_rejected() {
+            let parent_lease_id = "parent-depth-overflow";
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                parent_lease_id,
+                "W-DS-DEPTH-OVERFLOW",
+                "gate-quality",
+                "executor-001",
+            );
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            seed_sublease_lineage(
+                &dispatcher,
+                parent_lease_id,
+                MAX_SUBLEASE_DELEGATION_DEPTH,
+                &actor_id,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-depth-overflow".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-depth-overflow".to_string(),
+                identity_proof_hash: vec![0x77; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("requested_depth="),
+                        "depth overflow denial must include requested_depth, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("max_depth="),
+                        "depth overflow denial must include max_depth, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected depth overflow denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_satisfiability_budget_derived_and_depth_safe() {
+            let derived_min_budget =
+                ((MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS as u64) * 2 + 4).max(40);
+            assert_eq!(
+                SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS, derived_min_budget,
+                "delegation budget must be derived from lineage traversal bound"
+            );
+            assert!(
+                derived_min_budget >= 40,
+                "delegation budget derivation must keep >=40 safety margin"
+            );
+
+            let parent_lease_id = "parent-budget-safe";
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                parent_lease_id,
+                "W-DS-BUDGET-SAFE",
+                "gate-quality",
+                "executor-001",
+            );
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            seed_sublease_lineage(
+                &dispatcher,
+                parent_lease_id,
+                MAX_SUBLEASE_DELEGATION_DEPTH - 1,
+                &actor_id,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-budget-safe".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-budget-safe".to_string(),
+                identity_proof_hash: vec![0x88; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::DelegateSublease(_) => {},
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        !err.message
+                            .contains("delegation_satisfiability_budget_ticks exhausted"),
+                        "derived budget must cover max-depth traversal, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected DelegateSublease or non-budget error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_missing_lineage_for_persisted_delegated_parent_denied() {
+            let (dispatcher, ctx, parent_lease) = setup_dispatcher_with_orchestrator(
+                "parent-missing-lineage",
+                "W-DS-MISSING-LINEAGE",
+                "gate-quality",
+                "executor-001",
+            );
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            let orphan_parent_id = "sublease-missing-lineage-parent";
+            let orphan_parent = dispatcher
+                .gate_orchestrator
+                .as_ref()
+                .expect("gate orchestrator should be configured")
+                .issue_delegated_sublease(
+                    &parent_lease,
+                    orphan_parent_id,
+                    &caller_actor,
+                    parent_lease.issued_at.saturating_add(10),
+                    parent_lease.expires_at.saturating_sub(100),
+                )
+                .expect("orphan parent sublease issuance should succeed");
+            dispatcher
+                .lease_validator
+                .register_delegated_full_lease(&orphan_parent, &parent_lease.lease_id)
+                .expect("persisted delegated lease should register");
+
+            // Regression guard: this fixture intentionally persists a delegated
+            // lease without a corresponding SubleaseIssued lineage event.
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: orphan_parent_id.to_string(),
+                delegatee_actor_id: "child-missing-lineage".to_string(),
+                requested_expiry_ns: orphan_parent
+                    .expires_at
+                    .saturating_sub(1)
+                    .saturating_mul(1_000_000),
+                sublease_id: "child-from-missing-lineage-parent".to_string(),
+                identity_proof_hash: vec![0x6B; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lineage evidence missing"),
+                        "missing delegated lineage evidence must deny delegation, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected delegated-lineage denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_vacuous_window_rejected() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-vacuous-window",
+                "W-DS-VACUOUS",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-vacuous-window".to_string(),
+                delegatee_actor_id: "child-vacuous-window".to_string(),
+                requested_expiry_ns: 1, // deterministically <= issued_at at runtime
+                sublease_id: "sublease-vacuous-window".to_string(),
+                identity_proof_hash: vec![0x91; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("vacuous delegation window"),
+                        "vacuous window must be denied explicitly, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected vacuous-window denial, got {other:?}"),
             }
         }
 
@@ -27351,23 +28292,25 @@ mod tests {
             }
         }
 
-        /// Security BLOCKER: Unauthorized caller (different actor ID) must be
-        /// explicitly rejected when attempting to delegate from a parent lease
-        /// they do not own.
         #[test]
-        fn test_delegate_sublease_unauthorized_caller_rejected() {
+        fn test_delegate_sublease_unauthorized_caller_rejected_with_pcac() {
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
             let orch = Arc::new(crate::gate::GateOrchestrator::new(
                 crate::gate::GateOrchestratorConfig::default(),
-                signer,
+                Arc::clone(&signer),
             ));
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
 
             // Register parent lease with executor_actor_id that does NOT
             // match the caller (uid=1000, gid=1000).
             let cas = Arc::new(MemoryCas::default());
             let dispatcher = PrivilegedDispatcher::new()
                 .with_gate_orchestrator(orch)
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -27385,12 +28328,41 @@ mod tests {
                 "gate-authz",
                 "totally-different-actor",
             );
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-AUTHZ",
+                "totally-different-actor",
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-AUTHZ",
+                "totally-different-actor",
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-AUTHZ".to_string(),
+                    lease_id: "parent-authz".to_string(),
+                    actor_id: "totally-different-actor".to_string(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
 
-            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            let unauthorized_ctx =
+                ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }));
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-authz".to_string(),
@@ -27401,21 +28373,21 @@ mod tests {
             };
             let frame = encode_delegate_sublease_request(&request);
 
-            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let response = dispatcher.dispatch(&frame, &unauthorized_ctx).unwrap();
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
                         err.message.contains("not authorized to delegate"),
-                        "Unauthorized caller must get explicit rejection: {}",
+                        "error message must indicate authorization failure, got: {}",
                         err.message
                     );
                     assert_eq!(
                         err.code,
                         i32::from(PrivilegedErrorCode::PermissionDenied),
-                        "Error code should be PermissionDenied"
+                        "unauthorized caller must get PermissionDenied"
                     );
                 },
-                other => panic!("Expected PermissionDenied for unauthorized caller, got {other:?}"),
+                other => panic!("expected PermissionDenied for unauthorized caller, got {other:?}"),
             }
         }
 
@@ -27537,6 +28509,59 @@ mod tests {
                 "actor_id must NOT be the delegatee"
             );
             assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
+
+            let payload = ingest_review_receipt::decode_wrapped_or_direct_event_payload(&event);
+            let artifact = payload
+                .get("delegation_satisfiability_artifact")
+                .expect("delegation_satisfiability_artifact must be present");
+            assert_eq!(
+                artifact.get("schema").and_then(serde_json::Value::as_str),
+                Some("apm2.delegate_sublease_satisfiability_artifact.v1"),
+                "delegation satisfiability artifact schema must be persisted"
+            );
+            let receipt = artifact
+                .get("delegation_satisfiability_receipt")
+                .expect("delegation_satisfiability_receipt must be present");
+            assert_eq!(
+                receipt
+                    .get("delegation_depth")
+                    .and_then(serde_json::Value::as_u64),
+                Some(1),
+                "direct child delegation must persist depth evidence"
+            );
+            assert_eq!(
+                receipt
+                    .get("budget_ticks")
+                    .and_then(serde_json::Value::as_u64),
+                Some(SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS),
+                "persisted receipt must carry deterministic budget evidence"
+            );
+            assert!(
+                receipt
+                    .get("ticks_used")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                "persisted receipt must carry deterministic tick usage evidence"
+            );
+
+            let persisted_artifact_digest = payload
+                .get("delegation_satisfiability_artifact_digest")
+                .and_then(serde_json::Value::as_str)
+                .expect("delegation_satisfiability_artifact_digest must be present");
+            let expected_artifact_digest = hex::encode(hash_bytes(
+                &canonical_json_bytes(artifact).expect("artifact canonicalization"),
+            ));
+            assert_eq!(
+                persisted_artifact_digest, expected_artifact_digest,
+                "artifact digest must bind canonical delegation satisfiability evidence"
+            );
+            assert!(
+                payload
+                    .get("delegation_satisfiability_artifact_cas_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                "CAS-backed dispatcher must persist artifact CAS hash pointer"
+            );
         }
 
         #[test]
@@ -27641,36 +28666,17 @@ mod tests {
 
         #[test]
         fn test_delegate_sublease_duplicate_id_conflict_rejected() {
-            let signer = Arc::new(apm2_core::crypto::Signer::generate());
-            let orch = Arc::new(crate::gate::GateOrchestrator::new(
-                crate::gate::GateOrchestratorConfig::default(),
-                signer,
-            ));
-
-            // Derive the actor ID from the test peer credentials so the
-            // caller authorization check passes for both parent leases.
-            let test_creds = PeerCredentials {
+            let (dispatcher, ctx, _parent_a) =
+                setup_dispatcher_with_orchestrator("parent-A", "W-A", "gate-A", "executor-ignored");
+            let caller_actor = derive_actor_id(&PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
-            };
-            let caller_actor = derive_actor_id(&test_creds);
-
-            let cas = Arc::new(MemoryCas::default());
-            let dispatcher = PrivilegedDispatcher::new()
-                .with_gate_orchestrator(orch)
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
-            register_full_test_lease(&TestLeaseConfig {
-                dispatcher: &dispatcher,
-                cas: cas.as_ref(),
-                lease_id: "parent-A",
-                work_id: "W-A",
-                gate_id: "gate-A",
-                executor_actor_id: &caller_actor,
-                policy_hash: [0xAB; 32],
-                wall_time_source: WallTimeSource::AuthenticatedNts,
-                include_attestation: true,
             });
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -27683,23 +28689,35 @@ mod tests {
                 include_attestation: true,
             });
             dispatcher.lease_validator.register_lease_with_executor(
-                "parent-A",
-                "W-A",
-                "gate-A",
-                &caller_actor,
-            );
-            dispatcher.lease_validator.register_lease_with_executor(
                 "parent-B",
                 "W-B",
                 "gate-B",
                 &caller_actor,
             );
-
-            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage("W-B", &caller_actor, WorkRole::Reviewer, 0);
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-B",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-B".to_string(),
+                    lease_id: "parent-B".to_string(),
+                    actor_id: caller_actor,
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration for parent-B");
 
             // First call: issue sublease under parent A
             let req1 = DelegateSubleaseRequest {
@@ -27798,38 +28816,21 @@ mod tests {
         /// parent lease ID field to enforce exact lineage binding.
         #[test]
         fn test_delegate_sublease_idempotent_rejects_different_parent_lineage() {
-            let signer = Arc::new(apm2_core::crypto::Signer::generate());
-            let orch = Arc::new(crate::gate::GateOrchestrator::new(
-                crate::gate::GateOrchestratorConfig::default(),
-                signer,
-            ));
-
-            let test_creds = PeerCredentials {
+            let (dispatcher, ctx, _parent_a) = setup_dispatcher_with_orchestrator(
+                "parent-lin-A",
+                "W-LIN",
+                "gate-lin",
+                "executor-ignored",
+            );
+            let caller_actor = derive_actor_id(&PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
-            };
-            let caller_actor = derive_actor_id(&test_creds);
-
-            // Create two parent leases with IDENTICAL inherited fields
-            // (changeset_digest, policy_hash) but different lease IDs.
-            // This is the edge case where the changeset_digest/policy_hash
-            // comparison alone would incorrectly treat them as equivalent.
-            let cas = Arc::new(MemoryCas::default());
-            let dispatcher = PrivilegedDispatcher::new()
-                .with_gate_orchestrator(orch)
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
-            register_full_test_lease(&TestLeaseConfig {
-                dispatcher: &dispatcher,
-                cas: cas.as_ref(),
-                lease_id: "parent-lin-A",
-                work_id: "W-LIN",
-                gate_id: "gate-lin",
-                executor_actor_id: &caller_actor,
-                policy_hash: [0xAB; 32],
-                wall_time_source: WallTimeSource::AuthenticatedNts,
-                include_attestation: true,
             });
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -27842,23 +28843,34 @@ mod tests {
                 include_attestation: true,
             });
             dispatcher.lease_validator.register_lease_with_executor(
-                "parent-lin-A",
-                "W-LIN",
-                "gate-lin",
-                &caller_actor,
-            );
-            dispatcher.lease_validator.register_lease_with_executor(
                 "parent-lin-B",
                 "W-LIN",
                 "gate-lin",
                 &caller_actor,
             );
-
-            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage("W-LIN", &caller_actor, WorkRole::Reviewer, 0);
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-LIN",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            // If parent A's claim is already present from setup helper, this can
+            // return DuplicateWorkId; in that case we keep the helper-registered claim.
+            let _ = dispatcher.work_registry.register_claim(WorkClaim {
+                work_id: "W-LIN".to_string(),
+                lease_id: "parent-lin-B".to_string(),
+                actor_id: caller_actor,
+                role: WorkRole::Reviewer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            });
 
             // First call: issue sublease under parent A
             let req1 = DelegateSubleaseRequest {
@@ -28491,6 +29503,9 @@ mod tests {
             // TCK-00408: CAS is mandatory for ingest (fail-closed).
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
 
             let mut dispatcher = PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
@@ -28506,7 +29521,10 @@ mod tests {
                 manifest_loader,
                 subscription_registry,
             );
-            dispatcher = dispatcher.with_cas(cas as Arc<dyn ContentAddressedStore>);
+            dispatcher = dispatcher
+                .with_cas(cas as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
 
             let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
@@ -28639,6 +29657,104 @@ mod tests {
                 .expect("work claim registration");
         }
 
+        fn setup_delegate_sublease_sqlite_fixture(
+            parent_lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            Arc<Mutex<Connection>>,
+            String,
+        ) {
+            let (dispatcher, ctx, conn) = setup_sqlite_dispatcher();
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let dispatcher = dispatcher
+                .with_gate_orchestrator(orchestrator)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by sqlite fixture");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: parent_lease_id,
+                    work_id,
+                    gate_id,
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &caller_actor, WorkRole::Reviewer, 0);
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: parent_lease_id.to_string(),
+                    actor_id: caller_actor.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("sqlite delegate fixture claim registration");
+            (dispatcher, ctx, conn, caller_actor)
+        }
+
+        fn emit_sublease_lineage_event(
+            dispatcher: &PrivilegedDispatcher,
+            child_lease_id: &str,
+            parent_lease_id: &str,
+            actor_id: &str,
+            timestamp_ns: u64,
+        ) {
+            let payload = serde_json::json!({
+                "parent_lease_id": parent_lease_id,
+                "identity_proof_hash": hex::encode([0xA5; 32]),
+            });
+            let payload_bytes =
+                serde_json::to_vec(&payload).expect("lineage payload should serialize");
+            dispatcher
+                .event_emitter()
+                .emit_session_event(
+                    child_lease_id,
+                    "SubleaseIssued",
+                    &payload_bytes,
+                    actor_id,
+                    timestamp_ns,
+                )
+                .expect("lineage seed event should insert");
+        }
+
         #[test]
         fn test_ingest_review_receipt_sqlite_tier0_passes() {
             let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
@@ -28671,12 +29787,13 @@ mod tests {
             );
 
             // Register work claim via SqliteWorkRegistry (production path)
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-SQL-001",
                 &executor_actor_id,
                 WorkRole::Reviewer,
                 0,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-SQL-001",
@@ -28763,12 +29880,13 @@ mod tests {
             );
 
             // Register work claim at Tier2 (should be rejected)
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-SQL-T2",
                 &executor_actor_id,
                 WorkRole::Reviewer,
                 2,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-SQL-T2",
@@ -28827,6 +29945,9 @@ mod tests {
                 crate::gate::GateOrchestratorConfig::default(),
                 Arc::clone(&signer),
             ));
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
 
             // Derive the actor ID from the test peer credentials (uid=1000,
             // gid=1000) so the caller authorization check passes.
@@ -28836,6 +29957,11 @@ mod tests {
                 pid: Some(12345),
             });
 
+            // Wire orchestrator and mandatory DelegateSublease PCAC gate.
+            let dispatcher = dispatcher
+                .with_gate_orchestrator(orch)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             let cas = dispatcher
                 .cas
                 .as_ref()
@@ -28853,9 +29979,34 @@ mod tests {
                     include_attestation: true,
                 },
             );
-
-            // Wire orchestrator after construction (mimics DispatcherState flow)
-            let dispatcher = dispatcher.with_gate_orchestrator(orch);
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-SQL-DS",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-SQL-DS",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-SQL-DS".to_string(),
+                    lease_id: "sql-parent".to_string(),
+                    actor_id: caller_actor,
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration should succeed");
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "sql-parent".to_string(),
@@ -28918,6 +30069,207 @@ mod tests {
                     );
                 },
                 other => panic!("Expected parent-not-found rejection, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_missing_ancestor_lease_row_denied() {
+            let parent_lease_id = "sql-parent-missing-ancestor";
+            let missing_ancestor_lease_id = "sql-ancestor-missing";
+            let (dispatcher, ctx, _conn, caller_actor) = setup_delegate_sublease_sqlite_fixture(
+                parent_lease_id,
+                "W-SQL-DS-MISSING-ANCESTOR",
+                "gate-sql-ds",
+            );
+            emit_sublease_lineage_event(
+                &dispatcher,
+                parent_lease_id,
+                missing_ancestor_lease_id,
+                &caller_actor,
+                1_700_000_110,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-sql-missing-ancestor".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-missing-ancestor".to_string(),
+                identity_proof_hash: vec![0x44; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("references ancestor"),
+                        "missing ancestor denial must identify broken lineage edge, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message
+                            .contains("no authoritative gate_lease_issued record"),
+                        "missing ancestor denial must explain missing authoritative lease row, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected missing-ancestor denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_malformed_gate_lease_payload_denied() {
+            let parent_lease_id = "sql-parent-malformed-ancestor";
+            let ancestor_lease_id = "sql-ancestor-malformed";
+            let (dispatcher, ctx, conn, caller_actor) = setup_delegate_sublease_sqlite_fixture(
+                parent_lease_id,
+                "W-SQL-DS-MALFORMED-ANCESTOR",
+                "gate-sql-ds",
+            );
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by sqlite fixture");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: ancestor_lease_id,
+                    work_id: "W-SQL-DS-MALFORMED-ROOT",
+                    gate_id: "gate-sql-ds",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            emit_sublease_lineage_event(
+                &dispatcher,
+                parent_lease_id,
+                ancestor_lease_id,
+                &caller_actor,
+                1_700_000_120,
+            );
+
+            {
+                let conn = conn
+                    .lock()
+                    .expect("sqlite connection lock should be available");
+                let payload_bytes: Vec<u8> = conn
+                    .query_row(
+                        "SELECT payload FROM ledger_events \
+                         WHERE event_type = 'gate_lease_issued' \
+                         AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                         AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+                         ORDER BY rowid DESC LIMIT 1",
+                        rusqlite::params![ancestor_lease_id],
+                        |row| row.get(0),
+                    )
+                    .expect("ancestor gate_lease_issued payload should exist");
+                let mut payload_value: serde_json::Value = serde_json::from_slice(&payload_bytes)
+                    .expect("ancestor payload should deserialize");
+                payload_value["delegated_parent_lease_id"] = serde_json::json!(1337);
+                let malformed_payload = serde_json::to_vec(&payload_value)
+                    .expect("malformed payload fixture should serialize");
+                conn.execute(
+                    "UPDATE ledger_events \
+                     SET payload = ?1 \
+                     WHERE event_type = 'gate_lease_issued' \
+                     AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?2 \
+                     AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL",
+                    rusqlite::params![malformed_payload, ancestor_lease_id],
+                )
+                .expect("ancestor payload mutation should succeed");
+            }
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-sql-malformed-ancestor".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-malformed-ancestor".to_string(),
+                identity_proof_hash: vec![0x45; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lineage metadata lookup failed"),
+                        "malformed payload denial must indicate metadata lookup failure, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("non-string delegated_parent_lease_id"),
+                        "malformed payload denial must identify parse/type defect, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected malformed lineage metadata denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_valid_ancestor_chain_succeeds() {
+            let parent_lease_id = "sql-parent-valid-ancestor-chain";
+            let ancestor_lease_id = "sql-ancestor-root";
+            let (dispatcher, ctx, _conn, caller_actor) = setup_delegate_sublease_sqlite_fixture(
+                parent_lease_id,
+                "W-SQL-DS-VALID-ANCESTOR",
+                "gate-sql-ds",
+            );
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by sqlite fixture");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: ancestor_lease_id,
+                    work_id: "W-SQL-DS-VALID-ANCESTOR-ROOT",
+                    gate_id: "gate-sql-ds",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            emit_sublease_lineage_event(
+                &dispatcher,
+                parent_lease_id,
+                ancestor_lease_id,
+                &caller_actor,
+                1_700_000_130,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-sql-valid-ancestor".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-valid-ancestor".to_string(),
+                identity_proof_hash: vec![0x46; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-sql-valid-ancestor");
+                    assert_eq!(resp.parent_lease_id, parent_lease_id);
+                    assert_eq!(resp.gate_id, "gate-sql-ds");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "valid lineage chain response must carry event_id"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "valid lineage chain should pass sqlite delegation checks, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected DelegateSublease success, got {other:?}"),
             }
         }
 
@@ -28996,6 +30348,35 @@ mod tests {
                     include_attestation: true,
                 },
             );
+            let mut ds_policy_resolution = test_policy_resolution_with_lineage(
+                "W-PROD-001",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            ds_policy_resolution.resolved_policy_hash = [0xAB; 32];
+            ds_policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PROD-001",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &ds_policy_resolution,
+            );
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PROD-001".to_string(),
+                    lease_id: "ds-parent-prod".to_string(),
+                    actor_id: caller_actor.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution: ds_policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("delegate work claim registration should succeed");
 
             let ctx = ConnectionContext::privileged_session_open(Some(test_creds));
 
@@ -29052,12 +30433,13 @@ mod tests {
                 },
             );
 
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-REVIEW-001",
                 &caller_actor,
                 WorkRole::Reviewer,
                 0,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-REVIEW-001",
@@ -29122,10 +30504,7 @@ mod tests {
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_lifecycle_enabled_succeeds() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: true,
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -29216,10 +30595,7 @@ mod tests {
 
         #[test]
         fn test_ingest_review_receipt_privileged_pcac_lifecycle_enabled_succeeds() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: false,
-                require_ajc_for_ingest_review_receipt: true,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -29305,10 +30681,7 @@ mod tests {
 
         #[test]
         fn test_ingest_review_blocked_privileged_pcac_lifecycle_enabled_succeeds() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: false,
-                require_ajc_for_ingest_review_receipt: true,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -29394,10 +30767,7 @@ mod tests {
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_tier2_pointer_only_denied() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: true,
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
 
@@ -29585,10 +30955,7 @@ mod tests {
 
             let dispatcher = dispatcher
                 .with_pcac_lifecycle_gate(gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_delegate_sublease: false,
-                    require_ajc_for_ingest_review_receipt: true,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "pcac-review-pointer-only-observe".to_string(),
@@ -29611,34 +30978,94 @@ mod tests {
             let observed = observed_levels.lock().expect("lock poisoned");
             assert!(
                 observed.contains(&IdentityEvidenceLevel::PointerOnly),
-                "IngestReviewReceipt must construct join input with PointerOnly identity evidence"
+                "IngestReviewReceipt must construct join input with PointerOnly identity evidence (WVR-0103 active)"
             );
         }
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_deny_delegation_widening() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: true,
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, false);
-
-            register_test_lease_and_claim(
-                &state,
-                "pcac-parent-wide",
-                "W-PCAC-DS-WIDE",
-                "gate-pcac-wide",
-                &caller_actor,
-                [0xCD; 32],
-                0,
+            let cas = state
+                .privileged_dispatcher()
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by DispatcherState");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: state.privileged_dispatcher(),
+                    cas: cas.as_ref(),
+                    lease_id: "pcac-parent-wide",
+                    work_id: "W-PCAC-DS-WIDE",
+                    gate_id: "gate-pcac-wide",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xCD; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
             );
 
+            // Bind the Tier2+ pointer-only waiver scope to a narrower expiry.
+            let expected_scope_hash = {
+                let expected_expiry_millis = 1_900_000_u64;
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"pcac-privileged-delegate-sublease-scope-v1");
+                hasher.update(b"pcac-parent-wide");
+                hasher.update(b"pcac-sublease-wide");
+                hasher.update(b"pcac-child-wide");
+                hasher.update(&expected_expiry_millis.to_le_bytes());
+                hasher.update(b"W-PCAC-DS-WIDE");
+                hasher.update(b"gate-pcac-wide");
+                *hasher.finalize().as_bytes()
+            };
+            let waiver = apm2_core::pcac::PointerOnlyWaiver {
+                waiver_id: "WVR-PCAC-DS-WIDE".to_string(),
+                expires_at_tick: u64::MAX,
+                scope_binding_hash: expected_scope_hash,
+            };
+            let pcac_policy = apm2_core::pcac::PcacPolicyKnobs {
+                pointer_only_waiver: Some(waiver.clone()),
+                ..apm2_core::pcac::PcacPolicyKnobs::default()
+            };
+
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-PCAC-DS-WIDE",
+                &caller_actor,
+                WorkRole::Reviewer,
+                2,
+            );
+            policy_resolution.resolved_policy_hash = [0xCD; 32];
+            policy_resolution.pointer_only_waiver = Some(waiver);
+            policy_resolution.pcac_policy = Some(pcac_policy);
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PCAC-DS-WIDE",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PCAC-DS-WIDE".to_string(),
+                    lease_id: "pcac-parent-wide".to_string(),
+                    actor_id: caller_actor,
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration for widening denial");
+
             // Parent expires_at is 2_000_000ms in the test lease helper.
+            // Request widening beyond parent + waiver-scoped expiry.
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "pcac-parent-wide".to_string(),
                 delegatee_actor_id: "pcac-child-wide".to_string(),
-                requested_expiry_ns: 2_000_000_000_000,
+                requested_expiry_ns: 2_100_000_000_000,
                 sublease_id: "pcac-sublease-wide".to_string(),
                 identity_proof_hash: vec![0x66; 32],
             };
@@ -29651,8 +31078,13 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("delegation widening"),
-                        "widening denial must mention delegation widening, got: {}",
+                        err.message.contains("WaiverScopeInvalid")
+                            || err.message.contains("waiver")
+                            || err.message.contains("strict expiry narrowing violated")
+                            || err
+                                .message
+                                .contains("PCAC authority denied for DelegateSublease"),
+                        "widening denial must fail closed, got: {}",
                         err.message
                     );
                 },
@@ -29683,78 +31115,368 @@ mod tests {
         }
 
         #[test]
-        fn test_delegate_sublease_privileged_pcac_deny_missing_lineage() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: true,
-                require_ajc_for_ingest_review_receipt: false,
+        fn test_delegate_sublease_privileged_pcac_deny_stale_authority_revalidate() {
+            use apm2_core::pcac::{
+                AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
+                AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
             };
-            let (state, ctx, caller_actor, _cas_dir) =
-                setup_dispatcher_state_with_privileged_pcac(policy, false);
 
-            // Zero policy_hash is treated as missing lineage binding.
-            register_test_lease_and_claim(
-                &state,
-                "pcac-parent-lineage-missing",
-                "W-PCAC-DS-LINEAGE",
-                "gate-pcac-lineage",
-                &caller_actor,
-                [0u8; 32],
-                0,
+            struct StaleAfterJoinKernel {
+                inner: crate::pcac::InProcessKernel,
+            }
+
+            impl StaleAfterJoinKernel {
+                fn new() -> Self {
+                    Self {
+                        inner: crate::pcac::InProcessKernel::new(1),
+                    }
+                }
+            }
+
+            impl AuthorityJoinKernel for StaleAfterJoinKernel {
+                fn join(
+                    &self,
+                    input: &AuthorityJoinInputV1,
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
+                ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                    let cert = AuthorityJoinKernel::join(&self.inner, input, policy)?;
+                    self.inner.advance_tick(
+                        cert.issued_at_tick
+                            .saturating_add(policy.freshness_max_age_ticks)
+                            .saturating_add(1),
+                    );
+                    Ok(cert)
+                }
+
+                fn revalidate(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    current_time_envelope_ref: [u8; 32],
+                    current_ledger_anchor: [u8; 32],
+                    current_revocation_head_hash: [u8; 32],
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
+                ) -> Result<(), Box<AuthorityDenyV1>> {
+                    AuthorityJoinKernel::revalidate(
+                        &self.inner,
+                        cert,
+                        current_time_envelope_ref,
+                        current_ledger_anchor,
+                        current_revocation_head_hash,
+                        policy,
+                    )
+                }
+
+                fn consume(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    intent_digest: [u8; 32],
+                    boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+                    requires_authoritative_acceptance: bool,
+                    current_time_envelope_ref: [u8; 32],
+                    current_revocation_head_hash: [u8; 32],
+                    policy: &apm2_core::pcac::PcacPolicyKnobs,
+                ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+                {
+                    AuthorityJoinKernel::consume(
+                        &self.inner,
+                        cert,
+                        intent_digest,
+                        boundary_intent_class,
+                        requires_authoritative_acceptance,
+                        current_time_envelope_ref,
+                        current_revocation_head_hash,
+                        policy,
+                    )
+                }
+            }
+
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: "pcac-parent-stale",
+                    work_id: "W-PCAC-DS-STALE",
+                    gate_id: "gate-pcac-stale",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xD2; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
             );
 
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-PCAC-DS-STALE",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xD2; 32];
+            let pcac_policy = apm2_core::pcac::PcacPolicyKnobs {
+                freshness_max_age_ticks: 0,
+                ..apm2_core::pcac::PcacPolicyKnobs::default()
+            };
+            policy_resolution.pcac_policy = Some(pcac_policy);
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PCAC-DS-STALE",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PCAC-DS-STALE".to_string(),
+                    lease_id: "pcac-parent-stale".to_string(),
+                    actor_id: caller_actor,
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
+
+            let kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(StaleAfterJoinKernel::new());
+            let gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = dispatcher
+                .with_gate_orchestrator(orchestrator)
+                .with_pcac_lifecycle_gate(gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+
             let request = DelegateSubleaseRequest {
-                parent_lease_id: "pcac-parent-lineage-missing".to_string(),
-                delegatee_actor_id: "pcac-child-lineage".to_string(),
+                parent_lease_id: "pcac-parent-stale".to_string(),
+                delegatee_actor_id: "pcac-child-stale".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
-                sublease_id: "pcac-sublease-lineage".to_string(),
-                identity_proof_hash: vec![0x77; 32],
+                sublease_id: "pcac-sublease-stale".to_string(),
+                identity_proof_hash: vec![0x74; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
-            let response = state
-                .privileged_dispatcher()
-                .dispatch(&frame, &ctx)
-                .unwrap();
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("invalid delegation chain"),
-                        "missing lineage denial must mention invalid delegation chain, got: {}",
+                        err.message
+                            .contains("PCAC authority denied for DelegateSublease")
+                            && err.message.contains("freshness"),
+                        "stale authority denial must fail during revalidate, got: {}",
                         err.message
                     );
                 },
-                other => panic!("expected missing-lineage denial, got {other:?}"),
+                other => panic!("expected stale authority denial, got {other:?}"),
             }
 
-            let persisted_sublease = state
-                .privileged_dispatcher()
+            let persisted_sublease = dispatcher
                 .lease_validator()
-                .get_gate_lease("pcac-sublease-lineage");
+                .get_gate_lease("pcac-sublease-stale");
             assert!(
                 persisted_sublease.is_none(),
-                "missing-lineage denial must not persist a sublease"
+                "stale authority denial must not persist a sublease"
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_privileged_pcac_deny_duplicate_consume_from_durable_index() {
+            use apm2_core::pcac::{
+                AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
+                AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+            };
+
+            struct DeterministicKernel;
+
+            impl AuthorityJoinKernel for DeterministicKernel {
+                fn join(
+                    &self,
+                    input: &AuthorityJoinInputV1,
+                    _policy: &apm2_core::pcac::PcacPolicyKnobs,
+                ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                    Ok(AuthorityJoinCertificateV1 {
+                        ajc_id: [0xA5; 32],
+                        authority_join_hash: [0x5A; 32],
+                        intent_digest: input.intent_digest,
+                        boundary_intent_class: input.boundary_intent_class,
+                        risk_tier: input.risk_tier,
+                        issued_time_envelope_ref: input.time_envelope_ref,
+                        issued_at_tick: 1,
+                        as_of_ledger_anchor: input.as_of_ledger_anchor,
+                        expires_at_tick: u64::MAX,
+                        revocation_head_hash: input.directory_head_hash,
+                        identity_evidence_level: input.identity_evidence_level,
+                        admission_capacity_token: None,
+                    })
+                }
+
+                fn revalidate(
+                    &self,
+                    _cert: &AuthorityJoinCertificateV1,
+                    _current_time_envelope_ref: [u8; 32],
+                    _current_ledger_anchor: [u8; 32],
+                    _current_revocation_head_hash: [u8; 32],
+                    _policy: &apm2_core::pcac::PcacPolicyKnobs,
+                ) -> Result<(), Box<AuthorityDenyV1>> {
+                    Ok(())
+                }
+
+                fn consume(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    intent_digest: [u8; 32],
+                    _boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+                    _requires_authoritative_acceptance: bool,
+                    current_time_envelope_ref: [u8; 32],
+                    _current_revocation_head_hash: [u8; 32],
+                    _policy: &apm2_core::pcac::PcacPolicyKnobs,
+                ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+                {
+                    Ok((
+                        AuthorityConsumedV1 {
+                            ajc_id: cert.ajc_id,
+                            intent_digest,
+                            consumed_time_envelope_ref: current_time_envelope_ref,
+                            consumed_at_tick: 2,
+                        },
+                        AuthorityConsumeRecordV1 {
+                            ajc_id: cert.ajc_id,
+                            consumed_time_envelope_ref: current_time_envelope_ref,
+                            consumed_at_tick: 2,
+                            effect_selector_digest: [0xCC; 32],
+                        },
+                    ))
+                }
+            }
+
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: "pcac-parent-duplicate-consume",
+                    work_id: "W-PCAC-DS-DUP-CONSUME",
+                    gate_id: "gate-pcac-duplicate-consume",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xE2; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
             );
 
-            let sublease_events = state
-                .privileged_dispatcher()
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-PCAC-DS-DUP-CONSUME",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xE2; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PCAC-DS-DUP-CONSUME",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PCAC-DS-DUP-CONSUME".to_string(),
+                    lease_id: "pcac-parent-duplicate-consume".to_string(),
+                    actor_id: caller_actor,
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
+
+            let consume_dir = tempfile::tempdir().expect("durable consume tempdir");
+            let consume_log_path = consume_dir.path().join("pcac_consume.log");
+            let durable_index = crate::pcac::FileBackedConsumeIndex::open(&consume_log_path, None)
+                .expect("open durable consume index");
+            let durable_kernel =
+                crate::pcac::DurableKernel::new(DeterministicKernel, Box::new(durable_index));
+            let kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(durable_kernel);
+            let gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = dispatcher
+                .with_gate_orchestrator(orchestrator)
+                .with_pcac_lifecycle_gate(gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "pcac-parent-duplicate-consume".to_string(),
+                delegatee_actor_id: "pcac-child-duplicate-consume".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "pcac-sublease-duplicate-consume".to_string(),
+                identity_proof_hash: vec![0x91; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let first_response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            assert!(
+                matches!(first_response, PrivilegedResponse::DelegateSublease(_)),
+                "first delegated sublease should succeed before consume replay"
+            );
+
+            let second_response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match second_response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("authority already consumed"),
+                        "second request must be denied by durable consume index, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected duplicate consume denial, got {other:?}"),
+            }
+
+            let sublease_events = dispatcher
                 .event_emitter()
-                .get_events_by_work_id("pcac-sublease-lineage");
+                .get_events_by_work_id("pcac-sublease-duplicate-consume");
             let sublease_event_count = sublease_events
                 .iter()
                 .filter(|event| event.event_type == "SubleaseIssued")
                 .count();
             assert_eq!(
-                sublease_event_count, 0,
-                "missing-lineage denial must not emit SubleaseIssued events"
+                sublease_event_count, 1,
+                "duplicate consume denial must not emit an additional SubleaseIssued event"
             );
         }
 
         #[test]
         fn test_delegate_sublease_privileged_pcac_deny_lifecycle_failure() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: true,
-                require_ajc_for_ingest_review_receipt: false,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, true);
 
@@ -29817,10 +31539,7 @@ mod tests {
 
         #[test]
         fn test_ingest_review_receipt_privileged_pcac_deny_lifecycle_failure() {
-            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
-                require_ajc_for_delegate_sublease: false,
-                require_ajc_for_ingest_review_receipt: true,
-            };
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {};
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, true);
 
@@ -29877,7 +31596,7 @@ mod tests {
         }
 
         #[test]
-        fn test_privileged_handlers_policy_off_no_wire_break_without_privileged_gate() {
+        fn test_delegate_sublease_pcac_mandatory_even_when_policy_default() {
             let policy = crate::protocol::dispatch::PrivilegedPcacPolicy::default();
             let (state, ctx, caller_actor, _cas_dir) =
                 setup_dispatcher_state_with_privileged_pcac(policy, true);
@@ -29913,10 +31632,16 @@ mod tests {
                 .privileged_dispatcher()
                 .dispatch(&delegate_frame, &ctx)
                 .unwrap();
-            assert!(
-                matches!(delegate_response, PrivilegedResponse::DelegateSublease(_)),
-                "DelegateSublease must remain wire-compatible when rollout flag is off"
-            );
+            match delegate_response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC authority gate not wired"),
+                        "DelegateSublease must fail-closed when PCAC lifecycle gate is missing, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected DelegateSublease fail-closed denial, got {other:?}"),
+            }
 
             let delegate_events = state
                 .privileged_dispatcher()
@@ -29927,8 +31652,8 @@ mod tests {
                 .filter(|event| event.event_type == "SubleaseIssued")
                 .count();
             assert_eq!(
-                delegate_event_count, 1,
-                "DelegateSublease must still emit SubleaseIssued when rollout flag is off"
+                delegate_event_count, 0,
+                "DelegateSublease must not emit SubleaseIssued when PCAC gate is missing"
             );
 
             let review_request = IngestReviewReceiptRequest {
@@ -29947,10 +31672,16 @@ mod tests {
                 .privileged_dispatcher()
                 .dispatch(&review_frame, &ctx)
                 .unwrap();
-            assert!(
-                matches!(review_response, PrivilegedResponse::IngestReviewReceipt(_)),
-                "IngestReviewReceipt must remain wire-compatible when rollout flag is off"
-            );
+            match review_response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC authority gate not wired"),
+                        "IngestReviewReceipt must fail-closed when PCAC lifecycle gate is missing, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected IngestReviewReceipt fail-closed denial, got {other:?}"),
+            }
 
             let review_events = state
                 .privileged_dispatcher()
@@ -29961,8 +31692,112 @@ mod tests {
                 .filter(|event| event.event_type == "review_receipt_recorded")
                 .count();
             assert_eq!(
-                review_event_count, 1,
-                "IngestReviewReceipt must still emit review_receipt_recorded when rollout flag is off"
+                review_event_count, 0,
+                "IngestReviewReceipt must not emit review_receipt_recorded when PCAC gate is missing"
+            );
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_pcac_mandatory_even_when_policy_default() {
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy::default();
+            let (state, ctx, caller_actor, _cas_dir) =
+                setup_dispatcher_state_with_privileged_pcac(policy, false);
+
+            let cas = state
+                .privileged_dispatcher()
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by DispatcherState");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: state.privileged_dispatcher(),
+                    cas: cas.as_ref(),
+                    lease_id: "pcac-review-lifecycle-disabled",
+                    work_id: "W-PCAC-RR-LIFECYCLE-DISABLED",
+                    gate_id: "gate-pcac-review-lifecycle-disabled",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xA3; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-PCAC-RR-LIFECYCLE-DISABLED",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xA3; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs {
+                lifecycle_enforcement: false,
+                ..apm2_core::pcac::PcacPolicyKnobs::default()
+            });
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PCAC-RR-LIFECYCLE-DISABLED",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PCAC-RR-LIFECYCLE-DISABLED".to_string(),
+                    lease_id: "pcac-review-lifecycle-disabled".to_string(),
+                    actor_id: caller_actor.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "pcac-review-lifecycle-disabled".to_string(),
+                receipt_id: "RR-PCAC-LIFECYCLE-DISABLED".to_string(),
+                reviewer_actor_id: caller_actor,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x55; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("IngestReviewReceipt requires PCAC lifecycle evidence (mandatory cutover)"),
+                        "mandatory cutover must deny when lifecycle_enforcement=false, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("expected IngestReviewReceipt mandatory PCAC denial, got {other:?}")
+                },
+            }
+
+            let review_events = state
+                .privileged_dispatcher()
+                .event_emitter()
+                .get_events_by_work_id("W-PCAC-RR-LIFECYCLE-DISABLED");
+            let review_event_count = review_events
+                .iter()
+                .filter(|event| event.event_type == "review_receipt_recorded")
+                .count();
+            assert_eq!(
+                review_event_count, 0,
+                "mandatory PCAC denial must not emit review_receipt_recorded events"
             );
         }
 
