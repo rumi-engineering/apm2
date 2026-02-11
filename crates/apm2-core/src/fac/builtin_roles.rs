@@ -883,7 +883,10 @@ pub fn get_builtin_role(role_id: &str) -> Option<RoleSpecV1> {
 mod tests {
     use super::*;
     use crate::evidence::MemoryCas;
-    use crate::fac::ROLE_SPEC_V1_SCHEMA;
+    use crate::fac::{
+        FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES, ROLE_SPEC_V1_SCHEMA,
+        forbidden_direct_github_capability_class,
+    };
 
     #[test]
     fn test_orchestrator_role_valid() {
@@ -1226,6 +1229,34 @@ mod tests {
                 role.role_id
             );
         }
+    }
+
+    #[test]
+    fn test_builtin_roles_exclude_direct_github_capability_classes() {
+        for role in all_builtin_roles() {
+            for capability in role.required_capabilities.keys() {
+                assert!(
+                    forbidden_direct_github_capability_class(capability).is_none(),
+                    "role {} must not include forbidden direct GitHub capability class in {}",
+                    role.role_id,
+                    capability
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_builtin_role_contract_v2_excludes_direct_github_capability_classes() {
+        let contract = fac_workobject_implementor_v2_role_contract();
+        for capability in contract.required_capabilities.keys() {
+            assert!(
+                forbidden_direct_github_capability_class(capability).is_none(),
+                "v2 contract must not include forbidden direct GitHub capability class in {capability}",
+            );
+        }
+
+        // Sanity: test explicitly exercises all forbidden classes.
+        assert_eq!(FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES.len(), 4);
     }
 
     #[test]

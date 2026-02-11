@@ -217,7 +217,7 @@ impl GitHubAppTokenProvider {
 
     /// Legacy helper — resolves from env var or keyring only (no config file).
     ///
-    /// Prefer [`resolve_private_key`] which also checks the config file.
+    /// Prefer [`Self::resolve_private_key`] which also checks the config file.
     ///
     /// # Errors
     ///

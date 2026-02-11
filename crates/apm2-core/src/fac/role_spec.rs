@@ -99,6 +99,40 @@ pub const MAX_TOOL_BUDGETS: usize = 256;
 /// Maximum length for capability ID.
 pub const MAX_CAPABILITY_ID_LENGTH: usize = 128;
 
+/// Forbidden direct GitHub capability classes for production `agent_runtime`
+/// projection isolation (RFC-0028 REQ-0008).
+pub const FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES: [&str; 4] = [
+    "github_api",
+    "gh_cli",
+    "forge_org_admin",
+    "forge_repo_admin",
+];
+
+/// Returns the forbidden direct GitHub capability class if `capability_id`
+/// resolves to one, otherwise `None`.
+#[must_use]
+pub fn forbidden_direct_github_capability_class(capability_id: &str) -> Option<&'static str> {
+    let normalized = capability_id.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let normalized = normalized
+        .strip_prefix("kernel.")
+        .unwrap_or(&normalized)
+        .trim();
+
+    let class = normalized
+        .split(['.', ':', '/'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(normalized);
+
+    FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES
+        .iter()
+        .copied()
+        .find(|forbidden| class == *forbidden)
+}
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -144,6 +178,10 @@ pub enum RoleSpecError {
     /// Invalid tool class in allowlist.
     #[error("invalid tool class: {0}")]
     InvalidToolClass(String),
+
+    /// Forbidden direct GitHub capability class for production agent runtime.
+    #[error("forbidden direct GitHub capability class: {0}")]
+    ForbiddenCapabilityClass(String),
 
     /// Tool budget specified for tool not in allowlist.
     #[error("tool budget for '{tool}' not in allowlist")]
@@ -723,6 +761,11 @@ impl RoleSpecV1 {
                     max: MAX_CAPABILITY_ID_LENGTH,
                 });
             }
+            if let Some(forbidden_class) = forbidden_direct_github_capability_class(cap_id) {
+                return Err(RoleSpecError::ForbiddenCapabilityClass(format!(
+                    "{cap_id} (class: {forbidden_class})"
+                )));
+            }
         }
 
         Ok(())
@@ -1120,6 +1163,23 @@ mod tests {
             allowlist.validate(),
             Err(RoleSpecError::ToolBudgetNotInAllowlist { tool }) if tool == "kernel.fs.write"
         ));
+    }
+
+    #[test]
+    fn test_role_spec_rejects_forbidden_direct_github_capability_classes() {
+        for forbidden in FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES {
+            let result = RoleSpecV1::builder()
+                .role_id("forbidden-cap-role")
+                .role_name("Forbidden Capability Role")
+                .tool_allowlist(ToolAllowlist::empty().with_tool("kernel.fs.read"))
+                .required_capability(format!("{forbidden}.write"), 1)
+                .build();
+
+            assert!(
+                matches!(result, Err(RoleSpecError::ForbiddenCapabilityClass(_))),
+                "expected forbidden capability class rejection for {forbidden}, got: {result:?}"
+            );
+        }
     }
 
     #[test]

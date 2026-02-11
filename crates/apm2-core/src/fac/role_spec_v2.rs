@@ -22,6 +22,7 @@ use thiserror::Error;
 use super::role_spec::{
     MAX_CAPABILITY_ID_LENGTH, MAX_DESCRIPTION_LENGTH, MAX_OUTPUT_SCHEMA_LENGTH, MAX_ROLE_ID_LENGTH,
     MAX_ROLE_NAME_LENGTH, MAX_TOOL_CLASS_LENGTH, RoleType,
+    forbidden_direct_github_capability_class,
 };
 use crate::evidence::{CasError, ContentAddressedStore};
 use crate::htf::Canonicalizable;
@@ -98,6 +99,10 @@ pub enum RoleSpecV2Error {
     /// Invalid tool class in allowlist or budget map.
     #[error("invalid tool class: {0}")]
     InvalidToolClass(String),
+
+    /// Forbidden direct GitHub capability class for production agent runtime.
+    #[error("forbidden direct GitHub capability class: {0}")]
+    ForbiddenCapabilityClass(String),
 
     /// Required tool budget entry missing for an allowlisted tool.
     #[error("missing tool budget for allowlisted tool: {tool}")]
@@ -613,6 +618,11 @@ impl RoleSpecV2 {
                     max: MAX_CAPABILITY_ID_LENGTH,
                 });
             }
+            if let Some(forbidden_class) = forbidden_direct_github_capability_class(cap_id) {
+                return Err(RoleSpecV2Error::ForbiddenCapabilityClass(format!(
+                    "{cap_id} (class: {forbidden_class})"
+                )));
+            }
         }
 
         Ok(())
@@ -806,6 +816,20 @@ mod tests {
     fn role_spec_v2_validates() {
         let spec = valid_role_spec_v2();
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn role_spec_v2_rejects_forbidden_direct_github_capability_classes() {
+        for forbidden in super::super::role_spec::FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES {
+            let mut spec = valid_role_spec_v2();
+            spec.required_capabilities
+                .insert(format!("{forbidden}.write"), 1);
+            let err = spec.validate().unwrap_err();
+            assert!(
+                matches!(err, RoleSpecV2Error::ForbiddenCapabilityClass(_)),
+                "expected forbidden capability class rejection for {forbidden}, got: {err:?}"
+            );
+        }
     }
 
     #[test]
