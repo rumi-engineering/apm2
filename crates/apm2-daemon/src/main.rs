@@ -1536,12 +1536,12 @@ async fn async_main(args: Args) -> Result<()> {
             let github_repo = dw_config.github_repo.clone();
             let trunk_branch = dw_config.trunk_branch.clone();
             let watchdog_state = state.clone();
+            let watchdog_repo_id = repo_id;
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(poll_interval);
-                // Track the last known merge receipt HEAD to avoid redundant API
-                // calls when no new merges have happened.
-                let mut last_divergence_detected = false;
+                let precautionary_freeze_id = format!("precautionary-{watchdog_repo_id}");
+                let mut consecutive_check_errors: u32 = 0;
 
                 loop {
                     interval.tick().await;
@@ -1595,6 +1595,7 @@ async fn async_main(args: Args) -> Result<()> {
                     // Step 3: Check for divergence.
                     match watchdog.check_divergence(merge_receipt_head, external_head) {
                         Ok(Some(result)) => {
+                            consecutive_check_errors = 0;
                             // Divergence detected! Emit DefectRecorded event.
                             error!(
                                 expected_head = %hex::encode(merge_receipt_head),
@@ -1725,22 +1726,40 @@ async fn async_main(args: Args) -> Result<()> {
                                     error!("Failed to serialize projection replay receipt payload");
                                 }
                             }
-
-                            last_divergence_detected = true;
                         },
                         Ok(None) => {
-                            // No divergence, or already frozen (idempotent).
-                            if last_divergence_detected {
-                                // Still frozen from prior detection -- no
-                                // new event.
-                                // This is the idempotent path.
+                            let had_check_errors = consecutive_check_errors > 0;
+                            consecutive_check_errors = 0;
+
+                            // Successful checks after transient watchdog errors
+                            // can remove precautionary freezes, but only when
+                            // no non-precautionary (divergence) freeze is active.
+                            if had_check_errors {
+                                let registry = watchdog.registry();
+                                let has_active_divergence_freeze = registry
+                                    .is_frozen(&watchdog_repo_id)
+                                    .as_deref()
+                                    .is_some_and(|freeze_id| {
+                                        !freeze_id.starts_with("precautionary-")
+                                    });
+                                if !has_active_divergence_freeze {
+                                    registry.remove_precautionary_freeze(
+                                        &watchdog_repo_id,
+                                        &precautionary_freeze_id,
+                                    );
+                                }
                             }
                         },
                         Err(e) => {
+                            consecutive_check_errors = consecutive_check_errors.saturating_add(1);
                             error!(
                                 error = %e,
-                                "Divergence check failed (fail-closed: check will \
-                                 retry on next poll)"
+                                consecutive_check_errors,
+                                "Divergence check failed; precautionary freeze applied until next successful check"
+                            );
+                            watchdog.registry().register_precautionary_freeze(
+                                &watchdog_repo_id,
+                                precautionary_freeze_id.clone(),
                             );
                         },
                     }

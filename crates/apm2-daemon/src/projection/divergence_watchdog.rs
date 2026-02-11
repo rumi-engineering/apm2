@@ -113,6 +113,9 @@ const MAX_TIME_ENVELOPE_REF_LENGTH: usize = 1024;
 /// Maximum supported trusted authority bindings in watchdog config.
 const MAX_TRUSTED_AUTHORITY_BINDINGS: usize = 64;
 
+/// Prefix reserved for fail-closed precautionary freezes.
+const PRECAUTIONARY_FREEZE_ID_PREFIX: &str = "precautionary-";
+
 // =============================================================================
 // Type-Safe Identifiers (CTR-2602)
 // =============================================================================
@@ -390,10 +393,17 @@ struct VerifiedTemporalAuthority {
 pub struct SinkEndpointEvidenceV1 {
     /// Canonical sink endpoint identifier (URL or hostname form).
     pub endpoint_canonical_id: String,
-    /// Endpoint key fingerprint (TLS SPKI/SSH host key fingerprint).
+    /// Endpoint key fingerprint. When `endpoint_identity_verified` is true,
+    /// this is derived from remote endpoint identity (TLS SPKI/SSH host key).
+    /// When false, this is derived from local signer key material as a
+    /// placeholder binding.
     pub endpoint_key_fingerprint: String,
     /// Key epoch for endpoint key rotation continuity.
     pub key_epoch: u64,
+    /// Whether the endpoint key fingerprint was verified against remote
+    /// endpoint identity material. When `false`, the fingerprint is derived
+    /// from local signer key material as a placeholder binding.
+    pub endpoint_identity_verified: bool,
 }
 
 /// Signed temporal authority envelope for compromise and recovery decisions.
@@ -1885,6 +1895,67 @@ impl FreezeRegistry {
         self.hydrated.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn is_precautionary_freeze_id(freeze_id: &str) -> bool {
+        freeze_id.starts_with(PRECAUTIONARY_FREEZE_ID_PREFIX)
+    }
+
+    /// Registers a fail-closed precautionary freeze for a scope.
+    ///
+    /// This path is used when divergence checks fail internally and the daemon
+    /// must block admissions until a successful follow-up check confirms state.
+    ///
+    /// Returns `true` only when a new freeze is inserted.
+    pub fn register_precautionary_freeze(&self, scope_value: &str, freeze_id: String) -> bool {
+        if !Self::is_precautionary_freeze_id(&freeze_id) {
+            return false;
+        }
+
+        let Ok(mut active) = self.active_freezes.write() else {
+            return false;
+        };
+        let Ok(mut scope) = self.scope_map.write() else {
+            return false;
+        };
+
+        if scope.contains_key(scope_value) {
+            return false;
+        }
+
+        active.insert(freeze_id.clone());
+        scope.insert(scope_value.to_string(), freeze_id);
+        true
+    }
+
+    /// Removes a fail-closed precautionary freeze for a scope if IDs match.
+    ///
+    /// Returns `true` only when the mapped freeze exactly matches
+    /// `freeze_id` and follows the precautionary ID prefix contract.
+    pub fn remove_precautionary_freeze(&self, scope_value: &str, freeze_id: &str) -> bool {
+        if !Self::is_precautionary_freeze_id(freeze_id) {
+            return false;
+        }
+
+        let Ok(mut active) = self.active_freezes.write() else {
+            return false;
+        };
+        let Ok(mut scope) = self.scope_map.write() else {
+            return false;
+        };
+
+        let should_remove = scope
+            .get(scope_value)
+            .is_some_and(|existing| existing == freeze_id)
+            && Self::is_precautionary_freeze_id(freeze_id);
+
+        if !should_remove {
+            return false;
+        }
+
+        scope.remove(scope_value);
+        active.remove(freeze_id);
+        true
+    }
+
     /// Replays a freeze event from ledger during rehydration.
     ///
     /// This method registers a freeze in the registry after verifying its
@@ -1959,11 +2030,15 @@ impl FreezeRegistry {
         // Prevent duplicate registrations for the same scope.
         // This prevents unbounded memory growth in active_freezes if multiple
         // freeze events are registered for the same scope without unfreeze.
-        if let Some(existing_freeze_id) = scope.get(&freeze.scope_value) {
-            return Err(DivergenceError::ScopeAlreadyFrozen {
-                scope_value: freeze.scope_value.clone(),
-                existing_freeze_id: existing_freeze_id.clone(),
-            });
+        if let Some(existing_freeze_id) = scope.get(&freeze.scope_value).cloned() {
+            if Self::is_precautionary_freeze_id(&existing_freeze_id) {
+                active.remove(&existing_freeze_id);
+            } else {
+                return Err(DivergenceError::ScopeAlreadyFrozen {
+                    scope_value: freeze.scope_value.clone(),
+                    existing_freeze_id,
+                });
+            }
         }
 
         active.insert(freeze.freeze_id.clone());
@@ -2582,15 +2657,27 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         *hasher.finalize().as_bytes()
     }
 
-    fn sink_endpoint_evidence(&self) -> SinkEndpointEvidenceV1 {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"apm2.projection_compromise.endpoint_key_fingerprint.v1");
-        hasher.update(&self.signer.public_key_bytes());
-        SinkEndpointEvidenceV1 {
-            endpoint_canonical_id: format!("github://{}", self.config.repo_id),
-            endpoint_key_fingerprint: hex::encode(hasher.finalize().as_bytes()),
-            key_epoch: 0,
-        }
+    fn sink_endpoint_evidence(&self, remote_fingerprint: Option<&str>) -> SinkEndpointEvidenceV1 {
+        remote_fingerprint.map_or_else(
+            || {
+                let mut hasher = blake3::Hasher::new();
+                hasher
+                    .update(b"apm2.projection_compromise.endpoint_key_fingerprint.local_signer.v1");
+                hasher.update(&self.signer.public_key_bytes());
+                SinkEndpointEvidenceV1 {
+                    endpoint_canonical_id: format!("github://{}", self.config.repo_id),
+                    endpoint_key_fingerprint: hex::encode(hasher.finalize().as_bytes()),
+                    key_epoch: 0,
+                    endpoint_identity_verified: false,
+                }
+            },
+            |fingerprint| SinkEndpointEvidenceV1 {
+                endpoint_canonical_id: format!("github://{}", self.config.repo_id),
+                endpoint_key_fingerprint: fingerprint.to_string(),
+                key_epoch: 0,
+                endpoint_identity_verified: true,
+            },
+        )
     }
 
     fn validate_sink_endpoint_evidence(
@@ -2632,6 +2719,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         hasher.update(endpoint_evidence.endpoint_canonical_id.as_bytes());
         hasher.update(endpoint_evidence.endpoint_key_fingerprint.as_bytes());
         hasher.update(&endpoint_evidence.key_epoch.to_be_bytes());
+        hasher.update(&[u8::from(endpoint_evidence.endpoint_identity_verified)]);
         Ok(*hasher.finalize().as_bytes())
     }
 
@@ -2645,6 +2733,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         hasher.update(endpoint_evidence.endpoint_canonical_id.as_bytes());
         hasher.update(endpoint_evidence.endpoint_key_fingerprint.as_bytes());
         hasher.update(&endpoint_evidence.key_epoch.to_be_bytes());
+        hasher.update(&[u8::from(endpoint_evidence.endpoint_identity_verified)]);
         Ok(*hasher.finalize().as_bytes())
     }
 
@@ -2690,7 +2779,9 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         // If the repository is already frozen (from a prior divergence), we don't
         // need to create another freeze event. This makes the operation idempotent
         // and prevents DoS via accumulated freeze IDs in the registry.
-        if self.registry.is_frozen(&self.config.repo_id).is_some() {
+        if let Some(freeze_id) = self.registry.is_frozen(&self.config.repo_id)
+            && !FreezeRegistry::is_precautionary_freeze_id(&freeze_id)
+        {
             return Ok(None);
         }
 
@@ -2737,7 +2828,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         } = self.resolve_temporal_authority(timestamp, &trusted_authority_bindings)?;
         let time_envelope_ref = time_authority_envelope.time_envelope_ref.clone();
         let window_ref = time_authority_envelope.window_ref;
-        let sink_endpoint_evidence = self.sink_endpoint_evidence();
+        let sink_endpoint_evidence = self.sink_endpoint_evidence(None);
         let sink_identity_digest = self.derive_sink_identity_digest(&sink_endpoint_evidence)?;
         let endpoint_binding_digest =
             Self::derive_endpoint_binding_digest(&sink_endpoint_evidence)?;
@@ -2848,6 +2939,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             "sink_endpoint_canonical_id": sink_endpoint_evidence.endpoint_canonical_id,
             "sink_endpoint_key_fingerprint": sink_endpoint_evidence.endpoint_key_fingerprint,
             "sink_endpoint_key_epoch": sink_endpoint_evidence.key_epoch,
+            "sink_endpoint_identity_verified": sink_endpoint_evidence.endpoint_identity_verified,
         });
 
         let defect = DefectRecord::builder(&defect_id, "PROJECTION_DIVERGENCE")
@@ -4083,6 +4175,71 @@ pub mod tests {
     }
 
     #[test]
+    fn test_register_precautionary_freeze_registers_scope_and_exposes_freeze_id() {
+        let registry = FreezeRegistry::new_hydrated_for_testing();
+        let freeze_id = "precautionary-test-repo".to_string();
+
+        assert!(registry.register_precautionary_freeze("test-repo", freeze_id.clone()));
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.is_frozen("test-repo"), Some(freeze_id));
+
+        // Duplicate scope should not create an additional freeze.
+        assert!(
+            !registry.register_precautionary_freeze(
+                "test-repo",
+                "precautionary-test-repo-2".to_string()
+            )
+        );
+        assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_precautionary_freeze_only_removes_matching_precautionary_id() {
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
+        let precautionary_id = "precautionary-test-repo".to_string();
+        assert!(registry.register_precautionary_freeze("test-repo", precautionary_id.clone()));
+
+        // Wrong pattern must not remove.
+        assert!(!registry.remove_precautionary_freeze("test-repo", "freeze-001"));
+        assert_eq!(
+            registry.is_frozen("test-repo"),
+            Some(precautionary_id.clone())
+        );
+
+        // Mismatched precautionary ID must not remove.
+        assert!(!registry.remove_precautionary_freeze("test-repo", "precautionary-other"));
+        assert_eq!(
+            registry.is_frozen("test-repo"),
+            Some(precautionary_id.clone())
+        );
+
+        // Exact precautionary ID removes successfully.
+        assert!(registry.remove_precautionary_freeze("test-repo", &precautionary_id));
+        assert!(registry.is_frozen("test-repo").is_none());
+
+        // Non-precautionary freeze IDs must not be removable through this API.
+        let signed_freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("signed-repo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+        registry
+            .register(&signed_freeze, &signer.verifying_key())
+            .unwrap();
+
+        assert!(!registry.remove_precautionary_freeze("signed-repo", &signed_freeze.freeze_id));
+        assert_eq!(
+            registry.is_frozen("signed-repo"),
+            Some(signed_freeze.freeze_id)
+        );
+    }
+
+    #[test]
     fn test_registry_unregister_with_adjudication_succeeds() {
         // Verify that unfreeze with Adjudication type + adjudication_id works
         let signer = Signer::generate();
@@ -4382,6 +4539,32 @@ pub mod tests {
         let result3 = watchdog.check_divergence([0x11; 32], [0x22; 32]).unwrap();
         assert!(result3.is_none()); // Still idempotent
         assert_eq!(watchdog.registry().active_count(), 1);
+    }
+
+    #[test]
+    fn test_watchdog_replaces_precautionary_freeze_with_divergence_freeze() {
+        let watchdog = create_test_watchdog();
+        let precautionary_id = "precautionary-test-repo".to_string();
+        assert!(
+            watchdog
+                .registry()
+                .register_precautionary_freeze("test-repo", precautionary_id.clone())
+        );
+        assert_eq!(
+            watchdog.registry().is_frozen("test-repo"),
+            Some(precautionary_id.clone())
+        );
+
+        let result = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should replace precautionary freeze");
+
+        assert_ne!(result.freeze.freeze_id, precautionary_id);
+        assert_eq!(
+            watchdog.registry().is_frozen("test-repo"),
+            Some(result.freeze.freeze_id)
+        );
     }
 
     #[test]
@@ -4945,6 +5128,57 @@ pub mod tests {
             .replay_receipt
             .verify_signature(&trusted_authority_bindings)
             .expect("replay receipt must verify");
+    }
+
+    #[test]
+    fn test_sink_endpoint_evidence_local_placeholder_is_unverified() {
+        let watchdog = create_test_watchdog();
+        let evidence = watchdog.sink_endpoint_evidence(None);
+
+        assert!(!evidence.endpoint_identity_verified);
+        assert_eq!(evidence.endpoint_canonical_id, "github://test-repo");
+        assert!(!evidence.endpoint_key_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn test_sink_endpoint_evidence_remote_fingerprint_is_verified() {
+        let watchdog = create_test_watchdog();
+        let evidence = watchdog.sink_endpoint_evidence(Some("remote-fingerprint"));
+
+        assert!(evidence.endpoint_identity_verified);
+        assert_eq!(evidence.endpoint_canonical_id, "github://test-repo");
+        assert_eq!(evidence.endpoint_key_fingerprint, "remote-fingerprint");
+    }
+
+    #[test]
+    fn test_endpoint_identity_verified_flag_domain_separates_digests() {
+        let watchdog = create_test_watchdog();
+        let unverified = SinkEndpointEvidenceV1 {
+            endpoint_canonical_id: "github://test-repo".to_string(),
+            endpoint_key_fingerprint: "fingerprint".to_string(),
+            key_epoch: 0,
+            endpoint_identity_verified: false,
+        };
+        let verified = SinkEndpointEvidenceV1 {
+            endpoint_identity_verified: true,
+            ..unverified.clone()
+        };
+
+        let unverified_sink_digest = watchdog
+            .derive_sink_identity_digest(&unverified)
+            .expect("unverified sink identity digest should derive");
+        let verified_sink_digest = watchdog
+            .derive_sink_identity_digest(&verified)
+            .expect("verified sink identity digest should derive");
+        assert_ne!(unverified_sink_digest, verified_sink_digest);
+
+        let unverified_binding_digest =
+            DivergenceWatchdog::<SystemTimeSource>::derive_endpoint_binding_digest(&unverified)
+                .expect("unverified endpoint binding digest should derive");
+        let verified_binding_digest =
+            DivergenceWatchdog::<SystemTimeSource>::derive_endpoint_binding_digest(&verified)
+                .expect("verified endpoint binding digest should derive");
+        assert_ne!(unverified_binding_digest, verified_binding_digest);
     }
 
     #[test]
