@@ -5979,6 +5979,9 @@ impl PrivilegedMessageType {
             72 => Some(Self::DelegateSublease),
             // Ledger integrity audit (TCK-00487)
             73 => Some(Self::VerifyLedgerChain),
+            // Projection recovery (TCK-00469)
+            74 => Some(Self::RegisterRecoveryEvidence),
+            75 => Some(Self::RequestUnfreeze),
             _ => None,
         }
     }
@@ -6030,6 +6033,8 @@ impl PrivilegedMessageType {
             Self::PublishChangeSet,
             Self::DelegateSublease,
             Self::VerifyLedgerChain,
+            Self::RegisterRecoveryEvidence,
+            Self::RequestUnfreeze,
         ]
     }
 
@@ -6078,7 +6083,9 @@ impl PrivilegedMessageType {
             | Self::UnsubscribePulse
             | Self::PublishChangeSet
             | Self::DelegateSublease
-            | Self::VerifyLedgerChain => true,
+            | Self::VerifyLedgerChain
+            | Self::RegisterRecoveryEvidence
+            | Self::RequestUnfreeze => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6124,6 +6131,8 @@ impl PrivilegedMessageType {
             Self::PublishChangeSet => "hsi.changeset.publish",
             Self::DelegateSublease => "hsi.sublease.delegate",
             Self::VerifyLedgerChain => "hsi.ledger.verify_chain",
+            Self::RegisterRecoveryEvidence => "hsi.projection.register_recovery_evidence",
+            Self::RequestUnfreeze => "hsi.projection.request_unfreeze",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -6164,6 +6173,8 @@ impl PrivilegedMessageType {
             Self::PublishChangeSet => "PUBLISH_CHANGESET",
             Self::DelegateSublease => "DELEGATE_SUBLEASE",
             Self::VerifyLedgerChain => "VERIFY_LEDGER_CHAIN",
+            Self::RegisterRecoveryEvidence => "REGISTER_RECOVERY_EVIDENCE",
+            Self::RequestUnfreeze => "REQUEST_UNFREEZE",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -6204,6 +6215,8 @@ impl PrivilegedMessageType {
             Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
             Self::DelegateSublease => "apm2.delegate_sublease_request.v1",
             Self::VerifyLedgerChain => "apm2.verify_ledger_chain_request.v1",
+            Self::RegisterRecoveryEvidence => "apm2.register_recovery_evidence_request.v1",
+            Self::RequestUnfreeze => "apm2.request_unfreeze_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -6244,6 +6257,8 @@ impl PrivilegedMessageType {
             Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
             Self::DelegateSublease => "apm2.delegate_sublease_response.v1",
             Self::VerifyLedgerChain => "apm2.verify_ledger_chain_response.v1",
+            Self::RegisterRecoveryEvidence => "apm2.register_recovery_evidence_response.v1",
+            Self::RequestUnfreeze => "apm2.request_unfreeze_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -6324,6 +6339,10 @@ pub enum PrivilegedResponse {
     DelegateSublease(DelegateSubleaseResponse),
     /// Successful `VerifyLedgerChain` response (TCK-00487).
     VerifyLedgerChain(VerifyLedgerChainResponse),
+    /// Successful `RegisterRecoveryEvidence` response (TCK-00469).
+    RegisterRecoveryEvidence(RegisterRecoveryEvidenceResponse),
+    /// Successful `RequestUnfreeze` response (TCK-00469).
+    RequestUnfreeze(RequestUnfreezeResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -7224,6 +7243,15 @@ pub struct PrivilegedDispatcher {
     /// TODO(TCK-00425): Wire real ticket aliases through policy resolution
     /// so `ClaimWork` can register true alias->work_id mappings.
     alias_reconciliation_gate: Arc<dyn AliasReconciliationGate>,
+
+    /// TCK-00469: Divergence watchdog for projection compromise recovery.
+    ///
+    /// When present, `RegisterRecoveryEvidence` and `RequestUnfreeze`
+    /// handlers call through to the watchdog to register durable recovery
+    /// evidence and lift projection freezes. When `None`, both handlers
+    /// return an error indicating the watchdog is not configured.
+    divergence_watchdog:
+        Option<Arc<crate::projection::DivergenceWatchdog<crate::projection::SystemTimeSource>>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -7970,6 +7998,7 @@ impl PrivilegedDispatcher {
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
+            divergence_watchdog: None,
         }
     }
 
@@ -8056,6 +8085,7 @@ impl PrivilegedDispatcher {
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
+            divergence_watchdog: None,
         }
     }
 
@@ -8159,6 +8189,7 @@ impl PrivilegedDispatcher {
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
+            divergence_watchdog: None,
         }
     }
 
@@ -8240,6 +8271,7 @@ impl PrivilegedDispatcher {
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
+            divergence_watchdog: None,
         }
     }
 
@@ -8416,6 +8448,20 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub const fn with_privileged_pcac_policy(mut self, policy: PrivilegedPcacPolicy) -> Self {
         self.privileged_pcac_policy = policy;
+        self
+    }
+
+    /// Sets the divergence watchdog for projection recovery (TCK-00469).
+    ///
+    /// When set, `RegisterRecoveryEvidence` and `RequestUnfreeze` handlers
+    /// call through to the watchdog to register durable recovery evidence
+    /// and lift projection freezes.
+    #[must_use]
+    pub fn with_divergence_watchdog(
+        mut self,
+        watchdog: Arc<crate::projection::DivergenceWatchdog<crate::projection::SystemTimeSource>>,
+    ) -> Self {
+        self.divergence_watchdog = Some(watchdog);
         self
     }
 
@@ -9372,6 +9418,11 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::DelegateSublease => self.handle_delegate_sublease(payload, ctx),
             // TCK-00487: explicit full-chain operator verification
             PrivilegedMessageType::VerifyLedgerChain => self.handle_verify_ledger_chain(payload),
+            // TCK-00469: Projection recovery handlers
+            PrivilegedMessageType::RegisterRecoveryEvidence => {
+                self.handle_register_recovery_evidence(payload)
+            },
+            PrivilegedMessageType::RequestUnfreeze => self.handle_request_unfreeze(payload),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -9425,6 +9476,9 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::DelegateSublease => "DelegateSublease",
                 // TCK-00487
                 PrivilegedMessageType::VerifyLedgerChain => "VerifyLedgerChain",
+                // TCK-00469
+                PrivilegedMessageType::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
+                PrivilegedMessageType::RequestUnfreeze => "RequestUnfreeze",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
