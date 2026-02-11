@@ -3302,9 +3302,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 ));
             }
 
-            #[allow(clippy::useless_let_if_seq)]
-            let mut fallback_bytes = None;
-
             if let Some(cas_address) = cas_address.filter(|value| !value.is_empty()) {
                 let cas = self.cas.as_ref().ok_or_else(|| {
                     format!(
@@ -3329,7 +3326,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 }
                 cas_provider.insert_with_address(cas_address.to_string(), receipt_bytes.clone());
-                fallback_bytes = Some(receipt_bytes);
             }
 
             if let Some(ledger_event_id) = ledger_event_id.filter(|value| !value.is_empty()) {
@@ -3362,9 +3358,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
                 ledger_provider
                     .insert_with_event_id(ledger_event_id.to_string(), receipt_bytes.clone());
-                if fallback_bytes.is_none() {
-                    fallback_bytes = Some(receipt_bytes);
-                }
             }
 
             if cas_address.is_none() && ledger_event_id.is_none() {
@@ -3374,18 +3367,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 ));
             }
 
-            // Digest-only fallback is only used when a provider-specific locator
-            // is absent for this pointer.
-            if cas_address.is_none() {
-                if let Some(bytes) = fallback_bytes.as_ref() {
-                    cas_provider.insert_with_digest(pointer.receipt_digest, bytes.clone());
-                }
-            }
-            if ledger_event_id.is_none() {
-                if let Some(bytes) = fallback_bytes.as_ref() {
-                    ledger_provider.insert_with_digest(pointer.receipt_digest, bytes.clone());
-                }
-            }
+            // No cross-provider digest fallback: if a pointer carries any
+            // locator, each provider must resolve via its own locator
+            // (ACPT_RECEIPT_LOCATOR_REQUIRED fail-closed policy).
         }
 
         Ok((cas_provider, ledger_provider))
@@ -3427,6 +3411,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         pending_pcac: Option<&PendingPcacAuthority>,
         timestamp_ns: u64,
     ) -> Result<(), String> {
+        struct PreparedReceipt {
+            receipt_type: AcceptanceReceiptType,
+            receipt_digest: Hash,
+            payload: Vec<u8>,
+        }
+
         if !risk_tier.requires_enhanced_evidence() {
             return Ok(());
         }
@@ -3562,34 +3552,116 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        let mut receipt_pointers = Vec::with_capacity(receipt_payloads.len());
+        let subject_effect_id = Self::compute_subject_effect_id(
+            session_id,
+            lease_id,
+            request_id,
+            &tool_class_label,
+            &effect_digest,
+        );
+
+        // Phase 1: compute digests and verify package structure in-memory before
+        // any durable CAS/ledger writes.
+        let mut prepared_receipts = Vec::with_capacity(receipt_payloads.len());
+        let mut preverify_pointers = Vec::with_capacity(receipt_payloads.len());
+        let mut mem_cas_provider = CasReceiptProvider::new();
+        let mut mem_ledger_provider = LedgerReceiptProvider::new();
 
         for (receipt_type, payload) in receipt_payloads {
             let receipt_digest = EventHasher::hash_content(&payload);
+            let synthetic_cas_address = format!("cas://{}", hex::encode(receipt_digest));
+            let synthetic_ledger_event_id = format!("preverify-{}", hex::encode(receipt_digest));
+
+            mem_cas_provider.insert_with_address(synthetic_cas_address.clone(), payload.clone());
+            mem_ledger_provider
+                .insert_with_event_id(synthetic_ledger_event_id.clone(), payload.clone());
+
+            prepared_receipts.push(PreparedReceipt {
+                receipt_type,
+                receipt_digest,
+                payload,
+            });
+
+            preverify_pointers.push(AcceptanceReceiptPointer {
+                receipt_type,
+                receipt_digest,
+                cas_address: Some(synthetic_cas_address),
+                ledger_event_id: Some(synthetic_ledger_event_id),
+            });
+        }
+
+        let mut preverify_package = AcceptancePackageV1 {
+            version: AcceptancePackageV1::current_version(),
+            package_id: [0u8; 32],
+            subject_effect_id,
+            receipt_set_digest: AcceptancePackageV1::compute_receipt_set_digest(
+                &preverify_pointers,
+            ),
+            receipt_pointers: preverify_pointers,
+            policy_snapshot_hash: boundary_flow_state
+                .policy_binding
+                .admitted_policy_root_digest,
+            time_authority_ref: pending_pcac.certificate.issued_time_envelope_ref,
+            verdict: AcceptanceAdmissionVerdict::Admitted,
+            issuer_signature: Vec::new(),
+            issuer_verifying_key: [0u8; 32],
+        };
+
+        preverify_package
+            .sign_with(self.channel_context_signer.as_ref())
+            .map_err(|error| {
+                format!("acceptance package pre-verification signing failed: {error}")
+            })?;
+
+        let cas_preverify = verify_acceptance_package(&preverify_package, &mem_cas_provider, None);
+        if !cas_preverify.verified {
+            return Err(Self::format_acceptance_verification_failure(
+                "cas-preverify",
+                &cas_preverify,
+            ));
+        }
+
+        let ledger_preverify =
+            verify_acceptance_package(&preverify_package, &mem_ledger_provider, None);
+        if !ledger_preverify.verified {
+            return Err(Self::format_acceptance_verification_failure(
+                "ledger-preverify",
+                &ledger_preverify,
+            ));
+        }
+
+        if cas_preverify != ledger_preverify {
+            return Err(format!(
+                "acceptance package pre-verification concordance mismatch: cas={cas_preverify:?}, ledger={ledger_preverify:?}"
+            ));
+        }
+
+        // Phase 2: pre-verification passed, so now persist receipts durably.
+        let mut receipt_pointers = Vec::with_capacity(prepared_receipts.len());
+        for prepared in &prepared_receipts {
             let mut cas_address = None;
             let mut ledger_event_id = None;
 
             if let Some(cas) = self.cas.as_ref() {
-                let stored_hash = cas.store(&payload);
-                if stored_hash != receipt_digest {
+                let stored_hash = cas.store(&prepared.payload);
+                if stored_hash != prepared.receipt_digest {
                     return Err(format!(
                         "receipt digest mismatch after CAS store for {:?}: expected {}, got {}",
-                        receipt_type,
-                        hex::encode(receipt_digest),
+                        prepared.receipt_type,
+                        hex::encode(prepared.receipt_digest),
                         hex::encode(stored_hash)
                     ));
                 }
-                let address = format!("cas://{}", hex::encode(stored_hash));
-                cas_address = Some(address);
+                cas_address = Some(format!("cas://{}", hex::encode(stored_hash)));
             }
 
             if let Some(ledger) = self.ledger.as_ref() {
-                let event_type = Self::acceptance_receipt_event_type(receipt_type);
+                let event_type = Self::acceptance_receipt_event_type(prepared.receipt_type);
                 let event = ledger
                     .emit_session_event(
                         session_id,
                         event_type,
-                        &payload,
+                        &prepared.payload,
                         "pcac:acceptance-package",
                         timestamp_ns,
                     )
@@ -3609,8 +3681,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
 
             receipt_pointers.push(AcceptanceReceiptPointer {
-                receipt_type,
-                receipt_digest,
+                receipt_type: prepared.receipt_type,
+                receipt_digest: prepared.receipt_digest,
                 cas_address,
                 ledger_event_id,
             });
@@ -3618,14 +3690,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         let (cas_provider, ledger_provider) =
             self.build_receipt_providers_from_durable_store(request_id, &receipt_pointers)?;
-
-        let subject_effect_id = Self::compute_subject_effect_id(
-            session_id,
-            lease_id,
-            request_id,
-            &tool_class_label,
-            &effect_digest,
-        );
 
         let mut package = AcceptancePackageV1 {
             version: AcceptancePackageV1::current_version(),
@@ -3646,7 +3710,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .sign_with(self.channel_context_signer.as_ref())
             .map_err(|error| format!("acceptance package signing failed: {error}"))?;
 
-        let cas_result = verify_acceptance_package(&package, &cas_provider);
+        // Internal structural reverification: the daemon just signed this
+        // package with its own key, so trust-anchor binding is not applicable
+        // here. External verifiers must pass a TrustedIssuerSet.
+        let cas_result = verify_acceptance_package(&package, &cas_provider, None);
         if !cas_result.verified {
             return Err(Self::format_acceptance_verification_failure(
                 "cas",
@@ -3654,7 +3721,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        let ledger_result = verify_acceptance_package(&package, &ledger_provider);
+        let ledger_result = verify_acceptance_package(&package, &ledger_provider, None);
         if !ledger_result.verified {
             return Err(Self::format_acceptance_verification_failure(
                 "ledger",
@@ -9507,8 +9574,8 @@ mod tests {
             .expect("durable read-back provider reconstruction should succeed");
 
         let write_buffer_cas_result =
-            verify_acceptance_package(&package, &write_buffer_cas_provider);
-        let readback_cas_result = verify_acceptance_package(&package, &readback_cas_provider);
+            verify_acceptance_package(&package, &write_buffer_cas_provider, None);
+        let readback_cas_result = verify_acceptance_package(&package, &readback_cas_provider, None);
         assert!(
             readback_cas_result.verified,
             "durable read-back CAS verification must pass: {readback_cas_result:?}"
@@ -9519,8 +9586,9 @@ mod tests {
         );
 
         let write_buffer_ledger_result =
-            verify_acceptance_package(&package, &write_buffer_ledger_provider);
-        let readback_ledger_result = verify_acceptance_package(&package, &readback_ledger_provider);
+            verify_acceptance_package(&package, &write_buffer_ledger_provider, None);
+        let readback_ledger_result =
+            verify_acceptance_package(&package, &readback_ledger_provider, None);
         assert!(
             readback_ledger_result.verified,
             "durable read-back ledger verification must pass: {readback_ledger_result:?}"
@@ -12036,6 +12104,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments_b,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("intent-mismatch boundary-flow runtime state should build");

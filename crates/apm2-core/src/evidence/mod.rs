@@ -95,7 +95,7 @@ pub use aat_receipt::{
 pub use acceptance_package::{
     AcceptancePackageError, AcceptancePackageV1, AdmissionVerdict, CasReceiptProvider,
     FindingSeverity, LedgerReceiptProvider, ReceiptPointer, ReceiptProvider, ReceiptType,
-    VerificationFinding, VerificationResult, verify_acceptance_package,
+    TrustedIssuerSet, VerificationFinding, VerificationResult, verify_acceptance_package,
 };
 pub use cas::{CasError, ContentAddressedStore, MemoryCas, StoreResult};
 pub use category::EvidenceCategory;

@@ -60,6 +60,21 @@ pub struct ReceiptPointer {
     pub ledger_event_id: Option<String>,
 }
 
+impl ReceiptPointer {
+    /// Returns `true` if this pointer carries at least one non-empty locator
+    /// (CAS address or ledger event ID).
+    #[must_use]
+    pub fn has_any_locator(&self) -> bool {
+        self.cas_address
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .ledger_event_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+    }
+}
+
 /// Receipt types that can appear in an acceptance package.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -318,7 +333,7 @@ pub trait ReceiptProvider: Send + Sync {
     /// Resolves the raw receipt bytes for a pointer.
     ///
     /// # Errors
-    /// Returns [`ReceiptResolutionError`] when a locator cannot be resolved,
+    /// Returns `ReceiptResolutionError` when a locator cannot be resolved,
     /// when digest validation fails, or when digest fallback lookup fails.
     fn resolve_receipt(&self, pointer: &ReceiptPointer) -> Result<Vec<u8>, ReceiptResolutionError>;
 }
@@ -337,6 +352,13 @@ pub enum ReceiptResolutionError {
         expected: Hash,
         /// Actual digest computed over resolved bytes.
         actual: Hash,
+    },
+    /// The pointer carries at least one locator, but not the provider-specific
+    /// one. Digest fallback is denied for locator-present pointers
+    /// (fail-closed).
+    LocatorRequired {
+        /// Description of which locator is required.
+        provider_kind: &'static str,
     },
     /// Digest-based fallback lookup failed.
     NotFound {
@@ -404,6 +426,17 @@ impl ReceiptProvider for CasReceiptProvider {
             }
             return Ok(receipt);
         }
+
+        // Fail closed: if the pointer carries ANY locator (including ledger),
+        // digest-only fallback is denied. The CAS provider MUST resolve via
+        // its own locator for locator-present pointers.
+        if pointer.has_any_locator() {
+            return Err(ReceiptResolutionError::LocatorRequired {
+                provider_kind: "cas",
+            });
+        }
+
+        // Pure digest-only fallback is only allowed when no locators exist.
         self.receipts_by_digest
             .get(&pointer.receipt_digest)
             .cloned()
@@ -471,6 +504,17 @@ impl ReceiptProvider for LedgerReceiptProvider {
             }
             return Ok(receipt);
         }
+
+        // Fail closed: if the pointer carries ANY locator (including CAS),
+        // digest-only fallback is denied. The ledger provider MUST resolve via
+        // its own locator for locator-present pointers.
+        if pointer.has_any_locator() {
+            return Err(ReceiptResolutionError::LocatorRequired {
+                provider_kind: "ledger",
+            });
+        }
+
+        // Pure digest-only fallback is only allowed when no locators exist.
         self.receipts_by_digest
             .get(&pointer.receipt_digest)
             .cloned()
@@ -480,12 +524,39 @@ impl ReceiptProvider for LedgerReceiptProvider {
     }
 }
 
+/// Set of trusted issuer verifying keys for acceptance package validation.
+///
+/// When provided, the verifier checks that the package's
+/// `issuer_verifying_key` matches one of the trusted keys, failing closed on
+/// mismatch.
+#[derive(Debug, Clone)]
+pub struct TrustedIssuerSet {
+    trusted_keys: Vec<[u8; 32]>,
+}
+
+impl TrustedIssuerSet {
+    /// Creates a trust set from verifying key bytes.
+    #[must_use]
+    pub fn from_keys(keys: &[[u8; 32]]) -> Self {
+        Self {
+            trusted_keys: keys.to_vec(),
+        }
+    }
+
+    /// Returns `true` if the given key is in the trusted set.
+    #[must_use]
+    pub fn contains(&self, key: &[u8; 32]) -> bool {
+        self.trusted_keys.iter().any(|trusted| trusted == key)
+    }
+}
+
 /// Deterministic verifier that checks acceptance package integrity without
 /// ambient runtime state.
 #[must_use]
 pub fn verify_acceptance_package(
     package: &AcceptancePackageV1,
     receipt_provider: &dyn ReceiptProvider,
+    trusted_issuers: Option<&TrustedIssuerSet>,
 ) -> VerificationResult {
     let mut findings = Vec::new();
 
@@ -560,6 +631,17 @@ pub fn verify_acceptance_package(
     }
 
     verify_signature_envelope(package, &mut findings);
+    if let Some(trusted) = trusted_issuers {
+        if !trusted.contains(&package.issuer_verifying_key) {
+            findings.push(VerificationFinding::error(
+                "ACPT_ISSUER_UNTRUSTED",
+                format!(
+                    "issuer verifying key {} is not in the trusted issuer set",
+                    hex::encode(package.issuer_verifying_key)
+                ),
+            ));
+        }
+    }
     verify_required_receipt_types(package, &mut findings);
     verify_receipts(package, receipt_provider, &mut findings);
 
@@ -739,6 +821,15 @@ fn verify_receipts(
                     ),
                 ));
             },
+            Err(ReceiptResolutionError::LocatorRequired { provider_kind }) => {
+                findings.push(VerificationFinding::error(
+                    "ACPT_RECEIPT_LOCATOR_REQUIRED",
+                    format!(
+                        "receipt pointer for {:?} carries locators but {} provider has no {}-specific locator; digest fallback denied",
+                        pointer.receipt_type, provider_kind, provider_kind
+                    ),
+                ));
+            },
         }
     }
 }
@@ -863,12 +954,23 @@ mod tests {
         provider
     }
 
+    fn build_digest_only_ledger_provider(fixtures: &[ReceiptFixture]) -> LedgerReceiptProvider {
+        let mut provider = LedgerReceiptProvider::new();
+        for fixture in fixtures {
+            provider.insert_with_digest(
+                fixture.pointer.receipt_digest,
+                fixture.receipt_bytes.clone(),
+            );
+        }
+        provider
+    }
+
     #[test]
     fn verify_acceptance_package_valid_package_passes() {
         let (package, fixtures) = build_fixture_package();
         let cas_provider = build_cas_provider(&fixtures);
 
-        let result = verify_acceptance_package(&package, &cas_provider);
+        let result = verify_acceptance_package(&package, &cas_provider, None);
         assert!(result.verified, "valid package must verify: {result:?}");
         assert_eq!(result.findings.len(), 0);
     }
@@ -878,7 +980,7 @@ mod tests {
         let (package, fixtures) = build_fixture_package();
         let cas_provider = build_cas_provider(&fixtures[1..]);
 
-        let result = verify_acceptance_package(&package, &cas_provider);
+        let result = verify_acceptance_package(&package, &cas_provider, None);
         assert!(
             !result.verified,
             "package with missing receipt must deny: {result:?}"
@@ -898,7 +1000,7 @@ mod tests {
         let cas_provider = build_cas_provider(&fixtures);
 
         package.issuer_signature[0] ^= 0x80;
-        let result = verify_acceptance_package(&package, &cas_provider);
+        let result = verify_acceptance_package(&package, &cas_provider, None);
         assert!(
             !result.verified,
             "package with invalid signature must deny: {result:?}"
@@ -923,7 +1025,7 @@ mod tests {
             .expect("fixture pointer should have address");
         cas_provider.remove_by_address(&first_address);
 
-        let result = verify_acceptance_package(&package, &cas_provider);
+        let result = verify_acceptance_package(&package, &cas_provider, None);
         assert!(
             !result.verified,
             "missing locator-targeted receipt must deny: {result:?}"
@@ -948,7 +1050,7 @@ mod tests {
             .expect("fixture pointer should have address");
         cas_provider.insert_with_address(first_address, b"tampered-receipt".to_vec());
 
-        let result = verify_acceptance_package(&package, &cas_provider);
+        let result = verify_acceptance_package(&package, &cas_provider, None);
         assert!(
             !result.verified,
             "tampered receipt content must deny: {result:?}"
@@ -974,7 +1076,7 @@ mod tests {
             .expect("re-signing package without locators should succeed");
         let digest_provider = build_digest_only_provider(&fixtures);
 
-        let result = verify_acceptance_package(&package, &digest_provider);
+        let result = verify_acceptance_package(&package, &digest_provider, None);
         assert!(
             result.verified,
             "digest-only lookup without locators must pass: {result:?}"
@@ -987,7 +1089,7 @@ mod tests {
         let cas_provider = build_cas_provider(&fixtures);
         package.policy_snapshot_hash = ZERO_HASH;
 
-        let result = verify_acceptance_package(&package, &cas_provider);
+        let result = verify_acceptance_package(&package, &cas_provider, None);
         assert!(
             !result.verified,
             "zero policy snapshot hash must deny: {result:?}"
@@ -1007,8 +1109,8 @@ mod tests {
         let cas_provider = build_cas_provider(&fixtures);
         let ledger_provider = build_ledger_provider(&fixtures);
 
-        let cas_result = verify_acceptance_package(&package, &cas_provider);
-        let ledger_result = verify_acceptance_package(&package, &ledger_provider);
+        let cas_result = verify_acceptance_package(&package, &cas_provider, None);
+        let ledger_result = verify_acceptance_package(&package, &ledger_provider, None);
 
         assert!(
             cas_result.verified,
@@ -1078,16 +1180,17 @@ mod tests {
         }
 
         let write_buffer_cas_result =
-            verify_acceptance_package(&package, &write_buffer_cas_provider);
-        let readback_cas_result = verify_acceptance_package(&package, &readback_cas_provider);
+            verify_acceptance_package(&package, &write_buffer_cas_provider, None);
+        let readback_cas_result = verify_acceptance_package(&package, &readback_cas_provider, None);
         assert_eq!(
             write_buffer_cas_result, readback_cas_result,
             "CAS durable read-back verifier result must match write-buffer verifier result"
         );
 
         let write_buffer_ledger_result =
-            verify_acceptance_package(&package, &write_buffer_ledger_provider);
-        let readback_ledger_result = verify_acceptance_package(&package, &readback_ledger_provider);
+            verify_acceptance_package(&package, &write_buffer_ledger_provider, None);
+        let readback_ledger_result =
+            verify_acceptance_package(&package, &readback_ledger_provider, None);
         assert_eq!(
             write_buffer_ledger_result, readback_ledger_result,
             "ledger durable read-back verifier result must match write-buffer verifier result"
@@ -1108,7 +1211,7 @@ mod tests {
             serde_json::from_slice(&loaded_bytes).expect("fixture decode should succeed");
 
         let provider = build_cas_provider(&fixtures);
-        let result = verify_acceptance_package(&loaded_package, &provider);
+        let result = verify_acceptance_package(&loaded_package, &provider, None);
         assert!(
             result.verified,
             "clean-context replay verification must pass: {result:?}"
@@ -1123,5 +1226,90 @@ mod tests {
         std::env::temp_dir().join(format!(
             "apm2_acceptance_package_fixture_{pid}_{sequence}.json"
         ))
+    }
+
+    #[test]
+    fn verify_acceptance_package_untrusted_issuer_with_valid_signature_denies() {
+        let (package, fixtures) = build_fixture_package();
+        let cas_provider = build_cas_provider(&fixtures);
+        let untrusted_signer =
+            Signer::from_bytes(&[0xAA; 32]).expect("untrusted signer bytes must parse");
+        let trusted = TrustedIssuerSet::from_keys(&[untrusted_signer.public_key_bytes()]);
+
+        let result = verify_acceptance_package(&package, &cas_provider, Some(&trusted));
+        assert!(
+            !result.verified,
+            "valid signature from untrusted issuer must deny: {result:?}"
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.code == "ACPT_ISSUER_UNTRUSTED"),
+            "untrusted issuer finding must be present: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_acceptance_package_trusted_issuer_with_valid_signature_passes() {
+        let (package, fixtures) = build_fixture_package();
+        let cas_provider = build_cas_provider(&fixtures);
+        let trusted = TrustedIssuerSet::from_keys(&[deterministic_signer().public_key_bytes()]);
+
+        let result = verify_acceptance_package(&package, &cas_provider, Some(&trusted));
+        assert!(
+            result.verified,
+            "valid signature from trusted issuer must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_acceptance_package_locator_present_digest_fallback_denied_cas() {
+        let (mut package, fixtures) = build_fixture_package();
+        for pointer in &mut package.receipt_pointers {
+            pointer.cas_address = None;
+        }
+        package
+            .sign_with(&deterministic_signer())
+            .expect("re-signing package after locator edits should succeed");
+
+        let digest_provider = build_digest_only_provider(&fixtures);
+        let result = verify_acceptance_package(&package, &digest_provider, None);
+        assert!(
+            !result.verified,
+            "digest fallback must be denied when any locator is present: {result:?}"
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.code == "ACPT_RECEIPT_LOCATOR_REQUIRED"),
+            "locator-required finding must be present: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_acceptance_package_locator_present_digest_fallback_denied_ledger() {
+        let (mut package, fixtures) = build_fixture_package();
+        for pointer in &mut package.receipt_pointers {
+            pointer.ledger_event_id = None;
+        }
+        package
+            .sign_with(&deterministic_signer())
+            .expect("re-signing package after locator edits should succeed");
+
+        let digest_provider = build_digest_only_ledger_provider(&fixtures);
+        let result = verify_acceptance_package(&package, &digest_provider, None);
+        assert!(
+            !result.verified,
+            "digest fallback must be denied when any locator is present: {result:?}"
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.code == "ACPT_RECEIPT_LOCATOR_REQUIRED"),
+            "locator-required finding must be present: {result:?}"
+        );
     }
 }
