@@ -223,7 +223,14 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
                 db_path.display()
             ));
         };
-        return Ok(parent.join("pcac_consume.log"));
+        let consume_log_name = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(
+                || "pcac_consume.log".to_string(),
+                |name| format!("{name}.pcac_consume.log"),
+            );
+        return Ok(parent.join(consume_log_name));
     }
 
     Err("sqlite main database entry not found while deriving PCAC path".to_string())

@@ -49,6 +49,8 @@ pub mod verifier_economics;
 pub mod verifier_metrics;
 
 #[cfg(test)]
+mod serialization_compat;
+#[cfg(test)]
 mod tests;
 
 pub use auth_verifier::{

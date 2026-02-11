@@ -7421,6 +7421,23 @@ impl PrivilegedPcacInputBuilder {
         join_ledger_anchor: [u8; 32],
         join_revocation_head: [u8; 32],
     ) -> AuthorityJoinInputV1 {
+        let join_tick_bytes = join_freshness_tick.to_le_bytes();
+        let leakage_witness_hash = self.hash(
+            "boundary_leakage_witness_hash",
+            &[
+                &self.effect_intent_digest,
+                &self.scope_witness_hash,
+                &join_tick_bytes,
+            ],
+        );
+        let timing_witness_hash = self.hash(
+            "boundary_timing_witness_hash",
+            &[
+                &join_time_envelope_ref,
+                &join_ledger_anchor,
+                &join_tick_bytes,
+            ],
+        );
         AuthorityJoinInputV1 {
             session_id: self.session_id,
             holon_id: None,
@@ -7438,6 +7455,8 @@ impl PrivilegedPcacInputBuilder {
             freshness_witness_tick: join_freshness_tick,
             stop_budget_profile_digest: self.stop_budget_profile_digest,
             pre_actuation_receipt_hashes: Vec::new(),
+            leakage_witness_hash,
+            timing_witness_hash,
             risk_tier: self.risk_tier,
             determinism_class: PcacDeterminismClass::Deterministic,
             time_envelope_ref: join_time_envelope_ref,
@@ -7469,6 +7488,108 @@ pub struct PrivilegedPcacLifecycleArtifacts {
 
 /// Runtime boundary-flow evidence used to evaluate RFC-0028 REQ-0004
 /// predicate closure at channel admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeakageWitnessV1 {
+    /// Daemon-side measurement method identifier.
+    pub measurement_method: String,
+    /// Daemon-observed leakage estimate in `leakage_bits`.
+    pub measured_bits: u64,
+    /// Confidence in basis points (`0..=10000`).
+    pub confidence: u16,
+    /// HTF timestamp (nanoseconds since Unix epoch).
+    pub timestamp: u64,
+}
+
+/// Daemon-authoritative timing witness for boundary-flow admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Daemon-authoritative timing-variance witness measured at boundary crossing.
+pub struct TimingWitnessV1 {
+    /// Daemon-side measurement method identifier.
+    pub measurement_method: String,
+    /// Daemon-observed timing variance in ticks.
+    pub observed_variance_ticks: u64,
+    /// Baseline timing expectation in ticks.
+    pub baseline_ticks: u64,
+    /// Confidence in basis points (`0..=10000`).
+    pub confidence: u16,
+    /// HTF timestamp (nanoseconds since Unix epoch).
+    pub timestamp: u64,
+}
+
+const BOUNDARY_WITNESS_TIMING_TICK_QUANTUM_NS: u64 = 5_000_000;
+
+#[inline]
+const fn ceiling_div(value: u64, divisor: u64) -> u64 {
+    if divisor == 0 {
+        return value;
+    }
+    value.saturating_add(divisor.saturating_sub(1)) / divisor
+}
+
+/// Builds daemon-authoritative leakage/timing witnesses from runtime-observed
+/// payload and elapsed-time signals.
+#[must_use]
+pub(crate) fn build_authoritative_witnesses(
+    measurement_scope: &str,
+    payload: &[u8],
+    leakage_quantum_bytes: u64,
+    baseline_ticks: u64,
+    elapsed_ns: u64,
+    timestamp_ns: u64,
+) -> (LeakageWitnessV1, TimingWitnessV1) {
+    let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let measured_bits = ceiling_div(payload_len, leakage_quantum_bytes.max(1));
+    let elapsed_ticks = ceiling_div(elapsed_ns, BOUNDARY_WITNESS_TIMING_TICK_QUANTUM_NS);
+    let payload_ticks = ceiling_div(payload_len, 64);
+    let observed_ticks = elapsed_ticks.max(payload_ticks);
+    let baseline_ticks = baseline_ticks.max(1);
+    let observed_variance_ticks = observed_ticks.abs_diff(baseline_ticks);
+
+    let leakage = LeakageWitnessV1 {
+        measurement_method: format!("daemon_{measurement_scope}_payload_quanta_v1"),
+        measured_bits,
+        confidence: 9_500,
+        timestamp: timestamp_ns,
+    };
+    let timing = TimingWitnessV1 {
+        measurement_method: format!("daemon_{measurement_scope}_elapsed_variance_v1"),
+        observed_variance_ticks,
+        baseline_ticks,
+        confidence: 9_500,
+        timestamp: timestamp_ns,
+    };
+    (leakage, timing)
+}
+
+/// Domain-tagged digest of a leakage witness for PCAC join binding.
+#[must_use]
+pub(crate) fn leakage_witness_hash(witness: &LeakageWitnessV1) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pcac-boundary-leakage-witness-v1");
+    hasher.update(witness.measurement_method.as_bytes());
+    hasher.update(&witness.measured_bits.to_le_bytes());
+    hasher.update(&witness.confidence.to_le_bytes());
+    hasher.update(&witness.timestamp.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Domain-tagged digest of a timing witness for PCAC join binding.
+#[must_use]
+pub(crate) fn timing_witness_hash(witness: &TimingWitnessV1) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pcac-boundary-timing-witness-v1");
+    hasher.update(witness.measurement_method.as_bytes());
+    hasher.update(&witness.observed_variance_ticks.to_le_bytes());
+    hasher.update(&witness.baseline_ticks.to_le_bytes());
+    hasher.update(&witness.confidence.to_le_bytes());
+    hasher.update(&witness.timestamp.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Runtime boundary-flow evidence used to evaluate RFC-0028 REQ-0004
+/// predicate closure at channel admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundaryFlowRuntimeState {
     /// Dual-lattice taint admission predicate.
@@ -7483,8 +7604,12 @@ pub struct BoundaryFlowRuntimeState {
     pub redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
     /// Policy digest + canonicalizer tuple binding witness.
     pub policy_binding: BoundaryFlowPolicyBinding,
+    /// Authoritative leakage witness measured by the daemon.
+    pub leakage_witness: LeakageWitnessV1,
     /// Typed leakage-budget receipt.
     pub leakage_budget_receipt: LeakageBudgetReceipt,
+    /// Authoritative timing witness measured by the daemon.
+    pub timing_witness: TimingWitnessV1,
     /// Timing-channel release-bucketing witness.
     pub timing_channel_budget: TimingChannelBudget,
     /// Disclosure-control policy interlock binding.
@@ -7522,12 +7647,25 @@ impl BoundaryFlowRuntimeState {
                 canonicalizer_tuple_digest: canonicalizer_digest,
                 admitted_canonicalizer_tuple_digest: canonicalizer_digest,
             },
+            leakage_witness: LeakageWitnessV1 {
+                measurement_method: "allow_all_default".to_string(),
+                measured_bits: 0,
+                confidence: 10_000,
+                timestamp: 1,
+            },
             leakage_budget_receipt: LeakageBudgetReceipt {
                 leakage_bits: 0,
                 budget_bits: 8,
                 estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
                 confidence_bps: 10_000,
                 confidence_label: "default".to_string(),
+            },
+            timing_witness: TimingWitnessV1 {
+                measurement_method: "allow_all_default".to_string(),
+                observed_variance_ticks: 0,
+                baseline_ticks: 1,
+                confidence: 10_000,
+                timestamp: 1,
             },
             timing_channel_budget: TimingChannelBudget {
                 release_bucket_ticks: 1,
@@ -9357,6 +9495,7 @@ impl PrivilegedDispatcher {
             }
             policy_resolution.role_spec_hash = role_spec_hash;
 
+            let context_compile_started = std::time::Instant::now();
             let context_pack_recipe_hash = match policy_context_pack_recipe_hash(
                 &work_id,
                 &actor_id,
@@ -9387,6 +9526,53 @@ impl PrivilegedDispatcher {
                 ));
             }
             policy_resolution.context_pack_recipe_hash = context_pack_recipe_hash;
+            let context_compile_elapsed_ns =
+                u64::try_from(context_compile_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if let Ok(measurement_timestamp_ns) = self.get_htf_timestamp_ns() {
+                let mut measurement_input = Vec::with_capacity(96);
+                measurement_input.extend_from_slice(&role_spec_hash);
+                measurement_input.extend_from_slice(&policy_resolution.context_pack_hash);
+                measurement_input.extend_from_slice(&context_pack_recipe_hash);
+                let (leakage_witness, timing_witness) = build_authoritative_witnesses(
+                    "context_compilation",
+                    &measurement_input,
+                    16,
+                    4,
+                    context_compile_elapsed_ns,
+                    measurement_timestamp_ns,
+                );
+                let payload = serde_json::json!({
+                    "hook": "context_compilation",
+                    "leakage_witness": leakage_witness,
+                    "timing_witness": timing_witness,
+                    "leakage_witness_hash": hex::encode(leakage_witness_hash(&leakage_witness)),
+                    "timing_witness_hash": hex::encode(timing_witness_hash(&timing_witness)),
+                });
+                match serde_json::to_vec(&payload) {
+                    Ok(payload_bytes) => {
+                        if let Err(error) = self.event_emitter.emit_session_event(
+                            &work_id,
+                            "pcac_context_compilation_witness",
+                            &payload_bytes,
+                            &actor_id,
+                            measurement_timestamp_ns,
+                        ) {
+                            warn!(
+                                work_id = %work_id,
+                                error = %error,
+                                "context-compilation witness emission failed"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        warn!(
+                            work_id = %work_id,
+                            error = %error,
+                            "context-compilation witness payload serialization failed"
+                        );
+                    },
+                }
+            }
 
             if let Err(e) = seed_policy_artifacts_in_cas(
                 &work_id,
@@ -19057,15 +19243,35 @@ mod tests {
             // Query events by work_id from the ledger
             let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
 
-            // TCK-00395: ClaimWork now emits both work_claimed and
-            // work_transitioned(Open->Claimed)
+            // TCK-00395 + TCK-00488: ClaimWork emits work_claimed,
+            // work_transitioned(Open->Claimed), and authoritative context
+            // compilation witness telemetry.
             assert_eq!(
                 events.len(),
-                2,
-                "ClaimWork should emit work_claimed + work_transitioned events"
+                3,
+                "ClaimWork should emit work_claimed + work_transitioned + context witness events"
+            );
+            let event_types: std::collections::HashSet<&str> = events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect();
+            assert!(
+                event_types.contains("work_claimed"),
+                "work_claimed event must be present"
+            );
+            assert!(
+                event_types.contains("work_transitioned"),
+                "work_transitioned event must be present"
+            );
+            assert!(
+                event_types.contains("pcac_context_compilation_witness"),
+                "context compilation witness event must be present"
             );
 
-            let event = &events[0];
+            let event = events
+                .iter()
+                .find(|event| event.event_type == "work_claimed")
+                .expect("work_claimed event should be present");
             assert_eq!(event.work_id, work_id);
             assert_eq!(event.event_type, "work_claimed");
             assert!(!event.signature.is_empty(), "Event should be signed");
