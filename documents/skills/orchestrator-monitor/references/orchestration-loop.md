@@ -5,7 +5,7 @@ decision_tree:
   nodes[9]:
     - id: START
       purpose: "Initialize scope and verify prerequisites before any side effects."
-      steps[6]:
+      steps[5]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <...> placeholders with concrete values."
         - id: DISCOVER_RELEVANT_FAC_HELP
@@ -29,8 +29,6 @@ decision_tree:
           action: "If explicit PR numbers were provided, use them. Otherwise run fac_review_status (global) and infer active PR scope from FAC review entries/recent events."
         - id: ENFORCE_SCOPE_BOUND
           action: "If scoped open PR count >20, pause and request wave partitioning."
-        - id: LOAD_PROFILE
-          action: "Select profile from references/scaling-profiles.md based on scoped PR count."
       next: HEARTBEAT_LOOP
 
     - id: HEARTBEAT_LOOP
@@ -53,7 +51,13 @@ decision_tree:
             If state cannot be determined exactly, or review statuses are not bound to current HEAD SHA,
             classify as BLOCKED_UNKNOWN and defer merge action.
         - id: PLAN_DISPATCH
-          action: "Create this tick's action list using scaling profile limits and priority_order."
+          action: |
+            Create this tick's action list using fixed orchestration bounds:
+            (1) never more than 3 total actions per tick,
+            (2) never more than 1 action for a single PR per tick,
+            (3) at most 1 implementor dispatch and at most 1 restart action per tick.
+            Prioritize states in this order:
+            READY_TO_MERGE, PR_CONFLICTING, CI_FAILED, REVIEW_FAILED, REVIEW_MISSING, WAITING_CI, BLOCKED_UNKNOWN.
       next: EXECUTE_ACTIONS
 
     - id: EXECUTE_ACTIONS
@@ -82,13 +86,17 @@ decision_tree:
       purpose: "Contain fanout and recover from stalled workers."
       steps[4]:
         - id: ENFORCE_BACKPRESSURE
-          action: "Apply BP01..BP04 from references/scaling-profiles.md before adding new actions."
+          action: |
+            Apply queue guards before adding actions:
+            (1) if review backlog is high or review processes are saturated, skip net-new implementor dispatches for this tick,
+            (2) if CI failure ratio spikes over the last 3 ticks, dispatch fixes only and avoid net-new work,
+            (3) if a review for the current SHA is already active, do not restart it.
         - id: STALE_SHA_RECOVERY
           action: "If HEAD changed after review launch, mark old review stale and requeue on new HEAD."
         - id: IDLE_AGENT_RECOVERY
-          action: "If an implementor has no progress signal beyond profile idle threshold, replace with fresh agent."
+          action: "If an implementor has no progress signal for >=120 seconds, replace with a fresh agent."
         - id: SATURATION_CHECK
-          action: "Use fac_review_status (global) to ensure active FAC review runs remain within profile caps."
+          action: "Use fac_review_status (global) to ensure active FAC review runs remain within bounded capacity before any restart/dispatch action."
       next: SYNC_TICK_FACTS
 
     - id: SYNC_TICK_FACTS
