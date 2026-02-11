@@ -891,8 +891,10 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     ///
     /// Violating channels are denied fail-closed until mitigation/clearance.
     boundary_channel_quarantine: Arc<Mutex<BoundaryChannelQuarantineState>>,
-    /// Tracks consumed redundancy declassification receipts to enforce
-    /// single-use semantics across request boundaries.
+    /// Fast-path cache of consumed redundancy declassification receipts.
+    ///
+    /// Authoritative single-use state is persisted in the ledger; this cache
+    /// avoids repeated scans for recently consumed receipts.
     consumed_redundancy_receipts: Arc<Mutex<HashMap<String, ConsumedRedundancyReceiptBinding>>>,
 }
 
@@ -920,18 +922,6 @@ struct BoundaryFlowHints {
     leakage_budget_receipt: Option<LeakageBudgetHints>,
     #[serde(default)]
     timing_channel: Option<TimingChannelHints>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RequestToolArgumentsBoundaryFlowEnvelope {
-    #[serde(default)]
-    boundary_flow: Option<BoundaryFlowHints>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RequestToolArgumentsBoundaryFlowProbe {
-    #[serde(default)]
-    boundary_flow: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -2235,23 +2225,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     fn extract_boundary_flow_hints(
         request_arguments: &[u8],
     ) -> Result<Option<BoundaryFlowHints>, String> {
-        let typed_parse =
-            serde_json::from_slice::<RequestToolArgumentsBoundaryFlowEnvelope>(request_arguments);
-        let typed_error = match typed_parse {
-            Ok(arguments) => return Ok(arguments.boundary_flow),
-            Err(error) => error,
-        };
-
-        let Ok(probe) =
-            serde_json::from_slice::<RequestToolArgumentsBoundaryFlowProbe>(request_arguments)
+        let Ok(request_json) = serde_json::from_slice::<serde_json::Value>(request_arguments)
         else {
             return Ok(None);
         };
-        if probe.boundary_flow.is_none() {
+        let Some(boundary_flow) = request_json.get("boundary_flow") else {
+            return Ok(None);
+        };
+        if boundary_flow.is_null() {
             return Ok(None);
         }
-
-        Err(format!("invalid boundary_flow hints: {typed_error}"))
+        serde_json::from_value::<BoundaryFlowHints>(boundary_flow.clone())
+            .map(Some)
+            .map_err(|error| format!("invalid boundary_flow hints: {error}"))
     }
 
     const fn leakage_budget_bits_for_tier(risk_tier: RiskTier) -> u64 {
@@ -2350,21 +2336,90 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         request_id: &str,
         tool_class: ToolClass,
     ) -> bool {
+        let tool_class = tool_class.to_string();
         let Ok(consumed) = self.consumed_redundancy_receipts.lock() else {
             return false;
         };
-        let Some(binding) = consumed.get(receipt_id) else {
+        if let Some(binding) = consumed.get(receipt_id)
+            && (binding.request_id != request_id || binding.tool_class != tool_class)
+        {
+            return false;
+        }
+        drop(consumed);
+
+        let Some(ledger) = self.ledger.as_ref() else {
+            return false;
+        };
+        let authoritative_binding = ledger.get_redundancy_receipt_consumption(receipt_id);
+        let Some(authoritative_binding) = authoritative_binding else {
             return true;
         };
-        binding.request_id == request_id && binding.tool_class == tool_class.to_string()
+
+        if let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() {
+            consumed.insert(
+                receipt_id.to_string(),
+                ConsumedRedundancyReceiptBinding {
+                    request_id: authoritative_binding.request_id.clone(),
+                    tool_class: authoritative_binding.tool_class.clone(),
+                },
+            );
+        } else {
+            return false;
+        }
+
+        authoritative_binding.request_id == request_id
+            && authoritative_binding.tool_class == tool_class
+    }
+
+    fn htf_wall_ns_for_ledger_event(&self) -> Option<u64> {
+        self.clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
     }
 
     fn consume_redundancy_receipt(
         &self,
+        session_id: &str,
         receipt_id: &str,
         request_id: &str,
         tool_class: ToolClass,
     ) -> bool {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return false;
+        };
+        let tool_class = tool_class.to_string();
+        if let Some(existing) = ledger.get_redundancy_receipt_consumption(receipt_id) {
+            if existing.request_id != request_id || existing.tool_class != tool_class {
+                return false;
+            }
+            let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() else {
+                return false;
+            };
+            consumed.insert(
+                receipt_id.to_string(),
+                ConsumedRedundancyReceiptBinding {
+                    request_id: request_id.to_string(),
+                    tool_class,
+                },
+            );
+            return true;
+        }
+
+        let Some(timestamp_ns) = self.htf_wall_ns_for_ledger_event() else {
+            return false;
+        };
+        let persisted = ledger.emit_redundancy_receipt_consumed(
+            session_id,
+            receipt_id,
+            request_id,
+            &tool_class,
+            session_id,
+            timestamp_ns,
+        );
+        if persisted.is_err() {
+            return false;
+        }
+
         let Ok(mut consumed) = self.consumed_redundancy_receipts.lock() else {
             return false;
         };
@@ -2372,7 +2427,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             receipt_id.to_string(),
             ConsumedRedundancyReceiptBinding {
                 request_id: request_id.to_string(),
-                tool_class: tool_class.to_string(),
+                tool_class,
             },
         );
         true
@@ -2455,7 +2510,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         {
             return None;
         }
-        if !self.consume_redundancy_receipt(receipt_id, request_id, tool_class) {
+        if !self.consume_redundancy_receipt(session_id, receipt_id, request_id, tool_class) {
             return None;
         }
         Some(receipt)
@@ -2638,30 +2693,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         })
     }
 
-    /// Derive a PCAC ledger anchor from bounded metadata (O(1) cost).
+    /// Derive a PCAC ledger anchor from a validated ledger hash chain.
     ///
-    /// Uses `get_event_count()` + `get_latest_event()` instead of
-    /// `get_all_events()` to avoid full-table materialization on every
-    /// PCAC-gated request. The anchor hash is computed from the event
-    /// count and latest event fields, providing equivalent collision
-    /// resistance without O(N) memory/CPU cost.
-    fn derive_pcac_ledger_anchor(ledger: &dyn LedgerEventEmitter) -> Hash {
+    /// Fail-closed: chain validation errors are surfaced to callers so
+    /// authority checks can deny requests rather than trusting corrupted state.
+    fn derive_pcac_ledger_anchor(ledger: &dyn LedgerEventEmitter) -> Result<Hash, String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pcac-ledger-anchor-v1");
         let count = ledger.get_event_count() as u64;
         hasher.update(&count.to_le_bytes());
-        if let Some(last) = ledger.get_latest_event() {
-            hasher.update(last.event_id.as_bytes());
-            hasher.update(last.event_type.as_bytes());
-            hasher.update(last.work_id.as_bytes());
-            hasher.update(last.actor_id.as_bytes());
-            hasher.update(&last.timestamp_ns.to_le_bytes());
-            hasher.update(&last.signature);
-            hasher.update(blake3::hash(&last.payload).as_bytes());
-        } else {
-            hasher.update(b"genesis");
-        }
-        *hasher.finalize().as_bytes()
+        let chain_hash = ledger
+            .derive_event_chain_hash()
+            .map_err(|e| format!("ledger hash-chain validation failed: {e}"))?;
+        hasher.update(chain_hash.as_bytes());
+        Ok(*hasher.finalize().as_bytes())
     }
 
     fn hash_preactuation_receipt(receipt: &PreActuationReceipt) -> Hash {
@@ -2700,7 +2745,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .ledger
             .as_ref()
             .ok_or_else(|| "ledger unavailable".to_string())?;
-        let current_ledger_anchor = Self::derive_pcac_ledger_anchor(ledger.as_ref());
+        let current_ledger_anchor = Self::derive_pcac_ledger_anchor(ledger.as_ref())?;
 
         let registry = self
             .session_registry
@@ -3726,7 +3771,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
             let intent_digest = *blake3::hash(&request.arguments).as_bytes();
             let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
-            let as_of_ledger_anchor = Self::derive_pcac_ledger_anchor(ledger.as_ref());
+            let as_of_ledger_anchor = match Self::derive_pcac_ledger_anchor(ledger.as_ref()) {
+                Ok(anchor) => anchor,
+                Err(error) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %error,
+                        "PCAC denied: ledger hash-chain validation failed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!(
+                            "PCAC authority denied: ledger hash-chain validation failed: {error}"
+                        ),
+                    ));
+                },
+            };
             let determinism_class = match tool_class {
                 ToolClass::Read | ToolClass::ListFiles => {
                     apm2_core::pcac::DeterminismClass::Deterministic
@@ -7614,8 +7674,133 @@ mod tests {
     }
 
     #[test]
+    fn test_pcac_ledger_anchor_fails_closed_on_tampered_intermediate_event() {
+        use rusqlite::{Connection, params};
+
+        use crate::ledger::SqliteLedgerEventEmitter;
+        use crate::protocol::dispatch::{PolicyResolution, WorkClaim, WorkTransition};
+        use crate::protocol::messages::WorkRole;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("sqlite in-memory DB should open"),
+        ));
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            SqliteLedgerEventEmitter::init_schema(&conn_guard)
+                .expect("ledger schema should initialize");
+        }
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key);
+
+        let claim = WorkClaim {
+            work_id: "W-ANCHOR-TAMPER-001".to_string(),
+            lease_id: "lease-anchor-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: "policy-anchor-tamper".to_string(),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [1u8; 32],
+                context_pack_hash: [2u8; 32],
+                role_spec_hash: [3u8; 32],
+                context_pack_recipe_hash: [4u8; 32],
+                resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
+            },
+            executor_custody_domains: Vec::new(),
+            author_custody_domains: Vec::new(),
+            permeability_receipt: None,
+        };
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_000_000)
+            .expect("work_claimed should emit");
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id: "W-ANCHOR-TAMPER-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "test",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: 1_700_000_000_000_000_001,
+            })
+            .expect("work_transitioned should emit");
+        emitter
+            .emit_session_terminated(
+                "session-anchor-001",
+                "W-ANCHOR-TAMPER-001",
+                0,
+                "test-complete",
+                "uid:1000",
+                1_700_000_000_000_000_002,
+            )
+            .expect("session_terminated should emit");
+
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            let mut stmt = conn_guard
+                .prepare(
+                    "SELECT prev_hash, event_hash
+                     FROM ledger_events
+                     ORDER BY timestamp_ns ASC, rowid ASC",
+                )
+                .expect("chain query should prepare");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("chain query should execute")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("chain rows should decode");
+            assert_eq!(rows.len(), 3, "expected three emitted events in chain");
+            assert_eq!(rows[0].0, "genesis", "first event must bind to genesis");
+            assert_eq!(
+                rows[1].0, rows[0].1,
+                "second event prev_hash must bind to first event_hash"
+            );
+            assert_eq!(
+                rows[2].0, rows[1].1,
+                "third event prev_hash must bind to second event_hash"
+            );
+        }
+
+        SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(&emitter)
+            .expect("valid chain should derive anchor");
+
+        // Tamper with the middle event while preserving stored chain columns.
+        // Re-derivation must fail-closed by detecting hash-chain mismatch.
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            conn_guard
+                .execute(
+                    "UPDATE ledger_events
+                     SET payload = ?1
+                     WHERE rowid = (
+                         SELECT rowid FROM ledger_events
+                         ORDER BY timestamp_ns ASC, rowid ASC
+                         LIMIT 1 OFFSET 1
+                     )",
+                    params![br#"{"event_type":"work_transitioned","tampered":true}"#.as_slice()],
+                )
+                .expect("tamper update should succeed");
+        }
+
+        let tampered_anchor =
+            SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(&emitter);
+        assert!(
+            tampered_anchor.is_err(),
+            "tampered intermediate event must fail chain-anchor derivation"
+        );
+    }
+
+    #[test]
     fn test_redundancy_declassification_receipt_single_use_denies_second_request() {
         use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
         use crate::session::{SessionRegistry, SessionState};
 
         let receipt_id = "RR-REPLAY-001";
@@ -7652,10 +7837,15 @@ mod tests {
             })
             .expect("session registration should succeed");
         let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default clock should initialize"),
+        );
 
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
             .with_ledger(ledger)
-            .with_session_registry(registry_dyn);
+            .with_session_registry(registry_dyn)
+            .with_clock(clock);
 
         let request_arguments = serde_json::to_vec(&serde_json::json!({
             "prompt": "safe read request",
@@ -7766,6 +7956,130 @@ mod tests {
             },
             Ok(_) => panic!("second request must deny replayed declassification receipt"),
         }
+    }
+
+    #[test]
+    fn test_redundancy_receipt_reuse_denied_after_dispatcher_restart() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState};
+
+        let receipt_id = "RR-RESTART-001";
+        let session_id = "session-001";
+        let lease_id = "lease-001";
+        let work_id = "W-RECEIPT-RESTART";
+        let policy_hash = [0xA1; 32];
+
+        let ledger_event = make_authoritative_redundancy_receipt_event(
+            receipt_id,
+            lease_id,
+            work_id,
+            None,
+            Some(ToolClass::Read),
+        );
+        let ledger: Arc<dyn LedgerEventEmitter> =
+            Arc::new(StaticReceiptLookupLedger::new(vec![ledger_event]));
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: "handle-receipt-restart".to_string(),
+                policy_resolved_ref: "policy-resolved-ref-restart".to_string(),
+                capability_manifest_hash: blake3::hash(b"receipt-restart-manifest")
+                    .as_bytes()
+                    .to_vec(),
+                episode_id: Some(session_id.to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("session registration should succeed");
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default clock should initialize"),
+        );
+
+        let request_arguments = serde_json::to_vec(&serde_json::json!({
+            "prompt": "safe read request",
+            "boundary_flow": {
+                "declassification": {
+                    "intent": "redundancy_purpose",
+                    "receipt_id": receipt_id,
+                    "scoped_fragment_only": true,
+                    "plaintext_semantics_exposed": false
+                }
+            }
+        }))
+        .expect("arguments serialization");
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+
+        let dispatcher_before_restart =
+            SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+                .with_ledger(Arc::clone(&ledger))
+                .with_session_registry(Arc::clone(&registry_dyn))
+                .with_clock(Arc::clone(&clock));
+        let first_state = dispatcher_before_restart
+            .build_boundary_flow_runtime_state(
+                session_id,
+                lease_id,
+                "REQ-RESTART-FIRST",
+                ToolClass::Read,
+                &Ok(ToolDecision::Allow {
+                    request_id: "REQ-RESTART-FIRST".to_string(),
+                    capability_id: "cap-read-restart".to_string(),
+                    rule_id: Some("rule-allow".to_string()),
+                    policy_hash,
+                    budget_delta: crate::episode::BudgetDelta::single_call(),
+                    credential: None,
+                }),
+                Some(RiskTier::Tier0),
+                &taint_assessment,
+                &request_arguments,
+                Some(policy_hash),
+            )
+            .expect("first boundary-flow runtime state should build");
+        assert!(
+            first_state.declass_receipt_valid,
+            "first request should consume authoritative receipt"
+        );
+
+        // Simulate daemon restart: a new dispatcher instance with empty
+        // in-memory cache but the same ledger backend.
+        let dispatcher_after_restart =
+            SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+                .with_ledger(ledger)
+                .with_session_registry(registry_dyn)
+                .with_clock(clock);
+        let second_state = dispatcher_after_restart
+            .build_boundary_flow_runtime_state(
+                session_id,
+                lease_id,
+                "REQ-RESTART-SECOND",
+                ToolClass::Read,
+                &Ok(ToolDecision::Allow {
+                    request_id: "REQ-RESTART-SECOND".to_string(),
+                    capability_id: "cap-read-restart".to_string(),
+                    rule_id: Some("rule-allow".to_string()),
+                    policy_hash,
+                    budget_delta: crate::episode::BudgetDelta::single_call(),
+                    credential: None,
+                }),
+                Some(RiskTier::Tier0),
+                &taint_assessment,
+                &request_arguments,
+                Some(policy_hash),
+            )
+            .expect("second boundary-flow runtime state should build");
+
+        assert!(
+            !second_state.declass_receipt_valid,
+            "second request after restart must be denied via ledger-authoritative receipt consumption"
+        );
     }
 
     #[test]
@@ -10059,7 +10373,8 @@ mod tests {
             let current_ledger_anchor =
                 SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
                     ledger.as_ref(),
-                );
+                )
+                .expect("ledger anchor derivation should succeed");
             let current_revocation_head = *blake3::hash(policy_ref.as_bytes()).as_bytes();
 
             let certificate = AuthorityJoinCertificateV1 {
@@ -10357,7 +10672,8 @@ mod tests {
             let current_ledger_anchor =
                 SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
                     ledger.as_ref(),
-                );
+                )
+                .expect("ledger anchor derivation should succeed");
             let current_revocation_head = *blake3::hash(policy_ref.as_bytes()).as_bytes();
 
             let cert = AuthorityJoinCertificateV1 {
@@ -10491,7 +10807,8 @@ mod tests {
             let current_ledger_anchor =
                 SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
                     ledger.as_ref(),
-                );
+                )
+                .expect("ledger anchor derivation should succeed");
             let current_revocation_head = *blake3::hash(policy_ref.as_bytes()).as_bytes();
 
             let cert = AuthorityJoinCertificateV1 {

@@ -63,6 +63,7 @@ use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
@@ -206,6 +207,17 @@ pub struct SignedLedgerEvent {
 
     /// Timestamp in nanoseconds since epoch (HTF-compliant).
     pub timestamp_ns: u64,
+}
+
+/// Authoritative binding for a consumed redundancy declassification receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedundancyReceiptConsumption {
+    /// Canonical receipt identifier.
+    pub receipt_id: String,
+    /// Request ID bound to the first successful consumption.
+    pub request_id: String,
+    /// Tool class bound to the first successful consumption.
+    pub tool_class: String,
 }
 
 /// Error type for ledger event emission.
@@ -531,6 +543,116 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// materialization. `SQLite` implementations should use
     /// `SELECT ... ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1`.
     fn get_latest_event(&self) -> Option<SignedLedgerEvent> {
+        None
+    }
+
+    /// Derives the authoritative ledger chain tip hash.
+    ///
+    /// Implementations should fail-closed if chain integrity cannot be
+    /// established. The default implementation derives a deterministic chain
+    /// from replay-order events using `prev_hash -> payload -> signature`
+    /// bindings.
+    fn derive_event_chain_hash(&self) -> Result<String, String> {
+        let mut prev_hash = "genesis".to_string();
+        for event in self.get_all_events() {
+            let mut hasher = Sha256::new();
+            hasher.update(b"apm2-ledger-chain-default-v1");
+            hasher.update(prev_hash.as_bytes());
+            hasher.update(event.event_type.as_bytes());
+            hasher.update(event.work_id.as_bytes());
+            hasher.update(event.actor_id.as_bytes());
+            hasher.update(event.timestamp_ns.to_le_bytes());
+            hasher.update(&event.payload);
+            hasher.update(&event.signature);
+            prev_hash = hex::encode(hasher.finalize());
+        }
+        Ok(prev_hash)
+    }
+
+    /// Emits an authoritative receipt-consumption ledger event.
+    ///
+    /// Default implementation emits through `emit_session_event` to preserve
+    /// compatibility for in-memory test emitters.
+    fn emit_redundancy_receipt_consumed(
+        &self,
+        session_id: &str,
+        receipt_id: &str,
+        request_id: &str,
+        tool_class: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        let payload = serde_json::json!({
+            "receipt_id": receipt_id,
+            "request_id": request_id,
+            "tool_class": tool_class,
+        });
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("receipt consumption payload serialization failed: {e}"),
+            })?;
+        self.emit_session_event(
+            session_id,
+            "redundancy_receipt_consumed",
+            &payload_bytes,
+            actor_id,
+            timestamp_ns,
+        )
+    }
+
+    /// Returns the authoritative receipt-consumption binding, if present.
+    ///
+    /// Default implementation scans replay-order events from newest to oldest
+    /// and supports both direct JSON payloads and wrapped `session_event`
+    /// payloads where the inner payload is hex-encoded.
+    fn get_redundancy_receipt_consumption(
+        &self,
+        receipt_id: &str,
+    ) -> Option<RedundancyReceiptConsumption> {
+        fn parse_consumption(payload: &serde_json::Value) -> Option<RedundancyReceiptConsumption> {
+            let obj = payload.as_object()?;
+            Some(RedundancyReceiptConsumption {
+                receipt_id: obj.get("receipt_id")?.as_str()?.to_string(),
+                request_id: obj.get("request_id")?.as_str()?.to_string(),
+                tool_class: obj.get("tool_class")?.as_str()?.to_string(),
+            })
+        }
+
+        let mut events = self.get_all_events();
+        events.reverse();
+        for event in events {
+            if event.event_type != "redundancy_receipt_consumed" {
+                continue;
+            }
+
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&event.payload) else {
+                continue;
+            };
+
+            if let Some(consumption) = parse_consumption(&payload) {
+                if consumption.receipt_id == receipt_id {
+                    return Some(consumption);
+                }
+                continue;
+            }
+
+            let Some(inner_hex) = payload.get("payload").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Ok(inner_bytes) = hex::decode(inner_hex) else {
+                continue;
+            };
+            let Ok(inner_payload) = serde_json::from_slice::<serde_json::Value>(&inner_bytes)
+            else {
+                continue;
+            };
+            let Some(consumption) = parse_consumption(&inner_payload) else {
+                continue;
+            };
+            if consumption.receipt_id == receipt_id {
+                return Some(consumption);
+            }
+        }
         None
     }
 
@@ -7762,24 +7884,18 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Derive a bounded-cost PCAC ledger anchor from emitter metadata.
-    fn derive_pcac_ledger_anchor(&self) -> [u8; 32] {
+    /// Derive a fail-closed PCAC ledger anchor from the validated chain hash.
+    fn derive_pcac_ledger_anchor(&self) -> Result<[u8; 32], String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pcac-privileged-ledger-anchor-v1");
         let count = self.event_emitter.get_event_count() as u64;
         hasher.update(&count.to_le_bytes());
-        if let Some(last) = self.event_emitter.get_latest_event() {
-            hasher.update(last.event_id.as_bytes());
-            hasher.update(last.event_type.as_bytes());
-            hasher.update(last.work_id.as_bytes());
-            hasher.update(last.actor_id.as_bytes());
-            hasher.update(&last.timestamp_ns.to_le_bytes());
-            hasher.update(&last.signature);
-            hasher.update(blake3::hash(&last.payload).as_bytes());
-        } else {
-            hasher.update(b"genesis");
-        }
-        *hasher.finalize().as_bytes()
+        let chain_hash = self
+            .event_emitter
+            .derive_event_chain_hash()
+            .map_err(|e| format!("ledger hash-chain validation failed: {e}"))?;
+        hasher.update(chain_hash.as_bytes());
+        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Derives fresh revalidation inputs for privileged PCAC lifecycle checks.
@@ -7799,7 +7915,7 @@ impl PrivilegedDispatcher {
         }
 
         let current_time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
-        let current_ledger_anchor = self.derive_pcac_ledger_anchor();
+        let current_ledger_anchor = self.derive_pcac_ledger_anchor()?;
 
         let work_id = self
             .lease_validator
