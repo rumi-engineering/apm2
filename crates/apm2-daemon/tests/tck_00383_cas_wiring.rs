@@ -68,7 +68,7 @@ fn test_session_registry() -> Arc<dyn SessionRegistry> {
 fn make_sqlite_conn(temp_dir: &TempDir) -> Arc<Mutex<Connection>> {
     let db_path = temp_dir.path().join("test_ledger.db");
     let conn = Connection::open(&db_path).expect("failed to open test SQLite");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("failed to init ledger schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("failed to init ledger schema");
     SqliteWorkRegistry::init_schema(&conn).expect("failed to init work schema");
     Arc::new(Mutex::new(conn))
 }

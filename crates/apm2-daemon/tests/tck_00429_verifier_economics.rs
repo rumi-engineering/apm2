@@ -117,7 +117,7 @@ fn make_sync_events(count: usize) -> Vec<SyncEvent> {
 fn make_file_backed_sqlite_conn(temp_dir: &TempDir) -> Arc<Mutex<Connection>> {
     let db_path = temp_dir.path().join("tck_00429_runtime.sqlite");
     let conn = Connection::open(&db_path).expect("file-backed sqlite should open");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema should initialize");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("ledger schema should initialize");
     SqliteWorkRegistry::init_schema(&conn).expect("work schema should initialize");
     Arc::new(Mutex::new(conn))
 }

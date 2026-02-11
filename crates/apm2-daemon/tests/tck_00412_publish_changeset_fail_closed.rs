@@ -27,7 +27,8 @@ use tempfile::TempDir;
 
 fn make_sqlite_conn() -> Arc<Mutex<Connection>> {
     let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+        .expect("ledger schema init should succeed");
     SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
     Arc::new(Mutex::new(conn))
 }
@@ -628,7 +629,7 @@ fn tck_00412_quarantine_migration_deduplicates_changeset_published() {
     .expect("insert unrelated event");
 
     // Step 3: Run init_schema -- this triggers the quarantine migration.
-    SqliteLedgerEventEmitter::init_schema(&conn)
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn)
         .expect("init_schema should succeed with pre-existing duplicates");
 
     // Verification (a): Only one canonical row with that (work_id,
@@ -757,7 +758,7 @@ fn tck_00412_quarantine_migration_deduplicates_changeset_published() {
     );
 
     // Verification (d): Running init_schema a second time is idempotent.
-    SqliteLedgerEventEmitter::init_schema(&conn)
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn)
         .expect("second init_schema invocation must be idempotent");
 
     let canonical_count_after: i64 = conn

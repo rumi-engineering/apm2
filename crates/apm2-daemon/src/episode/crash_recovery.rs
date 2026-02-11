@@ -572,7 +572,7 @@ mod tests {
     /// Creates an in-memory `SQLite` connection with schemas initialized.
     fn setup_sqlite() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init ledger schema");
         SqliteWorkRegistry::init_schema(&conn).expect("init work schema");
         Arc::new(Mutex::new(conn))
     }

@@ -15808,7 +15808,8 @@ impl PrivilegedDispatcher {
         // `&self` (not `&mut self`), concurrent dispatch of two requests
         // with the same `sublease_id` could theoretically race past this
         // check. Two database-level constraints enforce authoritative
-        // uniqueness (see `SqliteLedgerEventEmitter::init_schema`):
+        // uniqueness (see `SqliteLedgerEventEmitter::init_schema_for_test` /
+        // `init_schema_with_signing_key`):
         //
         // 1. `idx_unique_full_lease_id`: Partial unique index on `json_extract(payload,
         //    '$.lease_id')` for `gate_lease_issued` events with `full_lease`. This
@@ -29995,7 +29996,7 @@ mod tests {
             Arc<Mutex<Connection>>,
         ) {
             let conn = Connection::open_in_memory().unwrap();
-            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
             SqliteWorkRegistry::init_schema(&conn).unwrap();
             let conn = Arc::new(Mutex::new(conn));
 
@@ -30071,7 +30072,7 @@ mod tests {
             use crate::state::DispatcherState;
 
             let conn = Connection::open_in_memory().expect("sqlite connection");
-            SqliteLedgerEventEmitter::init_schema(&conn).expect("sqlite ledger schema");
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("sqlite ledger schema");
             SqliteWorkRegistry::init_schema(&conn).expect("sqlite work schema");
             let conn = Arc::new(Mutex::new(conn));
 
@@ -30807,7 +30808,7 @@ mod tests {
             use crate::state::DispatcherState;
 
             let conn = Connection::open_in_memory().unwrap();
-            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
             SqliteWorkRegistry::init_schema(&conn).unwrap();
             let conn = Arc::new(Mutex::new(conn));
 
@@ -32339,7 +32340,7 @@ mod tests {
             use crate::state::DispatcherState;
 
             let conn = Connection::open_in_memory().unwrap();
-            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
             SqliteWorkRegistry::init_schema(&conn).unwrap();
             let conn = Arc::new(Mutex::new(conn));
 

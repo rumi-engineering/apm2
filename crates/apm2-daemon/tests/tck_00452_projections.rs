@@ -98,7 +98,8 @@ fn sqlite_dispatcher_state() -> (Arc<Mutex<Connection>>, DispatcherState) {
         let conn_guard = conn
             .lock()
             .expect("sqlite lock should be available for schema init");
-        SqliteLedgerEventEmitter::init_schema(&conn_guard).expect("ledger schema init should pass");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn_guard)
+            .expect("ledger schema init should pass");
         SqliteWorkRegistry::init_schema(&conn_guard).expect("work schema init should pass");
     }
 
