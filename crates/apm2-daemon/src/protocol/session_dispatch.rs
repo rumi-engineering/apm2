@@ -59,7 +59,8 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -437,6 +438,84 @@ const BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES: &[u8] =
     b"apm2.canonicalizer.jcs|1.0.0|dcp://apm2.cac/canonicalizer/vectors@v1";
 const DEFAULT_LEAKAGE_CONFIDENCE_LABEL: &str = "runtime-default";
 const DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT: bool = true;
+
+/// Primary environment variable for GH-DIRECT stage policy selection.
+const GH_DIRECT_STAGE_ENV_PRIMARY: &str = "APM2_GH_DIRECT_STAGE";
+/// Secondary environment variable for GH-DIRECT stage policy selection.
+const GH_DIRECT_STAGE_ENV_SECONDARY: &str = "GH_DIRECT_STAGE";
+/// Optional freshness timestamp (`ns since unix epoch`) for GH-DIRECT state.
+const GH_DIRECT_STAGE_REFRESHED_AT_ENV_PRIMARY: &str = "APM2_GH_DIRECT_STAGE_REFRESHED_AT_NS";
+/// Secondary freshness timestamp (`ns since unix epoch`) for GH-DIRECT state.
+const GH_DIRECT_STAGE_REFRESHED_AT_ENV_SECONDARY: &str = "GH_DIRECT_STAGE_REFRESHED_AT_NS";
+/// Runtime environment selector (production vs non-production).
+const RUNTIME_ENV_PRIMARY: &str = "APM2_RUNTIME_ENV";
+/// Secondary runtime environment selector (production vs non-production).
+const RUNTIME_ENV_SECONDARY: &str = "APM2_ENV";
+/// Break-glass flag for `GH-DIRECT-STAGE-1` production override.
+const GH_DIRECT_BREAK_GLASS_ENV_PRIMARY: &str = "APM2_GH_DIRECT_BREAK_GLASS";
+/// Secondary break-glass flag for `GH-DIRECT-STAGE-1` production override.
+const GH_DIRECT_BREAK_GLASS_ENV_SECONDARY: &str = "GH_DIRECT_BREAK_GLASS";
+/// Maximum accepted age for stage-state freshness evidence (24h).
+const GH_DIRECT_STAGE_MAX_AGE_NS: u64 = 86_400_000_000_000;
+/// Maximum detail length persisted in deny diagnostics.
+const MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN: usize = 256;
+/// Maximum wrapper-unwrapping depth when inspecting shell command indirection.
+const MAX_GH_DIRECT_COMMAND_UNWRAP_DEPTH: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhDirectStage {
+    Stage0,
+    Stage1,
+    Stage2,
+}
+
+impl GhDirectStage {
+    #[must_use]
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Stage0 => "GH-DIRECT-STAGE-0",
+            Self::Stage1 => "GH-DIRECT-STAGE-1",
+            Self::Stage2 => "GH-DIRECT-STAGE-2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhDirectStageResolution {
+    Explicit,
+    MissingFailClosed,
+    MissingFreshnessFailClosed,
+    UnknownFailClosed,
+    AmbiguousFailClosed,
+    StaleFailClosed,
+}
+
+impl GhDirectStageResolution {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::MissingFailClosed => "missing_fail_closed",
+            Self::MissingFreshnessFailClosed => "missing_freshness_fail_closed",
+            Self::UnknownFailClosed => "unknown_fail_closed",
+            Self::AmbiguousFailClosed => "ambiguous_fail_closed",
+            Self::StaleFailClosed => "stale_fail_closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GhDirectStageEvaluation {
+    stage: GhDirectStage,
+    resolution: GhDirectStageResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectGithubActuationAttempt {
+    class: &'static str,
+    vector: &'static str,
+    detail: String,
+}
 
 /// Sanitizes an error message for safe return over the protocol.
 ///
@@ -3090,6 +3169,1498 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Ok(tick)
     }
 
+    fn parse_gh_direct_stage(value: &str) -> Option<GhDirectStage> {
+        let normalized = value
+            .trim()
+            .to_ascii_uppercase()
+            .replace('_', "-")
+            .replace(' ', "");
+        match normalized.as_str() {
+            "GH-DIRECT-STAGE-0" | "STAGE0" | "0" => Some(GhDirectStage::Stage0),
+            "GH-DIRECT-STAGE-1" | "STAGE1" | "1" => Some(GhDirectStage::Stage1),
+            "GH-DIRECT-STAGE-2" | "STAGE2" | "2" => Some(GhDirectStage::Stage2),
+            _ => None,
+        }
+    }
+
+    fn evaluate_gh_direct_stage_inputs(
+        primary: Option<&str>,
+        secondary: Option<&str>,
+        refreshed_at_ns: Option<u64>,
+        now_ns: u64,
+    ) -> GhDirectStageEvaluation {
+        let primary_parsed = primary.and_then(Self::parse_gh_direct_stage);
+        let secondary_parsed = secondary.and_then(Self::parse_gh_direct_stage);
+
+        if primary.is_none() && secondary.is_none() {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::MissingFailClosed,
+            };
+        }
+
+        if (primary.is_some() && primary_parsed.is_none())
+            || (secondary.is_some() && secondary_parsed.is_none())
+        {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::UnknownFailClosed,
+            };
+        }
+
+        if let (Some(left), Some(right)) = (primary_parsed, secondary_parsed) {
+            if left != right {
+                return GhDirectStageEvaluation {
+                    stage: GhDirectStage::Stage2,
+                    resolution: GhDirectStageResolution::AmbiguousFailClosed,
+                };
+            }
+        }
+
+        let resolved_stage = primary_parsed
+            .or(secondary_parsed)
+            .unwrap_or(GhDirectStage::Stage2);
+
+        if matches!(
+            resolved_stage,
+            GhDirectStage::Stage0 | GhDirectStage::Stage1
+        ) && refreshed_at_ns.is_none()
+        {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::MissingFreshnessFailClosed,
+            };
+        }
+
+        if let Some(refreshed_ns) = refreshed_at_ns {
+            let age_is_stale = now_ns
+                .checked_sub(refreshed_ns)
+                .is_none_or(|age_ns| age_ns > GH_DIRECT_STAGE_MAX_AGE_NS);
+            let stale = refreshed_ns > now_ns || age_is_stale;
+            if stale {
+                return GhDirectStageEvaluation {
+                    stage: GhDirectStage::Stage2,
+                    resolution: GhDirectStageResolution::StaleFailClosed,
+                };
+            }
+        }
+
+        GhDirectStageEvaluation {
+            stage: resolved_stage,
+            resolution: GhDirectStageResolution::Explicit,
+        }
+    }
+
+    fn read_optional_u64_env(primary_key: &str, secondary_key: &str) -> Result<Option<u64>, ()> {
+        let primary = env::var(primary_key).ok();
+        let secondary = env::var(secondary_key).ok();
+
+        match (primary, secondary) {
+            (None, None) => Ok(None),
+            (Some(raw), None) | (None, Some(raw)) => {
+                raw.trim().parse::<u64>().map(Some).map_err(|_| ())
+            },
+            (Some(left), Some(right)) => {
+                let left_parsed = left.trim().parse::<u64>().map_err(|_| ())?;
+                let right_parsed = right.trim().parse::<u64>().map_err(|_| ())?;
+                if left_parsed == right_parsed {
+                    Ok(Some(left_parsed))
+                } else {
+                    Err(())
+                }
+            },
+        }
+    }
+
+    fn evaluate_gh_direct_stage_state() -> GhDirectStageEvaluation {
+        let primary = env::var(GH_DIRECT_STAGE_ENV_PRIMARY).ok();
+        let secondary = env::var(GH_DIRECT_STAGE_ENV_SECONDARY).ok();
+        let now_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                duration.as_nanos().try_into().unwrap_or(u64::MAX)
+            });
+
+        let Ok(refreshed_at_ns) = Self::read_optional_u64_env(
+            GH_DIRECT_STAGE_REFRESHED_AT_ENV_PRIMARY,
+            GH_DIRECT_STAGE_REFRESHED_AT_ENV_SECONDARY,
+        ) else {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::AmbiguousFailClosed,
+            };
+        };
+
+        Self::evaluate_gh_direct_stage_inputs(
+            primary.as_deref(),
+            secondary.as_deref(),
+            refreshed_at_ns,
+            now_ns,
+        )
+    }
+
+    fn parse_runtime_production_mode(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "prod" | "production" => Some(true),
+            "dev" | "development" | "test" | "local" | "staging" | "nonprod" | "non-production" => {
+                Some(false)
+            },
+            _ => None,
+        }
+    }
+
+    fn is_production_runtime_mode() -> bool {
+        let primary = env::var(RUNTIME_ENV_PRIMARY).ok();
+        let secondary = env::var(RUNTIME_ENV_SECONDARY).ok();
+
+        let primary_mode = primary
+            .as_deref()
+            .and_then(Self::parse_runtime_production_mode);
+        let secondary_mode = secondary
+            .as_deref()
+            .and_then(Self::parse_runtime_production_mode);
+
+        match (primary_mode, secondary_mode, primary, secondary) {
+            (Some(mode), None, _, None) | (None, Some(mode), None, _) => mode,
+            (Some(left), Some(right), _, _) if left == right => left,
+            // Unknown or ambiguous runtime environment is authoritative state
+            // ambiguity and must fail closed to production behavior.
+            _ => true,
+        }
+    }
+
+    fn parse_bool_flag(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn gh_direct_break_glass_enabled() -> bool {
+        let primary = env::var(GH_DIRECT_BREAK_GLASS_ENV_PRIMARY).ok();
+        let secondary = env::var(GH_DIRECT_BREAK_GLASS_ENV_SECONDARY).ok();
+        let primary_flag = primary.as_deref().and_then(Self::parse_bool_flag);
+        let secondary_flag = secondary.as_deref().and_then(Self::parse_bool_flag);
+
+        match (primary_flag, secondary_flag, primary, secondary) {
+            (Some(flag), None, _, None) | (None, Some(flag), None, _) => flag,
+            (Some(left), Some(right), _, _) if left == right => left,
+            // Unknown/ambiguous break-glass state fails closed to "disabled".
+            _ => false,
+        }
+    }
+
+    #[inline]
+    const fn should_deny_direct_github_attempt(
+        stage_eval: GhDirectStageEvaluation,
+        production_mode: bool,
+        break_glass_enabled: bool,
+    ) -> bool {
+        if !production_mode {
+            return false;
+        }
+        match stage_eval.stage {
+            GhDirectStage::Stage0 | GhDirectStage::Stage2 => true,
+            GhDirectStage::Stage1 => !break_glass_enabled,
+        }
+    }
+
+    fn truncate_attempt_detail(detail: &str) -> String {
+        if detail.len() <= MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN {
+            return detail.to_string();
+        }
+        let truncated_len = MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN.saturating_sub(3);
+        let safe_boundary = detail
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(detail.len()))
+            .take_while(|idx| *idx <= truncated_len)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &detail[..safe_boundary])
+    }
+
+    fn detect_forbidden_direct_github_capability_tool_id(
+        tool_id: &str,
+    ) -> Option<DirectGithubActuationAttempt> {
+        let normalized = tool_id.trim();
+        let normalized_lower = normalized.to_ascii_lowercase();
+        let candidate = normalized_lower
+            .strip_prefix("kernel.")
+            .unwrap_or(&normalized_lower);
+
+        let class = candidate
+            .split(['.', ':', '/'])
+            .find(|segment| !segment.is_empty())?;
+
+        let forbidden_class = apm2_core::fac::forbidden_direct_github_capability_class(class)?;
+
+        Some(DirectGithubActuationAttempt {
+            class: forbidden_class,
+            vector: "capability_surface",
+            detail: Self::truncate_attempt_detail(normalized),
+        })
+    }
+
+    fn normalize_shell_token(token: &str) -> &str {
+        token.trim_matches(|ch| matches!(ch, '"' | '\''))
+    }
+
+    fn trim_shell_word_boundary(token: &str) -> &str {
+        token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ';' | ',' | '(' | ')' | '{' | '}' | '[' | ']' | ':'
+            )
+        })
+    }
+
+    fn push_shell_command_segment<'a>(
+        command: &'a str,
+        start: usize,
+        end: usize,
+        segments: &mut Vec<&'a str>,
+    ) {
+        let segment = command[start..end].trim();
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
+    }
+
+    fn split_shell_command_segments(command: &str) -> Vec<&str> {
+        let mut segments = Vec::new();
+        let bytes = command.as_bytes();
+        let mut segment_start = 0usize;
+        let mut idx = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+
+            if in_single_quote {
+                if byte == b'\'' {
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if byte == b'\\' {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                    continue;
+                }
+                if byte == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            match byte {
+                b'\'' => {
+                    in_single_quote = true;
+                    idx += 1;
+                },
+                b'"' => {
+                    in_double_quote = true;
+                    idx += 1;
+                },
+                b'\\' => {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                },
+                b';' | b'\n' => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 1;
+                    segment_start = idx;
+                },
+                b'\r' => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 1;
+                    if bytes.get(idx) == Some(&b'\n') {
+                        idx += 1;
+                    }
+                    segment_start = idx;
+                },
+                b'&' if bytes.get(idx + 1) == Some(&b'&') => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 2;
+                    segment_start = idx;
+                },
+                b'&' => {
+                    // Single '&' is a command separator (background execution)
+                    // and must be treated the same as ';' for chain analysis.
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 1;
+                    segment_start = idx;
+                },
+                b'|' => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    if bytes.get(idx + 1) == Some(&b'|') {
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                    segment_start = idx;
+                },
+                _ => {
+                    idx += 1;
+                },
+            }
+        }
+
+        Self::push_shell_command_segment(command, segment_start, command.len(), &mut segments);
+        segments
+    }
+
+    fn strip_outer_subshell(command: &str) -> Option<&str> {
+        let command = command.trim();
+        let bytes = command.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return None;
+        }
+
+        let mut idx = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+
+            if in_single_quote {
+                if byte == b'\'' {
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if byte == b'\\' {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                    continue;
+                }
+                if byte == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            match byte {
+                b'\'' => in_single_quote = true,
+                b'"' => in_double_quote = true,
+                b'\\' => {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                    continue;
+                },
+                b'(' => depth += 1,
+                b')' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    if depth == 0 && idx + 1 != bytes.len() {
+                        // Outer subshell closes before the end of the segment.
+                        return None;
+                    }
+                },
+                _ => {},
+            }
+
+            idx += 1;
+        }
+
+        if depth != 0 {
+            return None;
+        }
+
+        let inner = command[1..command.len() - 1].trim();
+        (!inner.is_empty()).then_some(inner)
+    }
+
+    fn command_primary_executable_from_tokens(
+        tokens: &[&str],
+        start_idx: usize,
+    ) -> Option<(String, usize)> {
+        tokens
+            .iter()
+            .enumerate()
+            .skip(start_idx)
+            .find_map(|(idx, token)| {
+                let cleaned = Self::normalize_shell_token(token);
+                if cleaned.is_empty() || cleaned.contains('=') {
+                    None
+                } else {
+                    Some((cleaned.to_ascii_lowercase(), idx))
+                }
+            })
+    }
+
+    fn executable_name(exec: &str) -> &str {
+        exec.rsplit(['/', '\\']).next().unwrap_or(exec)
+    }
+
+    fn is_gh_executable(exec: &str) -> bool {
+        matches!(Self::executable_name(exec), "gh" | "gh.exe")
+    }
+
+    fn is_env_wrapper_executable(exec: &str) -> bool {
+        matches!(Self::executable_name(exec), "env" | "env.exe")
+    }
+
+    fn is_shell_eval_builtin(exec: &str) -> bool {
+        matches!(Self::executable_name(exec), "eval")
+    }
+
+    fn is_shell_control_keyword(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "if" | "then"
+                | "elif"
+                | "else"
+                | "fi"
+                | "for"
+                | "while"
+                | "until"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "select"
+                | "in"
+                | "time"
+                | "coproc"
+        )
+    }
+
+    fn is_shell_wrapper_executable(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "sh" | "sh.exe"
+                | "bash"
+                | "bash.exe"
+                | "dash"
+                | "dash.exe"
+                | "zsh"
+                | "zsh.exe"
+                | "ksh"
+                | "ksh.exe"
+                | "ash"
+                | "ash.exe"
+        )
+    }
+
+    fn is_inline_interpreter_executable(exec: &str) -> bool {
+        let name = Self::executable_name(exec);
+        name == "python"
+            || name == "python.exe"
+            || name == "python3"
+            || name == "python3.exe"
+            || name.starts_with("python3.")
+            || matches!(
+                name,
+                "perl"
+                    | "perl.exe"
+                    | "ruby"
+                    | "ruby.exe"
+                    | "node"
+                    | "node.exe"
+                    | "pwsh"
+                    | "pwsh.exe"
+                    | "powershell"
+                    | "powershell.exe"
+            )
+    }
+
+    fn shell_option_has_inline_command_flag(option: &str) -> bool {
+        option.starts_with('-')
+            && !option.starts_with("--")
+            && option.chars().skip(1).any(|ch| ch == 'c')
+    }
+
+    fn interpreter_option_has_inline_command_flag(exec: &str, option: &str) -> bool {
+        if !option.starts_with('-') {
+            return false;
+        }
+        let trimmed = option.trim_start_matches('-');
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let name = Self::executable_name(exec);
+        if matches!(name, "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe") {
+            return trimmed.eq_ignore_ascii_case("c") || trimmed.eq_ignore_ascii_case("command");
+        }
+
+        if name == "python"
+            || name == "python.exe"
+            || name == "python3"
+            || name == "python3.exe"
+            || name.starts_with("python3.")
+        {
+            return trimmed.chars().any(|ch| ch == 'c');
+        }
+
+        trimmed.chars().any(|ch| ch == 'e')
+    }
+
+    fn join_command_tokens(tokens: &[&str], start_idx: usize) -> Option<String> {
+        (start_idx < tokens.len()).then(|| tokens[start_idx..].join(" "))
+    }
+
+    fn extract_env_wrapped_executable(
+        tokens: &[&str],
+        start_idx: usize,
+    ) -> Option<(String, usize)> {
+        let mut idx = start_idx;
+        while idx < tokens.len() {
+            let token = Self::normalize_shell_token(tokens[idx]);
+            if token.is_empty() {
+                idx += 1;
+                continue;
+            }
+            if token == "--" {
+                return Self::command_primary_executable_from_tokens(tokens, idx + 1);
+            }
+            if token == "-u" || token == "--unset" {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if token.starts_with('-') || token.contains('=') {
+                idx += 1;
+                continue;
+            }
+            return Some((token.to_ascii_lowercase(), idx));
+        }
+        None
+    }
+
+    fn extract_shell_wrapper_inline_command(tokens: &[&str], start_idx: usize) -> Option<String> {
+        let mut idx = start_idx;
+        while idx < tokens.len() {
+            let token = Self::normalize_shell_token(tokens[idx]);
+            if token.is_empty() {
+                idx += 1;
+                continue;
+            }
+            if token == "--" {
+                idx += 1;
+                continue;
+            }
+            if token.starts_with('-') {
+                if Self::shell_option_has_inline_command_flag(token) {
+                    return Self::join_command_tokens(tokens, idx + 1);
+                }
+                idx += 1;
+                continue;
+            }
+            // First non-option token is a script path, not an inline command string.
+            return None;
+        }
+        None
+    }
+
+    fn extract_interpreter_wrapper_inline_command(
+        exec: &str,
+        tokens: &[&str],
+        start_idx: usize,
+    ) -> Option<String> {
+        let mut idx = start_idx;
+        while idx < tokens.len() {
+            let token = Self::normalize_shell_token(tokens[idx]);
+            if token.is_empty() {
+                idx += 1;
+                continue;
+            }
+            if token == "--" {
+                idx += 1;
+                continue;
+            }
+            if token.starts_with('-') {
+                if Self::interpreter_option_has_inline_command_flag(exec, token) {
+                    return Self::join_command_tokens(tokens, idx + 1);
+                }
+                idx += 1;
+                continue;
+            }
+            return None;
+        }
+        None
+    }
+
+    fn extract_wrapper_inline_command(
+        exec: &str,
+        tokens: &[&str],
+        start_idx: usize,
+    ) -> Option<String> {
+        if Self::is_shell_eval_builtin(exec) {
+            return Self::join_command_tokens(tokens, start_idx);
+        }
+        if Self::is_shell_wrapper_executable(exec) || exec.starts_with('$') {
+            // Treat `$SHELL -c ...` (and other `$VAR -c ...` wrappers) as
+            // shell-wrapper candidates and inspect the inline payload.
+            return Self::extract_shell_wrapper_inline_command(tokens, start_idx);
+        }
+        if Self::is_inline_interpreter_executable(exec) {
+            return Self::extract_interpreter_wrapper_inline_command(exec, tokens, start_idx);
+        }
+        None
+    }
+
+    fn token_contains_gh_reference(token: &str) -> bool {
+        let stripped = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+        if stripped.is_empty() {
+            return false;
+        }
+
+        let lower = stripped.to_ascii_lowercase();
+        Self::is_gh_executable(&lower)
+            || Self::is_gh_executable(lower.trim_start_matches("$("))
+            || Self::is_gh_executable(lower.trim_start_matches('$'))
+    }
+
+    fn command_contains_gh_token(command: &str) -> bool {
+        command
+            .split_whitespace()
+            .any(Self::token_contains_gh_reference)
+    }
+
+    fn extract_shell_variable_reference(token: &str) -> Option<&str> {
+        let stripped = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+        let raw_reference = stripped.strip_prefix('$')?;
+        if raw_reference.is_empty() {
+            return None;
+        }
+        let variable = raw_reference
+            .strip_prefix('{')
+            .and_then(|inner| inner.strip_suffix('}'))
+            .unwrap_or(raw_reference)
+            .trim_end_matches(|ch: char| ch != '_' && !ch.is_ascii_alphanumeric());
+        if variable.is_empty()
+            || !variable
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        Some(variable)
+    }
+
+    fn is_shell_variable_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if first != '_' && !first.is_ascii_alphabetic() {
+            return false;
+        }
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    }
+
+    fn extract_shell_variable_assignment(token: &str) -> Option<(&str, &str)> {
+        let cleaned = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+        let (name, raw_value) = cleaned.split_once('=')?;
+        if !Self::is_shell_variable_name(name) {
+            return None;
+        }
+        let value = Self::trim_shell_word_boundary(raw_value);
+        if value.is_empty() {
+            return None;
+        }
+        Some((name, value))
+    }
+
+    fn is_shell_assignment_builtin(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "export" | "declare" | "readonly" | "typeset" | "local"
+        )
+    }
+
+    fn mark_github_api_variable_assignment(
+        token: &str,
+        github_api_bound_variables: &mut HashSet<String>,
+    ) {
+        if let Some((name, value)) = Self::extract_shell_variable_assignment(token)
+            && Self::argument_targets_github_api(value)
+        {
+            github_api_bound_variables.insert(name.to_string());
+        }
+    }
+
+    fn collect_github_api_variable_assignments_from_segment(
+        tokens: &[&str],
+        github_api_bound_variables: &mut HashSet<String>,
+    ) {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            for token in tokens {
+                Self::mark_github_api_variable_assignment(token, github_api_bound_variables);
+            }
+            return;
+        };
+
+        for token in tokens.iter().take(exec_idx) {
+            Self::mark_github_api_variable_assignment(token, github_api_bound_variables);
+        }
+
+        if Self::is_shell_assignment_builtin(&exec) {
+            for token in tokens.iter().skip(exec_idx + 1) {
+                Self::mark_github_api_variable_assignment(token, github_api_bound_variables);
+            }
+        }
+    }
+
+    fn mark_gh_cli_variable_assignment(token: &str, gh_bound_variables: &mut HashSet<String>) {
+        let Some((name, value)) = Self::extract_shell_variable_assignment(token) else {
+            return;
+        };
+        let value_lower = value.to_ascii_lowercase();
+        if Self::is_gh_executable(&value_lower) {
+            gh_bound_variables.insert(name.to_string());
+        } else {
+            // Shell assignments are mutable; non-gh rebinds must clear stale bindings.
+            gh_bound_variables.remove(name);
+        }
+    }
+
+    fn collect_gh_cli_variable_assignments_from_segment(
+        tokens: &[&str],
+        gh_bound_variables: &mut HashSet<String>,
+    ) {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            for token in tokens {
+                Self::mark_gh_cli_variable_assignment(token, gh_bound_variables);
+            }
+            return;
+        };
+
+        for token in tokens.iter().take(exec_idx) {
+            Self::mark_gh_cli_variable_assignment(token, gh_bound_variables);
+        }
+
+        if Self::is_shell_assignment_builtin(&exec) {
+            for token in tokens.iter().skip(exec_idx + 1) {
+                Self::mark_gh_cli_variable_assignment(token, gh_bound_variables);
+            }
+        }
+    }
+
+    fn segment_invokes_gh_cli_via_shell_variable(
+        tokens: &[&str],
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            return false;
+        };
+
+        if Self::extract_shell_variable_reference(&exec)
+            .is_some_and(|name| gh_bound_variables.contains(name))
+        {
+            return true;
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, wrapped_idx)) =
+                Self::extract_env_wrapped_executable(tokens, exec_idx + 1)
+        {
+            if Self::extract_shell_variable_reference(&wrapped_exec)
+                .is_some_and(|name| gh_bound_variables.contains(name))
+            {
+                return true;
+            }
+
+            if Self::is_gh_execution_wrapper_command(&wrapped_exec)
+                && Self::wrapper_references_gh_cli_variable(
+                    &wrapped_exec,
+                    tokens,
+                    wrapped_idx + 1,
+                    gh_bound_variables,
+                )
+            {
+                return true;
+            }
+
+            if Self::is_known_non_execution_command(&wrapped_exec) {
+                return false;
+            }
+
+            return Self::arguments_reference_gh_cli_variable(
+                tokens.iter().skip(wrapped_idx + 1).copied(),
+                gh_bound_variables,
+            );
+        }
+
+        if Self::is_gh_execution_wrapper_command(&exec)
+            && Self::wrapper_references_gh_cli_variable(
+                &exec,
+                tokens,
+                exec_idx + 1,
+                gh_bound_variables,
+            )
+        {
+            return true;
+        }
+
+        if Self::is_known_non_execution_command(&exec) {
+            return false;
+        }
+
+        Self::arguments_reference_gh_cli_variable(
+            tokens.iter().skip(exec_idx + 1).copied(),
+            gh_bound_variables,
+        )
+    }
+
+    fn is_known_non_execution_command(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "echo" | "printf" | "cat" | "grep" | "sed" | "awk" | "test" | "["
+        )
+    }
+
+    fn is_gh_execution_wrapper_command(exec: &str) -> bool {
+        matches!(Self::executable_name(exec), "eval" | "exec" | "xargs")
+            || Self::is_shell_wrapper_executable(exec)
+    }
+
+    fn arguments_reference_gh_cli_variable<'a>(
+        mut arguments: impl Iterator<Item = &'a str>,
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        arguments.any(|token| {
+            Self::extract_shell_variable_reference(token)
+                .is_some_and(|name| gh_bound_variables.contains(name))
+        })
+    }
+
+    fn command_text_references_gh_cli_variable(
+        command: &str,
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        Self::arguments_reference_gh_cli_variable(command.split_whitespace(), gh_bound_variables)
+    }
+
+    fn wrapper_references_gh_cli_variable(
+        exec: &str,
+        tokens: &[&str],
+        start_idx: usize,
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        if let Some(inner_command) = Self::extract_wrapper_inline_command(exec, tokens, start_idx)
+            && Self::command_text_references_gh_cli_variable(&inner_command, gh_bound_variables)
+        {
+            return true;
+        }
+
+        Self::arguments_reference_gh_cli_variable(
+            tokens.iter().skip(start_idx).copied(),
+            gh_bound_variables,
+        )
+    }
+
+    fn arguments_reference_github_api_variable<'a>(
+        mut arguments: impl Iterator<Item = &'a str>,
+        github_api_bound_variables: &HashSet<String>,
+    ) -> bool {
+        arguments.any(|token| {
+            Self::extract_shell_variable_reference(token)
+                .is_some_and(|name| github_api_bound_variables.contains(name))
+        })
+    }
+
+    fn segment_uses_github_api_variable_with_network_client(
+        tokens: &[&str],
+        github_api_bound_variables: &HashSet<String>,
+    ) -> bool {
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(tokens, 0) else {
+            return false;
+        };
+
+        if Self::is_http_client_executable(&exec) {
+            return Self::arguments_reference_github_api_variable(
+                tokens.iter().skip(exec_idx + 1).copied(),
+                github_api_bound_variables,
+            );
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, wrapped_idx)) =
+                Self::extract_env_wrapped_executable(tokens, exec_idx + 1)
+            && Self::is_http_client_executable(&wrapped_exec)
+        {
+            return Self::arguments_reference_github_api_variable(
+                tokens.iter().skip(wrapped_idx + 1).copied(),
+                github_api_bound_variables,
+            );
+        }
+
+        false
+    }
+
+    fn command_targets_github_api_via_shell_variable(command: &str) -> bool {
+        let mut github_api_bound_variables = HashSet::new();
+        for segment in Self::split_shell_command_segments(command) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Parse variable assignment segments in command order so values can
+            // propagate to later command segments (e.g., `url=...; curl "$url"`).
+            Self::collect_github_api_variable_assignments_from_segment(
+                &tokens,
+                &mut github_api_bound_variables,
+            );
+
+            if github_api_bound_variables.is_empty() {
+                continue;
+            }
+
+            if Self::segment_uses_github_api_variable_with_network_client(
+                &tokens,
+                &github_api_bound_variables,
+            ) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn command_invokes_gh_cli_via_shell_variable(command: &str) -> bool {
+        let mut gh_bound_variables = HashSet::new();
+        for segment in Self::split_shell_command_segments(command) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            // Parse assignments in shell order so later segments can reference
+            // earlier bindings (`cmd=gh; $cmd api /repos`).
+            Self::collect_gh_cli_variable_assignments_from_segment(
+                &tokens,
+                &mut gh_bound_variables,
+            );
+            if gh_bound_variables.is_empty() {
+                continue;
+            }
+            if Self::segment_invokes_gh_cli_via_shell_variable(&tokens, &gh_bound_variables) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn command_substitution_contains_gh_reference(command: &str, depth: usize) -> bool {
+        let mut stack: Vec<usize> = Vec::new();
+        let bytes = command.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            if bytes[idx] == b'$' && bytes.get(idx + 1) == Some(&b'(') {
+                stack.push(idx + 2);
+                idx += 2;
+                continue;
+            }
+
+            if bytes[idx] == b')'
+                && let Some(start) = stack.pop()
+                && start <= idx
+            {
+                let inner = &command[start..idx];
+                if Self::command_invokes_gh_cli_inner(inner, depth + 1)
+                    || Self::command_contains_gh_token(inner)
+                {
+                    return true;
+                }
+            }
+
+            idx += 1;
+        }
+
+        let mut backtick_start: Option<usize> = None;
+        let mut backtick_idx = 0usize;
+        while backtick_idx < bytes.len() {
+            if bytes[backtick_idx] == b'`' {
+                let escaped = backtick_idx > 0 && bytes[backtick_idx - 1] == b'\\';
+                if !escaped {
+                    if let Some(start) = backtick_start.take() {
+                        if start <= backtick_idx {
+                            let inner = &command[start..backtick_idx];
+                            if Self::command_invokes_gh_cli_inner(inner, depth + 1)
+                                || Self::command_contains_gh_token(inner)
+                            {
+                                return true;
+                            }
+                        }
+                    } else {
+                        backtick_start = Some(backtick_idx + 1);
+                    }
+                }
+            }
+            backtick_idx += 1;
+        }
+
+        false
+    }
+
+    fn command_contains_github_api_argument(command: &str) -> bool {
+        command
+            .split_whitespace()
+            .any(Self::argument_targets_github_api)
+    }
+
+    fn command_substitution_targets_github_api(command: &str, depth: usize) -> bool {
+        let mut stack: Vec<usize> = Vec::new();
+        let bytes = command.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            if bytes[idx] == b'$' && bytes.get(idx + 1) == Some(&b'(') {
+                stack.push(idx + 2);
+                idx += 2;
+                continue;
+            }
+
+            if bytes[idx] == b')'
+                && let Some(start) = stack.pop()
+                && start <= idx
+            {
+                let inner = &command[start..idx];
+                if Self::command_targets_github_api_inner(inner, depth + 1)
+                    || Self::command_contains_github_api_argument(inner)
+                {
+                    return true;
+                }
+            }
+
+            idx += 1;
+        }
+
+        let mut backtick_start: Option<usize> = None;
+        let mut backtick_idx = 0usize;
+        while backtick_idx < bytes.len() {
+            if bytes[backtick_idx] == b'`' {
+                let escaped = backtick_idx > 0 && bytes[backtick_idx - 1] == b'\\';
+                if !escaped {
+                    if let Some(start) = backtick_start.take() {
+                        if start <= backtick_idx {
+                            let inner = &command[start..backtick_idx];
+                            if Self::command_targets_github_api_inner(inner, depth + 1)
+                                || Self::command_contains_github_api_argument(inner)
+                            {
+                                return true;
+                            }
+                        }
+                    } else {
+                        backtick_start = Some(backtick_idx + 1);
+                    }
+                }
+            }
+            backtick_idx += 1;
+        }
+
+        false
+    }
+
+    fn command_invokes_gh_cli_inner(command: &str, depth: usize) -> bool {
+        if depth > MAX_GH_DIRECT_COMMAND_UNWRAP_DEPTH {
+            return false;
+        }
+
+        let command = Self::normalize_shell_token(command.trim());
+        if command.is_empty() {
+            return false;
+        }
+
+        if let Some(inner_subshell) = Self::strip_outer_subshell(command) {
+            return Self::command_invokes_gh_cli_inner(inner_subshell, depth + 1)
+                || Self::command_contains_gh_token(inner_subshell);
+        }
+
+        let segments = Self::split_shell_command_segments(command);
+        if segments.len() > 1 {
+            if segments
+                .into_iter()
+                .any(|segment| Self::command_invokes_gh_cli_inner(segment, depth))
+            {
+                return true;
+            }
+
+            // Some shell indirection patterns (e.g., variable assignment in one
+            // segment and invocation in another) require full-command context.
+            return Self::command_substitution_contains_gh_reference(command, depth)
+                || Self::command_invokes_gh_cli_via_shell_variable(command);
+        }
+
+        let command = segments.first().copied().unwrap_or(command);
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(&tokens, 0)
+        else {
+            return false;
+        };
+        if Self::is_gh_executable(&exec) {
+            return true;
+        }
+        if Self::is_shell_control_keyword(&exec)
+            && let Some(control_body) = Self::join_command_tokens(&tokens, exec_idx + 1)
+            && Self::command_invokes_gh_cli_inner(&control_body, depth + 1)
+        {
+            return true;
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, wrapped_idx)) =
+                Self::extract_env_wrapped_executable(&tokens, exec_idx + 1)
+        {
+            if Self::is_gh_executable(&wrapped_exec) {
+                return true;
+            }
+            if let Some(inner_command) =
+                Self::extract_wrapper_inline_command(&wrapped_exec, &tokens, wrapped_idx + 1)
+                && Self::command_invokes_gh_cli_inner(&inner_command, depth + 1)
+            {
+                return true;
+            }
+        }
+
+        if let Some(inner_command) =
+            Self::extract_wrapper_inline_command(&exec, &tokens, exec_idx + 1)
+        {
+            return Self::command_invokes_gh_cli_inner(&inner_command, depth + 1);
+        }
+
+        // Heuristic fallbacks for shell indirection that simple token parsing
+        // cannot model exactly (command substitution and variable expansion).
+        if Self::command_substitution_contains_gh_reference(command, depth)
+            || Self::command_invokes_gh_cli_via_shell_variable(command)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    fn command_invokes_gh_cli(command: &str) -> bool {
+        Self::command_invokes_gh_cli_inner(command, 0)
+    }
+
+    fn normalize_host_for_github_api_match(host: &str) -> String {
+        host.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    fn host_targets_github_api(host: &str) -> bool {
+        let lower = Self::normalize_host_for_github_api_match(host);
+        lower == "api.github.com" || lower.ends_with(".api.github.com")
+    }
+
+    fn is_http_client_executable(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "curl"
+                | "curl.exe"
+                | "wget"
+                | "wget.exe"
+                | "fetch"
+                | "fetch.exe"
+                | "http"
+                | "http.exe"
+                | "httpie"
+                | "httpie.exe"
+        )
+    }
+
+    fn argument_targets_github_api(argument: &str) -> bool {
+        let normalized = Self::trim_shell_word_boundary(Self::normalize_shell_token(argument));
+        if normalized.is_empty() {
+            return false;
+        }
+
+        let lower = normalized.to_ascii_lowercase();
+        if let Some(host_candidate) = lower.strip_prefix("host:")
+            && Self::host_targets_github_api(host_candidate)
+        {
+            return true;
+        }
+
+        if let Ok(parsed_url) = url::Url::parse(normalized)
+            && let Some(host) = parsed_url.host_str()
+            && Self::host_targets_github_api(host)
+        {
+            return true;
+        }
+
+        if lower.contains("api.github.com") {
+            return true;
+        }
+
+        false
+    }
+
+    fn command_targets_github_api_inner(command: &str, depth: usize) -> bool {
+        if depth > MAX_GH_DIRECT_COMMAND_UNWRAP_DEPTH {
+            return false;
+        }
+
+        let command = Self::normalize_shell_token(command.trim());
+        if command.is_empty() {
+            return false;
+        }
+
+        if let Some(inner_subshell) = Self::strip_outer_subshell(command) {
+            return Self::command_targets_github_api_inner(inner_subshell, depth + 1)
+                || Self::command_contains_github_api_argument(inner_subshell);
+        }
+
+        // Fail-closed detection for shell variable indirection where a GitHub
+        // API URL is assigned then consumed by a network client command.
+        if Self::command_targets_github_api_via_shell_variable(command) {
+            return true;
+        }
+
+        let segments = Self::split_shell_command_segments(command);
+        if segments.len() > 1 {
+            if segments
+                .into_iter()
+                .any(|segment| Self::command_targets_github_api_inner(segment, depth))
+            {
+                return true;
+            }
+            return Self::command_substitution_targets_github_api(command, depth);
+        }
+
+        let command = segments.first().copied().unwrap_or(command);
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(&tokens, 0)
+        else {
+            return false;
+        };
+
+        if Self::is_shell_control_keyword(&exec)
+            && let Some(control_body) = Self::join_command_tokens(&tokens, exec_idx + 1)
+            && Self::command_targets_github_api_inner(&control_body, depth + 1)
+        {
+            return true;
+        }
+
+        if Self::is_http_client_executable(&exec) {
+            return tokens
+                .iter()
+                .skip(exec_idx + 1)
+                .copied()
+                .any(Self::argument_targets_github_api);
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, wrapped_idx)) =
+                Self::extract_env_wrapped_executable(&tokens, exec_idx + 1)
+        {
+            if Self::is_http_client_executable(&wrapped_exec) {
+                return tokens
+                    .iter()
+                    .skip(wrapped_idx + 1)
+                    .copied()
+                    .any(Self::argument_targets_github_api);
+            }
+            if let Some(inner_command) =
+                Self::extract_wrapper_inline_command(&wrapped_exec, &tokens, wrapped_idx + 1)
+                && Self::command_targets_github_api_inner(&inner_command, depth + 1)
+            {
+                return true;
+            }
+        }
+
+        if let Some(inner_command) =
+            Self::extract_wrapper_inline_command(&exec, &tokens, exec_idx + 1)
+        {
+            return Self::command_targets_github_api_inner(&inner_command, depth + 1);
+        }
+
+        if Self::command_substitution_targets_github_api(command, depth) {
+            return true;
+        }
+
+        false
+    }
+
+    fn command_targets_github_api(command: &str) -> bool {
+        Self::command_targets_github_api_inner(command, 0)
+    }
+
+    // SECURITY (RFC-0028 REQ-0008): command-text inspection is a heuristic,
+    // defense-in-depth signal only. The primary security boundary is RoleSpec
+    // capability rejection at the capability/egress boundary.
+    fn detect_direct_github_runtime_attempt(
+        tool_class: ToolClass,
+        arguments: Option<&serde_json::Value>,
+    ) -> Option<DirectGithubActuationAttempt> {
+        match tool_class {
+            ToolClass::Execute => {
+                let command = arguments
+                    .and_then(|args| args.get("command"))
+                    .and_then(serde_json::Value::as_str)?;
+
+                if Self::command_invokes_gh_cli(command) {
+                    return Some(DirectGithubActuationAttempt {
+                        class: "gh_cli",
+                        vector: "shell_command",
+                        detail: Self::truncate_attempt_detail(command),
+                    });
+                }
+
+                if Self::command_targets_github_api(command) {
+                    return Some(DirectGithubActuationAttempt {
+                        class: "github_api",
+                        vector: "shell_command",
+                        detail: Self::truncate_attempt_detail(command),
+                    });
+                }
+
+                None
+            },
+            ToolClass::Network => {
+                let url_str = arguments
+                    .and_then(|args| args.get("url"))
+                    .and_then(serde_json::Value::as_str)?;
+                if let Ok(parsed_url) = url::Url::parse(url_str)
+                    && let Some(host) = parsed_url.host_str()
+                    && Self::host_targets_github_api(host)
+                {
+                    return Some(DirectGithubActuationAttempt {
+                        class: "github_api",
+                        vector: "network_url",
+                        detail: Self::truncate_attempt_detail(url_str),
+                    });
+                }
+                None
+            },
+            _ => None,
+        }
+    }
+
+    fn emit_projection_isolation_deny_defect(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        attempt: &DirectGithubActuationAttempt,
+        stage_eval: GhDirectStageEvaluation,
+        production_mode: bool,
+        break_glass_enabled: bool,
+    ) -> Result<(), String> {
+        let Some(ref ledger) = self.ledger else {
+            return Err("ledger unavailable for projection isolation defect emission".to_string());
+        };
+
+        let defect_id = format!("DEF-SIO28-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+            .unwrap_or(0);
+        let severity = DefectSeverity::S1;
+
+        let defect_record = DefectRecord::builder(&defect_id, "PROJECTION_ISOLATION_DENY")
+            .severity(severity)
+            .work_id(session_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::UnplannedToolCall,
+                format!(
+                    "sio_sig=SIO-SIG-016 class={} vector={} tool_id={} stage={} stage_resolution={} production={} break_glass={} detail={}",
+                    attempt.class,
+                    attempt.vector,
+                    tool_id,
+                    stage_eval.stage.as_label(),
+                    stage_eval.resolution.as_str(),
+                    production_mode,
+                    break_glass_enabled,
+                    attempt.detail
+                ),
+            ))
+            .context(
+                HolonDefectContext::new()
+                    .with_session_id(session_id)
+                    .with_requested_stable_id(tool_id.to_string()),
+            )
+            .build()
+            .map_err(|e| format!("failed to build projection isolation DefectRecord: {e}"))?;
+
+        let defect_json = serde_json::to_vec(&defect_record)
+            .map_err(|e| format!("failed to serialize projection isolation DefectRecord: {e}"))?;
+        let cas_hash = self.cas.as_ref().map_or_else(
+            || blake3::hash(&defect_json).as_bytes().to_vec(),
+            |cas| cas.store(&defect_json).to_vec(),
+        );
+
+        let time_envelope_uri = format!(
+            "htf:projection-isolation:{}:{}",
+            timestamp_ns, attempt.class
+        );
+        let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: "PROJECTION_ISOLATION_DENY".to_string(),
+            cas_hash,
+            source: DefectSource::ContextMiss as i32,
+            work_id: session_id.to_string(),
+            severity: severity.as_str().to_string(),
+            detected_at: timestamp_ns,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash,
+            }),
+        };
+
+        ledger
+            .emit_defect_recorded(&defect_event, timestamp_ns)
+            .map_err(|e| format!("failed to emit projection isolation defect: {e}"))?;
+
+        Ok(())
+    }
+
+    fn maybe_deny_direct_github_attempt(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        attempt: &DirectGithubActuationAttempt,
+    ) -> Result<Option<SessionResponse>, String> {
+        let stage_eval = Self::evaluate_gh_direct_stage_state();
+        let production_mode = Self::is_production_runtime_mode();
+        let break_glass_enabled = Self::gh_direct_break_glass_enabled();
+
+        if !Self::should_deny_direct_github_attempt(
+            stage_eval,
+            production_mode,
+            break_glass_enabled,
+        ) {
+            return Ok(None);
+        }
+
+        self.emit_projection_isolation_deny_defect(
+            session_id,
+            tool_id,
+            attempt,
+            stage_eval,
+            production_mode,
+            break_glass_enabled,
+        )?;
+
+        Ok(Some(SessionResponse::error(
+            SessionErrorCode::SessionErrorToolNotAllowed,
+            format!(
+                "projection isolation denied direct GitHub actuation: class={} vector={} stage={} resolution={} (SIO-SIG-016)",
+                attempt.class,
+                attempt.vector,
+                stage_eval.stage.as_label(),
+                stage_eval.resolution.as_str()
+            ),
+        )))
+    }
+
     #[inline]
     const fn requires_temporal_arbitration(risk_tier: apm2_core::pcac::RiskTier) -> bool {
         matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus)
@@ -3453,6 +5024,44 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
+        let parsed_arguments = serde_json::from_slice::<serde_json::Value>(&request.arguments).ok();
+
+        // RFC-0028 REQ-0008: deny direct projection-sink capability surfaces
+        // from `agent_runtime` before class parsing.
+        if let Some(attempt) =
+            Self::detect_forbidden_direct_github_capability_tool_id(&request.tool_id)
+        {
+            match self.maybe_deny_direct_github_attempt(
+                &token.session_id,
+                &request.tool_id,
+                &attempt,
+            ) {
+                Ok(Some(response)) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        class = attempt.class,
+                        vector = attempt.vector,
+                        "RequestTool denied by projection isolation capability-surface policy"
+                    );
+                    return Ok(response);
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    error!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        error = %e,
+                        "projection isolation defect emission failed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("projection isolation defect emission failed: {e}"),
+                    ));
+                },
+            }
+        }
+
         // TCK-00260: Parse tool_id to ToolClass
         let Some(tool_class) = ToolClass::parse(&request.tool_id) else {
             warn!(
@@ -3466,6 +5075,43 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("unknown tool class: {}", request.tool_id),
             ));
         };
+
+        // RFC-0028 REQ-0008: deny direct GitHub actuation attempts from
+        // `agent_runtime` (`gh` CLI and GitHub API vectors) under GH-DIRECT
+        // stage policy.
+        if let Some(attempt) =
+            Self::detect_direct_github_runtime_attempt(tool_class, parsed_arguments.as_ref())
+        {
+            match self.maybe_deny_direct_github_attempt(
+                &token.session_id,
+                &request.tool_id,
+                &attempt,
+            ) {
+                Ok(Some(response)) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        class = attempt.class,
+                        vector = attempt.vector,
+                        "RequestTool denied by projection isolation runtime actuation policy"
+                    );
+                    return Ok(response);
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    error!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        error = %e,
+                        "projection isolation defect emission failed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("projection isolation defect emission failed: {e}"),
+                    ));
+                },
+            }
+        }
 
         let boundary_channel_key = Self::boundary_channel_key(&token.session_id, tool_class);
         if Self::requires_channel_boundary_enforcement(tool_class) {
@@ -4348,7 +5994,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         )
         .with_inline_args(request.arguments);
 
-        if let Ok(args_value) = serde_json::from_slice::<serde_json::Value>(&request_arguments) {
+        if let Some(args_value) = parsed_arguments {
             match tool_class {
                 ToolClass::Read | ToolClass::Write | ToolClass::ListFiles => {
                     if let Some(path) = args_value.get("path").and_then(serde_json::Value::as_str) {
@@ -7212,6 +8858,668 @@ mod tests {
                 .expect("receipt payload serialization"),
             signature: vec![0u8; 64],
             timestamp_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    mod projection_isolation {
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+        use crate::protocol::messages::RequestToolRequest;
+        use crate::session::{SessionRegistry, SessionState};
+
+        #[test]
+        fn gh_direct_stage_missing_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    None, None, None, 10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::MissingFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_unknown_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("unrecognized-stage"),
+                    None,
+                    None,
+                    10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::UnknownFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_ambiguous_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-0"),
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::AmbiguousFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_stale_fails_closed_to_stage2() {
+            let now_ns: u64 = 90_000_000_000_000;
+            let stale_refreshed_at_ns = now_ns.saturating_sub(GH_DIRECT_STAGE_MAX_AGE_NS + 1);
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    Some(stale_refreshed_at_ns),
+                    now_ns,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::StaleFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_explicit_stage1_when_fresh() {
+            let now_ns: u64 = 90_000_000_000_000;
+            let fresh_refreshed_at_ns = now_ns.saturating_sub(1_000_000_000);
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    Some(fresh_refreshed_at_ns),
+                    now_ns,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage1);
+            assert_eq!(evaluation.resolution, GhDirectStageResolution::Explicit);
+        }
+
+        #[test]
+        fn gh_direct_stage_stage1_without_freshness_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    None,
+                    10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::MissingFreshnessFailClosed
+            );
+        }
+
+        fn make_projection_isolation_dispatcher() -> (
+            SessionDispatcher<InMemoryManifestStore>,
+            Arc<StubLedgerEventEmitter>,
+            TokenMinter,
+        ) {
+            let minter = test_minter();
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            let ledger_trait: Arc<dyn LedgerEventEmitter> = ledger.clone();
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-PROJECTION-ISOLATION-001".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-projection-isolation-001".to_string(),
+                    policy_resolved_ref: "policy-ref".to_string(),
+                    capability_manifest_hash: vec![0x11; 32],
+                    episode_id: Some("episode-projection-isolation-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn crate::session::SessionRegistry> = registry;
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_trait)
+                .with_session_registry(registry_dyn);
+
+            (dispatcher, ledger, minter)
+        }
+
+        fn assert_execute_direct_github_attempt_denied(
+            command: &str,
+            dedupe_key: &str,
+            expected_class: &str,
+        ) {
+            let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "execute".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({ "command": command })).unwrap(),
+                dedupe_key: dedupe_key.to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("projection isolation denied"),
+                        "expected projection isolation deny, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("SIO-SIG-016"),
+                        "expected SIO-SIG-016 marker in deny message, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains(&format!("class={expected_class}")),
+                        "expected {expected_class} class in deny message, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("vector=shell_command"),
+                        "expected shell_command vector in deny message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected direct GitHub actuation deny, got: {other:?}"),
+            }
+
+            let defect_events = ledger
+                .get_events_by_work_id("session-001")
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .collect::<Vec<_>>();
+            assert_eq!(defect_events.len(), 1, "expected one deny defect event");
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&defect_events[0].payload).unwrap();
+            assert_eq!(
+                payload
+                    .get("defect_type")
+                    .and_then(serde_json::Value::as_str),
+                Some("PROJECTION_ISOLATION_DENY")
+            );
+        }
+
+        fn assert_network_direct_github_attempt_denied(url: &str, dedupe_key: &str) {
+            let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "network".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "url": url,
+                    "method": "GET"
+                }))
+                .unwrap(),
+                dedupe_key: dedupe_key.to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("projection isolation denied"),
+                        "expected projection isolation deny, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("class=github_api"),
+                        "expected github_api class in deny message, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("vector=network_url"),
+                        "expected network_url vector in deny message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected direct GitHub network deny, got: {other:?}"),
+            }
+
+            let defect_count = ledger
+                .get_events_by_work_id("session-001")
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .count();
+            assert_eq!(defect_count, 1, "expected one deny defect event");
+        }
+
+        #[test]
+        fn direct_gh_cli_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "gh api repos/example/repo/statuses/abcdef",
+                "projection-isolation-gh-cli",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn wrapped_bash_c_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -c \"gh api repos/example/repo/statuses/abcdef\"",
+                "projection-isolation-bash-c-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn wrapped_sh_c_gh_pr_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "sh -c \"gh pr list --repo example/repo\"",
+                "projection-isolation-sh-c-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn env_wrapped_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "env GH_TOKEN=test-token gh api repos/example/repo/statuses/abcdef",
+                "projection-isolation-env-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_env_wrapper_c_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "$SHELL -c \"gh api /repos\"",
+                "projection-isolation-shell-var-gh-api",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_env_wrapper_braced_c_gh_pr_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "${SHELL} -c \"gh pr view 123\"",
+                "projection-isolation-shell-var-braced-gh-pr",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn wrapped_bash_lc_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -lc \"gh pr view --repo example/repo\"",
+                "projection-isolation-bash-lc-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn substitution_wrapped_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -c \"$(echo gh) api /repos\"",
+                "projection-isolation-subst-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn backtick_substitution_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=`echo gh`; $cmd api /repos",
+                "projection-isolation-backtick-subst-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn eval_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "eval \"gh api /repos\"",
+                "projection-isolation-eval-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_variable_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; $cmd api /repos",
+                "projection-isolation-var-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_variable_eval_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; eval $cmd api /repos",
+                "projection-isolation-var-eval-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_variable_bash_c_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; bash -c \"$cmd api /repos\"",
+                "projection-isolation-var-bash-c-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_variable_bound_to_gh_as_echo_argument_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({ "command": "cmd=gh; echo $cmd" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "variable references should only be flagged when used as executable position"
+            );
+        }
+
+        #[test]
+        fn shell_variable_bound_to_gh_as_printf_argument_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({ "command": "cmd=gh; printf \"%s\" $cmd" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "printf argument references must be treated as non-actuating"
+            );
+        }
+
+        #[test]
+        fn shell_variable_bound_to_gh_as_unknown_argument_denied_fail_closed() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; customcmd $cmd",
+                "projection-isolation-var-unknown-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_and_operator_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "true && gh api /repos/owner/repo",
+                "projection-isolation-chain-and-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_background_operator_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "true & gh api /repos/owner/repo",
+                "projection-isolation-chain-background-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn subshell_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "(gh api /repos/owner/repo)",
+                "projection-isolation-subshell-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn control_flow_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "if gh api /repos/owner/repo; then echo ok; fi",
+                "projection-isolation-control-flow-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_semicolon_operator_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "echo ok; gh pr view 123",
+                "projection-isolation-chain-semicolon-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_semicolon_without_space_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "echo;gh api /repos",
+                "projection-isolation-chain-semicolon-nospace-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn nested_bash_c_chained_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -c \"true && gh api /repos\"",
+                "projection-isolation-nested-bash-c-chain-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn quoted_gh_string_echo_argument_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({ "command": "echo \"gh api /repos\"" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "quoted gh string passed to echo must not be flagged as gh-cli invocation"
+            );
+        }
+
+        #[test]
+        fn echoed_api_github_url_argument_is_not_detected_as_direct_attempt() {
+            let args =
+                serde_json::json!({ "command": "echo \"https://api.github.com/repos/example\"" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "api.github.com in output-only echo command must not be flagged as direct API actuation"
+            );
+        }
+
+        #[test]
+        fn documented_api_github_host_echo_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({
+                "command": "echo \"the URL api.github.com is documented here\""
+            });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "echo-only documentation text must not be flagged as direct API actuation"
+            );
+        }
+
+        #[test]
+        fn curl_api_github_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "curl https://api.github.com/repos/owner/repo",
+                "projection-isolation-curl-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn shell_variable_propagation_api_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "url=https://api.github.com/repos/example/repo; curl \"$url\"",
+                "projection-isolation-shell-var-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn background_operator_api_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd & curl https://api.github.com/repos/o/r",
+                "projection-isolation-background-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn curl_api_github_trailing_dot_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "curl https://api.github.com./repos/owner/repo",
+                "projection-isolation-curl-api-host-trailing-dot",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn nested_api_github_host_in_shell_argument_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -c \"curl -sSf https://api.github.com/repos/example/repo\"",
+                "projection-isolation-nested-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn unicode_multibyte_execute_detail_truncates_without_panic() {
+            let unicode_payload = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let command = format!("gh api /repos/example/repo/issues --body {unicode_payload}");
+            let args = serde_json::json!({ "command": command });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                )
+                .expect("expected direct gh attempt detection");
+            assert!(attempt.detail.len() <= MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            assert!(attempt.detail.ends_with("..."));
+        }
+
+        #[test]
+        fn unicode_multibyte_network_url_detail_truncates_without_panic() {
+            let unicode_suffix = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let url = format!("https://api.github.com/repos/example/repo/issues/{unicode_suffix}");
+            let args = serde_json::json!({ "url": url, "method": "GET" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Network,
+                    Some(&args),
+                )
+                .expect("expected direct github API detection");
+            assert!(attempt.detail.len() <= MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            assert!(attempt.detail.ends_with("..."));
+        }
+
+        #[test]
+        fn unicode_multibyte_execute_attempt_denied_without_panic() {
+            let unicode_payload = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let command = format!("gh api /repos/example/repo/issues --body {unicode_payload}");
+            assert_execute_direct_github_attempt_denied(
+                &command,
+                "projection-isolation-unicode-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn unicode_multibyte_network_url_attempt_denied_without_panic() {
+            let unicode_suffix = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let url = format!("https://api.github.com/repos/example/repo/issues/{unicode_suffix}");
+            assert_network_direct_github_attempt_denied(
+                &url,
+                "projection-isolation-unicode-network",
+            );
+        }
+
+        #[test]
+        fn network_url_api_github_trailing_dot_host_attempt_denied_with_structured_defect() {
+            assert_network_direct_github_attempt_denied(
+                "https://api.github.com./repos/owner/repo",
+                "projection-isolation-network-api-host-trailing-dot",
+            );
+        }
+
+        #[test]
+        fn direct_github_api_capability_surface_denied_with_defect() {
+            let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "github_api.create_status".to_string(),
+                arguments: b"{}".to_vec(),
+                dedupe_key: "projection-isolation-cap-class".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("projection isolation denied"),
+                        "expected projection isolation deny, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("class=github_api"),
+                        "expected github_api class in deny message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected direct github_api class deny, got: {other:?}"),
+            }
+
+            let defect_count = ledger
+                .get_events_by_work_id("session-001")
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .count();
+            assert_eq!(defect_count, 1, "expected one deny defect event");
         }
     }
 

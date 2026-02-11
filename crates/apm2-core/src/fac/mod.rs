@@ -329,6 +329,7 @@ pub use role_conformance::{
 };
 // Re-export role spec types (TCK-00331)
 pub use role_spec::{
+    FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES,
     MAX_CAPABILITY_ID_LENGTH as MAX_ROLE_CAPABILITY_ID_LENGTH,
     MAX_DESCRIPTION_LENGTH as MAX_ROLE_DESCRIPTION_LENGTH,
     MAX_OUTPUT_SCHEMA_LENGTH as MAX_ROLE_OUTPUT_SCHEMA_LENGTH,
@@ -336,6 +337,7 @@ pub use role_spec::{
     MAX_ROLE_NAME_LENGTH, MAX_TOOL_BUDGETS, MAX_TOOL_CLASS_LENGTH, MAX_TOOLS_IN_ALLOWLIST,
     ROLE_SPEC_V1_SCHEMA, RequiredOutputSchema, RoleBudgets, RoleSpecError, RoleSpecV1,
     RoleSpecV1Builder, RoleType, ToolAllowlist, ToolBudget,
+    forbidden_direct_github_capability_class,
 };
 pub use role_spec_v2::{
     DenyCondition, DenyReason, DenyReasonCode, MAX_V2_DENY_REASON_MESSAGE_LENGTH,
