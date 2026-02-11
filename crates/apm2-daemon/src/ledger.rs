@@ -7,9 +7,9 @@
 //!
 //! # Schema
 //!
-//! The `ledger_events` table has columns: `event_id`, `event_type`, `work_id`,
-//! `actor_id`, `payload`, `signature`, `timestamp_ns`, `prev_hash`,
-//! `event_hash`.
+//! The `ledger_events` table has columns: `event_id`, `event_type`,
+//! `event_type_class`, `work_id`, `actor_id`, `payload`, `signature`,
+//! `timestamp_ns`, `prev_hash`, `event_hash`.
 //!
 //! The `work_claims` table has columns: `work_id`, `lease_id`, `actor_id`,
 //! `role`, `claim_json`.
@@ -27,13 +27,13 @@ use tracing::{error, info, warn};
 
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
-    EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
+    EPISODE_EVENT_DOMAIN_PREFIX, EventTypeClass, LeaseValidationError, LeaseValidator,
+    LedgerEventEmitter, LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
     REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX, RedundancyReceiptConsumption,
     SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
     STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
     WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
-    append_privileged_pcac_lifecycle_fields, build_session_started_payload,
+    append_privileged_pcac_lifecycle_fields, build_session_started_payload, classify_event_type,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -88,6 +88,7 @@ impl SqliteLedgerEventEmitter {
             "CREATE TABLE IF NOT EXISTS ledger_events (
                 event_id TEXT PRIMARY KEY,
                 event_type TEXT NOT NULL,
+                event_type_class TEXT NOT NULL DEFAULT 'session',
                 work_id TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
                 payload BLOB NOT NULL,
@@ -99,7 +100,9 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
         Self::ensure_hash_chain_columns(conn)?;
+        Self::ensure_event_type_class_column(conn)?;
         Self::ensure_metadata_table(conn)?;
+        Self::backfill_event_type_classes(conn)?;
         let mut migration_changes_applied = Self::backfill_hash_chain(conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_work_id ON ledger_events(work_id)",
@@ -116,6 +119,11 @@ impl SqliteLedgerEventEmitter {
         // Index for LeaseValidator
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_type_payload ON ledger_events(event_type)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_events_class_type_actor \
+             ON ledger_events(event_type_class, event_type, actor_id)",
             [],
         )?;
         // SECURITY (v9 Finding 1 — Delegation Uniqueness Constraint):
@@ -431,6 +439,80 @@ impl SqliteLedgerEventEmitter {
         Ok(())
     }
 
+    fn ensure_event_type_class_column(conn: &Connection) -> rusqlite::Result<()> {
+        let has_event_type_class: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM pragma_table_info('ledger_events')
+                WHERE name = 'event_type_class'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !has_event_type_class {
+            conn.execute(
+                "ALTER TABLE ledger_events \
+                 ADD COLUMN event_type_class TEXT NOT NULL DEFAULT 'session'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn backfill_event_type_classes(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE ledger_events
+             SET event_type_class = CASE
+                 WHEN event_type IN (
+                     'gate.policy_resolved',
+                     'policy_root_published',
+                     'policy_updated',
+                     'gate_configuration_updated'
+                 ) AND actor_id IN (
+                     'orchestrator:gate-lifecycle',
+                     'governance:policy-root',
+                     'governance:policy'
+                 ) THEN 'governance'
+                 WHEN event_type IN (
+                     'work_claimed',
+                     'session_started',
+                     'session_terminated',
+                     'work_transitioned',
+                     'stop_flags_mutated',
+                     'defect_recorded',
+                     'changeset_published',
+                     'review_receipt_recorded',
+                     'review_blocked_recorded',
+                     'redundancy_receipt_consumed',
+                     'SubleaseIssued',
+                     'gate_lease_issued',
+                     'episode_run_attributed'
+                 ) THEN 'system'
+                 ELSE 'session'
+             END
+             WHERE event_type_class IS NULL
+                OR event_type_class = ''
+                OR event_type_class NOT IN ('governance', 'session', 'system')
+                OR (
+                    event_type IN (
+                        'gate.policy_resolved',
+                        'policy_root_published',
+                        'policy_updated',
+                        'gate_configuration_updated'
+                    )
+                    AND actor_id IN (
+                        'orchestrator:gate-lifecycle',
+                        'governance:policy-root',
+                        'governance:policy'
+                    )
+                    AND event_type_class != 'governance'
+                )",
+            [],
+        )?;
+        Ok(())
+    }
+
     fn backfill_hash_chain(conn: &Connection) -> rusqlite::Result<bool> {
         if Self::get_metadata_value(conn, Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG)?.as_deref()
             == Some(Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE)
@@ -649,10 +731,13 @@ impl SqliteLedgerEventEmitter {
         prev_hash: &str,
         event_hash: &str,
     ) -> Result<(), LedgerEventError> {
+        let event_type_class =
+            classify_event_type(&signed_event.event_type, &signed_event.actor_id).as_str();
         conn.execute(
             "INSERT INTO ledger_events (
                 event_id,
                 event_type,
+                event_type_class,
                 work_id,
                 actor_id,
                 payload,
@@ -660,10 +745,11 @@ impl SqliteLedgerEventEmitter {
                 timestamp_ns,
                 prev_hash,
                 event_hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 signed_event.event_id,
                 signed_event.event_type,
+                event_type_class,
                 signed_event.work_id,
                 signed_event.actor_id,
                 signed_event.payload,
@@ -1367,17 +1453,56 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .ok()
     }
 
+    fn get_latest_governance_policy_event(&self) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             WHERE event_type_class = ?1
+             AND event_type IN (
+                 'gate.policy_resolved',
+                 'policy_root_published',
+                 'policy_updated',
+                 'gate_configuration_updated'
+             )
+             AND actor_id IN (
+                 'orchestrator:gate-lifecycle',
+                 'governance:policy-root',
+                 'governance:policy'
+             )
+             ORDER BY rowid DESC
+             LIMIT 1",
+            params![EventTypeClass::Governance.as_str()],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
         let conn = self.conn.lock().ok()?;
 
         conn.query_row(
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
              FROM ledger_events
-             WHERE event_type = 'gate.policy_resolved'
+             WHERE event_type_class = ?1
+             AND event_type = 'gate.policy_resolved'
              AND actor_id = 'orchestrator:gate-lifecycle'
              ORDER BY rowid DESC
              LIMIT 1",
-            [],
+            params![EventTypeClass::Governance.as_str()],
             |row| {
                 Ok(SignedLedgerEvent {
                     event_id: row.get(0)?,
