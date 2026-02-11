@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signer, Verifier};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -29,11 +29,11 @@ use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
     LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
-    RedundancyReceiptConsumption, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
-    STOP_FLAGS_MUTATED_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent,
-    StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim,
-    WorkRegistry, WorkRegistryError, WorkTransition, append_privileged_pcac_lifecycle_fields,
-    build_session_started_payload,
+    REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX, RedundancyReceiptConsumption,
+    SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
+    STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
+    append_privileged_pcac_lifecycle_fields, build_session_started_payload,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -308,15 +308,14 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'changeset_published'",
             [],
         )?;
-        Self::validate_startup_hash_chain_checkpoint(conn, migration_changes_applied).map_err(
-            |message| {
+        Self::validate_startup_hash_chain_checkpoint(conn, migration_changes_applied, None)
+            .map_err(|message| {
                 error!(
                     reason = %message,
                     "ledger hash-chain integrity checkpoint mismatch; refusing startup"
                 );
                 rusqlite::Error::InvalidQuery
-            },
-        )?;
+            })?;
         Ok(())
     }
 
@@ -356,6 +355,7 @@ impl SqliteLedgerEventEmitter {
     fn validate_startup_hash_chain_checkpoint(
         conn: &Connection,
         migration_changes_applied: bool,
+        trusted_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> Result<(), String> {
         // First startup (no checkpoint) performs an O(N) full-chain verification
         // before seeding metadata. Subsequent startups remain O(1) by comparing
@@ -369,8 +369,9 @@ impl SqliteLedgerEventEmitter {
         let checkpoint = Self::get_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY)
             .map_err(|e| format!("failed to read hash-chain checkpoint metadata: {e}"))?;
         let Some(checkpoint) = checkpoint else {
-            let verified_tip = Self::derive_event_chain_hash_from_db(conn)
-                .map_err(|e| format!("first-startup chain verification failed: {e}"))?;
+            let verified_tip =
+                Self::derive_event_chain_hash_from_db_internal(conn, trusted_verifying_key)
+                    .map_err(|e| format!("first-startup chain verification failed: {e}"))?;
             if verified_tip != chain_tip {
                 return Err(format!(
                     "first-startup chain verification mismatch: derived={verified_tip}, stored_tip={chain_tip}"
@@ -683,7 +684,23 @@ impl SqliteLedgerEventEmitter {
         Ok(())
     }
 
-    fn derive_event_chain_hash_from_db(conn: &Connection) -> Result<String, String> {
+    fn derive_event_chain_hash_from_db(
+        conn: &Connection,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<String, String> {
+        Self::derive_event_chain_hash_from_db_internal(conn, Some(verifying_key))
+    }
+
+    fn derive_event_chain_hash_from_db_internal(
+        conn: &Connection,
+        trusted_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> Result<String, String> {
+        const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+        const REDUNDANCY_RECEIPT_CONSUMED_DOMAIN_PREFIX: &[u8] =
+            b"apm2.event.redundancy_receipt_consumed:";
+        const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
+
         #[derive(Debug)]
         struct ChainRow {
             event_id: String,
@@ -748,6 +765,87 @@ impl SqliteLedgerEventEmitter {
                     return Err(format!(
                         "event {} prev_hash payload mismatch: payload={}, column={}",
                         row.event_id, payload_prev_hash, row.prev_hash
+                    ));
+                }
+            }
+
+            if row.signature.len() != 64 {
+                return Err(format!(
+                    "event {} has invalid signature length: expected 64 bytes, got {}",
+                    row.event_id,
+                    row.signature.len()
+                ));
+            }
+
+            let is_synthetic_gate_lease =
+                row.event_type == "gate_lease_issued" && row.actor_id == "system";
+            if is_synthetic_gate_lease {
+                if !row.signature.iter().all(|byte| *byte == 0) {
+                    return Err(format!(
+                        "synthetic gate_lease_issued event {} must use zero-filled signature",
+                        row.event_id
+                    ));
+                }
+            } else if let Some(verifying_key) = trusted_verifying_key {
+                let signature = ed25519_dalek::Signature::try_from(row.signature.as_slice())
+                    .map_err(|error| {
+                        format!(
+                            "event {} has invalid Ed25519 signature bytes: {error}",
+                            row.event_id
+                        )
+                    })?;
+
+                let mut candidate_prefixes: Vec<&[u8]> = Vec::with_capacity(4);
+                let mut push_prefix = |prefix: &'static [u8]| {
+                    if !candidate_prefixes.contains(&prefix) {
+                        candidate_prefixes.push(prefix);
+                    }
+                };
+
+                match row.event_type.as_str() {
+                    "work_claimed" => push_prefix(WORK_CLAIMED_DOMAIN_PREFIX),
+                    "session_started" => push_prefix(SESSION_STARTED_DOMAIN_PREFIX),
+                    "stop_flags_mutated" => push_prefix(STOP_FLAGS_MUTATED_DOMAIN_PREFIX),
+                    "defect_recorded" => push_prefix(DEFECT_RECORDED_DOMAIN_PREFIX),
+                    "redundancy_receipt_consumed" => {
+                        push_prefix(REDUNDANCY_RECEIPT_CONSUMED_DOMAIN_PREFIX);
+                    },
+                    "work_transitioned" => push_prefix(WORK_TRANSITIONED_DOMAIN_PREFIX),
+                    "session_terminated" => {
+                        push_prefix(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX);
+                    },
+                    "changeset_published" => {
+                        push_prefix(CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX);
+                    },
+                    "review_receipt_recorded" => {
+                        push_prefix(REVIEW_RECEIPT_RECORDED_PREFIX);
+                    },
+                    "review_blocked_recorded" => {
+                        push_prefix(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX);
+                    },
+                    "episode_run_attributed" => push_prefix(EPISODE_RUN_ATTRIBUTED_PREFIX),
+                    _ => {},
+                }
+                push_prefix(SESSION_EVENT_DOMAIN_PREFIX);
+                push_prefix(EPISODE_EVENT_DOMAIN_PREFIX);
+
+                let mut signature_valid = false;
+                for prefix in candidate_prefixes {
+                    let mut canonical_bytes = Vec::with_capacity(prefix.len() + row.payload.len());
+                    canonical_bytes.extend_from_slice(prefix);
+                    canonical_bytes.extend_from_slice(&row.payload);
+                    if verifying_key
+                        .verify(canonical_bytes.as_slice(), &signature)
+                        .is_ok()
+                    {
+                        signature_valid = true;
+                        break;
+                    }
+                }
+                if !signature_valid {
+                    return Err(format!(
+                        "event {} failed Ed25519 signature verification",
+                        row.event_id
                     ));
                 }
             }
@@ -1269,6 +1367,34 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .ok()
     }
 
+    fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             WHERE event_type = 'gate.policy_resolved'
+             AND actor_id = 'orchestrator:gate-lifecycle'
+             ORDER BY rowid DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     fn get_latest_event_hash(&self) -> Result<Option<String>, String> {
         let conn = self
             .conn
@@ -1298,7 +1424,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .conn
             .lock()
             .map_err(|_| "connection lock poisoned".to_string())?;
-        Self::derive_event_chain_hash_from_db(&conn)
+        let verifying_key = self.verifying_key();
+        Self::derive_event_chain_hash_from_db(&conn, &verifying_key)
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
@@ -3251,6 +3378,115 @@ mod tests {
     }
 
     #[test]
+    fn derive_event_chain_hash_rejects_rehashed_tampered_event_with_invalid_signature() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("sqlite in-memory should open"),
+        ));
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            SqliteLedgerEventEmitter::init_schema(&conn_guard)
+                .expect("schema initialization should succeed");
+        }
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key);
+
+        let claim = WorkClaim {
+            work_id: "W-SIG-CHECK-001".to_string(),
+            lease_id: "L-SIG-CHECK-001".to_string(),
+            actor_id: "uid:sig-check".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_000_000)
+            .expect("work_claimed should persist");
+
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            let (
+                event_id,
+                event_type,
+                work_id,
+                actor_id,
+                payload_bytes,
+                timestamp_i64,
+                prev_hash,
+            ): (String, String, String, String, Vec<u8>, i64, String) = conn_guard
+                .query_row(
+                    "SELECT event_id, event_type, work_id, actor_id, payload, timestamp_ns, prev_hash
+                     FROM ledger_events
+                     ORDER BY rowid ASC
+                     LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .expect("seed event row should load");
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            let timestamp_ns = timestamp_i64 as u64;
+
+            let mut tampered_payload: serde_json::Value =
+                serde_json::from_slice(&payload_bytes).expect("seed payload should decode");
+            tampered_payload["tampered"] = serde_json::Value::Bool(true);
+            let tampered_payload_bytes =
+                serde_json::to_vec(&tampered_payload).expect("tampered payload should encode");
+            let tampered_signature = vec![0x7Fu8; 64];
+            let tampered_event_hash =
+                SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+                    event_id: &event_id,
+                    event_type: &event_type,
+                    work_id: &work_id,
+                    actor_id: &actor_id,
+                    payload: &tampered_payload_bytes,
+                    signature: &tampered_signature,
+                    timestamp_ns,
+                    prev_hash: &prev_hash,
+                });
+
+            conn_guard
+                .execute(
+                    "UPDATE ledger_events
+                     SET payload = ?1, signature = ?2, event_hash = ?3
+                     WHERE event_id = ?4",
+                    params![
+                        tampered_payload_bytes,
+                        tampered_signature,
+                        tampered_event_hash,
+                        event_id
+                    ],
+                )
+                .expect("tampered row update should succeed");
+            SqliteLedgerEventEmitter::set_metadata_value(
+                &conn_guard,
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+                &tampered_event_hash,
+            )
+            .expect("checkpoint update should succeed");
+        }
+
+        let err = emitter
+            .derive_event_chain_hash()
+            .expect_err("signature-authenticated chain derivation must fail on tampered row");
+        assert!(
+            err.contains("signature verification"),
+            "chain verification must fail on invalid signatures: {err}"
+        );
+    }
+
+    #[test]
     fn authoritative_projection_query_is_bounded_to_recent_receipts() {
         let emitter = test_emitter();
         let total = MAX_PROJECTION_EVENTS + 3;
@@ -3778,9 +4014,12 @@ mod tests {
             "exec-checkpoint",
         );
 
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
         let conn_guard = conn.lock().expect("sqlite lock should be available");
-        let chain_tip = SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard)
-            .expect("chain tip derivation should succeed");
+        let chain_tip =
+            SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard, &verifying_key)
+                .expect("chain tip derivation should succeed");
         let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
             &conn_guard,
             SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
@@ -3791,8 +4030,12 @@ mod tests {
             Some(chain_tip.as_str()),
             "register_lease_with_executor must update hash-chain checkpoint"
         );
-        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(&conn_guard, false)
-            .expect("startup checkpoint validation should pass after lease registration");
+        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn_guard,
+            false,
+            Some(&verifying_key),
+        )
+        .expect("startup checkpoint validation should pass after lease registration");
     }
 
     /// Regression: full-lease registration updates hash-chain checkpoint
@@ -3825,9 +4068,12 @@ mod tests {
             .register_full_lease(&lease)
             .expect("register_full_lease should succeed");
 
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
         let conn_guard = conn.lock().expect("sqlite lock should be available");
-        let chain_tip = SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard)
-            .expect("chain tip derivation should succeed");
+        let chain_tip =
+            SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard, &verifying_key)
+                .expect("chain tip derivation should succeed");
         let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
             &conn_guard,
             SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
@@ -3838,8 +4084,12 @@ mod tests {
             Some(chain_tip.as_str()),
             "register_full_lease must update hash-chain checkpoint"
         );
-        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(&conn_guard, false)
-            .expect("startup checkpoint validation should pass after full lease registration");
+        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn_guard,
+            false,
+            Some(&verifying_key),
+        )
+        .expect("startup checkpoint validation should pass after full lease registration");
     }
 
     // ====================================================================
@@ -4520,6 +4770,92 @@ mod tests {
         assert!(
             chain_err.contains("hash chain broken") && chain_err.contains("event_hash"),
             "expected explicit hash-chain break diagnostics, got: {chain_err}"
+        );
+    }
+
+    #[test]
+    fn derive_event_chain_hash_detects_signature_tampering_with_rehashed_row() {
+        let emitter = test_emitter();
+        let claim = WorkClaim {
+            work_id: "W-HASH-CHAIN-SIG-001".to_string(),
+            lease_id: "L-HASH-CHAIN-SIG-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_100_000)
+            .expect("work_claimed must emit for signature tampering test");
+
+        let (event_id, event_type, work_id, actor_id, payload, timestamp_ns, prev_hash): (
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            i64,
+            String,
+        ) = {
+            let conn = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available for seed query");
+            conn.query_row(
+                "SELECT event_id, event_type, work_id, actor_id, payload, timestamp_ns, prev_hash \
+                 FROM ledger_events WHERE rowid = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("seed row should exist")
+        };
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let timestamp_ns = timestamp_ns as u64;
+
+        let tampered_signature = vec![0xA5; 64];
+        let tampered_event_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+            event_id: &event_id,
+            event_type: &event_type,
+            work_id: &work_id,
+            actor_id: &actor_id,
+            payload: &payload,
+            signature: &tampered_signature,
+            timestamp_ns,
+            prev_hash: &prev_hash,
+        });
+
+        {
+            let conn = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available for tamper mutation");
+            conn.execute(
+                "UPDATE ledger_events SET signature = ?1, event_hash = ?2 WHERE event_id = ?3",
+                params![tampered_signature, tampered_event_hash, event_id],
+            )
+            .expect("signature tamper mutation should succeed");
+        }
+
+        let chain_err = emitter
+            .derive_event_chain_hash()
+            .expect_err("rehashed signature tampering must fail chain derivation");
+        assert!(
+            chain_err.contains("signature verification")
+                || chain_err.contains("failed Ed25519 signature"),
+            "expected signature verification failure diagnostics, got: {chain_err}"
         );
     }
 

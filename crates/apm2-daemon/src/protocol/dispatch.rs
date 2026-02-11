@@ -550,6 +550,18 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
+    /// Returns the latest trusted `gate.policy_resolved` lifecycle event.
+    ///
+    /// The default implementation scans events from newest to oldest and
+    /// returns the first event whose type and actor match gate orchestrator
+    /// policy-resolution provenance.
+    fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
+        self.get_all_events().into_iter().rev().find(|event| {
+            event.event_type == "gate.policy_resolved"
+                && event.actor_id == "orchestrator:gate-lifecycle"
+        })
+    }
+
     /// Returns the latest persisted event hash chain tip in O(1) time.
     ///
     /// `Ok(None)` indicates an empty ledger with no persisted events.
@@ -3232,6 +3244,17 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         order
             .last()
             .and_then(|event_id| events.get(event_id).cloned())
+    }
+
+    fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        let (order, events) = &*guard;
+        order.iter().rev().find_map(|event_id| {
+            let event = events.get(event_id)?;
+            (event.event_type == "gate.policy_resolved"
+                && event.actor_id == "orchestrator:gate-lifecycle")
+                .then(|| event.clone())
+        })
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
