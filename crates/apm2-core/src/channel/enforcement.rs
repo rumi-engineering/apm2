@@ -11,6 +11,10 @@ use crate::crypto::{Signature, Signer, VerifyingKey, parse_signature, verify_sig
 
 /// Maximum string length for channel enforcement detail fields.
 pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
+/// Maximum length for declassification receipt identifiers.
+pub const MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH: usize = 128;
+/// Maximum length for leakage estimator confidence labels.
+pub const MAX_LEAKAGE_CONFIDENCE_LABEL_LENGTH: usize = 128;
 const CHANNEL_SOURCE_WITNESS_DOMAIN: &[u8] = b"apm2.channel_source_witness.v1";
 const CHANNEL_CONTEXT_TOKEN_SCHEMA_ID: &str = "apm2.channel_context_token.v1";
 const MAX_CHANNEL_CONTEXT_TOKEN_LEN: usize = 8192;
@@ -41,6 +45,133 @@ impl ChannelSource {
     }
 }
 
+/// Declassification intent scope for boundary-flow downgrade requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclassificationIntentScope {
+    /// No boundary downgrade is requested.
+    None,
+    /// Downgrade is requested for recoverability redundancy fragments only.
+    RedundancyPurpose,
+    /// Unknown/unscoped intent (explicit fail-closed deny).
+    Unknown,
+}
+
+const fn default_unknown_declassification_intent_scope() -> DeclassificationIntentScope {
+    DeclassificationIntentScope::Unknown
+}
+
+/// Estimator family for typed leakage-budget receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakageEstimatorFamily {
+    /// Mutual-information upper-bound estimator family.
+    MutualInformationUpperBound,
+    /// Channel-capacity upper-bound estimator family.
+    ChannelCapacityUpperBound,
+    /// Deterministic histogram bucket estimator family.
+    EmpiricalBucketHistogram,
+    /// Unknown estimator family (fail-closed deny).
+    Unknown,
+}
+
+/// Digest/coherence binding for RFC-0028 boundary-flow policy checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryFlowPolicyBinding {
+    /// Flow policy digest presented at the boundary.
+    pub policy_digest: [u8; 32],
+    /// Admitted policy root digest from authoritative state.
+    pub admitted_policy_root_digest: [u8; 32],
+    /// Canonicalizer tuple digest presented at the boundary.
+    pub canonicalizer_tuple_digest: [u8; 32],
+    /// Admitted canonicalizer tuple digest from authoritative state.
+    pub admitted_canonicalizer_tuple_digest: [u8; 32],
+}
+
+impl BoundaryFlowPolicyBinding {
+    fn has_non_zero_digests(&self) -> bool {
+        self.policy_digest != [0u8; 32]
+            && self.admitted_policy_root_digest != [0u8; 32]
+            && self.canonicalizer_tuple_digest != [0u8; 32]
+            && self.admitted_canonicalizer_tuple_digest != [0u8; 32]
+    }
+
+    fn policy_digest_matches(&self) -> bool {
+        bool::from(self.policy_digest.ct_eq(&self.admitted_policy_root_digest))
+    }
+
+    fn canonicalizer_tuple_matches(&self) -> bool {
+        bool::from(
+            self.canonicalizer_tuple_digest
+                .ct_eq(&self.admitted_canonicalizer_tuple_digest),
+        )
+    }
+}
+
+/// Receipt metadata required for `redundancy_purpose` declassification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedundancyDeclassificationReceipt {
+    /// Stable receipt identifier.
+    pub receipt_id: String,
+    /// True when the release is scoped to fragment metadata only.
+    pub scoped_fragment_only: bool,
+    /// True when authority-bearing plaintext semantics are exposed.
+    pub plaintext_semantics_exposed: bool,
+}
+
+impl RedundancyDeclassificationReceipt {
+    fn is_well_formed(&self) -> bool {
+        !self.receipt_id.is_empty()
+            && self.receipt_id.len() <= MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
+            && self.scoped_fragment_only
+            && !self.plaintext_semantics_exposed
+    }
+}
+
+/// Typed leakage-budget receipt for boundary-flow admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeakageBudgetReceipt {
+    /// Leakage estimate in `leakage_bits`.
+    pub leakage_bits: u64,
+    /// Budget ceiling in `leakage_bits`.
+    pub budget_bits: u64,
+    /// Estimator family declaration.
+    pub estimator_family: LeakageEstimatorFamily,
+    /// Confidence in basis points (`0..=10000`).
+    pub confidence_bps: u16,
+    /// Optional bounded confidence descriptor.
+    pub confidence_label: String,
+}
+
+impl LeakageBudgetReceipt {
+    fn is_well_formed(&self) -> bool {
+        self.budget_bits > 0
+            && self.confidence_bps <= 10_000
+            && self.confidence_label.len() <= MAX_LEAKAGE_CONFIDENCE_LABEL_LENGTH
+    }
+}
+
+/// Timing-channel budget witness for release bucketing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimingChannelBudget {
+    /// Release bucket size in ticks.
+    pub release_bucket_ticks: u64,
+    /// Observed timing variance in ticks.
+    pub observed_variance_ticks: u64,
+    /// Maximum admissible timing variance in ticks.
+    pub budget_ticks: u64,
+}
+
+impl TimingChannelBudget {
+    const fn is_well_formed(&self) -> bool {
+        self.release_bucket_ticks > 0 && self.budget_ticks > 0
+    }
+}
+
 /// Channel boundary enforcement result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -58,6 +189,34 @@ pub struct ChannelBoundaryCheck {
     pub context_firewall_verified: bool,
     /// Whether policy hash admission was verified against the ledger.
     pub policy_ledger_verified: bool,
+    /// Whether taint lattice admission allows this flow.
+    pub taint_allow: bool,
+    /// Whether confidentiality/classification admission allows this flow.
+    pub classification_allow: bool,
+    /// Whether declassification receipt validation passed for this flow.
+    pub declass_receipt_valid: bool,
+    /// Declassification intent scope at this boundary.
+    pub declassification_intent: DeclassificationIntentScope,
+    /// Optional redundancy-purpose declassification receipt.
+    pub redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
+    /// Policy digest/canonicalizer tuple binding witness.
+    pub boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
+    /// Typed leakage-budget receipt.
+    pub leakage_budget_receipt: Option<LeakageBudgetReceipt>,
+    /// Timing-channel release-bucketing witness.
+    pub timing_channel_budget: Option<TimingChannelBudget>,
+    /// Policy-derived maximum leakage budget in bits.
+    #[serde(default)]
+    pub leakage_budget_policy_max_bits: Option<u64>,
+    /// Client-claimed leakage budget in bits before policy clamping.
+    #[serde(default)]
+    pub declared_leakage_budget_bits: Option<u64>,
+    /// Policy-derived maximum timing budget in ticks.
+    #[serde(default)]
+    pub timing_budget_policy_max_ticks: Option<u64>,
+    /// Client-claimed timing budget in ticks before policy clamping.
+    #[serde(default)]
+    pub declared_timing_budget_ticks: Option<u64>,
 }
 
 /// Serialized channel context payload signed by the daemon signer.
@@ -78,6 +237,30 @@ struct ChannelContextTokenPayloadV1 {
     capability_verified: bool,
     context_firewall_verified: bool,
     policy_ledger_verified: bool,
+    #[serde(default)]
+    taint_allow: bool,
+    #[serde(default)]
+    classification_allow: bool,
+    #[serde(default)]
+    declass_receipt_valid: bool,
+    #[serde(default = "default_unknown_declassification_intent_scope")]
+    declassification_intent: DeclassificationIntentScope,
+    #[serde(default)]
+    redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
+    #[serde(default)]
+    boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
+    #[serde(default)]
+    leakage_budget_receipt: Option<LeakageBudgetReceipt>,
+    #[serde(default)]
+    timing_channel_budget: Option<TimingChannelBudget>,
+    #[serde(default)]
+    leakage_budget_policy_max_bits: Option<u64>,
+    #[serde(default)]
+    declared_leakage_budget_bits: Option<u64>,
+    #[serde(default)]
+    timing_budget_policy_max_ticks: Option<u64>,
+    #[serde(default)]
+    declared_timing_budget_ticks: Option<u64>,
 }
 
 /// Serialized signed channel context token.
@@ -200,6 +383,33 @@ pub enum ChannelViolationClass {
     UnknownChannelSource,
     /// Policy hash was not verified against authoritative ledger admission.
     PolicyNotLedgerVerified,
+    /// Taint lattice admission denied this boundary flow.
+    TaintNotAdmitted,
+    /// Confidentiality/classification admission denied this boundary flow.
+    ClassificationNotAdmitted,
+    /// Declassification receipt was required but missing/invalid.
+    DeclassificationReceiptInvalid,
+    /// Declassification intent was unknown or unscoped.
+    UnknownOrUnscopedDeclassificationIntent,
+    /// Policy digest binding mismatch or missing policy digest witness.
+    PolicyDigestBindingMismatch,
+    /// Canonicalizer tuple binding mismatch or missing witness.
+    CanonicalizerTupleBindingMismatch,
+    /// Leakage budget receipt missing, malformed, or over budget.
+    LeakageBudgetExceeded,
+    /// Timing-channel release bucketing/budget violated.
+    TimingChannelBudgetExceeded,
+}
+
+impl ChannelViolationClass {
+    /// Returns `true` when this defect requires boundary-channel quarantine.
+    #[must_use]
+    pub const fn requires_quarantine(self) -> bool {
+        matches!(
+            self,
+            Self::LeakageBudgetExceeded | Self::TimingChannelBudgetExceeded
+        )
+    }
 }
 
 /// Deterministically derives a witness token for the provided channel source.
@@ -296,6 +506,18 @@ fn issue_channel_context_token_with_freshness(
         capability_verified: check.capability_verified,
         context_firewall_verified: check.context_firewall_verified,
         policy_ledger_verified: check.policy_ledger_verified,
+        taint_allow: check.taint_allow,
+        classification_allow: check.classification_allow,
+        declass_receipt_valid: check.declass_receipt_valid,
+        declassification_intent: check.declassification_intent,
+        redundancy_declassification_receipt: check.redundancy_declassification_receipt.clone(),
+        boundary_flow_policy_binding: check.boundary_flow_policy_binding.clone(),
+        leakage_budget_receipt: check.leakage_budget_receipt.clone(),
+        timing_channel_budget: check.timing_channel_budget.clone(),
+        leakage_budget_policy_max_bits: check.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: check.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: check.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: check.declared_timing_budget_ticks,
     };
 
     let payload_json = canonical_payload(&payload)?;
@@ -406,6 +628,18 @@ pub fn decode_channel_context_token(
         capability_verified: payload.payload.capability_verified,
         context_firewall_verified: payload.payload.context_firewall_verified,
         policy_ledger_verified: payload.payload.policy_ledger_verified,
+        taint_allow: payload.payload.taint_allow,
+        classification_allow: payload.payload.classification_allow,
+        declass_receipt_valid: payload.payload.declass_receipt_valid,
+        declassification_intent: payload.payload.declassification_intent,
+        redundancy_declassification_receipt: payload.payload.redundancy_declassification_receipt,
+        boundary_flow_policy_binding: payload.payload.boundary_flow_policy_binding,
+        leakage_budget_receipt: payload.payload.leakage_budget_receipt,
+        timing_channel_budget: payload.payload.timing_channel_budget,
+        leakage_budget_policy_max_bits: payload.payload.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: payload.payload.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: payload.payload.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: payload.payload.declared_timing_budget_ticks,
     })
 }
 
@@ -462,7 +696,233 @@ pub fn validate_channel_boundary(check: &ChannelBoundaryCheck) -> Vec<ChannelBou
         ));
     }
 
+    validate_boundary_admit_predicate(check, &mut defects);
+    validate_declassification_constraints(check, &mut defects);
+    validate_boundary_flow_policy_binding(check, &mut defects);
+    validate_leakage_budget(check, &mut defects);
+    validate_timing_budget(check, &mut defects);
+
     defects
+}
+
+fn validate_boundary_flow_policy_binding(
+    check: &ChannelBoundaryCheck,
+    defects: &mut Vec<ChannelBoundaryDefect>,
+) {
+    let Some(binding) = &check.boundary_flow_policy_binding else {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::PolicyDigestBindingMismatch,
+            "missing boundary-flow policy binding",
+        ));
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::CanonicalizerTupleBindingMismatch,
+            "missing canonicalizer tuple binding",
+        ));
+        return;
+    };
+
+    if !binding.has_non_zero_digests() || !binding.policy_digest_matches() {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::PolicyDigestBindingMismatch,
+            "policy digest binding mismatch against admitted policy root",
+        ));
+    }
+
+    if !binding.has_non_zero_digests() || !binding.canonicalizer_tuple_matches() {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::CanonicalizerTupleBindingMismatch,
+            "canonicalizer tuple digest mismatch against admitted tuple",
+        ));
+    }
+}
+
+fn validate_boundary_admit_predicate(
+    check: &ChannelBoundaryCheck,
+    defects: &mut Vec<ChannelBoundaryDefect>,
+) {
+    if !check.capability_verified {
+        // Existing CapabilityNotVerified defect is emitted above; keep this
+        // helper focused on REQ-0004 deltas.
+    }
+    if !check.taint_allow {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::TaintNotAdmitted,
+            "boundary_admit taint_allow predicate is false",
+        ));
+    }
+
+    if !check.classification_allow {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::ClassificationNotAdmitted,
+            "boundary_admit classification_allow predicate is false",
+        ));
+    }
+
+    if !check.declass_receipt_valid {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::DeclassificationReceiptInvalid,
+            "boundary_admit declass_receipt_valid predicate is false",
+        ));
+    }
+}
+
+fn validate_declassification_constraints(
+    check: &ChannelBoundaryCheck,
+    defects: &mut Vec<ChannelBoundaryDefect>,
+) {
+    match check.declassification_intent {
+        DeclassificationIntentScope::Unknown => defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::UnknownOrUnscopedDeclassificationIntent,
+            "declassification intent is unknown or unscoped (fail-closed deny)",
+        )),
+        DeclassificationIntentScope::RedundancyPurpose => {
+            let Some(receipt) = &check.redundancy_declassification_receipt else {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::DeclassificationReceiptInvalid,
+                    "redundancy-purpose declassification requires redundancy_declassification_receipt",
+                ));
+                return;
+            };
+
+            if !receipt.is_well_formed() {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::DeclassificationReceiptInvalid,
+                    "redundancy declassification receipt malformed or exposes plaintext semantics",
+                ));
+            }
+        },
+        DeclassificationIntentScope::None => {
+            if check.redundancy_declassification_receipt.is_some() {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::DeclassificationReceiptInvalid,
+                    "redundancy declassification receipt supplied without scoped intent",
+                ));
+            }
+        },
+    }
+}
+
+fn validate_leakage_budget(check: &ChannelBoundaryCheck, defects: &mut Vec<ChannelBoundaryDefect>) {
+    let Some(receipt) = &check.leakage_budget_receipt else {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::LeakageBudgetExceeded,
+            "missing typed leakage-budget receipt",
+        ));
+        return;
+    };
+
+    if !receipt.is_well_formed() {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::LeakageBudgetExceeded,
+            "leakage-budget receipt is malformed",
+        ));
+        return;
+    }
+
+    if receipt.estimator_family == LeakageEstimatorFamily::Unknown {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::LeakageBudgetExceeded,
+            "unknown leakage estimator semantics",
+        ));
+    }
+
+    if let Some(policy_max_bits) = check.leakage_budget_policy_max_bits {
+        if policy_max_bits == 0 {
+            defects.push(ChannelBoundaryDefect::new(
+                ChannelViolationClass::LeakageBudgetExceeded,
+                "policy leakage budget ceiling is zero (fail-closed)",
+            ));
+        } else {
+            if receipt.budget_bits > policy_max_bits {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::LeakageBudgetExceeded,
+                    format!(
+                        "leakage budget exceeds policy ceiling: budget_bits={} > policy_max_bits={policy_max_bits}",
+                        receipt.budget_bits
+                    ),
+                ));
+            }
+
+            if let Some(claimed_budget_bits) = check.declared_leakage_budget_bits {
+                if claimed_budget_bits > policy_max_bits {
+                    defects.push(ChannelBoundaryDefect::new(
+                        ChannelViolationClass::LeakageBudgetExceeded,
+                        format!(
+                            "declared leakage budget exceeds policy ceiling: declared_budget_bits={claimed_budget_bits} > policy_max_bits={policy_max_bits}",
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    if receipt.leakage_bits > receipt.budget_bits {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::LeakageBudgetExceeded,
+            format!(
+                "leakage budget exceeded: leakage_bits={} > budget_bits={}",
+                receipt.leakage_bits, receipt.budget_bits
+            ),
+        ));
+    }
+}
+
+fn validate_timing_budget(check: &ChannelBoundaryCheck, defects: &mut Vec<ChannelBoundaryDefect>) {
+    let Some(timing) = &check.timing_channel_budget else {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::TimingChannelBudgetExceeded,
+            "missing timing-channel budget witness",
+        ));
+        return;
+    };
+
+    if !timing.is_well_formed() {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::TimingChannelBudgetExceeded,
+            "timing-channel budget witness malformed",
+        ));
+        return;
+    }
+
+    if let Some(policy_max_ticks) = check.timing_budget_policy_max_ticks {
+        if policy_max_ticks == 0 {
+            defects.push(ChannelBoundaryDefect::new(
+                ChannelViolationClass::TimingChannelBudgetExceeded,
+                "policy timing budget ceiling is zero (fail-closed)",
+            ));
+        } else {
+            if timing.budget_ticks > policy_max_ticks {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::TimingChannelBudgetExceeded,
+                    format!(
+                        "timing budget exceeds policy ceiling: budget_ticks={} > policy_max_ticks={policy_max_ticks}",
+                        timing.budget_ticks
+                    ),
+                ));
+            }
+
+            if let Some(claimed_budget_ticks) = check.declared_timing_budget_ticks {
+                if claimed_budget_ticks > policy_max_ticks {
+                    defects.push(ChannelBoundaryDefect::new(
+                        ChannelViolationClass::TimingChannelBudgetExceeded,
+                        format!(
+                            "declared timing budget exceeds policy ceiling: declared_budget_ticks={claimed_budget_ticks} > policy_max_ticks={policy_max_ticks}",
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    if timing.observed_variance_ticks > timing.budget_ticks {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::TimingChannelBudgetExceeded,
+            format!(
+                "timing variance exceeds budget: observed={} > budget={}",
+                timing.observed_variance_ticks, timing.budget_ticks
+            ),
+        ));
+    }
 }
 
 fn resolve_effective_source(
@@ -511,6 +971,33 @@ mod tests {
 
     use super::*;
 
+    fn valid_policy_binding() -> BoundaryFlowPolicyBinding {
+        BoundaryFlowPolicyBinding {
+            policy_digest: [0x11; 32],
+            admitted_policy_root_digest: [0x11; 32],
+            canonicalizer_tuple_digest: [0x22; 32],
+            admitted_canonicalizer_tuple_digest: [0x22; 32],
+        }
+    }
+
+    fn valid_leakage_receipt() -> LeakageBudgetReceipt {
+        LeakageBudgetReceipt {
+            leakage_bits: 0,
+            budget_bits: 8,
+            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+            confidence_bps: 10_000,
+            confidence_label: "deterministic".to_string(),
+        }
+    }
+
+    fn valid_timing_budget() -> TimingChannelBudget {
+        TimingChannelBudget {
+            release_bucket_ticks: 10,
+            observed_variance_ticks: 0,
+            budget_ticks: 10,
+        }
+    }
+
     fn baseline_check() -> ChannelBoundaryCheck {
         ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
@@ -521,6 +1008,18 @@ mod tests {
             capability_verified: true,
             context_firewall_verified: true,
             policy_ledger_verified: true,
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: Some(valid_policy_binding()),
+            leakage_budget_receipt: Some(valid_leakage_receipt()),
+            timing_channel_budget: Some(valid_timing_budget()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         }
     }
 
@@ -660,14 +1159,13 @@ mod tests {
 
     #[test]
     fn test_multiple_violations_emitted() {
-        let check = ChannelBoundaryCheck {
-            source: ChannelSource::FreeFormOutput,
-            channel_source_witness: None,
-            broker_verified: false,
-            capability_verified: false,
-            context_firewall_verified: false,
-            policy_ledger_verified: false,
-        };
+        let mut check = baseline_check();
+        check.source = ChannelSource::FreeFormOutput;
+        check.channel_source_witness = None;
+        check.broker_verified = false;
+        check.capability_verified = false;
+        check.context_firewall_verified = false;
+        check.policy_ledger_verified = false;
 
         let defects = validate_channel_boundary(&check);
         let classes: Vec<ChannelViolationClass> = defects
@@ -700,6 +1198,184 @@ mod tests {
     }
 
     #[test]
+    fn test_boundary_downgrade_without_receipt_denied() {
+        let mut check = baseline_check();
+        check.classification_allow = false;
+        check.declass_receipt_valid = false;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(
+            |defect| defect.violation_class == ChannelViolationClass::ClassificationNotAdmitted
+        ));
+        assert!(defects.iter().any(|defect| defect.violation_class
+            == ChannelViolationClass::DeclassificationReceiptInvalid));
+    }
+
+    #[test]
+    fn test_classification_defect_is_independent_of_declass_receipt_validity() {
+        let mut check = baseline_check();
+        check.classification_allow = false;
+        check.declass_receipt_valid = true;
+        check.declassification_intent = DeclassificationIntentScope::None;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(
+            |defect| defect.violation_class == ChannelViolationClass::ClassificationNotAdmitted
+        ));
+    }
+
+    #[test]
+    fn test_unknown_declassification_intent_denied() {
+        let mut check = baseline_check();
+        check.declassification_intent = DeclassificationIntentScope::Unknown;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| defect.violation_class
+            == ChannelViolationClass::UnknownOrUnscopedDeclassificationIntent));
+    }
+
+    #[test]
+    fn test_redundancy_declassification_requires_receipt() {
+        let mut check = baseline_check();
+        check.declassification_intent = DeclassificationIntentScope::RedundancyPurpose;
+        check.redundancy_declassification_receipt = None;
+        check.declass_receipt_valid = false;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| defect.violation_class
+            == ChannelViolationClass::DeclassificationReceiptInvalid));
+    }
+
+    #[test]
+    fn test_policy_digest_binding_mismatch_denied() {
+        let mut check = baseline_check();
+        check.boundary_flow_policy_binding = Some(BoundaryFlowPolicyBinding {
+            policy_digest: [0xAA; 32],
+            admitted_policy_root_digest: [0xBB; 32],
+            canonicalizer_tuple_digest: [0x22; 32],
+            admitted_canonicalizer_tuple_digest: [0x22; 32],
+        });
+
+        let defects = validate_channel_boundary(&check);
+        assert!(
+            defects.iter().any(|defect| defect.violation_class
+                == ChannelViolationClass::PolicyDigestBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn test_canonicalizer_tuple_binding_mismatch_denied() {
+        let mut check = baseline_check();
+        check.boundary_flow_policy_binding = Some(BoundaryFlowPolicyBinding {
+            policy_digest: [0x11; 32],
+            admitted_policy_root_digest: [0x11; 32],
+            canonicalizer_tuple_digest: [0xAA; 32],
+            admitted_canonicalizer_tuple_digest: [0xBB; 32],
+        });
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| defect.violation_class
+            == ChannelViolationClass::CanonicalizerTupleBindingMismatch));
+    }
+
+    #[test]
+    fn test_leakage_budget_overrun_requires_quarantine() {
+        let mut check = baseline_check();
+        check.leakage_budget_receipt = Some(LeakageBudgetReceipt {
+            leakage_bits: 21,
+            budget_bits: 20,
+            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+            confidence_bps: 9_500,
+            confidence_label: "adversarial-check".to_string(),
+        });
+
+        let defects = validate_channel_boundary(&check);
+        assert!(
+            defects.iter().any(
+                |defect| defect.violation_class == ChannelViolationClass::LeakageBudgetExceeded
+            )
+        );
+        assert!(ChannelViolationClass::LeakageBudgetExceeded.requires_quarantine());
+    }
+
+    #[test]
+    fn test_timing_budget_overrun_requires_quarantine() {
+        let mut check = baseline_check();
+        check.timing_channel_budget = Some(TimingChannelBudget {
+            release_bucket_ticks: 10,
+            observed_variance_ticks: 22,
+            budget_ticks: 20,
+        });
+
+        let defects = validate_channel_boundary(&check);
+        assert!(
+            defects.iter().any(|defect| defect.violation_class
+                == ChannelViolationClass::TimingChannelBudgetExceeded)
+        );
+        assert!(ChannelViolationClass::TimingChannelBudgetExceeded.requires_quarantine());
+    }
+
+    #[test]
+    fn test_declared_leakage_budget_above_policy_ceiling_denied() {
+        let mut check = baseline_check();
+        check.declared_leakage_budget_bits = Some(999_999);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::LeakageBudgetExceeded
+                && defect
+                    .detail
+                    .contains("declared leakage budget exceeds policy ceiling")
+        }));
+    }
+
+    #[test]
+    fn test_declared_timing_budget_above_policy_ceiling_denied() {
+        let mut check = baseline_check();
+        check.declared_timing_budget_ticks = Some(999_999);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::TimingChannelBudgetExceeded
+                && defect
+                    .detail
+                    .contains("declared timing budget exceeds policy ceiling")
+        }));
+    }
+
+    #[test]
+    fn test_missing_boundary_flow_fields_fail_closed() {
+        let mut check = baseline_check();
+        check.boundary_flow_policy_binding = None;
+        check.leakage_budget_receipt = None;
+        check.timing_channel_budget = None;
+        check.leakage_budget_policy_max_bits = None;
+        check.declared_leakage_budget_bits = None;
+        check.timing_budget_policy_max_ticks = None;
+        check.declared_timing_budget_ticks = None;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(
+            defects.iter().any(|defect| defect.violation_class
+                == ChannelViolationClass::PolicyDigestBindingMismatch)
+        );
+        assert!(defects.iter().any(|defect| defect.violation_class
+            == ChannelViolationClass::CanonicalizerTupleBindingMismatch));
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::LeakageBudgetExceeded
+                && defect
+                    .detail
+                    .contains("missing typed leakage-budget receipt")
+        }));
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::TimingChannelBudgetExceeded
+                && defect
+                    .detail
+                    .contains("missing timing-channel budget witness")
+        }));
+    }
+
+    #[test]
     fn test_channel_context_token_roundtrip() {
         let check = baseline_check();
         let signer = Signer::generate();
@@ -717,6 +1393,44 @@ mod tests {
     }
 
     #[test]
+    fn test_channel_context_token_payload_v1_deserializes_legacy_payload() {
+        let legacy_payload = serde_json::json!({
+            "source": "typed_tool_intent",
+            "lease_id": "lease-legacy-1",
+            "request_id": "REQ-LEGACY-1",
+            "issued_at_secs": 1_700_000_000_u64,
+            "expires_after_secs": CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
+            "channel_source_witness": derive_channel_source_witness(ChannelSource::TypedToolIntent),
+            "broker_verified": true,
+            "capability_verified": true,
+            "context_firewall_verified": true,
+            "policy_ledger_verified": true
+        });
+
+        let payload: ChannelContextTokenPayloadV1 =
+            serde_json::from_value(legacy_payload).expect("legacy v1 payload should deserialize");
+        assert!(
+            !payload.taint_allow && !payload.classification_allow && !payload.declass_receipt_valid,
+            "missing legacy fields must default fail-closed to false"
+        );
+        assert_eq!(
+            payload.declassification_intent,
+            DeclassificationIntentScope::Unknown
+        );
+        assert!(
+            payload.redundancy_declassification_receipt.is_none()
+                && payload.boundary_flow_policy_binding.is_none()
+                && payload.leakage_budget_receipt.is_none()
+                && payload.timing_channel_budget.is_none()
+                && payload.leakage_budget_policy_max_bits.is_none()
+                && payload.declared_leakage_budget_bits.is_none()
+                && payload.timing_budget_policy_max_ticks.is_none()
+                && payload.declared_timing_budget_ticks.is_none(),
+            "missing legacy fields must default fail-closed to None"
+        );
+    }
+
+    #[test]
     fn test_payload_serialization_is_deterministic() {
         let payload = ChannelContextTokenPayloadV1 {
             source: ChannelSource::TypedToolIntent,
@@ -729,6 +1443,18 @@ mod tests {
             capability_verified: true,
             context_firewall_verified: true,
             policy_ledger_verified: true,
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: Some(valid_policy_binding()),
+            leakage_budget_receipt: Some(valid_leakage_receipt()),
+            timing_channel_budget: Some(valid_timing_budget()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         };
 
         let bytes1 = canonical_payload(&payload).expect("payload should serialize");
@@ -753,6 +1479,18 @@ mod tests {
             capability_verified: true,
             context_firewall_verified: true,
             policy_ledger_verified: true,
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: Some(valid_policy_binding()),
+            leakage_budget_receipt: Some(valid_leakage_receipt()),
+            timing_channel_budget: Some(valid_timing_budget()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         };
         let payload_json = canonical_payload(&payload).expect("payload should serialize");
         let token_payload = ChannelContextTokenV1 {

@@ -8,7 +8,8 @@
 //! # Schema
 //!
 //! The `ledger_events` table has columns: `event_id`, `event_type`, `work_id`,
-//! `actor_id`, `payload`, `signature`, `timestamp_ns`.
+//! `actor_id`, `payload`, `signature`, `timestamp_ns`, `prev_hash`,
+//! `event_hash`.
 //!
 //! The `work_claims` table has columns: `work_id`, `lease_id`, `actor_id`,
 //! `role`, `claim_json`.
@@ -18,15 +19,17 @@ use std::sync::{Arc, Mutex};
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signer, Verifier};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
     LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
+    REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX, RedundancyReceiptConsumption,
     SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
     STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
     WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
@@ -40,7 +43,38 @@ pub struct SqliteLedgerEventEmitter {
     signing_key: ed25519_dalek::SigningKey,
 }
 
+struct EventHashInput<'a> {
+    event_id: &'a str,
+    event_type: &'a str,
+    work_id: &'a str,
+    actor_id: &'a str,
+    payload: &'a [u8],
+    signature: &'a [u8],
+    timestamp_ns: u64,
+    prev_hash: &'a str,
+}
+
+#[derive(Debug)]
+struct ChainBackfillRow {
+    rowid: i64,
+    event_id: String,
+    event_type: String,
+    work_id: String,
+    actor_id: String,
+    payload: Vec<u8>,
+    signature: Vec<u8>,
+    timestamp_ns: u64,
+    event_hash: String,
+}
+
 impl SqliteLedgerEventEmitter {
+    const LEDGER_CHAIN_GENESIS: &'static str = "genesis";
+    const LEDGER_METADATA_TABLE: &'static str = "ledger_metadata";
+    const HASH_CHAIN_UNINITIALIZED_VALUE: &'static str = "legacy-uninitialized";
+    const HASH_CHAIN_BACKFILL_COMPLETED_FLAG: &'static str = "hash_chain_backfill_completed_v1";
+    const HASH_CHAIN_CHECKPOINT_KEY: &'static str = "hash_chain_tip_checkpoint_v1";
+    const HASH_CHAIN_BACKFILL_COMPLETED_VALUE: &'static str = "1";
+
     /// Creates a new emitter with the given `SQLite` connection and signing
     /// key.
     #[must_use]
@@ -58,10 +92,15 @@ impl SqliteLedgerEventEmitter {
                 actor_id TEXT NOT NULL,
                 payload BLOB NOT NULL,
                 signature BLOB NOT NULL,
-                timestamp_ns INTEGER NOT NULL
+                timestamp_ns INTEGER NOT NULL,
+                prev_hash TEXT NOT NULL DEFAULT 'genesis',
+                event_hash TEXT NOT NULL DEFAULT 'legacy-uninitialized'
             )",
             [],
         )?;
+        Self::ensure_hash_chain_columns(conn)?;
+        Self::ensure_metadata_table(conn)?;
+        let mut migration_changes_applied = Self::backfill_hash_chain(conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_work_id ON ledger_events(work_id)",
             [],
@@ -121,9 +160,14 @@ impl SqliteLedgerEventEmitter {
         // SECURITY (TCK-00407 — Receipt Identity Constraints):
         //
         // Enforce two complementary receipt constraints:
-        // - transport-level uniqueness by `receipt_id` (global uniqueness)
+        // - review-receipt uniqueness by `receipt_id` scoped to
+        //   `review_receipt_recorded`/`review_blocked_recorded`
         // - semantic identity uniqueness by tuple `(receipt_id, lease_id, work_id,
-        //   changeset_digest)`
+        //   changeset_digest)` for review receipt events
+        //
+        // Additionally, `redundancy_receipt_consumed` has its own uniqueness
+        // constraint on `receipt_id` so a review receipt and its subsequent
+        // consumption can share the same `receipt_id` without collision.
         //
         // `work_id` in the semantic tuple is sourced from the payload field
         // and falls back to the row's `work_id` column for legacy rows that
@@ -139,7 +183,7 @@ impl SqliteLedgerEventEmitter {
         // - legacy rowid-based tables are upgraded once to event_id-keyed schema
         // - rows already quarantined are skipped with `INSERT OR IGNORE`
         Self::ensure_receipt_quarantine_table(conn)?;
-        conn.execute(
+        let receipt_quarantine_inserted = conn.execute(
             "INSERT OR IGNORE INTO ledger_events_quarantine \
                  (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
              SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
@@ -160,17 +204,29 @@ impl SqliteLedgerEventEmitter {
              ",
             [],
         )?;
-        conn.execute(
+        migration_changes_applied |= receipt_quarantine_inserted > 0;
+        let receipt_rows_deleted = conn.execute(
             "DELETE FROM ledger_events WHERE event_id IN ( \
                  SELECT event_id FROM ledger_events_quarantine \
                  WHERE quarantine_reason = 'receipt_id_dedupe_migration' \
              )",
             [],
         )?;
+        migration_changes_applied |= receipt_rows_deleted > 0;
+        // Migrate legacy global index shape to scoped review-receipt uniqueness.
+        conn.execute("DROP INDEX IF EXISTS idx_unique_receipt_id", [])?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
              ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
-             WHERE json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_consumed \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE event_type = 'redundancy_receipt_consumed' \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
             [],
         )?;
         conn.execute(
@@ -213,7 +269,7 @@ impl SqliteLedgerEventEmitter {
         // - `INSERT OR IGNORE` skips already-quarantined rows
         // - `MIN(rowid)` keeps the earliest row, quarantines the rest
         // - after quarantine, the unique index creation is safe
-        conn.execute(
+        let changeset_quarantine_inserted = conn.execute(
             "INSERT OR IGNORE INTO ledger_events_quarantine \
                  (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, quarantine_reason) \
              SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
@@ -237,20 +293,583 @@ impl SqliteLedgerEventEmitter {
              ",
             [],
         )?;
-        conn.execute(
+        migration_changes_applied |= changeset_quarantine_inserted > 0;
+        let changeset_rows_deleted = conn.execute(
             "DELETE FROM ledger_events WHERE event_id IN ( \
                  SELECT event_id FROM ledger_events_quarantine \
                  WHERE quarantine_reason = 'changeset_digest_dedupe_migration' \
              )",
             [],
         )?;
+        migration_changes_applied |= changeset_rows_deleted > 0;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_changeset_published \
              ON ledger_events(work_id, json_extract(CAST(payload AS TEXT), '$.changeset_digest')) \
              WHERE event_type = 'changeset_published'",
             [],
         )?;
+        Self::validate_startup_hash_chain_checkpoint(conn, migration_changes_applied, None)
+            .map_err(|message| {
+                error!(
+                    reason = %message,
+                    "ledger hash-chain integrity checkpoint mismatch; refusing startup"
+                );
+                rusqlite::Error::InvalidQuery
+            })?;
         Ok(())
+    }
+
+    fn ensure_metadata_table(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {} ( \
+                    meta_key TEXT PRIMARY KEY, \
+                    meta_value TEXT NOT NULL \
+                )",
+                Self::LEDGER_METADATA_TABLE
+            ),
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn get_metadata_value(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+        let sql = format!(
+            "SELECT meta_value FROM {} WHERE meta_key = ?1",
+            Self::LEDGER_METADATA_TABLE
+        );
+        conn.query_row(&sql, params![key], |row| row.get::<_, String>(0))
+            .optional()
+    }
+
+    fn set_metadata_value(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+        let sql = format!(
+            "INSERT INTO {}(meta_key, meta_value) VALUES (?1, ?2) \
+             ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value",
+            Self::LEDGER_METADATA_TABLE
+        );
+        conn.execute(&sql, params![key, value])?;
+        Ok(())
+    }
+
+    fn validate_startup_hash_chain_checkpoint(
+        conn: &Connection,
+        migration_changes_applied: bool,
+        trusted_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> Result<(), String> {
+        // First startup (no checkpoint) performs an O(N) full-chain verification
+        // before seeding metadata. Subsequent startups remain O(1) by comparing
+        // persisted checkpoint to current tip hash.
+        let chain_tip = Self::latest_event_hash_opt(conn)
+            .map_err(|e| format!("failed to read current hash-chain tip: {e}"))?
+            .unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string());
+        if chain_tip.is_empty() || chain_tip == Self::HASH_CHAIN_UNINITIALIZED_VALUE {
+            return Err("current hash-chain tip is uninitialized".to_string());
+        }
+        let checkpoint = Self::get_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY)
+            .map_err(|e| format!("failed to read hash-chain checkpoint metadata: {e}"))?;
+        let Some(checkpoint) = checkpoint else {
+            let verified_tip =
+                Self::derive_event_chain_hash_from_db_internal(conn, trusted_verifying_key)
+                    .map_err(|e| format!("first-startup chain verification failed: {e}"))?;
+            if verified_tip != chain_tip {
+                return Err(format!(
+                    "first-startup chain verification mismatch: derived={verified_tip}, stored_tip={chain_tip}"
+                ));
+            }
+            Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, &chain_tip)
+                .map_err(|e| format!("failed to initialize hash-chain checkpoint metadata: {e}"))?;
+            return Ok(());
+        };
+
+        if checkpoint != chain_tip {
+            if migration_changes_applied {
+                warn!(
+                    previous_checkpoint = %checkpoint,
+                    current_tip = %chain_tip,
+                    "ledger startup migrations mutated chain tip; reseeding checkpoint"
+                );
+                Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, &chain_tip)
+                    .map_err(|e| format!("failed to reseed hash-chain checkpoint metadata: {e}"))?;
+            } else {
+                return Err(format!(
+                    "hash-chain tip mismatch: expected checkpoint={checkpoint}, current_tip={chain_tip}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_hash_chain_columns(conn: &Connection) -> rusqlite::Result<()> {
+        let mut has_prev_hash = false;
+        let mut has_event_hash = false;
+        let mut stmt = conn.prepare("PRAGMA table_info('ledger_events')")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            match column?.as_str() {
+                "prev_hash" => has_prev_hash = true,
+                "event_hash" => has_event_hash = true,
+                _ => {},
+            }
+        }
+
+        if !has_prev_hash {
+            conn.execute(
+                "ALTER TABLE ledger_events \
+                 ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'genesis'",
+                [],
+            )?;
+        }
+        if !has_event_hash {
+            conn.execute(
+                "ALTER TABLE ledger_events \
+                 ADD COLUMN event_hash TEXT NOT NULL DEFAULT 'legacy-uninitialized'",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn backfill_hash_chain(conn: &Connection) -> rusqlite::Result<bool> {
+        if Self::get_metadata_value(conn, Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG)?.as_deref()
+            == Some(Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE)
+        {
+            return Ok(false);
+        }
+
+        let missing_row_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events \
+             WHERE event_hash IS NULL OR event_hash = '' OR event_hash = ?1",
+            params![Self::HASH_CHAIN_UNINITIALIZED_VALUE],
+            |row| row.get(0),
+        )?;
+
+        if missing_row_count == 0 {
+            Self::set_metadata_value(
+                conn,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE,
+            )?;
+            return Ok(false);
+        }
+
+        warn!(
+            missing_rows = missing_row_count,
+            "ledger hash-chain backfill required; running one-time migration"
+        );
+        // KNOWN LIMITATION (Initial hash-chain migration):
+        // Legacy rows that predate hash-chain fields do not include prior
+        // commitments. Backfill derives commitments from persisted rows as-is
+        // and assumes legacy rows are authentic.
+        warn!(
+            "Backfilling hash chain from legacy uninitialized state. Legacy events are assumed authentic."
+        );
+
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let backfill_result = (|| -> rusqlite::Result<()> {
+            // Stream one row at a time to keep migration memory bounded.
+            let mut cursor_timestamp_ns = i64::MIN;
+            let mut cursor_rowid = i64::MIN;
+            let mut previous_event_hash = Self::LEDGER_CHAIN_GENESIS.to_string();
+
+            loop {
+                let maybe_row: Option<ChainBackfillRow> = conn
+                    .query_row(
+                    "SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, event_hash \
+                     FROM ledger_events \
+                     WHERE (timestamp_ns > ?1) OR (timestamp_ns = ?1 AND rowid > ?2) \
+                     ORDER BY timestamp_ns ASC, rowid ASC \
+                     LIMIT 1",
+                        params![cursor_timestamp_ns, cursor_rowid],
+                        |row| {
+                            let timestamp_i64: i64 = row.get(7)?;
+                            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+                            let timestamp_ns = timestamp_i64 as u64;
+                            Ok(ChainBackfillRow {
+                                rowid: row.get(0)?,
+                                event_id: row.get(1)?,
+                                event_type: row.get(2)?,
+                                work_id: row.get(3)?,
+                                actor_id: row.get(4)?,
+                                payload: row.get(5)?,
+                                signature: row.get(6)?,
+                                timestamp_ns,
+                                event_hash: row.get(8)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                let Some(row) = maybe_row else {
+                    break;
+                };
+
+                let timestamp_i64 =
+                    i64::try_from(row.timestamp_ns).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                cursor_timestamp_ns = timestamp_i64;
+                cursor_rowid = row.rowid;
+
+                if row.event_hash.is_empty()
+                    || row.event_hash == Self::HASH_CHAIN_UNINITIALIZED_VALUE
+                {
+                    let event_hash = Self::compute_event_hash(&EventHashInput {
+                        event_id: &row.event_id,
+                        event_type: &row.event_type,
+                        work_id: &row.work_id,
+                        actor_id: &row.actor_id,
+                        payload: &row.payload,
+                        signature: &row.signature,
+                        timestamp_ns: row.timestamp_ns,
+                        prev_hash: &previous_event_hash,
+                    });
+
+                    conn.execute(
+                        "UPDATE ledger_events SET prev_hash = ?1, event_hash = ?2 WHERE rowid = ?3",
+                        params![&previous_event_hash, &event_hash, row.rowid],
+                    )?;
+                    previous_event_hash = event_hash;
+                } else {
+                    previous_event_hash = row.event_hash;
+                }
+            }
+
+            let checkpoint = previous_event_hash;
+            Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, &checkpoint)?;
+            Self::set_metadata_value(
+                conn,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE,
+            )?;
+            Ok(())
+        })();
+
+        if let Err(error) = backfill_result {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(error);
+        }
+        conn.execute_batch("COMMIT;")?;
+
+        Ok(true)
+    }
+
+    fn compute_event_hash(input: &EventHashInput<'_>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"apm2-ledger-event-hash-v1");
+        hasher.update(input.prev_hash.as_bytes());
+        hasher.update(input.event_id.as_bytes());
+        hasher.update(input.event_type.as_bytes());
+        hasher.update(input.work_id.as_bytes());
+        hasher.update(input.actor_id.as_bytes());
+        hasher.update(input.timestamp_ns.to_le_bytes());
+        hasher.update(input.payload);
+        hasher.update(input.signature);
+        hex::encode(hasher.finalize())
+    }
+
+    fn latest_event_hash(conn: &Connection) -> Result<String, LedgerEventError> {
+        Self::latest_event_hash_opt(conn)
+            .map(|hash| hash.unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string()))
+    }
+
+    fn latest_event_hash_opt(conn: &Connection) -> Result<Option<String>, LedgerEventError> {
+        conn.query_row(
+            "SELECT event_hash FROM ledger_events ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite latest event_hash query failed: {e}"),
+        })
+    }
+
+    fn canonicalize_payload_with_prev_hash(
+        mut payload: serde_json::Value,
+        prev_hash: &str,
+    ) -> Result<Vec<u8>, LedgerEventError> {
+        let Some(payload_object) = payload.as_object_mut() else {
+            return Err(LedgerEventError::SigningFailed {
+                message: "ledger payload must be a JSON object".to_string(),
+            });
+        };
+        payload_object.insert(
+            "prev_hash".to_string(),
+            serde_json::Value::String(prev_hash.to_string()),
+        );
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        Ok(canonical_payload.as_bytes().to_vec())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_signed_event_with_prev_hash(
+        &self,
+        event_type: &str,
+        work_id: &str,
+        actor_id: &str,
+        payload: serde_json::Value,
+        timestamp_ns: u64,
+        domain_prefix: &[u8],
+        prev_hash: &str,
+    ) -> Result<(SignedLedgerEvent, String), LedgerEventError> {
+        let payload_bytes = Self::canonicalize_payload_with_prev_hash(payload, prev_hash)?;
+        let mut canonical_bytes = Vec::with_capacity(domain_prefix.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(domain_prefix);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+        let signature = self.signing_key.sign(&canonical_bytes).to_bytes().to_vec();
+
+        let signed_event = SignedLedgerEvent {
+            event_id: format!("EVT-{}", uuid::Uuid::new_v4()),
+            event_type: event_type.to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature,
+            timestamp_ns,
+        };
+        let event_hash = Self::compute_event_hash(&EventHashInput {
+            event_id: &signed_event.event_id,
+            event_type: &signed_event.event_type,
+            work_id: &signed_event.work_id,
+            actor_id: &signed_event.actor_id,
+            payload: &signed_event.payload,
+            signature: &signed_event.signature,
+            timestamp_ns: signed_event.timestamp_ns,
+            prev_hash,
+        });
+        Ok((signed_event, event_hash))
+    }
+
+    fn persist_signed_event(
+        conn: &Connection,
+        signed_event: &SignedLedgerEvent,
+        prev_hash: &str,
+        event_hash: &str,
+    ) -> Result<(), LedgerEventError> {
+        conn.execute(
+            "INSERT INTO ledger_events (
+                event_id,
+                event_type,
+                work_id,
+                actor_id,
+                payload,
+                signature,
+                timestamp_ns,
+                prev_hash,
+                event_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns,
+                prev_hash,
+                event_hash,
+            ],
+        )
+        .map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+        Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, event_hash).map_err(
+            |e| LedgerEventError::PersistenceFailed {
+                message: format!("failed to update hash-chain checkpoint metadata: {e}"),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn derive_event_chain_hash_from_db(
+        conn: &Connection,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<String, String> {
+        Self::derive_event_chain_hash_from_db_internal(conn, Some(verifying_key))
+    }
+
+    fn derive_event_chain_hash_from_db_internal(
+        conn: &Connection,
+        trusted_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> Result<String, String> {
+        const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+        const REDUNDANCY_RECEIPT_CONSUMED_DOMAIN_PREFIX: &[u8] =
+            b"apm2.event.redundancy_receipt_consumed:";
+        const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
+
+        #[derive(Debug)]
+        struct ChainRow {
+            event_id: String,
+            event_type: String,
+            work_id: String,
+            actor_id: String,
+            payload: Vec<u8>,
+            signature: Vec<u8>,
+            timestamp_ns: u64,
+            prev_hash: String,
+            event_hash: String,
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, event_type, work_id, actor_id, payload, signature, \
+                        timestamp_ns, prev_hash, event_hash \
+                 FROM ledger_events ORDER BY timestamp_ns ASC, rowid ASC",
+            )
+            .map_err(|e| format!("sqlite chain query prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let timestamp_i64: i64 = row.get(6)?;
+                #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+                let timestamp_ns = timestamp_i64 as u64;
+                Ok(ChainRow {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns,
+                    prev_hash: row.get(7)?,
+                    event_hash: row.get(8)?,
+                })
+            })
+            .map_err(|e| format!("sqlite chain query failed: {e}"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("sqlite chain row decode failed: {e}"))?;
+        drop(stmt);
+
+        let mut expected_prev = Self::LEDGER_CHAIN_GENESIS.to_string();
+        for row in rows {
+            if row.prev_hash != expected_prev {
+                return Err(format!(
+                    "hash chain broken at event {}: expected prev_hash={}, got={}",
+                    row.event_id, expected_prev, row.prev_hash
+                ));
+            }
+
+            let payload = serde_json::from_slice::<serde_json::Value>(&row.payload)
+                .map_err(|e| format!("event {} payload is not valid JSON: {e}", row.event_id))?;
+            if let Some(payload_prev_hash) = payload.get("prev_hash") {
+                let Some(payload_prev_hash) = payload_prev_hash.as_str() else {
+                    return Err(format!(
+                        "event {} prev_hash payload field must be a string",
+                        row.event_id
+                    ));
+                };
+                if payload_prev_hash != row.prev_hash {
+                    return Err(format!(
+                        "event {} prev_hash payload mismatch: payload={}, column={}",
+                        row.event_id, payload_prev_hash, row.prev_hash
+                    ));
+                }
+            }
+
+            if row.signature.len() != 64 {
+                return Err(format!(
+                    "event {} has invalid signature length: expected 64 bytes, got {}",
+                    row.event_id,
+                    row.signature.len()
+                ));
+            }
+
+            let is_synthetic_gate_lease =
+                row.event_type == "gate_lease_issued" && row.actor_id == "system";
+            if is_synthetic_gate_lease {
+                if !row.signature.iter().all(|byte| *byte == 0) {
+                    return Err(format!(
+                        "synthetic gate_lease_issued event {} must use zero-filled signature",
+                        row.event_id
+                    ));
+                }
+            } else if let Some(verifying_key) = trusted_verifying_key {
+                let signature = ed25519_dalek::Signature::try_from(row.signature.as_slice())
+                    .map_err(|error| {
+                        format!(
+                            "event {} has invalid Ed25519 signature bytes: {error}",
+                            row.event_id
+                        )
+                    })?;
+
+                let mut candidate_prefixes: Vec<&[u8]> = Vec::with_capacity(4);
+                let mut push_prefix = |prefix: &'static [u8]| {
+                    if !candidate_prefixes.contains(&prefix) {
+                        candidate_prefixes.push(prefix);
+                    }
+                };
+
+                match row.event_type.as_str() {
+                    "work_claimed" => push_prefix(WORK_CLAIMED_DOMAIN_PREFIX),
+                    "session_started" => push_prefix(SESSION_STARTED_DOMAIN_PREFIX),
+                    "stop_flags_mutated" => push_prefix(STOP_FLAGS_MUTATED_DOMAIN_PREFIX),
+                    "defect_recorded" => push_prefix(DEFECT_RECORDED_DOMAIN_PREFIX),
+                    "redundancy_receipt_consumed" => {
+                        push_prefix(REDUNDANCY_RECEIPT_CONSUMED_DOMAIN_PREFIX);
+                    },
+                    "work_transitioned" => push_prefix(WORK_TRANSITIONED_DOMAIN_PREFIX),
+                    "session_terminated" => {
+                        push_prefix(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX);
+                    },
+                    "changeset_published" => {
+                        push_prefix(CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX);
+                    },
+                    "review_receipt_recorded" => {
+                        push_prefix(REVIEW_RECEIPT_RECORDED_PREFIX);
+                    },
+                    "review_blocked_recorded" => {
+                        push_prefix(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX);
+                    },
+                    "episode_run_attributed" => push_prefix(EPISODE_RUN_ATTRIBUTED_PREFIX),
+                    _ => {},
+                }
+                push_prefix(SESSION_EVENT_DOMAIN_PREFIX);
+                push_prefix(EPISODE_EVENT_DOMAIN_PREFIX);
+
+                let mut signature_valid = false;
+                for prefix in candidate_prefixes {
+                    let mut canonical_bytes = Vec::with_capacity(prefix.len() + row.payload.len());
+                    canonical_bytes.extend_from_slice(prefix);
+                    canonical_bytes.extend_from_slice(&row.payload);
+                    if verifying_key
+                        .verify(canonical_bytes.as_slice(), &signature)
+                        .is_ok()
+                    {
+                        signature_valid = true;
+                        break;
+                    }
+                }
+                if !signature_valid {
+                    return Err(format!(
+                        "event {} failed Ed25519 signature verification",
+                        row.event_id
+                    ));
+                }
+            }
+
+            let expected_event_hash = Self::compute_event_hash(&EventHashInput {
+                event_id: &row.event_id,
+                event_type: &row.event_type,
+                work_id: &row.work_id,
+                actor_id: &row.actor_id,
+                payload: &row.payload,
+                signature: &row.signature,
+                timestamp_ns: row.timestamp_ns,
+                prev_hash: &row.prev_hash,
+            });
+            if row.event_hash != expected_event_hash {
+                return Err(format!(
+                    "hash chain broken at event {}: expected event_hash={}, got={}",
+                    row.event_id, expected_event_hash, row.event_hash
+                ));
+            }
+            expected_prev = row.event_hash;
+        }
+
+        Ok(expected_prev)
     }
 
     fn ensure_receipt_quarantine_table(conn: &Connection) -> rusqlite::Result<()> {
@@ -387,10 +1006,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         claim: &WorkClaim,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
-        // Build payload as JSON
         let payload = serde_json::json!({
             "event_type": "work_claimed",
             "work_id": claim.work_id,
@@ -404,59 +1019,25 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "context_pack_recipe_hash": hex::encode(claim.policy_resolution.context_pack_recipe_hash),
         });
 
-        // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
-        // This ensures deterministic JSON representation per RFC-0016.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(WORK_CLAIMED_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(WORK_CLAIMED_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "work_claimed".to_string(),
-            work_id: claim.work_id.clone(),
-            actor_id: claim.actor_id.clone(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "work_claimed",
+            &claim.work_id,
+            &claim.actor_id,
+            payload,
+            timestamp_ns,
+            WORK_CLAIMED_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
-
-        info!(event_id = %event_id, "Persisted WorkClaimed event");
+        info!(event_id = %signed_event.event_id, "Persisted WorkClaimed event");
 
         Ok(signed_event)
     }
@@ -500,9 +1081,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Domain prefix for session events (must be at function start per clippy)
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         let payload = build_session_started_payload(
             session_id,
             work_id,
@@ -515,59 +1093,29 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             selection_decision,
         );
 
-        // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
-        // This ensures deterministic JSON representation per RFC-0016.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(SESSION_STARTED_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "session_started".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "session_started",
+            work_id,
+            actor_id,
+            payload,
+            timestamp_ns,
+            SESSION_STARTED_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
-
-        info!(event_id = %event_id, session_id = %session_id, "Persisted SessionStarted event");
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            "Persisted SessionStarted event"
+        );
 
         Ok(signed_event)
     }
@@ -583,9 +1131,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Domain prefix for generic session events (TCK-00290)
         const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
 
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // Build payload as JSON with actual event type and base64-encoded payload
         let payload_json = serde_json::json!({
             "event_type": event_type,
@@ -594,59 +1139,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "payload": hex::encode(payload),
         });
 
-        // TCK-00290: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_string = payload_json.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(SESSION_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(SESSION_EVENT_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: event_type.to_string(),
-            work_id: session_id.to_string(), // Use session_id as work_id for indexing
-            actor_id: actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            event_type,
+            session_id, // Use session_id as work_id for indexing
+            actor_id,
+            payload_json,
+            timestamp_ns,
+            SESSION_EVENT_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             session_id = %session_id,
             event_type = %event_type,
             actor_id = %actor_id,
@@ -660,8 +1172,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         &self,
         mutation: &StopFlagsMutation<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         let payload = serde_json::json!({
             "event_type": "stop_flags_mutated",
             "actor_id": mutation.actor_id,
@@ -673,55 +1183,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "timestamp_ns": mutation.timestamp_ns,
         });
 
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        let mut canonical_bytes =
-            Vec::with_capacity(STOP_FLAGS_MUTATED_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(STOP_FLAGS_MUTATED_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "stop_flags_mutated".to_string(),
-            work_id: STOP_FLAGS_MUTATED_WORK_ID.to_string(),
-            actor_id: mutation.actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns: mutation.timestamp_ns,
-        };
-
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "stop_flags_mutated",
+            STOP_FLAGS_MUTATED_WORK_ID,
+            mutation.actor_id,
+            payload,
+            mutation.timestamp_ns,
+            STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             actor_id = %mutation.actor_id,
             emergency_stop_previous = mutation.emergency_stop_previous,
             emergency_stop_current = mutation.emergency_stop_current,
@@ -743,9 +1224,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .validate()
             .map_err(|e| LedgerEventError::ValidationFailed { message: e })?;
 
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // TCK-00307 MAJOR 1: Include time_envelope_ref in JSON serialization
         // for temporal binding per RFC-0016.
         let time_envelope_ref_hex = defect
@@ -766,59 +1244,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "time_envelope_ref": time_envelope_ref_hex,
         });
 
-        // TCK-00307: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(DEFECT_RECORDED_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(DEFECT_RECORDED_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "defect_recorded".to_string(),
-            work_id: defect.work_id.clone(),
-            actor_id: String::new(), // Defects are system events, no actor
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "defect_recorded",
+            &defect.work_id,
+            "",
+            payload,
+            timestamp_ns,
+            DEFECT_RECORDED_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             defect_id = %defect.defect_id,
             defect_type = %defect.defect_type,
             "Persisted DefectRecorded event"
@@ -922,6 +1367,67 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .ok()
     }
 
+    fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             WHERE event_type = 'gate.policy_resolved'
+             AND actor_id = 'orchestrator:gate-lifecycle'
+             ORDER BY rowid DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    fn get_latest_event_hash(&self) -> Result<Option<String>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "connection lock poisoned".to_string())?;
+
+        let hash = conn
+            .query_row(
+                "SELECT event_hash FROM ledger_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("sqlite latest event_hash query failed: {e}"))?;
+
+        if hash
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value == "legacy-uninitialized")
+        {
+            return Err("latest ledger event_hash is uninitialized".to_string());
+        }
+        Ok(hash)
+    }
+
+    fn derive_event_chain_hash(&self) -> Result<String, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "connection lock poisoned".to_string())?;
+        let verifying_key = self.verifying_key();
+        Self::derive_event_chain_hash_from_db(&conn, &verifying_key)
+    }
+
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
         let conn = self.conn.lock().ok()?;
 
@@ -954,6 +1460,81 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .optional()
         .ok()
         .flatten()
+    }
+
+    fn emit_redundancy_receipt_consumed(
+        &self,
+        session_id: &str,
+        receipt_id: &str,
+        request_id: &str,
+        tool_class: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        const RECEIPT_CONSUMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.redundancy_receipt_consumed:";
+        let payload = serde_json::json!({
+            "event_type": "redundancy_receipt_consumed",
+            "session_id": session_id,
+            "receipt_id": receipt_id,
+            "request_id": request_id,
+            "tool_class": tool_class,
+            "actor_id": actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "redundancy_receipt_consumed",
+            session_id,
+            actor_id,
+            payload,
+            timestamp_ns,
+            RECEIPT_CONSUMED_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            receipt_id = %receipt_id,
+            request_id = %request_id,
+            tool_class = %tool_class,
+            "Persisted RedundancyReceiptConsumed event"
+        );
+        Ok(signed_event)
+    }
+
+    fn get_redundancy_receipt_consumption(
+        &self,
+        receipt_id: &str,
+    ) -> Option<RedundancyReceiptConsumption> {
+        let conn = self.conn.lock().ok()?;
+
+        let payload: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM ledger_events
+                 WHERE event_type = 'redundancy_receipt_consumed'
+                 AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?1
+                 ORDER BY rowid DESC LIMIT 1",
+                params![receipt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        let payload = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+        Some(RedundancyReceiptConsumption {
+            receipt_id: payload.get("receipt_id")?.as_str()?.to_string(),
+            request_id: payload.get("request_id")?.as_str()?.to_string(),
+            tool_class: payload.get("tool_class")?.as_str()?.to_string(),
+        })
     }
 
     fn get_authoritative_receipt_event_count(&self) -> usize {
@@ -1167,13 +1748,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // TCK-00321: EPISODE_EVENT_DOMAIN_PREFIX imported from
-        // crate::protocol::dispatch to maintain single source of truth for
-        // domain prefixes.
-
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // Build payload as JSON with episode event metadata
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
@@ -1185,59 +1759,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "timestamp_ns": timestamp_ns,
         });
 
-        // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_string = payload_json.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(EPISODE_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(EPISODE_EVENT_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: event_type.to_string(),
-            work_id: episode_id.to_string(), // Use episode_id as work_id for indexing
-            actor_id: "daemon".to_string(),  // Episode events are daemon-authored
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            event_type,
+            episode_id, // Use episode_id as work_id for indexing
+            "daemon",   // Episode events are daemon-authored
+            payload_json,
+            timestamp_ns,
+            EPISODE_EVENT_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             episode_id = %episode_id,
             event_type = %event_type,
             "Persisted EpisodeEvent"
@@ -1277,9 +1818,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                 });
             }
         }
-
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with review receipt data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
@@ -1337,60 +1875,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         let payload_json = serde_json::Value::Object(payload_map);
-
-        // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_string = payload_json.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "review_receipt_recorded".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: reviewer_actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "review_receipt_recorded",
+            work_id,
+            reviewer_actor_id,
+            payload_json,
+            timestamp_ns,
+            REVIEW_RECEIPT_RECORDED_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             lease_id = %lease_id,
             work_id = %work_id,
             receipt_id = %receipt_id,
@@ -1433,8 +1937,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                 });
             }
         }
-
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
@@ -1496,56 +1998,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         let payload_json = serde_json::Value::Object(payload_map);
-
-        let payload_string = payload_json.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        let mut canonical_bytes =
-            Vec::with_capacity(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "review_blocked_recorded".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: reviewer_actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "review_blocked_recorded",
+            work_id,
+            reviewer_actor_id,
+            payload_json,
+            timestamp_ns,
+            REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             lease_id = %lease_id,
             work_id = %work_id,
             receipt_id = %receipt_id,
@@ -1569,9 +2041,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // This is imported from dispatch.rs and used to ensure domain separation.
         const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
 
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // Build payload as JSON with run attribution data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
@@ -1586,61 +2055,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "adapter_profile_hash": hex::encode(adapter_profile_hash),
             "timestamp_ns": timestamp_ns,
         });
-
-        // TCK-00330: Use JCS (RFC 8785) canonicalization for signing.
-        // This ensures deterministic JSON representation per RFC-0016.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(EPISODE_RUN_ATTRIBUTED_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(EPISODE_RUN_ATTRIBUTED_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "episode_run_attributed".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: session_id.to_string(), // Session is the actor for run attribution
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "episode_run_attributed",
+            work_id,
+            session_id, // Session is the actor for run attribution
+            payload,
+            timestamp_ns,
+            EPISODE_RUN_ATTRIBUTED_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             work_id = %work_id,
             episode_id = %episode_id,
             session_id = %session_id,
@@ -1655,9 +2089,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         &self,
         transition: &WorkTransition<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // Build payload as JSON with work transition data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness)
@@ -1671,60 +2102,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": transition.actor_id,
             "timestamp_ns": transition.timestamp_ns,
         });
-
-        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(WORK_TRANSITIONED_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "work_transitioned".to_string(),
-            work_id: transition.work_id.to_string(),
-            actor_id: transition.actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns: transition.timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "work_transitioned",
+            transition.work_id,
+            transition.actor_id,
+            payload,
+            transition.timestamp_ns,
+            WORK_TRANSITIONED_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             work_id = %transition.work_id,
             from_state = %transition.from_state,
             to_state = %transition.to_state,
@@ -1743,9 +2140,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // Build payload as JSON with session termination data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness)
@@ -1758,60 +2152,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": actor_id,
             "timestamp_ns": timestamp_ns,
         });
-
-        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes =
-            Vec::with_capacity(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "session_terminated".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "session_terminated",
+            work_id,
+            actor_id,
+            payload,
+            timestamp_ns,
+            SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             session_id = %session_id,
             work_id = %work_id,
             exit_code = %exit_code,
@@ -1846,7 +2206,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             })?;
 
         // --- Event 1: WorkClaimed ---
-        let claimed_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let prev_hash = Self::latest_event_hash(&conn).inspect_err(|_e| {
+            let _ = conn.execute("ROLLBACK", []);
+        })?;
         let claimed_payload = serde_json::json!({
             "event_type": "work_claimed",
             "work_id": claim.work_id,
@@ -1859,47 +2221,25 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "role_spec_hash": hex::encode(claim.policy_resolution.role_spec_hash),
             "context_pack_recipe_hash": hex::encode(claim.policy_resolution.context_pack_recipe_hash),
         });
-        let claimed_payload_json = claimed_payload.to_string();
-        let claimed_canonical = canonicalize_json(&claimed_payload_json).map_err(|e| {
-            let _ = conn.execute("ROLLBACK", []);
-            LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            }
-        })?;
-        let claimed_payload_bytes = claimed_canonical.as_bytes().to_vec();
-        let mut claimed_canonical_bytes =
-            Vec::with_capacity(WORK_CLAIMED_DOMAIN_PREFIX.len() + claimed_payload_bytes.len());
-        claimed_canonical_bytes.extend_from_slice(WORK_CLAIMED_DOMAIN_PREFIX);
-        claimed_canonical_bytes.extend_from_slice(&claimed_payload_bytes);
-        let claimed_signature = self.signing_key.sign(&claimed_canonical_bytes);
+        let (claimed_event, claimed_event_hash) = self
+            .build_signed_event_with_prev_hash(
+                "work_claimed",
+                &claim.work_id,
+                &claim.actor_id,
+                claimed_payload,
+                timestamp_ns,
+                WORK_CLAIMED_DOMAIN_PREFIX,
+                &prev_hash,
+            )
+            .inspect_err(|_e| {
+                let _ = conn.execute("ROLLBACK", []);
+            })?;
 
-        let claimed_event = SignedLedgerEvent {
-            event_id: claimed_event_id.clone(),
-            event_type: "work_claimed".to_string(),
-            work_id: claim.work_id.clone(),
-            actor_id: claim.actor_id.clone(),
-            payload: claimed_payload_bytes.clone(),
-            signature: claimed_signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        if let Err(e) = conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                claimed_event.event_id,
-                claimed_event.event_type,
-                claimed_event.work_id,
-                claimed_event.actor_id,
-                claimed_event.payload,
-                claimed_event.signature,
-                claimed_event.timestamp_ns
-            ],
-        ) {
+        if let Err(e) =
+            Self::persist_signed_event(&conn, &claimed_event, &prev_hash, &claimed_event_hash)
+        {
             let _ = conn.execute("ROLLBACK", []);
-            return Err(LedgerEventError::PersistenceFailed {
-                message: format!("sqlite insert failed (work_claimed): {e}"),
-            });
+            return Err(e);
         }
 
         // --- Event 2: WorkTransitioned(Open -> Claimed) ---
@@ -1914,7 +2254,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let transition_count = transition_count as u32;
 
-        let transition_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
         let transition_payload = serde_json::json!({
             "event_type": "work_transitioned",
             "work_id": claim.work_id,
@@ -1925,38 +2264,28 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": actor_id,
             "timestamp_ns": timestamp_ns,
         });
-        let transition_payload_json = transition_payload.to_string();
-        let transition_canonical = canonicalize_json(&transition_payload_json).map_err(|e| {
-            let _ = conn.execute("ROLLBACK", []);
-            LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            }
-        })?;
-        let transition_payload_bytes = transition_canonical.as_bytes().to_vec();
-        let mut transition_canonical_bytes = Vec::with_capacity(
-            WORK_TRANSITIONED_DOMAIN_PREFIX.len() + transition_payload_bytes.len(),
-        );
-        transition_canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
-        transition_canonical_bytes.extend_from_slice(&transition_payload_bytes);
-        let transition_signature = self.signing_key.sign(&transition_canonical_bytes);
-
-        if let Err(e) = conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                transition_event_id,
+        let (transition_event, transition_event_hash) = self
+            .build_signed_event_with_prev_hash(
                 "work_transitioned",
-                claim.work_id,
+                &claim.work_id,
                 actor_id,
-                transition_payload_bytes,
-                transition_signature.to_bytes().to_vec(),
-                timestamp_ns
-            ],
+                transition_payload,
+                timestamp_ns,
+                WORK_TRANSITIONED_DOMAIN_PREFIX,
+                &claimed_event_hash,
+            )
+            .inspect_err(|_e| {
+                let _ = conn.execute("ROLLBACK", []);
+            })?;
+
+        if let Err(e) = Self::persist_signed_event(
+            &conn,
+            &transition_event,
+            &claimed_event_hash,
+            &transition_event_hash,
         ) {
             let _ = conn.execute("ROLLBACK", []);
-            return Err(LedgerEventError::PersistenceFailed {
-                message: format!("sqlite insert failed (work_transitioned): {e}"),
-            });
+            return Err(e);
         }
 
         // Commit the transaction. On commit failure, attempt explicit
@@ -1976,7 +2305,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         info!(
-            event_id = %claimed_event_id,
+            event_id = %claimed_event.event_id,
             work_id = %claim.work_id,
             "Persisted WorkClaimed + WorkTransitioned(Open->Claimed) atomically"
         );
@@ -2018,7 +2347,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             })?;
 
         // --- Event 1: SessionStarted ---
-        let session_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let prev_hash = Self::latest_event_hash(&conn).inspect_err(|_e| {
+            let _ = conn.execute("ROLLBACK", []);
+        })?;
         let session_payload = build_session_started_payload(
             session_id,
             work_id,
@@ -2030,47 +2361,25 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             identity_proof_profile_hash,
             selection_decision,
         );
-        let session_payload_json = session_payload.to_string();
-        let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
-            let _ = conn.execute("ROLLBACK", []);
-            LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            }
-        })?;
-        let session_payload_bytes = session_canonical.as_bytes().to_vec();
-        let mut session_canonical_bytes =
-            Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + session_payload_bytes.len());
-        session_canonical_bytes.extend_from_slice(SESSION_STARTED_DOMAIN_PREFIX);
-        session_canonical_bytes.extend_from_slice(&session_payload_bytes);
-        let session_signature = self.signing_key.sign(&session_canonical_bytes);
+        let (session_event, session_event_hash) = self
+            .build_signed_event_with_prev_hash(
+                "session_started",
+                work_id,
+                actor_id,
+                session_payload,
+                timestamp_ns,
+                SESSION_STARTED_DOMAIN_PREFIX,
+                &prev_hash,
+            )
+            .inspect_err(|_e| {
+                let _ = conn.execute("ROLLBACK", []);
+            })?;
 
-        let session_event = SignedLedgerEvent {
-            event_id: session_event_id.clone(),
-            event_type: "session_started".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: actor_id.to_string(),
-            payload: session_payload_bytes.clone(),
-            signature: session_signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        if let Err(e) = conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                session_event.event_id,
-                session_event.event_type,
-                session_event.work_id,
-                session_event.actor_id,
-                session_event.payload,
-                session_event.signature,
-                session_event.timestamp_ns
-            ],
-        ) {
+        if let Err(e) =
+            Self::persist_signed_event(&conn, &session_event, &prev_hash, &session_event_hash)
+        {
             let _ = conn.execute("ROLLBACK", []);
-            return Err(LedgerEventError::PersistenceFailed {
-                message: format!("sqlite insert failed (session_started): {e}"),
-            });
+            return Err(e);
         }
 
         // --- Event 2: WorkTransitioned(Claimed -> InProgress) ---
@@ -2084,7 +2393,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let transition_count = transition_count as u32;
 
-        let transition_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
         let transition_payload = serde_json::json!({
             "event_type": "work_transitioned",
             "work_id": work_id,
@@ -2095,38 +2403,28 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": actor_id,
             "timestamp_ns": timestamp_ns,
         });
-        let transition_payload_json = transition_payload.to_string();
-        let transition_canonical = canonicalize_json(&transition_payload_json).map_err(|e| {
-            let _ = conn.execute("ROLLBACK", []);
-            LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            }
-        })?;
-        let transition_payload_bytes = transition_canonical.as_bytes().to_vec();
-        let mut transition_canonical_bytes = Vec::with_capacity(
-            WORK_TRANSITIONED_DOMAIN_PREFIX.len() + transition_payload_bytes.len(),
-        );
-        transition_canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
-        transition_canonical_bytes.extend_from_slice(&transition_payload_bytes);
-        let transition_signature = self.signing_key.sign(&transition_canonical_bytes);
-
-        if let Err(e) = conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                transition_event_id,
+        let (transition_event, transition_event_hash) = self
+            .build_signed_event_with_prev_hash(
                 "work_transitioned",
                 work_id,
                 actor_id,
-                transition_payload_bytes,
-                transition_signature.to_bytes().to_vec(),
-                timestamp_ns
-            ],
+                transition_payload,
+                timestamp_ns,
+                WORK_TRANSITIONED_DOMAIN_PREFIX,
+                &session_event_hash,
+            )
+            .inspect_err(|_e| {
+                let _ = conn.execute("ROLLBACK", []);
+            })?;
+
+        if let Err(e) = Self::persist_signed_event(
+            &conn,
+            &transition_event,
+            &session_event_hash,
+            &transition_event_hash,
         ) {
             let _ = conn.execute("ROLLBACK", []);
-            return Err(LedgerEventError::PersistenceFailed {
-                message: format!("sqlite insert failed (work_transitioned): {e}"),
-            });
+            return Err(e);
         }
 
         // Commit the transaction. On commit failure, attempt explicit
@@ -2146,7 +2444,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         info!(
-            event_id = %session_event_id,
+            event_id = %session_event.event_id,
             session_id = %session_id,
             work_id = %work_id,
             "Persisted SessionStarted + WorkTransitioned(Claimed->InProgress) atomically"
@@ -2163,9 +2461,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Generate unique event ID
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // Build payload as JSON with changeset publication data.
         // SECURITY: timestamp_ns is included in signed payload to prevent
         // temporal malleability per LAW-09.
@@ -2177,61 +2472,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": actor_id,
             "timestamp_ns": timestamp_ns,
         });
-
-        // TCK-00394: Use JCS (RFC 8785) canonicalization for signing.
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        // Build canonical bytes for signing (domain prefix + JCS payload)
-        let mut canonical_bytes = Vec::with_capacity(
-            CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX.len() + payload_bytes.len(),
-        );
-        canonical_bytes.extend_from_slice(CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        // Sign the canonical bytes
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "changeset_published".to_string(),
-            work_id: work_id.to_string(),
-            actor_id: actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        // Persist to SQLite
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "changeset_published",
+            work_id,
+            actor_id,
+            payload,
+            timestamp_ns,
+            CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             work_id = %work_id,
             changeset_digest = %hex::encode(changeset_digest),
             cas_hash = %hex::encode(cas_hash),
@@ -2267,8 +2527,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                 message: format!("envelope binding validation failed: {e}"),
             })?;
 
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
         // TCK-00350: Include envelope bindings in signed payload.
         // This ensures receipts carry immutable proof of the envelope,
         // capability manifest, and view commitment that were active.
@@ -2289,56 +2547,26 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "view_commitment_hash": view_hex,
             "identity_proof_hash": hex::encode(identity_proof_hash),
         });
-
-        let payload_string = payload_json.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        let mut canonical_bytes =
-            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "review_receipt_recorded".to_string(),
-            work_id: episode_id.to_string(),
-            actor_id: reviewer_actor_id.to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
         let conn = self
             .conn
             .lock()
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
+        let prev_hash = Self::latest_event_hash(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "review_receipt_recorded",
+            episode_id,
+            reviewer_actor_id,
+            payload_json,
+            timestamp_ns,
+            REVIEW_RECEIPT_RECORDED_PREFIX,
+            &prev_hash,
+        )?;
+        Self::persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
 
         info!(
-            event_id = %event_id,
+            event_id = %signed_event.event_id,
             episode_id = %episode_id,
             receipt_id = %receipt_id,
             envelope_hash = %env_hex,
@@ -2466,6 +2694,37 @@ impl SqliteLeaseValidator {
         delegated_parent_lease_id: Option<&str>,
     ) -> Result<(), String> {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin lease transaction: {e}"))?;
+
+        let duplicate_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events
+                    WHERE event_type = 'gate_lease_issued'
+                    AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1
+                    AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL
+                )",
+                params![lease.lease_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!("failed to query existing lease: {e}")
+            })?;
+        if duplicate_exists {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+
+        let prev_hash = SqliteLedgerEventEmitter::latest_event_hash(&conn).map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("failed to read previous hash: {e}")
+        })?;
         let payload = serde_json::json!({
             "event_type": "gate_lease_issued",
             "lease_id": lease.lease_id,
@@ -2474,40 +2733,70 @@ impl SqliteLeaseValidator {
             "executor_actor_id": lease.executor_actor_id,
             "full_lease": lease,
             "delegated_parent_lease_id": delegated_parent_lease_id,
+            "prev_hash": prev_hash,
         });
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("failed to serialize lease payload: {e}"))?;
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("failed to serialize lease payload: {e}")
+        })?;
+        let signature = vec![0u8; 64];
+        let tip_timestamp_i64: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(timestamp_ns), 0) FROM ledger_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!("failed to read latest ledger timestamp: {e}")
+            })?;
+        let issued_at_i64 = i64::try_from(lease.issued_at).unwrap_or(0);
+        let appended_timestamp_i64 = issued_at_i64.max(tip_timestamp_i64);
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let timestamp_ns = appended_timestamp_i64 as u64;
+        let event_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+            event_id: &event_id,
+            event_type: "gate_lease_issued",
+            work_id: &lease.work_id,
+            actor_id: "system",
+            payload: &payload_bytes,
+            signature: &signature,
+            timestamp_ns,
+            prev_hash: &prev_hash,
+        });
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
-
-        let rows_affected = conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM ledger_events
-                 WHERE event_type = 'gate_lease_issued'
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?8
-                 AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL
-             )",
+        conn.execute(
+            "INSERT INTO ledger_events (
+                event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 event_id,
                 "gate_lease_issued",
                 lease.work_id,
                 "system",
                 payload_bytes,
-                vec![0u8; 64],
-                i64::try_from(lease.issued_at).unwrap_or(0),
-                lease.lease_id
+                signature,
+                appended_timestamp_i64,
+                &prev_hash,
+                &event_hash,
             ],
         )
-        .map_err(|e| format!("failed to insert lease event: {e}"))?;
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("failed to insert lease event: {e}")
+        })?;
+        SqliteLedgerEventEmitter::set_metadata_value(
+            &conn,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+            &event_hash,
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("failed to update hash-chain checkpoint metadata: {e}")
+        })?;
 
-        if rows_affected == 0 {
-            return Err(format!("duplicate lease_id: {}", lease.lease_id));
-        }
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("failed to commit lease insert: {e}"))?;
 
         Ok(())
     }
@@ -2625,30 +2914,82 @@ impl LeaseValidator for SqliteLeaseValidator {
         // We emit a fake event to populate the ledger for validation to work.
         // This makes `register_lease` functionally verify the ledger logic.
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        let payload = serde_json::json!({
-            "event_type": "gate_lease_issued",
-            "lease_id": lease_id,
-            "work_id": work_id,
-            "gate_id": gate_id,
-            "executor_actor_id": executor_actor_id
-        });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-
-        // We insert a dummy event into ledger_events.
         if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            if conn.execute("BEGIN IMMEDIATE", []).is_err() {
+                return;
+            }
+            let Ok(prev_hash) = SqliteLedgerEventEmitter::latest_event_hash(&conn) else {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            };
+            let Ok(tip_timestamp_i64) = conn.query_row(
+                "SELECT COALESCE(MAX(timestamp_ns), 0) FROM ledger_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            ) else {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            };
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            let timestamp_ns = tip_timestamp_i64 as u64;
+            let payload = serde_json::json!({
+                "event_type": "gate_lease_issued",
+                "lease_id": lease_id,
+                "work_id": work_id,
+                "gate_id": gate_id,
+                "executor_actor_id": executor_actor_id,
+                "prev_hash": prev_hash,
+            });
+            let Ok(payload_bytes) = serde_json::to_vec(&payload) else {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            };
+            let signature = vec![0u8; 64]; // Dummy signature
+            let event_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+                event_id: &event_id,
+                event_type: "gate_lease_issued",
+                work_id,
+                actor_id: "system",
+                payload: &payload_bytes,
+                signature: &signature,
+                timestamp_ns,
+                prev_hash: &prev_hash,
+            });
+            if conn
+                .execute(
+                "INSERT INTO ledger_events (
+                    event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     event_id,
                     "gate_lease_issued",
                     work_id,
                     "system",
                     payload_bytes,
-                    vec![0u8; 64], // Dummy signature
-                    0
+                    signature,
+                    tip_timestamp_i64,
+                    &prev_hash,
+                    &event_hash,
                 ],
-            );
+            )
+                .is_err()
+            {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            }
+            if SqliteLedgerEventEmitter::set_metadata_value(
+                &conn,
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+                &event_hash,
+            )
+            .is_err()
+            {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            }
+            if conn.execute("COMMIT", []).is_err() {
+                let _ = conn.execute("ROLLBACK", []);
+            }
         }
     }
 
@@ -2874,6 +3215,275 @@ mod tests {
             ],
         )
         .expect("projection seed event should insert");
+    }
+
+    #[test]
+    fn backfill_hash_chain_handles_multiple_batches_without_uninitialized_rows() {
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema(&conn).expect("schema initialization should succeed");
+
+        let row_count = 1_041;
+        for idx in 0..row_count {
+            conn.execute(
+                "INSERT INTO ledger_events
+                    (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'genesis', 'legacy-uninitialized')",
+                params![
+                    format!("legacy-batch-{idx:05}"),
+                    "session_started",
+                    format!("W-BATCH-{idx:05}"),
+                    "uid:test",
+                    br#"{"mode":"legacy"}"#.as_slice(),
+                    b"sig".as_slice(),
+                    i64::from(idx + 1),
+                ],
+            )
+            .expect("legacy row insert should succeed");
+        }
+
+        conn.execute(
+            "DELETE FROM ledger_metadata WHERE meta_key = ?1",
+            params![SqliteLedgerEventEmitter::HASH_CHAIN_BACKFILL_COMPLETED_FLAG],
+        )
+        .expect("backfill completion flag reset should succeed");
+
+        let migrated = SqliteLedgerEventEmitter::backfill_hash_chain(&conn)
+            .expect("backfill should succeed for multi-batch legacy rows");
+        assert!(migrated, "backfill should report migration work applied");
+
+        let remaining_uninitialized: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events
+                 WHERE event_hash IS NULL OR event_hash = '' OR event_hash = 'legacy-uninitialized'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("uninitialized row count query should succeed");
+        assert_eq!(
+            remaining_uninitialized, 0,
+            "all legacy rows must be assigned event hashes during backfill"
+        );
+
+        let latest_event_hash: String = conn
+            .query_row(
+                "SELECT event_hash FROM ledger_events ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("latest event hash query should succeed");
+        let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
+            &conn,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+        )
+        .expect("checkpoint lookup should succeed")
+        .expect("checkpoint should be present after backfill");
+        assert_eq!(
+            checkpoint, latest_event_hash,
+            "checkpoint metadata must track the latest event hash after backfill"
+        );
+    }
+
+    #[test]
+    fn backfill_hash_chain_links_legacy_suffix_to_existing_hashed_prefix() {
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema(&conn).expect("schema initialization should succeed");
+        conn.execute("DELETE FROM ledger_events", [])
+            .expect("table reset should succeed");
+
+        let first_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+            event_id: "seed-0001",
+            event_type: "session_started",
+            work_id: "W-SEED-0001",
+            actor_id: "uid:test",
+            payload: br#"{"mode":"seed"}"#,
+            signature: b"sig-seed",
+            timestamp_ns: 1,
+            prev_hash: SqliteLedgerEventEmitter::LEDGER_CHAIN_GENESIS,
+        });
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "seed-0001",
+                "session_started",
+                "W-SEED-0001",
+                "uid:test",
+                br#"{"mode":"seed"}"#.as_slice(),
+                b"sig-seed".as_slice(),
+                1_i64,
+                SqliteLedgerEventEmitter::LEDGER_CHAIN_GENESIS,
+                &first_hash,
+            ],
+        )
+        .expect("seed hashed row insert should succeed");
+
+        for idx in 2..=3 {
+            conn.execute(
+                "INSERT INTO ledger_events
+                    (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'genesis', 'legacy-uninitialized')",
+                params![
+                    format!("seed-{idx:04}"),
+                    "session_started",
+                    format!("W-SEED-{idx:04}"),
+                    "uid:test",
+                    br#"{"mode":"legacy"}"#.as_slice(),
+                    b"sig-legacy".as_slice(),
+                    i64::from(idx),
+                ],
+            )
+            .expect("legacy suffix row insert should succeed");
+        }
+
+        conn.execute(
+            "DELETE FROM ledger_metadata WHERE meta_key = ?1",
+            params![SqliteLedgerEventEmitter::HASH_CHAIN_BACKFILL_COMPLETED_FLAG],
+        )
+        .expect("backfill completion flag reset should succeed");
+
+        SqliteLedgerEventEmitter::backfill_hash_chain(&conn)
+            .expect("backfill should succeed for mixed hashed/legacy rows");
+
+        let second_prev_hash: String = conn
+            .query_row(
+                "SELECT prev_hash FROM ledger_events WHERE event_id = 'seed-0002'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second row prev_hash lookup should succeed");
+        assert_eq!(
+            second_prev_hash, first_hash,
+            "legacy suffix must chain from the existing hashed prefix"
+        );
+
+        let second_hash: String = conn
+            .query_row(
+                "SELECT event_hash FROM ledger_events WHERE event_id = 'seed-0002'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second row hash lookup should succeed");
+        let third_prev_hash: String = conn
+            .query_row(
+                "SELECT prev_hash FROM ledger_events WHERE event_id = 'seed-0003'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("third row prev_hash lookup should succeed");
+        assert_eq!(
+            third_prev_hash, second_hash,
+            "legacy rows within the suffix must link to the immediate prior migrated row"
+        );
+    }
+
+    #[test]
+    fn derive_event_chain_hash_rejects_rehashed_tampered_event_with_invalid_signature() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("sqlite in-memory should open"),
+        ));
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            SqliteLedgerEventEmitter::init_schema(&conn_guard)
+                .expect("schema initialization should succeed");
+        }
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key);
+
+        let claim = WorkClaim {
+            work_id: "W-SIG-CHECK-001".to_string(),
+            lease_id: "L-SIG-CHECK-001".to_string(),
+            actor_id: "uid:sig-check".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_000_000)
+            .expect("work_claimed should persist");
+
+        {
+            let conn_guard = conn.lock().expect("sqlite lock should be available");
+            let (
+                event_id,
+                event_type,
+                work_id,
+                actor_id,
+                payload_bytes,
+                timestamp_i64,
+                prev_hash,
+            ): (String, String, String, String, Vec<u8>, i64, String) = conn_guard
+                .query_row(
+                    "SELECT event_id, event_type, work_id, actor_id, payload, timestamp_ns, prev_hash
+                     FROM ledger_events
+                     ORDER BY rowid ASC
+                     LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .expect("seed event row should load");
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            let timestamp_ns = timestamp_i64 as u64;
+
+            let mut tampered_payload: serde_json::Value =
+                serde_json::from_slice(&payload_bytes).expect("seed payload should decode");
+            tampered_payload["tampered"] = serde_json::Value::Bool(true);
+            let tampered_payload_bytes =
+                serde_json::to_vec(&tampered_payload).expect("tampered payload should encode");
+            let tampered_signature = vec![0x7Fu8; 64];
+            let tampered_event_hash =
+                SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+                    event_id: &event_id,
+                    event_type: &event_type,
+                    work_id: &work_id,
+                    actor_id: &actor_id,
+                    payload: &tampered_payload_bytes,
+                    signature: &tampered_signature,
+                    timestamp_ns,
+                    prev_hash: &prev_hash,
+                });
+
+            conn_guard
+                .execute(
+                    "UPDATE ledger_events
+                     SET payload = ?1, signature = ?2, event_hash = ?3
+                     WHERE event_id = ?4",
+                    params![
+                        tampered_payload_bytes,
+                        tampered_signature,
+                        tampered_event_hash,
+                        event_id
+                    ],
+                )
+                .expect("tampered row update should succeed");
+            SqliteLedgerEventEmitter::set_metadata_value(
+                &conn_guard,
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+                &tampered_event_hash,
+            )
+            .expect("checkpoint update should succeed");
+        }
+
+        let err = emitter
+            .derive_event_chain_hash()
+            .expect_err("signature-authenticated chain derivation must fail on tampered row");
+        assert!(
+            err.contains("signature verification"),
+            "chain verification must fail on invalid signatures: {err}"
+        );
     }
 
     #[test]
@@ -3388,6 +3998,100 @@ mod tests {
         );
     }
 
+    /// Regression: lease registration updates the hash-chain checkpoint
+    /// metadata so startup checkpoint validation succeeds.
+    #[test]
+    fn sqlite_lease_validator_register_lease_with_executor_updates_checkpoint() {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        validator.register_lease_with_executor(
+            "checkpoint-lease-001",
+            "W-CHECKPOINT-001",
+            "gate-checkpoint",
+            "exec-checkpoint",
+        );
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let conn_guard = conn.lock().expect("sqlite lock should be available");
+        let chain_tip =
+            SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard, &verifying_key)
+                .expect("chain tip derivation should succeed");
+        let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
+            &conn_guard,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+        )
+        .expect("checkpoint metadata lookup should succeed");
+        assert_eq!(
+            checkpoint.as_deref(),
+            Some(chain_tip.as_str()),
+            "register_lease_with_executor must update hash-chain checkpoint"
+        );
+        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn_guard,
+            false,
+            Some(&verifying_key),
+        )
+        .expect("startup checkpoint validation should pass after lease registration");
+    }
+
+    /// Regression: full-lease registration updates hash-chain checkpoint
+    /// metadata atomically with event insertion.
+    #[test]
+    fn sqlite_lease_validator_register_full_lease_updates_checkpoint() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new(
+            "checkpoint-full-lease-001",
+            "W-CHECKPOINT-002",
+            "gate-full-checkpoint",
+        )
+        .changeset_digest([0x11; 32])
+        .executor_actor_id("exec-full-checkpoint")
+        .issued_at(1_234_567)
+        .expires_at(2_345_678)
+        .policy_hash([0x22; 32])
+        .issuer_actor_id("issuer-full-checkpoint")
+        .time_envelope_ref("htf:tick:321")
+        .build_and_sign(&signer);
+
+        validator
+            .register_full_lease(&lease)
+            .expect("register_full_lease should succeed");
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let conn_guard = conn.lock().expect("sqlite lock should be available");
+        let chain_tip =
+            SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard, &verifying_key)
+                .expect("chain tip derivation should succeed");
+        let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
+            &conn_guard,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+        )
+        .expect("checkpoint metadata lookup should succeed");
+        assert_eq!(
+            checkpoint.as_deref(),
+            Some(chain_tip.as_str()),
+            "register_full_lease must update hash-chain checkpoint"
+        );
+        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn_guard,
+            false,
+            Some(&verifying_key),
+        )
+        .expect("startup checkpoint validation should pass after full lease registration");
+    }
+
     // ====================================================================
     // v10 BLOCKER 2: register_full_lease duplicate rejection tests
     // ====================================================================
@@ -3888,10 +4592,10 @@ mod tests {
         );
     }
 
-    /// Regression: `receipt_id` uniqueness is enforced at the `SQLite` boundary
-    /// even when semantic tuple fields differ.
+    /// Regression: review receipt and consumption events can share a receipt ID
+    /// while per-event-type uniqueness remains enforced.
     #[test]
-    fn init_schema_restores_global_receipt_id_uniqueness() {
+    fn init_schema_scopes_receipt_id_uniqueness_by_event_type() {
         let conn = Connection::open_in_memory().unwrap();
         SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
 
@@ -3907,7 +4611,22 @@ mod tests {
             .unwrap();
         assert!(
             has_receipt_id_unique_index,
-            "init_schema must restore idx_unique_receipt_id for DB-level race protection"
+            "init_schema must restore scoped idx_unique_receipt_id for review receipt events"
+        );
+
+        let has_receipt_consumed_unique_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_unique_receipt_consumed'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_receipt_consumed_unique_index,
+            "init_schema must create idx_unique_receipt_consumed for consumption events"
         );
 
         conn.execute(
@@ -3925,6 +4644,22 @@ mod tests {
             ],
         )
         .unwrap();
+
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-consumed-base",
+                "redundancy_receipt_consumed",
+                "session-base",
+                "actor-base",
+                br#"{"receipt_id":"RR-UNIQUE-001","request_id":"REQ-BASE","tool_class":"inference"}"#.as_slice(),
+                b"sig-consumed".as_slice(),
+                101_i64
+            ],
+        )
+        .expect("review and consumed events must be allowed to share receipt_id");
 
         let duplicate_err = conn
             .execute(
@@ -3949,6 +4684,221 @@ mod tests {
                 || duplicate_err_text.contains("UNIQUE constraint failed"),
             "expected UNIQUE failure for idx_unique_receipt_id, got: {duplicate_err_text}"
         );
+
+        let duplicate_consumed_err = conn
+            .execute(
+                "INSERT INTO ledger_events
+                    (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "receipt-consumed-duplicate",
+                    "redundancy_receipt_consumed",
+                    "session-other",
+                    "actor-other",
+                    br#"{"receipt_id":"RR-UNIQUE-001","request_id":"REQ-OTHER","tool_class":"inference"}"#.as_slice(),
+                    b"sig-consumed-other".as_slice(),
+                    103_i64
+                ],
+            )
+            .expect_err("duplicate redundancy consumption receipt_id must be rejected");
+        let duplicate_consumed_err_text = duplicate_consumed_err.to_string();
+        assert!(
+            duplicate_consumed_err_text.contains("idx_unique_receipt_consumed")
+                || duplicate_consumed_err_text.contains("UNIQUE constraint failed"),
+            "expected UNIQUE failure for idx_unique_receipt_consumed, got: {duplicate_consumed_err_text}"
+        );
+    }
+
+    #[test]
+    fn derive_event_chain_hash_detects_tampered_intermediate_event_hash() {
+        let emitter = test_emitter();
+        let claim = WorkClaim {
+            work_id: "W-HASH-CHAIN-001".to_string(),
+            lease_id: "L-HASH-CHAIN-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_000_000)
+            .expect("work_claimed must emit for hash-chain test");
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id: "W-HASH-CHAIN-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "hash_chain_test",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: 1_700_000_000_000_000_001,
+            })
+            .expect("work_transitioned must emit for hash-chain test");
+        emitter
+            .emit_session_terminated(
+                "SESS-HASH-CHAIN-001",
+                "W-HASH-CHAIN-001",
+                0,
+                "test-complete",
+                "uid:1000",
+                1_700_000_000_000_000_002,
+            )
+            .expect("session_terminated must emit for hash-chain test");
+
+        emitter
+            .derive_event_chain_hash()
+            .expect("initial event chain derivation should succeed");
+
+        {
+            let conn = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available for tamper mutation");
+            conn.execute(
+                "UPDATE ledger_events SET event_hash = 'tampered' WHERE rowid = 2",
+                [],
+            )
+            .expect("tamper mutation should succeed for regression coverage");
+        }
+
+        let chain_err = emitter
+            .derive_event_chain_hash()
+            .expect_err("tampered intermediate hash must fail chain derivation");
+        assert!(
+            chain_err.contains("hash chain broken") && chain_err.contains("event_hash"),
+            "expected explicit hash-chain break diagnostics, got: {chain_err}"
+        );
+    }
+
+    #[test]
+    fn derive_event_chain_hash_detects_signature_tampering_with_rehashed_row() {
+        let emitter = test_emitter();
+        let claim = WorkClaim {
+            work_id: "W-HASH-CHAIN-SIG-001".to_string(),
+            lease_id: "L-HASH-CHAIN-SIG-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_100_000)
+            .expect("work_claimed must emit for signature tampering test");
+
+        let (event_id, event_type, work_id, actor_id, payload, timestamp_ns, prev_hash): (
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            i64,
+            String,
+        ) = {
+            let conn = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available for seed query");
+            conn.query_row(
+                "SELECT event_id, event_type, work_id, actor_id, payload, timestamp_ns, prev_hash \
+                 FROM ledger_events WHERE rowid = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("seed row should exist")
+        };
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let timestamp_ns = timestamp_ns as u64;
+
+        let tampered_signature = vec![0xA5; 64];
+        let tampered_event_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+            event_id: &event_id,
+            event_type: &event_type,
+            work_id: &work_id,
+            actor_id: &actor_id,
+            payload: &payload,
+            signature: &tampered_signature,
+            timestamp_ns,
+            prev_hash: &prev_hash,
+        });
+
+        {
+            let conn = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available for tamper mutation");
+            conn.execute(
+                "UPDATE ledger_events SET signature = ?1, event_hash = ?2 WHERE event_id = ?3",
+                params![tampered_signature, tampered_event_hash, event_id],
+            )
+            .expect("signature tamper mutation should succeed");
+        }
+
+        let chain_err = emitter
+            .derive_event_chain_hash()
+            .expect_err("rehashed signature tampering must fail chain derivation");
+        assert!(
+            chain_err.contains("signature verification")
+                || chain_err.contains("failed Ed25519 signature"),
+            "expected signature verification failure diagnostics, got: {chain_err}"
+        );
+    }
+
+    #[test]
+    fn review_receipt_and_consumption_event_allow_same_receipt_id() {
+        let emitter = test_emitter();
+        let receipt_id = "RR-CONSUME-001";
+        let identity_proof_hash = [0xABu8; 32];
+
+        emitter
+            .emit_review_receipt(
+                "lease-consume-001",
+                "work-consume-001",
+                receipt_id,
+                &[0x01; 32],
+                &[0x02; 32],
+                &[0x03; 32],
+                &[0x04; 32],
+                &[0x05; 32],
+                "reviewer-consume-001",
+                1_700_000_000_000_000_100,
+                &identity_proof_hash,
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                None,
+            )
+            .expect("review receipt emission should succeed");
+
+        emitter
+            .emit_redundancy_receipt_consumed(
+                "session-consume-001",
+                receipt_id,
+                "REQ-CONSUME-001",
+                "inference",
+                "session-consume-001",
+                1_700_000_000_000_000_101,
+            )
+            .expect("consumption event should succeed for same receipt_id as review receipt");
+
+        let consumption = emitter
+            .get_redundancy_receipt_consumption(receipt_id)
+            .expect("consumption lookup should return emitted binding");
+        assert_eq!(consumption.request_id, "REQ-CONSUME-001");
+        assert_eq!(consumption.tool_class, "inference");
     }
 
     /// Verifies that `emit_review_blocked_receipt` includes replay-critical

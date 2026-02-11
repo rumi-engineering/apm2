@@ -1770,6 +1770,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self
     }
 
+    /// Returns the authoritative active policy digest for this broker.
+    #[must_use]
+    pub const fn active_policy_hash(&self) -> Hash {
+        self.policy.policy_hash()
+    }
+
     /// Returns `true` if SSH agent is available for broker-mediated operations
     /// (TCK-00263).
     ///
@@ -3065,8 +3071,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // SECURITY: Cache lookup occurs AFTER authorization, path-ratchet,
         // AND epoch-seal enforcement to prevent bypass attacks.
         if self.config.use_dedupe_cache {
-            if let Some(cached) = self
-                .lookup_dedupe(&request.episode_id, &request.dedupe_key, timestamp_ns)
+            if let Some((cached, policy_hash)) = self
+                .lookup_dedupe_with_policy(&request.episode_id, &request.dedupe_key, timestamp_ns)
                 .await
             {
                 debug!(dedupe_key = %request.dedupe_key, "dedupe cache hit");
@@ -3081,6 +3087,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 }
                 respond!(ToolDecision::DedupeCacheHit {
                     request_id: request.request_id.clone(),
+                    policy_hash,
                     result: Box::new(cached),
                 });
             }
@@ -3153,17 +3160,20 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         result: ToolResult,
         timestamp_ns: u64,
     ) -> Result<(), BrokerError> {
-        // Verify this is an Allow decision
-        if !decision.is_allowed() {
-            return Err(BrokerError::Internal {
-                message: "cannot record result for non-Allow decision".to_string(),
-            });
-        }
+        // Verify this is an Allow decision and capture the admitted policy root.
+        let policy_hash = match decision {
+            ToolDecision::Allow { policy_hash, .. } => *policy_hash,
+            _ => {
+                return Err(BrokerError::Internal {
+                    message: "cannot record result for non-Allow decision".to_string(),
+                });
+            },
+        };
 
         // Store in dedupe cache
         if self.config.use_dedupe_cache {
             self.dedupe_cache
-                .insert(episode_id, dedupe_key, result, timestamp_ns)
+                .insert_with_policy(episode_id, dedupe_key, result, policy_hash, timestamp_ns)
                 .await;
         }
 
@@ -3262,10 +3272,24 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         key: &DedupeKey,
         timestamp_ns: u64,
     ) -> Option<ToolResult> {
+        self.lookup_dedupe_with_policy(episode_id, key, timestamp_ns)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Looks up a cached result and its admitted policy digest.
+    pub async fn lookup_dedupe_with_policy(
+        &self,
+        episode_id: &EpisodeId,
+        key: &DedupeKey,
+        timestamp_ns: u64,
+    ) -> Option<(ToolResult, Hash)> {
         if !self.config.use_dedupe_cache {
             return None;
         }
-        self.dedupe_cache.get(episode_id, key, timestamp_ns).await
+        self.dedupe_cache
+            .get_with_policy(episode_id, key, timestamp_ns)
+            .await
     }
 
     /// Evicts all cached results for an episode.

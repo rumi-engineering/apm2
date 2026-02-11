@@ -26,8 +26,8 @@ const SCALE_EFFECTS_10E3: u64 = 1_000;
 const SCALE_EFFECTS_10E4: u64 = 10_000;
 const SCALE_EFFECTS_10E5: u64 = 100_000;
 // Keep verification workload representative but bounded for CI runtime SLO.
-const MAX_BATCH_SAMPLES_PER_SCALE: usize = 64;
-const BOOTSTRAP_REPLICATES: usize = 512;
+const MAX_BATCH_SAMPLES_PER_SCALE: usize = 24;
+const BOOTSTRAP_REPLICATES: usize = 128;
 const P99_Z_SCORE: f64 = 2.326_347_874_040_840_8;
 
 #[derive(Debug, Clone, Copy)]

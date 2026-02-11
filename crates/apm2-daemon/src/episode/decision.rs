@@ -1290,6 +1290,10 @@ pub enum ToolDecision {
         /// The request ID for this cache hit.
         request_id: String,
 
+        /// Policy digest admitted for the original request that populated
+        /// this cache entry.
+        policy_hash: Hash,
+
         /// The cached result.
         result: Box<ToolResult>,
     },
@@ -1916,6 +1920,7 @@ mod tests {
 
         let decision = ToolDecision::DedupeCacheHit {
             request_id: "req-003".to_string(),
+            policy_hash: [0u8; 32],
             result: Box::new(result),
         };
 

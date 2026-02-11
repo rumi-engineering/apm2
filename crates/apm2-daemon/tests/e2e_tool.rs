@@ -451,7 +451,10 @@ async fn test_dedupe_cache_hit() {
         "second request should be a dedupe cache hit"
     );
 
-    if let ToolDecision::DedupeCacheHit { request_id, result } = decision2 {
+    if let ToolDecision::DedupeCacheHit {
+        request_id, result, ..
+    } = decision2
+    {
         assert_eq!(request_id, "req-002");
         assert_eq!(result.output, b"file contents");
     }

@@ -14,8 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelSource, ChannelViolationClass, decode_channel_context_token,
-    derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
+    BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelSource, ChannelViolationClass,
+    DeclassificationIntentScope, LeakageBudgetReceipt, LeakageEstimatorFamily, TimingChannelBudget,
+    decode_channel_context_token, derive_channel_source_witness, issue_channel_context_token,
+    validate_channel_boundary,
 };
 use apm2_core::crypto::Signer;
 use apm2_core::fac::{
@@ -67,6 +69,46 @@ fn make_sqlite_conn() -> Arc<Mutex<Connection>> {
     SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
     SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
     Arc::new(Mutex::new(conn))
+}
+
+fn admitted_boundary_check() -> ChannelBoundaryCheck {
+    ChannelBoundaryCheck {
+        source: ChannelSource::TypedToolIntent,
+        channel_source_witness: Some(derive_channel_source_witness(
+            ChannelSource::TypedToolIntent,
+        )),
+        broker_verified: true,
+        capability_verified: true,
+        context_firewall_verified: true,
+        policy_ledger_verified: true,
+        taint_allow: true,
+        classification_allow: true,
+        declass_receipt_valid: true,
+        declassification_intent: DeclassificationIntentScope::None,
+        redundancy_declassification_receipt: None,
+        boundary_flow_policy_binding: Some(BoundaryFlowPolicyBinding {
+            policy_digest: [1u8; 32],
+            admitted_policy_root_digest: [1u8; 32],
+            canonicalizer_tuple_digest: [2u8; 32],
+            admitted_canonicalizer_tuple_digest: [2u8; 32],
+        }),
+        leakage_budget_receipt: Some(LeakageBudgetReceipt {
+            leakage_bits: 4,
+            budget_bits: 8,
+            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+            confidence_bps: 9_500,
+            confidence_label: "high".to_string(),
+        }),
+        timing_channel_budget: Some(TimingChannelBudget {
+            release_bucket_ticks: 10,
+            observed_variance_ticks: 3,
+            budget_ticks: 10,
+        }),
+        leakage_budget_policy_max_bits: Some(8),
+        declared_leakage_budget_bits: None,
+        timing_budget_policy_max_ticks: Some(10),
+        declared_timing_budget_ticks: None,
+    }
 }
 
 fn make_dispatcher_state(
@@ -319,16 +361,7 @@ fn tck_00438_launch_rollout_e2e_lineage_liveness_and_projection() {
         "session_started role hash must preserve launch role lineage"
     );
 
-    let boundary_check = ChannelBoundaryCheck {
-        source: ChannelSource::TypedToolIntent,
-        channel_source_witness: Some(derive_channel_source_witness(
-            ChannelSource::TypedToolIntent,
-        )),
-        broker_verified: true,
-        capability_verified: true,
-        context_firewall_verified: true,
-        policy_ledger_verified: true,
-    };
+    let boundary_check = admitted_boundary_check();
     assert!(
         validate_channel_boundary(&boundary_check).is_empty(),
         "typed + fully verified channel boundary must admit authoritative actuation"
@@ -609,12 +642,8 @@ fn tck_00438_launch_rollout_fails_closed_on_missing_or_inconsistent_slices() {
 
     // Boundary fail-closed: missing typed source witness is denied.
     let boundary_defects = validate_channel_boundary(&ChannelBoundaryCheck {
-        source: ChannelSource::TypedToolIntent,
         channel_source_witness: None,
-        broker_verified: true,
-        capability_verified: true,
-        context_firewall_verified: true,
-        policy_ledger_verified: true,
+        ..admitted_boundary_check()
     });
     let boundary_classes: Vec<ChannelViolationClass> = boundary_defects
         .iter()

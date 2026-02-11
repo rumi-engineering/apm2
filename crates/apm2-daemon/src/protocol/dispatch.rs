@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
+    BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource,
+    ChannelViolationClass, DeclassificationIntentScope, LeakageBudgetReceipt,
+    LeakageEstimatorFamily, RedundancyDeclassificationReceipt, TimingChannelBudget,
     derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
 };
 use apm2_core::credentials::{
@@ -65,6 +67,7 @@ use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
@@ -208,6 +211,17 @@ pub struct SignedLedgerEvent {
 
     /// Timestamp in nanoseconds since epoch (HTF-compliant).
     pub timestamp_ns: u64,
+}
+
+/// Authoritative binding for a consumed redundancy declassification receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedundancyReceiptConsumption {
+    /// Canonical receipt identifier.
+    pub receipt_id: String,
+    /// Request ID bound to the first successful consumption.
+    pub request_id: String,
+    /// Tool class bound to the first successful consumption.
+    pub tool_class: String,
 }
 
 /// Error type for ledger event emission.
@@ -533,6 +547,141 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// materialization. `SQLite` implementations should use
     /// `SELECT ... ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1`.
     fn get_latest_event(&self) -> Option<SignedLedgerEvent> {
+        None
+    }
+
+    /// Returns the latest trusted `gate.policy_resolved` lifecycle event.
+    ///
+    /// The default implementation scans events from newest to oldest and
+    /// returns the first event whose type and actor match gate orchestrator
+    /// policy-resolution provenance.
+    fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
+        self.get_all_events().into_iter().rev().find(|event| {
+            event.event_type == "gate.policy_resolved"
+                && event.actor_id == "orchestrator:gate-lifecycle"
+        })
+    }
+
+    /// Returns the latest persisted event hash chain tip in O(1) time.
+    ///
+    /// `Ok(None)` indicates an empty ledger with no persisted events.
+    /// Implementations should use a direct lookup against persisted chain-tip
+    /// state (for `SQLite`: latest `event_hash`) rather than re-deriving the
+    /// full chain.
+    fn get_latest_event_hash(&self) -> Result<Option<String>, String> {
+        if self.get_event_count() == 0 {
+            return Ok(None);
+        }
+        self.derive_event_chain_hash().map(Some)
+    }
+
+    /// Derives the authoritative ledger chain tip hash.
+    ///
+    /// Implementations should fail-closed if chain integrity cannot be
+    /// established. The default implementation derives a deterministic chain
+    /// from replay-order events using `prev_hash -> payload -> signature`
+    /// bindings.
+    fn derive_event_chain_hash(&self) -> Result<String, String> {
+        let mut prev_hash = "genesis".to_string();
+        for event in self.get_all_events() {
+            let mut hasher = Sha256::new();
+            hasher.update(b"apm2-ledger-chain-default-v1");
+            hasher.update(prev_hash.as_bytes());
+            hasher.update(event.event_type.as_bytes());
+            hasher.update(event.work_id.as_bytes());
+            hasher.update(event.actor_id.as_bytes());
+            hasher.update(event.timestamp_ns.to_le_bytes());
+            hasher.update(&event.payload);
+            hasher.update(&event.signature);
+            prev_hash = hex::encode(hasher.finalize());
+        }
+        Ok(prev_hash)
+    }
+
+    /// Emits an authoritative receipt-consumption ledger event.
+    ///
+    /// Default implementation emits through `emit_session_event` to preserve
+    /// compatibility for in-memory test emitters.
+    fn emit_redundancy_receipt_consumed(
+        &self,
+        session_id: &str,
+        receipt_id: &str,
+        request_id: &str,
+        tool_class: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        let payload = serde_json::json!({
+            "receipt_id": receipt_id,
+            "request_id": request_id,
+            "tool_class": tool_class,
+        });
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("receipt consumption payload serialization failed: {e}"),
+            })?;
+        self.emit_session_event(
+            session_id,
+            "redundancy_receipt_consumed",
+            &payload_bytes,
+            actor_id,
+            timestamp_ns,
+        )
+    }
+
+    /// Returns the authoritative receipt-consumption binding, if present.
+    ///
+    /// Default implementation scans replay-order events from newest to oldest
+    /// and supports both direct JSON payloads and wrapped `session_event`
+    /// payloads where the inner payload is hex-encoded.
+    fn get_redundancy_receipt_consumption(
+        &self,
+        receipt_id: &str,
+    ) -> Option<RedundancyReceiptConsumption> {
+        fn parse_consumption(payload: &serde_json::Value) -> Option<RedundancyReceiptConsumption> {
+            let obj = payload.as_object()?;
+            Some(RedundancyReceiptConsumption {
+                receipt_id: obj.get("receipt_id")?.as_str()?.to_string(),
+                request_id: obj.get("request_id")?.as_str()?.to_string(),
+                tool_class: obj.get("tool_class")?.as_str()?.to_string(),
+            })
+        }
+
+        let mut events = self.get_all_events();
+        events.reverse();
+        for event in events {
+            if event.event_type != "redundancy_receipt_consumed" {
+                continue;
+            }
+
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&event.payload) else {
+                continue;
+            };
+
+            if let Some(consumption) = parse_consumption(&payload) {
+                if consumption.receipt_id == receipt_id {
+                    return Some(consumption);
+                }
+                continue;
+            }
+
+            let Some(inner_hex) = payload.get("payload").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Ok(inner_bytes) = hex::decode(inner_hex) else {
+                continue;
+            };
+            let Ok(inner_payload) = serde_json::from_slice::<serde_json::Value>(&inner_bytes)
+            else {
+                continue;
+            };
+            let Some(consumption) = parse_consumption(&inner_payload) else {
+                continue;
+            };
+            if consumption.receipt_id == receipt_id {
+                return Some(consumption);
+            }
+        }
         None
     }
 
@@ -3095,6 +3244,17 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         order
             .last()
             .and_then(|event_id| events.get(event_id).cloned())
+    }
+
+    fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        let (order, events) = &*guard;
+        order.iter().rev().find_map(|event_id| {
+            let event = events.get(event_id)?;
+            (event.event_type == "gate.policy_resolved"
+                && event.actor_id == "orchestrator:gate-lifecycle")
+                .then(|| event.clone())
+        })
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
@@ -7164,6 +7324,79 @@ pub struct PrivilegedPcacLifecycleArtifacts {
     pub consume_selector_digest: [u8; 32],
 }
 
+/// Runtime boundary-flow evidence used to evaluate RFC-0028 REQ-0004
+/// predicate closure at channel admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryFlowRuntimeState {
+    /// Dual-lattice taint admission predicate.
+    pub taint_allow: bool,
+    /// Dual-lattice confidentiality/classification admission predicate.
+    pub classification_allow: bool,
+    /// Declassification receipt validity predicate.
+    pub declass_receipt_valid: bool,
+    /// Declassification intent scope.
+    pub declassification_intent: DeclassificationIntentScope,
+    /// Optional redundancy-purpose receipt metadata.
+    pub redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
+    /// Policy digest + canonicalizer tuple binding witness.
+    pub policy_binding: BoundaryFlowPolicyBinding,
+    /// Typed leakage-budget receipt.
+    pub leakage_budget_receipt: LeakageBudgetReceipt,
+    /// Timing-channel release-bucketing witness.
+    pub timing_channel_budget: TimingChannelBudget,
+    /// Policy-derived leakage budget ceiling for the request risk tier.
+    pub leakage_budget_policy_max_bits: u64,
+    /// Client-claimed leakage budget before policy clamping.
+    pub claimed_leakage_budget_bits: Option<u64>,
+    /// Policy-derived timing budget ceiling for the request risk tier.
+    pub timing_budget_policy_max_ticks: u64,
+    /// Client-claimed timing budget before policy clamping.
+    pub claimed_timing_budget_ticks: Option<u64>,
+}
+
+impl BoundaryFlowRuntimeState {
+    /// Baseline pass-state used when call-sites have not provided
+    /// boundary-flow instrumentation.
+    #[must_use]
+    pub fn allow_all(policy_verified: bool) -> Self {
+        let policy_digest = if policy_verified {
+            [0x11; 32]
+        } else {
+            [0x22; 32]
+        };
+        let canonicalizer_digest = [0x33; 32];
+        Self {
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            policy_binding: BoundaryFlowPolicyBinding {
+                policy_digest,
+                admitted_policy_root_digest: policy_digest,
+                canonicalizer_tuple_digest: canonicalizer_digest,
+                admitted_canonicalizer_tuple_digest: canonicalizer_digest,
+            },
+            leakage_budget_receipt: LeakageBudgetReceipt {
+                leakage_bits: 0,
+                budget_bits: 8,
+                estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                confidence_bps: 10_000,
+                confidence_label: "default".to_string(),
+            },
+            timing_channel_budget: TimingChannelBudget {
+                release_bucket_ticks: 1,
+                observed_variance_ticks: 0,
+                budget_ticks: 1,
+            },
+            leakage_budget_policy_max_bits: 8,
+            claimed_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: 1,
+            claimed_timing_budget_ticks: None,
+        }
+    }
+}
+
 impl PrivilegedDispatcher {
     /// Builds a channel-boundary check from daemon-classified tool context.
     ///
@@ -7179,6 +7412,29 @@ impl PrivilegedDispatcher {
         broker_verified: bool,
         capability_verified: bool,
         context_firewall_verified: bool,
+    ) -> ChannelBoundaryCheck {
+        self.build_channel_boundary_check_with_flow(
+            tool_class,
+            policy_verified,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+            BoundaryFlowRuntimeState::allow_all(policy_verified),
+        )
+    }
+
+    /// Builds a channel-boundary check with explicit boundary-flow runtime
+    /// evidence for REQ-0004 enforcement.
+    #[must_use]
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn build_channel_boundary_check_with_flow(
+        &self,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+        boundary_flow: BoundaryFlowRuntimeState,
     ) -> ChannelBoundaryCheck {
         let source = match tool_class {
             ToolClass::Read
@@ -7212,6 +7468,18 @@ impl PrivilegedDispatcher {
             capability_verified,
             context_firewall_verified,
             policy_ledger_verified: policy_verified,
+            taint_allow: boundary_flow.taint_allow,
+            classification_allow: boundary_flow.classification_allow,
+            declass_receipt_valid: boundary_flow.declass_receipt_valid,
+            declassification_intent: boundary_flow.declassification_intent,
+            redundancy_declassification_receipt: boundary_flow.redundancy_declassification_receipt,
+            boundary_flow_policy_binding: Some(boundary_flow.policy_binding),
+            leakage_budget_receipt: Some(boundary_flow.leakage_budget_receipt),
+            timing_channel_budget: Some(boundary_flow.timing_channel_budget),
+            leakage_budget_policy_max_bits: Some(boundary_flow.leakage_budget_policy_max_bits),
+            declared_leakage_budget_bits: boundary_flow.claimed_leakage_budget_bits,
+            timing_budget_policy_max_ticks: Some(boundary_flow.timing_budget_policy_max_ticks),
+            declared_timing_budget_ticks: boundary_flow.claimed_timing_budget_ticks,
         }
     }
 
@@ -7220,6 +7488,10 @@ impl PrivilegedDispatcher {
     /// # Errors
     ///
     /// Returns boundary defects when validation fails or token issuance fails.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use validate_channel_boundary_and_issue_context_token_with_flow for explicit boundary-flow evidence"
+    )]
     #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     pub fn validate_channel_boundary_and_issue_context_token(
         &self,
@@ -7233,12 +7505,43 @@ impl PrivilegedDispatcher {
         capability_verified: bool,
         context_firewall_verified: bool,
     ) -> Result<String, Vec<ChannelBoundaryDefect>> {
-        let check = self.build_channel_boundary_check(
+        self.validate_channel_boundary_and_issue_context_token_with_flow(
+            signer,
+            lease_id,
+            request_id,
+            issued_at_secs,
             tool_class,
             policy_verified,
             broker_verified,
             capability_verified,
             context_firewall_verified,
+            BoundaryFlowRuntimeState::allow_all(policy_verified),
+        )
+    }
+
+    /// Validates channel boundaries with explicit boundary-flow evidence and
+    /// issues a daemon-signed context token on success.
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+    pub fn validate_channel_boundary_and_issue_context_token_with_flow(
+        &self,
+        signer: &apm2_core::crypto::Signer,
+        lease_id: &str,
+        request_id: &str,
+        issued_at_secs: u64,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+        broker_verified: bool,
+        capability_verified: bool,
+        context_firewall_verified: bool,
+        boundary_flow: BoundaryFlowRuntimeState,
+    ) -> Result<String, Vec<ChannelBoundaryDefect>> {
+        let check = self.build_channel_boundary_check_with_flow(
+            tool_class,
+            policy_verified,
+            broker_verified,
+            capability_verified,
+            context_firewall_verified,
+            boundary_flow,
         );
         let defects = validate_channel_boundary(&check);
         if !defects.is_empty() {
@@ -8149,24 +8452,18 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Derive a bounded-cost PCAC ledger anchor from emitter metadata.
-    fn derive_pcac_ledger_anchor(&self) -> [u8; 32] {
+    /// Derive a fail-closed PCAC ledger anchor from the validated chain hash.
+    fn derive_pcac_ledger_anchor(&self) -> Result<[u8; 32], String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pcac-privileged-ledger-anchor-v1");
         let count = self.event_emitter.get_event_count() as u64;
         hasher.update(&count.to_le_bytes());
-        if let Some(last) = self.event_emitter.get_latest_event() {
-            hasher.update(last.event_id.as_bytes());
-            hasher.update(last.event_type.as_bytes());
-            hasher.update(last.work_id.as_bytes());
-            hasher.update(last.actor_id.as_bytes());
-            hasher.update(&last.timestamp_ns.to_le_bytes());
-            hasher.update(&last.signature);
-            hasher.update(blake3::hash(&last.payload).as_bytes());
-        } else {
-            hasher.update(b"genesis");
-        }
-        *hasher.finalize().as_bytes()
+        let chain_hash = self
+            .event_emitter
+            .derive_event_chain_hash()
+            .map_err(|e| format!("ledger hash-chain validation failed: {e}"))?;
+        hasher.update(chain_hash.as_bytes());
+        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Derives fresh revalidation inputs for privileged PCAC lifecycle checks.
@@ -8186,7 +8483,7 @@ impl PrivilegedDispatcher {
         }
 
         let current_time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
-        let current_ledger_anchor = self.derive_pcac_ledger_anchor();
+        let current_ledger_anchor = self.derive_pcac_ledger_anchor()?;
 
         let work_id = self
             .lease_validator
@@ -17327,6 +17624,7 @@ mod tests {
                 .elapsed()
                 .expect("current time should be after unix epoch")
                 .as_secs();
+            #[allow(deprecated)]
             let token = dispatcher
                 .validate_channel_boundary_and_issue_context_token(
                     &signer,
@@ -29423,9 +29721,7 @@ mod tests {
             let dispatcher = dispatcher
                 .with_gate_orchestrator(orchestrator)
                 .with_pcac_lifecycle_gate(pcac_gate)
-                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
-                    require_ajc_for_ingest_review_receipt: false,
-                });
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
             let cas = dispatcher
                 .cas
                 .as_ref()
