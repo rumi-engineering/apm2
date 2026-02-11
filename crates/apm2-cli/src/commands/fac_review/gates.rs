@@ -3,15 +3,21 @@
 //! Runs all evidence gates locally, caches results per-SHA so the background
 //! pipeline can skip already-validated gates.
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
 use apm2_daemon::telemetry::is_cgroup_v2_available;
+use sha2::{Digest, Sha256};
 
 use super::evidence::{EvidenceGateOptions, run_evidence_gates};
+use super::gate_attestation::{
+    GateResourcePolicy, compute_gate_attestation, gate_command_for_attestation,
+};
 use super::gate_cache::GateCache;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
+use super::types::apm2_home_dir;
 use crate::exit_codes::codes as exit_codes;
 
 const MAX_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 240;
@@ -21,9 +27,9 @@ const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 
 ///
 /// 1. Requires clean working tree for full mode (`--quick` bypasses this)
 /// 2. Resolves HEAD SHA
-/// 3. Checks gate cache (unless `--force`)
+/// 3. Runs merge-conflict gate first (always recomputed)
 /// 4. Runs evidence gates (with bounded test runner if available)
-/// 5. Writes results to gate cache
+/// 5. Writes attested gate cache receipts for full runs
 /// 6. Prints summary table
 pub fn run_gates(
     force: bool,
@@ -75,8 +81,8 @@ pub fn run_gates(
                     println!("  Cache: not written in quick mode");
                 } else {
                     println!(
-                        "  Cache: ~/.apm2/private/fac/gate_cache/{}.yaml",
-                        &summary.sha[..std::cmp::min(12, summary.sha.len())]
+                        "  Cache: ~/.apm2/private/fac/gate_cache_v2/{}/",
+                        &summary.sha
                     );
                 }
             }
@@ -153,8 +159,7 @@ fn run_gates_inner(
         return Err(format!("unexpected short SHA: {sha}"));
     }
 
-    // 3. Merge-conflict gate always runs first, even in quick mode and cache-hit
-    //    paths.
+    // 3. Merge-conflict gate always runs first and is never cache-reused.
     let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha)?;
     if merge_gate.status == "FAIL" {
         return Ok(GatesSummary {
@@ -165,36 +170,6 @@ fn run_gates_inner(
             cache_status: "disabled (merge conflicts)".to_string(),
             gates: vec![merge_gate],
         });
-    }
-
-    // 3. Check gate cache (unless --force). Quick mode never reads/writes
-    // cache because it intentionally skips the heavyweight test gate.
-    if !force && !quick {
-        if let Some(cached) = GateCache::load(&sha) {
-            if cached.all_passed() {
-                eprintln!("all gates cached as PASS for {sha} — use --force to re-run");
-                let mut gates = vec![merge_gate];
-                let mut cached_gates = cached
-                    .gates
-                    .iter()
-                    .filter(|(name, _)| name.as_str() != "merge_conflict_main")
-                    .map(|(name, result)| GateResult {
-                        name: name.clone(),
-                        status: result.status.clone(),
-                        duration_secs: result.duration_secs,
-                    })
-                    .collect::<Vec<_>>();
-                gates.append(&mut cached_gates);
-                return Ok(GatesSummary {
-                    sha,
-                    passed: true,
-                    bounded: false,
-                    quick: false,
-                    cache_status: "hit".to_string(),
-                    gates,
-                });
-            }
-        }
     }
 
     // 4. Build test command override for bounded execution.
@@ -227,11 +202,37 @@ fn run_gates_inner(
     let (passed, gate_results) = run_evidence_gates(&workspace_root, &sha, None, Some(&opts))?;
     let total_secs = started.elapsed().as_secs();
 
-    // 6. Write results to gate cache for full runs only.
+    // 6. Write attested results to gate cache for full runs only.
     if !quick {
+        let policy = GateResourcePolicy::from_cli(
+            quick,
+            timeout_seconds,
+            memory_max,
+            pids_max,
+            cpu_quota,
+            bounded,
+        );
         let mut cache = GateCache::new(&sha);
         for result in &gate_results {
-            cache.set(&result.gate_name, result.passed, result.duration_secs);
+            let command = gate_command_for_attestation(
+                &workspace_root,
+                &result.gate_name,
+                opts.test_command.as_deref(),
+            );
+            let attestation_digest = command.and_then(|cmd| {
+                compute_gate_attestation(&workspace_root, &sha, &result.gate_name, &cmd, &policy)
+                    .ok()
+                    .map(|attestation| attestation.attestation_digest)
+            });
+            let evidence_log_digest = gate_log_digest(&result.gate_name);
+            cache.set_with_attestation(
+                &result.gate_name,
+                result.passed,
+                result.duration_secs,
+                attestation_digest,
+                quick,
+                evidence_log_digest,
+            );
         }
         cache.save()?;
     }
@@ -275,11 +276,28 @@ fn run_gates_inner(
         quick,
         cache_status: if quick {
             "disabled (quick mode)".to_string()
+        } else if force {
+            "bypass (--force)".to_string()
         } else {
-            "miss".to_string()
+            "write-through".to_string()
         },
         gates,
     })
+}
+
+fn gate_log_digest(gate_name: &str) -> Option<String> {
+    let path = apm2_home_dir()
+        .ok()?
+        .join("private/fac/evidence")
+        .join(format!("{gate_name}.log"));
+
+    if !path.exists() {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_timeout_seconds(timeout_seconds: u64) -> Result<(), String> {
@@ -374,6 +392,21 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         );
     }
 
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|e| format!("failed to run git ls-files --others --exclude-standard: {e}"))?;
+    if !untracked.status.success() {
+        return Err("failed to evaluate untracked files for clean-tree check".to_string());
+    }
+    if !String::from_utf8_lossy(&untracked.stdout).trim().is_empty() {
+        return Err(
+            "working tree has untracked files — commit, stash, or remove them first (or use `apm2 fac gates --quick` for inner-loop development)"
+                .to_string(),
+        );
+    }
+
     Ok(())
 }
 
@@ -408,6 +441,25 @@ mod tests {
 
         let err = ensure_clean_working_tree(repo, false).expect_err("dirty tree should fail");
         assert!(err.contains("working tree has unstaged changes"));
+    }
+
+    #[test]
+    fn ensure_clean_working_tree_rejects_untracked_changes_in_full_mode() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo = temp_dir.path();
+
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test User"]);
+
+        fs::write(repo.join("tracked.txt"), "v1\n").expect("write tracked file");
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "init"]);
+
+        fs::write(repo.join("untracked.txt"), "new\n").expect("write untracked file");
+
+        let err = ensure_clean_working_tree(repo, false).expect_err("untracked tree should fail");
+        assert!(err.contains("working tree has untracked files"));
     }
 
     fn run_git(repo: &Path, args: &[&str]) {

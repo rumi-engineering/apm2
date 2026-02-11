@@ -18,6 +18,7 @@ mod dispatch;
 mod events;
 mod evidence;
 mod findings;
+mod gate_attestation;
 mod gate_cache;
 mod gates;
 mod liveness;

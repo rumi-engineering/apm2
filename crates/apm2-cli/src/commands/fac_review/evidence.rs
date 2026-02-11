@@ -7,8 +7,13 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use super::ci_status::{CiStatus, ThrottledUpdater};
-use super::gate_cache::GateCache;
+use super::gate_attestation::{
+    GateResourcePolicy, compute_gate_attestation, gate_command_for_attestation, short_digest,
+};
+use super::gate_cache::{GateCache, ReuseDecision};
 use super::merge_conflicts::{
     check_merge_conflicts_against_main, render_merge_conflict_log, render_merge_conflict_summary,
 };
@@ -42,6 +47,40 @@ struct GateCommandOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+fn sha256_file_hex(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn gate_attestation_digest(
+    workspace_root: &Path,
+    sha: &str,
+    gate_name: &str,
+    test_command_override: Option<&[String]>,
+    policy: &GateResourcePolicy,
+) -> Option<String> {
+    let command = gate_command_for_attestation(workspace_root, gate_name, test_command_override)?;
+    compute_gate_attestation(workspace_root, sha, gate_name, &command, policy)
+        .ok()
+        .map(|attestation| attestation.attestation_digest)
+}
+
+fn reuse_decision_for_gate(
+    cache: Option<&GateCache>,
+    gate_name: &str,
+    attestation_digest: Option<&str>,
+) -> ReuseDecision {
+    cache.map_or_else(
+        || ReuseDecision::miss("no_record"),
+        |cached| cached.check_reuse(gate_name, attestation_digest, true),
+    )
 }
 
 fn run_gate_command_with_heartbeat(
@@ -592,9 +631,10 @@ pub fn run_evidence_gates_with_status(
     let mut status = CiStatus::new(sha, pr_number);
     let updater = ThrottledUpdater::new(owner_repo, pr_number);
 
-    // Load gate cache for this SHA (populated by `fac gates`).
+    // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
+    let policy = GateResourcePolicy::pipeline_default();
 
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
@@ -623,7 +663,7 @@ pub fn run_evidence_gates_with_status(
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
 
-    // Phase 0: merge conflict gate (always first, even if cache has PASS).
+    // Phase 0: merge conflict gate (always first, always recomputed).
     {
         let gate_name = MERGE_CONFLICT_GATE_NAME;
         status.set_running(gate_name);
@@ -633,8 +673,21 @@ pub fn run_evidence_gates_with_status(
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
         evidence_lines.push(line);
+        let merge_log = evidence_dir.join(format!("{gate_name}.log"));
+        let merge_digest = sha256_file_hex(&merge_log);
+        let merge_attestation =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        gate_cache.set_with_attestation(
+            gate_name,
+            passed,
+            duration,
+            merge_attestation,
+            false,
+            merge_digest,
+        );
         if !passed {
             updater.force_update(&status);
+            let _ = gate_cache.save();
             if let Some(file) = projection_log {
                 for line in &evidence_lines {
                     let _ = writeln!(file, "{line}");
@@ -646,24 +699,56 @@ pub fn run_evidence_gates_with_status(
 
     // Phase 1: cargo fmt/clippy/doc.
     for &(gate_name, cmd_args) in gates {
-        // Check cache: skip if already passed for this SHA.
-        if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
-            if cached.status == "PASS" {
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let reuse =
+            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        if reuse.reusable {
+            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 eprintln!(
-                    "cache-hit: {gate_name} PASS (cached, {:.0}s)",
-                    cached.duration_secs
+                    "ts={} sha={} gate={} reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let ts = now_iso8601();
                 evidence_lines.push(format!(
-                    "ts={ts} sha={sha} gate={gate_name} status=PASS cached=true"
+                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
-                gate_cache.set(gate_name, true, cached.duration_secs);
+                gate_cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    attestation_digest,
+                    false,
+                    cached.evidence_log_digest.clone(),
+                );
                 continue;
             }
         }
 
+        eprintln!(
+            "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            reuse.reason,
+            attestation_digest
+                .as_deref()
+                .map_or_else(|| "unknown".to_string(), short_digest),
+        );
         status.set_running(gate_name);
         updater.update(&status);
 
@@ -681,16 +766,27 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_cache.set(gate_name, passed, duration);
+        gate_cache.set_with_attestation(
+            gate_name,
+            passed,
+            duration,
+            attestation_digest,
+            false,
+            sha256_file_hex(&log_path),
+        );
 
         if !passed {
             all_passed = false;
         }
-        let ts = now_iso8601();
         let gate_status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
-            log_path.display()
+            "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            gate_status,
+            log_path.display(),
+            reuse.reason,
         ));
     }
 
@@ -701,23 +797,56 @@ pub fn run_evidence_gates_with_status(
             continue;
         }
 
-        if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
-            if cached.status == "PASS" {
-                eprintln!(
-                    "cache-hit: {gate_name} PASS (cached, {:.0}s)",
-                    cached.duration_secs
-                );
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let reuse =
+            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        if reuse.reusable {
+            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let ts = now_iso8601();
+                eprintln!(
+                    "ts={} sha={} gate={} reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
+                );
                 evidence_lines.push(format!(
-                    "ts={ts} sha={sha} gate={gate_name} status=PASS cached=true"
+                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
-                gate_cache.set(gate_name, true, cached.duration_secs);
+                gate_cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    attestation_digest,
+                    false,
+                    cached.evidence_log_digest.clone(),
+                );
                 continue;
             }
         }
 
+        eprintln!(
+            "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            reuse.reason,
+            attestation_digest
+                .as_deref()
+                .map_or_else(|| "unknown".to_string(), short_digest),
+        );
         status.set_running(gate_name);
         updater.update(&status);
 
@@ -735,16 +864,27 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_cache.set(gate_name, passed, duration);
+        gate_cache.set_with_attestation(
+            gate_name,
+            passed,
+            duration,
+            attestation_digest,
+            false,
+            sha256_file_hex(&log_path),
+        );
 
         if !passed {
             all_passed = false;
         }
-        let ts = now_iso8601();
         let gate_status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
-            log_path.display()
+            "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            gate_status,
+            log_path.display(),
+            reuse.reason,
         ));
     }
 
@@ -753,50 +893,51 @@ pub fn run_evidence_gates_with_status(
 
     {
         let gate_name = "test";
-        if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
-            if cached.status == "PASS" {
-                eprintln!(
-                    "cache-hit: {gate_name} PASS (cached, {:.0}s)",
-                    cached.duration_secs
-                );
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let reuse =
+            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        if reuse.reusable {
+            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let ts = now_iso8601();
                 evidence_lines.push(format!(
-                    "ts={ts} sha={sha} gate={gate_name} status=PASS cached=true"
-                ));
-                gate_cache.set(gate_name, true, cached.duration_secs);
-            } else {
-                status.set_running(gate_name);
-                updater.update(&status);
-
-                let log_path = evidence_dir.join("test.log");
-                let started = Instant::now();
-                let passed = run_single_evidence_gate(
-                    workspace_root,
+                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
                     sha,
                     gate_name,
-                    "cargo",
-                    &["test", "--workspace"],
-                    &log_path,
-                );
-                let duration = started.elapsed().as_secs();
-
-                status.set_result(gate_name, passed, duration);
-                updater.update(&status);
-                gate_cache.set(gate_name, passed, duration);
-
-                if !passed {
-                    all_passed = false;
-                }
-                let ts = now_iso8601();
-                let gate_status = if passed { "PASS" } else { "FAIL" };
-                evidence_lines.push(format!(
-                    "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
-                    log_path.display()
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    attestation_digest,
+                    false,
+                    cached.evidence_log_digest.clone(),
+                );
+            } else {
+                eprintln!(
+                    "ts={} sha={} gate={} reuse_status=miss reuse_reason=inconsistent_cache_entry",
+                    now_iso8601(),
+                    sha,
+                    gate_name
+                );
             }
         } else {
+            eprintln!(
+                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+                now_iso8601(),
+                sha,
+                gate_name,
+                reuse.reason,
+                attestation_digest
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), short_digest),
+            );
             status.set_running(gate_name);
             updater.update(&status);
 
@@ -814,52 +955,59 @@ pub fn run_evidence_gates_with_status(
 
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            gate_cache.set(gate_name, passed, duration);
+            gate_cache.set_with_attestation(
+                gate_name,
+                passed,
+                duration,
+                attestation_digest,
+                false,
+                sha256_file_hex(&log_path),
+            );
 
             if !passed {
                 all_passed = false;
             }
-            let ts = now_iso8601();
             let gate_status = if passed { "PASS" } else { "FAIL" };
             evidence_lines.push(format!(
-                "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
-                log_path.display()
+                "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
+                now_iso8601(),
+                sha,
+                gate_name,
+                gate_status,
+                log_path.display(),
+                reuse.reason
             ));
         }
     }
 
     {
         let gate_name = "workspace_integrity";
-        if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
-            if cached.status == "PASS" {
-                eprintln!(
-                    "cache-hit: {gate_name} PASS (cached, {:.0}s)",
-                    cached.duration_secs
-                );
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let reuse =
+            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        if reuse.reusable {
+            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let ts = now_iso8601();
                 evidence_lines.push(format!(
-                    "ts={ts} sha={sha} gate={gate_name} status=PASS cached=true"
+                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
-                gate_cache.set(gate_name, true, cached.duration_secs);
-            } else {
-                status.set_running(gate_name);
-                updater.update(&status);
-
-                let started = Instant::now();
-                let (passed, line) =
-                    verify_workspace_integrity_gate(workspace_root, sha, &evidence_dir);
-                let duration = started.elapsed().as_secs();
-
-                status.set_result(gate_name, passed, duration);
-                updater.update(&status);
-                gate_cache.set(gate_name, passed, duration);
-
-                if !passed {
-                    all_passed = false;
-                }
-                evidence_lines.push(line);
+                gate_cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    attestation_digest,
+                    false,
+                    cached.evidence_log_digest.clone(),
+                );
             }
         } else {
             status.set_running(gate_name);
@@ -872,12 +1020,23 @@ pub fn run_evidence_gates_with_status(
 
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            gate_cache.set(gate_name, passed, duration);
+            let log_path = evidence_dir.join("workspace_integrity.log");
+            gate_cache.set_with_attestation(
+                gate_name,
+                passed,
+                duration,
+                attestation_digest,
+                false,
+                sha256_file_hex(&log_path),
+            );
 
             if !passed {
                 all_passed = false;
             }
-            evidence_lines.push(line);
+            evidence_lines.push(format!(
+                "{} reuse_status=miss reuse_reason={}",
+                line, reuse.reason
+            ));
         }
     }
 
@@ -888,23 +1047,46 @@ pub fn run_evidence_gates_with_status(
             continue;
         }
 
-        if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
-            if cached.status == "PASS" {
-                eprintln!(
-                    "cache-hit: {gate_name} PASS (cached, {:.0}s)",
-                    cached.duration_secs
-                );
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let reuse =
+            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        if reuse.reusable {
+            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let ts = now_iso8601();
                 evidence_lines.push(format!(
-                    "ts={ts} sha={sha} gate={gate_name} status=PASS cached=true"
+                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
-                gate_cache.set(gate_name, true, cached.duration_secs);
+                gate_cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    attestation_digest,
+                    false,
+                    cached.evidence_log_digest.clone(),
+                );
                 continue;
             }
         }
 
+        eprintln!(
+            "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            reuse.reason,
+            attestation_digest
+                .as_deref()
+                .map_or_else(|| "unknown".to_string(), short_digest),
+        );
         status.set_running(gate_name);
         updater.update(&status);
 
@@ -922,16 +1104,27 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_cache.set(gate_name, passed, duration);
+        gate_cache.set_with_attestation(
+            gate_name,
+            passed,
+            duration,
+            attestation_digest,
+            false,
+            sha256_file_hex(&log_path),
+        );
 
         if !passed {
             all_passed = false;
         }
-        let ts = now_iso8601();
         let gate_status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
-            log_path.display()
+            "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            gate_status,
+            log_path.display(),
+            reuse.reason,
         ));
     }
 
@@ -939,7 +1132,9 @@ pub fn run_evidence_gates_with_status(
     updater.force_update(&status);
 
     // Persist gate cache so future pipeline runs can reuse results.
-    let _ = gate_cache.save();
+    if let Err(err) = gate_cache.save() {
+        eprintln!("warning: failed to persist attested gate cache: {err}");
+    }
 
     if let Some(file) = projection_log {
         for line in &evidence_lines {
