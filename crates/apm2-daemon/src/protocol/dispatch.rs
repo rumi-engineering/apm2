@@ -14641,6 +14641,37 @@ impl PrivilegedDispatcher {
             ));
         };
 
+        // ---- Phase 2a: Caller authorization against parent lease ----
+        //
+        // SECURITY: The caller must be the executor authorized by the parent
+        // lease, OR the issuer of the parent lease. Only the lease holder
+        // (executor) or the lease issuer should be able to delegate subleases.
+        // This prevents confused-deputy / capability laundering attacks where
+        // an unauthorized caller delegates from another entity's lease.
+        //
+        // NOTE: This is a pre-PCAC admission gate — PCAC binds the
+        // caller_actor_id into the effect_intent_digest for integrity, but
+        // cannot enforce caller-to-lease ownership semantics. Authorization
+        // MUST be checked before the PCAC lifecycle is invoked.
+        if parent_lease.executor_actor_id != caller_actor_id
+            && parent_lease.issuer_actor_id != caller_actor_id
+        {
+            warn!(
+                parent_lease_id = %request.parent_lease_id,
+                caller = %caller_actor_id,
+                executor = %parent_lease.executor_actor_id,
+                issuer = %parent_lease.issuer_actor_id,
+                "Caller not authorized to delegate from parent lease"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "caller is not authorized to delegate from lease '{}'",
+                    request.parent_lease_id
+                ),
+            ));
+        }
+
         // Resolve parent risk tier for delegated PCAC join input construction.
         let (parent_risk_tier, _) =
             self.resolve_risk_tier_for_lease(&request.parent_lease_id, parent_lease.policy_hash);
@@ -26814,22 +26845,27 @@ mod tests {
             }
         }
 
-        /// `DelegateSublease` must fail closed if the PCAC lifecycle gate is
-        /// not wired, even when all other inputs are valid.
         #[test]
-        fn test_delegate_sublease_unauthorized_caller_rejected() {
+        fn test_delegate_sublease_unauthorized_caller_rejected_with_pcac() {
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
             let orch = Arc::new(crate::gate::GateOrchestrator::new(
                 crate::gate::GateOrchestratorConfig::default(),
-                signer,
+                Arc::clone(&signer),
             ));
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
 
             // Register parent lease with executor_actor_id that does NOT
             // match the caller (uid=1000, gid=1000).
             let cas = Arc::new(MemoryCas::default());
             let dispatcher = PrivilegedDispatcher::new()
                 .with_gate_orchestrator(orch)
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
+                    require_ajc_for_ingest_review_receipt: false,
+                });
             register_full_test_lease(&TestLeaseConfig {
                 dispatcher: &dispatcher,
                 cas: cas.as_ref(),
@@ -26847,12 +26883,41 @@ mod tests {
                 "gate-authz",
                 "totally-different-actor",
             );
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-AUTHZ",
+                "totally-different-actor",
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-AUTHZ",
+                "totally-different-actor",
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-AUTHZ".to_string(),
+                    lease_id: "parent-authz".to_string(),
+                    actor_id: "totally-different-actor".to_string(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
 
-            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            let unauthorized_ctx =
+                ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }));
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-authz".to_string(),
@@ -26863,23 +26928,21 @@ mod tests {
             };
             let frame = encode_delegate_sublease_request(&request);
 
-            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let response = dispatcher.dispatch(&frame, &unauthorized_ctx).unwrap();
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("PCAC authority gate not wired"),
-                        "DelegateSublease must fail closed when gate is missing: {}",
+                        err.message.contains("not authorized to delegate"),
+                        "error message must indicate authorization failure, got: {}",
                         err.message
                     );
                     assert_eq!(
                         err.code,
-                        i32::from(PrivilegedErrorCode::CapabilityRequestRejected),
-                        "Error code should be CapabilityRequestRejected"
+                        i32::from(PrivilegedErrorCode::PermissionDenied),
+                        "unauthorized caller must get PermissionDenied"
                     );
                 },
-                other => panic!(
-                    "Expected fail-closed rejection when PCAC gate is missing, got {other:?}"
-                ),
+                other => panic!("expected PermissionDenied for unauthorized caller, got {other:?}"),
             }
         }
 
