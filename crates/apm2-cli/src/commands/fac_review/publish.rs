@@ -201,6 +201,7 @@ mod tests {
         assert!(rendered.contains("\"schema\": \"apm2.review.metadata.v1\""));
         assert!(rendered.contains("\"review_type\": \"security\""));
         assert!(rendered.contains("\"reviewer_id\": \"fac-reviewer\""));
-        assert!(rendered.contains("\"blocker\": 1"));
+        assert!(rendered.contains("\"verdict\": \"FAIL\""));
+        assert!(!rendered.contains("\"severity_counts\""));
     }
 }

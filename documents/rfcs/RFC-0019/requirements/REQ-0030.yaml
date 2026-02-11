@@ -1,0 +1,38 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0030"
+  title: "Anti-rollback anchoring: external anchor provider(s) and fail-closed tier gating when missing or mismatched"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Fail-closed tiers MUST require at least one configured anti-rollback anchor mechanism
+    (remote witness log, hardware monotonic counter, or quorum replication) that anchors
+    the validated ledger state outside the adversary's local write scope.
+
+    An AntiRollbackAnchor interface MUST be implemented with at least one production-suitable
+    provider. The provider MUST support verify_committed(anchor) semantics for LedgerAnchorV1.
+
+    Startup MUST verify that the most recent trusted seal is committed to (or derivable from)
+    the external anchor mechanism. If the external anchor is unavailable or does not match
+    local seals/anchors, fail-closed tiers MUST deny.
+
+    At request time, fail-closed tiers MUST verify external anchor consistency; if unavailable
+    or inconsistent, admission MUST deny.
+
+    Monitor tiers MAY run without anti-rollback anchoring, but MUST mark themselves as
+    non-authoritative for fail-closed tiers.
+
+    Primary delivery ticket: TCK-00502.
+  rationale: |
+    Purely local tamper-evidence does not fully solve rollback if an adversary can rewrite
+    both ledger and local state. External anchoring closes the gap between tamper-evident
+    and rollback-resistant under a local-write adversary.
+  acceptance_criteria:
+    - "Fail-closed tiers cannot run without verified external anchor state."
+    - "Rollback attacks that would pass purely local seal verification are denied."
+    - "CI includes tests covering anchor mismatch and anchor outage behavior."
+  evidence_ids:
+    - "EVID-0025"
+  source_refs:
+    - "documents/rfcs/RFC-0019/19_admission_spine_v1_1_pcac_boundaries.md"

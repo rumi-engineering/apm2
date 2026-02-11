@@ -1,0 +1,24 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0024"
+  title: "Crash-safe effect execution: effect journal, idempotency key propagation, in-doubt handling"
+  category: "CODE_AND_TEST"
+  status: "STUB"
+  description: |
+    Evidence that an effect execution journal is implemented with RequestId-keyed state
+    tracking (NotStarted/Started/Completed/Unknown), sufficient pre-effect binding
+    persistence for deterministic restart, idempotency key propagation to external systems,
+    and fail-closed in-doubt handling for fail-closed tiers.
+  requirement_ids:
+    - "REQ-0029"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0029.yaml"
+  expected_contents:
+    - "Effect execution journal storage (bounded, indexed, restart-safe)."
+    - "Journal integration into AdmissionKernel execute phase."
+    - "Tool/broker adapter support for RequestId idempotency key propagation."
+    - "Tests: crash after consume before effect → deterministic classification."
+    - "Tests: crash during effect → deterministic classification."
+    - "Tests: crash after effect before receipts → deterministic classification."
+    - "Tests: fail-closed tiers fail closed on Unknown state."
+  artifacts: []

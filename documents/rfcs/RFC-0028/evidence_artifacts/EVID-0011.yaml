@@ -1,0 +1,20 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0011"
+  title: "Authoritative witness closure evidence"
+  category: "CODE_AND_TEST"
+  status: "STUB"
+  description: |
+    Evidence that daemon-instrumented witnesses are required for fail-closed tiers,
+    witness seeds are bound into AJC join inputs (seed-at-join), post-effect witness
+    evidence is materialized and bound into AdmissionBundleV1 (evidence-post-effect),
+    and witness provider provenance is committed into seed objects.
+  requirement_ids:
+    - "REQ-0004"
+  expected_contents:
+    - "Fail-closed tiers deny on missing witness seeds at join."
+    - "Fail-closed tiers deny output release on missing post-effect witness evidence."
+    - "Witness seed hashes are bound into AJC join input and referenced in AdmissionBundle."
+    - "Post-effect evidence hashes/refs are in AdmissionBundle."
+    - "Witness provider identity/version is committed into seed objects."
+    - "Monitor tiers use explicit waiver binding (no silent permissive defaults)."

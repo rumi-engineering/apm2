@@ -1,0 +1,22 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0021"
+  title: "PublishEvidence and EmitEvent cutover to AdmissionKernel"
+  category: "CODE_AND_TEST"
+  status: "STUB"
+  description: |
+    Evidence that PublishEvidence and EmitEvent handlers route through AdmissionKernel
+    in authoritative mode, enforcing PCAC lifecycle and bundle binding with policy-root
+    trust prerequisites.
+  requirement_ids:
+    - "REQ-0026"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0026.yaml"
+  expected_contents:
+    - "PublishEvidence handler delegates to AdmissionKernel plan/execute."
+    - "EmitEvent handler delegates to AdmissionKernel plan/execute."
+    - "Full PCAC lifecycle enforced (join -> revalidate -> consume -> effect)."
+    - "Receipts reference AdmissionBundleDigest."
+    - "Tests: deny on missing governance policy root for fail-closed tiers."
+    - "Tests: lifecycle bypass denied."
+  artifacts: []

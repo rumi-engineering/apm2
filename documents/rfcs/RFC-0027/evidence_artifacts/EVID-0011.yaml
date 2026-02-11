@@ -1,0 +1,19 @@
+evidence_artifact:
+  schema_version: "2026-02-07"
+  id: "EVID-0011"
+  title: "Declassification receipt consumption as PCAC-gated effects"
+  category: "CODE_AND_TEST"
+  status: "STUB"
+  description: |
+    Evidence that all declassification receipt consumption is normalized to PCAC-gated
+    effects with durable single-use enforcement, request-scoped binding in authority
+    intent digest, and non-colliding uniqueness constraints across event types.
+  requirement_ids:
+    - "REQ-0002"
+    - "REQ-0005"
+  expected_contents:
+    - "No ad-hoc receipt single-consume tracking remains for declassification paths."
+    - "Replay across request and across restart is denied by construction and tested."
+    - "Receipt event uniqueness collisions are structurally impossible."
+    - "Consumption ledger events carry replay-critical binding fields."
+    - "Consumption ledger events include AdmissionBundleDigest for O(1) correlation."
