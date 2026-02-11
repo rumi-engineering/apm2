@@ -2566,7 +2566,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if Self::is_shell_eval_builtin(exec) {
             return Self::join_command_tokens(tokens, start_idx);
         }
-        if Self::is_shell_wrapper_executable(exec) {
+        if Self::is_shell_wrapper_executable(exec) || exec.starts_with('$') {
+            // Treat `$SHELL -c ...` (and other `$VAR -c ...` wrappers) as
+            // shell-wrapper candidates and inspect the inline payload.
             return Self::extract_shell_wrapper_inline_command(tokens, start_idx);
         }
         if Self::is_inline_interpreter_executable(exec) {
@@ -2754,6 +2756,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         lower == "api.github.com" || lower.ends_with(".api.github.com")
     }
 
+    fn is_http_client_executable(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "curl"
+                | "curl.exe"
+                | "wget"
+                | "wget.exe"
+                | "fetch"
+                | "fetch.exe"
+                | "http"
+                | "http.exe"
+                | "httpie"
+                | "httpie.exe"
+        )
+    }
+
     fn argument_targets_github_api(argument: &str) -> bool {
         let normalized = Self::trim_shell_word_boundary(Self::normalize_shell_token(argument));
         if normalized.is_empty() {
@@ -2781,21 +2799,68 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         false
     }
 
-    fn command_targets_github_api(command: &str) -> bool {
+    fn command_targets_github_api_inner(command: &str, depth: usize) -> bool {
+        if depth > MAX_GH_DIRECT_COMMAND_UNWRAP_DEPTH {
+            return false;
+        }
+
         let command = Self::normalize_shell_token(command.trim());
         if command.is_empty() {
             return false;
         }
 
-        Self::split_shell_command_segments(command)
-            .into_iter()
-            .any(|segment| {
-                let lower = segment.to_ascii_lowercase();
-                lower.contains("api.github.com")
-                    || segment
-                        .split_whitespace()
-                        .any(Self::argument_targets_github_api)
-            })
+        let segments = Self::split_shell_command_segments(command);
+        if segments.len() > 1 {
+            return segments
+                .into_iter()
+                .any(|segment| Self::command_targets_github_api_inner(segment, depth));
+        }
+
+        let command = segments.first().copied().unwrap_or(command);
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(&tokens, 0)
+        else {
+            return false;
+        };
+
+        if Self::is_http_client_executable(&exec) {
+            return tokens
+                .iter()
+                .skip(exec_idx + 1)
+                .copied()
+                .any(Self::argument_targets_github_api);
+        }
+
+        if Self::is_env_wrapper_executable(&exec)
+            && let Some((wrapped_exec, wrapped_idx)) =
+                Self::extract_env_wrapped_executable(&tokens, exec_idx + 1)
+        {
+            if Self::is_http_client_executable(&wrapped_exec) {
+                return tokens
+                    .iter()
+                    .skip(wrapped_idx + 1)
+                    .copied()
+                    .any(Self::argument_targets_github_api);
+            }
+            if let Some(inner_command) =
+                Self::extract_wrapper_inline_command(&wrapped_exec, &tokens, wrapped_idx + 1)
+                && Self::command_targets_github_api_inner(&inner_command, depth + 1)
+            {
+                return true;
+            }
+        }
+
+        if let Some(inner_command) =
+            Self::extract_wrapper_inline_command(&exec, &tokens, exec_idx + 1)
+        {
+            return Self::command_targets_github_api_inner(&inner_command, depth + 1);
+        }
+
+        false
+    }
+
+    fn command_targets_github_api(command: &str) -> bool {
+        Self::command_targets_github_api_inner(command, 0)
     }
 
     // SECURITY (RFC-0028 REQ-0008): command-text inspection is a heuristic,
@@ -6945,6 +7010,24 @@ mod tests {
         }
 
         #[test]
+        fn shell_env_wrapper_c_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "$SHELL -c \"gh api /repos\"",
+                "projection-isolation-shell-var-gh-api",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_env_wrapper_braced_c_gh_pr_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "${SHELL} -c \"gh pr view 123\"",
+                "projection-isolation-shell-var-braced-gh-pr",
+                "gh_cli",
+            );
+        }
+
+        #[test]
         fn wrapped_bash_lc_gh_attempt_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
                 "bash -lc \"gh pr view --repo example/repo\"",
@@ -7027,6 +7110,30 @@ mod tests {
             assert!(
                 attempt.is_none(),
                 "quoted gh string passed to echo must not be flagged as gh-cli invocation"
+            );
+        }
+
+        #[test]
+        fn echoed_api_github_url_argument_is_not_detected_as_direct_attempt() {
+            let args =
+                serde_json::json!({ "command": "echo \"https://api.github.com/repos/example\"" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "api.github.com in output-only echo command must not be flagged as direct API actuation"
+            );
+        }
+
+        #[test]
+        fn curl_api_github_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "curl https://api.github.com/repos/owner/repo",
+                "projection-isolation-curl-api-host",
+                "github_api",
             );
         }
 
