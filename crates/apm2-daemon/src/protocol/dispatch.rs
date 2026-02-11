@@ -57,6 +57,10 @@ use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, DeterminismClass as PcacDeterminismClass,
     IdentityEvidenceLevel, RiskTier as PcacRiskTier,
 };
+use apm2_core::policy::permeability::{
+    DELEGATION_SATISFIABILITY_SCHEMA_ID, DELEGATION_SATISFIABILITY_SCHEMA_MAJOR,
+    DelegationSatisfiabilityReceiptV1,
+};
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
@@ -1207,7 +1211,12 @@ pub const MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS: usize =
 ///
 /// The budget is expressed in integer ticks and consumed by fixed-cost lineage
 /// traversal and binding checks.
-pub const SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS: u64 = 30;
+pub const SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS: u64 =
+    if (MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS as u64) * 2 + 4 < 40 {
+        40
+    } else {
+        (MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS as u64) * 2 + 4
+    };
 
 /// Builds the canonical JSON payload for a `SessionStarted` ledger event.
 ///
@@ -4809,17 +4818,103 @@ fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8
     Ok((parent_lease_id, identity_proof_hash))
 }
 
+fn compute_delegate_sublease_lineage_digest(
+    parent_lease_id: &str,
+    sublease_id: &str,
+    parent_changeset_digest: &[u8; 32],
+    parent_policy_hash: &[u8; 32],
+    requested_depth: u32,
+    ticks_used: u64,
+    budget_ticks: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.delegate_sublease.lineage_digest.v1");
+    hasher.update(parent_lease_id.as_bytes());
+    hasher.update(sublease_id.as_bytes());
+    hasher.update(parent_changeset_digest);
+    hasher.update(parent_policy_hash);
+    hasher.update(&requested_depth.to_be_bytes());
+    hasher.update(&ticks_used.to_be_bytes());
+    hasher.update(&budget_ticks.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn build_delegate_sublease_satisfiability_artifact(
+    parent_lease_id: &str,
+    sublease_id: &str,
+    parent_changeset_digest: &[u8; 32],
+    parent_policy_hash: &[u8; 32],
+    requested_depth: u32,
+    ticks_used: u64,
+) -> Result<serde_json::Value, String> {
+    let receipt = DelegationSatisfiabilityReceiptV1 {
+        schema_id: DELEGATION_SATISFIABILITY_SCHEMA_ID.to_string(),
+        schema_major: DELEGATION_SATISFIABILITY_SCHEMA_MAJOR,
+        delegation_depth: requested_depth,
+        budget_ticks: SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS,
+        ticks_used,
+        admissible_workset_non_empty: true,
+    };
+
+    let receipt_json = serde_json::to_value(&receipt)
+        .map_err(|e| format!("delegation satisfiability receipt serialization failed: {e}"))?;
+    let receipt_digest = hash_bytes(&canonical_json_bytes(&receipt_json)?);
+    let parent_lease_id_digest = hash_bytes(parent_lease_id.as_bytes());
+    let sublease_id_digest = hash_bytes(sublease_id.as_bytes());
+    let lineage_digest = compute_delegate_sublease_lineage_digest(
+        parent_lease_id,
+        sublease_id,
+        parent_changeset_digest,
+        parent_policy_hash,
+        requested_depth,
+        ticks_used,
+        SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS,
+    );
+
+    Ok(serde_json::json!({
+        "schema": "apm2.delegate_sublease_satisfiability_artifact.v1",
+        "schema_major": 1_u16,
+        "delegation_satisfiability_receipt": receipt,
+        "delegation_satisfiability_receipt_digest": hex::encode(receipt_digest),
+        "canonical_parent_lease_id_digest": hex::encode(parent_lease_id_digest),
+        "canonical_sublease_id_digest": hex::encode(sublease_id_digest),
+        "canonical_parent_changeset_digest": hex::encode(parent_changeset_digest),
+        "canonical_parent_policy_hash": hex::encode(parent_policy_hash),
+        "canonical_lineage_digest": hex::encode(lineage_digest),
+    }))
+}
+
+fn persist_delegate_sublease_satisfiability_artifact(
+    cas: Option<&dyn ContentAddressedStore>,
+    artifact: &serde_json::Value,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(cas) = cas else {
+        return Ok(None);
+    };
+
+    let artifact_bytes = canonical_json_bytes(artifact)?;
+    let stored = cas
+        .store(&artifact_bytes)
+        .map_err(|e| format!("CAS store delegation satisfiability artifact failed: {e}"))?;
+    Ok(Some(stored.hash))
+}
+
 /// Deterministically computes parent delegation depth and evaluation ticks for
 /// `DelegateSublease` admission.
 ///
 /// Traverses persisted `SubleaseIssued` lineage by repeatedly reading the
 /// latest event for each lease ID and following its `parent_lease_id`.
 ///
+/// Fail-closed rule: if a lease is marked as delegated in authoritative lease
+/// metadata but no corresponding `SubleaseIssued` evidence exists, traversal
+/// returns an error instead of treating the lease as root.
+///
 /// Returns:
 /// - `depth`: number of sublease hops from `parent_lease_id` to the root lease
 /// - `ticks_used`: deterministic integer cost consumed by lineage evaluation
 fn compute_sublease_parent_depth_and_ticks(
     event_emitter: &dyn LedgerEventEmitter,
+    lease_validator: &dyn LeaseValidator,
     parent_lease_id: &str,
 ) -> Result<(u32, u64), String> {
     let mut current_lease = parent_lease_id.to_string();
@@ -4845,6 +4940,14 @@ fn compute_sublease_parent_depth_and_ticks(
             .find(|event| event.event_type == "SubleaseIssued");
 
         let Some(sublease_event) = maybe_event else {
+            if lease_validator
+                .get_delegation_parent_lease_id(&current_lease)
+                .is_some()
+            {
+                return Err(format!(
+                    "delegation lineage evidence missing for delegated lease '{current_lease}'"
+                ));
+            }
             return Ok((depth, ticks_used));
         };
 
@@ -6124,6 +6227,37 @@ pub trait LeaseValidator: Send + Sync {
         let _ = lease;
         Ok(())
     }
+
+    /// Registers a delegated `GateLease` with authoritative parent lineage.
+    ///
+    /// Implementations should persist `parent_lease_id` so delegation-depth
+    /// checks can fail closed if the corresponding `SubleaseIssued` evidence is
+    /// missing.
+    fn register_delegated_full_lease(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        parent_lease_id: &str,
+    ) -> Result<(), String> {
+        let _ = parent_lease_id;
+        self.register_full_lease(lease)
+    }
+
+    /// Returns the persisted delegation parent lease ID for `lease_id`.
+    ///
+    /// `None` indicates either root issuance or no persisted lineage metadata.
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Option<String> {
+        let _ = lease_id;
+        None
+    }
+
+    /// Removes a previously persisted full lease by lease ID.
+    ///
+    /// Used to rollback delegated lease persistence when downstream
+    /// `SubleaseIssued` emission fails.
+    fn rollback_full_lease(&self, lease_id: &str) -> Result<(), String> {
+        let _ = lease_id;
+        Err("full lease rollback is not supported by this lease validator".to_string())
+    }
 }
 
 /// Entry for a registered lease.
@@ -6135,6 +6269,12 @@ struct LeaseEntry {
     gate_id: String,
     /// The executor actor ID authorized by this lease (TCK-00389).
     executor_actor_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct FullLeaseEntry {
+    lease: apm2_core::fac::GateLease,
+    delegated_parent_lease_id: Option<String>,
 }
 
 /// Stub implementation of [`LeaseValidator`] for testing.
@@ -6163,7 +6303,7 @@ pub struct StubLeaseValidator {
         std::collections::HashMap<String, LeaseEntry>,
     )>,
     /// Full gate leases for sublease delegation (TCK-00340).
-    full_leases: std::sync::RwLock<std::collections::HashMap<String, apm2_core::fac::GateLease>>,
+    full_leases: std::sync::RwLock<std::collections::HashMap<String, FullLeaseEntry>>,
 }
 
 impl StubLeaseValidator {
@@ -6276,7 +6416,7 @@ impl LeaseValidator for StubLeaseValidator {
 
     fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
         let guard = self.full_leases.read().expect("lock poisoned");
-        guard.get(lease_id).cloned()
+        guard.get(lease_id).map(|entry| entry.lease.clone())
     }
 
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
@@ -6290,8 +6430,51 @@ impl LeaseValidator for StubLeaseValidator {
         if guard.contains_key(&lease.lease_id) {
             return Err(format!("duplicate lease_id: {}", lease.lease_id));
         }
-        guard.insert(lease.lease_id.clone(), lease.clone());
+        guard.insert(
+            lease.lease_id.clone(),
+            FullLeaseEntry {
+                lease: lease.clone(),
+                delegated_parent_lease_id: None,
+            },
+        );
         Ok(())
+    }
+
+    fn register_delegated_full_lease(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        parent_lease_id: &str,
+    ) -> Result<(), String> {
+        let mut guard = self.full_leases.write().expect("lock poisoned");
+        if guard.contains_key(&lease.lease_id) {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+        guard.insert(
+            lease.lease_id.clone(),
+            FullLeaseEntry {
+                lease: lease.clone(),
+                delegated_parent_lease_id: Some(parent_lease_id.to_string()),
+            },
+        );
+        Ok(())
+    }
+
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Option<String> {
+        let guard = self.full_leases.read().expect("lock poisoned");
+        guard
+            .get(lease_id)
+            .and_then(|entry| entry.delegated_parent_lease_id.clone())
+    }
+
+    fn rollback_full_lease(&self, lease_id: &str) -> Result<(), String> {
+        let mut guard = self.full_leases.write().expect("lock poisoned");
+        if guard.remove(lease_id).is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "no persisted full lease found for lease_id: {lease_id}"
+            ))
+        }
     }
 }
 
@@ -14996,6 +15179,7 @@ impl PrivilegedDispatcher {
         // ---- Phase 2d: Deterministic delegation depth + budget checks ----
         let (parent_depth, depth_eval_ticks) = match compute_sublease_parent_depth_and_ticks(
             self.event_emitter.as_ref(),
+            self.lease_validator.as_ref(),
             &request.parent_lease_id,
         ) {
             Ok(values) => values,
@@ -15041,6 +15225,52 @@ impl PrivilegedDispatcher {
                 ),
             ));
         }
+
+        let delegation_satisfiability_artifact =
+            match build_delegate_sublease_satisfiability_artifact(
+                &request.parent_lease_id,
+                &request.sublease_id,
+                &parent_lease.changeset_digest,
+                &parent_lease.policy_hash,
+                requested_depth,
+                depth_eval_ticks,
+            ) {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("sublease delegation denied: {deny_class} ({error})"),
+                    ));
+                },
+            };
+
+        let delegation_satisfiability_artifact_digest =
+            match canonical_json_bytes(&delegation_satisfiability_artifact) {
+                Ok(bytes) => hash_bytes(&bytes),
+                Err(error) => {
+                    let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("sublease delegation denied: {deny_class} ({error})"),
+                    ));
+                },
+            };
+
+        let delegation_satisfiability_artifact_cas_hash =
+            match persist_delegate_sublease_satisfiability_artifact(
+                self.cas.as_deref(),
+                &delegation_satisfiability_artifact,
+            ) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("sublease delegation denied: {deny_class} ({error})"),
+                    ));
+                },
+            };
 
         // ---- Phase 2e: Delegation narrowing and lineage binding checks ----
         let expiry_millis = request.requested_expiry_ns / 1_000_000;
@@ -15312,9 +15542,9 @@ impl PrivilegedDispatcher {
         // anchor. Retries would emit duplicate events. By persisting the
         // lease first:
         //   - If register_full_lease fails, no event is emitted (clean).
-        //   - If emit_session_event fails after successful persistence, the lease
-        //     exists (authoritative state) and we log a warning but return success --
-        //     the event is an audit trail that follows.
+        //   - If emit_session_event fails after successful persistence, the lease is
+        //     rolled back (or fails closed as invalid if rollback cannot complete) so
+        //     no usable delegated authority exists without lineage evidence.
         //
         // SECURITY (v10 BLOCKER 2 -- Sublease ID uniqueness via DB):
         //
@@ -15324,7 +15554,10 @@ impl PrivilegedDispatcher {
         // call register_full_lease succeeds and the second gets a duplicate
         // error, which we handle as idempotent (look up existing lease and
         // return it) or reject as conflict.
-        if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
+        if let Err(e) = self
+            .lease_validator
+            .register_delegated_full_lease(&sublease, &request.parent_lease_id)
+        {
             // Check if this is a duplicate: the lease_id already exists.
             // If it does, treat as idempotent if the existing lease matches
             // ALL fields including parent lineage. Otherwise reject as conflict.
@@ -15508,7 +15741,20 @@ impl PrivilegedDispatcher {
             "expires_at": sublease.expires_at,
             "issued_at": sublease.issued_at,
             "identity_proof_hash": hex::encode(&request.identity_proof_hash),
+            "delegation_satisfiability_artifact": delegation_satisfiability_artifact,
+            "delegation_satisfiability_artifact_digest": hex::encode(
+                delegation_satisfiability_artifact_digest
+            ),
         });
+        if let (Some(cas_hash), Some(payload_object)) = (
+            delegation_satisfiability_artifact_cas_hash,
+            event_payload.as_object_mut(),
+        ) {
+            payload_object.insert(
+                "delegation_satisfiability_artifact_cas_hash".to_string(),
+                serde_json::Value::String(hex::encode(cas_hash)),
+            );
+        }
         if let (Some(artifacts), Some(payload_object)) = (
             pcac_lifecycle_artifacts.as_ref(),
             event_payload.as_object_mut(),
@@ -15563,22 +15809,44 @@ impl PrivilegedDispatcher {
                 // 2. A retry will hit the idempotent `register_full_lease` duplicate path,
                 //    which will find the existing lease and attempt to look up the event. If
                 //    the event still cannot be emitted, the retry will also fail-closed.
-                // 3. The persisted lease anchor ensures no authority is lost; the caller simply
-                //    needs to retry when the event emitter recovers.
-                warn!(
-                    sublease_id = %sublease.lease_id,
-                    error = %e,
-                    "SubleaseIssued event emission failed after lease persistence \
-                     -- failing closed (lease persisted, event missing)"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
-                        "sublease '{}' lease persisted but SubleaseIssued event \
-                         emission failed: {e} -- retry to complete",
-                        sublease.lease_id
-                    ),
-                ));
+                // 3. The delegated lease must not remain usable without lineage evidence. We
+                //    rollback persistence; if rollback fails, delegation lineage checks still
+                //    fail closed because parent metadata indicates delegated lineage but no
+                //    `SubleaseIssued` evidence exists.
+                let rollback_result = self.lease_validator.rollback_full_lease(&sublease.lease_id);
+                match rollback_result {
+                    Ok(()) => {
+                        warn!(
+                            sublease_id = %sublease.lease_id,
+                            error = %e,
+                            "SubleaseIssued event emission failed; persisted delegated lease rolled back"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "sublease '{}' SubleaseIssued emission failed and the delegated \
+                                 lease was rolled back: {e}",
+                                sublease.lease_id
+                            ),
+                        ));
+                    },
+                    Err(rollback_error) => {
+                        warn!(
+                            sublease_id = %sublease.lease_id,
+                            error = %e,
+                            rollback_error = %rollback_error,
+                            "SubleaseIssued event emission failed and delegated lease rollback failed"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "sublease '{}' SubleaseIssued emission failed: {e}; delegated \
+                                 lease rollback failed: {rollback_error}",
+                                sublease.lease_id
+                            ),
+                        ));
+                    },
+                }
             },
         };
 
@@ -27091,11 +27359,22 @@ mod tests {
         }
 
         #[test]
-        fn test_delegate_sublease_satisfiability_budget_exhaustion_rejected() {
-            let parent_lease_id = "parent-budget-exhaust";
+        fn test_delegate_sublease_satisfiability_budget_derived_and_depth_safe() {
+            let derived_min_budget =
+                ((MAX_SUBLEASE_LINEAGE_TRAVERSAL_STEPS as u64) * 2 + 4).max(40);
+            assert_eq!(
+                SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS, derived_min_budget,
+                "delegation budget must be derived from lineage traversal bound"
+            );
+            assert!(
+                derived_min_budget >= 40,
+                "delegation budget derivation must keep >=40 safety margin"
+            );
+
+            let parent_lease_id = "parent-budget-safe";
             let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
                 parent_lease_id,
-                "W-DS-BUDGET-EXHAUST",
+                "W-DS-BUDGET-SAFE",
                 "gate-quality",
                 "executor-001",
             );
@@ -27114,10 +27393,70 @@ mod tests {
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: parent_lease_id.to_string(),
-                delegatee_actor_id: "child-budget-exhaust".to_string(),
+                delegatee_actor_id: "child-budget-safe".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
-                sublease_id: "sublease-budget-exhaust".to_string(),
+                sublease_id: "sublease-budget-safe".to_string(),
                 identity_proof_hash: vec![0x88; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::DelegateSublease(_) => {},
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        !err.message
+                            .contains("delegation_satisfiability_budget_ticks exhausted"),
+                        "derived budget must cover max-depth traversal, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected DelegateSublease or non-budget error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_missing_lineage_for_persisted_delegated_parent_denied() {
+            let (dispatcher, ctx, parent_lease) = setup_dispatcher_with_orchestrator(
+                "parent-missing-lineage",
+                "W-DS-MISSING-LINEAGE",
+                "gate-quality",
+                "executor-001",
+            );
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            let orphan_parent_id = "sublease-missing-lineage-parent";
+            let orphan_parent = dispatcher
+                .gate_orchestrator
+                .as_ref()
+                .expect("gate orchestrator should be configured")
+                .issue_delegated_sublease(
+                    &parent_lease,
+                    orphan_parent_id,
+                    &caller_actor,
+                    parent_lease.issued_at.saturating_add(10),
+                    parent_lease.expires_at.saturating_sub(100),
+                )
+                .expect("orphan parent sublease issuance should succeed");
+            dispatcher
+                .lease_validator
+                .register_delegated_full_lease(&orphan_parent, &parent_lease.lease_id)
+                .expect("persisted delegated lease should register");
+
+            // Regression guard: this fixture intentionally persists a delegated
+            // lease without a corresponding SubleaseIssued lineage event.
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: orphan_parent_id.to_string(),
+                delegatee_actor_id: "child-missing-lineage".to_string(),
+                requested_expiry_ns: orphan_parent
+                    .expires_at
+                    .saturating_sub(1)
+                    .saturating_mul(1_000_000),
+                sublease_id: "child-from-missing-lineage-parent".to_string(),
+                identity_proof_hash: vec![0x6B; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -27125,13 +27464,12 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message
-                            .contains("delegation_satisfiability_budget_ticks exhausted"),
-                        "budget exhaustion denial must be explicit, got: {}",
+                        err.message.contains("lineage evidence missing"),
+                        "missing delegated lineage evidence must deny delegation, got: {}",
                         err.message
                     );
                 },
-                other => panic!("expected budget exhaustion denial, got {other:?}"),
+                other => panic!("expected delegated-lineage denial, got {other:?}"),
             }
         }
 
@@ -27571,6 +27909,59 @@ mod tests {
                 "actor_id must NOT be the delegatee"
             );
             assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
+
+            let payload = ingest_review_receipt::decode_wrapped_or_direct_event_payload(&event);
+            let artifact = payload
+                .get("delegation_satisfiability_artifact")
+                .expect("delegation_satisfiability_artifact must be present");
+            assert_eq!(
+                artifact.get("schema").and_then(serde_json::Value::as_str),
+                Some("apm2.delegate_sublease_satisfiability_artifact.v1"),
+                "delegation satisfiability artifact schema must be persisted"
+            );
+            let receipt = artifact
+                .get("delegation_satisfiability_receipt")
+                .expect("delegation_satisfiability_receipt must be present");
+            assert_eq!(
+                receipt
+                    .get("delegation_depth")
+                    .and_then(serde_json::Value::as_u64),
+                Some(1),
+                "direct child delegation must persist depth evidence"
+            );
+            assert_eq!(
+                receipt
+                    .get("budget_ticks")
+                    .and_then(serde_json::Value::as_u64),
+                Some(SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS),
+                "persisted receipt must carry deterministic budget evidence"
+            );
+            assert!(
+                receipt
+                    .get("ticks_used")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                "persisted receipt must carry deterministic tick usage evidence"
+            );
+
+            let persisted_artifact_digest = payload
+                .get("delegation_satisfiability_artifact_digest")
+                .and_then(serde_json::Value::as_str)
+                .expect("delegation_satisfiability_artifact_digest must be present");
+            let expected_artifact_digest = hex::encode(hash_bytes(
+                &canonical_json_bytes(artifact).expect("artifact canonicalization"),
+            ));
+            assert_eq!(
+                persisted_artifact_digest, expected_artifact_digest,
+                "artifact digest must bind canonical delegation satisfiability evidence"
+            );
+            assert!(
+                payload
+                    .get("delegation_satisfiability_artifact_cas_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                "CAS-backed dispatcher must persist artifact CAS hash pointer"
+            );
         }
 
         #[test]

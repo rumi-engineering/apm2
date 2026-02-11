@@ -1210,10 +1210,18 @@ impl PermeabilityReceipt {
     /// * `now_ms` - Current time in milliseconds since epoch. Must be non-zero;
     ///   freshness is always enforced.
     ///
+    /// # Returns
+    ///
+    /// Deterministic delegation satisfiability receipt produced by admission
+    /// evaluation.
+    ///
     /// # Errors
     ///
     /// Returns [`PermeabilityError`] if any admission check fails.
-    pub fn validate_admission(&self, now_ms: u64) -> Result<(), PermeabilityError> {
+    pub fn validate_admission(
+        &self,
+        now_ms: u64,
+    ) -> Result<DelegationSatisfiabilityReceiptV1, PermeabilityError> {
         // Structural checks (shared with validate_admission_unchecked)
         self.validate_structural()?;
 
@@ -1250,9 +1258,7 @@ impl PermeabilityReceipt {
         // RFC-0028 Section 4: algebraically-valid but vacuous delegation
         // outputs are non-admissible, and satisfiability evaluation must stay
         // within deterministic tick budget.
-        evaluate_delegation_satisfiability_v1(self, DELEGATION_SATISFIABILITY_BUDGET_TICKS)?;
-
-        Ok(())
+        evaluate_delegation_satisfiability_v1(self, DELEGATION_SATISFIABILITY_BUDGET_TICKS)
     }
 
     /// Validates this receipt for admission without freshness enforcement.
@@ -2658,6 +2664,51 @@ mod tests {
             .unwrap();
 
         assert!(receipt.validate_admission(1_500_000).is_ok());
+    }
+
+    #[test]
+    fn test_validate_admission_returns_satisfiability_receipt() {
+        let parent = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(10_000),
+            StopPredicateLevel::Override,
+            TaintCeiling::Adversarial,
+            ClassificationLevel::TopSecret,
+        );
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5_000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("receipt-admission-receipt", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(2_000_000)
+            .build()
+            .expect("builder should succeed");
+
+        let admission_receipt = receipt
+            .validate_admission(1_500_000)
+            .expect("admission should produce satisfiability receipt");
+        assert_eq!(
+            admission_receipt.schema_id,
+            DELEGATION_SATISFIABILITY_SCHEMA_ID
+        );
+        assert_eq!(
+            admission_receipt.schema_major,
+            DELEGATION_SATISFIABILITY_SCHEMA_MAJOR
+        );
+        assert_eq!(
+            admission_receipt.budget_ticks,
+            DELEGATION_SATISFIABILITY_BUDGET_TICKS
+        );
+        assert!(admission_receipt.admissible_workset_non_empty);
+        assert!(admission_receipt.ticks_used > 0);
     }
 
     #[test]

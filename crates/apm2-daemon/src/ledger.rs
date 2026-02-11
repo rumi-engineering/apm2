@@ -2459,6 +2459,58 @@ impl SqliteLeaseValidator {
     pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
+
+    fn register_full_lease_inner(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        delegated_parent_lease_id: Option<&str>,
+    ) -> Result<(), String> {
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let payload = serde_json::json!({
+            "event_type": "gate_lease_issued",
+            "lease_id": lease.lease_id,
+            "work_id": lease.work_id,
+            "gate_id": lease.gate_id,
+            "executor_actor_id": lease.executor_actor_id,
+            "full_lease": lease,
+            "delegated_parent_lease_id": delegated_parent_lease_id,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("failed to serialize lease payload: {e}"))?;
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
+
+        let rows_affected = conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM ledger_events
+                 WHERE event_type = 'gate_lease_issued'
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?8
+                 AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL
+             )",
+            params![
+                event_id,
+                "gate_lease_issued",
+                lease.work_id,
+                "system",
+                payload_bytes,
+                vec![0u8; 64],
+                i64::try_from(lease.issued_at).unwrap_or(0),
+                lease.lease_id
+            ],
+        )
+        .map_err(|e| format!("failed to insert lease event: {e}"))?;
+
+        if rows_affected == 0 {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -2701,76 +2753,61 @@ impl LeaseValidator for SqliteLeaseValidator {
     /// signature over the canonical event bytes. This would allow external
     /// auditors to verify event integrity without trusting the daemon process.
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
-        // Store the full lease as a gate_lease_issued event with the complete
-        // lease object embedded in the payload for later retrieval.
+        self.register_full_lease_inner(lease, None)
+    }
 
-        // SECURITY (v11 BLOCKER 1 -- Atomic INSERT ... WHERE NOT EXISTS):
-        //
-        // The previous implementation used a check-then-insert (TOCTOU)
-        // pattern: `get_gate_lease()` followed by a separate INSERT.
-        // Under concurrent requests, two callers could both pass the
-        // check and both insert, creating duplicate lease entries.
-        //
-        // The fix uses a SINGLE atomic SQL statement that checks for an
-        // existing `gate_lease_issued` event with the same `lease_id`
-        // (via `json_extract` on the payload BLOB) and only inserts if
-        // no such row exists. SQLite serializes writes within a single
-        // statement, eliminating the TOCTOU race.
-        //
-        // After the INSERT, we check `rows_affected()`: if 0, a lease
-        // with this ID already exists -- return a duplicate error.
-        // No schema migration or new columns are needed.
+    fn register_delegated_full_lease(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        parent_lease_id: &str,
+    ) -> Result<(), String> {
+        self.register_full_lease_inner(lease, Some(parent_lease_id))
+    }
 
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        let payload = serde_json::json!({
-            "event_type": "gate_lease_issued",
-            "lease_id": lease.lease_id,
-            "work_id": lease.work_id,
-            "gate_id": lease.gate_id,
-            "executor_actor_id": lease.executor_actor_id,
-            "full_lease": lease
-        });
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("failed to serialize lease payload: {e}"))?;
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM ledger_events \
+                 WHERE event_type = 'gate_lease_issued' \
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                 AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+                 ORDER BY rowid DESC LIMIT 1",
+            )
+            .ok()?;
 
+        let payload_bytes: Vec<u8> = stmt.query_row(params![lease_id], |row| row.get(0)).ok()?;
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+        payload
+            .get("delegated_parent_lease_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+
+    fn rollback_full_lease(&self, lease_id: &str) -> Result<(), String> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
-
-        // NOTE: The zero-filled signature is intentional -- see trust model
-        // documentation above. The real cryptographic proof lives inside
-        // `full_lease.issuer_signature`.
-        //
-        // The WHERE NOT EXISTS subquery atomically checks that no
-        // `gate_lease_issued` event with this `lease_id` already exists
-        // in the payload JSON. Because this is a single SQL statement,
-        // SQLite's write serialization prevents interleaving.
-        let rows_affected = conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM ledger_events
-                 WHERE event_type = 'gate_lease_issued'
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?8
-             )",
-            params![
-                event_id,
-                "gate_lease_issued",
-                lease.work_id,
-                "system",
-                payload_bytes,
-                vec![0u8; 64],
-                i64::try_from(lease.issued_at).unwrap_or(0),
-                lease.lease_id
-            ],
-        )
-        .map_err(|e| format!("failed to insert lease event: {e}"))?;
-
+        let rows_affected = conn
+            .execute(
+                "DELETE FROM ledger_events
+                 WHERE rowid IN (
+                     SELECT rowid FROM ledger_events
+                     WHERE event_type = 'gate_lease_issued'
+                     AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1
+                     AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL
+                     ORDER BY rowid DESC
+                     LIMIT 1
+                 )",
+                params![lease_id],
+            )
+            .map_err(|e| format!("failed to rollback lease event: {e}"))?;
         if rows_affected == 0 {
-            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+            return Err(format!(
+                "no persisted full lease found for lease_id: {lease_id}"
+            ));
         }
-
         Ok(())
     }
 }
