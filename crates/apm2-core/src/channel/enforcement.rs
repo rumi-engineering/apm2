@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::crypto::{Signature, Signer, VerifyingKey, parse_signature, verify_signature};
+use crate::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
 
 /// Maximum string length for channel enforcement detail fields.
 pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
@@ -15,6 +16,10 @@ pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
 pub const MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH: usize = 128;
 /// Maximum length for leakage estimator confidence labels.
 pub const MAX_LEAKAGE_CONFIDENCE_LABEL_LENGTH: usize = 128;
+/// Maximum length for disclosure phase identifiers in boundary bindings.
+pub const MAX_DISCLOSURE_PHASE_ID_LENGTH: usize = 128;
+/// Maximum length for disclosure state validation reasons.
+pub const MAX_DISCLOSURE_STATE_REASON_LENGTH: usize = 256;
 const CHANNEL_SOURCE_WITNESS_DOMAIN: &[u8] = b"apm2.channel_source_witness.v1";
 const CHANNEL_CONTEXT_TOKEN_SCHEMA_ID: &str = "apm2.channel_context_token.v1";
 const MAX_CHANNEL_CONTEXT_TOKEN_LEN: usize = 8192;
@@ -172,6 +177,54 @@ impl TimingChannelBudget {
     }
 }
 
+/// Disclosure-control policy binding for RFC-0028 REQ-0007 admission checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisclosurePolicyBinding {
+    /// Whether this request must enforce disclosure interlock fail-closed.
+    pub required_for_effect: bool,
+    /// Whether snapshot signature/freshness/phase/mode validation passed.
+    pub state_valid: bool,
+    /// Active policy mode reported for this request.
+    pub active_mode: DisclosurePolicyMode,
+    /// Expected policy mode from `phase_disclosure_profile(phase_id)`.
+    pub expected_mode: DisclosurePolicyMode,
+    /// Channel class attempted by the request.
+    pub attempted_channel: DisclosureChannelClass,
+    /// Snapshot digest presented for this decision.
+    pub policy_snapshot_digest: [u8; 32],
+    /// Admitted policy epoch root digest from authoritative state.
+    pub admitted_policy_epoch_root_digest: [u8; 32],
+    /// Policy epoch associated with the snapshot.
+    pub policy_epoch: u64,
+    /// Phase identifier for evaluated window.
+    pub phase_id: String,
+    /// Bounded validation reason emitted on invalid state.
+    pub state_reason: String,
+}
+
+impl DisclosurePolicyBinding {
+    fn has_non_zero_snapshot_digest(&self) -> bool {
+        self.policy_snapshot_digest != [0u8; 32]
+            && self.admitted_policy_epoch_root_digest != [0u8; 32]
+    }
+
+    fn snapshot_digest_matches(&self) -> bool {
+        bool::from(
+            self.policy_snapshot_digest
+                .ct_eq(&self.admitted_policy_epoch_root_digest),
+        )
+    }
+
+    fn bounded_reason(&self) -> String {
+        truncate_to_length(&self.state_reason, MAX_DISCLOSURE_STATE_REASON_LENGTH)
+    }
+
+    fn bounded_phase_id(&self) -> String {
+        truncate_to_length(&self.phase_id, MAX_DISCLOSURE_PHASE_ID_LENGTH)
+    }
+}
+
 /// Channel boundary enforcement result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -205,6 +258,9 @@ pub struct ChannelBoundaryCheck {
     pub leakage_budget_receipt: Option<LeakageBudgetReceipt>,
     /// Timing-channel release-bucketing witness.
     pub timing_channel_budget: Option<TimingChannelBudget>,
+    /// Disclosure-control policy interlock binding.
+    #[serde(default)]
+    pub disclosure_policy_binding: Option<DisclosurePolicyBinding>,
     /// Policy-derived maximum leakage budget in bits.
     #[serde(default)]
     pub leakage_budget_policy_max_bits: Option<u64>,
@@ -253,6 +309,8 @@ struct ChannelContextTokenPayloadV1 {
     leakage_budget_receipt: Option<LeakageBudgetReceipt>,
     #[serde(default)]
     timing_channel_budget: Option<TimingChannelBudget>,
+    #[serde(default)]
+    disclosure_policy_binding: Option<DisclosurePolicyBinding>,
     #[serde(default)]
     leakage_budget_policy_max_bits: Option<u64>,
     #[serde(default)]
@@ -399,6 +457,14 @@ pub enum ChannelViolationClass {
     LeakageBudgetExceeded,
     /// Timing-channel release bucketing/budget violated.
     TimingChannelBudgetExceeded,
+    /// Disclosure-control state missing, stale, invalid, or ambiguous.
+    DisclosurePolicyStateInvalid,
+    /// Active disclosure mode mismatches the phase profile.
+    DisclosurePolicyModeMismatch,
+    /// Disclosure policy snapshot digest binding mismatch.
+    DisclosurePolicyDigestBindingMismatch,
+    /// Attempted disclosure channel is denied by active mode.
+    DisclosureChannelNotAdmitted,
 }
 
 impl ChannelViolationClass {
@@ -514,6 +580,7 @@ fn issue_channel_context_token_with_freshness(
         boundary_flow_policy_binding: check.boundary_flow_policy_binding.clone(),
         leakage_budget_receipt: check.leakage_budget_receipt.clone(),
         timing_channel_budget: check.timing_channel_budget.clone(),
+        disclosure_policy_binding: check.disclosure_policy_binding.clone(),
         leakage_budget_policy_max_bits: check.leakage_budget_policy_max_bits,
         declared_leakage_budget_bits: check.declared_leakage_budget_bits,
         timing_budget_policy_max_ticks: check.timing_budget_policy_max_ticks,
@@ -636,6 +703,7 @@ pub fn decode_channel_context_token(
         boundary_flow_policy_binding: payload.payload.boundary_flow_policy_binding,
         leakage_budget_receipt: payload.payload.leakage_budget_receipt,
         timing_channel_budget: payload.payload.timing_channel_budget,
+        disclosure_policy_binding: payload.payload.disclosure_policy_binding,
         leakage_budget_policy_max_bits: payload.payload.leakage_budget_policy_max_bits,
         declared_leakage_budget_bits: payload.payload.declared_leakage_budget_bits,
         timing_budget_policy_max_ticks: payload.payload.timing_budget_policy_max_ticks,
@@ -701,6 +769,7 @@ pub fn validate_channel_boundary(check: &ChannelBoundaryCheck) -> Vec<ChannelBou
     validate_boundary_flow_policy_binding(check, &mut defects);
     validate_leakage_budget(check, &mut defects);
     validate_timing_budget(check, &mut defects);
+    validate_disclosure_policy_binding(check, &mut defects);
 
     defects
 }
@@ -925,6 +994,81 @@ fn validate_timing_budget(check: &ChannelBoundaryCheck, defects: &mut Vec<Channe
     }
 }
 
+fn validate_disclosure_policy_binding(
+    check: &ChannelBoundaryCheck,
+    defects: &mut Vec<ChannelBoundaryDefect>,
+) {
+    let Some(binding) = &check.disclosure_policy_binding else {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::DisclosurePolicyStateInvalid,
+            "missing disclosure policy binding",
+        ));
+        return;
+    };
+
+    if !binding.required_for_effect {
+        return;
+    }
+
+    if !binding.state_valid {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::DisclosurePolicyStateInvalid,
+            format!(
+                "disclosure policy state invalid: phase_id={} policy_epoch={} reason={}",
+                binding.bounded_phase_id(),
+                binding.policy_epoch,
+                binding.bounded_reason(),
+            ),
+        ));
+    }
+
+    if !binding.has_non_zero_snapshot_digest() || !binding.snapshot_digest_matches() {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::DisclosurePolicyDigestBindingMismatch,
+            format!(
+                "disclosure policy snapshot digest mismatch: policy_epoch={} phase_id={}",
+                binding.policy_epoch,
+                binding.bounded_phase_id(),
+            ),
+        ));
+    }
+
+    if binding.active_mode != binding.expected_mode {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::DisclosurePolicyModeMismatch,
+            format!(
+                "disclosure mode mismatch: active={:?} expected={:?} phase_id={}",
+                binding.active_mode,
+                binding.expected_mode,
+                binding.bounded_phase_id(),
+            ),
+        ));
+    }
+
+    let channel_allowed = match binding.active_mode {
+        DisclosurePolicyMode::TradeSecretOnly => {
+            matches!(binding.attempted_channel, DisclosureChannelClass::Internal)
+        },
+        DisclosurePolicyMode::SelectiveDisclosure => matches!(
+            binding.attempted_channel,
+            DisclosureChannelClass::Internal | DisclosureChannelClass::DeclassificationControlled
+        ),
+    };
+
+    if !channel_allowed {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::DisclosureChannelNotAdmitted,
+            format!(
+                "disclosure channel denied: active_mode={:?} attempted_channel={:?} policy_epoch={} phase_id={}",
+                binding.active_mode,
+                binding.attempted_channel,
+                binding.policy_epoch,
+                binding.bounded_phase_id(),
+            ),
+        ));
+    }
+}
+
 fn resolve_effective_source(
     check: &ChannelBoundaryCheck,
     defects: &mut Vec<ChannelBoundaryDefect>,
@@ -965,6 +1109,17 @@ fn truncate_channel_detail(mut detail: String) -> String {
     detail
 }
 
+fn truncate_to_length(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+    let mut boundary = max_len;
+    while !value.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    value[..boundary].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -998,6 +1153,21 @@ mod tests {
         }
     }
 
+    fn valid_disclosure_policy_binding() -> DisclosurePolicyBinding {
+        DisclosurePolicyBinding {
+            required_for_effect: true,
+            state_valid: true,
+            active_mode: DisclosurePolicyMode::TradeSecretOnly,
+            expected_mode: DisclosurePolicyMode::TradeSecretOnly,
+            attempted_channel: DisclosureChannelClass::Internal,
+            policy_snapshot_digest: [0x44; 32],
+            admitted_policy_epoch_root_digest: [0x44; 32],
+            policy_epoch: 1,
+            phase_id: "pre_federation".to_string(),
+            state_reason: "valid".to_string(),
+        }
+    }
+
     fn baseline_check() -> ChannelBoundaryCheck {
         ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
@@ -1016,6 +1186,7 @@ mod tests {
             boundary_flow_policy_binding: Some(valid_policy_binding()),
             leakage_budget_receipt: Some(valid_leakage_receipt()),
             timing_channel_budget: Some(valid_timing_budget()),
+            disclosure_policy_binding: Some(valid_disclosure_policy_binding()),
             leakage_budget_policy_max_bits: Some(8),
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
@@ -1349,6 +1520,7 @@ mod tests {
         check.boundary_flow_policy_binding = None;
         check.leakage_budget_receipt = None;
         check.timing_channel_budget = None;
+        check.disclosure_policy_binding = None;
         check.leakage_budget_policy_max_bits = None;
         check.declared_leakage_budget_bits = None;
         check.timing_budget_policy_max_ticks = None;
@@ -1372,6 +1544,69 @@ mod tests {
                 && defect
                     .detail
                     .contains("missing timing-channel budget witness")
+        }));
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::DisclosurePolicyStateInvalid
+                && defect.detail.contains("missing disclosure policy binding")
+        }));
+    }
+
+    #[test]
+    fn test_trade_secret_mode_denies_patent_channel() {
+        let mut check = baseline_check();
+        let mut binding = valid_disclosure_policy_binding();
+        binding.attempted_channel = DisclosureChannelClass::PatentFiling;
+        check.disclosure_policy_binding = Some(binding);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::DisclosureChannelNotAdmitted
+                && defect.detail.contains("attempted_channel=PatentFiling")
+        }));
+    }
+
+    #[test]
+    fn test_trade_secret_mode_denies_provisional_channel() {
+        let mut check = baseline_check();
+        let mut binding = valid_disclosure_policy_binding();
+        binding.attempted_channel = DisclosureChannelClass::ProvisionalApplication;
+        check.disclosure_policy_binding = Some(binding);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::DisclosureChannelNotAdmitted
+                && defect
+                    .detail
+                    .contains("attempted_channel=ProvisionalApplication")
+        }));
+    }
+
+    #[test]
+    fn test_disclosure_policy_state_invalid_denied() {
+        let mut check = baseline_check();
+        let mut binding = valid_disclosure_policy_binding();
+        binding.state_valid = false;
+        binding.state_reason = "stale policy snapshot".to_string();
+        check.disclosure_policy_binding = Some(binding);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::DisclosurePolicyStateInvalid
+                && defect.detail.contains("stale policy snapshot")
+        }));
+    }
+
+    #[test]
+    fn test_disclosure_policy_digest_mismatch_denied() {
+        let mut check = baseline_check();
+        let mut binding = valid_disclosure_policy_binding();
+        binding.policy_snapshot_digest = [0x77; 32];
+        binding.admitted_policy_epoch_root_digest = [0x88; 32];
+        check.disclosure_policy_binding = Some(binding);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::DisclosurePolicyDigestBindingMismatch
         }));
     }
 
@@ -1422,6 +1657,7 @@ mod tests {
                 && payload.boundary_flow_policy_binding.is_none()
                 && payload.leakage_budget_receipt.is_none()
                 && payload.timing_channel_budget.is_none()
+                && payload.disclosure_policy_binding.is_none()
                 && payload.leakage_budget_policy_max_bits.is_none()
                 && payload.declared_leakage_budget_bits.is_none()
                 && payload.timing_budget_policy_max_ticks.is_none()
@@ -1451,6 +1687,7 @@ mod tests {
             boundary_flow_policy_binding: Some(valid_policy_binding()),
             leakage_budget_receipt: Some(valid_leakage_receipt()),
             timing_channel_budget: Some(valid_timing_budget()),
+            disclosure_policy_binding: Some(valid_disclosure_policy_binding()),
             leakage_budget_policy_max_bits: Some(8),
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
@@ -1462,6 +1699,49 @@ mod tests {
         assert_eq!(
             bytes1, bytes2,
             "payload serialization must be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_disclosure_policy_epoch_changes_payload_bytes() {
+        let payload1 = ChannelContextTokenPayloadV1 {
+            source: ChannelSource::TypedToolIntent,
+            lease_id: "lease-epoch".to_string(),
+            request_id: "REQ-EPOCH-1".to_string(),
+            issued_at_secs: 1_700_000_000,
+            expires_after_secs: CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
+            channel_source_witness: derive_channel_source_witness(ChannelSource::TypedToolIntent),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: Some(valid_policy_binding()),
+            leakage_budget_receipt: Some(valid_leakage_receipt()),
+            timing_channel_budget: Some(valid_timing_budget()),
+            disclosure_policy_binding: Some(valid_disclosure_policy_binding()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
+        };
+
+        let mut payload2 = payload1.clone();
+        if let Some(binding) = payload2.disclosure_policy_binding.as_mut() {
+            binding.policy_epoch = 2;
+            binding.policy_snapshot_digest = [0x45; 32];
+            binding.admitted_policy_epoch_root_digest = [0x45; 32];
+        }
+
+        let bytes1 = canonical_payload(&payload1).expect("payload1 should serialize");
+        let bytes2 = canonical_payload(&payload2).expect("payload2 should serialize");
+        assert_ne!(
+            bytes1, bytes2,
+            "disclosure policy epoch/digest changes must alter decision evidence payload bytes",
         );
     }
 
@@ -1487,6 +1767,7 @@ mod tests {
             boundary_flow_policy_binding: Some(valid_policy_binding()),
             leakage_budget_receipt: Some(valid_leakage_receipt()),
             timing_channel_budget: Some(valid_timing_budget()),
+            disclosure_policy_binding: Some(valid_disclosure_policy_binding()),
             leakage_budget_policy_max_bits: Some(8),
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),

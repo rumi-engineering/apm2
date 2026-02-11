@@ -53,6 +53,7 @@ pub mod coordination;
 pub mod credentials;
 pub mod crypto;
 pub mod determinism;
+pub mod disclosure;
 pub mod economics;
 pub mod events;
 pub mod evidence;
