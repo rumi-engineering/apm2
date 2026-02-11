@@ -28,6 +28,7 @@ mod pipeline;
 mod projection;
 mod push;
 mod restart;
+mod selector;
 mod state;
 mod types;
 
@@ -690,8 +691,14 @@ pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
     pipeline::run_pipeline(repo, pr_url, pr_number, sha)
 }
 
-pub fn run_logs(pr_number: Option<u32>, json_output: bool) -> u8 {
-    logs::run_logs(pr_number, json_output)
+pub fn run_logs(
+    pr_number: Option<u32>,
+    repo: &str,
+    selector_type: Option<&str>,
+    selector: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    logs::run_logs(pr_number, repo, selector_type, selector, json_output)
 }
 
 pub fn run_gates(
