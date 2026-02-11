@@ -15274,6 +15274,18 @@ impl PrivilegedDispatcher {
         // `requested_expiry_ns` must be carried into both PCAC scope witnesses
         // and delegated sublease issuance.
         let expiry_millis = request.requested_expiry_ns / 1_000_000;
+        if expiry_millis >= parent_lease.expires_at {
+            let deny_class = AuthorityDenyClass::InvalidDelegationChain;
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease delegation denied: {deny_class} \
+                     (strict expiry narrowing violated: requested_expiry_ms={expiry_millis}, \
+                     parent_expires_at_ms={})",
+                    parent_lease.expires_at
+                ),
+            ));
+        }
 
         // Decode parent time envelope hash for delegated lineage witnesses.
         let parent_time_envelope_hash =
@@ -27281,11 +27293,11 @@ mod tests {
             );
 
             // Request sublease with expiry EXCEEDING parent bounds (parent
-            // expires at 2_000_000, sublease requests 3_000_000).
+            // expires at 2_000_000ms, sublease requests 3_000_000ms).
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-exp".to_string(),
                 delegatee_actor_id: "child-executor-001".to_string(),
-                requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (3_000_000
+                requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (2_000_000
                                                          * ms) */
                 sublease_id: "sublease-overflow".to_string(),
                 identity_proof_hash: vec![0x99; 32],
@@ -27297,6 +27309,7 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert!(
                         err.message.contains("sublease delegation failed")
+                            || err.message.contains("strict expiry narrowing violated")
                             || err.message.contains("is after parent expires_at"),
                         "Error should mention parent expiry bound violation: {}",
                         err.message
@@ -27304,6 +27317,57 @@ mod tests {
                 },
                 other => panic!("Expected error for expiry overflow, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn test_delegate_sublease_equal_parent_expiry_rejected() {
+            let (dispatcher, ctx, parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-equal-exp",
+                "W-DS-EQUAL-EXP",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-equal-exp".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: parent.expires_at * 1_000_000,
+                sublease_id: "sublease-equal-exp".to_string(),
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("strict expiry narrowing violated"),
+                        "Error should reject equal-expiry sublease delegation: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected strict expiry narrowing rejection, got {other:?}"),
+            }
+
+            let persisted_sublease = dispatcher
+                .lease_validator()
+                .get_gate_lease("sublease-equal-exp");
+            assert!(
+                persisted_sublease.is_none(),
+                "equal-expiry denial must not persist a sublease"
+            );
+
+            let sublease_events = dispatcher
+                .event_emitter()
+                .get_events_by_work_id("sublease-equal-exp");
+            let sublease_event_count = sublease_events
+                .iter()
+                .filter(|event| event.event_type == "SubleaseIssued")
+                .count();
+            assert_eq!(
+                sublease_event_count, 0,
+                "equal-expiry denial must not emit SubleaseIssued events"
+            );
         }
 
         #[test]
@@ -30216,6 +30280,7 @@ mod tests {
                     assert!(
                         err.message.contains("WaiverScopeInvalid")
                             || err.message.contains("waiver")
+                            || err.message.contains("strict expiry narrowing violated")
                             || err
                                 .message
                                 .contains("PCAC authority denied for DelegateSublease"),
