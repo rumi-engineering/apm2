@@ -29,7 +29,8 @@ use tempfile::TempDir;
 
 fn make_sqlite_conn() -> Arc<Mutex<Connection>> {
     let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+        .expect("ledger schema init should succeed");
     SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
     Arc::new(Mutex::new(conn))
 }

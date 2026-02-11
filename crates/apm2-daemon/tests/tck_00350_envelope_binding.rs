@@ -272,7 +272,7 @@ fn emit_receipt_succeeds_with_valid_bindings_stub() {
 #[test]
 fn emit_receipt_succeeds_with_valid_bindings_sqlite() {
     let conn = Connection::open_in_memory().expect("sqlite open");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("init schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init schema");
     let conn = Arc::new(Mutex::new(conn));
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
@@ -337,7 +337,7 @@ fn emit_receipt_succeeds_with_valid_bindings_sqlite() {
 #[test]
 fn emit_receipt_rejects_zero_bindings_sqlite() {
     let conn = Connection::open_in_memory().expect("sqlite open");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("init schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init schema");
     let conn = Arc::new(Mutex::new(conn));
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);

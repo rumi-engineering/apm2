@@ -60,7 +60,7 @@ fn make_stale_session(id: &str, work_id: &str) -> SessionState {
 /// schemas initialized, mirroring the daemon startup path in `async_main`.
 fn setup_sqlite() -> Arc<Mutex<Connection>> {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init ledger schema");
     SqliteWorkRegistry::init_schema(&conn).expect("init work schema");
     Arc::new(Mutex::new(conn))
 }

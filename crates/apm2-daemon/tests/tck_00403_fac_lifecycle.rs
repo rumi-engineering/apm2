@@ -77,7 +77,7 @@ impl Display for DaemonError {
 fn make_sqlite_conn(ledger_dir: &Path) -> Arc<Mutex<Connection>> {
     let db_path = ledger_dir.join("fac_lifecycle.db");
     let conn = Connection::open(&db_path).expect("open SQLite database");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("initialize ledger schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("initialize ledger schema");
     SqliteWorkRegistry::init_schema(&conn).expect("initialize work schema");
     Arc::new(Mutex::new(conn))
 }

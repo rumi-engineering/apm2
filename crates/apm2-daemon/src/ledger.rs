@@ -92,6 +92,9 @@ impl SqliteLedgerEventEmitter {
     const LEDGER_METADATA_TABLE: &'static str = "ledger_metadata";
     const HASH_CHAIN_UNINITIALIZED_VALUE: &'static str = "legacy-uninitialized";
     const HASH_CHAIN_BACKFILL_COMPLETED_FLAG: &'static str = "hash_chain_backfill_completed_v1";
+    /// Deterministic test-only key seed. Private to this impl block and only
+    /// referenced by [`Self::checkpoint_signing_key_default`] /
+    /// [`Self::init_schema_for_test`].
     const CHECKPOINT_SIGNING_KEY_SEED_V1: [u8; 32] = [0xA5; 32];
     const HASH_CHAIN_CHECKPOINT_ROWID_KEY: &'static str = "hash_chain_tip_checkpoint_rowid_v2";
     const HASH_CHAIN_CHECKPOINT_EVENT_ID_KEY: &'static str =
@@ -110,12 +113,18 @@ impl SqliteLedgerEventEmitter {
     }
 
     /// Initializes the database schema using a deterministic test-only signing
-    /// key. **Not for production use** — production callers must use
-    /// [`Self::init_schema_with_signing_key`] with the daemon lifecycle key.
-    pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-        // `init_schema` is used by test-only paths that do not yet pass the
-        // daemon lifecycle signing key. Use a deterministic local key so
-        // checkpoint signatures remain verifiable across repeated calls.
+    /// key (hardcoded `0xA5` seed). **Not for production use** — production
+    /// callers must use [`Self::init_schema_with_signing_key`] with the daemon
+    /// lifecycle key.
+    ///
+    /// This method exists solely to support integration and unit tests that do
+    /// not provision a daemon lifecycle signing key. It MUST NOT appear in any
+    /// production code path.
+    #[doc(hidden)]
+    pub fn init_schema_for_test(conn: &Connection) -> rusqlite::Result<()> {
+        // `init_schema_for_test` is used by test-only paths that do not yet
+        // pass the daemon lifecycle signing key. Use a deterministic local key
+        // so checkpoint signatures remain verifiable across repeated calls.
         let signing_key = Self::checkpoint_signing_key_default();
         Self::init_schema_internal(conn, &signing_key, None)
     }
@@ -439,6 +448,11 @@ impl SqliteLedgerEventEmitter {
         Ok(())
     }
 
+    /// Returns a deterministic signing key from the hardcoded test seed.
+    ///
+    /// **Test-only** — callers outside `#[cfg(test)]` and integration tests
+    /// MUST NOT use this function. Production code uses the daemon lifecycle
+    /// signing key instead.
     fn checkpoint_signing_key_default() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&Self::CHECKPOINT_SIGNING_KEY_SEED_V1)
     }
@@ -3874,7 +3888,7 @@ mod tests {
     /// Creates an in-memory `SQLite` connection with schema initialized.
     fn test_emitter() -> SqliteLedgerEventEmitter {
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key)
     }
@@ -3925,7 +3939,8 @@ mod tests {
     #[test]
     fn backfill_hash_chain_handles_multiple_batches_without_uninitialized_rows() {
         let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("schema initialization should succeed");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("schema initialization should succeed");
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
 
         let row_count = 1_041;
@@ -3992,7 +4007,8 @@ mod tests {
     #[test]
     fn backfill_hash_chain_links_legacy_suffix_to_existing_hashed_prefix() {
         let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("schema initialization should succeed");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("schema initialization should succeed");
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         conn.execute("DELETE FROM ledger_events", [])
             .expect("table reset should succeed");
@@ -4094,7 +4110,7 @@ mod tests {
         ));
         {
             let conn_guard = conn.lock().expect("sqlite lock should be available");
-            SqliteLedgerEventEmitter::init_schema(&conn_guard)
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn_guard)
                 .expect("schema initialization should succeed");
         }
 
@@ -4445,7 +4461,7 @@ mod tests {
         ));
         {
             let conn_guard = conn.lock().expect("sqlite lock should be available");
-            SqliteLedgerEventEmitter::init_schema(&conn_guard)
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn_guard)
                 .expect("schema initialization should succeed");
         }
 
@@ -4888,7 +4904,7 @@ mod tests {
         // Create a connection and schema, then drop the table to
         // simulate a failure scenario.
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
 
         // Insert a trigger that causes the second insert (work_transitioned)
         // to fail by using a UNIQUE constraint violation. We'll pre-insert
@@ -4947,7 +4963,7 @@ mod tests {
     #[test]
     fn emit_spawn_lifecycle_rollback_on_failure() {
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let conn = Arc::new(Mutex::new(conn));
         let emitter = SqliteLedgerEventEmitter::new(conn.clone(), signing_key);
@@ -5000,7 +5016,7 @@ mod tests {
         use crate::protocol::dispatch::LeaseValidator;
 
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         // Use Arc<dyn LeaseValidator> to match how the dispatcher uses it
         let validator: Arc<dyn LeaseValidator> =
@@ -5040,7 +5056,7 @@ mod tests {
         use crate::protocol::dispatch::LeaseValidator;
 
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
 
@@ -5064,7 +5080,7 @@ mod tests {
     #[test]
     fn sqlite_lease_validator_register_lease_with_executor_updates_checkpoint() {
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let validator =
@@ -5107,7 +5123,7 @@ mod tests {
         use crate::protocol::dispatch::LeaseValidator;
 
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let validator =
@@ -5166,7 +5182,7 @@ mod tests {
         use crate::protocol::dispatch::LeaseValidator;
 
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let validator: Arc<dyn LeaseValidator> =
             Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
@@ -5498,7 +5514,7 @@ mod tests {
         )
         .unwrap();
 
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
 
         let legit_event_still_exists: bool = conn
             .query_row(
@@ -5597,7 +5613,7 @@ mod tests {
         )
         .unwrap();
 
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
 
         let keep_exists: bool = conn
             .query_row(
@@ -5638,7 +5654,7 @@ mod tests {
             "duplicate receipt event must be quarantined exactly once"
         );
 
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
 
         let duplicate_quarantined_count_after_rerun: i64 = conn
             .query_row(
@@ -5660,7 +5676,7 @@ mod tests {
     #[test]
     fn init_schema_scopes_receipt_id_uniqueness_by_event_type() {
         let conn = Connection::open_in_memory().unwrap();
-        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
 
         let has_receipt_id_unique_index: bool = conn
             .query_row(

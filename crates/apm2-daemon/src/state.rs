@@ -2320,7 +2320,8 @@ mod tests {
     fn spawn_default_max_episodes_allows_first_request_tool_gate() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("ledger schema init should succeed");
         SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
         let conn = Arc::new(Mutex::new(conn));
         let cas_root = tempfile::tempdir().expect("temp CAS root should be created");
@@ -2454,7 +2455,8 @@ mod tests {
     fn update_stop_flags_emergency_stop_denies_subsequent_request_tool() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("ledger schema init should succeed");
         SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
         let conn = Arc::new(Mutex::new(conn));
         let cas_root = tempfile::tempdir().expect("temp CAS root should be created");

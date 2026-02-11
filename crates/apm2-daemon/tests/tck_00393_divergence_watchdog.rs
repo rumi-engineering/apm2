@@ -22,7 +22,7 @@ use rusqlite::Connection;
 /// Helper: create an in-memory `SQLite` connection with ledger schema.
 fn create_test_ledger() -> Arc<Mutex<Connection>> {
     let conn = Connection::open_in_memory().expect("open in-memory db");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("init schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init schema");
     Arc::new(Mutex::new(conn))
 }
 

@@ -315,10 +315,19 @@ fn ledger_signing_key_path(daemon_config: &DaemonConfig) -> PathBuf {
     )
 }
 
-/// Load or create a persistent Ed25519 signing key for ledger event
-/// signatures.
+/// Load or create the Ed25519 signing key used for ledger hash-chain
+/// checkpoints.
 ///
 /// The key file stores a 32-byte seed and is created with mode 0600.
+///
+/// # Critical State File
+///
+/// The key file at `<state_dir>/ledger_signer.key` is a **critical persistent
+/// artifact**. Loss of this file (e.g., container replacement without a
+/// persistent volume) will cause the daemon to fail startup because historical
+/// checkpoint signatures cannot be verified. Operators MUST ensure this file is
+/// persisted across restarts and backed up as part of disaster recovery
+/// procedures.
 fn load_or_create_ledger_signing_key(
     daemon_config: &DaemonConfig,
 ) -> Result<ed25519_dalek::SigningKey> {
@@ -327,21 +336,19 @@ fn load_or_create_ledger_signing_key(
     let key_path = ledger_signing_key_path(daemon_config);
 
     if let Some(parent) = key_path.parent() {
-        if !parent.exists() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent)
-                    .context("failed to create ledger signer key directory")?;
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::create_dir_all(parent)
-                    .context("failed to create ledger signer key directory")?;
-            }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .context("failed to create ledger signer key directory")?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent)
+                .context("failed to create ledger signer key directory")?;
         }
     }
 
@@ -375,8 +382,26 @@ fn load_or_create_ledger_signing_key(
                 }
             }
 
-            let key_bytes =
-                std::fs::read(&key_path).context("failed to read ledger signer key file")?;
+            let key_bytes = {
+                #[cfg(unix)]
+                {
+                    use std::io::Read;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(nix::libc::O_NOFOLLOW)
+                        .open(&key_path)
+                        .context("failed to open ledger signer key file")?;
+                    let mut buf = Vec::new();
+                    file.read_to_end(&mut buf)
+                        .context("failed to read ledger signer key file")?;
+                    buf
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::read(&key_path).context("failed to read ledger signer key file")?
+                }
+            };
             if key_bytes.len() != 32 {
                 anyhow::bail!(
                     "invalid ledger signer key file: expected 32 bytes, got {}",
@@ -2588,7 +2613,7 @@ mod crash_recovery_integration_tests {
     /// Creates an in-memory `SQLite` connection with schemas initialized.
     fn setup_sqlite() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init ledger schema");
         SqliteWorkRegistry::init_schema(&conn).expect("init work schema");
         Arc::new(Mutex::new(conn))
     }

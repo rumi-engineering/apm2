@@ -36,7 +36,7 @@ async fn test_persistence_end_to_end() {
     let conn = Connection::open(db_file.path()).unwrap();
 
     // Init schemas
-    SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
     SqliteWorkRegistry::init_schema(&conn).unwrap();
 
     let conn_arc = Arc::new(Mutex::new(conn));

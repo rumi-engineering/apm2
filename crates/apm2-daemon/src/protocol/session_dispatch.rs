@@ -11243,7 +11243,7 @@ mod tests {
         ));
         {
             let conn_guard = conn.lock().expect("sqlite lock should be available");
-            SqliteLedgerEventEmitter::init_schema(&conn_guard)
+            SqliteLedgerEventEmitter::init_schema_for_test(&conn_guard)
                 .expect("ledger schema should initialize");
         }
 
@@ -17852,7 +17852,7 @@ mod tests {
 
                 // In-memory SQLite for ledger
                 let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
-                SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+                SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init ledger schema");
                 let conn = Arc::new(std::sync::Mutex::new(conn));
                 let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
                 let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> = Arc::new(

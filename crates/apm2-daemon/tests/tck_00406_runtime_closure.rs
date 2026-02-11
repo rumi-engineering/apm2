@@ -160,7 +160,7 @@ fn spawn_episode_fails_closed_when_envelope_risk_tier_binding_invalid() {
 #[test]
 fn request_tool_taint_deny_emits_defect_recorded() {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init ledger schema");
     let conn = Arc::new(Mutex::new(conn));
 
     let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(create_sqlite_emitter(&conn));
@@ -278,7 +278,7 @@ fn request_tool_taint_deny_emits_defect_recorded() {
 #[test]
 fn divergence_watchdog_freeze_transition_persists_durably() {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-    SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+    SqliteLedgerEventEmitter::init_schema_for_test(&conn).expect("init ledger schema");
     let conn = Arc::new(Mutex::new(conn));
 
     let lifecycle_signer = Signer::generate();
