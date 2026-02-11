@@ -57,6 +57,10 @@ pub enum DeclassificationIntentScope {
     Unknown,
 }
 
+const fn default_unknown_declassification_intent_scope() -> DeclassificationIntentScope {
+    DeclassificationIntentScope::Unknown
+}
+
 /// Estimator family for typed leakage-budget receipts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,13 +237,21 @@ struct ChannelContextTokenPayloadV1 {
     capability_verified: bool,
     context_firewall_verified: bool,
     policy_ledger_verified: bool,
+    #[serde(default)]
     taint_allow: bool,
+    #[serde(default)]
     classification_allow: bool,
+    #[serde(default)]
     declass_receipt_valid: bool,
+    #[serde(default = "default_unknown_declassification_intent_scope")]
     declassification_intent: DeclassificationIntentScope,
+    #[serde(default)]
     redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
+    #[serde(default)]
     boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
+    #[serde(default)]
     leakage_budget_receipt: Option<LeakageBudgetReceipt>,
+    #[serde(default)]
     timing_channel_budget: Option<TimingChannelBudget>,
     #[serde(default)]
     leakage_budget_policy_max_bits: Option<u64>,
@@ -1378,6 +1390,44 @@ mod tests {
         )
         .expect("token should decode");
         assert_eq!(decoded, check);
+    }
+
+    #[test]
+    fn test_channel_context_token_payload_v1_deserializes_legacy_payload() {
+        let legacy_payload = serde_json::json!({
+            "source": "typed_tool_intent",
+            "lease_id": "lease-legacy-1",
+            "request_id": "REQ-LEGACY-1",
+            "issued_at_secs": 1_700_000_000_u64,
+            "expires_after_secs": CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
+            "channel_source_witness": derive_channel_source_witness(ChannelSource::TypedToolIntent),
+            "broker_verified": true,
+            "capability_verified": true,
+            "context_firewall_verified": true,
+            "policy_ledger_verified": true
+        });
+
+        let payload: ChannelContextTokenPayloadV1 =
+            serde_json::from_value(legacy_payload).expect("legacy v1 payload should deserialize");
+        assert!(
+            !payload.taint_allow && !payload.classification_allow && !payload.declass_receipt_valid,
+            "missing legacy fields must default fail-closed to false"
+        );
+        assert_eq!(
+            payload.declassification_intent,
+            DeclassificationIntentScope::Unknown
+        );
+        assert!(
+            payload.redundancy_declassification_receipt.is_none()
+                && payload.boundary_flow_policy_binding.is_none()
+                && payload.leakage_budget_receipt.is_none()
+                && payload.timing_channel_budget.is_none()
+                && payload.leakage_budget_policy_max_bits.is_none()
+                && payload.declared_leakage_budget_bits.is_none()
+                && payload.timing_budget_policy_max_ticks.is_none()
+                && payload.declared_timing_budget_ticks.is_none(),
+            "missing legacy fields must default fail-closed to None"
+        );
     }
 
     #[test]

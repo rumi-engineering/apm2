@@ -2632,13 +2632,22 @@ impl SqliteLeaseValidator {
                 payload_bytes,
                 signature,
                 appended_timestamp_i64,
-                prev_hash,
-                event_hash,
+                &prev_hash,
+                &event_hash,
             ],
         )
         .map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
             format!("failed to insert lease event: {e}")
+        })?;
+        SqliteLedgerEventEmitter::set_metadata_value(
+            &conn,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+            &event_hash,
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("failed to update hash-chain checkpoint metadata: {e}")
         })?;
 
         conn.execute("COMMIT", [])
@@ -2761,15 +2770,21 @@ impl LeaseValidator for SqliteLeaseValidator {
         // This makes `register_lease` functionally verify the ledger logic.
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
         if let Ok(conn) = self.conn.lock() {
-            let prev_hash = SqliteLedgerEventEmitter::latest_event_hash(&conn)
-                .unwrap_or_else(|_| SqliteLedgerEventEmitter::LEDGER_CHAIN_GENESIS.to_string());
-            let tip_timestamp_i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(timestamp_ns), 0) FROM ledger_events",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0);
+            if conn.execute("BEGIN IMMEDIATE", []).is_err() {
+                return;
+            }
+            let Ok(prev_hash) = SqliteLedgerEventEmitter::latest_event_hash(&conn) else {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            };
+            let Ok(tip_timestamp_i64) = conn.query_row(
+                "SELECT COALESCE(MAX(timestamp_ns), 0) FROM ledger_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            ) else {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            };
             #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             let timestamp_ns = tip_timestamp_i64 as u64;
             let payload = serde_json::json!({
@@ -2781,6 +2796,7 @@ impl LeaseValidator for SqliteLeaseValidator {
                 "prev_hash": prev_hash,
             });
             let Ok(payload_bytes) = serde_json::to_vec(&payload) else {
+                let _ = conn.execute("ROLLBACK", []);
                 return;
             };
             let signature = vec![0u8; 64]; // Dummy signature
@@ -2794,7 +2810,8 @@ impl LeaseValidator for SqliteLeaseValidator {
                 timestamp_ns,
                 prev_hash: &prev_hash,
             });
-            let _ = conn.execute(
+            if conn
+                .execute(
                 "INSERT INTO ledger_events (
                     event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -2806,10 +2823,28 @@ impl LeaseValidator for SqliteLeaseValidator {
                     payload_bytes,
                     signature,
                     tip_timestamp_i64,
-                    prev_hash,
-                    event_hash,
+                    &prev_hash,
+                    &event_hash,
                 ],
-            );
+            )
+                .is_err()
+            {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            }
+            if SqliteLedgerEventEmitter::set_metadata_value(
+                &conn,
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+                &event_hash,
+            )
+            .is_err()
+            {
+                let _ = conn.execute("ROLLBACK", []);
+                return;
+            }
+            if conn.execute("COMMIT", []).is_err() {
+                let _ = conn.execute("ROLLBACK", []);
+            }
         }
     }
 
@@ -3547,6 +3582,86 @@ mod tests {
             Some("W-WID-001"),
             "get_lease_work_id must return the stored work_id"
         );
+    }
+
+    /// Regression: lease registration updates the hash-chain checkpoint
+    /// metadata so startup checkpoint validation succeeds.
+    #[test]
+    fn sqlite_lease_validator_register_lease_with_executor_updates_checkpoint() {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        validator.register_lease_with_executor(
+            "checkpoint-lease-001",
+            "W-CHECKPOINT-001",
+            "gate-checkpoint",
+            "exec-checkpoint",
+        );
+
+        let conn_guard = conn.lock().expect("sqlite lock should be available");
+        let chain_tip = SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard)
+            .expect("chain tip derivation should succeed");
+        let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
+            &conn_guard,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+        )
+        .expect("checkpoint metadata lookup should succeed");
+        assert_eq!(
+            checkpoint.as_deref(),
+            Some(chain_tip.as_str()),
+            "register_lease_with_executor must update hash-chain checkpoint"
+        );
+        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(&conn_guard, false)
+            .expect("startup checkpoint validation should pass after lease registration");
+    }
+
+    /// Regression: full-lease registration updates hash-chain checkpoint
+    /// metadata atomically with event insertion.
+    #[test]
+    fn sqlite_lease_validator_register_full_lease_updates_checkpoint() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new(
+            "checkpoint-full-lease-001",
+            "W-CHECKPOINT-002",
+            "gate-full-checkpoint",
+        )
+        .changeset_digest([0x11; 32])
+        .executor_actor_id("exec-full-checkpoint")
+        .issued_at(1_234_567)
+        .expires_at(2_345_678)
+        .policy_hash([0x22; 32])
+        .issuer_actor_id("issuer-full-checkpoint")
+        .time_envelope_ref("htf:tick:321")
+        .build_and_sign(&signer);
+
+        validator
+            .register_full_lease(&lease)
+            .expect("register_full_lease should succeed");
+
+        let conn_guard = conn.lock().expect("sqlite lock should be available");
+        let chain_tip = SqliteLedgerEventEmitter::derive_event_chain_hash_from_db(&conn_guard)
+            .expect("chain tip derivation should succeed");
+        let checkpoint = SqliteLedgerEventEmitter::get_metadata_value(
+            &conn_guard,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+        )
+        .expect("checkpoint metadata lookup should succeed");
+        assert_eq!(
+            checkpoint.as_deref(),
+            Some(chain_tip.as_str()),
+            "register_full_lease must update hash-chain checkpoint"
+        );
+        SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(&conn_guard, false)
+            .expect("startup checkpoint validation should pass after full lease registration");
     }
 
     // ====================================================================
