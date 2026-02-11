@@ -85,6 +85,8 @@ fn valid_input() -> AuthorityJoinInputV1 {
         freshness_witness_tick: 1000,
         stop_budget_profile_digest: test_hash(0x06),
         pre_actuation_receipt_hashes: vec![],
+        leakage_witness_hash: test_hash(0x0A),
+        timing_witness_hash: test_hash(0x0B),
         risk_tier: RiskTier::Tier1,
         determinism_class: DeterminismClass::Deterministic,
         time_envelope_ref: test_hash(0x07),

@@ -54,6 +54,8 @@ fn valid_input(risk_tier: RiskTier, scope_complexity: usize, seed: u8) -> Author
         freshness_witness_tick: 1000,
         stop_budget_profile_digest: test_hash(seed.wrapping_add(0x06)),
         pre_actuation_receipt_hashes: vec![],
+        leakage_witness_hash: test_hash(seed.wrapping_add(0x09)),
+        timing_witness_hash: test_hash(seed.wrapping_add(0x0A)),
         risk_tier,
         determinism_class: DeterminismClass::Deterministic,
         time_envelope_ref: test_hash(seed.wrapping_add(0x07)),

@@ -692,10 +692,10 @@ impl InProcessKernel {
     ///
     /// Per RFC-0027 §3.1, the join hash commits to ALL required fields:
     /// session, intent, capabilities, scope witnesses, identity, freshness,
-    /// stop/budget, risk tier, determinism class, identity evidence level,
-    /// and time/ledger anchors. Omitting any field would allow an attacker
-    /// to produce colliding join hashes for semantically distinct authority
-    /// requests.
+    /// stop/budget, boundary-flow witness hashes, risk tier, determinism class,
+    /// identity evidence level, and time/ledger anchors. Omitting any field
+    /// would allow an attacker to produce colliding join hashes for
+    /// semantically distinct authority requests.
     ///
     /// # Framing
     ///
@@ -823,6 +823,17 @@ impl InProcessKernel {
         for receipt_hash in &sorted_pre_actuation_receipt_hashes {
             update_tagged_fixed(&mut hasher, b"pre_actuation_receipt_hash", receipt_hash);
         }
+        // Authoritative boundary-flow witness bindings
+        update_tagged_fixed(
+            &mut hasher,
+            b"leakage_witness_hash",
+            &input.leakage_witness_hash,
+        );
+        update_tagged_fixed(
+            &mut hasher,
+            b"timing_witness_hash",
+            &input.timing_witness_hash,
+        );
         // Risk classification
         hasher.update(b"risk_tier");
         hasher.update(&[match input.risk_tier {
@@ -1007,6 +1018,20 @@ impl AuthorityJoinKernel for InProcessKernel {
         Self::require_nonzero(
             &input.stop_budget_profile_digest,
             "stop_budget_profile_digest",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.leakage_witness_hash,
+            "leakage_witness_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.timing_witness_hash,
+            "timing_witness_hash",
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             tick,

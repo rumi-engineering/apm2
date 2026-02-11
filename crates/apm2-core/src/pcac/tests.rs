@@ -34,6 +34,8 @@ fn valid_join_input() -> AuthorityJoinInputV1 {
         freshness_witness_tick: 1000,
         stop_budget_profile_digest: test_hash(0x06),
         pre_actuation_receipt_hashes: vec![],
+        leakage_witness_hash: test_hash(0x0A),
+        timing_witness_hash: test_hash(0x0B),
         risk_tier: types::RiskTier::Tier1,
         determinism_class: types::DeterminismClass::Deterministic,
         time_envelope_ref: test_hash(0x07),
@@ -100,6 +102,8 @@ fn authority_join_input_has_all_required_fields() {
     assert_ne!(input.directory_head_hash, zero_hash());
     assert_ne!(input.freshness_policy_hash, zero_hash());
     assert_ne!(input.stop_budget_profile_digest, zero_hash());
+    assert_ne!(input.leakage_witness_hash, zero_hash());
+    assert_ne!(input.timing_witness_hash, zero_hash());
     assert_ne!(input.time_envelope_ref, zero_hash());
     assert_ne!(input.as_of_ledger_anchor, zero_hash());
 }
@@ -766,6 +770,26 @@ fn zero_stop_budget_profile_digest_denied_by_validator() {
     let err = input.validate().unwrap_err();
     assert!(
         matches!(err, types::PcacValidationError::ZeroHash { field } if field == "stop_budget_profile_digest")
+    );
+}
+
+#[test]
+fn zero_leakage_witness_hash_denied_by_validator() {
+    let mut input = valid_join_input();
+    input.leakage_witness_hash = zero_hash();
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "leakage_witness_hash")
+    );
+}
+
+#[test]
+fn zero_timing_witness_hash_denied_by_validator() {
+    let mut input = valid_join_input();
+    input.timing_witness_hash = zero_hash();
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "timing_witness_hash")
     );
 }
 
@@ -1750,6 +1774,8 @@ fn risk_tier_and_determinism_class_reexported_from_pcac_module() {
         freshness_witness_tick: 1000,
         stop_budget_profile_digest: test_hash(0x06),
         pre_actuation_receipt_hashes: vec![],
+        leakage_witness_hash: test_hash(0x0A),
+        timing_witness_hash: test_hash(0x0B),
         risk_tier: crate::pcac::RiskTier::Tier1,
         determinism_class: crate::pcac::DeterminismClass::Deterministic,
         time_envelope_ref: test_hash(0x07),

@@ -63,7 +63,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use apm2_core::channel::{
     BoundaryFlowPolicyBinding, DeclassificationIntentScope, DisclosurePolicyBinding,
@@ -100,9 +100,10 @@ use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use super::dispatch::{
-    BoundaryFlowRuntimeState, ConnectionContext, EventTypeClass, LedgerEventEmitter,
-    PrivilegedDispatcher, classify_event_type, is_governance_policy_actor,
-    is_governance_policy_event_type,
+    BoundaryFlowRuntimeState, ConnectionContext, EventTypeClass, LeakageWitnessV1,
+    LedgerEventEmitter, PrivilegedDispatcher, TimingWitnessV1, build_authoritative_witnesses,
+    classify_event_type, is_governance_policy_actor, is_governance_policy_event_type,
+    leakage_witness_hash, timing_witness_hash,
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
@@ -463,7 +464,10 @@ const MAX_ERROR_MESSAGE_LEN: usize = 256;
 const BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES: &[u8] =
     b"apm2.canonicalizer.jcs|1.0.0|dcp://apm2.cac/canonicalizer/vectors@v1";
 const DEFAULT_LEAKAGE_CONFIDENCE_LABEL: &str = "runtime-default";
+const AUTHORITATIVE_LEAKAGE_CONFIDENCE_LABEL: &str = "daemon-authoritative";
+const NON_STRICT_WAIVER_CONFIDENCE_LABEL: &str = "non-strict-waiver";
 const DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT: bool = true;
+const BOUNDARY_WITNESS_LEAKAGE_QUANTUM_BYTES: u64 = 256;
 #[cfg(test)]
 const DISCLOSURE_POLICY_MAX_AGE_NS: u64 = 86_400_000_000_000;
 
@@ -1047,6 +1051,12 @@ struct AuthoritativeRedundancyReceiptAuthority {
     receipt_hash: Hash,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BoundaryWitnessMeasurements {
+    context_elapsed_ns: u64,
+    tool_elapsed_ns: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct BoundaryFlowHints {
@@ -1091,6 +1101,7 @@ struct BoundaryDeclassificationHints {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct LeakageBudgetHints {
     leakage_bits: u64,
@@ -1102,6 +1113,7 @@ struct LeakageBudgetHints {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct TimingChannelHints {
     #[serde(rename = "observed_variance_ticks")]
@@ -2034,6 +2046,82 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn emit_non_strict_boundary_waiver_defect(
+        &self,
+        session_id: &str,
+        channel_key: &str,
+        tool_class: ToolClass,
+        waiver_hash: Hash,
+        leakage_witness: &LeakageWitnessV1,
+        timing_witness: &TimingWitnessV1,
+        fallback_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        let Some(ref ledger) = self.ledger else {
+            return Err(
+                "ledger unavailable for non-strict boundary waiver defect emission".to_string(),
+            );
+        };
+
+        let defect_id = format!("DEF-BOUNDARY-WAIVER-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+            .unwrap_or(fallback_timestamp_ns);
+        let defect_record = DefectRecord::builder(&defect_id, "BOUNDARY_FLOW_NON_STRICT_WAIVER")
+            .severity(DefectSeverity::S2)
+            .work_id(session_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::UnplannedToolCall,
+                format!(
+                    "channel={channel_key} tool_class={tool_class} waiver_hash={} leakage_bits={} timing_variance_ticks={}",
+                    hex::encode(waiver_hash),
+                    leakage_witness.measured_bits,
+                    timing_witness.observed_variance_ticks
+                ),
+            ))
+            .context(
+                HolonDefectContext::new()
+                    .with_session_id(session_id)
+                    .with_requested_stable_id(channel_key.to_string()),
+            )
+            .build()
+            .map_err(|e| format!("failed to build non-strict boundary waiver DefectRecord: {e}"))?;
+
+        let defect_json = serde_json::to_vec(&defect_record).map_err(|e| {
+            format!("failed to serialize non-strict boundary waiver DefectRecord: {e}")
+        })?;
+        let cas_hash = self.cas.as_ref().map_or_else(
+            || blake3::hash(&defect_json).as_bytes().to_vec(),
+            |cas| cas.store(&defect_json).to_vec(),
+        );
+
+        let time_envelope_uri = format!("htf:boundary-waiver:{timestamp_ns}:{channel_key}");
+        let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: "BOUNDARY_FLOW_NON_STRICT_WAIVER".to_string(),
+            cas_hash,
+            source: DefectSource::ContextMiss as i32,
+            work_id: session_id.to_string(),
+            severity: DefectSeverity::S2.as_str().to_string(),
+            detected_at: timestamp_ns,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash,
+            }),
+        };
+
+        ledger
+            .emit_defect_recorded(&defect_event, timestamp_ns)
+            .map_err(|e| format!("failed to emit non-strict boundary waiver defect: {e}"))?;
+        Ok(())
+    }
+
     fn ensure_session_terminated(&self, session_id: &str, rationale: &str) -> Result<(), String> {
         let Some(session_registry) = &self.session_registry else {
             return Err("session registry unavailable for mandatory termination".to_string());
@@ -2560,6 +2648,155 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    #[inline]
+    const fn tier_allows_non_strict_boundary_mode(risk_tier: RiskTier) -> bool {
+        matches!(risk_tier, RiskTier::Tier0 | RiskTier::Tier1)
+    }
+
+    #[inline]
+    const fn strict_boundary_witness_enforcement_for_tier(
+        &self,
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+    ) -> bool {
+        let boundary_class_enforced =
+            risk_tier.requires_sandbox() || Self::requires_channel_boundary_enforcement(tool_class);
+        boundary_class_enforced
+            && (self.strict_boundary_authority_enforcement
+                || !Self::tier_allows_non_strict_boundary_mode(risk_tier))
+    }
+
+    #[inline]
+    const fn non_strict_boundary_mode_for_tier(
+        &self,
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+    ) -> bool {
+        let boundary_class_enforced =
+            risk_tier.requires_sandbox() || Self::requires_channel_boundary_enforcement(tool_class);
+        boundary_class_enforced
+            && !self.strict_boundary_witness_enforcement_for_tier(tool_class, risk_tier)
+    }
+
+    #[inline]
+    fn elapsed_nanos(start: Instant) -> u64 {
+        u64::try_from(start.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    #[inline]
+    #[cfg(test)]
+    fn default_boundary_witness_measurements(
+        request_arguments: &[u8],
+    ) -> BoundaryWitnessMeasurements {
+        let payload_len = u64::try_from(request_arguments.len()).unwrap_or(u64::MAX);
+        // Keep defaults deterministic for unit tests that call helper
+        // construction paths directly without runtime timing hooks.
+        let fallback_elapsed_ns = payload_len.saturating_mul(1_000).max(1);
+        BoundaryWitnessMeasurements {
+            context_elapsed_ns: fallback_elapsed_ns,
+            tool_elapsed_ns: fallback_elapsed_ns,
+        }
+    }
+
+    fn derive_context_compilation_witness(
+        request_arguments: &[u8],
+        risk_tier: RiskTier,
+        elapsed_ns: u64,
+        timestamp_ns: u64,
+    ) -> Option<(LeakageWitnessV1, TimingWitnessV1)> {
+        if timestamp_ns == 0 || elapsed_ns == 0 {
+            return None;
+        }
+        Some(build_authoritative_witnesses(
+            "context_compilation",
+            request_arguments,
+            BOUNDARY_WITNESS_LEAKAGE_QUANTUM_BYTES,
+            Self::timing_budget_ticks_for_tier(risk_tier),
+            elapsed_ns,
+            timestamp_ns,
+        ))
+    }
+
+    fn derive_tool_actuation_witness(
+        request_arguments: &[u8],
+        risk_tier: RiskTier,
+        elapsed_ns: u64,
+        timestamp_ns: u64,
+    ) -> Option<(LeakageWitnessV1, TimingWitnessV1)> {
+        if timestamp_ns == 0 || elapsed_ns == 0 {
+            return None;
+        }
+        Some(build_authoritative_witnesses(
+            "tool_actuation",
+            request_arguments,
+            BOUNDARY_WITNESS_LEAKAGE_QUANTUM_BYTES,
+            Self::timing_budget_ticks_for_tier(risk_tier),
+            elapsed_ns,
+            timestamp_ns,
+        ))
+    }
+
+    fn aggregate_boundary_witnesses(
+        context_witness: &(LeakageWitnessV1, TimingWitnessV1),
+        tool_witness: &(LeakageWitnessV1, TimingWitnessV1),
+        risk_tier: RiskTier,
+        timestamp_ns: u64,
+    ) -> (LeakageWitnessV1, TimingWitnessV1) {
+        let leakage = LeakageWitnessV1 {
+            measurement_method: "daemon_boundary_context_tool_aggregate_v1".to_string(),
+            measured_bits: context_witness
+                .0
+                .measured_bits
+                .saturating_add(tool_witness.0.measured_bits),
+            confidence: context_witness.0.confidence.min(tool_witness.0.confidence),
+            timestamp: timestamp_ns,
+        };
+        let timing = TimingWitnessV1 {
+            measurement_method: "daemon_boundary_context_tool_aggregate_v1".to_string(),
+            observed_variance_ticks: context_witness
+                .1
+                .observed_variance_ticks
+                .max(tool_witness.1.observed_variance_ticks),
+            baseline_ticks: Self::timing_budget_ticks_for_tier(risk_tier),
+            confidence: context_witness.1.confidence.min(tool_witness.1.confidence),
+            timestamp: timestamp_ns,
+        };
+        (leakage, timing)
+    }
+
+    #[inline]
+    const fn runtime_tier_from_pcac(risk_tier: apm2_core::pcac::RiskTier) -> RiskTier {
+        match risk_tier {
+            apm2_core::pcac::RiskTier::Tier0 => RiskTier::Tier0,
+            apm2_core::pcac::RiskTier::Tier1 => RiskTier::Tier1,
+            _ => RiskTier::Tier2,
+        }
+    }
+
+    fn derive_waived_boundary_witnesses(
+        risk_tier: RiskTier,
+        timestamp_ns: u64,
+    ) -> (LeakageWitnessV1, TimingWitnessV1) {
+        let leakage_budget = Self::leakage_budget_bits_for_tier(risk_tier);
+        let timing_budget = Self::timing_budget_ticks_for_tier(risk_tier);
+        let leakage = LeakageWitnessV1 {
+            measurement_method: "daemon_boundary_non_strict_waiver_v1".to_string(),
+            measured_bits: leakage_budget,
+            confidence: 5_000,
+            timestamp: timestamp_ns.max(1),
+        };
+        let timing = TimingWitnessV1 {
+            measurement_method: "daemon_boundary_non_strict_waiver_v1".to_string(),
+            observed_variance_ticks: timing_budget,
+            baseline_ticks: timing_budget,
+            confidence: 5_000,
+            timestamp: timestamp_ns.max(1),
+        };
+        (leakage, timing)
+    }
+
     const fn taint_allow_for_tier(risk_tier: RiskTier, level: RuntimeTaintLevel) -> bool {
         if risk_tier.requires_sandbox() {
             matches!(
@@ -2784,71 +3021,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    const fn conservative_authoritative_leakage_budget_bits(tool_class: ToolClass) -> u64 {
-        match tool_class {
-            ToolClass::Read | ToolClass::ListFiles => 0,
-            ToolClass::Execute | ToolClass::Network => 1_024,
-            ToolClass::Write | ToolClass::Git => 256,
-            _ => 512,
-        }
-    }
-
-    const fn conservative_authoritative_timing_budget_ticks(tool_class: ToolClass) -> u64 {
-        match tool_class {
-            ToolClass::Read | ToolClass::ListFiles => 100,
-            ToolClass::Execute | ToolClass::Network => 10_000,
-            _ => 1_000,
-        }
-    }
-
-    fn resolve_authoritative_leakage_budget_receipt(
-        tool_class: ToolClass,
-        risk_tier: RiskTier,
-        claimed_budget_bits: Option<u64>,
-    ) -> LeakageBudgetReceipt {
-        let policy_budget_bits = Self::leakage_budget_bits_for_tier(risk_tier);
-        let conservative_budget_bits =
-            Self::conservative_authoritative_leakage_budget_bits(tool_class);
-        let authoritative_budget_bits = conservative_budget_bits.min(policy_budget_bits).max(1);
-        let effective_budget_bits = claimed_budget_bits
-            .map_or(authoritative_budget_bits, |claimed| {
-                claimed.min(authoritative_budget_bits)
-            });
-
-        LeakageBudgetReceipt {
-            leakage_bits: if conservative_budget_bits == 0 {
-                0
-            } else {
-                authoritative_budget_bits
-            },
-            budget_bits: effective_budget_bits,
-            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
-            confidence_bps: 10_000,
-            confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
-        }
-    }
-
-    fn resolve_authoritative_timing_channel_budget(
-        tool_class: ToolClass,
-        risk_tier: RiskTier,
-        claimed_budget_ticks: Option<u64>,
-    ) -> TimingChannelBudget {
-        let policy_budget_ticks = Self::timing_budget_ticks_for_tier(risk_tier);
-        let conservative_budget_ticks =
-            Self::conservative_authoritative_timing_budget_ticks(tool_class);
-        let authoritative_budget_ticks = conservative_budget_ticks.min(policy_budget_ticks).max(1);
-        let effective_budget_ticks = claimed_budget_ticks
-            .map_or(authoritative_budget_ticks, |claimed| {
-                claimed.min(authoritative_budget_ticks)
-            });
-
-        TimingChannelBudget {
-            release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
-            observed_variance_ticks: authoritative_budget_ticks,
-            budget_ticks: effective_budget_ticks,
-        }
-    }
-
     fn redundancy_receipt_available_for_intent(
         &self,
         receipt_id: &str,
@@ -3046,6 +3218,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         })
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn build_boundary_flow_runtime_state(
         &self,
@@ -3064,11 +3237,54 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // When None, no ledger-rooted policy authority was established.
         authoritative_policy_root_digest: Option<Hash>,
     ) -> Result<BoundaryFlowRuntimeState, String> {
+        self.build_boundary_flow_runtime_state_with_measurements(
+            session_id,
+            lease_id,
+            request_id,
+            tool_class,
+            decision,
+            risk_tier,
+            taint_assessment,
+            request_arguments,
+            current_time_ns,
+            authoritative_policy_root_digest,
+            Self::default_boundary_witness_measurements(request_arguments),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_boundary_flow_runtime_state_with_measurements(
+        &self,
+        session_id: &str,
+        lease_id: &str,
+        request_id: &str,
+        tool_class: ToolClass,
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+        risk_tier: Option<RiskTier>,
+        taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
+        request_arguments: &[u8],
+        current_time_ns: u64,
+        authoritative_policy_root_digest: Option<Hash>,
+        measurements: BoundaryWitnessMeasurements,
+        non_strict_waiver_hash: Option<Hash>,
+    ) -> Result<BoundaryFlowRuntimeState, String> {
         let risk_tier = risk_tier.unwrap_or(RiskTier::Tier4);
-        let strict_boundary_enforcement = self.strict_boundary_authority_enforcement
-            && (risk_tier.requires_sandbox()
-                || Self::requires_channel_boundary_enforcement(tool_class));
+        let strict_boundary_enforcement =
+            self.strict_boundary_witness_enforcement_for_tier(tool_class, risk_tier);
+        let non_strict_boundary_mode =
+            self.non_strict_boundary_mode_for_tier(tool_class, risk_tier);
         let hints = Self::extract_boundary_flow_hints(request_arguments)?;
+        if strict_boundary_enforcement
+            && hints.as_ref().is_some_and(|hints| {
+                hints.leakage_budget_receipt.is_some() || hints.timing_channel.is_some()
+            })
+        {
+            return Err(
+                "client-provided leakage/timing hints are not accepted in enforcement tiers"
+                    .to_string(),
+            );
+        }
         let base_taint_allow = Self::taint_allow_for_tier(risk_tier, taint_assessment.tag.level);
         let base_classification_allow =
             Self::confidentiality_rank_for_taint(taint_assessment.tag.level)
@@ -3137,70 +3353,121 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .as_ref()
             .and_then(|hints| hints.leakage_budget_receipt.as_ref())
             .map(|hint| hint.budget_bits);
-        let leakage_budget_receipt = if strict_boundary_enforcement {
-            Self::resolve_authoritative_leakage_budget_receipt(
-                tool_class,
-                risk_tier,
-                claimed_leakage_budget_bits,
-            )
-        } else {
-            hints
-                .as_ref()
-                .and_then(|hints| hints.leakage_budget_receipt.as_ref())
-                .map_or_else(
-                    || LeakageBudgetReceipt {
-                        leakage_bits: 0,
-                        budget_bits: policy_leakage_budget_bits,
-                        estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
-                        confidence_bps: 10_000,
-                        confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
-                    },
-                    |hint| LeakageBudgetReceipt {
-                        leakage_bits: hint.leakage_bits,
-                        budget_bits: hint.budget_bits.min(policy_leakage_budget_bits),
-                        estimator_family: hint.estimator_family,
-                        confidence_bps: hint.confidence_bps,
-                        confidence_label: hint
-                            .confidence_label
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string()),
-                    },
-                )
-        };
-
         let policy_timing_budget_ticks = Self::timing_budget_ticks_for_tier(risk_tier);
         let claimed_timing_budget_ticks = hints
             .as_ref()
             .and_then(|hints| hints.timing_channel.as_ref())
             .map(|hint| hint.budget);
-        let timing_channel_budget = if strict_boundary_enforcement {
-            Self::resolve_authoritative_timing_channel_budget(
-                tool_class,
-                risk_tier,
-                claimed_timing_budget_ticks,
-            )
-        } else {
-            hints
-                .as_ref()
-                .and_then(|hints| hints.timing_channel.as_ref())
-                .map_or_else(
-                    || TimingChannelBudget {
-                        release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
-                        observed_variance_ticks: 0,
-                        budget_ticks: policy_timing_budget_ticks,
-                    },
-                    |hint| TimingChannelBudget {
-                        release_bucket_ticks: hint.release_bucket,
-                        observed_variance_ticks: hint.observed_variance,
-                        budget_ticks: hint.budget.min(policy_timing_budget_ticks),
-                    },
+        let context_witness = Self::derive_context_compilation_witness(
+            request_arguments,
+            risk_tier,
+            measurements.context_elapsed_ns,
+            current_time_ns,
+        );
+        let tool_witness = Self::derive_tool_actuation_witness(
+            request_arguments,
+            risk_tier,
+            measurements.tool_elapsed_ns,
+            current_time_ns,
+        );
+        let ((leakage_witness, timing_witness), clamp_for_non_strict) =
+            if strict_boundary_enforcement {
+                let Some(context_witness) = context_witness.as_ref() else {
+                    return Err(
+                        "missing authoritative context-compilation witness (fail-closed)"
+                            .to_string(),
+                    );
+                };
+                let Some(tool_witness) = tool_witness.as_ref() else {
+                    return Err(
+                        "missing authoritative tool-actuation witness (fail-closed)".to_string()
+                    );
+                };
+                (
+                    Self::aggregate_boundary_witnesses(
+                        context_witness,
+                        tool_witness,
+                        risk_tier,
+                        current_time_ns,
+                    ),
+                    false,
                 )
+            } else if non_strict_boundary_mode {
+                let Some(_waiver_hash) = non_strict_waiver_hash else {
+                    return Err(
+                        "Tier0-Tier1 non-strict mode requires explicit waiver binding".to_string(),
+                    );
+                };
+                let aggregate = match (context_witness.as_ref(), tool_witness.as_ref()) {
+                    (Some(context_witness), Some(tool_witness)) => {
+                        Self::aggregate_boundary_witnesses(
+                            context_witness,
+                            tool_witness,
+                            risk_tier,
+                            current_time_ns.max(1),
+                        )
+                    },
+                    _ => Self::derive_waived_boundary_witnesses(risk_tier, current_time_ns),
+                };
+                (aggregate, true)
+            } else {
+                (
+                    Self::derive_waived_boundary_witnesses(risk_tier, current_time_ns),
+                    false,
+                )
+            };
+        let leakage_budget_receipt = LeakageBudgetReceipt {
+            leakage_bits: if clamp_for_non_strict {
+                leakage_witness
+                    .measured_bits
+                    .min(policy_leakage_budget_bits)
+            } else {
+                leakage_witness.measured_bits
+            },
+            budget_bits: policy_leakage_budget_bits,
+            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+            confidence_bps: leakage_witness.confidence,
+            confidence_label: if strict_boundary_enforcement {
+                AUTHORITATIVE_LEAKAGE_CONFIDENCE_LABEL.to_string()
+            } else if non_strict_boundary_mode {
+                NON_STRICT_WAIVER_CONFIDENCE_LABEL.to_string()
+            } else {
+                DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string()
+            },
         };
+        let timing_channel_budget = TimingChannelBudget {
+            release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
+            observed_variance_ticks: if clamp_for_non_strict {
+                timing_witness
+                    .observed_variance_ticks
+                    .min(policy_timing_budget_ticks)
+            } else {
+                timing_witness.observed_variance_ticks
+            },
+            budget_ticks: policy_timing_budget_ticks,
+        };
+        let effective_policy_root_digest = if non_strict_boundary_mode {
+            authoritative_policy_root_digest
+                .filter(|hash| *hash != [0u8; 32])
+                .or_else(|| {
+                    Self::presented_policy_digest(decision).filter(|hash| *hash != [0u8; 32])
+                })
+                .or(non_strict_waiver_hash)
+        } else {
+            authoritative_policy_root_digest
+        };
+        let mut policy_binding =
+            Self::derive_policy_binding(decision, effective_policy_root_digest);
+        if non_strict_boundary_mode {
+            let fallback_digest = effective_policy_root_digest.unwrap_or([0x55; 32]);
+            policy_binding.policy_digest = fallback_digest;
+            policy_binding.admitted_policy_root_digest = fallback_digest;
+        }
         let disclosure_policy_binding = self.resolve_disclosure_policy_binding(
             tool_class,
             risk_tier,
             hints.as_ref(),
-            authoritative_policy_root_digest,
+            effective_policy_root_digest,
             current_time_ns,
         );
 
@@ -3210,8 +3477,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             declass_receipt_valid,
             declassification_intent,
             redundancy_declassification_receipt: redundancy_receipt,
-            policy_binding: Self::derive_policy_binding(decision, authoritative_policy_root_digest),
+            policy_binding,
+            leakage_witness,
             leakage_budget_receipt,
+            timing_witness,
             timing_channel_budget,
             disclosure_policy_binding,
             leakage_budget_policy_max_bits: policy_leakage_budget_bits,
@@ -5159,6 +5428,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     reason: format!("invalid RequestToolRequest: {e}"),
                 }
             })?;
+        let boundary_context_started = Instant::now();
 
         // INV-SESS-001: Validate session token
         let token = match self.validate_token(&request.session_token) {
@@ -5832,6 +6102,28 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "PCAC authority denied: risk tier missing from capability policy (fail-closed)",
                 ));
             };
+            let runtime_risk_tier = Self::runtime_tier_from_pcac(risk_tier);
+            let strict_boundary_join_enforcement =
+                self.strict_boundary_witness_enforcement_for_tier(tool_class, runtime_risk_tier);
+            let non_strict_boundary_join_mode =
+                self.non_strict_boundary_mode_for_tier(tool_class, runtime_risk_tier);
+            let non_strict_boundary_waiver_hash = pcac_policy
+                .pointer_only_waiver
+                .as_ref()
+                .map(apm2_core::pcac::PointerOnlyWaiver::content_hash);
+            if non_strict_boundary_join_mode && non_strict_boundary_waiver_hash.is_none() {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    risk_tier = ?runtime_risk_tier,
+                    "PCAC denied: Tier0-Tier1 non-strict boundary mode requires explicit waiver binding"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: Tier0-Tier1 non-strict boundary mode requires explicit waiver binding",
+                ));
+            }
+            let context_compilation_elapsed_ns = Self::elapsed_nanos(boundary_context_started);
 
             let directory_head_hash =
                 *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
@@ -5902,6 +6194,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             };
+            if strict_boundary_join_enforcement
+                && boundary_hints.as_ref().is_some_and(|hints| {
+                    hints.leakage_budget_receipt.is_some() || hints.timing_channel.is_some()
+                })
+            {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    "PCAC denied: client-provided leakage/timing hints are disallowed in enforcement tiers"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: client-provided leakage/timing hints are disallowed in enforcement tiers",
+                ));
+            }
 
             let redundancy_receipt_authority = match boundary_hints
                 .as_ref()
@@ -6029,6 +6336,33 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             if let Some(authority) = &redundancy_receipt_authority {
                 scope_witness_hashes.push(authority.receipt_hash);
             }
+            let join_context_witness = Self::derive_context_compilation_witness(
+                &request.arguments,
+                runtime_risk_tier,
+                context_compilation_elapsed_ns,
+                hlc.wall_ns,
+            );
+            let (join_leakage_witness, join_timing_witness) = if let Some(witnesses) =
+                join_context_witness
+            {
+                witnesses
+            } else if strict_boundary_join_enforcement {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    "PCAC denied: authoritative boundary witnesses missing at join time"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: authoritative boundary witnesses missing at join time (fail-closed)",
+                ));
+            } else {
+                Self::derive_waived_boundary_witnesses(runtime_risk_tier, hlc.wall_ns)
+            };
+            let join_leakage_witness_hash = leakage_witness_hash(&join_leakage_witness);
+            let join_timing_witness_hash = timing_witness_hash(&join_timing_witness);
+            scope_witness_hashes.push(join_leakage_witness_hash);
+            scope_witness_hashes.push(join_timing_witness_hash);
 
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
                 session_id: token.session_id.clone(),
@@ -6046,6 +6380,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 freshness_witness_tick,
                 stop_budget_profile_digest,
                 pre_actuation_receipt_hashes: pre_actuation_receipt_hashes.clone(),
+                leakage_witness_hash: join_leakage_witness_hash,
+                timing_witness_hash: join_timing_witness_hash,
                 risk_tier,
                 determinism_class,
                 time_envelope_ref,
@@ -6546,6 +6882,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // Call broker.request() asynchronously using tokio runtime
+        let tool_actuation_started = Instant::now();
         let broker_response = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async {
@@ -6554,6 +6891,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     .await
             })
         });
+        let tool_actuation_elapsed_ns = Self::elapsed_nanos(tool_actuation_started);
+        let context_compilation_elapsed_ns = Self::elapsed_nanos(boundary_context_started);
         let (decision, defects, verified_content, toctou_verification_required): (
             Result<ToolDecision, crate::episode::BrokerError>,
             Vec<FirewallViolationDefect>,
@@ -6578,6 +6917,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Self::enforce_mandatory_defect_termination(decision, &token.session_id, &defects);
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
+        let mut deferred_non_strict_boundary_waiver_defect: Option<(
+            Hash,
+            LeakageWitnessV1,
+            TimingWitnessV1,
+        )> = None;
         let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class)
             && matches!(
                 &decision,
@@ -6593,9 +6937,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 authoritative_policy_root_digest,
             );
             if !policy_ledger_verified
-                && self.strict_boundary_authority_enforcement
-                && (risk_tier.requires_sandbox()
-                    || Self::requires_channel_boundary_enforcement(tool_class))
+                && self.strict_boundary_witness_enforcement_for_tier(tool_class, risk_tier)
             {
                 warn!(
                     session_id = %token.session_id,
@@ -6611,32 +6953,61 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
-            let boundary_flow_state = match self.build_boundary_flow_runtime_state(
-                &token.session_id,
-                &token.lease_id,
-                &request_id,
-                tool_class,
-                &decision,
-                Some(risk_tier),
-                &taint_assessment,
-                &request_arguments,
-                timestamp_ns,
-                authoritative_policy_root_digest,
-            ) {
+            let non_strict_waiver_hash = self
+                .session_registry
+                .as_ref()
+                .and_then(|registry| registry.get_session(&token.session_id))
+                .and_then(|session| {
+                    session
+                        .pointer_only_waiver
+                        .as_ref()
+                        .map(apm2_core::pcac::PointerOnlyWaiver::content_hash)
+                });
+            let boundary_flow_state = match self
+                .build_boundary_flow_runtime_state_with_measurements(
+                    &token.session_id,
+                    &token.lease_id,
+                    &request_id,
+                    tool_class,
+                    &decision,
+                    Some(risk_tier),
+                    &taint_assessment,
+                    &request_arguments,
+                    timestamp_ns,
+                    authoritative_policy_root_digest,
+                    BoundaryWitnessMeasurements {
+                        context_elapsed_ns: context_compilation_elapsed_ns,
+                        tool_elapsed_ns: tool_actuation_elapsed_ns,
+                    },
+                    non_strict_waiver_hash,
+                ) {
                 Ok(state) => state,
                 Err(error) => {
                     warn!(
                         session_id = %token.session_id,
                         tool_class = %tool_class,
                         error = %error,
-                        "RequestTool denied: invalid boundary-flow hints"
+                        "RequestTool denied: boundary-flow witness resolution failed"
                     );
                     return Ok(SessionResponse::error(
                         SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("boundary flow hint parse failed: {error}"),
+                        format!("boundary flow witness resolution failed: {error}"),
                     ));
                 },
             };
+            if self.non_strict_boundary_mode_for_tier(tool_class, risk_tier) {
+                let Some(waiver_hash) = non_strict_waiver_hash else {
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "Tier0-Tier1 non-strict boundary mode requires explicit waiver binding",
+                    ));
+                };
+                deferred_non_strict_boundary_waiver_defect = Some((
+                    waiver_hash,
+                    boundary_flow_state.leakage_witness.clone(),
+                    boundary_flow_state.timing_witness.clone(),
+                ));
+            }
 
             match channel_boundary_dispatcher()
                 .validate_channel_boundary_and_issue_context_token_with_flow(
@@ -6802,6 +7173,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         "session terminated: CONTEXT_FIREWALL_VIOLATION".to_string(),
                     ));
                 }
+            }
+        }
+
+        if let Some((waiver_hash, leakage_witness, timing_witness)) =
+            deferred_non_strict_boundary_waiver_defect
+        {
+            if let Err(error) = self.emit_non_strict_boundary_waiver_defect(
+                &token.session_id,
+                &boundary_channel_key,
+                tool_class,
+                waiver_hash,
+                &leakage_witness,
+                &timing_witness,
+                timestamp_ns,
+            ) {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    error = %error,
+                    "non-strict boundary waiver defect emission failed (out-of-band telemetry)"
+                );
             }
         }
 
@@ -8079,7 +8471,62 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // Store artifact in CAS
+        let evidence_publish_started = Instant::now();
         let hash = cas.store(&request.artifact);
+        let evidence_publish_elapsed_ns = Self::elapsed_nanos(evidence_publish_started);
+        if let Some(timestamp_ns) = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+        {
+            let (leakage_witness, timing_witness) = build_authoritative_witnesses(
+                "evidence_publish",
+                &request.artifact,
+                BOUNDARY_WITNESS_LEAKAGE_QUANTUM_BYTES,
+                Self::timing_budget_ticks_for_tier(RiskTier::Tier1),
+                evidence_publish_elapsed_ns,
+                timestamp_ns,
+            );
+            debug!(
+                session_id = %token.session_id,
+                leakage_witness_hash = %hex::encode(leakage_witness_hash(&leakage_witness)),
+                timing_witness_hash = %hex::encode(timing_witness_hash(&timing_witness)),
+                "boundary-flow evidence publish witness measured"
+            );
+            if let Some(ref ledger) = self.ledger {
+                let payload = serde_json::json!({
+                    "hook": "evidence_publish",
+                    "leakage_witness": leakage_witness,
+                    "timing_witness": timing_witness,
+                    "leakage_witness_hash": hex::encode(leakage_witness_hash(&leakage_witness)),
+                    "timing_witness_hash": hex::encode(timing_witness_hash(&timing_witness)),
+                });
+                match serde_json::to_vec(&payload) {
+                    Ok(payload_bytes) => {
+                        if let Err(error) = ledger.emit_session_event(
+                            &token.session_id,
+                            "pcac_evidence_publish_witness",
+                            &payload_bytes,
+                            &token.session_id,
+                            timestamp_ns,
+                        ) {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %error,
+                                "evidence-publish witness emission failed"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        warn!(
+                            session_id = %token.session_id,
+                            error = %error,
+                            "evidence-publish witness payload serialization failed"
+                        );
+                    },
+                }
+            }
+        }
 
         // Build storage path using hash prefix sharding (consistent with DurableCas)
         let hex_hash = hex::encode(hash);
@@ -10642,9 +11089,14 @@ mod tests {
 
             manifest_store.register("session-001", tier3_manifest.clone());
 
-            let broker = Arc::new(ToolBroker::new(
-                ToolBrokerConfig::default().without_policy_check(),
-            ));
+            let mut broker = ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
+            broker
+                .set_policy_from_tool_allowlist(
+                    "boundary-non-strict-tier0-policy",
+                    &[ToolClass::Inference],
+                )
+                .expect("tier0 non-strict test policy should configure");
+            let broker = Arc::new(broker);
             broker
                 .initialize_with_manifest(tier3_manifest)
                 .await
@@ -10693,6 +11145,11 @@ mod tests {
                     .expect("default clock should initialize"),
             );
             let authoritative_policy_hash = broker.active_policy_hash();
+            assert_ne!(
+                authoritative_policy_hash,
+                [0u8; 32],
+                "non-strict waiver test requires non-zero authoritative policy hash"
+            );
             let governance_ledger = crate::protocol::dispatch::StubLedgerEventEmitter::new();
             let governance_payload = serde_json::to_vec(
                 &crate::gate::GateOrchestratorEvent::PolicyResolved {
@@ -11366,6 +11823,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments_b,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("intent-mismatch boundary-flow runtime state should build");
@@ -11411,22 +11869,40 @@ mod tests {
             )
             .expect("boundary-flow runtime state should build");
         let leakage_budget = &boundary_flow_state.leakage_budget_receipt;
-        assert_eq!(
-            leakage_budget.leakage_bits, 24,
-            "strict authoritative leakage witness should use conservative Tier0 budget",
+        assert!(
+            leakage_budget.leakage_bits > 0,
+            "strict authoritative leakage witness must carry measured non-zero leakage bits",
+        );
+        assert!(
+            leakage_budget.leakage_bits <= leakage_budget.budget_bits,
+            "strict authoritative measured leakage must remain within budget on happy path",
         );
         assert_eq!(
             leakage_budget.budget_bits, 24,
-            "strict authoritative leakage witness should enforce policy-bounded budget",
+            "strict authoritative leakage witness must enforce Tier0 policy budget ceiling",
         );
         let timing_budget = &boundary_flow_state.timing_channel_budget;
-        assert_eq!(
-            timing_budget.observed_variance_ticks, 20,
-            "strict authoritative timing witness should use conservative Tier0 budget",
+        assert!(
+            timing_budget.observed_variance_ticks > 0,
+            "strict authoritative timing witness must carry measured non-zero variance",
+        );
+        assert!(
+            timing_budget.observed_variance_ticks <= timing_budget.budget_ticks,
+            "strict authoritative measured timing must remain within budget on happy path",
         );
         assert_eq!(
             timing_budget.budget_ticks, 20,
-            "strict authoritative timing witness should enforce policy-bounded budget",
+            "strict authoritative timing witness must enforce Tier0 policy budget ceiling",
+        );
+        assert_eq!(
+            boundary_flow_state.leakage_witness.measurement_method,
+            "daemon_boundary_context_tool_aggregate_v1",
+            "strict path must use daemon-side aggregate boundary witness method",
+        );
+        assert_eq!(
+            boundary_flow_state.timing_witness.measurement_method,
+            "daemon_boundary_context_tool_aggregate_v1",
+            "strict path must use daemon-side aggregate timing witness method",
         );
 
         let signer = apm2_core::crypto::Signer::generate();
@@ -11445,12 +11921,57 @@ mod tests {
             );
         assert!(
             result.is_ok(),
-            "strict mode with conservative authoritative witnesses must allow bounded requests"
+            "strict mode with measured authoritative witnesses must allow bounded requests"
         );
     }
 
     #[test]
-    fn test_forged_low_boundary_flow_hints_rejected_against_authoritative_budgets() {
+    fn test_empty_request_arguments_use_strict_authoritative_witnesses() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
+        let policy_hash = [0x42; 32];
+        let request_id = "REQ-EMPTY-ARGS";
+        let decision = Ok(ToolDecision::Allow {
+            request_id: request_id.to_string(),
+            capability_id: "cap-read-tier3".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let request_arguments = Vec::new();
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+        let boundary_flow_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                "session-001",
+                "lease-001",
+                request_id,
+                ToolClass::Read,
+                &decision,
+                Some(RiskTier::Tier3),
+                &taint_assessment,
+                &request_arguments,
+                1_700_000_000_000_000_001,
+                Some(policy_hash),
+            )
+            .expect("strict boundary-flow runtime state should build for empty request arguments");
+
+        assert_eq!(
+            boundary_flow_state.leakage_budget_receipt.leakage_bits, 0,
+            "empty request arguments must produce authoritative zero-bit leakage witness",
+        );
+        assert!(
+            boundary_flow_state
+                .timing_witness
+                .measurement_method
+                .contains("daemon_boundary_context_tool_aggregate_v1"),
+            "strict Tier2+ requests with empty arguments must keep authoritative timing witnesses present",
+        );
+    }
+
+    #[test]
+    fn test_client_provided_leakage_and_timing_hints_rejected_in_enforcement_tiers() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
             .with_strict_boundary_authority_enforcement(true);
         let policy_hash = [0x52; 32];
@@ -11482,7 +12003,7 @@ mod tests {
         .expect("arguments serialization");
         let taint_assessment =
             evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
-        let boundary_flow_state = dispatcher
+        let error = dispatcher
             .build_boundary_flow_runtime_state(
                 "session-001",
                 "lease-001",
@@ -11495,38 +12016,51 @@ mod tests {
                 1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
-            .expect("boundary-flow runtime state should build");
-
-        let signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
-            .validate_channel_boundary_and_issue_context_token_with_flow(
-                &signer,
-                "lease-001",
-                "REQ-FORGED-LOW",
-                1_700_000_000,
-                &ToolClass::Inference,
-                true,
-                true,
-                true,
-                true,
-                boundary_flow_state,
+            .expect_err(
+                "enforcement tiers must reject client-provided leakage/timing hints outright",
             );
-        let defects = result.expect_err(
-            "forged low boundary-flow hints must be rejected against authoritative budgets",
-        );
         assert!(
-            defects.iter().any(|defect| {
-                defect.violation_class
-                    == apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
-            }),
-            "forged low leakage hints must trigger leakage-budget defects: {defects:?}",
+            error.contains("client-provided leakage/timing hints are not accepted"),
+            "strict enforcement must reject client-provided hints: {error}",
         );
+    }
+
+    #[test]
+    fn test_missing_authoritative_witnesses_denied_in_enforcement_tiers() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
+        let policy_hash = [0x53; 32];
+        let decision = Ok(ToolDecision::Allow {
+            request_id: "REQ-MISSING-WITNESS".to_string(),
+            capability_id: "cap-inference-tier3".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let request_arguments = serde_json::to_vec(&serde_json::json!({
+            "prompt": "enforcement-path",
+        }))
+        .expect("arguments serialization");
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+        let error = dispatcher
+            .build_boundary_flow_runtime_state(
+                "session-001",
+                "lease-001",
+                "REQ-MISSING-WITNESS",
+                ToolClass::Inference,
+                &decision,
+                Some(RiskTier::Tier3),
+                &taint_assessment,
+                &request_arguments,
+                0,
+                Some(policy_hash),
+            )
+            .expect_err("strict enforcement must deny missing authoritative witnesses");
         assert!(
-            defects.iter().any(|defect| {
-                defect.violation_class
-                    == apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
-            }),
-            "forged low timing hints must trigger timing-budget defects: {defects:?}",
+            error.contains("missing authoritative"),
+            "strict enforcement must fail-closed when witnesses are missing: {error}",
         );
     }
 
@@ -12033,7 +12567,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inflated_leakage_budget_claim_is_clamped_and_quarantines_boundary_channel() {
+    fn test_measured_leakage_overrun_quarantines_boundary_channel() {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
@@ -12135,20 +12669,12 @@ mod tests {
                 .with_stop_authority(authority)
                 .with_pcac_lifecycle_gate(pcac_gate);
 
+            let leakage_overrun_prompt = "L".repeat(32_768);
             let leakage_overrun_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
                 tool_id: "inference".to_string(),
                 arguments: serde_json::to_vec(&serde_json::json!({
-                    "prompt": "hello",
-                    "boundary_flow": {
-                        "leakage_budget_receipt": {
-                            "leakage_bits": 64,
-                            "budget_bits": 999_999,
-                            "estimator_family": "mutual_information_upper_bound",
-                            "confidence_bps": 9200,
-                            "confidence_label": "adversarial-overrun"
-                        }
-                    }
+                    "prompt": leakage_overrun_prompt,
                 }))
                 .expect("arguments serialization"),
                 dedupe_key: "boundary-leakage-overrun".to_string(),
@@ -12169,18 +12695,7 @@ mod tests {
                     );
                     assert!(
                         err.message.contains("leakage_budget_exceeded"),
-                        "leakage overrun denial must include leakage defect: {}",
-                        err.message
-                    );
-                    assert!(
-                        err.message
-                            .contains("declared leakage budget exceeds policy ceiling"),
-                        "inflated leakage budget must be rejected against policy ceilings: {}",
-                        err.message
-                    );
-                    assert!(
-                        err.message.contains("policy_max_bits=24"),
-                        "leakage policy ceiling must clamp to Tier0 max (24 bits): {}",
+                        "measured leakage overrun denial must include leakage defect: {}",
                         err.message
                     );
                 },
@@ -12222,7 +12737,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inflated_timing_budget_claim_is_clamped_and_quarantines_boundary_channel() {
+    fn test_measured_timing_overrun_quarantines_boundary_channel() {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
@@ -12324,18 +12839,12 @@ mod tests {
                 .with_stop_authority(authority)
                 .with_pcac_lifecycle_gate(pcac_gate);
 
+            let timing_overrun_prompt = "T".repeat(2_800);
             let timing_overrun_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
                 tool_id: "inference".to_string(),
                 arguments: serde_json::to_vec(&serde_json::json!({
-                    "prompt": "hello",
-                    "boundary_flow": {
-                        "timing_channel": {
-                            "observed_variance_ticks": 40,
-                            "budget_ticks": 999_999,
-                            "release_bucket_ticks": 8
-                        }
-                    }
+                    "prompt": timing_overrun_prompt,
                 }))
                 .expect("arguments serialization"),
                 dedupe_key: "boundary-timing-overrun".to_string(),
@@ -12356,18 +12865,7 @@ mod tests {
                     );
                     assert!(
                         err.message.contains("timing_channel_budget_exceeded"),
-                        "timing overrun denial must include timing defect: {}",
-                        err.message
-                    );
-                    assert!(
-                        err.message
-                            .contains("declared timing budget exceeds policy ceiling"),
-                        "inflated timing budget must be rejected against policy ceilings: {}",
-                        err.message
-                    );
-                    assert!(
-                        err.message.contains("policy_max_ticks=20"),
-                        "timing policy ceiling must clamp to Tier0 max (20 ticks): {}",
+                        "measured timing overrun denial must include timing defect: {}",
                         err.message
                     );
                 },
@@ -12405,6 +12903,693 @@ mod tests {
                 },
                 other => panic!("expected quarantined channel deny, got: {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn test_tier0_non_strict_mode_with_waiver_passes_and_emits_defect() {
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let token = test_token(&minter);
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest =
+                tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Inference]);
+            manifest_store.register("session-001", manifest.clone());
+
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
+            broker
+                .initialize_with_manifest(manifest)
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-BOUNDARY-NON-STRICT".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-non-strict".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some("session-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: Some(apm2_core::pcac::PointerOnlyWaiver {
+                        waiver_id: "WVR-BOUNDARY-TIER0-NON-STRICT".to_string(),
+                        expires_at_tick: u64::MAX / 2,
+                        scope_binding_hash: [0x7Au8; 32],
+                    }),
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        duration.as_nanos() as u64
+                    }
+                })
+                .unwrap_or(1);
+            telemetry
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_ledger = Arc::new(crate::protocol::dispatch::StubLedgerEventEmitter::new());
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-NON-STRICT".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            governance_ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger: Arc<dyn LedgerEventEmitter> = governance_ledger.clone();
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_ledger(ledger)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_strict_boundary_authority_enforcement(false);
+
+            let non_strict_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "prompt": "N".repeat(32_768),
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-non-strict-waiver".to_string(),
+                epoch_seal: None,
+            };
+            let response = dispatcher
+                .dispatch(&encode_request_tool_request(&non_strict_request), &make_session_ctx())
+                .expect("dispatch should complete");
+
+            match response {
+                SessionResponse::RequestTool(resp) => {
+                    assert_eq!(
+                        resp.decision,
+                        DecisionType::Allow as i32,
+                        "Tier0 non-strict mode with explicit waiver should admit request"
+                    );
+                },
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInternal as i32,
+                        "non-strict waived request should clear boundary/PCAC admission and fail only at execution when runtime is absent"
+                    );
+                    assert!(
+                        err.message.contains("tool execution unavailable"),
+                        "non-strict waived request must progress to execution path: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    let observed_event_types: Vec<_> = governance_ledger
+                        .get_all_events()
+                        .into_iter()
+                        .map(|event| event.event_type)
+                        .collect();
+                    panic!(
+                        "expected non-strict waived request to pass, got: {other:?}; observed events: {observed_event_types:?}"
+                    );
+                },
+            }
+
+            let defect_events: Vec<_> = governance_ledger
+                .get_all_events()
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .collect();
+            assert!(
+                defect_events.iter().any(|event| {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&event.payload).expect("defect payload json");
+                    payload.get("defect_type").and_then(serde_json::Value::as_str)
+                        == Some("BOUNDARY_FLOW_NON_STRICT_WAIVER")
+                }),
+                "non-strict Tier0/Tier1 waiver path must emit boundary waiver defect"
+            );
+        });
+    }
+
+    #[test]
+    fn test_tier0_non_strict_waiver_defect_failure_keeps_success_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::episode::decision::Credential;
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::tool_handler::ToolArgs;
+        use crate::episode::{
+            BudgetDelta, Capability, CapabilityManifestBuilder, CapabilityScope, EpisodeRuntime,
+            EpisodeRuntimeConfig, InMemorySessionRegistry, RiskTier, StubContentAddressedStore,
+            ToolBroker, ToolBrokerConfig, ToolClass, ToolHandler, ToolHandlerError, ToolResultData,
+        };
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::protocol::dispatch::{
+            LedgerEventEmitter, LedgerEventError, SignedLedgerEvent, StubLedgerEventEmitter,
+        };
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        #[derive(Debug)]
+        struct MockInferenceHandler {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolHandler for MockInferenceHandler {
+            fn tool_class(&self) -> ToolClass {
+                ToolClass::Inference
+            }
+
+            async fn execute(
+                &self,
+                _args: &ToolArgs,
+                _credential: Option<&Credential>,
+            ) -> Result<ToolResultData, ToolHandlerError> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResultData::success(
+                    b"non-strict-waiver-success".to_vec(),
+                    BudgetDelta::single_call(),
+                    std::time::Duration::from_millis(1),
+                ))
+            }
+
+            fn validate(&self, _args: &ToolArgs) -> Result<(), ToolHandlerError> {
+                Ok(())
+            }
+
+            fn name(&self) -> &'static str {
+                "MockInferenceHandler"
+            }
+        }
+
+        #[derive(Debug)]
+        struct DefectFailingLedger {
+            inner: StubLedgerEventEmitter,
+        }
+
+        impl DefectFailingLedger {
+            fn new() -> Self {
+                Self {
+                    inner: StubLedgerEventEmitter::new(),
+                }
+            }
+
+            fn defect_recorded_event_count(&self) -> usize {
+                self.inner
+                    .get_all_events()
+                    .into_iter()
+                    .filter(|event| event.event_type == "defect_recorded")
+                    .count()
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        impl LedgerEventEmitter for DefectFailingLedger {
+            fn emit_work_claimed(
+                &self,
+                claim: &crate::protocol::dispatch::WorkClaim,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_work_claimed(claim, timestamp_ns)
+            }
+
+            fn emit_session_started(
+                &self,
+                session_id: &str,
+                work_id: &str,
+                lease_id: &str,
+                actor_id: &str,
+                adapter_profile_hash: &[u8; 32],
+                role_spec_hash: Option<&[u8; 32]>,
+                timestamp_ns: u64,
+                contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+                identity_proof_profile_hash: Option<&[u8; 32]>,
+                selection_decision: Option<&apm2_core::fac::SelectionDecision>,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_session_started(
+                    session_id,
+                    work_id,
+                    lease_id,
+                    actor_id,
+                    adapter_profile_hash,
+                    role_spec_hash,
+                    timestamp_ns,
+                    contract_binding,
+                    identity_proof_profile_hash,
+                    selection_decision,
+                )
+            }
+
+            fn emit_session_event(
+                &self,
+                session_id: &str,
+                event_type: &str,
+                payload: &[u8],
+                actor_id: &str,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_session_event(
+                    session_id,
+                    event_type,
+                    payload,
+                    actor_id,
+                    timestamp_ns,
+                )
+            }
+
+            fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+                self.inner.verifying_key()
+            }
+
+            fn emit_stop_flags_mutated(
+                &self,
+                mutation: &crate::protocol::dispatch::StopFlagsMutation<'_>,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_stop_flags_mutated(mutation)
+            }
+
+            fn emit_defect_recorded(
+                &self,
+                defect: &DefectRecorded,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                if defect.defect_type == "BOUNDARY_FLOW_NON_STRICT_WAIVER" {
+                    return Err(LedgerEventError::PersistenceFailed {
+                        message: "simulated non-strict waiver defect persistence failure"
+                            .to_string(),
+                    });
+                }
+                self.inner.emit_defect_recorded(defect, timestamp_ns)
+            }
+
+            fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent> {
+                self.inner.get_event(event_id)
+            }
+
+            fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
+                self.inner.get_events_by_work_id(work_id)
+            }
+
+            fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
+                self.inner.get_all_events()
+            }
+
+            fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+                self.inner.get_event_by_receipt_id(receipt_id)
+            }
+
+            fn emit_episode_event(
+                &self,
+                episode_id: &str,
+                event_type: &str,
+                payload: &[u8],
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner
+                    .emit_episode_event(episode_id, event_type, payload, timestamp_ns)
+            }
+
+            fn emit_review_receipt(
+                &self,
+                lease_id: &str,
+                work_id: &str,
+                receipt_id: &str,
+                changeset_digest: &[u8; 32],
+                artifact_bundle_hash: &[u8; 32],
+                capability_manifest_hash: &[u8; 32],
+                context_pack_hash: &[u8; 32],
+                role_spec_hash: &[u8; 32],
+                reviewer_actor_id: &str,
+                timestamp_ns: u64,
+                identity_proof_hash: &[u8; 32],
+                time_envelope_ref: &str,
+                pcac_lifecycle: Option<
+                    &crate::protocol::dispatch::PrivilegedPcacLifecycleArtifacts,
+                >,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_review_receipt(
+                    lease_id,
+                    work_id,
+                    receipt_id,
+                    changeset_digest,
+                    artifact_bundle_hash,
+                    capability_manifest_hash,
+                    context_pack_hash,
+                    role_spec_hash,
+                    reviewer_actor_id,
+                    timestamp_ns,
+                    identity_proof_hash,
+                    time_envelope_ref,
+                    pcac_lifecycle,
+                )
+            }
+
+            fn emit_review_blocked_receipt(
+                &self,
+                lease_id: &str,
+                work_id: &str,
+                receipt_id: &str,
+                changeset_digest: &[u8; 32],
+                artifact_bundle_hash: &[u8; 32],
+                capability_manifest_hash: &[u8; 32],
+                context_pack_hash: &[u8; 32],
+                role_spec_hash: &[u8; 32],
+                reason_code: u32,
+                blocked_log_hash: &[u8; 32],
+                reviewer_actor_id: &str,
+                timestamp_ns: u64,
+                identity_proof_hash: &[u8; 32],
+                time_envelope_ref: &str,
+                pcac_lifecycle: Option<
+                    &crate::protocol::dispatch::PrivilegedPcacLifecycleArtifacts,
+                >,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_review_blocked_receipt(
+                    lease_id,
+                    work_id,
+                    receipt_id,
+                    changeset_digest,
+                    artifact_bundle_hash,
+                    capability_manifest_hash,
+                    context_pack_hash,
+                    role_spec_hash,
+                    reason_code,
+                    blocked_log_hash,
+                    reviewer_actor_id,
+                    timestamp_ns,
+                    identity_proof_hash,
+                    time_envelope_ref,
+                    pcac_lifecycle,
+                )
+            }
+
+            fn get_work_transition_count(&self, work_id: &str) -> u32 {
+                self.inner.get_work_transition_count(work_id)
+            }
+
+            fn emit_work_transitioned(
+                &self,
+                transition: &crate::protocol::dispatch::WorkTransition<'_>,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_work_transitioned(transition)
+            }
+
+            fn emit_session_terminated(
+                &self,
+                session_id: &str,
+                work_id: &str,
+                exit_code: i32,
+                termination_reason: &str,
+                actor_id: &str,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_session_terminated(
+                    session_id,
+                    work_id,
+                    exit_code,
+                    termination_reason,
+                    actor_id,
+                    timestamp_ns,
+                )
+            }
+
+            fn emit_episode_run_attributed(
+                &self,
+                work_id: &str,
+                episode_id: &str,
+                session_id: &str,
+                adapter_profile_hash: &[u8; 32],
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_episode_run_attributed(
+                    work_id,
+                    episode_id,
+                    session_id,
+                    adapter_profile_hash,
+                    timestamp_ns,
+                )
+            }
+
+            fn emit_changeset_published(
+                &self,
+                work_id: &str,
+                changeset_digest: &[u8; 32],
+                cas_hash: &[u8; 32],
+                actor_id: &str,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_changeset_published(
+                    work_id,
+                    changeset_digest,
+                    cas_hash,
+                    actor_id,
+                    timestamp_ns,
+                )
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+            let capability = Capability {
+                capability_id: "cap-inference-tier0".to_string(),
+                tool_class: ToolClass::Inference,
+                scope: CapabilityScope {
+                    root_paths: Vec::new(),
+                    allowed_patterns: Vec::new(),
+                    size_limits: crate::episode::scope::SizeLimits::default_limits(),
+                    network_policy: None,
+                },
+                risk_tier_required: RiskTier::Tier0,
+            };
+            let manifest = CapabilityManifestBuilder::new("non-strict-waiver-success-manifest")
+                .delegator("test-delegator")
+                .capabilities(vec![capability])
+                .tool_allowlist(vec![ToolClass::Inference])
+                .build()
+                .expect("manifest build should succeed");
+
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
+            broker
+                .initialize_with_manifest(manifest.clone())
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let cas: Arc<dyn crate::episode::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+            #[allow(deprecated)]
+            let episode_runtime = Arc::new(
+                EpisodeRuntime::new(EpisodeRuntimeConfig::default())
+                    .with_cas(cas)
+                    .with_handler_factory({
+                        let executions = Arc::clone(&executions);
+                        move || {
+                            Box::new(MockInferenceHandler {
+                                executions: Arc::clone(&executions),
+                            }) as Box<dyn ToolHandler>
+                        }
+                    }),
+            );
+            let episode_id = episode_runtime
+                .create(*blake3::hash(b"non-strict-waiver-envelope").as_bytes(), 1_000_000)
+                .await
+                .expect("create episode");
+            #[allow(deprecated)]
+            let _handle = episode_runtime
+                .start(&episode_id, "lease-001", 2_000_000)
+                .await
+                .expect("start episode");
+            let session_id = episode_id.as_str().to_string();
+
+            manifest_store.register(&session_id, manifest);
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.clone(),
+                    work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-non-strict-ledger-fail".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.clone()),
+                    pcac_policy: None,
+                    pointer_only_waiver: Some(apm2_core::pcac::PointerOnlyWaiver {
+                        waiver_id: "WVR-BOUNDARY-TIER0-NON-STRICT-FAIL".to_string(),
+                        expires_at_tick: u64::MAX / 2,
+                        scope_binding_hash: [0x7Bu8; 32],
+                    }),
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        duration.as_nanos() as u64
+                    }
+                })
+                .unwrap_or(1);
+            telemetry
+                .register(&session_id, started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+            let ledger = Arc::new(DefectFailingLedger::new());
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            ledger
+                .emit_session_event(
+                    &session_id,
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_ledger(ledger_dyn)
+                .with_episode_runtime(episode_runtime)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_strict_boundary_authority_enforcement(false);
+
+            let spawn_time = std::time::SystemTime::now();
+            let token = minter
+                .mint(&session_id, "lease-001", spawn_time, Duration::from_secs(3600))
+                .expect("mint token");
+            let ctx = ConnectionContext::session_open(
+                Some(crate::protocol::credentials::PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some(session_id),
+            );
+
+            let non_strict_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "type": "inference",
+                    "prompt": "hello",
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-non-strict-waiver-ledger-fail".to_string(),
+                epoch_seal: None,
+            };
+            let response = dispatcher
+                .dispatch(&encode_request_tool_request(&non_strict_request), &ctx)
+                .expect("dispatch should complete");
+
+            match response {
+                SessionResponse::RequestTool(resp) => {
+                    assert_eq!(
+                        resp.decision,
+                        DecisionType::Allow as i32,
+                        "waiver defect telemetry failure must not rewrite successful effect response",
+                    );
+                },
+                other => panic!(
+                    "expected successful effect response despite waiver defect telemetry failure, got: {other:?}"
+                ),
+            }
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                1,
+                "tool effect must execute exactly once even when waiver defect telemetry fails",
+            );
+            assert_eq!(
+                ledger.defect_recorded_event_count(),
+                0,
+                "failed waiver defect telemetry must remain out-of-band and not persist a defect event",
+            );
         });
     }
 

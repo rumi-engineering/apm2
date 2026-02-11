@@ -236,6 +236,8 @@ impl std::fmt::Display for IdentityEvidenceLevel {
 /// - `capability_manifest_hash` pins the capability set at join time.
 /// - `freshness_witness_tick` ensures authority is current.
 /// - `stop_budget_profile_digest` captures stop/budget constraints.
+/// - `leakage_witness_hash` and `timing_witness_hash` bind authoritative
+///   boundary-flow measurements into join-time admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityJoinInputV1 {
@@ -302,6 +304,14 @@ pub struct AuthorityJoinInputV1 {
     /// Pre-actuation receipt hash(es) required before revalidate/consume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_actuation_receipt_hashes: Vec<Hash>,
+
+    /// Hash commitment to authoritative leakage witness evidence.
+    #[serde(default)]
+    pub leakage_witness_hash: Hash,
+
+    /// Hash commitment to authoritative timing-variance witness evidence.
+    #[serde(default)]
+    pub timing_witness_hash: Hash,
 
     // -- Risk classification --
     /// Risk tier for this authority request.
@@ -552,6 +562,16 @@ impl AuthorityJoinInputV1 {
         if self.stop_budget_profile_digest == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "stop_budget_profile_digest",
+            });
+        }
+        if self.leakage_witness_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "leakage_witness_hash",
+            });
+        }
+        if self.timing_witness_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "timing_witness_hash",
             });
         }
         if self.time_envelope_ref == ZERO_HASH {
