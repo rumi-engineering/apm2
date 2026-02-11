@@ -16,12 +16,14 @@ use apm2_core::channel::LeakageEstimatorFamily;
 use apm2_core::channel::derive_channel_source_witness;
 use apm2_core::channel::{
     BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource,
-    ChannelViolationClass, DeclassificationIntentScope, LeakageBudgetReceipt,
-    RedundancyDeclassificationReceipt, TimingChannelBudget, decode_channel_context_token,
-    validate_channel_boundary,
+    ChannelViolationClass, DeclassificationIntentScope, DisclosurePolicyBinding,
+    LeakageBudgetReceipt, RedundancyDeclassificationReceipt, TimingChannelBudget,
+    decode_channel_context_token, validate_channel_boundary,
 };
 use apm2_core::crypto::VerifyingKey;
 use apm2_core::determinism::canonicalize_json;
+#[cfg(test)]
+use apm2_core::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
 use apm2_core::fac::{DenyCondition, RoleSpecV2};
 use apm2_core::ledger::{Ledger, LedgerError};
 use clap::Args;
@@ -96,6 +98,7 @@ struct RoleLaunchChannelContext {
     declassification_intent: DeclassificationIntentScope,
     redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
     boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
+    disclosure_policy_binding: Option<DisclosurePolicyBinding>,
     leakage_budget_receipt: Option<LeakageBudgetReceipt>,
     timing_channel_budget: Option<TimingChannelBudget>,
     leakage_budget_policy_max_bits: Option<u64>,
@@ -119,6 +122,7 @@ impl RoleLaunchChannelContext {
             declassification_intent: DeclassificationIntentScope::Unknown,
             redundancy_declassification_receipt: None,
             boundary_flow_policy_binding: None,
+            disclosure_policy_binding: None,
             leakage_budget_receipt: None,
             timing_channel_budget: None,
             leakage_budget_policy_max_bits: None,
@@ -149,6 +153,18 @@ impl RoleLaunchChannelContext {
                 admitted_policy_root_digest: [1u8; 32],
                 canonicalizer_tuple_digest: [2u8; 32],
                 admitted_canonicalizer_tuple_digest: [2u8; 32],
+            }),
+            disclosure_policy_binding: Some(DisclosurePolicyBinding {
+                required_for_effect: false,
+                state_valid: true,
+                active_mode: DisclosurePolicyMode::TradeSecretOnly,
+                expected_mode: DisclosurePolicyMode::TradeSecretOnly,
+                attempted_channel: DisclosureChannelClass::Internal,
+                policy_snapshot_digest: [3u8; 32],
+                admitted_policy_epoch_root_digest: [3u8; 32],
+                policy_epoch: 1,
+                phase_id: "pre_federation".to_string(),
+                state_reason: "ok".to_string(),
             }),
             leakage_budget_receipt: Some(LeakageBudgetReceipt {
                 leakage_bits: 4,
@@ -491,6 +507,7 @@ fn resolve_channel_context(
         declassification_intent: check.declassification_intent,
         redundancy_declassification_receipt: check.redundancy_declassification_receipt,
         boundary_flow_policy_binding: check.boundary_flow_policy_binding,
+        disclosure_policy_binding: check.disclosure_policy_binding,
         leakage_budget_receipt: check.leakage_budget_receipt,
         timing_channel_budget: check.timing_channel_budget,
         leakage_budget_policy_max_bits: check.leakage_budget_policy_max_bits,
@@ -672,6 +689,7 @@ fn enforce_channel_boundary(
             .redundancy_declassification_receipt
             .clone(),
         boundary_flow_policy_binding: channel_context.boundary_flow_policy_binding.clone(),
+        disclosure_policy_binding: channel_context.disclosure_policy_binding.clone(),
         leakage_budget_receipt: channel_context.leakage_budget_receipt.clone(),
         timing_channel_budget: channel_context.timing_channel_budget.clone(),
         leakage_budget_policy_max_bits: channel_context.leakage_budget_policy_max_bits,
@@ -1468,6 +1486,12 @@ const fn channel_violation_label(violation: ChannelViolationClass) -> &'static s
         },
         ChannelViolationClass::LeakageBudgetExceeded => "leakage_budget_exceeded",
         ChannelViolationClass::TimingChannelBudgetExceeded => "timing_channel_budget_exceeded",
+        ChannelViolationClass::DisclosurePolicyStateInvalid => "disclosure_policy_state_invalid",
+        ChannelViolationClass::DisclosurePolicyModeMismatch => "disclosure_policy_mode_mismatch",
+        ChannelViolationClass::DisclosurePolicyDigestBindingMismatch => {
+            "disclosure_policy_digest_binding_mismatch"
+        },
+        ChannelViolationClass::DisclosureChannelNotAdmitted => "disclosure_channel_not_admitted",
     }
 }
 
@@ -1629,6 +1653,18 @@ mod tests {
                 admitted_policy_root_digest: [1u8; 32],
                 canonicalizer_tuple_digest: [2u8; 32],
                 admitted_canonicalizer_tuple_digest: [2u8; 32],
+            }),
+            disclosure_policy_binding: Some(DisclosurePolicyBinding {
+                required_for_effect: false,
+                state_valid: true,
+                active_mode: DisclosurePolicyMode::TradeSecretOnly,
+                expected_mode: DisclosurePolicyMode::TradeSecretOnly,
+                attempted_channel: DisclosureChannelClass::Internal,
+                policy_snapshot_digest: [3u8; 32],
+                admitted_policy_epoch_root_digest: [3u8; 32],
+                policy_epoch: 1,
+                phase_id: "pre_federation".to_string(),
+                state_reason: "ok".to_string(),
             }),
             leakage_budget_receipt: Some(LeakageBudgetReceipt {
                 leakage_bits: 4,

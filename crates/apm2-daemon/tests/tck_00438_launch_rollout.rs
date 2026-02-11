@@ -15,11 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::channel::{
     BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelSource, ChannelViolationClass,
-    DeclassificationIntentScope, LeakageBudgetReceipt, LeakageEstimatorFamily, TimingChannelBudget,
-    decode_channel_context_token, derive_channel_source_witness, issue_channel_context_token,
-    validate_channel_boundary,
+    DeclassificationIntentScope, DisclosurePolicyBinding, LeakageBudgetReceipt,
+    LeakageEstimatorFamily, TimingChannelBudget, decode_channel_context_token,
+    derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
 };
 use apm2_core::crypto::Signer;
+use apm2_core::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
 use apm2_core::fac::{
     AuditorLaunchProjectionV1, OrchestratorLaunchProjectionV1,
     fac_workobject_implementor_v2_role_contract,
@@ -91,6 +92,18 @@ fn admitted_boundary_check() -> ChannelBoundaryCheck {
             admitted_policy_root_digest: [1u8; 32],
             canonicalizer_tuple_digest: [2u8; 32],
             admitted_canonicalizer_tuple_digest: [2u8; 32],
+        }),
+        disclosure_policy_binding: Some(DisclosurePolicyBinding {
+            required_for_effect: false,
+            state_valid: true,
+            active_mode: DisclosurePolicyMode::TradeSecretOnly,
+            expected_mode: DisclosurePolicyMode::TradeSecretOnly,
+            attempted_channel: DisclosureChannelClass::Internal,
+            policy_snapshot_digest: [3u8; 32],
+            admitted_policy_epoch_root_digest: [3u8; 32],
+            policy_epoch: 1,
+            phase_id: "pre_federation".to_string(),
+            state_reason: "ok".to_string(),
         }),
         leakage_budget_receipt: Some(LeakageBudgetReceipt {
             leakage_bits: 4,
