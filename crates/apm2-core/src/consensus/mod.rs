@@ -76,6 +76,7 @@ pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
 pub mod fact_root;
+pub mod formal_artifacts;
 pub mod functor;
 pub mod genesis;
 pub mod handlers;
@@ -155,6 +156,11 @@ pub use fact_root::{
     CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
     MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
     MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof, compute_qc_anchor_hash,
+};
+pub use formal_artifacts::{
+    AntiEntropyArtifactStatus, FORMAL_BISIMULATION_MAX_DEPTH, FormalArtifactDefect,
+    FormalGateArtifactError, FormalGateArtifactResult, FormalGateArtifactSet, FormalGateClass,
+    ModelCheckedInvariantReport,
 };
 // Functorial observation law checks for admitted rewrites (TCK-00368)
 pub use functor::{

@@ -625,7 +625,7 @@ async fn tck_00403_fac_lifecycle_end_to_end() {
     );
     assert!(
         !message_lower.contains("policydeny") && !message_lower.contains("policy deny"),
-        "RequestTool denial must come from scope enforcement, not broker policy deny: {}",
+        "RequestTool denial must come from scope/taint enforcement, not broker policy deny: {}",
         tool_error.message
     );
 

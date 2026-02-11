@@ -61,6 +61,7 @@
 mod hash;
 pub mod hsm;
 mod keys;
+mod rotation;
 mod sign;
 pub mod yubihsm;
 
@@ -75,6 +76,11 @@ pub use hsm::{
     create_hsm_provider,
 };
 pub use keys::{KeyManager, KeyManagerError, StoredKeypair};
+pub use rotation::{
+    KEY_ROTATION_RECEIPT_V1_SCHEMA, KeyRotationReceiptError, KeyRotationReceiptV1,
+    MAX_ROTATION_KEY_ID_LEN, rotate_key_with_overlap_duration,
+    rotate_key_with_overlapping_validity,
+};
 pub use sign::{
     PUBLIC_KEY_SIZE, SIGNATURE_SIZE, Signature, Signer, SignerError, VerifyingKey, parse_signature,
     parse_verifying_key, verify_signature,

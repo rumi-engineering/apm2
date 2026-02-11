@@ -39,6 +39,7 @@
 
 use std::sync::Arc;
 
+use apm2_core::consensus::{FormalArtifactDefect, FormalGateArtifactResult};
 use apm2_core::crypto::Signer;
 use apm2_core::fac::{MergeReceipt, PolicyResolvedForChangeSet, ReasonCode, ReviewBlockedRecorded};
 use apm2_core::ledger::EventRecord;
@@ -327,6 +328,22 @@ pub struct MergeInput {
     ///
     /// Required when `work_events` are provided.
     pub expected_reducer_state: Option<WorkReducerState>,
+    /// Optional promotion stage label (for example `S0.9`, `S1`, `S2.6`).
+    ///
+    /// Formal artifacts are required when this is present and stage `>= S1`.
+    pub promotion_stage: Option<String>,
+    /// Optional formal-artifact evaluation result.
+    ///
+    /// Required for `S1+` promotions.
+    pub formal_artifacts: Option<FormalGateArtifactResult>,
+    /// Optional stop-path SLO readiness signal.
+    ///
+    /// When explicitly `Some(false)`, promotion is blocked for `S1+`.
+    pub stop_path_slo_allows_promotion: Option<bool>,
+    /// Optional RPO/RTO readiness signal.
+    ///
+    /// When explicitly `Some(false)`, promotion is blocked for `S1+`.
+    pub rpo_rto_within_targets: Option<bool>,
 }
 
 // =============================================================================
@@ -555,6 +572,11 @@ impl MergeExecutor {
                 defect_records: gate_result.defect_records,
             });
         }
+
+        // RFC-0020 TCK-00382:
+        // For S1+ promotion stages, fail closed unless formal artifacts and
+        // business-continuity signals are explicitly present and passing.
+        Self::verify_formal_artifacts_for_stage(input)?;
 
         // Step 1: Verify all gates passed
         Self::verify_all_gates_passed(input)?;
@@ -824,6 +846,97 @@ impl MergeExecutor {
 
         Ok(())
     }
+
+    fn verify_formal_artifacts_for_stage(input: &MergeInput) -> Result<(), MergeExecutorError> {
+        let Some(stage) = input.promotion_stage.as_deref() else {
+            return Ok(());
+        };
+        let stage = stage.trim();
+        let requires_formal_artifacts = Self::promotion_stage_requires_formal_artifacts(stage)
+            .map_err(|reason| MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason,
+                defect_records: Vec::new(),
+            })?;
+        if !requires_formal_artifacts {
+            return Ok(());
+        }
+
+        let Some(formal) = input.formal_artifacts.as_ref() else {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "formal artifacts missing for stage '{stage}' (fail-closed for S1+)"
+                ),
+                defect_records: Vec::new(),
+            });
+        };
+
+        if !formal.allowed || !formal.blocking_defects.is_empty() {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "formal artifacts failed for stage '{stage}': {}",
+                    Self::format_formal_defects(&formal.blocking_defects)
+                ),
+                defect_records: Vec::new(),
+            });
+        }
+
+        if input.stop_path_slo_allows_promotion != Some(true) {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "stop-path SLO signal missing/failing for stage '{stage}' (requires explicit pass)"
+                ),
+                defect_records: Vec::new(),
+            });
+        }
+
+        if input.rpo_rto_within_targets != Some(true) {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "RPO/RTO signal missing/failing for stage '{stage}' (requires explicit pass)"
+                ),
+                defect_records: Vec::new(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn promotion_stage_requires_formal_artifacts(stage: &str) -> Result<bool, String> {
+        if stage.is_empty() {
+            return Err("promotion_stage is empty".to_string());
+        }
+        let stripped = stage
+            .strip_prefix('S')
+            .or_else(|| stage.strip_prefix('s'))
+            .ok_or_else(|| {
+                format!("invalid promotion_stage '{stage}': expected prefix 'S' (e.g., S0.9, S1)")
+            })?;
+        let major = stripped
+            .split('.')
+            .next()
+            .ok_or_else(|| format!("invalid promotion_stage '{stage}': missing major component"))?
+            .parse::<u64>()
+            .map_err(|_| {
+                format!("invalid promotion_stage '{stage}': non-numeric major component")
+            })?;
+        Ok(major >= 1)
+    }
+
+    fn format_formal_defects(defects: &[FormalArtifactDefect]) -> String {
+        if defects.is_empty() {
+            return "no defect records provided".to_string();
+        }
+        defects
+            .iter()
+            .map(|defect| format!("{:?}:{}:{}", defect.gate, defect.code, defect.detail))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 // =============================================================================
@@ -834,6 +947,11 @@ impl MergeExecutor {
 mod tests {
     use std::time::Instant;
 
+    use apm2_core::consensus::{
+        AdmittedRewriteCatalog, AntiEntropyArtifactStatus, ConvergenceSimulator,
+        FormalGateArtifactSet, Hlc, MAX_CONVERGENCE_ROUNDS, ModelCheckedInvariantReport,
+        RewriteRule, build_linear_composition,
+    };
     use apm2_core::fac::PolicyResolvedForChangeSetBuilder;
     use apm2_core::reducer::{Reducer, ReducerContext};
     use apm2_core::work::{WorkReducer, helpers};
@@ -960,7 +1078,54 @@ mod tests {
             actor_id: "merge-executor-test".to_string(),
             work_events,
             expected_reducer_state: Some(expected_reducer_state),
+            promotion_stage: None,
+            formal_artifacts: None,
+            stop_path_slo_allows_promotion: None,
+            rpo_rto_within_targets: None,
         }
+    }
+
+    fn make_passing_formal_artifact_result() -> FormalGateArtifactResult {
+        let compositions = vec![build_linear_composition(0).expect("composition should build")];
+
+        let mut catalog = AdmittedRewriteCatalog::new().expect("catalog should construct");
+        let lts = build_linear_composition(0).expect("composition should build");
+        let rule = RewriteRule::new("R001".to_string(), "identity".to_string(), lts.clone(), lts)
+            .expect("rule should construct");
+        catalog.register_rule(rule).expect("rule should register");
+        catalog
+            .submit_proof("R001", "cas://proof/r001")
+            .expect("proof should verify");
+
+        let anti_entropy = AntiEntropyArtifactStatus {
+            pull_only_enforced: true,
+            relay_budget_enforced: true,
+            byzantine_relay_detected: false,
+            defects: Vec::new(),
+        };
+
+        let mut convergence =
+            ConvergenceSimulator::new(vec!["cell-a".to_string(), "cell-b".to_string()], 8)
+                .expect("simulator should construct");
+        convergence
+            .admit("cell-a", "subject-1", "value", Hlc::new(1, 0))
+            .expect("admit should succeed");
+
+        let invariants = ModelCheckedInvariantReport {
+            no_actuation_without_verified_stop_state: true,
+            no_delegation_widening: true,
+            no_unsigned_facts_admitted: true,
+        };
+
+        FormalGateArtifactSet::evaluate_all(
+            &compositions,
+            &catalog,
+            anti_entropy,
+            &mut convergence,
+            MAX_CONVERGENCE_ROUNDS,
+            invariants,
+        )
+        .expect("formal artifact evaluation should pass")
     }
 
     #[test]
@@ -1553,5 +1718,69 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_stage_s1_requires_formal_artifacts_fail_closed() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.promotion_stage = Some("S1".to_string());
+        input.stop_path_slo_allows_promotion = Some(true);
+        input.rpo_rto_within_targets = Some(true);
+        input.formal_artifacts = None;
+
+        let adapter = SuccessAdapter {
+            result_sha: "sha-ok".to_string(),
+        };
+        let err = executor.execute_merge(&input, &adapter).unwrap_err();
+        match err {
+            MergeExecutorError::PromotionGateBlocked { reason, .. } => {
+                assert!(reason.contains("formal artifacts missing"));
+            },
+            other => panic!("expected PromotionGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stage_s1_blocks_when_stop_path_signal_fails() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.promotion_stage = Some("S1".to_string());
+        input.formal_artifacts = Some(make_passing_formal_artifact_result());
+        input.stop_path_slo_allows_promotion = Some(false);
+        input.rpo_rto_within_targets = Some(true);
+
+        let adapter = SuccessAdapter {
+            result_sha: "sha-ok".to_string(),
+        };
+        let err = executor.execute_merge(&input, &adapter).unwrap_err();
+        match err {
+            MergeExecutorError::PromotionGateBlocked { reason, .. } => {
+                assert!(reason.contains("stop-path SLO signal"));
+            },
+            other => panic!("expected PromotionGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stage_s1_allows_with_formal_and_continuity_signals() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.promotion_stage = Some("S1".to_string());
+        input.formal_artifacts = Some(make_passing_formal_artifact_result());
+        input.stop_path_slo_allows_promotion = Some(true);
+        input.rpo_rto_within_targets = Some(true);
+
+        let adapter = SuccessAdapter {
+            result_sha: "sha-ok".to_string(),
+        };
+        let result = executor.execute_merge(&input, &adapter);
+        assert!(result.is_ok());
     }
 }
