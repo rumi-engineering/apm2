@@ -7698,7 +7698,6 @@ mod tests {
             );
         }
 
-
         #[test]
         fn direct_github_api_capability_surface_denied_with_defect() {
             let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
