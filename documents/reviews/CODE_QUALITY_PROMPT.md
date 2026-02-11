@@ -18,7 +18,7 @@ metadata_contract:
     - '"pr_number" MUST match the prepared PR number exactly.'
     - "Set reviewed_sha = headRefOid."
 
-references[16]:
+references[17]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "Holonic model, truth/projection split, and verification-first behavior."
   - path: "@AGENTS.md"
@@ -45,6 +45,8 @@ references[16]:
     purpose: "Severity calibration."
   - path: "@documents/skills/rust-standards/references/28_required_actions_templates.md"
     purpose: "Finding statement quality."
+  - path: "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md"
+    purpose: "Canonical PCAC/AJC integration pattern for authority-bearing handlers."
 
 decision_tree:
   entrypoint: STEP_1_DISCOVERY
@@ -101,7 +103,7 @@ decision_tree:
 
     - id: STEP_4_ANALYZE
       purpose: "Evaluate correctness, maintainability, and test evidence."
-      lenses[6]:
+      lenses[7]:
         - lens: "Invariant Preservation"
           focus: "Behavioral regressions, hidden coupling, invalid assumptions."
         - lens: "API and Type Surface"
@@ -114,11 +116,13 @@ decision_tree:
           focus: "Hot-path regressions, needless allocations, expensive loops."
         - lens: "Documentation Coherence"
           focus: "Code/docs/AGENTS.md alignment."
+        - lens: "PCAC Pattern Compliance"
+          focus: "Authority-bearing handlers follow canonical PCAC lifecycle (join -> revalidate -> consume -> effect) and prefer PrivilegedPcacInputBuilder over manual join-input construction."
       next: STEP_5_WRITE_FINDINGS
 
     - id: STEP_5_WRITE_FINDINGS
       purpose: "Write the reviewer-authored finding body (no manual metadata block)."
-      steps[3]:
+      steps[4]:
         - action: write_file
           path: "$temp_dir/code_quality_findings.md"
           required_structure:
@@ -131,6 +135,8 @@ decision_tree:
             - "### **WAIVED FINDINGS**"
         - action: quality_rule
           rule: "Each non-empty finding includes path, impact, and required action."
+        - action: structural_rule
+          rule: "For PCAC-integrated handlers, verify canonical lifecycle ordering and builder usage; flag manual join-input construction or lifecycle drift as findings."
         - action: classify
           output: [blocker_count, major_count, minor_count, nit_count, verdict]
       next: STEP_6_PUBLISH

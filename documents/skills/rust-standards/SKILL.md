@@ -313,6 +313,7 @@ holonic_checks:
 | T25 | [40_time_monotonicity_determinism.md](references/40_time_monotonicity_determinism.md) | Time |
 | T26 | [41_apm2_safe_patterns_and_anti_patterns.md](references/41_apm2_safe_patterns_and_anti_patterns.md) | APM2 Patterns |
 | T27 | [42_distributed_security_invariants.md](references/42_distributed_security_invariants.md) | Distributed Security |
+| T28 | [42_pcac_ajc_integration.md](references/42_pcac_ajc_integration.md) | PCAC/AJC Integration |
 
 ---
 
