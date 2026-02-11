@@ -2350,6 +2350,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     idx += 2;
                     segment_start = idx;
                 },
+                b'&' => {
+                    // Single '&' is a command separator (background execution)
+                    // and must be treated the same as ';' for chain analysis.
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 1;
+                    segment_start = idx;
+                },
                 b'|' => {
                     Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
                     if bytes.get(idx + 1) == Some(&b'|') {
@@ -2367,6 +2374,72 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         Self::push_shell_command_segment(command, segment_start, command.len(), &mut segments);
         segments
+    }
+
+    fn strip_outer_subshell(command: &str) -> Option<&str> {
+        let command = command.trim();
+        let bytes = command.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return None;
+        }
+
+        let mut idx = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+
+            if in_single_quote {
+                if byte == b'\'' {
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if byte == b'\\' {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                    continue;
+                }
+                if byte == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            match byte {
+                b'\'' => in_single_quote = true,
+                b'"' => in_double_quote = true,
+                b'\\' => {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                    continue;
+                },
+                b'(' => depth += 1,
+                b')' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    if depth == 0 && idx + 1 != bytes.len() {
+                        // Outer subshell closes before the end of the segment.
+                        return None;
+                    }
+                },
+                _ => {},
+            }
+
+            idx += 1;
+        }
+
+        if depth != 0 {
+            return None;
+        }
+
+        let inner = command[1..command.len() - 1].trim();
+        (!inner.is_empty()).then_some(inner)
     }
 
     fn command_primary_executable_from_tokens(
@@ -2401,6 +2474,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     fn is_shell_eval_builtin(exec: &str) -> bool {
         matches!(Self::executable_name(exec), "eval")
+    }
+
+    fn is_shell_control_keyword(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "if" | "then"
+                | "elif"
+                | "else"
+                | "fi"
+                | "for"
+                | "while"
+                | "until"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "select"
+                | "in"
+                | "time"
+                | "coproc"
+        )
     }
 
     fn is_shell_wrapper_executable(exec: &str) -> bool {
@@ -2824,6 +2918,65 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         false
     }
 
+    fn command_contains_github_api_argument(command: &str) -> bool {
+        command
+            .split_whitespace()
+            .any(Self::argument_targets_github_api)
+    }
+
+    fn command_substitution_targets_github_api(command: &str, depth: usize) -> bool {
+        let mut stack: Vec<usize> = Vec::new();
+        let bytes = command.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            if bytes[idx] == b'$' && bytes.get(idx + 1) == Some(&b'(') {
+                stack.push(idx + 2);
+                idx += 2;
+                continue;
+            }
+
+            if bytes[idx] == b')'
+                && let Some(start) = stack.pop()
+                && start <= idx
+            {
+                let inner = &command[start..idx];
+                if Self::command_targets_github_api_inner(inner, depth + 1)
+                    || Self::command_contains_github_api_argument(inner)
+                {
+                    return true;
+                }
+            }
+
+            idx += 1;
+        }
+
+        let mut backtick_start: Option<usize> = None;
+        let mut backtick_idx = 0usize;
+        while backtick_idx < bytes.len() {
+            if bytes[backtick_idx] == b'`' {
+                let escaped = backtick_idx > 0 && bytes[backtick_idx - 1] == b'\\';
+                if !escaped {
+                    if let Some(start) = backtick_start.take() {
+                        if start <= backtick_idx {
+                            let inner = &command[start..backtick_idx];
+                            if Self::command_targets_github_api_inner(inner, depth + 1)
+                                || Self::command_contains_github_api_argument(inner)
+                            {
+                                return true;
+                            }
+                        }
+                    } else {
+                        backtick_start = Some(backtick_idx + 1);
+                    }
+                }
+            }
+            backtick_idx += 1;
+        }
+
+        false
+    }
+
     fn command_invokes_gh_cli_inner(command: &str, depth: usize) -> bool {
         if depth > MAX_GH_DIRECT_COMMAND_UNWRAP_DEPTH {
             return false;
@@ -2832,6 +2985,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let command = Self::normalize_shell_token(command.trim());
         if command.is_empty() {
             return false;
+        }
+
+        if let Some(inner_subshell) = Self::strip_outer_subshell(command) {
+            return Self::command_invokes_gh_cli_inner(inner_subshell, depth + 1)
+                || Self::command_contains_gh_token(inner_subshell);
         }
 
         let segments = Self::split_shell_command_segments(command);
@@ -2856,6 +3014,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return false;
         };
         if Self::is_gh_executable(&exec) {
+            return true;
+        }
+        if Self::is_shell_control_keyword(&exec)
+            && let Some(control_body) = Self::join_command_tokens(&tokens, exec_idx + 1)
+            && Self::command_invokes_gh_cli_inner(&control_body, depth + 1)
+        {
             return true;
         }
 
@@ -2957,6 +3121,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return false;
         }
 
+        if let Some(inner_subshell) = Self::strip_outer_subshell(command) {
+            return Self::command_targets_github_api_inner(inner_subshell, depth + 1)
+                || Self::command_contains_github_api_argument(inner_subshell);
+        }
+
         // Fail-closed detection for shell variable indirection where a GitHub
         // API URL is assigned then consumed by a network client command.
         if Self::command_targets_github_api_via_shell_variable(command) {
@@ -2965,9 +3134,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         let segments = Self::split_shell_command_segments(command);
         if segments.len() > 1 {
-            return segments
+            if segments
                 .into_iter()
-                .any(|segment| Self::command_targets_github_api_inner(segment, depth));
+                .any(|segment| Self::command_targets_github_api_inner(segment, depth))
+            {
+                return true;
+            }
+            return Self::command_substitution_targets_github_api(command, depth);
         }
 
         let command = segments.first().copied().unwrap_or(command);
@@ -2976,6 +3149,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         else {
             return false;
         };
+
+        if Self::is_shell_control_keyword(&exec)
+            && let Some(control_body) = Self::join_command_tokens(&tokens, exec_idx + 1)
+            && Self::command_targets_github_api_inner(&control_body, depth + 1)
+        {
+            return true;
+        }
 
         if Self::is_http_client_executable(&exec) {
             return tokens
@@ -3008,6 +3188,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Self::extract_wrapper_inline_command(&exec, &tokens, exec_idx + 1)
         {
             return Self::command_targets_github_api_inner(&inner_command, depth + 1);
+        }
+
+        if Self::command_substitution_targets_github_api(command, depth) {
+            return true;
         }
 
         false
@@ -7236,6 +7420,33 @@ mod tests {
         }
 
         #[test]
+        fn chained_background_operator_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "true & gh api /repos/owner/repo",
+                "projection-isolation-chain-background-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn subshell_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "(gh api /repos/owner/repo)",
+                "projection-isolation-subshell-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn control_flow_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "if gh api /repos/owner/repo; then echo ok; fi",
+                "projection-isolation-control-flow-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
         fn chained_semicolon_operator_gh_attempt_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
                 "echo ok; gh pr view 123",
@@ -7321,6 +7532,15 @@ mod tests {
             assert_execute_direct_github_attempt_denied(
                 "url=https://api.github.com/repos/example/repo; curl \"$url\"",
                 "projection-isolation-shell-var-api-host",
+                "github_api",
+            );
+        }
+
+        #[test]
+        fn background_operator_api_host_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd & curl https://api.github.com/repos/o/r",
+                "projection-isolation-background-api-host",
                 "github_api",
             );
         }

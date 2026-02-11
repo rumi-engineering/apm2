@@ -1248,6 +1248,17 @@ async fn async_main(args: Args) -> Result<()> {
 
         match ProjectionWorker::new(projection_conn, config) {
             Ok(mut worker) => {
+                if let Some(authoritative_cas) = dispatcher_state.evidence_cas() {
+                    worker.set_authoritative_cas(authoritative_cas);
+                    info!(
+                        "Authoritative CAS injected into projection worker for receipt linkage validation"
+                    );
+                } else {
+                    warn!(
+                        "Projection worker started without authoritative CAS; receipt linkage validation will fail closed"
+                    );
+                }
+
                 // BLOCKER FIX: Actually inject the adapter into the worker!
                 // This was the critical missing step that caused all projections to be skipped.
                 if let Some(adapter) = github_adapter {
