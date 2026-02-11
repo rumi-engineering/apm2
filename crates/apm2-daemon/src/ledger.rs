@@ -598,17 +598,40 @@ impl SqliteLedgerEventEmitter {
         }
 
         let Some(checkpoint) = Self::load_hash_chain_checkpoint(conn)? else {
-            // First-startup behavior is now fail-safe and incremental: seed
-            // checkpoint at current tip and require explicit admin
-            // full-chain verification for legacy history.
-            warn!(
-                rowid = chain_tip.rowid,
-                event_hash = %chain_tip.event_hash,
-                "no trusted hash-chain checkpoint metadata found; seeding current tip checkpoint"
+            if chain_tip.rowid == 0 {
+                warn!(
+                    rowid = chain_tip.rowid,
+                    event_hash = %chain_tip.event_hash,
+                    "no trusted hash-chain checkpoint metadata found on empty ledger; seeding genesis checkpoint"
+                );
+                Self::persist_hash_chain_checkpoint(conn, &chain_tip).map_err(|e| {
+                    format!("failed to initialize genesis hash-chain checkpoint metadata: {e}")
+                })?;
+                return Ok(0);
+            }
+
+            let (derived_tip, validated_rows) = Self::derive_event_chain_hash_from_db_suffix(
+                conn,
+                0,
+                Self::LEDGER_CHAIN_GENESIS,
+                trusted_verifying_key,
+            )?;
+            if derived_tip != chain_tip.event_hash {
+                return Err(format!(
+                    "startup hash-chain full verification mismatch while reseeding missing checkpoint: \
+                     derived_tip={derived_tip}, stored_tip={}",
+                    chain_tip.event_hash
+                ));
+            }
+
+            info!(
+                validated_rows,
+                tip_rowid = chain_tip.rowid,
+                "no checkpoint metadata found; full-chain verification succeeded before reseeding checkpoint"
             );
             Self::persist_hash_chain_checkpoint(conn, &chain_tip)
                 .map_err(|e| format!("failed to initialize hash-chain checkpoint metadata: {e}"))?;
-            return Ok(0);
+            return Ok(validated_rows);
         };
 
         if checkpoint.rowid > chain_tip.rowid {
@@ -997,47 +1020,68 @@ impl SqliteLedgerEventEmitter {
         prev_hash: &str,
         event_hash: &str,
     ) -> Result<(), LedgerEventError> {
-        let event_type_class =
-            classify_event_type(&signed_event.event_type, &signed_event.actor_id).as_str();
-        conn.execute(
-            "INSERT INTO ledger_events (
-                event_id,
-                event_type,
-                event_type_class,
-                work_id,
-                actor_id,
-                payload,
-                signature,
-                timestamp_ns,
-                prev_hash,
-                event_hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                event_type_class,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns,
-                prev_hash,
-                event_hash,
-            ],
-        )
-        .map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
-        let checkpoint = HashChainCheckpoint {
-            rowid: conn.last_insert_rowid(),
-            event_id: Some(signed_event.event_id.clone()),
-            event_hash: event_hash.to_string(),
-        };
-        Self::persist_hash_chain_checkpoint(conn, &checkpoint).map_err(|e| {
+        conn.execute("SAVEPOINT persist_event", []).map_err(|e| {
             LedgerEventError::PersistenceFailed {
-                message: format!("failed to update hash-chain checkpoint metadata: {e}"),
+                message: format!("sqlite savepoint begin failed: {e}"),
             }
         })?;
+
+        let persist_result = (|| {
+            let event_type_class =
+                classify_event_type(&signed_event.event_type, &signed_event.actor_id).as_str();
+            conn.execute(
+                "INSERT INTO ledger_events (
+                    event_id,
+                    event_type,
+                    event_type_class,
+                    work_id,
+                    actor_id,
+                    payload,
+                    signature,
+                    timestamp_ns,
+                    prev_hash,
+                    event_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    signed_event.event_id,
+                    signed_event.event_type,
+                    event_type_class,
+                    signed_event.work_id,
+                    signed_event.actor_id,
+                    signed_event.payload,
+                    signed_event.signature,
+                    signed_event.timestamp_ns,
+                    prev_hash,
+                    event_hash,
+                ],
+            )
+            .map_err(|e| LedgerEventError::PersistenceFailed {
+                message: format!("sqlite insert failed: {e}"),
+            })?;
+            let checkpoint = HashChainCheckpoint {
+                rowid: conn.last_insert_rowid(),
+                event_id: Some(signed_event.event_id.clone()),
+                event_hash: event_hash.to_string(),
+            };
+            Self::persist_hash_chain_checkpoint(conn, &checkpoint).map_err(|e| {
+                LedgerEventError::PersistenceFailed {
+                    message: format!("failed to update hash-chain checkpoint metadata: {e}"),
+                }
+            })?;
+            conn.execute("RELEASE persist_event", []).map_err(|e| {
+                LedgerEventError::PersistenceFailed {
+                    message: format!("sqlite savepoint release failed: {e}"),
+                }
+            })?;
+            Ok(())
+        })();
+
+        if let Err(error) = persist_result {
+            let _ = conn.execute("ROLLBACK TO persist_event", []);
+            let _ = conn.execute("RELEASE persist_event", []);
+            return Err(error);
+        }
+
         Ok(())
     }
 
@@ -3635,6 +3679,8 @@ impl LeaseValidator for SqliteLeaseValidator {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
     use crate::protocol::dispatch::PolicyResolution;
     use crate::protocol::messages::WorkRole;
@@ -3913,6 +3959,194 @@ mod tests {
         assert_eq!(
             validated_rows, SUFFIX_EVENTS,
             "startup validation must process only rows after the trusted checkpoint"
+        );
+    }
+
+    #[test]
+    fn startup_validation_restart_succeeds_with_persistent_key_and_fails_with_wrong_key() {
+        const EVENT_COUNT: usize = 3;
+
+        let temp_dir = tempdir().expect("tempdir should create");
+        let db_path = temp_dir.path().join("ledger_restart.sqlite3");
+        let signing_key_a = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should open");
+            SqliteLedgerEventEmitter::init_schema_with_verifying_key(
+                &conn,
+                &signing_key_a.verifying_key(),
+            )
+            .expect("schema initialization should succeed");
+            let emitter =
+                SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key_a.clone());
+
+            for idx in 0..EVENT_COUNT {
+                emitter
+                    .emit_session_event(
+                        "W-RESTART-001",
+                        "session_started",
+                        format!(r#"{{"event_type":"session_started","idx":{idx}}}"#).as_bytes(),
+                        "uid:restart-test",
+                        1_700_000_000_000_200_000 + idx as u64,
+                    )
+                    .expect("session event should persist");
+            }
+        }
+
+        let conn = Connection::open(&db_path).expect("sqlite file should reopen");
+        SqliteLedgerEventEmitter::init_schema_with_verifying_key(
+            &conn,
+            &signing_key_a.verifying_key(),
+        )
+        .expect("startup schema init should accept the original verifying key");
+
+        SqliteLedgerEventEmitter::persist_hash_chain_checkpoint(
+            &conn,
+            &HashChainCheckpoint::genesis(),
+        )
+        .expect("checkpoint reset should succeed");
+        let validated_rows = SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn,
+            false,
+            Some(&signing_key_a.verifying_key()),
+        )
+        .expect("startup validation should succeed with original key");
+        assert_eq!(
+            validated_rows, EVENT_COUNT,
+            "startup validation should verify all rows from genesis when checkpoint is reset"
+        );
+
+        SqliteLedgerEventEmitter::persist_hash_chain_checkpoint(
+            &conn,
+            &HashChainCheckpoint::genesis(),
+        )
+        .expect("checkpoint reset should succeed");
+        let signing_key_b = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let err = SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn,
+            false,
+            Some(&signing_key_b.verifying_key()),
+        )
+        .expect_err("startup validation must fail with a different verifying key");
+        assert!(
+            err.contains("signature verification"),
+            "wrong-key startup failure should report signature verification failure: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_validation_missing_checkpoint_metadata_verifies_full_chain_before_reseeding() {
+        const EVENT_COUNT: usize = 4;
+
+        let temp_dir = tempdir().expect("tempdir should create");
+        let db_path = temp_dir.path().join("ledger_missing_checkpoint.sqlite3");
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should open");
+            SqliteLedgerEventEmitter::init_schema_with_verifying_key(
+                &conn,
+                &signing_key.verifying_key(),
+            )
+            .expect("schema initialization should succeed");
+            let emitter =
+                SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key.clone());
+
+            for idx in 0..EVENT_COUNT {
+                emitter
+                    .emit_session_event(
+                        "W-MISSING-CHECKPOINT-001",
+                        "session_started",
+                        format!(r#"{{"event_type":"session_started","idx":{idx}}}"#).as_bytes(),
+                        "uid:checkpoint-test",
+                        1_700_000_000_000_300_000 + idx as u64,
+                    )
+                    .expect("session event should persist");
+            }
+        }
+
+        let conn = Connection::open(&db_path).expect("sqlite file should reopen");
+        conn.execute(
+            "DELETE FROM ledger_metadata WHERE meta_key IN (?1, ?2, ?3)",
+            params![
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_KEY,
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_ROWID_KEY,
+                SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_EVENT_ID_KEY,
+            ],
+        )
+        .expect("checkpoint metadata deletion should succeed");
+
+        let validated_rows = SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn,
+            false,
+            Some(&signing_key.verifying_key()),
+        )
+        .expect("startup validation should verify full chain when checkpoint metadata is missing");
+        assert_eq!(
+            validated_rows, EVENT_COUNT,
+            "missing checkpoint metadata must trigger full-chain verification, not blind reseed"
+        );
+    }
+
+    #[test]
+    fn startup_validation_with_stale_checkpoint_verifies_suffix_after_restart() {
+        const EVENT_COUNT: usize = 5;
+        const STALE_ROWID: i64 = 3;
+        const EXPECTED_SUFFIX_ROWS: usize = 2;
+
+        let temp_dir = tempdir().expect("tempdir should create");
+        let db_path = temp_dir.path().join("ledger_stale_checkpoint.sqlite3");
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should open");
+            SqliteLedgerEventEmitter::init_schema_with_verifying_key(
+                &conn,
+                &signing_key.verifying_key(),
+            )
+            .expect("schema initialization should succeed");
+            let emitter =
+                SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key.clone());
+
+            for idx in 0..EVENT_COUNT {
+                emitter
+                    .emit_session_event(
+                        "W-STALE-CHECKPOINT-001",
+                        "session_started",
+                        format!(r#"{{"event_type":"session_started","idx":{idx}}}"#).as_bytes(),
+                        "uid:stale-test",
+                        1_700_000_000_000_400_000 + idx as u64,
+                    )
+                    .expect("session event should persist");
+            }
+        }
+
+        let conn = Connection::open(&db_path).expect("sqlite file should reopen");
+        let stale_checkpoint: HashChainCheckpoint = conn
+            .query_row(
+                "SELECT rowid, event_id, event_hash FROM ledger_events WHERE rowid = ?1",
+                params![STALE_ROWID],
+                |row| {
+                    Ok(HashChainCheckpoint {
+                        rowid: row.get(0)?,
+                        event_id: Some(row.get(1)?),
+                        event_hash: row.get(2)?,
+                    })
+                },
+            )
+            .expect("stale checkpoint row should exist");
+        SqliteLedgerEventEmitter::persist_hash_chain_checkpoint(&conn, &stale_checkpoint)
+            .expect("stale checkpoint metadata update should succeed");
+
+        let validated_rows = SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn,
+            false,
+            Some(&signing_key.verifying_key()),
+        )
+        .expect("startup validation should verify suffix from stale checkpoint");
+        assert_eq!(
+            validated_rows, EXPECTED_SUFFIX_ROWS,
+            "stale checkpoint must validate only the unverified suffix"
         );
     }
 

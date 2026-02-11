@@ -301,6 +301,80 @@ fn load_or_create_persistent_signer(key_path: &PathBuf) -> Result<apm2_core::cry
     }
 }
 
+fn ledger_signing_key_path(daemon_config: &DaemonConfig) -> PathBuf {
+    if let Some(ledger_db_path) = daemon_config.ledger_db_path.as_ref() {
+        return ledger_db_path.parent().map_or_else(
+            || PathBuf::from("/var/lib/apm2/ledger_signer.key"),
+            |parent| parent.join("ledger_signer.key"),
+        );
+    }
+
+    daemon_config.state_file_path.parent().map_or_else(
+        || PathBuf::from("/var/lib/apm2/ledger_signer.key"),
+        |parent| parent.join("ledger_signer.key"),
+    )
+}
+
+/// Load or create a persistent Ed25519 signing key for ledger event
+/// signatures.
+///
+/// The key file stores a 32-byte seed and is created with mode 0600.
+fn load_or_create_ledger_signing_key(
+    daemon_config: &DaemonConfig,
+) -> Result<ed25519_dalek::SigningKey> {
+    let key_path = ledger_signing_key_path(daemon_config);
+
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create ledger signer key directory")?;
+    }
+
+    if key_path.exists() {
+        let key_bytes =
+            std::fs::read(&key_path).context("failed to read ledger signer key file")?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!(
+                "invalid ledger signer key file: expected 32 bytes, got {}",
+                key_bytes.len()
+            );
+        }
+
+        let key_seed: [u8; 32] = key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("failed to decode ledger signer key seed"))?;
+        info!(key_path = %key_path.display(), "Loaded persistent ledger signing key");
+        Ok(ed25519_dalek::SigningKey::from_bytes(&key_seed))
+    } else {
+        use rand::rngs::OsRng;
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let key_bytes = signing_key.to_bytes();
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key_path)
+                .context("failed to create ledger signer key file")?;
+            file.write_all(&key_bytes)
+                .context("failed to write ledger signer key")?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&key_path, &key_bytes).context("failed to write ledger signer key")?;
+        }
+
+        info!(key_path = %key_path.display(), "Generated new persistent ledger signing key");
+        Ok(signing_key)
+    }
+}
+
 /// Initialize the supervisor with processes from configuration.
 fn init_supervisor(config: &EcosystemConfig) -> Supervisor {
     let mut supervisor = Supervisor::new();
@@ -848,15 +922,11 @@ async fn async_main(args: Args) -> Result<()> {
     // Write PID file
     write_pid_file(&daemon_config.pid_path)?;
 
-    // Security Review v5 MAJOR 2: Create ONE ledger signing key per daemon
-    // lifecycle. This key is shared between crash recovery (LEASE_REVOKED
-    // events) and the dispatcher (session events). Previously, recovery and
-    // the dispatcher each generated their own ephemeral key, resulting in
-    // multi-key signing within a single daemon lifecycle.
-    let ledger_signing_key = {
-        use rand::rngs::OsRng;
-        ed25519_dalek::SigningKey::generate(&mut OsRng)
-    };
+    // Load one persistent ledger signing key and reuse it across daemon
+    // restarts and runtime paths (startup validation, crash recovery, and
+    // dispatcher emission).
+    let ledger_signing_key = load_or_create_ledger_signing_key(&daemon_config)
+        .context("failed to load ledger signing key")?;
     let lifecycle_signing_key_bytes = ledger_signing_key.to_bytes();
 
     // Initialize persistent ledger if configured (TCK-00289)
