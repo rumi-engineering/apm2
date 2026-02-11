@@ -6,7 +6,7 @@
 
 The `apm2_core::ledger` module provides the persistence layer for APM2's event-sourced architecture. All kernel state changes are recorded as immutable events in this ledger, enabling complete audit trails, crash recovery, and state reconstruction through reducer replay.
 
-The ledger uses SQLite with Write-Ahead Logging (WAL) mode to achieve concurrent read access while writes are in progress. Events form a cryptographic hash chain using BLAKE3, with optional Ed25519 signatures for tamper-evident logging.
+The ledger uses SQLite with Write-Ahead Logging (WAL) mode to achieve concurrent read access while writes are in progress. In the SQLite daemon emitter, events form a cryptographic hash chain using SHA-256, with optional Ed25519 signatures for tamper-evident logging.
 
 ### Architectural Position
 
@@ -63,7 +63,7 @@ pub struct EventRecord {
 **Invariants:**
 - [INV-LED-001] Events are immutable once appended; the ledger is append-only
 - [INV-LED-002] Sequence IDs are monotonically increasing and gap-free (SQLite AUTOINCREMENT)
-- [INV-LED-003] Hash chain integrity: `event_hash = BLAKE3(payload || prev_hash)`
+- [INV-LED-003] Hash chain integrity: `event_hash = SHA-256(event_domain || prev_hash || event_metadata || payload || signature)`
 - [INV-LED-007] RFC-0014 consensus fields are nullable for backward compatibility with pre-consensus events
 
 **Contracts:**
@@ -230,13 +230,13 @@ Events form a cryptographic hash chain for tamper evidence:
 Genesis Hash (32 zero bytes)
        |
        v
-Event 1: event_hash = BLAKE3(payload_1 || genesis_hash)
+Event 1: event_hash = SHA-256(payload_1 || genesis_hash)
        |
        v
-Event 2: event_hash = BLAKE3(payload_2 || event_hash_1)
+Event 2: event_hash = SHA-256(payload_2 || event_hash_1)
        |
        v
-Event N: event_hash = BLAKE3(payload_N || event_hash_(N-1))
+Event N: event_hash = SHA-256(payload_N || event_hash_(N-1))
 ```
 
 **Verification:** `verify_chain()` walks all events and recomputes hashes. Any tampering breaks the chain.

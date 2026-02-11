@@ -15,6 +15,7 @@
 //!
 //! Cache Entry:
 //!     ├── result: ToolResult
+//!     ├── policy_hash: Hash
 //!     ├── inserted_at_ns: u64  // For TTL (RSK-1304)
 //!     └── access_count: u64
 //! ```
@@ -66,6 +67,7 @@ use tracing::{debug, trace};
 
 use super::decision::{DedupeKey, ToolResult};
 use super::error::EpisodeId;
+use super::runtime::Hash;
 
 // =============================================================================
 // Limits (CTR-1303)
@@ -195,6 +197,9 @@ impl DedupeCacheConfig {
 struct CacheEntry {
     /// The cached tool result.
     result: ToolResult,
+
+    /// Policy digest admitted for the request that populated this entry.
+    policy_hash: Hash,
 
     /// Timestamp when this entry was inserted (nanoseconds since epoch).
     ///
@@ -361,6 +366,20 @@ impl DedupeCache {
         key: &DedupeKey,
         current_ns: u64,
     ) -> Option<ToolResult> {
+        self.get_with_policy(episode_id, key, current_ns)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Looks up a cached result and its admitted policy digest.
+    ///
+    /// Returns `None` under the same conditions as [`Self::get`].
+    pub async fn get_with_policy(
+        &self,
+        episode_id: &EpisodeId,
+        key: &DedupeKey,
+        current_ns: u64,
+    ) -> Option<(ToolResult, Hash)> {
         let ttl_ns = self.config.ttl_secs * 1_000_000_000;
 
         let mut entries = self.entries.write().await;
@@ -389,7 +408,7 @@ impl DedupeCache {
         entry.access_count += 1;
 
         trace!(key = %key, access_count = entry.access_count, "cache hit");
-        Some(entry.result.clone())
+        Some((entry.result.clone(), entry.policy_hash))
     }
 
     /// Inserts a result into the cache.
@@ -408,6 +427,19 @@ impl DedupeCache {
         episode_id: EpisodeId,
         key: DedupeKey,
         result: ToolResult,
+        current_ns: u64,
+    ) {
+        self.insert_with_policy(episode_id, key, result, [0u8; 32], current_ns)
+            .await;
+    }
+
+    /// Inserts a result and admitted policy digest into the cache.
+    pub async fn insert_with_policy(
+        &self,
+        episode_id: EpisodeId,
+        key: DedupeKey,
+        result: ToolResult,
+        policy_hash: Hash,
         current_ns: u64,
     ) {
         let output_size = result.output.len();
@@ -434,6 +466,7 @@ impl DedupeCache {
 
         let entry = CacheEntry {
             result,
+            policy_hash,
             inserted_at_ns: current_ns,
             episode_id: episode_id.clone(),
             access_count: 0,

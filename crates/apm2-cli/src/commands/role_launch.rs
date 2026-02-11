@@ -11,10 +11,14 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Result, anyhow};
 #[cfg(test)]
+use apm2_core::channel::LeakageEstimatorFamily;
+#[cfg(test)]
 use apm2_core::channel::derive_channel_source_witness;
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
-    decode_channel_context_token, validate_channel_boundary,
+    BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource,
+    ChannelViolationClass, DeclassificationIntentScope, LeakageBudgetReceipt,
+    RedundancyDeclassificationReceipt, TimingChannelBudget, decode_channel_context_token,
+    validate_channel_boundary,
 };
 use apm2_core::crypto::VerifyingKey;
 use apm2_core::determinism::canonicalize_json;
@@ -77,7 +81,7 @@ pub struct RoleLaunchArgs {
 }
 
 /// System-resolved channel context used for boundary enforcement.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct RoleLaunchChannelContext {
     source: ChannelSource,
@@ -86,6 +90,18 @@ struct RoleLaunchChannelContext {
     capability_verified: bool,
     context_firewall_verified: bool,
     policy_ledger_verified: bool,
+    taint_allow: bool,
+    classification_allow: bool,
+    declass_receipt_valid: bool,
+    declassification_intent: DeclassificationIntentScope,
+    redundancy_declassification_receipt: Option<RedundancyDeclassificationReceipt>,
+    boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
+    leakage_budget_receipt: Option<LeakageBudgetReceipt>,
+    timing_channel_budget: Option<TimingChannelBudget>,
+    leakage_budget_policy_max_bits: Option<u64>,
+    declared_leakage_budget_bits: Option<u64>,
+    timing_budget_policy_max_ticks: Option<u64>,
+    declared_timing_budget_ticks: Option<u64>,
 }
 
 impl RoleLaunchChannelContext {
@@ -97,6 +113,18 @@ impl RoleLaunchChannelContext {
             capability_verified: false,
             context_firewall_verified: false,
             policy_ledger_verified: false,
+            taint_allow: false,
+            classification_allow: false,
+            declass_receipt_valid: false,
+            declassification_intent: DeclassificationIntentScope::Unknown,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: None,
+            leakage_budget_receipt: None,
+            timing_channel_budget: None,
+            leakage_budget_policy_max_bits: None,
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: None,
+            declared_timing_budget_ticks: None,
         }
     }
 
@@ -111,6 +139,33 @@ impl RoleLaunchChannelContext {
             capability_verified: true,
             context_firewall_verified: true,
             policy_ledger_verified: true,
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: Some(BoundaryFlowPolicyBinding {
+                policy_digest: [1u8; 32],
+                admitted_policy_root_digest: [1u8; 32],
+                canonicalizer_tuple_digest: [2u8; 32],
+                admitted_canonicalizer_tuple_digest: [2u8; 32],
+            }),
+            leakage_budget_receipt: Some(LeakageBudgetReceipt {
+                leakage_bits: 4,
+                budget_bits: 8,
+                estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                confidence_bps: 9_500,
+                confidence_label: "high".to_string(),
+            }),
+            timing_channel_budget: Some(TimingChannelBudget {
+                release_bucket_ticks: 10,
+                observed_variance_ticks: 3,
+                budget_ticks: 10,
+            }),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         }
     }
 }
@@ -361,7 +416,7 @@ fn execute_role_launch_with_daemon_verifying_key(
     daemon_verifying_key: Option<&VerifyingKey>,
 ) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
     let channel_context = resolve_channel_context(args, daemon_verifying_key);
-    execute_role_launch_with_channel_context(args, ledger_path, cas_path, channel_context)
+    execute_role_launch_with_channel_context(args, ledger_path, cas_path, &channel_context)
 }
 
 fn resolve_daemon_channel_verifying_key(
@@ -430,6 +485,18 @@ fn resolve_channel_context(
         capability_verified: check.capability_verified,
         context_firewall_verified: check.context_firewall_verified,
         policy_ledger_verified: check.policy_ledger_verified,
+        taint_allow: check.taint_allow,
+        classification_allow: check.classification_allow,
+        declass_receipt_valid: check.declass_receipt_valid,
+        declassification_intent: check.declassification_intent,
+        redundancy_declassification_receipt: check.redundancy_declassification_receipt,
+        boundary_flow_policy_binding: check.boundary_flow_policy_binding,
+        leakage_budget_receipt: check.leakage_budget_receipt,
+        timing_channel_budget: check.timing_channel_budget,
+        leakage_budget_policy_max_bits: check.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: check.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: check.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: check.declared_timing_budget_ticks,
     }
 }
 
@@ -437,7 +504,7 @@ fn execute_role_launch_with_channel_context(
     args: &RoleLaunchArgs,
     ledger_path: &Path,
     cas_path: &Path,
-    channel_context: RoleLaunchChannelContext,
+    channel_context: &RoleLaunchChannelContext,
 ) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
     validate_required_bounded("work_id", &args.work_id, MAX_WORK_ID_LENGTH)?;
     validate_required_bounded("role", &args.role, MAX_ROLE_LENGTH)?;
@@ -588,7 +655,7 @@ fn parse_hash_input(field: &str, value: &str) -> std::result::Result<[u8; 32], L
 }
 
 fn enforce_channel_boundary(
-    channel_context: RoleLaunchChannelContext,
+    channel_context: &RoleLaunchChannelContext,
 ) -> std::result::Result<(), LaunchDenyReason> {
     let check = ChannelBoundaryCheck {
         source: channel_context.source,
@@ -597,6 +664,20 @@ fn enforce_channel_boundary(
         capability_verified: channel_context.capability_verified,
         context_firewall_verified: channel_context.context_firewall_verified,
         policy_ledger_verified: channel_context.policy_ledger_verified,
+        taint_allow: channel_context.taint_allow,
+        classification_allow: channel_context.classification_allow,
+        declass_receipt_valid: channel_context.declass_receipt_valid,
+        declassification_intent: channel_context.declassification_intent,
+        redundancy_declassification_receipt: channel_context
+            .redundancy_declassification_receipt
+            .clone(),
+        boundary_flow_policy_binding: channel_context.boundary_flow_policy_binding.clone(),
+        leakage_budget_receipt: channel_context.leakage_budget_receipt.clone(),
+        timing_channel_budget: channel_context.timing_channel_budget.clone(),
+        leakage_budget_policy_max_bits: channel_context.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: channel_context.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: channel_context.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: channel_context.declared_timing_budget_ticks,
     };
     let defects = validate_channel_boundary(&check);
     if defects.is_empty() {
@@ -1375,6 +1456,18 @@ const fn channel_violation_label(violation: ChannelViolationClass) -> &'static s
         ChannelViolationClass::MissingChannelMetadata => "missing_channel_metadata",
         ChannelViolationClass::UnknownChannelSource => "unknown_channel_source",
         ChannelViolationClass::PolicyNotLedgerVerified => "policy_not_ledger_verified",
+        ChannelViolationClass::TaintNotAdmitted => "taint_not_admitted",
+        ChannelViolationClass::ClassificationNotAdmitted => "classification_not_admitted",
+        ChannelViolationClass::DeclassificationReceiptInvalid => "declassification_receipt_invalid",
+        ChannelViolationClass::UnknownOrUnscopedDeclassificationIntent => {
+            "unknown_or_unscoped_declassification_intent"
+        },
+        ChannelViolationClass::PolicyDigestBindingMismatch => "policy_digest_binding_mismatch",
+        ChannelViolationClass::CanonicalizerTupleBindingMismatch => {
+            "canonicalizer_tuple_binding_mismatch"
+        },
+        ChannelViolationClass::LeakageBudgetExceeded => "leakage_budget_exceeded",
+        ChannelViolationClass::TimingChannelBudgetExceeded => "timing_channel_budget_exceeded",
     }
 }
 
@@ -1516,12 +1609,52 @@ mod tests {
         }
     }
 
+    fn daemon_admitted_boundary_check() -> ChannelBoundaryCheck {
+        ChannelBoundaryCheck {
+            source: ChannelSource::TypedToolIntent,
+            channel_source_witness: Some(derive_channel_source_witness(
+                ChannelSource::TypedToolIntent,
+            )),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+            taint_allow: true,
+            classification_allow: true,
+            declass_receipt_valid: true,
+            declassification_intent: DeclassificationIntentScope::None,
+            redundancy_declassification_receipt: None,
+            boundary_flow_policy_binding: Some(BoundaryFlowPolicyBinding {
+                policy_digest: [1u8; 32],
+                admitted_policy_root_digest: [1u8; 32],
+                canonicalizer_tuple_digest: [2u8; 32],
+                admitted_canonicalizer_tuple_digest: [2u8; 32],
+            }),
+            leakage_budget_receipt: Some(LeakageBudgetReceipt {
+                leakage_bits: 4,
+                budget_bits: 8,
+                estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                confidence_bps: 9_500,
+                confidence_label: "high".to_string(),
+            }),
+            timing_channel_budget: Some(TimingChannelBudget {
+                release_bucket_ticks: 10,
+                observed_variance_ticks: 3,
+                budget_ticks: 10,
+            }),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
+        }
+    }
+
     fn execute_launch(env: &TestEnv) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
         execute_role_launch_with_channel_context(
             &env.args,
             &env.ledger_path,
             &env.cas_path,
-            env.channel_context,
+            &env.channel_context,
         )
     }
 
@@ -1881,16 +2014,7 @@ mod tests {
         let signer = Signer::generate();
         let daemon_verifying_key = signer.verifying_key();
         let request_id = "REQ-TEST-ROLE-LAUNCH-1";
-        let check = ChannelBoundaryCheck {
-            source: ChannelSource::TypedToolIntent,
-            channel_source_witness: Some(derive_channel_source_witness(
-                ChannelSource::TypedToolIntent,
-            )),
-            broker_verified: true,
-            capability_verified: true,
-            context_firewall_verified: true,
-            policy_ledger_verified: true,
-        };
+        let check = daemon_admitted_boundary_check();
         env.args.request_id = Some(request_id.to_string());
         env.args.channel_context_token = Some(
             issue_channel_context_token(
@@ -1951,16 +2075,7 @@ mod tests {
         let signer = Signer::generate();
         let daemon_verifying_key = signer.verifying_key();
         let request_id = "REQ-TEST-ROLE-LAUNCH-2";
-        let check = ChannelBoundaryCheck {
-            source: ChannelSource::TypedToolIntent,
-            channel_source_witness: Some(derive_channel_source_witness(
-                ChannelSource::TypedToolIntent,
-            )),
-            broker_verified: true,
-            capability_verified: true,
-            context_firewall_verified: true,
-            policy_ledger_verified: true,
-        };
+        let check = daemon_admitted_boundary_check();
         env.args.request_id = Some(request_id.to_string());
         env.args.channel_context_token = Some(
             issue_channel_context_token(
@@ -2001,16 +2116,7 @@ mod tests {
         let mut env = setup_test_env();
         let signer = Signer::generate();
         let daemon_verifying_key = signer.verifying_key();
-        let check = ChannelBoundaryCheck {
-            source: ChannelSource::TypedToolIntent,
-            channel_source_witness: Some(derive_channel_source_witness(
-                ChannelSource::TypedToolIntent,
-            )),
-            broker_verified: true,
-            capability_verified: true,
-            context_firewall_verified: true,
-            policy_ledger_verified: true,
-        };
+        let check = daemon_admitted_boundary_check();
         env.args.request_id = Some("REQ-TEST-ROLE-LAUNCH-WRONG".to_string());
         env.args.channel_context_token = Some(
             issue_channel_context_token(

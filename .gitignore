@@ -61,3 +61,10 @@ secrets.json
 
 # Claude Code local config
 .claude/
+
+# Local agent prompt/debug artifacts
+AGENT_PROMPT.md
+FIX_PROMPT*.md
+CLIPPY_FIX.md
+MERGE_CONFLICT*.md
+security_findings.md
