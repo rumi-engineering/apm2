@@ -1,321 +1,167 @@
 title: Code Quality Review Prompt
 protocol:
   id: CODE-QUALITY-REVIEW
-  version: 1.2.0
+  version: 2.0.0
   type: executable_specification
-  inputs[1]:
-    - PR_URL
-  outputs[2]:
-    - PRComment
-    - StatusCheck
+  purpose: "Evaluate PR code quality, publish findings through FAC, and set a SHA-bound decision."
 
-variables:
-  PR_URL: "$PR_URL"
+inputs[1]:
+  - OPTIONAL_CONTEXT
 
-references[39]:
+outputs[2]:
+  - ReviewCommentProjection
+  - DecisionProjection
+
+metadata_contract:
+  invariants[3]:
+    - '"head_sha" MUST equal reviewed_sha.'
+    - '"pr_number" MUST match the prepared PR number exactly.'
+    - "Set reviewed_sha = headRefOid."
+
+references[16]:
   - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "REQUIRED READING: APM2 terminology and ontology."
-  - path: "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json"
-    purpose: "Mode #07: Type-Theoretic Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/40-mechanistic.json"
-    purpose: "Mode #40: Mechanistic Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/13-abductive.json"
-    purpose: "Mode #13: Abductive Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/17-simplicity-compression.json"
-    purpose: "Mode #17: Simplicity / Compression Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/assets/59-dialectical.json"
-    purpose: "Mode #59: Dialectical Reasoning"
+    purpose: "Holonic model, truth/projection split, and verification-first behavior."
   - path: "@AGENTS.md"
-    purpose: "Global Agent Instructions"
+    purpose: "Global repository instructions."
   - path: "@documents/security/SECURITY_POLICY.cac.json"
-    purpose: "Security Policy"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "Holonic Unified Theory"
-  - path: "@documents/skills/rust-standards/SKILL.md"
-    purpose: "Rust Standards Skill"
-  - path: "@documents/skills/rust-standards/references/00_operating_mode.md"
-    purpose: "RS-00: Operating Mode"
-  - path: "@documents/skills/rust-standards/references/02_inputs_and_stop_conditions.md"
-    purpose: "RS-02: Inputs & Stop Conditions"
-  - path: "@documents/skills/rust-standards/references/04_qcp_classification.md"
-    purpose: "RS-04: QCP Classification"
+    purpose: "Cross-cutting policy guardrails."
   - path: "@documents/skills/rust-standards/references/06_triage_fast_scan.md"
-    purpose: "RS-06: Triage Fast Scan"
+    purpose: "Fast triage procedure."
   - path: "@documents/skills/rust-standards/references/08_invariant_mapping.md"
-    purpose: "RS-08: Invariant Mapping"
+    purpose: "Invariant and contract mapping."
   - path: "@documents/skills/rust-standards/references/10_abstraction_and_simplification.md"
-    purpose: "RS-10: Abstraction & Simplification"
-  - path: "@documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md"
-    purpose: "RS-12: Soundness & Unsafe"
-  - path: "@documents/skills/rust-standards/references/14_allocator_arena_pool_review.md"
-    purpose: "RS-14: Allocators & Pools"
+    purpose: "Complexity reduction checks."
   - path: "@documents/skills/rust-standards/references/16_error_handling_and_panic_policy.md"
-    purpose: "RS-16: Error & Panic Policy"
+    purpose: "Error handling expectations."
   - path: "@documents/skills/rust-standards/references/18_api_design_and_semver.md"
-    purpose: "RS-18: API Design & Semver"
+    purpose: "Public API compatibility and ergonomics."
   - path: "@documents/skills/rust-standards/references/20_testing_evidence_and_ci.md"
-    purpose: "RS-20: Testing & CI"
+    purpose: "Test sufficiency expectations."
   - path: "@documents/skills/rust-standards/references/22_performance_review.md"
-    purpose: "RS-22: Performance Review"
+    purpose: "Performance regressions and hotspots."
   - path: "@documents/skills/rust-standards/references/24_dependency_and_build_surface.md"
-    purpose: "RS-24: Dependencies & Build"
+    purpose: "Dependency and build-surface scrutiny."
   - path: "@documents/skills/rust-standards/references/26_severity_and_verdict.md"
-    purpose: "RS-26: Severity & Verdict"
+    purpose: "Severity calibration."
   - path: "@documents/skills/rust-standards/references/28_required_actions_templates.md"
-    purpose: "RS-28: Required Actions Templates"
-  - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
-    purpose: "RS-41: Safe Patterns"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-01: Loop Closure"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-02: Context Sufficiency"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-03: Monotone Ledger"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-05: Dual-Axis Containment"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-06: MDL Budget"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-07: Verifiable Summaries"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-08: Goodhart Resistance"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-12: Bounded Search"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-13: Semantic Typing"
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "LAW-15: Content-Addressed Evidence"
-  - path: "@documents/rfcs/RFC-0019/AUTONOMOUS_FORGE_ADMISSION_CYCLE.md"
-    purpose: "RFC-0019: Autonomous Forge Admission Cycle"
-  - path: "@.github/review-gate/trusted-reviewers.json"
-    purpose: "Authoritative allowlist for machine-readable reviewer_id and GitHub identity binding."
-  - path: "@documents/reviews/REVIEW_GATE_WAIVER_FLOW.md"
-    purpose: "Waiver-only operator override flow for blocked review gates."
+    purpose: "Finding statement quality."
 
 decision_tree:
-  entrypoint: PHASE_1_COLLECT_PR_IDENTITY
-  nodes[7]:
-    - id: PHASE_1_COLLECT_PR_IDENTITY
-      purpose: "Gather PR metadata, diff, and ticket bindings."
-      steps[6]:
-        - id: FETCH_PR_METADATA
-          action: command
-          run: "gh pr view $PR_URL --json number,title,body,author,baseRefName,headRefName,headRefOid,commits,files,additions,deletions"
-          capture_as: pr_metadata_json
-        - id: EXTRACT_PR_FIELDS
-          action: parse_json
-          from: pr_metadata_json
-          extract: [pr_number, pr_title, pr_body, files, additions, deletions, headRefName, baseRefName, headRefOid]
-        - id: ASSIGN_REVIEWED_SHA
-          action: "Set reviewed_sha = headRefOid."
-        - id: STOP_IF_NO_REVIEWED_SHA
-          if: "reviewed_sha is empty"
-          then:
-            action: "EMIT StopCondition STOP-NO-HEAD-SHA severity BLOCKER message 'Could not resolve latest commit SHA from PR_URL'."
-            stop: true
-        - id: FETCH_DIFF
-          action: command
-          run: "gh pr diff $PR_URL"
-          capture_as: diff_content
-        - id: EXTRACT_TICKET_BINDING
-          action: parse_text
-          from_fields: [pr_title, pr_body]
-          patterns:
-            ticket_id: "TCK-[0-9]{5}"
-            rfc_id: "RFC-[0-9]{4}"
-      next: PHASE_1A_RESOLVE_WORKTREE
+  entrypoint: STEP_1_DISCOVERY
+  nodes[8]:
+    - id: STEP_1_DISCOVERY
+      purpose: "Discover FAC commands before execution."
+      steps[7]:
+        - action: "Read all files listed in references before proceeding."
+        - action: command
+          run: "apm2 fac review --help"
+        - action: command
+          run: "apm2 fac review prepare --help"
+        - action: command
+          run: "apm2 fac review publish --help"
+        - action: command
+          run: "apm2 fac review findings --help"
+        - action: command
+          run: "apm2 fac review decision --help"
+        - action: command
+          run: "apm2 fac review decision set --help"
+      next: STEP_2_PREPARE_INPUTS
 
-    - id: PHASE_1A_RESOLVE_WORKTREE
-      purpose: "Resolve an existing local worktree for this PR. Default is reuse, never auto-create."
+    - id: STEP_2_PREPARE_INPUTS
+      purpose: "Materialize the PR review inputs from FAC."
       steps[4]:
-        - id: LIST_WORKTREES
-          action: command
-          run: "git worktree list --porcelain | awk '/^worktree /{wt=$2}/^branch /{b=$2; sub(/^refs\\/heads\\//,\"\",b); print wt \"\\t\" b}'"
-          capture_as: worktree_index
-        - id: MATCH_BY_HEAD_BRANCH
-          action: select_first
-          from: worktree_index
-          where: "branch == headRefName"
-          capture_as: review_worktree
-        - id: FALLBACK_MATCH_BY_TICKET
-          if: "review_worktree is empty AND ticket_id is not empty"
-          action: "Select first entry where branch contains ticket_id OR path contains ticket_id."
-        - id: ENFORCE_DEFAULT_REUSE_POLICY
-          action: |
-            If review_worktree exists: use it as primary local source for file reads and adjacent context.
-            If review_worktree does not exist: continue with PR API/diff review mode.
-            Do NOT create a new worktree by default during review execution.
-      next: PHASE_2_GATHER_TICKET_CONTEXT
+        - action: command
+          run: "apm2 fac review prepare --json"
+          capture_as: prepare_json
+        - action: parse_json
+          from: prepare_json
+          extract: [repo, pr_number, pr_url, head_sha, diff_path, commit_history_path, temp_dir]
+        - action: "Set headRefOid = head_sha. Set reviewed_sha = headRefOid."
+        - action: stop_if
+          if: "diff_path is empty OR head_sha is empty"
+          message: "STOP-NO-PREPARED-INPUTS: fac review prepare did not return required fields."
+      next: STEP_3_COLLECT_CONTEXT
 
-    - id: PHASE_2_GATHER_TICKET_CONTEXT
-      purpose: "Map PR to design intent and DOD."
-      decisions[5]:
-        - id: HANDLE_MISSING_TICKET
-          if: "ticket_id is empty"
+    - id: STEP_3_COLLECT_CONTEXT
+      purpose: "Collect quality standards and relevant module context."
+      steps[5]:
+        - action: read_file
+          path: "$diff_path"
+        - action: read_file
+          path: "$commit_history_path"
+        - action: command
+          run: "rg --files -g 'AGENTS.md' crates/apm2-core crates/apm2-cli"
+          capture_as: module_agents_md
+        - action: selective_read
+          from: module_agents_md
+          rule: "Read AGENTS.md files adjacent to modules touched by the diff."
+        - action: selective_read
+          rule: "Read RFC/ticket/doc references linked from touched files when necessary for intent verification."
+      next: STEP_4_ANALYZE
+
+    - id: STEP_4_ANALYZE
+      purpose: "Evaluate correctness, maintainability, and test evidence."
+      lenses[6]:
+        - lens: "Invariant Preservation"
+          focus: "Behavioral regressions, hidden coupling, invalid assumptions."
+        - lens: "API and Type Surface"
+          focus: "Semantics, naming, compatibility, ergonomics."
+        - lens: "Failure Handling"
+          focus: "Error paths, fail-closed behavior, observability."
+        - lens: "Testing Sufficiency"
+          focus: "Missing tests, weak assertions, absent negative cases."
+        - lens: "Performance / Resource Use"
+          focus: "Hot-path regressions, needless allocations, expensive loops."
+        - lens: "Documentation Coherence"
+          focus: "Code/docs/AGENTS.md alignment."
+      next: STEP_5_WRITE_FINDINGS
+
+    - id: STEP_5_WRITE_FINDINGS
+      purpose: "Write the reviewer-authored finding body (no manual metadata block)."
+      steps[3]:
+        - action: write_file
+          path: "$temp_dir/code_quality_findings.md"
+          required_structure:
+            - "## Code Quality Review: PASS | FAIL"
+            - "Reviewed SHA: $head_sha"
+            - "### **BLOCKER FINDINGS**"
+            - "### **MAJOR FINDINGS**"
+            - "### **MINOR FINDINGS**"
+            - "### **NITS**"
+            - "### **WAIVED FINDINGS**"
+        - action: quality_rule
+          rule: "Each non-empty finding includes path, impact, and required action."
+        - action: classify
+          output: [blocker_count, major_count, minor_count, nit_count, verdict]
+      next: STEP_6_PUBLISH
+
+    - id: STEP_6_PUBLISH
+      purpose: "Publish through FAC projection path only."
+      steps[1]:
+        - action: command
+          run: "apm2 fac review publish --type code-quality --body-file \"$temp_dir/code_quality_findings.md\" --json"
+          capture_as: publish_json
+      next: STEP_7_SET_DECISION
+
+    - id: STEP_7_SET_DECISION
+      purpose: "Write SHA-bound decision for code-quality dimension."
+      decisions[2]:
+        - if: "blocker_count == 0 AND major_count == 0"
           then:
-            action: "EMIT StopCondition STOP-NO-BINDING severity BLOCKER message 'Non-trivial changes require binding ticket'."
-        - id: READ_RFC_CONTEXT
-          if: "rfc_id is found"
-          actions: ["Read decomposition and design decisions for RFC."]
-        - id: READ_TICKET_CONTEXT
-          if: "ticket_id is found"
-          actions: ["Read ticket metadata and body."]
-      next: PHASE_3_ANALYZE_FILES
+            action: command
+            run: "apm2 fac review decision set --dimension code-quality --decision approve --reason \"PASS for $head_sha\" --json"
+        - if: "blocker_count > 0 OR major_count > 0"
+          then:
+            action: command
+            run: "apm2 fac review decision set --dimension code-quality --decision deny --reason \"BLOCKER/MAJOR findings for $head_sha\" --json"
+      note: "Decision command removes prepared tmp review inputs by default. Use --keep-prepared-inputs only when debugging."
+      next: STEP_8_VERIFY_AND_STOP
 
-    - id: PHASE_3_ANALYZE_FILES
-      purpose: "Perform static analysis on changed and adjacent files."
+    - id: STEP_8_VERIFY_AND_STOP
+      purpose: "Verify projection and end deterministically."
       steps[2]:
-        - id: REVIEW_MODIFIED_FILES
-          action: for_each_file
-          cases:
-            - match: "*.rs"
-              action: "Read entire file."
-            - match: "config files"
-              action: "Verify syntax and correctness."
-            - match: "docs"
-              action: "Verify accuracy against code."
-        - id: READ_ADJACENT_CONTEXT
-          action: "Read mod.rs, related tests, and AGENTS.md in touched modules."
-      next: PHASE_4_EXECUTE_REVIEW
-
-    - id: PHASE_4_EXECUTE_REVIEW
-      purpose: "Apply Rust standards and architectural lenses."
-      lenses[7]:
-        - lens: "Rust Soundness"
-          focus: "Ownership, lifetimes, unsafe justification."
-        - lens: "Failure Models"
-          focus: "Error propagation, observability, stable identities."
-        - lens: "Testing Evidence"
-          focus: "Coverage, negative evidence, falsification."
-        - lens: "Documentation"
-          focus: "Public APIs, AGENTS.md accuracy."
-        - lens: "Performance"
-          focus: "Allocations, hot paths, algorithmic risk."
-        - lens: "Security"
-          focus: "SCP determination, boundary scrutiny."
-        - lens: "Architectural Alignment"
-          focus: "Holonic boundary model, Markov Blanket."
-      next: PHASE_5_COMPUTE_VERDICT
-
-    - id: PHASE_5_COMPUTE_VERDICT
-      purpose: "Assign PASS/FAIL based on findings severity."
-      severity_definitions:
-        BLOCKER: "Unsound code, security vulnerability, data loss, scope missing."
-        MAJOR: "Missing tests, API issues, criteria not met."
-        MINOR: "Non-idiomatic, missing docs."
-        NIT: "Style, optional improvements."
-      waiver_policy:
-        purpose: "Incorporate explicit, approved waivers into severity and verdict computation (fail-closed)."
-        rules:
-          - |
-            If you identify a trust-boundary regression / strictness decrease in review gate provenance
-            (e.g., authoritative merge-required status and allowlisted artifacts produced from PR-branch mutable code),
-            you MUST check whether an APPROVED, unexpired `WVR-####` waiver exists and is valid for `reviewed_sha`.
-          - |
-            Waiver validity check (from `documents/reviews/REVIEW_GATE_WAIVER_FLOW.md`):
-            - `waiver.references.commit_sha` MUST equal `reviewed_sha`; OR
-            - If the PR head includes a waiver-only commit that only changes `documents/work/waivers/`,
-              `commit_sha` MAY equal the immediate parent of `reviewed_sha` (pre-waiver PR head).
-          - |
-            If a waiver is valid AND its scope covers the finding (by gate_ids / quality_dimension_ids),
-            record it under **WAIVED FINDINGS** and do NOT count it toward blocker/major severity_counts or verdict.
-          - |
-            If a waiver is missing/invalid/out-of-scope for the finding, classify it as a normal finding (usually BLOCKER).
-      verdict_rules:
-        PASS: "blocker_count == 0 AND major_count == 0"
-        FAIL: "blocker_count > 0 OR major_count > 0"
-      next: PHASE_6_PUBLISH_RESULTS
-
-    - id: PHASE_6_PUBLISH_RESULTS
-      purpose: "Post PR comment and publish review-gate metadata for projection-only status handling."
-      comment_content:
-        structure:
-          - section: "Verdict Banner"
-            format: "## Code Quality Review: PASS | FAIL"
-            content: "Clear verdict with overall severity summary"
-          - section: "Summary"
-            content: "1-2 paragraph overview of what was reviewed and key conclusions"
-          - section: "Worktree Resolution"
-            content: "State reused worktree path (or no-existing-worktree fallback mode) and branch match basis."
-          - section: "Ticket Requirements"
-            content: "Enumerated list of DOD criteria from bound ticket"
-          - section: "Requirements Verification"
-            content: "For each requirement: evidence of how the code satisfies it"
-          - section: "Quality Analysis"
-            subsections:
-              - "Simplicity: Minimal moving parts, no unnecessary abstraction"
-              - "Elegance: Idiomatic patterns, clean data flow"
-              - "Invariant Adherence: Conformance to Rust Standards references"
-          - section: "Lenses Applied"
-            content: "Summary of each lens from PHASE_4 and what was checked"
-          - section: "BLOCKER FINDINGS"
-            format: "### **BLOCKER FINDINGS**"
-            content: "Numbered list of blockers, each with:"
-            item_structure:
-              - "Issue: What is wrong"
-              - "Impact: What breaks or is at risk"
-              - "Consequence: Downstream effects if unaddressed"
-              - "Required Fix: Clear, actionable remediation"
-          - section: "MAJOR FINDINGS"
-            format: "### **MAJOR FINDINGS**"
-            content: "Numbered list of majors with same structure as blockers"
-          - section: "WAIVED FINDINGS"
-            format: "### **WAIVED FINDINGS**"
-            content: "Numbered list of waived items (with waiver id + why it is valid), each with the same structure as blockers"
-          - section: "MINOR/NIT FINDINGS"
-            format: "### **MINOR FINDINGS** / ### **NITS**"
-            content: "Optional sections for lower-severity items"
-          - section: "POSITIVE OBSERVATIONS"
-            format: "### **POSITIVE OBSERVATIONS (PASS)**"
-            content: "What the PR does well; specific invariants correctly upheld"
-          - section: "Machine-Readable Metadata (REQUIRED)"
-            content: "Append this exact metadata block at the end of the comment for gate evaluation."
-            template: |
-              <!-- apm2-review-metadata:v1:code-quality -->
-              ```json
-              {
-                "schema": "apm2.review.metadata.v1",
-                "review_type": "code-quality",
-                "pr_number": <pr_number>,
-                "head_sha": "$reviewed_sha",
-                "verdict": "PASS|FAIL",
-                "severity_counts": {
-                  "blocker": <blocker_count>,
-                  "major": <major_count>,
-                  "minor": <minor_count>,
-                  "nit": <nit_count>
-                },
-                "reviewer_id": "<allowlisted_reviewer_id>"
-              }
-              ```
-            constraints:
-              - "head_sha MUST equal reviewed_sha exactly."
-              - "pr_number MUST equal the PR being reviewed."
-              - "reviewer_id MUST appear in `.github/review-gate/trusted-reviewers.json` under `code_quality`."
-              - "Missing/invalid metadata is gate-fatal."
-          - section: "Footer"
-            format: "---"
-            content: "Reviewed commit: $reviewed_sha (resolved from PR_URL at review start for auditability)"
-      steps[4]:
-        - id: WRITE_FINDINGS
-          action: write_file
-          path: "quality_findings.md"
-          content: "$FORMATTED_FINDINGS"
-        - id: APPEND_METADATA
-          action: append_file
-          path: "quality_findings.md"
-          content: "$MACHINE_READABLE_METADATA_BLOCK"
-        - id: POST_AND_UPDATE
-          action: command
-          note: |
-            Post findings as a PR comment only.
-            Do NOT call GitHub statuses/check-runs APIs directly.
-            The authoritative `Review Gate Success` status is produced by
-            the review-gate evaluator from the machine-readable metadata
-            block above.
-          run: |
-            gh pr comment $PR_URL --body-file quality_findings.md
-            rm quality_findings.md
-        - id: TERMINATE
-          action: output
-          content: "DONE"
+        - action: command
+          run: "apm2 fac review findings --json"
+        - action: output
+          text: "DONE"
+      stop: true

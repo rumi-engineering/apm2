@@ -18,18 +18,23 @@ mod dispatch;
 mod events;
 mod evidence;
 mod findings;
+mod gate_attestation;
 mod gate_cache;
 mod gates;
 mod liveness;
 mod logs;
+mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
+mod prepare;
 mod projection;
+mod publish;
 mod push;
 mod restart;
 mod selector;
 mod state;
+mod target;
 mod types;
 
 use std::fs::{self, File};
@@ -45,9 +50,10 @@ use barrier::{
 };
 // Re-export public API for use by `fac.rs`
 pub use decision::DecisionValueArg;
-use dispatch::dispatch_single_review;
+use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
+pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
@@ -161,6 +167,7 @@ pub fn run_review(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
     json_output: bool,
 ) -> u8 {
     let event_offset = review_events_path()
@@ -168,7 +175,7 @@ pub fn run_review(
         .and_then(|path| fs::metadata(path).ok().map(|meta| meta.len()))
         .unwrap_or(0);
 
-    match orchestrator::run_review_inner(pr_url, review_type, expected_head_sha) {
+    match orchestrator::run_review_inner(pr_url, review_type, expected_head_sha, force) {
         Ok(summary) => {
             let success = summary.security.as_ref().is_none_or(|entry| entry.success)
                 && summary.quality.as_ref().is_none_or(|entry| entry.success);
@@ -266,9 +273,10 @@ pub fn run_dispatch(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
     json_output: bool,
 ) -> u8 {
-    match run_dispatch_inner(pr_url, review_type, expected_head_sha) {
+    match run_dispatch_inner(pr_url, review_type, expected_head_sha, force) {
         Ok(summary) => {
             if json_output {
                 let payload = serde_json::json!({
@@ -376,6 +384,72 @@ pub fn run_findings(
     }
 }
 
+pub fn run_prepare(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match prepare::run_prepare(repo, pr_number, pr_url, sha, json_output) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_prepare_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_publish(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    review_type: ReviewPublishTypeArg,
+    body_file: &Path,
+    json_output: bool,
+) -> u8 {
+    match publish::run_publish(
+        repo,
+        pr_number,
+        pr_url,
+        sha,
+        review_type,
+        body_file,
+        json_output,
+    ) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_publish_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_decision_set(
     repo: &str,
@@ -385,6 +459,7 @@ pub fn run_decision_set(
     dimension: &str,
     decision: DecisionValueArg,
     reason: Option<&str>,
+    keep_prepared_inputs: bool,
     json_output: bool,
 ) -> u8 {
     match decision::run_decision_set(
@@ -395,6 +470,7 @@ pub fn run_decision_set(
         dimension,
         decision,
         reason,
+        keep_prepared_inputs,
         json_output,
     ) {
         Ok(code) => code,
@@ -727,6 +803,7 @@ fn run_dispatch_inner(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
 ) -> Result<DispatchSummary, String> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
     let current_head_sha = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
@@ -738,7 +815,6 @@ fn run_dispatch_inner(
             ));
         }
     }
-
     let dispatch_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -752,13 +828,14 @@ fn run_dispatch_inner(
 
     let mut results = Vec::with_capacity(kinds.len());
     for kind in kinds {
-        let result = dispatch_single_review(
+        let result = dispatch_single_review_with_force(
             pr_url,
             &owner_repo,
             pr_number,
             kind,
             &current_head_sha,
             dispatch_epoch,
+            force,
         )?;
         results.push(result);
     }
@@ -802,7 +879,7 @@ fn run_kickoff_inner(
     ensure_gh_cli_ready()?;
 
     let started = Instant::now();
-    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha))?;
+    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha), false)?;
     let mut after_seq = 0_u64;
     let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
     let mut terminal_state = "failure:timeout".to_string();

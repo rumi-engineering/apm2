@@ -19,6 +19,7 @@ use super::detection::{
 };
 use super::events::emit_event;
 use super::liveness::scan_log_liveness;
+use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::model_pool::{
     acquire_provider_slot, backoff_before_cross_family_fallback, ensure_model_backend_available,
     select_cross_family_fallback, select_fallback_model, select_review_model_random,
@@ -81,6 +82,7 @@ pub fn run_review_inner(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
 ) -> Result<ReviewRunSummary, String> {
     let (owner_repo, pr_number) = super::types::parse_pr_url(pr_url)?;
     let current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
@@ -92,6 +94,14 @@ pub fn run_review_inner(
                 "PR head moved before review start: expected {expected}, got {current_head_sha}"
             ));
         }
+    }
+    let workspace_root = resolve_repo_root()?;
+    let merge_report = check_merge_conflicts_against_main(&workspace_root, &initial_head_sha)?;
+    if merge_report.has_conflicts() {
+        return Err(format!(
+            "cannot run review for conflicted head SHA {initial_head_sha}:\n{}",
+            render_merge_conflict_summary(&merge_report)
+        ));
     }
 
     let event_ctx = ExecutionContext {
@@ -114,6 +124,7 @@ pub fn run_review_inner(
                 current_head_sha,
                 selected,
                 &event_ctx,
+                force,
             )?;
             final_heads.push(result.final_head_sha.clone());
             security_summary = Some(result.summary);
@@ -128,6 +139,7 @@ pub fn run_review_inner(
                 current_head_sha,
                 selected,
                 &event_ctx,
+                force,
             )?;
             final_heads.push(result.final_head_sha.clone());
             quality_summary = Some(result.summary);
@@ -147,6 +159,7 @@ pub fn run_review_inner(
                     sec_head,
                     sec_model,
                     &sec_ctx,
+                    force,
                 )
             });
 
@@ -164,6 +177,7 @@ pub fn run_review_inner(
                     qual_head,
                     qual_model,
                     &qual_ctx,
+                    force,
                 )
             });
 
@@ -278,6 +292,7 @@ fn persist_review_run_state(
 
 // ── run_single_review ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_single_review(
     pr_url: &str,
     owner_repo: &str,
@@ -286,6 +301,7 @@ fn run_single_review(
     initial_head_sha: String,
     initial_model: ReviewModelSelection,
     event_ctx: &ExecutionContext,
+    force: bool,
 ) -> Result<SingleReviewResult, String> {
     let repo_root = resolve_repo_root()?;
     let prompt_template = repo_root.join(review_kind.prompt_path());
@@ -333,6 +349,19 @@ fn run_single_review(
     let expected_comment_author = resolve_authenticated_gh_login();
     let sequence_number = next_review_sequence_number(pr_number, review_type)?;
     let run_id = build_review_run_id(pr_number, review_type, sequence_number, &current_head_sha);
+    if let Some(previous) = load_review_run_state_strict(pr_number, review_type)? {
+        if previous.head_sha.eq_ignore_ascii_case(&current_head_sha)
+            && previous.status.is_terminal()
+            && !force
+        {
+            return Err(format!(
+                "same SHA already has terminal {review_type} review state={} run_id={} for {} — re-run with --force to override",
+                previous.status.as_str(),
+                previous.run_id,
+                current_head_sha
+            ));
+        }
+    }
     let mut run_state = ReviewRunState {
         run_id: run_id.clone(),
         pr_url: pr_url.to_string(),

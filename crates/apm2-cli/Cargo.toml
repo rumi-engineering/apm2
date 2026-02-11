@@ -53,9 +53,11 @@ chrono.workspace = true
 regex.workspace = true
 fs2 = "0.4"
 rand.workspace = true
+libc.workspace = true
 
 # Security / Credentials
 keyring.workspace = true
+secrecy.workspace = true
 
 # Cryptographic hashing
 blake3.workspace = true

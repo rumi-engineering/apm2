@@ -30,7 +30,7 @@
 //! - Per-episode rate limits prevent token churn attacks (LAW-06)
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,7 +58,17 @@ pub struct GitHubAppConfig {
     pub installation_id: String,
     /// Optional path to the PEM private key file.
     /// On systems with a working keyring this may be `None`.
+    #[serde(default)]
     pub private_key_file: Option<PathBuf>,
+    /// Optional keyring service override persisted by auth-setup.
+    #[serde(default)]
+    pub keyring_service: Option<String>,
+    /// Optional keyring account override persisted by auth-setup.
+    #[serde(default)]
+    pub keyring_account: Option<String>,
+    /// Whether file fallback is explicitly allowed for this config.
+    #[serde(default)]
+    pub allow_private_key_file_fallback: Option<bool>,
 }
 
 /// Loads the persistent GitHub App config from disk.
@@ -114,8 +124,8 @@ impl GitHubAppTokenProvider {
     ///
     /// Resolution order:
     /// 1. Env var (inline PEM content via `env_var_name`)
-    /// 2. Config file `private_key_file` path → read file
-    /// 3. OS keyring lookup (service/account derived from `app_id`)
+    /// 2. OS keyring lookup (service/account derived from `app_id`)
+    /// 3. Config file `private_key_file` path → read file (explicit opt-in)
     ///
     /// # Errors
     ///
@@ -127,72 +137,82 @@ impl GitHubAppTokenProvider {
         config: Option<&GitHubAppConfig>,
         keyring_service: Option<&str>,
         keyring_account: Option<&str>,
-    ) -> Result<String, String> {
+        allow_private_key_file_fallback: bool,
+    ) -> Result<SecretString, String> {
         // 1. Env var — inline PEM content
         if let Ok(value) = std::env::var(env_var_name) {
             let trimmed = value.trim().to_string();
             if !trimmed.is_empty() {
-                return Ok(trimmed);
+                return Ok(SecretString::new(trimmed.into_boxed_str()));
             }
         }
 
-        // 2. Config file private_key_file
-        let mut config_resolution_error: Option<String> = None;
+        // 2. Keyring lookup.
+        let service = keyring_service
+            .or_else(|| config.and_then(|cfg| cfg.keyring_service.as_deref()))
+            .unwrap_or("apm2.github.app");
+        let account = keyring_account
+            .map(str::to_string)
+            .or_else(|| config.and_then(|cfg| cfg.keyring_account.clone()))
+            .unwrap_or_else(|| format!("app-{app_id}"));
+
+        let keyring_resolution_error = match keyring::Entry::new(service, &account) {
+            Ok(entry) => match entry.get_password() {
+                Ok(secret) if !secret.trim().is_empty() => {
+                    let trimmed = secret.trim().to_string();
+                    return Ok(SecretString::new(trimmed.into_boxed_str()));
+                },
+                Ok(_) => Some(
+                    "keyring entry exists but is empty; re-run `apm2 fac pr auth-setup`"
+                        .to_string(),
+                ),
+                Err(keyring::Error::NoEntry) => {
+                    Some(format!("keyring entry not found ({service}/{account})"))
+                },
+                Err(err) => Some(format!("keyring lookup failed: {err}")),
+            },
+            Err(err) => Some(format!("keyring init failed: {err}")),
+        };
+
+        // 3. Optional config-file private key fallback (explicit opt-in only).
+        let mut file_resolution_error = None;
         if let Some(cfg) = config {
-            if let Some(ref pem_path) = cfg.private_key_file {
-                match std::fs::read_to_string(pem_path) {
-                    Ok(content) if !content.trim().is_empty() => {
-                        return Ok(content);
-                    },
-                    Ok(_) => {
-                        config_resolution_error =
-                            Some(format!("config file path {} is empty", pem_path.display()));
-                    },
-                    Err(err) => {
-                        config_resolution_error = Some(format!(
-                            "config file points to {}, but read failed: {err}",
-                            pem_path.display()
-                        ));
-                    },
+            if let Some(pem_path) = cfg.private_key_file.as_ref() {
+                if allow_private_key_file_fallback {
+                    match read_private_key_file_secure(pem_path) {
+                        Ok(secret) => return Ok(secret),
+                        Err(err) => {
+                            file_resolution_error = Some(format!(
+                                "config private_key_file {} could not be used: {err}",
+                                pem_path.display()
+                            ));
+                        },
+                    }
+                } else {
+                    file_resolution_error = Some(format!(
+                        "config private_key_file {} is configured but file fallback is disabled",
+                        pem_path.display()
+                    ));
                 }
             }
         }
 
-        // 3. Keyring lookup
-        let service = keyring_service.unwrap_or("apm2.github.app");
-        let account = keyring_account.map_or_else(|| format!("app-{app_id}"), String::from);
-
-        match keyring::Entry::new(service, &account) {
-            Ok(entry) => match entry.get_password() {
-                Ok(secret) if !secret.trim().is_empty() => Ok(secret),
-                Ok(_) => Err(
-                    "keyring entry exists but is empty; re-run `apm2 fac pr auth-setup`"
-                        .to_string(),
-                ),
-                Err(keyring::Error::NoEntry) => config_resolution_error.map_or_else(
-                    || {
-                        Err(format!(
-                            "no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
-                             or store key in keyring ({service}/{account})"
-                        ))
-                    },
-                    |config_err| {
-                        Err(format!(
-                            "{config_err}; no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
-                             or store key in keyring ({service}/{account})"
-                        ))
-                    },
-                ),
-                Err(err) => config_resolution_error.map_or_else(
-                    || Err(format!("keyring lookup failed: {err}")),
-                    |config_err| Err(format!("{config_err}; keyring lookup failed: {err}")),
-                ),
-            },
-            Err(err) => config_resolution_error.map_or_else(
-                || Err(format!("keyring init failed: {err}")),
-                |config_err| Err(format!("{config_err}; keyring init failed: {err}")),
-            ),
+        let mut details = Vec::new();
+        if let Some(err) = keyring_resolution_error {
+            details.push(err);
         }
+        if let Some(err) = file_resolution_error {
+            details.push(err);
+        }
+        let detail_suffix = if details.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", details.join("; "))
+        };
+        Err(format!(
+            "no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
+             or store key in keyring ({service}/{account}){detail_suffix}"
+        ))
     }
 
     /// Legacy helper — resolves from env var or keyring only (no config file).
@@ -208,9 +228,41 @@ impl GitHubAppTokenProvider {
         env_var_name: &str,
         keyring_service: Option<&str>,
         keyring_account: Option<&str>,
-    ) -> Result<String, String> {
-        Self::resolve_private_key(app_id, env_var_name, None, keyring_service, keyring_account)
+    ) -> Result<SecretString, String> {
+        Self::resolve_private_key(
+            app_id,
+            env_var_name,
+            None,
+            keyring_service,
+            keyring_account,
+            false,
+        )
     }
+}
+
+fn read_private_key_file_secure(path: &Path) -> Result<SecretString, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to inspect key path {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink path for private key file: {}",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing non-regular path for private key file: {}",
+            path.display()
+        ));
+    }
+
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(format!("config file path {} is empty", path.display()));
+    }
+    Ok(SecretString::new(trimmed.to_string().into_boxed_str()))
 }
 
 /// Request for minting a new installation access token.
@@ -922,6 +974,9 @@ mod unit_tests {
             app_id: "12345".to_string(),
             installation_id: "67890".to_string(),
             private_key_file: Some(missing_pem),
+            keyring_service: None,
+            keyring_account: None,
+            allow_private_key_file_fallback: Some(true),
         };
 
         let err = GitHubAppTokenProvider::resolve_private_key(
@@ -930,14 +985,80 @@ mod unit_tests {
             Some(&cfg),
             Some("apm2.tests.nonexistent.service"),
             Some("apm2.tests.nonexistent.account"),
+            true,
         )
         .expect_err("missing config file and keyring should fail");
 
-        assert!(err.contains("config file points to"));
+        assert!(err.contains("config private_key_file"));
         assert!(
             err.contains("no private key found")
                 || err.contains("keyring lookup failed")
                 || err.contains("keyring init failed")
+        );
+    }
+
+    #[test]
+    fn test_resolve_private_key_reads_config_file_when_explicitly_allowed() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let pem = temp.path().join("key.pem");
+        std::fs::write(
+            &pem,
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write pem");
+        let cfg = GitHubAppConfig {
+            app_id: "12345".to_string(),
+            installation_id: "67890".to_string(),
+            private_key_file: Some(pem),
+            keyring_service: None,
+            keyring_account: None,
+            allow_private_key_file_fallback: Some(true),
+        };
+
+        let secret = GitHubAppTokenProvider::resolve_private_key(
+            "12345",
+            "APM2_TEST_MISSING_PRIVATE_KEY_ENV_SHOULD_NOT_EXIST",
+            Some(&cfg),
+            Some("apm2.tests.nonexistent.service"),
+            Some("apm2.tests.nonexistent.account"),
+            true,
+        )
+        .expect("file fallback should resolve secret");
+
+        assert!(secret.expose_secret().contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn test_resolve_private_key_rejects_config_file_when_fallback_disabled() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let pem = temp.path().join("key.pem");
+        std::fs::write(
+            &pem,
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write pem");
+        let cfg = GitHubAppConfig {
+            app_id: "12345".to_string(),
+            installation_id: "67890".to_string(),
+            private_key_file: Some(pem),
+            keyring_service: None,
+            keyring_account: None,
+            allow_private_key_file_fallback: Some(false),
+        };
+
+        let err = GitHubAppTokenProvider::resolve_private_key(
+            "12345",
+            "APM2_TEST_MISSING_PRIVATE_KEY_ENV_SHOULD_NOT_EXIST",
+            Some(&cfg),
+            Some("apm2.tests.nonexistent.service"),
+            Some("apm2.tests.nonexistent.account"),
+            false,
+        )
+        .expect_err("fallback disabled should refuse file path");
+
+        assert!(
+            err.contains("file fallback is disabled"),
+            "unexpected: {err}"
         );
     }
 }

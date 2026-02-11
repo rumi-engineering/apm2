@@ -25,6 +25,8 @@ const BATCH_SIZE: usize = 256;
 const SCALE_EFFECTS_10E3: u64 = 1_000;
 const SCALE_EFFECTS_10E4: u64 = 10_000;
 const SCALE_EFFECTS_10E5: u64 = 100_000;
+// Keep verification workload representative but bounded for CI runtime SLO.
+const MAX_BATCH_SAMPLES_PER_SCALE: usize = 64;
 const BOOTSTRAP_REPLICATES: usize = 512;
 const P99_Z_SCORE: f64 = 2.326_347_874_040_840_8;
 
@@ -38,10 +40,12 @@ struct BootstrapP99Envelope {
 #[derive(Debug)]
 struct ScaleRun {
     effects: u64,
-    direct_total_elapsed_us: u64,
-    batched_total_elapsed_us: u64,
+    direct_total_elapsed_us_estimate: u64,
+    batched_total_elapsed_us_estimate: u64,
     direct_batch_samples_us: Vec<u64>,
     batched_batch_samples_us: Vec<u64>,
+    sampled_batches: usize,
+    total_batches: usize,
 }
 
 struct ScaleMeasurementFixture<'a> {
@@ -174,71 +178,110 @@ fn build_partial_multiproof(
     .expect("partial multiproof must remain structurally valid")
 }
 
+fn estimate_total_elapsed_us(batch_samples_us: &[u64], total_batches: usize) -> u64 {
+    if batch_samples_us.is_empty() || total_batches == 0 {
+        return 0;
+    }
+    let sample_sum: u128 = batch_samples_us.iter().copied().map(u128::from).sum();
+    let sample_count = u128::try_from(batch_samples_us.len()).unwrap_or(1);
+    let total_batches_u128 = u128::try_from(total_batches).unwrap_or(0);
+    let rounded = sample_sum
+        .saturating_mul(total_batches_u128)
+        .saturating_add(sample_count / 2)
+        / sample_count;
+    u64::try_from(rounded).unwrap_or(u64::MAX)
+}
+
+fn sampled_batch_sizes(full_batches: usize, remainder: usize) -> Vec<usize> {
+    let total_batches = full_batches + usize::from(remainder > 0);
+    if total_batches == 0 {
+        return Vec::new();
+    }
+    if total_batches <= MAX_BATCH_SAMPLES_PER_SCALE {
+        let mut exact = vec![BATCH_SIZE; full_batches];
+        if remainder > 0 {
+            exact.push(remainder);
+        }
+        return exact;
+    }
+
+    let mut sampled = Vec::with_capacity(MAX_BATCH_SAMPLES_PER_SCALE);
+    if full_batches > 0 {
+        let reserve_for_remainder = usize::from(remainder > 0);
+        let sampled_full = MAX_BATCH_SAMPLES_PER_SCALE
+            .saturating_sub(reserve_for_remainder)
+            .max(1)
+            .min(full_batches);
+        sampled.extend(std::iter::repeat_n(BATCH_SIZE, sampled_full));
+    }
+    if remainder > 0 && sampled.len() < MAX_BATCH_SAMPLES_PER_SCALE {
+        sampled.push(remainder);
+    }
+    sampled
+}
+
 fn measure_scale_run(effects: u64, fixture: &ScaleMeasurementFixture<'_>) -> ScaleRun {
     let effects_usize = usize::try_from(effects).unwrap_or(usize::MAX);
     let full_batches = effects_usize / BATCH_SIZE;
     let remainder = effects_usize % BATCH_SIZE;
-    let batch_samples = full_batches + usize::from(remainder > 0);
+    let total_batches = full_batches + usize::from(remainder > 0);
+    let batch_sizes = sampled_batch_sizes(full_batches, remainder);
+    let batch_samples = batch_sizes.len();
     let verifying_key = fixture.signer.verifying_key();
 
     let mut direct_batch_samples_us = Vec::with_capacity(batch_samples);
-    let direct_total_start = Instant::now();
-    for _ in 0..full_batches {
+    for count in &batch_sizes {
         let start = Instant::now();
-        verify_direct_slice(fixture.direct_material, BATCH_SIZE, &verifying_key);
+        verify_direct_slice(fixture.direct_material, *count, &verifying_key);
         direct_batch_samples_us.push(elapsed_us(start));
     }
-    if remainder > 0 {
-        let start = Instant::now();
-        verify_direct_slice(fixture.direct_material, remainder, &verifying_key);
-        direct_batch_samples_us.push(elapsed_us(start));
-    }
-    let direct_total_elapsed_us = elapsed_us(direct_total_start);
-
-    let partial_multiproof = (remainder > 0).then(|| {
-        build_partial_multiproof(
-            fixture.batch_root,
-            fixture.receipt_hashes,
-            fixture.batch_seal_hash,
-            fixture.proofs,
-            remainder,
-        )
-    });
 
     let mut batched_batch_samples_us = Vec::with_capacity(batch_samples);
-    let batched_total_start = Instant::now();
-    for _ in 0..full_batches {
+    for count in &batch_sizes {
         let start = Instant::now();
-        ReceiptPointerVerifier::verify_multiproof(
-            fixture.full_multiproof,
-            fixture.batch_seal,
-            BatchSealVerifier::SingleKey(&verifying_key),
-            TEST_SUBJECT_KIND,
-            true,
-        )
-        .expect("batched multiproof verification");
+        if *count == BATCH_SIZE {
+            ReceiptPointerVerifier::verify_multiproof(
+                fixture.full_multiproof,
+                fixture.batch_seal,
+                BatchSealVerifier::SingleKey(&verifying_key),
+                TEST_SUBJECT_KIND,
+                true,
+            )
+            .expect("batched multiproof verification");
+        } else {
+            let partial = build_partial_multiproof(
+                fixture.batch_root,
+                fixture.receipt_hashes,
+                fixture.batch_seal_hash,
+                fixture.proofs,
+                *count,
+            );
+            ReceiptPointerVerifier::verify_multiproof(
+                &partial,
+                fixture.batch_seal,
+                BatchSealVerifier::SingleKey(&verifying_key),
+                TEST_SUBJECT_KIND,
+                true,
+            )
+            .expect("partial batched multiproof verification");
+        }
         batched_batch_samples_us.push(elapsed_us(start));
     }
-    if let Some(partial) = partial_multiproof.as_ref() {
-        let start = Instant::now();
-        ReceiptPointerVerifier::verify_multiproof(
-            partial,
-            fixture.batch_seal,
-            BatchSealVerifier::SingleKey(&verifying_key),
-            TEST_SUBJECT_KIND,
-            true,
-        )
-        .expect("partial batched multiproof verification");
-        batched_batch_samples_us.push(elapsed_us(start));
-    }
-    let batched_total_elapsed_us = elapsed_us(batched_total_start);
 
     ScaleRun {
         effects,
-        direct_total_elapsed_us,
-        batched_total_elapsed_us,
+        direct_total_elapsed_us_estimate: estimate_total_elapsed_us(
+            &direct_batch_samples_us,
+            total_batches,
+        ),
+        batched_total_elapsed_us_estimate: estimate_total_elapsed_us(
+            &batched_batch_samples_us,
+            total_batches,
+        ),
         direct_batch_samples_us,
         batched_batch_samples_us,
+        sampled_batches: batch_samples,
+        total_batches,
     }
 }
 
@@ -495,10 +538,12 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
         pooled_batched_batch_samples_us.extend_from_slice(&run.batched_batch_samples_us);
 
         println!(
-            "TCK-00372 scale={} methodology=direct_measurement direct_elapsed_us={} batched_elapsed_us={} direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+            "TCK-00372 scale={} methodology=sampled_measurement sampled_batches={} total_batches={} direct_elapsed_us_estimate={} batched_elapsed_us_estimate={} direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
             run.effects,
-            run.direct_total_elapsed_us,
-            run.batched_total_elapsed_us,
+            run.sampled_batches,
+            run.total_batches,
+            run.direct_total_elapsed_us_estimate,
+            run.batched_total_elapsed_us_estimate,
             direct_envelope.point_p99,
             direct_envelope.ci95_lower,
             direct_envelope.ci95_upper,

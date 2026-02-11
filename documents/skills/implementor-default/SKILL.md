@@ -43,7 +43,7 @@ references[11]:
 
 decision_tree:
   entrypoint: START
-  nodes[9]:
+  nodes[10]:
     - id: START
       purpose: "Initialize scope, collect authoritative context, and avoid ambient assumptions."
       steps[11]:
@@ -64,11 +64,21 @@ decision_tree:
             (8) `apm2 fac restart --help`
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
-          action: "Resolve target from input: if a ticket id is provided, load that ticket; if a PR number is provided, load PR context plus latest findings."
+          action: |
+            Locate the ticket YAML at `documents/work/tickets/<TICKET_ID>.yaml` and read the full file. If a PR number was provided instead, extract the ticket ID from the branch name or PR description.
+
+            Before proceeding, confirm: (1) ticket.status is OPEN, (2) all entries in dependencies.tickets are completed — read the reason field to understand each blocking relationship, (3) note custody.responsibility_domains — DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed review patterns.
+
+            Orient on the ticket structure: binds links your work to requirements and evidence artifacts via file paths; scope.in_scope is your delivery contract and scope.out_of_scope is a hard boundary; definition_of_done.criteria plus linked requirement acceptance_criteria form your completion checklist.
         - id: LOAD_REQUIRED_READING
           action: "Read SKILL references marked REQUIRED READING and any orchestrator-provided warm handoff files before edits."
         - id: LOAD_REQUIREMENT_BINDINGS
-          action: "Read requirement files bound by the ticket and note acceptance criteria in implementation notes."
+          action: |
+            For each entry in binds.requirements: read the file at requirement_ref (strip the #anchor suffix). Extract the requirement's statement, acceptance_criteria, and priority. Merge these acceptance_criteria with definition_of_done.criteria to form your complete implementation checklist.
+
+            For each entry in binds.evidence_artifacts: read the file at artifact_ref (strip the #anchor suffix). Note expected_contents — this tells you exactly what proof your PR must include (e.g., denial proofs, lifecycle receipts, test output).
+
+            Read the parent RFC at documents/rfcs/<rfc_id>/ for design context if the requirement statements reference concepts you do not yet understand.
         - id: LIST_MODULE_AGENTS_DOCS
           action: "List module-level AGENTS docs with `rg --files -g 'AGENTS.md' crates` and record candidates for touched areas."
         - id: READ_RELEVANT_MODULE_AGENTS
@@ -152,13 +162,22 @@ decision_tree:
           action: "Update relevant AGENTS.md files with new/changed module responsibilities, invariants, workflows, or guardrails introduced by the change."
         - id: NOTE_AGENTS_DOC_UPDATES
           action: "Ensure AGENTS.md edits are included in the final committed diff."
+      next: COMMIT
+
+    - id: COMMIT
+      purpose: "Stage and commit all work before push — apm2 fac push only pushes existing commits."
+      steps[2]:
+        - id: STAGE_ALL_CHANGES
+          action: "Run `git add -A` to stage implementation code, test additions, and AGENTS.md updates."
+        - id: CREATE_COMMIT
+          action: "Run `git commit` with a concise message summarizing what changed and why."
       next: PUSH
 
     - id: PUSH
       purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures."
       steps[4]:
         - id: RUN_FAC_PUSH
-          action: "Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
+          action: "`apm2 fac push` only pushes committed work — it will not stage or commit for you. Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
         - id: CAPTURE_PR_CONTEXT
           action: "Capture PR number/URL from `apm2 fac push` output for monitoring and restart."
         - id: HANDLE_PUSH_FAILURE

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use fs2::FileExt;
 
+use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
     load_review_run_state_for_home, next_review_sequence_number_for_home,
@@ -566,6 +567,7 @@ fn dispatch_single_review_locked_for_home<F>(
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
+    force_same_sha_retry: bool,
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
@@ -603,6 +605,23 @@ where
             );
         },
         ReviewRunStateLoad::Present(state) => {
+            if state.head_sha.eq_ignore_ascii_case(&key.head_sha)
+                && state.status.is_terminal()
+                && !force_same_sha_retry
+            {
+                return Ok(DispatchReviewResult {
+                    review_type: key.review_type.clone(),
+                    mode: "joined".to_string(),
+                    run_state: state.status.as_str().to_string(),
+                    run_id: Some(state.run_id),
+                    sequence_number: Some(state.sequence_number),
+                    terminal_reason: state.terminal_reason,
+                    pid: state.pid,
+                    unit: None,
+                    log_file: None,
+                });
+            }
+
             if !state.status.is_terminal() && state.head_sha.eq_ignore_ascii_case(&key.head_sha) {
                 if run_state_has_live_process(&state) {
                     return Ok(DispatchReviewResult {
@@ -794,12 +813,36 @@ where
     attach_run_state_contract_for_home(home, key, started)
 }
 
+#[cfg(test)]
 fn dispatch_single_review_for_home_with_spawn<F>(
     home: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
+    spawn_review: &F,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    dispatch_single_review_for_home_with_spawn_force(
+        home,
+        pr_url,
+        key,
+        review_kind,
+        dispatch_epoch,
+        false,
+        spawn_review,
+    )
+}
+
+fn dispatch_single_review_for_home_with_spawn_force<F>(
+    home: &Path,
+    pr_url: &str,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    force_same_sha_retry: bool,
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
@@ -848,6 +891,7 @@ where
         key,
         review_kind,
         dispatch_epoch,
+        force_same_sha_retry,
         spawn_review,
     )
 }
@@ -858,13 +902,15 @@ fn dispatch_single_review_for_home(
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
+    force_same_sha_retry: bool,
 ) -> Result<DispatchReviewResult, String> {
-    dispatch_single_review_for_home_with_spawn(
+    dispatch_single_review_for_home_with_spawn_force(
         home,
         pr_url,
         key,
         review_kind,
         dispatch_epoch,
+        force_same_sha_retry,
         &spawn_detached_review,
     )
 }
@@ -879,10 +925,46 @@ pub fn dispatch_single_review(
     head_sha: &str,
     dispatch_epoch: u64,
 ) -> Result<DispatchReviewResult, String> {
+    dispatch_single_review_with_force(
+        pr_url,
+        owner_repo,
+        pr_number,
+        review_kind,
+        head_sha,
+        dispatch_epoch,
+        false,
+    )
+}
+
+pub fn dispatch_single_review_with_force(
+    pr_url: &str,
+    owner_repo: &str,
+    pr_number: u32,
+    review_kind: ReviewKind,
+    head_sha: &str,
+    dispatch_epoch: u64,
+    force_same_sha_retry: bool,
+) -> Result<DispatchReviewResult, String> {
     let key = DispatchIdempotencyKey::new(owner_repo, pr_number, review_kind.as_str(), head_sha);
     key.validate()?;
+    let workspace_root =
+        std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
+    let merge_report = check_merge_conflicts_against_main(&workspace_root, head_sha)?;
+    if merge_report.has_conflicts() {
+        return Err(format!(
+            "cannot dispatch review for conflicted head SHA {head_sha}:\n{}",
+            render_merge_conflict_summary(&merge_report)
+        ));
+    }
     let home = apm2_home_dir()?;
-    dispatch_single_review_for_home(&home, pr_url, &key, review_kind, dispatch_epoch)
+    dispatch_single_review_for_home(
+        &home,
+        pr_url,
+        &key,
+        review_kind,
+        dispatch_epoch,
+        force_same_sha_retry,
+    )
 }
 
 fn spawn_detached_review(
@@ -1009,7 +1091,8 @@ mod tests {
 
     use super::{
         DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
-        dispatch_single_review_for_home_with_spawn, review_dispatch_scope_lock_path_for_home,
+        dispatch_single_review_for_home_with_spawn,
+        dispatch_single_review_for_home_with_spawn_force, review_dispatch_scope_lock_path_for_home,
         run_state_has_live_process, write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
@@ -1205,6 +1288,90 @@ mod tests {
         .expect("dispatch with new sha");
 
         assert_eq!(result.mode, "started");
+    }
+
+    #[test]
+    fn test_same_sha_terminal_state_joined_without_force() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut terminal = sample_run_state(Some(dead_pid_for_test()));
+        terminal.status = ReviewRunStatus::Done;
+        terminal.sequence_number = 4;
+        terminal.run_id = "pr441-security-s4-01234567".to_string();
+        write_review_run_state_for_home(home, &terminal).expect("seed terminal state");
+
+        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let spawn = |_: &str,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            panic!("spawn must not be called when same SHA is terminal");
+        };
+
+        let result = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            100,
+            &spawn,
+        )
+        .expect("same-sha terminal state should join");
+        assert_eq!(result.mode, "joined");
+        assert_eq!(result.run_state, "done");
+        assert_eq!(result.run_id.as_deref(), Some("pr441-security-s4-01234567"));
+    }
+
+    #[test]
+    fn test_same_sha_terminal_state_allowed_with_force() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut terminal = sample_run_state(Some(dead_pid_for_test()));
+        terminal.status = ReviewRunStatus::Done;
+        terminal.sequence_number = 9;
+        terminal.run_id = "pr441-security-s9-01234567".to_string();
+        write_review_run_state_for_home(home, &terminal).expect("seed terminal state");
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_ref = Arc::clone(&spawn_count);
+        let spawn = move |_: &str,
+                          _: u32,
+                          _: ReviewKind,
+                          _: &str,
+                          _: u64|
+              -> Result<DispatchReviewResult, String> {
+            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "started".to_string(),
+                run_state: "pending".to_string(),
+                run_id: None,
+                sequence_number: None,
+                terminal_reason: None,
+                pid: Some(dead_pid_for_test()),
+                unit: None,
+                log_file: None,
+            })
+        };
+
+        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let result = dispatch_single_review_for_home_with_spawn_force(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            101,
+            true,
+            &spawn,
+        )
+        .expect("force same-sha dispatch should start");
+
+        assert_eq!(result.mode, "started");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

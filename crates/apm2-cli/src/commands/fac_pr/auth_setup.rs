@@ -1,8 +1,12 @@
 //! `apm2 fac pr auth-setup` — bootstrap GitHub App credentials.
 
-use std::os::unix::fs::OpenOptionsExt;
+use std::fmt::Write as _;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use apm2_core::github::resolve_apm2_home;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
 use super::PrAuthSetupCliArgs;
@@ -15,8 +19,16 @@ struct AuthSetupResult {
     keyring_service: String,
     keyring_account: String,
     private_key_stored: bool,
+    file_fallback_enabled: bool,
+    fallback_private_key_file: Option<String>,
     source_file_deleted: bool,
-    config_file: Option<String>,
+    config_file: String,
+}
+
+#[derive(Debug)]
+struct PersistedConfigResult {
+    config_path: PathBuf,
+    fallback_private_key_file: Option<PathBuf>,
 }
 
 pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
@@ -26,25 +38,10 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
         .unwrap_or_else(|| format!("app-{}", args.app_id));
 
     // ── Read PEM file ──────────────────────────────────────────────────────
-    let private_key = match std::fs::read_to_string(&args.private_key_file) {
-        Ok(value) if !value.trim().is_empty() => value,
-        Ok(_) => {
-            super::output_pr_error(
-                json_output,
-                "pr_auth_setup_failed",
-                "private key file is empty",
-            );
-            return exit_codes::GENERIC_ERROR;
-        },
+    let private_key = match read_private_key_secret(&args.private_key_file) {
+        Ok(value) => value,
         Err(error) => {
-            super::output_pr_error(
-                json_output,
-                "pr_auth_setup_failed",
-                &format!(
-                    "failed to read private key file {}: {error}",
-                    args.private_key_file.display()
-                ),
-            );
+            super::output_pr_error(json_output, "pr_auth_setup_failed", &error);
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -62,7 +59,7 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
         },
     };
 
-    if let Err(error) = entry.set_password(&private_key) {
+    if let Err(error) = entry.set_password(private_key.expose_secret()) {
         super::output_pr_error(
             json_output,
             "pr_auth_setup_failed",
@@ -72,12 +69,11 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
     }
 
     // ── Write persistent config file ───────────────────────────────────────
-    let config_file = match write_config_and_pem(args, &keyring_account, &private_key) {
-        Ok(path) => Some(path),
+    let persisted = match write_persistent_config(args, &keyring_account, &private_key) {
+        Ok(value) => value,
         Err(error) => {
-            // Non-fatal: keyring succeeded, config file is a convenience fallback
-            eprintln!("Warning: config file write failed: {error}");
-            None
+            super::output_pr_error(json_output, "pr_auth_setup_failed", &error);
+            return exit_codes::GENERIC_ERROR;
         },
     };
 
@@ -109,8 +105,13 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
         keyring_service: args.keyring_service.clone(),
         keyring_account,
         private_key_stored: true,
+        file_fallback_enabled: args.allow_private_key_file_fallback,
+        fallback_private_key_file: persisted
+            .fallback_private_key_file
+            .as_ref()
+            .map(|path| path.display().to_string()),
         source_file_deleted: deleted,
-        config_file: config_file.clone(),
+        config_file: persisted.config_path.display().to_string(),
     };
 
     if json_output {
@@ -120,21 +121,15 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
         );
     } else {
         println!("GitHub App private key stored in OS keyring.");
-        if let Some(ref path) = config_file {
-            println!("Config written to: {path}");
-            println!("  No env vars needed — auth-check will read this file.");
-        } else {
+        println!("Config written to: {}", result.config_file);
+        println!("  auth-check reads app/install IDs and keyring metadata from this file.");
+        if let Some(path) = result.fallback_private_key_file.as_deref() {
+            println!("Private key file fallback enabled: {path}");
             println!(
-                "Set environment for runtime:\n  \
-                 export APM2_GITHUB_APP_ID={}\n  \
-                 export APM2_GITHUB_INSTALLATION_ID={}\n  \
-                 export APM2_GITHUB_KEYRING_SERVICE={}\n  \
-                 export APM2_GITHUB_KEYRING_ACCOUNT={}",
-                result.app_id,
-                result.installation_id,
-                result.keyring_service,
-                result.keyring_account,
+                "  Disable by rerunning auth-setup without --allow-private-key-file-fallback."
             );
+        } else {
+            println!("Private key file fallback disabled (keyring-first).");
         }
         if result.source_file_deleted {
             println!("Deleted source private key file after keyring import.");
@@ -144,61 +139,152 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
     exit_codes::SUCCESS
 }
 
-/// Writes `~/.apm2/github_app.toml` and copies the PEM to
-/// `~/.apm2/app-{app_id}.pem`.
-///
-/// Returns the path to the config file on success.
-fn write_config_and_pem(
+fn read_private_key_secret(path: &Path) -> Result<SecretString, String> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read private key file {}: {error}",
+            path.display()
+        )
+    })?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("private key file is empty".to_string());
+    }
+    Ok(SecretString::new(trimmed.to_string().into_boxed_str()))
+}
+
+/// Writes `~/.apm2/github_app.toml` and, when explicitly requested, persists
+/// a file-based fallback private key path.
+fn write_persistent_config(
     args: &PrAuthSetupCliArgs,
-    _keyring_account: &str,
-    private_key_content: &str,
-) -> Result<String, String> {
+    keyring_account: &str,
+    private_key_content: &SecretString,
+) -> Result<PersistedConfigResult, String> {
     let apm2_home = resolve_apm2_home()
         .ok_or_else(|| "cannot determine home directory for ~/.apm2".to_string())?;
 
     std::fs::create_dir_all(&apm2_home)
         .map_err(|e| format!("failed to create {}: {e}", apm2_home.display()))?;
 
-    // Determine PEM destination path
-    let pem_dest = if args.keep_private_key_file {
-        // Point config at the original file location
-        std::fs::canonicalize(&args.private_key_file)
-            .map_err(|e| format!("failed to resolve PEM path: {e}"))?
+    let fallback_private_key_file = if args.allow_private_key_file_fallback {
+        if args.keep_private_key_file {
+            let canonical = std::fs::canonicalize(&args.private_key_file)
+                .map_err(|e| format!("failed to resolve PEM path: {e}"))?;
+            ensure_regular_file_no_symlink(&canonical)?;
+            Some(canonical)
+        } else {
+            let dest = apm2_home.join(format!("app-{}.pem", args.app_id));
+            write_file_mode_0600(&dest, private_key_content.expose_secret())?;
+            Some(dest)
+        }
     } else {
-        // Copy PEM into ~/.apm2/app-{app_id}.pem with restrictive perms
-        let dest = apm2_home.join(format!("app-{}.pem", args.app_id));
-        write_file_mode_0600(&dest, private_key_content)?;
-        dest
+        None
     };
 
     // Write github_app.toml
     let config_path = apm2_home.join("github_app.toml");
-    let toml_content = format!(
-        "app_id = \"{}\"\ninstallation_id = \"{}\"\nprivate_key_file = \"{}\"\n",
+    let mut toml_content = format!(
+        "app_id = \"{}\"\ninstallation_id = \"{}\"\nkeyring_service = \"{}\"\nkeyring_account = \"{}\"\nallow_private_key_file_fallback = {}\n",
         args.app_id,
         args.installation_id,
-        pem_dest.display(),
+        args.keyring_service,
+        keyring_account,
+        args.allow_private_key_file_fallback,
     );
-    std::fs::write(&config_path, toml_content)
-        .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
+    if let Some(path) = fallback_private_key_file.as_ref() {
+        writeln!(
+            &mut toml_content,
+            "private_key_file = \"{}\"",
+            path.display()
+        )
+        .expect("infallible String write");
+    }
+    write_file_mode_0600(&config_path, &toml_content)?;
 
-    Ok(config_path.display().to_string())
+    Ok(PersistedConfigResult {
+        config_path,
+        fallback_private_key_file,
+    })
 }
 
 /// Writes `content` to `path` with Unix file mode 0600.
-fn write_file_mode_0600(path: &std::path::Path, content: &str) -> Result<(), String> {
-    use std::io::Write;
+fn write_file_mode_0600(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    if path.exists() {
+        ensure_regular_file_no_symlink(path)?;
+    }
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
 
     file.write_all(content.as_bytes())
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("failed to sync {}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("failed to enforce mode 0600 on {}: {e}", path.display()))?;
 
     Ok(())
+}
+
+fn ensure_regular_file_no_symlink(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to use symlink target for private key path: {}",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing to use non-regular file for private key path: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::write_file_mode_0600;
+
+    #[test]
+    fn write_file_mode_0600_enforces_mode_on_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("secret.pem");
+        fs::write(&path, "old").expect("seed file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set weak mode");
+
+        write_file_mode_0600(&path, "new").expect("secure rewrite");
+
+        let content = fs::read_to_string(&path).expect("read file");
+        assert_eq!(content, "new");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn write_file_mode_0600_rejects_symlink_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target.pem");
+        fs::write(&target, "target").expect("seed target");
+        let link = tmp.path().join("link.pem");
+        symlink(&target, &link).expect("create symlink");
+
+        let err = write_file_mode_0600(&link, "new").expect_err("symlink must fail");
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
 }

@@ -1,14 +1,14 @@
 //! Admission control: event context resolution and trust-boundary enforcement.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
 
 use super::events::emit_review_event;
 use super::types::{
-    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, now_iso8601_millis, split_owner_repo,
-    validate_expected_head_sha,
+    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, QUALITY_MARKER, SECURITY_MARKER, now_iso8601_millis,
+    split_owner_repo, validate_expected_head_sha,
 };
 
 // ── Event context resolution ────────────────────────────────────────────────
@@ -449,6 +449,218 @@ pub fn resolve_authenticated_gh_login() -> Option<String> {
     if login.is_empty() { None } else { Some(login) }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetadataSeverityCounts {
+    blocker: u64,
+    major: u64,
+    minor: u64,
+    nit: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeveritySection {
+    Blocker,
+    Major,
+    Minor,
+    Nit,
+}
+
+fn review_type_for_marker(marker: &str) -> Option<&'static str> {
+    if marker == SECURITY_MARKER {
+        Some("security")
+    } else if marker == QUALITY_MARKER {
+        Some("code-quality")
+    } else {
+        None
+    }
+}
+
+fn comment_matches_review_dimension(body_lower: &str, review_type: &str) -> bool {
+    match review_type {
+        "security" => body_lower.contains("## security review:"),
+        "code-quality" => {
+            body_lower.contains("## code quality review:")
+                || body_lower.contains("## quality review:")
+        },
+        _ => false,
+    }
+}
+
+fn resolve_severity_heading(line: &str) -> Option<SeveritySection> {
+    let upper = line.to_ascii_uppercase();
+    if upper.contains("BLOCKER FINDINGS") {
+        return Some(SeveritySection::Blocker);
+    }
+    if upper.contains("MAJOR FINDINGS") {
+        return Some(SeveritySection::Major);
+    }
+    if upper.contains("MINOR FINDINGS") {
+        return Some(SeveritySection::Minor);
+    }
+    if upper.contains("NITS") || upper.contains("NIT FINDINGS") {
+        return Some(SeveritySection::Nit);
+    }
+    None
+}
+
+fn line_is_finding_item(line: &str) -> bool {
+    if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("Issue:") {
+        return true;
+    }
+
+    let mut chars = line.chars();
+    let mut digit_count = 0usize;
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_digit() {
+            digit_count += 1;
+            continue;
+        }
+        if ch == '.' && digit_count > 0 {
+            return !chars.as_str().trim().is_empty();
+        }
+        break;
+    }
+    false
+}
+
+fn count_findings_by_severity(body: &str) -> MetadataSeverityCounts {
+    let mut counts = MetadataSeverityCounts::default();
+    let mut current_section = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("<!--") || trimmed.starts_with("```") {
+            continue;
+        }
+        if let Some(section) = resolve_severity_heading(trimmed) {
+            current_section = Some(section);
+            continue;
+        }
+        if !line_is_finding_item(trimmed) {
+            continue;
+        }
+
+        match current_section {
+            Some(SeveritySection::Blocker) => counts.blocker = counts.blocker.saturating_add(1),
+            Some(SeveritySection::Major) => counts.major = counts.major.saturating_add(1),
+            Some(SeveritySection::Minor) => counts.minor = counts.minor.saturating_add(1),
+            Some(SeveritySection::Nit) => counts.nit = counts.nit.saturating_add(1),
+            None => {},
+        }
+    }
+
+    counts
+}
+
+fn derive_verdict_from_body(body: &str, counts: MetadataSeverityCounts) -> String {
+    if let Some(value) = super::detection::extract_verdict_from_comment_body(body) {
+        return value;
+    }
+    if counts.blocker > 0 || counts.major > 0 {
+        "FAIL".to_string()
+    } else {
+        "PASS".to_string()
+    }
+}
+
+fn strip_existing_metadata_block(body: &str, marker: &str) -> String {
+    let pattern = format!(r"(?s){}\s*```json.*?```", regex::escape(marker));
+    let Ok(re) = regex::Regex::new(&pattern) else {
+        return body.to_string();
+    };
+    re.replacen(body, 1, "").to_string()
+}
+
+fn build_generated_metadata_block(
+    marker: &str,
+    review_type: &str,
+    pr_number: u32,
+    head_sha: &str,
+    reviewer_id: &str,
+    verdict: &str,
+    counts: MetadataSeverityCounts,
+) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "schema": "apm2.review.metadata.v1",
+        "review_type": review_type,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "verdict": verdict,
+        "severity_counts": {
+            "blocker": counts.blocker,
+            "major": counts.major,
+            "minor": counts.minor,
+            "nit": counts.nit,
+        },
+        "reviewer_id": reviewer_id,
+    });
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("failed to serialize generated review metadata: {err}"))?;
+    Ok(format!("{marker}\n```json\n{json}\n```"))
+}
+
+pub(super) fn render_comment_with_generated_metadata(
+    body: &str,
+    marker: &str,
+    review_type: &str,
+    pr_number: u32,
+    head_sha: &str,
+    reviewer_id: &str,
+) -> Result<String, String> {
+    let stripped = strip_existing_metadata_block(body, marker);
+    let counts = count_findings_by_severity(&stripped);
+    let verdict = derive_verdict_from_body(&stripped, counts);
+    let metadata = build_generated_metadata_block(
+        marker,
+        review_type,
+        pr_number,
+        head_sha,
+        reviewer_id,
+        &verdict,
+        counts,
+    )?;
+    let normalized = stripped.trim_end();
+    if normalized.is_empty() {
+        Ok(format!("{metadata}\n"))
+    } else {
+        Ok(format!("{normalized}\n\n{metadata}\n"))
+    }
+}
+
+fn patch_issue_comment_body(owner_repo: &str, comment_id: u64, body: &str) -> Result<(), String> {
+    let mut payload_file = tempfile::NamedTempFile::new()
+        .map_err(|err| format!("failed to create temp payload for comment patch: {err}"))?;
+    let payload = serde_json::json!({ "body": body });
+    let payload_text = serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize comment patch payload: {err}"))?;
+    payload_file
+        .write_all(payload_text.as_bytes())
+        .map_err(|err| format!("failed to write comment patch payload: {err}"))?;
+    payload_file
+        .flush()
+        .map_err(|err| format!("failed to flush comment patch payload: {err}"))?;
+
+    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &endpoint,
+            "--method",
+            "PATCH",
+            "--input",
+            &payload_file.path().display().to_string(),
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for comment patch: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed patching comment {comment_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 pub fn confirm_review_posted(
     owner_repo: &str,
     pr_number: u32,
@@ -459,6 +671,7 @@ pub fn confirm_review_posted(
     let marker_lower = marker.to_ascii_lowercase();
     let head_sha_lower = head_sha.to_ascii_lowercase();
     let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
+    let review_type = review_type_for_marker(marker);
 
     for page in 1..=super::types::COMMENT_CONFIRM_MAX_PAGES {
         let endpoint =
@@ -486,18 +699,18 @@ pub fn confirm_review_posted(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             let body_lower = body.to_ascii_lowercase();
-            if !(body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower)) {
-                continue;
-            }
+            let has_marker_and_sha =
+                body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower);
+
+            let author_login = comment
+                .get("user")
+                .and_then(|value| value.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let author_lower = author_login.to_ascii_lowercase();
 
             if let Some(expected_author) = expected_author_lower.as_deref() {
-                let author = comment
-                    .get("user")
-                    .and_then(|value| value.get("login"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if author != expected_author {
+                if author_lower != expected_author {
                     continue;
                 }
             }
@@ -506,12 +719,43 @@ pub fn confirm_review_posted(
                 .get("id")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
-            if id != 0 {
+            if has_marker_and_sha && id != 0 {
                 return Ok(Some(super::types::PostedReview {
                     id,
                     verdict: super::detection::extract_verdict_from_comment_body(body),
                 }));
             }
+
+            let should_generate = review_type.is_some_and(|kind| {
+                id != 0
+                    && comment_matches_review_dimension(&body_lower, kind)
+                    && body_lower.contains(&head_sha_lower)
+            });
+            if !should_generate {
+                continue;
+            }
+
+            let reviewer_id = if author_login.is_empty() {
+                expected_author_login.unwrap_or("unknown")
+            } else {
+                author_login
+            };
+            let generated = render_comment_with_generated_metadata(
+                body,
+                marker,
+                review_type.unwrap_or(""),
+                pr_number,
+                head_sha,
+                reviewer_id,
+            )?;
+            if generated == body {
+                continue;
+            }
+            patch_issue_comment_body(owner_repo, id, &generated)?;
+            return Ok(Some(super::types::PostedReview {
+                id,
+                verdict: super::detection::extract_verdict_from_comment_body(&generated),
+            }));
         }
     }
     Ok(None)
@@ -540,4 +784,132 @@ pub fn confirm_review_posted_with_retry(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MetadataSeverityCounts, count_findings_by_severity, derive_verdict_from_body,
+        render_comment_with_generated_metadata, review_type_for_marker,
+    };
+    use crate::commands::fac_review::types::{QUALITY_MARKER, SECURITY_MARKER};
+
+    #[test]
+    fn review_type_for_marker_maps_known_markers() {
+        assert_eq!(review_type_for_marker(SECURITY_MARKER), Some("security"));
+        assert_eq!(review_type_for_marker(QUALITY_MARKER), Some("code-quality"));
+        assert_eq!(review_type_for_marker("<!-- unknown -->"), None);
+    }
+
+    #[test]
+    fn count_findings_by_severity_extracts_expected_totals() {
+        let body = r"
+## Security Review: FAIL
+
+### **BLOCKER FINDINGS**
+1. Issue: one
+
+### **MAJOR FINDINGS**
+- two
+
+### **MINOR FINDINGS**
+* three
+
+### **NITS**
+1. four
+";
+        let counts = count_findings_by_severity(body);
+        assert_eq!(
+            counts,
+            MetadataSeverityCounts {
+                blocker: 1,
+                major: 1,
+                minor: 1,
+                nit: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn derive_verdict_falls_back_to_severity_counts() {
+        let pass = derive_verdict_from_body(
+            "no explicit verdict",
+            MetadataSeverityCounts {
+                blocker: 0,
+                major: 0,
+                minor: 2,
+                nit: 1,
+            },
+        );
+        assert_eq!(pass, "PASS");
+
+        let fail = derive_verdict_from_body(
+            "no explicit verdict",
+            MetadataSeverityCounts {
+                blocker: 0,
+                major: 1,
+                minor: 0,
+                nit: 0,
+            },
+        );
+        assert_eq!(fail, "FAIL");
+    }
+
+    #[test]
+    fn render_comment_with_generated_metadata_appends_block() {
+        let body = r"
+## Code Quality Review: PASS
+### **MINOR FINDINGS**
+1. Improve this.
+";
+        let rendered = render_comment_with_generated_metadata(
+            body,
+            QUALITY_MARKER,
+            "code-quality",
+            587,
+            "0123456789abcdef0123456789abcdef01234567",
+            "fac-bot",
+        )
+        .expect("rendered");
+        assert!(rendered.contains(QUALITY_MARKER));
+        assert!(rendered.contains("\"schema\": \"apm2.review.metadata.v1\""));
+        assert!(rendered.contains("\"review_type\": \"code-quality\""));
+        assert!(rendered.contains("\"pr_number\": 587"));
+        assert!(rendered.contains("\"head_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
+        assert!(rendered.contains("\"reviewer_id\": \"fac-bot\""));
+        assert!(rendered.contains("\"minor\": 1"));
+    }
+
+    #[test]
+    fn render_comment_with_generated_metadata_replaces_existing_block() {
+        let body = r#"
+## Security Review: PASS
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{
+  "schema": "apm2.review.metadata.v1",
+  "review_type": "security",
+  "pr_number": 1,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "verdict": "PASS",
+  "severity_counts": { "blocker": 0, "major": 0, "minor": 0, "nit": 0 },
+  "reviewer_id": "old"
+}
+```
+"#;
+        let rendered = render_comment_with_generated_metadata(
+            body,
+            SECURITY_MARKER,
+            "security",
+            441,
+            "0123456789abcdef0123456789abcdef01234567",
+            "new-reviewer",
+        )
+        .expect("rendered");
+        assert_eq!(rendered.matches(SECURITY_MARKER).count(), 1);
+        assert!(rendered.contains("\"pr_number\": 441"));
+        assert!(rendered.contains("\"reviewer_id\": \"new-reviewer\""));
+        assert!(!rendered.contains("\"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+    }
 }

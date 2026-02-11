@@ -48,18 +48,36 @@ fn local_auth_material_check() -> Result<AuthInfo, String> {
     // Keyring service/account are optional; derived from app_id when absent
     let keyring_service = std::env::var("APM2_GITHUB_KEYRING_SERVICE")
         .ok()
-        .filter(|v| !v.trim().is_empty());
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|value| value.keyring_service.clone())
+        });
     let keyring_account = std::env::var("APM2_GITHUB_KEYRING_ACCOUNT")
         .ok()
-        .filter(|v| !v.trim().is_empty());
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|value| value.keyring_account.clone())
+        });
+    let allow_file_fallback =
+        env_bool("APM2_GITHUB_ALLOW_FILE_KEY_FALLBACK").unwrap_or_else(|| {
+            config
+                .as_ref()
+                .and_then(|value| value.allow_private_key_file_fallback)
+                .unwrap_or(false)
+        });
 
-    // Resolve private key: env var → config file → keyring
+    // Resolve private key: env var → keyring → optional file fallback.
     let _private_key = GitHubAppTokenProvider::resolve_private_key(
         &app_id,
         "APM2_GITHUB_APP_PRIVATE_KEY",
         config.as_ref(),
         keyring_service.as_deref(),
         keyring_account.as_deref(),
+        allow_file_fallback,
     )
     .map_err(|error| format!("GitHub App credential setup failed: {error}"))?;
 
@@ -67,6 +85,16 @@ fn local_auth_material_check() -> Result<AuthInfo, String> {
         authenticated: true,
         login: format!("app:{app_id} installation:{installation_id}"),
     })
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Reads a value from the environment variable first; if empty/absent, falls
