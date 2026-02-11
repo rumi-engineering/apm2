@@ -299,6 +299,22 @@ pub struct RedundancyReceiptConsumption {
     pub request_id: String,
     /// Tool class bound to the first successful consumption.
     pub tool_class: String,
+    /// Request-scoped intent digest (`tool_class + channel_key +
+    /// argument_digest`).
+    ///
+    /// `None` indicates a legacy consumption record emitted before intent
+    /// binding was added; callers must treat it fail-closed.
+    pub intent_digest: Option<[u8; 32]>,
+    /// Digest of request argument/content bytes used in `intent_digest`.
+    ///
+    /// `None` indicates a legacy consumption record emitted before argument
+    /// digest binding was added; callers must treat it fail-closed.
+    pub argument_content_digest: Option<[u8; 32]>,
+    /// Boundary channel key bound to the consumed intent.
+    ///
+    /// `None` indicates a legacy consumption record emitted before channel-key
+    /// binding was added; callers must treat it fail-closed.
+    pub channel_key: Option<String>,
 }
 
 /// Error type for ledger event emission.
@@ -692,12 +708,16 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// Default implementation emits through `emit_session_event` to preserve
     /// compatibility for in-memory test emitters.
+    #[allow(clippy::too_many_arguments)]
     fn emit_redundancy_receipt_consumed(
         &self,
         session_id: &str,
         receipt_id: &str,
         request_id: &str,
         tool_class: &str,
+        intent_digest: &[u8; 32],
+        argument_content_digest: &[u8; 32],
+        channel_key: &str,
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -705,6 +725,9 @@ pub trait LedgerEventEmitter: Send + Sync {
             "receipt_id": receipt_id,
             "request_id": request_id,
             "tool_class": tool_class,
+            "intent_digest": hex::encode(intent_digest),
+            "argument_content_digest": hex::encode(argument_content_digest),
+            "channel_key": channel_key,
         });
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
@@ -728,12 +751,30 @@ pub trait LedgerEventEmitter: Send + Sync {
         &self,
         receipt_id: &str,
     ) -> Option<RedundancyReceiptConsumption> {
+        fn parse_hex_hash32(value: Option<&str>) -> Option<[u8; 32]> {
+            let hex = value?;
+            let bytes = hex::decode(hex).ok()?;
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            Some(arr)
+        }
+
         fn parse_consumption(payload: &serde_json::Value) -> Option<RedundancyReceiptConsumption> {
             let obj = payload.as_object()?;
             Some(RedundancyReceiptConsumption {
                 receipt_id: obj.get("receipt_id")?.as_str()?.to_string(),
                 request_id: obj.get("request_id")?.as_str()?.to_string(),
                 tool_class: obj.get("tool_class")?.as_str()?.to_string(),
+                intent_digest: parse_hex_hash32(
+                    obj.get("intent_digest").and_then(serde_json::Value::as_str),
+                ),
+                argument_content_digest: parse_hex_hash32(
+                    obj.get("argument_content_digest")
+                        .and_then(serde_json::Value::as_str),
+                ),
+                channel_key: obj
+                    .get("channel_key")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         }
 
