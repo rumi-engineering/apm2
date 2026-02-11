@@ -31,15 +31,13 @@ notes:
   - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces, including findings retrieval via `apm2 fac review findings --pr <N> --json`."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
 
-references[7]:
+references[6]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
     purpose: "CI and validation contract for implementation completion."
   - path: "references/orchestration-loop.md"
     purpose: "Primary decision tree for 1-20 PR control-loop orchestration."
-  - path: "references/scaling-profiles.md"
-    purpose: "Concurrency budgets, queue limits, and anti-stall thresholds by PR count."
   - path: "@documents/skills/implementor-default/SKILL.md"
     purpose: "Default implementor skill; use this for all fix-agent dispatches."
   - path: "@documents/reviews/SECURITY_REVIEW_PROMPT.md"

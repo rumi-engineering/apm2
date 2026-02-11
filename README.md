@@ -19,15 +19,14 @@
     }
   },
   "payload": {
-    "purpose": "Comprehensive agent user guide for APM2 architecture, governance, and workflow patterns. CLI command surfaces are intentionally discovered at runtime via --help; for daemon operator reference, see DAEMON.md.",
+    "purpose": "Agent guide for APM2 architecture, governance, and workflow patterns. CLI command surfaces are intentionally discovered at runtime via --help; for daemon operator reference, see DAEMON.md.",
     "project": {
       "name": "APM2",
-      "full_name": "APM2 — Holonic AI Process Manager",
+      "full_name": "APM2 — Holonic AI Process Manager rooted in Proof-Admitted Stigmergic Morphogenesis (PASM) theory.",
       "version": "0.3.0",
       "description": "Daemon-supervised, event-sourced process manager for AI agents. Organizes agents in hierarchical part-whole (holonic) relationships with capability-based security, content-addressed evidence, and reducer/projection patterns.",
       "edition": "2024",
-      "msrv": "1.85",
-      "license": "MIT OR Apache-2.0"
+      "msrv": "1.85"
     },
     "architecture": {
       "layers": [
@@ -81,9 +80,7 @@
       "fmt": "cargo fmt --all",
       "fmt_check": "cargo fmt --all -- --check",
       "clippy": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-      "doc": "cargo doc --workspace --no-deps",
-      "selftest": "cargo xtask selftest",
-      "capabilities": "cargo xtask capabilities --json"
+      "doc": "cargo doc --workspace --no-deps"
     },
     "agent_workflows": {
       "description": "Common agent workflows (illustrative only). Resolve exact command/flag syntax via --help in the current runtime.",
@@ -110,39 +107,12 @@
         "5. Resume from anchor: apm2 fac resume <work-id>"
       ]
     },
-    "environment_variables": {
-      "APM2_SESSION_TOKEN": "Session token for authentication. Preferred over --session-token flag for security (CWE-214).",
-      "APM2_DATA_DIR": "Data directory for ledger and CAS. Used by fac commands when --ledger-path / --cas-path not specified."
-    },
-    "developer_environment": {
-      "nix_dev_shell": {
-        "enter": "nix develop",
-        "update_lockfile": "nix --extra-experimental-features 'nix-command flakes' flake lock"
-      },
-      "skills_runtime_sync": {
-        "source_of_truth": "documents/skills/",
-        "sync_command": "scripts/dev/skills_runtime_sync.sh sync",
-        "check_command": "scripts/dev/skills_runtime_sync.sh --check",
-        "global_runtime_path_pattern": "${XDG_STATE_HOME:-$HOME/.local/state}/apm2/skills/<repo_id>/<worktree_id>",
-        "worktree_layout": ".claude/skills -> ${XDG_STATE_HOME:-$HOME/.local/state}/apm2/skills/<repo_id>/<worktree_id>",
-        "migration_note": "Legacy .claude/sync-skills.sh is retired. Use scripts/dev/skills_runtime_sync.sh."
-      }
-    },
     "security_notes": {
       "session_tokens": "Always use APM2_SESSION_TOKEN environment variable instead of --session-token CLI flag. CLI arguments are visible in process listings on multi-user systems (CWE-214).",
       "operator_socket": "Mode 0600. Only the daemon owner can send operator commands (spawn, capability issue, kill).",
       "session_socket": "Mode 0660. Session-scoped operations require valid session tokens.",
       "credential_signatures": "Work claims require Ed25519 signatures computed over (actor_id || role || nonce) for replay protection.",
       "replay_protection": "CAC patch operations require --expected-base BLAKE3 hash to prevent stale overwrites."
-    },
-    "cli_discovery_policy": {
-      "instruction": "Do not rely on static command catalogs in this document. CLI surfaces evolve; discover command names, flags, and behavior with --help in the active environment.",
-      "required_practice": [
-        "Run apm2 --help at session start.",
-        "For every command you plan to execute, run apm2 <subcommand> --help first.",
-        "For ticket/PR lifecycle operations, prefer FAC surfaces (apm2 fac ...)."
-      ],
-      "projection_note": "GitHub is a projection surface; treat FAC projections and local FAC artifacts as operational truth."
     }
   }
 }
