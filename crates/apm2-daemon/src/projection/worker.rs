@@ -27,6 +27,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use apm2_core::evidence::ContentAddressedStore;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -104,6 +105,39 @@ pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// deserializing untrusted payloads. (Blocker fix: Unbounded Input Consumption)
 pub const MAX_STRING_LENGTH: usize = 1024;
 
+/// Required 32-byte hash linkage fields for projection write admission.
+const RECEIPT_LINKAGE_HASH_FIELDS: [&str; 6] = [
+    "changeset_digest",
+    "artifact_bundle_hash",
+    "capability_manifest_hash",
+    "context_pack_hash",
+    "role_spec_hash",
+    "identity_proof_hash",
+];
+
+/// Optional lifecycle linkage hash fields that must be all-or-none.
+const RECEIPT_LIFECYCLE_HASH_FIELDS: [&str; 3] =
+    ["ajc_id", "intent_digest", "consume_selector_digest"];
+
+/// Linkage hashes that must resolve in authoritative CAS before projection.
+const RECEIPT_CAS_LINKAGE_HASH_FIELDS: [&str; 4] = [
+    "artifact_bundle_hash",
+    "capability_manifest_hash",
+    "context_pack_hash",
+    "role_spec_hash",
+];
+
+/// Authoritative stores used to validate projection receipt linkage.
+struct ProjectionLinkageAuthority<'a> {
+    conn: &'a Arc<Mutex<Connection>>,
+    cas: Option<&'a dyn ContentAddressedStore>,
+}
+
+struct AuthoritativeReceiptLinkageRecord {
+    event_id: String,
+    payload: serde_json::Value,
+}
+
 /// Validates that a string field does not exceed the maximum allowed length.
 /// Returns an error if the string is too long.
 /// (Blocker fix: Unbounded Input Consumption)
@@ -114,6 +148,256 @@ fn validate_string_length(field_name: &str, value: &str) -> Result<(), Projectio
             value.len()
         )));
     }
+    Ok(())
+}
+
+fn validate_hash32_hex_field(
+    payload: &serde_json::Value,
+    field: &str,
+) -> Result<[u8; 32], ProjectionWorkerError> {
+    let value = payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ProjectionWorkerError::InvalidPayload(format!("missing {field}")))?;
+    validate_string_length(field, value)?;
+    let decoded = hex::decode(value).map_err(|e| {
+        ProjectionWorkerError::InvalidPayload(format!("{field} is not valid hex: {e}"))
+    })?;
+    if decoded.len() != 32 {
+        return Err(ProjectionWorkerError::InvalidPayload(format!(
+            "{field} must decode to 32 bytes"
+        )));
+    }
+
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&decoded);
+    if hash.iter().all(|byte| *byte == 0) {
+        return Err(ProjectionWorkerError::InvalidPayload(format!(
+            "{field} is zero (unset authority linkage)"
+        )));
+    }
+    Ok(hash)
+}
+
+fn validate_nonempty_string_field(
+    payload: &serde_json::Value,
+    field: &str,
+) -> Result<(), ProjectionWorkerError> {
+    let value = payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ProjectionWorkerError::InvalidPayload(format!("missing {field}")))?;
+    validate_string_length(field, value)?;
+    if value.trim().is_empty() {
+        return Err(ProjectionWorkerError::InvalidPayload(format!(
+            "{field} is empty"
+        )));
+    }
+    Ok(())
+}
+
+fn payload_nonempty_str<'a>(
+    payload: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, ProjectionWorkerError> {
+    validate_nonempty_string_field(payload, field)?;
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ProjectionWorkerError::InvalidPayload(format!("missing {field}")))
+}
+
+fn load_authoritative_receipt_linkage_record(
+    authority: &ProjectionLinkageAuthority<'_>,
+    receipt_id: &str,
+    lease_id: &str,
+    work_id: &str,
+) -> Result<Option<AuthoritativeReceiptLinkageRecord>, ProjectionWorkerError> {
+    let conn = authority
+        .conn
+        .lock()
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT event_id, payload
+             FROM ledger_events
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')
+               AND work_id = ?1
+             ORDER BY timestamp_ns DESC, rowid DESC",
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+    let mut rows = stmt
+        .query(params![work_id])
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+    {
+        let event_id: String = row
+            .get(0)
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+        let payload_bytes: Vec<u8> = row
+            .get(1)
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|e| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "authoritative event payload is not valid JSON: {e}"
+            ))
+        })?;
+
+        let row_receipt = payload
+            .get("receipt_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let row_lease = payload
+            .get("lease_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let row_work = payload
+            .get("work_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        if row_receipt == receipt_id && row_lease == lease_id && row_work == work_id {
+            return Ok(Some(AuthoritativeReceiptLinkageRecord {
+                event_id,
+                payload,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn validate_projection_receipt_linkage(
+    payload: &serde_json::Value,
+    event: &SignedLedgerEvent,
+    authority: &ProjectionLinkageAuthority<'_>,
+) -> Result<(), ProjectionWorkerError> {
+    validate_nonempty_string_field(payload, "receipt_id")?;
+    validate_nonempty_string_field(payload, "lease_id")?;
+    validate_nonempty_string_field(payload, "work_id")?;
+    validate_nonempty_string_field(payload, "time_envelope_ref")?;
+
+    let payload_receipt_id = payload_nonempty_str(payload, "receipt_id")?;
+    let payload_lease_id = payload_nonempty_str(payload, "lease_id")?;
+
+    let payload_work_id = payload
+        .get("work_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("validated work_id presence");
+    if payload_work_id != event.work_id {
+        return Err(ProjectionWorkerError::InvalidPayload(format!(
+            "work_id mismatch: payload={} envelope={}",
+            payload_work_id, event.work_id
+        )));
+    }
+
+    let mut payload_hashes = std::collections::HashMap::new();
+    for field in RECEIPT_LINKAGE_HASH_FIELDS {
+        let hash = validate_hash32_hex_field(payload, field)?;
+        payload_hashes.insert(field, hash);
+    }
+
+    let authoritative_record = load_authoritative_receipt_linkage_record(
+        authority,
+        payload_receipt_id,
+        payload_lease_id,
+        payload_work_id,
+    )?
+    .ok_or_else(|| {
+        ProjectionWorkerError::InvalidPayload(format!(
+            "authoritative receipt linkage missing for receipt_id={payload_receipt_id} \
+             lease_id={payload_lease_id} work_id={payload_work_id}"
+        ))
+    })?;
+
+    if authoritative_record.event_id != event.event_id {
+        return Err(ProjectionWorkerError::InvalidPayload(format!(
+            "receipt identity tuple resolves to authoritative event_id={} but current projection context is event_id={}",
+            authoritative_record.event_id, event.event_id
+        )));
+    }
+
+    for field in RECEIPT_LINKAGE_HASH_FIELDS {
+        let payload_hash = payload_hashes.get(field).copied().ok_or_else(|| {
+            ProjectionWorkerError::InvalidPayload(format!("missing cached hash for {field}"))
+        })?;
+        let authoritative_hash = validate_hash32_hex_field(&authoritative_record.payload, field)?;
+        if payload_hash != authoritative_hash {
+            return Err(ProjectionWorkerError::InvalidPayload(format!(
+                "linkage hash mismatch for {field}: payload={} authoritative={}",
+                hex::encode(payload_hash),
+                hex::encode(authoritative_hash),
+            )));
+        }
+    }
+
+    let Some(cas) = authority.cas else {
+        return Err(ProjectionWorkerError::InvalidPayload(
+            "authoritative CAS unavailable for projection linkage validation".to_string(),
+        ));
+    };
+
+    for field in RECEIPT_CAS_LINKAGE_HASH_FIELDS {
+        let hash = payload_hashes.get(field).copied().ok_or_else(|| {
+            ProjectionWorkerError::InvalidPayload(format!("missing cached hash for {field}"))
+        })?;
+        match cas.exists(&hash) {
+            Ok(true) => {},
+            Ok(false) => {
+                return Err(ProjectionWorkerError::InvalidPayload(format!(
+                    "{field} {} is not resolvable in authoritative CAS",
+                    hex::encode(hash)
+                )));
+            },
+            Err(e) => {
+                return Err(ProjectionWorkerError::InvalidPayload(format!(
+                    "authoritative CAS lookup failed for {field}: {e}"
+                )));
+            },
+        }
+    }
+
+    let lifecycle_fields_present = [
+        "ajc_id",
+        "intent_digest",
+        "consume_tick",
+        "pcac_time_envelope_ref",
+        "consume_selector_digest",
+    ]
+    .iter()
+    .filter(|field| payload.get(*field).is_some())
+    .count();
+
+    if lifecycle_fields_present != 0 && lifecycle_fields_present != 5 {
+        return Err(ProjectionWorkerError::InvalidPayload(
+            "partial lifecycle linkage tuple is not admissible (all-or-none required)".to_string(),
+        ));
+    }
+
+    if lifecycle_fields_present == 5 {
+        for field in RECEIPT_LIFECYCLE_HASH_FIELDS {
+            validate_hash32_hex_field(payload, field)?;
+        }
+        validate_nonempty_string_field(payload, "pcac_time_envelope_ref")?;
+
+        let consume_tick = payload
+            .get("consume_tick")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                ProjectionWorkerError::InvalidPayload(
+                    "consume_tick must be an unsigned integer".to_string(),
+                )
+            })?;
+        if consume_tick == 0 {
+            return Err(ProjectionWorkerError::InvalidPayload(
+                "consume_tick must be > 0".to_string(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1114,6 +1398,7 @@ pub struct ProjectionWorker {
     /// Tailer for `review_receipt_recorded` events.
     review_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
+    authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Shutdown flag.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1165,6 +1450,7 @@ impl ProjectionWorker {
             work_pr_tailer,
             review_tailer,
             adapter,
+            authoritative_cas: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -1194,6 +1480,14 @@ impl ProjectionWorker {
     /// skipped (fail-safe, not fail-open).
     pub fn set_adapter(&mut self, adapter: GitHubProjectionAdapter) {
         self.adapter = Some(adapter);
+    }
+
+    /// Sets the authoritative CAS used for receipt linkage resolution.
+    ///
+    /// Projection linkage validation is fail-closed and requires CAS-backed
+    /// hashes to resolve in this store before any projection write is emitted.
+    pub fn set_authoritative_cas(&mut self, cas: Arc<dyn ContentAddressedStore>) {
+        self.authoritative_cas = Some(cas);
     }
 
     /// Returns whether a GitHub adapter is configured.
@@ -1643,6 +1937,16 @@ impl ProjectionWorker {
         let payload: serde_json::Value = serde_json::from_slice(&event.payload)
             .map_err(|e| ProjectionWorkerError::InvalidPayload(e.to_string()))?;
 
+        // RFC-0028 REQ-0008: projection writes are admissible only when the
+        // receipt payload carries authoritative linkage fields and those
+        // fields bind to the signed event envelope.
+        let work_index_conn = self.work_index.connection();
+        let linkage_authority = ProjectionLinkageAuthority {
+            conn: &work_index_conn,
+            cas: self.authoritative_cas.as_deref(),
+        };
+        validate_projection_receipt_linkage(&payload, event, &linkage_authority)?;
+
         let changeset_digest_hex = payload
             .get("changeset_digest")
             .and_then(|v| v.as_str())
@@ -1700,7 +2004,6 @@ impl ProjectionWorker {
 
         // Major fix: Thread blocking in async context
         // Look up PR metadata using spawn_blocking to avoid blocking the Tokio runtime
-        let work_index_conn = self.work_index.connection();
         let work_id_owned = work_id.clone();
         let pr_metadata = tokio::task::spawn_blocking(move || {
             let conn_guard = work_index_conn.lock().map_err(|e| {
@@ -1936,6 +2239,8 @@ impl ProjectionWorker {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
     use super::*;
 
     fn create_test_db() -> Arc<Mutex<Connection>> {
@@ -2627,6 +2932,199 @@ mod tests {
         assert!(
             validate_string_length("field", empty_string).is_ok(),
             "Should accept empty string"
+        );
+    }
+
+    struct TestLinkageHashes {
+        changeset_digest: [u8; 32],
+        artifact_bundle_hash: [u8; 32],
+        capability_manifest_hash: [u8; 32],
+        context_pack_hash: [u8; 32],
+        role_spec_hash: [u8; 32],
+        identity_proof_hash: [u8; 32],
+    }
+
+    fn make_test_linkage_hashes(cas: &MemoryCas) -> TestLinkageHashes {
+        let artifact_bundle_hash = cas
+            .store(b"artifact-bundle-test")
+            .expect("artifact bundle hash")
+            .hash;
+        let capability_manifest_hash = cas
+            .store(b"capability-manifest-test")
+            .expect("capability manifest hash")
+            .hash;
+        let context_pack_hash = cas
+            .store(b"context-pack-test")
+            .expect("context pack hash")
+            .hash;
+        let role_spec_hash = cas.store(b"role-spec-test").expect("role spec hash").hash;
+        let identity_digest = blake3::hash(b"identity-proof-test");
+        let mut identity_proof_hash = [0u8; 32];
+        identity_proof_hash.copy_from_slice(identity_digest.as_bytes());
+
+        TestLinkageHashes {
+            changeset_digest: [0x42u8; 32],
+            artifact_bundle_hash,
+            capability_manifest_hash,
+            context_pack_hash,
+            role_spec_hash,
+            identity_proof_hash,
+        }
+    }
+
+    fn valid_receipt_linkage_payload(
+        work_id: &str,
+        hashes: &TestLinkageHashes,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "receipt_id": "receipt-001",
+            "lease_id": "lease-001",
+            "work_id": work_id,
+            "changeset_digest": hex::encode(hashes.changeset_digest),
+            "artifact_bundle_hash": hex::encode(hashes.artifact_bundle_hash),
+            "capability_manifest_hash": hex::encode(hashes.capability_manifest_hash),
+            "context_pack_hash": hex::encode(hashes.context_pack_hash),
+            "role_spec_hash": hex::encode(hashes.role_spec_hash),
+            "identity_proof_hash": hex::encode(hashes.identity_proof_hash),
+            "time_envelope_ref": "htf:tick:123456",
+        })
+    }
+
+    fn test_event(work_id: &str) -> SignedLedgerEvent {
+        SignedLedgerEvent {
+            event_id: "evt-001".to_string(),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: "actor-001".to_string(),
+            payload: Vec::new(),
+            signature: vec![0u8; 64],
+            timestamp_ns: 1000,
+        }
+    }
+
+    fn insert_authoritative_receipt_event(
+        conn: &Arc<Mutex<Connection>>,
+        event: &SignedLedgerEvent,
+        payload: &serde_json::Value,
+    ) {
+        conn.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.event_id,
+                    event.event_type,
+                    event.work_id,
+                    event.actor_id,
+                    serde_json::to_vec(payload).expect("serialize payload"),
+                    event.signature.clone(),
+                    i64::try_from(event.timestamp_ns).expect("test timestamp_ns must fit into i64")
+                ],
+            )
+            .expect("insert authoritative receipt event");
+    }
+
+    #[test]
+    fn test_validate_projection_receipt_linkage_accepts_authoritative_payload() {
+        let conn = create_test_db();
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        let payload = valid_receipt_linkage_payload("work-001", &hashes);
+        let event = test_event("work-001");
+        insert_authoritative_receipt_event(&conn, &event, &payload);
+        let authority = ProjectionLinkageAuthority {
+            conn: &conn,
+            cas: Some(&cas),
+        };
+        let result = validate_projection_receipt_linkage(&payload, &event, &authority);
+        assert!(result.is_ok(), "expected valid linkage payload to pass");
+    }
+
+    #[test]
+    fn test_validate_projection_receipt_linkage_rejects_work_id_mismatch() {
+        let conn = create_test_db();
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        let payload = valid_receipt_linkage_payload("work-payload", &hashes);
+        let event = test_event("work-envelope");
+        let authority = ProjectionLinkageAuthority {
+            conn: &conn,
+            cas: Some(&cas),
+        };
+        let err = validate_projection_receipt_linkage(&payload, &event, &authority).unwrap_err();
+        assert!(
+            matches!(err, ProjectionWorkerError::InvalidPayload(_)),
+            "expected work_id mismatch to fail with InvalidPayload"
+        );
+        assert!(err.to_string().contains("work_id mismatch"));
+    }
+
+    #[test]
+    fn test_validate_projection_receipt_linkage_rejects_missing_authority_hash() {
+        let conn = create_test_db();
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        let mut payload = valid_receipt_linkage_payload("work-001", &hashes);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("capability_manifest_hash");
+        let event = test_event("work-001");
+        let authority = ProjectionLinkageAuthority {
+            conn: &conn,
+            cas: Some(&cas),
+        };
+        let err = validate_projection_receipt_linkage(&payload, &event, &authority).unwrap_err();
+        assert!(matches!(err, ProjectionWorkerError::InvalidPayload(_)));
+        assert!(err.to_string().contains("missing capability_manifest_hash"));
+    }
+
+    #[test]
+    fn test_validate_projection_receipt_linkage_rejects_partial_lifecycle_tuple() {
+        let conn = create_test_db();
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        let mut payload = valid_receipt_linkage_payload("work-001", &hashes);
+        let event = test_event("work-001");
+        insert_authoritative_receipt_event(&conn, &event, &payload);
+        payload["ajc_id"] = serde_json::json!("42".repeat(32));
+        payload["intent_digest"] = serde_json::json!("42".repeat(32));
+        let authority = ProjectionLinkageAuthority {
+            conn: &conn,
+            cas: Some(&cas),
+        };
+        let err = validate_projection_receipt_linkage(&payload, &event, &authority).unwrap_err();
+        assert!(matches!(err, ProjectionWorkerError::InvalidPayload(_)));
+        assert!(err.to_string().contains("partial lifecycle linkage tuple"));
+    }
+
+    #[test]
+    fn test_validate_projection_receipt_linkage_rejects_forged_linkage_hash() {
+        let conn = create_test_db();
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        let authoritative_payload = valid_receipt_linkage_payload("work-001", &hashes);
+        let event = test_event("work-001");
+        insert_authoritative_receipt_event(&conn, &event, &authoritative_payload);
+
+        let mut forged_payload = authoritative_payload;
+        let forged_capability_manifest_hash = cas
+            .store(b"forged-capability-manifest")
+            .expect("forged capability hash")
+            .hash;
+        forged_payload["capability_manifest_hash"] =
+            serde_json::json!(hex::encode(forged_capability_manifest_hash));
+
+        let authority = ProjectionLinkageAuthority {
+            conn: &conn,
+            cas: Some(&cas),
+        };
+        let err =
+            validate_projection_receipt_linkage(&forged_payload, &event, &authority).unwrap_err();
+        assert!(matches!(err, ProjectionWorkerError::InvalidPayload(_)));
+        assert!(
+            err.to_string()
+                .contains("linkage hash mismatch for capability_manifest_hash")
         );
     }
 
