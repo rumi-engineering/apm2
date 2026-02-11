@@ -2706,7 +2706,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         elapsed_ns: u64,
         timestamp_ns: u64,
     ) -> Option<(LeakageWitnessV1, TimingWitnessV1)> {
-        if request_arguments.is_empty() || timestamp_ns == 0 || elapsed_ns == 0 {
+        if timestamp_ns == 0 || elapsed_ns == 0 {
             return None;
         }
         Some(build_authoritative_witnesses(
@@ -2725,7 +2725,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         elapsed_ns: u64,
         timestamp_ns: u64,
     ) -> Option<(LeakageWitnessV1, TimingWitnessV1)> {
-        if request_arguments.is_empty() || timestamp_ns == 0 || elapsed_ns == 0 {
+        if timestamp_ns == 0 || elapsed_ns == 0 {
             return None;
         }
         Some(build_authoritative_witnesses(
@@ -7188,16 +7188,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 &timing_witness,
                 timestamp_ns,
             ) {
-                error!(
+                warn!(
                     session_id = %token.session_id,
                     tool_class = %tool_class,
                     error = %error,
-                    "non-strict boundary waiver defect emission failed"
+                    "non-strict boundary waiver defect emission failed (out-of-band telemetry)"
                 );
-                response = Ok(SessionResponse::error(
-                    SessionErrorCode::SessionErrorInternal,
-                    format!("non-strict boundary waiver defect emission failed: {error}"),
-                ));
             }
         }
 
@@ -11930,6 +11926,51 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_request_arguments_use_strict_authoritative_witnesses() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
+        let policy_hash = [0x42; 32];
+        let request_id = "REQ-EMPTY-ARGS";
+        let decision = Ok(ToolDecision::Allow {
+            request_id: request_id.to_string(),
+            capability_id: "cap-read-tier3".to_string(),
+            rule_id: Some("rule-allow".to_string()),
+            policy_hash,
+            budget_delta: crate::episode::BudgetDelta::single_call(),
+            credential: None,
+        });
+        let request_arguments = Vec::new();
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request_arguments, &TaintPolicy::default());
+        let boundary_flow_state = dispatcher
+            .build_boundary_flow_runtime_state(
+                "session-001",
+                "lease-001",
+                request_id,
+                ToolClass::Read,
+                &decision,
+                Some(RiskTier::Tier3),
+                &taint_assessment,
+                &request_arguments,
+                1_700_000_000_000_000_001,
+                Some(policy_hash),
+            )
+            .expect("strict boundary-flow runtime state should build for empty request arguments");
+
+        assert_eq!(
+            boundary_flow_state.leakage_budget_receipt.leakage_bits, 0,
+            "empty request arguments must produce authoritative zero-bit leakage witness",
+        );
+        assert!(
+            boundary_flow_state
+                .timing_witness
+                .measurement_method
+                .contains("daemon_boundary_context_tool_aggregate_v1"),
+            "strict Tier2+ requests with empty arguments must keep authoritative timing witnesses present",
+        );
+    }
+
+    #[test]
     fn test_client_provided_leakage_and_timing_hints_rejected_in_enforcement_tiers() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
             .with_strict_boundary_authority_enforcement(true);
@@ -13032,6 +13073,522 @@ mod tests {
                         == Some("BOUNDARY_FLOW_NON_STRICT_WAIVER")
                 }),
                 "non-strict Tier0/Tier1 waiver path must emit boundary waiver defect"
+            );
+        });
+    }
+
+    #[test]
+    fn test_tier0_non_strict_waiver_defect_failure_keeps_success_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::episode::decision::Credential;
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::tool_handler::ToolArgs;
+        use crate::episode::{
+            BudgetDelta, Capability, CapabilityManifestBuilder, CapabilityScope, EpisodeRuntime,
+            EpisodeRuntimeConfig, InMemorySessionRegistry, RiskTier, StubContentAddressedStore,
+            ToolBroker, ToolBrokerConfig, ToolClass, ToolHandler, ToolHandlerError, ToolResultData,
+        };
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::protocol::dispatch::{
+            LedgerEventEmitter, LedgerEventError, SignedLedgerEvent, StubLedgerEventEmitter,
+        };
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        #[derive(Debug)]
+        struct MockInferenceHandler {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolHandler for MockInferenceHandler {
+            fn tool_class(&self) -> ToolClass {
+                ToolClass::Inference
+            }
+
+            async fn execute(
+                &self,
+                _args: &ToolArgs,
+                _credential: Option<&Credential>,
+            ) -> Result<ToolResultData, ToolHandlerError> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResultData::success(
+                    b"non-strict-waiver-success".to_vec(),
+                    BudgetDelta::single_call(),
+                    std::time::Duration::from_millis(1),
+                ))
+            }
+
+            fn validate(&self, _args: &ToolArgs) -> Result<(), ToolHandlerError> {
+                Ok(())
+            }
+
+            fn name(&self) -> &'static str {
+                "MockInferenceHandler"
+            }
+        }
+
+        #[derive(Debug)]
+        struct DefectFailingLedger {
+            inner: StubLedgerEventEmitter,
+        }
+
+        impl DefectFailingLedger {
+            fn new() -> Self {
+                Self {
+                    inner: StubLedgerEventEmitter::new(),
+                }
+            }
+
+            fn defect_recorded_event_count(&self) -> usize {
+                self.inner
+                    .get_all_events()
+                    .into_iter()
+                    .filter(|event| event.event_type == "defect_recorded")
+                    .count()
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        impl LedgerEventEmitter for DefectFailingLedger {
+            fn emit_work_claimed(
+                &self,
+                claim: &crate::protocol::dispatch::WorkClaim,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_work_claimed(claim, timestamp_ns)
+            }
+
+            fn emit_session_started(
+                &self,
+                session_id: &str,
+                work_id: &str,
+                lease_id: &str,
+                actor_id: &str,
+                adapter_profile_hash: &[u8; 32],
+                role_spec_hash: Option<&[u8; 32]>,
+                timestamp_ns: u64,
+                contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+                identity_proof_profile_hash: Option<&[u8; 32]>,
+                selection_decision: Option<&apm2_core::fac::SelectionDecision>,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_session_started(
+                    session_id,
+                    work_id,
+                    lease_id,
+                    actor_id,
+                    adapter_profile_hash,
+                    role_spec_hash,
+                    timestamp_ns,
+                    contract_binding,
+                    identity_proof_profile_hash,
+                    selection_decision,
+                )
+            }
+
+            fn emit_session_event(
+                &self,
+                session_id: &str,
+                event_type: &str,
+                payload: &[u8],
+                actor_id: &str,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_session_event(
+                    session_id,
+                    event_type,
+                    payload,
+                    actor_id,
+                    timestamp_ns,
+                )
+            }
+
+            fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+                self.inner.verifying_key()
+            }
+
+            fn emit_stop_flags_mutated(
+                &self,
+                mutation: &crate::protocol::dispatch::StopFlagsMutation<'_>,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_stop_flags_mutated(mutation)
+            }
+
+            fn emit_defect_recorded(
+                &self,
+                defect: &DefectRecorded,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                if defect.defect_type == "BOUNDARY_FLOW_NON_STRICT_WAIVER" {
+                    return Err(LedgerEventError::PersistenceFailed {
+                        message: "simulated non-strict waiver defect persistence failure"
+                            .to_string(),
+                    });
+                }
+                self.inner.emit_defect_recorded(defect, timestamp_ns)
+            }
+
+            fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent> {
+                self.inner.get_event(event_id)
+            }
+
+            fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
+                self.inner.get_events_by_work_id(work_id)
+            }
+
+            fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
+                self.inner.get_all_events()
+            }
+
+            fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+                self.inner.get_event_by_receipt_id(receipt_id)
+            }
+
+            fn emit_episode_event(
+                &self,
+                episode_id: &str,
+                event_type: &str,
+                payload: &[u8],
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner
+                    .emit_episode_event(episode_id, event_type, payload, timestamp_ns)
+            }
+
+            fn emit_review_receipt(
+                &self,
+                lease_id: &str,
+                work_id: &str,
+                receipt_id: &str,
+                changeset_digest: &[u8; 32],
+                artifact_bundle_hash: &[u8; 32],
+                capability_manifest_hash: &[u8; 32],
+                context_pack_hash: &[u8; 32],
+                role_spec_hash: &[u8; 32],
+                reviewer_actor_id: &str,
+                timestamp_ns: u64,
+                identity_proof_hash: &[u8; 32],
+                time_envelope_ref: &str,
+                pcac_lifecycle: Option<
+                    &crate::protocol::dispatch::PrivilegedPcacLifecycleArtifacts,
+                >,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_review_receipt(
+                    lease_id,
+                    work_id,
+                    receipt_id,
+                    changeset_digest,
+                    artifact_bundle_hash,
+                    capability_manifest_hash,
+                    context_pack_hash,
+                    role_spec_hash,
+                    reviewer_actor_id,
+                    timestamp_ns,
+                    identity_proof_hash,
+                    time_envelope_ref,
+                    pcac_lifecycle,
+                )
+            }
+
+            fn emit_review_blocked_receipt(
+                &self,
+                lease_id: &str,
+                work_id: &str,
+                receipt_id: &str,
+                changeset_digest: &[u8; 32],
+                artifact_bundle_hash: &[u8; 32],
+                capability_manifest_hash: &[u8; 32],
+                context_pack_hash: &[u8; 32],
+                role_spec_hash: &[u8; 32],
+                reason_code: u32,
+                blocked_log_hash: &[u8; 32],
+                reviewer_actor_id: &str,
+                timestamp_ns: u64,
+                identity_proof_hash: &[u8; 32],
+                time_envelope_ref: &str,
+                pcac_lifecycle: Option<
+                    &crate::protocol::dispatch::PrivilegedPcacLifecycleArtifacts,
+                >,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_review_blocked_receipt(
+                    lease_id,
+                    work_id,
+                    receipt_id,
+                    changeset_digest,
+                    artifact_bundle_hash,
+                    capability_manifest_hash,
+                    context_pack_hash,
+                    role_spec_hash,
+                    reason_code,
+                    blocked_log_hash,
+                    reviewer_actor_id,
+                    timestamp_ns,
+                    identity_proof_hash,
+                    time_envelope_ref,
+                    pcac_lifecycle,
+                )
+            }
+
+            fn get_work_transition_count(&self, work_id: &str) -> u32 {
+                self.inner.get_work_transition_count(work_id)
+            }
+
+            fn emit_work_transitioned(
+                &self,
+                transition: &crate::protocol::dispatch::WorkTransition<'_>,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_work_transitioned(transition)
+            }
+
+            fn emit_session_terminated(
+                &self,
+                session_id: &str,
+                work_id: &str,
+                exit_code: i32,
+                termination_reason: &str,
+                actor_id: &str,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_session_terminated(
+                    session_id,
+                    work_id,
+                    exit_code,
+                    termination_reason,
+                    actor_id,
+                    timestamp_ns,
+                )
+            }
+
+            fn emit_episode_run_attributed(
+                &self,
+                work_id: &str,
+                episode_id: &str,
+                session_id: &str,
+                adapter_profile_hash: &[u8; 32],
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_episode_run_attributed(
+                    work_id,
+                    episode_id,
+                    session_id,
+                    adapter_profile_hash,
+                    timestamp_ns,
+                )
+            }
+
+            fn emit_changeset_published(
+                &self,
+                work_id: &str,
+                changeset_digest: &[u8; 32],
+                cas_hash: &[u8; 32],
+                actor_id: &str,
+                timestamp_ns: u64,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_changeset_published(
+                    work_id,
+                    changeset_digest,
+                    cas_hash,
+                    actor_id,
+                    timestamp_ns,
+                )
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+            let capability = Capability {
+                capability_id: "cap-inference-tier0".to_string(),
+                tool_class: ToolClass::Inference,
+                scope: CapabilityScope {
+                    root_paths: Vec::new(),
+                    allowed_patterns: Vec::new(),
+                    size_limits: crate::episode::scope::SizeLimits::default_limits(),
+                    network_policy: None,
+                },
+                risk_tier_required: RiskTier::Tier0,
+            };
+            let manifest = CapabilityManifestBuilder::new("non-strict-waiver-success-manifest")
+                .delegator("test-delegator")
+                .capabilities(vec![capability])
+                .tool_allowlist(vec![ToolClass::Inference])
+                .build()
+                .expect("manifest build should succeed");
+
+            let broker = Arc::new(ToolBroker::new(
+                ToolBrokerConfig::default().without_policy_check(),
+            ));
+            broker
+                .initialize_with_manifest(manifest.clone())
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let cas: Arc<dyn crate::episode::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+            #[allow(deprecated)]
+            let episode_runtime = Arc::new(
+                EpisodeRuntime::new(EpisodeRuntimeConfig::default())
+                    .with_cas(cas)
+                    .with_handler_factory({
+                        let executions = Arc::clone(&executions);
+                        move || {
+                            Box::new(MockInferenceHandler {
+                                executions: Arc::clone(&executions),
+                            }) as Box<dyn ToolHandler>
+                        }
+                    }),
+            );
+            let episode_id = episode_runtime
+                .create(*blake3::hash(b"non-strict-waiver-envelope").as_bytes(), 1_000_000)
+                .await
+                .expect("create episode");
+            #[allow(deprecated)]
+            let _handle = episode_runtime
+                .start(&episode_id, "lease-001", 2_000_000)
+                .await
+                .expect("start episode");
+            let session_id = episode_id.as_str().to_string();
+
+            manifest_store.register(&session_id, manifest);
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.clone(),
+                    work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-non-strict-ledger-fail".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.clone()),
+                    pcac_policy: None,
+                    pointer_only_waiver: Some(apm2_core::pcac::PointerOnlyWaiver {
+                        waiver_id: "WVR-BOUNDARY-TIER0-NON-STRICT-FAIL".to_string(),
+                        expires_at_tick: u64::MAX / 2,
+                        scope_binding_hash: [0x7Bu8; 32],
+                    }),
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        duration.as_nanos() as u64
+                    }
+                })
+                .unwrap_or(1);
+            telemetry
+                .register(&session_id, started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+            let ledger = Arc::new(DefectFailingLedger::new());
+            let authoritative_policy_hash = broker.active_policy_hash();
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    policy_hash: authoritative_policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            ledger
+                .emit_session_event(
+                    &session_id,
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emit should succeed");
+            let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_ledger(ledger_dyn)
+                .with_episode_runtime(episode_runtime)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_strict_boundary_authority_enforcement(false);
+
+            let spawn_time = std::time::SystemTime::now();
+            let token = minter
+                .mint(&session_id, "lease-001", spawn_time, Duration::from_secs(3600))
+                .expect("mint token");
+            let ctx = ConnectionContext::session_open(
+                Some(crate::protocol::credentials::PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some(session_id),
+            );
+
+            let non_strict_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "inference".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "type": "inference",
+                    "prompt": "hello",
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-non-strict-waiver-ledger-fail".to_string(),
+                epoch_seal: None,
+            };
+            let response = dispatcher
+                .dispatch(&encode_request_tool_request(&non_strict_request), &ctx)
+                .expect("dispatch should complete");
+
+            match response {
+                SessionResponse::RequestTool(resp) => {
+                    assert_eq!(
+                        resp.decision,
+                        DecisionType::Allow as i32,
+                        "waiver defect telemetry failure must not rewrite successful effect response",
+                    );
+                },
+                other => panic!(
+                    "expected successful effect response despite waiver defect telemetry failure, got: {other:?}"
+                ),
+            }
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                1,
+                "tool effect must execute exactly once even when waiver defect telemetry fails",
+            );
+            assert_eq!(
+                ledger.defect_recorded_event_count(),
+                0,
+                "failed waiver defect telemetry must remain out-of-band and not persist a defect event",
             );
         });
     }
