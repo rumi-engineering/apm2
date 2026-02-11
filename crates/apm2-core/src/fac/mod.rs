@@ -241,10 +241,11 @@ pub use projection::{
 };
 // Re-export projection compromise controls (RFC-0028 REQ-0009).
 pub use projection_compromise::{
-    DivergenceEvidence, ProjectionChannel, ProjectionCompromiseError, ProjectionCompromiseSignalV1,
-    ProjectionDivergence, ProjectionReplayReceiptV1, ProjectionSurfaceType, QuarantineStatus,
-    ReconstructedProjectionState, SinkIdentitySnapshotV1, SourceTrustSnapshotV1,
-    detect_projection_divergence, quarantine_channel, reconstruct_projection_state,
+    AuthorityKeyBindingV1, DivergenceEvidence, ProjectionChannel, ProjectionCompromiseError,
+    ProjectionCompromiseSignalV1, ProjectionDivergence, ProjectionReplayReceiptV1,
+    ProjectionSurfaceType, QuarantineStatus, ReconstructedProjectionState, ReplaySequenceBoundsV1,
+    SinkIdentitySnapshotV1, SourceTrustSnapshotV1, detect_projection_divergence,
+    quarantine_channel, reconstruct_projection_state,
 };
 // Re-export projection receipt recorded types
 pub use projection_receipt_recorded::{

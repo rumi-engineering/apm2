@@ -87,18 +87,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use apm2_core::crypto::{Hash, Signer, VerifyingKey};
+use apm2_core::crypto::{Hash, Signature, Signer, VerifyingKey, parse_verifying_key};
 use apm2_core::events::{
     DefectRecorded, DefectSource, InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
 };
 use apm2_core::fac::{
-    INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, ProjectionChannel,
-    ProjectionCompromiseSignalV1, ProjectionReplayReceiptV1, ProjectionSurfaceType,
-    ReconstructedProjectionState, SinkIdentitySnapshotV1, SourceTrustSnapshotV1,
-    detect_projection_divergence, quarantine_channel, reconstruct_projection_state,
-    sign_with_domain, verify_with_domain,
+    AuthorityKeyBindingV1, INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX,
+    ProjectionChannel, ProjectionCompromiseSignalV1, ProjectionReplayReceiptV1,
+    ProjectionSurfaceType, ReconstructedProjectionState, ReplaySequenceBoundsV1,
+    SinkIdentitySnapshotV1, SourceTrustSnapshotV1, detect_projection_divergence,
+    quarantine_channel, reconstruct_projection_state, sign_with_domain, verify_with_domain,
 };
 use apm2_holon::defect::{DefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType};
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,24 @@ pub const MAX_DEFECT_ID_LENGTH: usize = 256;
 
 /// Maximum length for actor IDs (CTR-2602 compliance).
 pub const MAX_ACTOR_ID_LENGTH: usize = 256;
+
+/// Domain separator for signed temporal authority envelopes.
+const TIME_AUTHORITY_ENVELOPE_PREFIX: &[u8] = b"TIME_AUTHORITY_ENVELOPE:";
+
+/// Signed temporal envelope lifetime for compromise/quarantine decisions.
+const DEFAULT_TIME_AUTHORITY_TTL: Duration = Duration::from_secs(300);
+
+/// Maximum supported endpoint canonical identifier length.
+const MAX_ENDPOINT_CANONICAL_ID_LENGTH: usize = 1024;
+
+/// Maximum supported endpoint fingerprint length.
+const MAX_ENDPOINT_FINGERPRINT_LENGTH: usize = 512;
+
+/// Maximum supported temporal envelope reference length.
+const MAX_TIME_ENVELOPE_REF_LENGTH: usize = 1024;
+
+/// Maximum supported trusted authority bindings in watchdog config.
+const MAX_TRUSTED_AUTHORITY_BINDINGS: usize = 64;
 
 // =============================================================================
 // Type-Safe Identifiers (CTR-2602)
@@ -385,12 +403,209 @@ pub struct DivergenceResult {
     pub replay_receipt: ProjectionReplayReceiptV1,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedTemporalAuthority {
+    envelope: TimeAuthorityEnvelopeV1,
+    time_authority_ref: Hash,
+}
+
+/// Concrete sink endpoint evidence bound into compromise snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkEndpointEvidenceV1 {
+    /// Canonical sink endpoint identifier (URL or hostname form).
+    pub endpoint_canonical_id: String,
+    /// Endpoint key fingerprint (TLS SPKI/SSH host key fingerprint).
+    pub endpoint_key_fingerprint: String,
+    /// Key epoch for endpoint key rotation continuity.
+    pub key_epoch: u64,
+}
+
+/// Signed temporal authority envelope for compromise and recovery decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeAuthorityEnvelopeV1 {
+    /// HTF envelope reference.
+    pub time_envelope_ref: String,
+    /// Declared HTF decision window reference.
+    #[serde(with = "serde_bytes")]
+    pub window_ref: Hash,
+    /// Issuance time for this temporal authority assertion.
+    pub issued_at_ns: u64,
+    /// Expiration time for this temporal authority assertion.
+    pub expires_at_ns: u64,
+    /// Signer actor identity.
+    pub signer_actor_id: String,
+    /// Signer public key bytes.
+    #[serde(with = "serde_bytes")]
+    pub signer_key: [u8; 32],
+    /// Signature over canonical bytes.
+    #[serde(with = "serde_bytes")]
+    pub signature: [u8; 64],
+}
+
+impl TimeAuthorityEnvelopeV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn create_signed(
+        time_envelope_ref: impl Into<String>,
+        window_ref: Hash,
+        issued_at_ns: u64,
+        expires_at_ns: u64,
+        signer_actor_id: impl Into<String>,
+        signer: &Signer,
+    ) -> Result<Self, DivergenceError> {
+        let time_envelope_ref = time_envelope_ref.into();
+        let signer_actor_id = signer_actor_id.into();
+
+        if time_envelope_ref.trim().is_empty() {
+            return Err(DivergenceError::MissingTemporalAuthority(
+                "time_envelope_ref".to_string(),
+            ));
+        }
+        if time_envelope_ref.len() > MAX_TIME_ENVELOPE_REF_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "time_envelope_ref",
+                actual: time_envelope_ref.len(),
+                max: MAX_TIME_ENVELOPE_REF_LENGTH,
+            });
+        }
+        if signer_actor_id.trim().is_empty() {
+            return Err(DivergenceError::MissingField(
+                "time_authority_signer_actor_id",
+            ));
+        }
+        if signer_actor_id.len() > MAX_ACTOR_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "time_authority_signer_actor_id",
+                actual: signer_actor_id.len(),
+                max: MAX_ACTOR_ID_LENGTH,
+            });
+        }
+        if window_ref.iter().all(|byte| *byte == 0) {
+            return Err(DivergenceError::MissingTemporalAuthority(
+                "window_ref".to_string(),
+            ));
+        }
+        if expires_at_ns <= issued_at_ns {
+            return Err(DivergenceError::InvalidTemporalAuthority(
+                "expires_at_ns must be greater than issued_at_ns".to_string(),
+            ));
+        }
+
+        let mut envelope = Self {
+            time_envelope_ref,
+            window_ref,
+            issued_at_ns,
+            expires_at_ns,
+            signer_actor_id,
+            signer_key: signer.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        let signature = sign_with_domain(
+            signer,
+            TIME_AUTHORITY_ENVELOPE_PREFIX,
+            &envelope.canonical_bytes(),
+        );
+        envelope.signature = signature.to_bytes();
+        Ok(envelope)
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+        bytes.extend_from_slice(&self.window_ref);
+        bytes.extend_from_slice(&self.issued_at_ns.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at_ns.to_be_bytes());
+        bytes.extend_from_slice(&(self.signer_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.signer_actor_id.as_bytes());
+        bytes.extend_from_slice(&self.signer_key);
+        bytes
+    }
+
+    fn validate_signature(
+        &self,
+        trusted_time_authority_bindings: &[AuthorityKeyBindingV1],
+    ) -> Result<(), DivergenceError> {
+        if trusted_time_authority_bindings.is_empty() {
+            return Err(DivergenceError::MissingTemporalAuthority(
+                "trusted_time_authority_bindings".to_string(),
+            ));
+        }
+
+        let actor_bindings = trusted_time_authority_bindings
+            .iter()
+            .filter(|binding| binding.actor_id == self.signer_actor_id)
+            .collect::<Vec<_>>();
+        if actor_bindings.is_empty() {
+            return Err(DivergenceError::InvalidTemporalAuthority(format!(
+                "unknown time authority actor {}",
+                self.signer_actor_id
+            )));
+        }
+        if !actor_bindings
+            .iter()
+            .any(|binding| binding.verifying_key == self.signer_key)
+        {
+            return Err(DivergenceError::InvalidTemporalAuthority(format!(
+                "untrusted key for time authority actor {}",
+                self.signer_actor_id
+            )));
+        }
+
+        let key = parse_verifying_key(&self.signer_key)
+            .map_err(|error| DivergenceError::InvalidTemporalAuthority(error.to_string()))?;
+        let signature = Signature::from_bytes(&self.signature);
+        verify_with_domain(
+            &key,
+            TIME_AUTHORITY_ENVELOPE_PREFIX,
+            &self.canonical_bytes(),
+            &signature,
+        )
+        .map_err(|error| DivergenceError::InvalidTemporalAuthority(error.to_string()))
+    }
+
+    fn validate_freshness(&self, now_ns: u64) -> Result<(), DivergenceError> {
+        if self.expires_at_ns <= self.issued_at_ns {
+            return Err(DivergenceError::InvalidTemporalAuthority(
+                "expires_at_ns must be greater than issued_at_ns".to_string(),
+            ));
+        }
+        if now_ns < self.issued_at_ns {
+            return Err(DivergenceError::InvalidTemporalAuthority(format!(
+                "time authority envelope issued in the future: now={now_ns}, issued_at={}",
+                self.issued_at_ns
+            )));
+        }
+        if now_ns > self.expires_at_ns {
+            return Err(DivergenceError::StaleTemporalAuthority {
+                now_ns,
+                expires_at_ns: self.expires_at_ns,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    fn derive_time_authority_ref(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.time_authority_envelope_ref.v1");
+        hasher.update(&self.canonical_bytes());
+        hasher.update(&self.signature);
+        *hasher.finalize().as_bytes()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProjectionRecoveryState {
     channel_id: String,
     source_snapshot: SourceTrustSnapshotV1,
     sink_snapshot: SinkIdentitySnapshotV1,
     receipts: Vec<ProjectionReplayReceiptV1>,
+    replay_sequence_bounds: ReplaySequenceBoundsV1,
+    time_authority_envelope: TimeAuthorityEnvelopeV1,
 }
 
 /// Default poll interval for divergence checks (30 seconds).
@@ -475,6 +690,24 @@ pub enum DivergenceError {
     /// Replay recovery failed during post-containment unfreeze checks.
     #[error("projection replay recovery failed: {0}")]
     ProjectionRecoveryFailed(String),
+
+    /// Temporal authority envelope is missing for a compromise/recovery
+    /// decision.
+    #[error("temporal authority envelope missing: {0}")]
+    MissingTemporalAuthority(String),
+
+    /// Temporal authority envelope verification failed.
+    #[error("temporal authority envelope invalid: {0}")]
+    InvalidTemporalAuthority(String),
+
+    /// Temporal authority envelope is stale for the decision window.
+    #[error("temporal authority envelope stale: now={now_ns}, expires_at={expires_at_ns}")]
+    StaleTemporalAuthority {
+        /// Current decision timestamp.
+        now_ns: u64,
+        /// Envelope expiration timestamp.
+        expires_at_ns: u64,
+    },
 }
 
 // =============================================================================
@@ -2182,14 +2415,73 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             .time_envelope_ref(&self.config.time_envelope_pattern)
     }
 
-    /// Derives signed temporal authority hash for compromise decisions.
-    fn derive_time_authority_ref(&self, time_envelope_ref: &str, timestamp_ns: u64) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"apm2.projection_compromise.time_authority_ref.v1");
-        hasher.update(time_envelope_ref.as_bytes());
-        hasher.update(self.config.repo_id.as_bytes());
-        hasher.update(&timestamp_ns.to_le_bytes());
-        *hasher.finalize().as_bytes()
+    fn trusted_authority_bindings(&self) -> Result<Vec<AuthorityKeyBindingV1>, DivergenceError> {
+        if self.config.actor_id.trim().is_empty() {
+            return Err(DivergenceError::MissingField("actor_id"));
+        }
+        if self.config.actor_id.len() > MAX_ACTOR_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "actor_id",
+                actual: self.config.actor_id.len(),
+                max: MAX_ACTOR_ID_LENGTH,
+            });
+        }
+
+        let bindings = vec![AuthorityKeyBindingV1 {
+            actor_id: self.config.actor_id.clone(),
+            verifying_key: self.signer.public_key_bytes(),
+        }];
+
+        if bindings.len() > MAX_TRUSTED_AUTHORITY_BINDINGS {
+            return Err(DivergenceError::InvalidConfiguration(format!(
+                "trusted authority bindings exceed limit: {} > {MAX_TRUSTED_AUTHORITY_BINDINGS}",
+                bindings.len()
+            )));
+        }
+
+        for binding in &bindings {
+            parse_verifying_key(&binding.verifying_key)
+                .map_err(|error| DivergenceError::InvalidConfiguration(error.to_string()))?;
+        }
+
+        Ok(bindings)
+    }
+
+    fn verify_temporal_authority_envelope(
+        envelope: TimeAuthorityEnvelopeV1,
+        trusted_authority_bindings: &[AuthorityKeyBindingV1],
+        now_ns: u64,
+    ) -> Result<VerifiedTemporalAuthority, DivergenceError> {
+        envelope.validate_signature(trusted_authority_bindings)?;
+        envelope.validate_freshness(now_ns)?;
+        Ok(VerifiedTemporalAuthority {
+            time_authority_ref: envelope.derive_time_authority_ref(),
+            envelope,
+        })
+    }
+
+    fn resolve_temporal_authority(
+        &self,
+        now_ns: u64,
+        trusted_authority_bindings: &[AuthorityKeyBindingV1],
+    ) -> Result<VerifiedTemporalAuthority, DivergenceError> {
+        let time_envelope_ref = self.generate_time_envelope_ref();
+        let window_ref = self.derive_window_ref(now_ns);
+        let ttl_ns = u64::try_from(DEFAULT_TIME_AUTHORITY_TTL.as_nanos()).map_err(|_| {
+            DivergenceError::InvalidConfiguration("time authority ttl exceeds u64".to_string())
+        })?;
+        let expires_at_ns = now_ns.checked_add(ttl_ns).ok_or_else(|| {
+            DivergenceError::InvalidConfiguration("time authority expiry overflow".to_string())
+        })?;
+        let envelope = TimeAuthorityEnvelopeV1::create_signed(
+            time_envelope_ref,
+            window_ref,
+            now_ns,
+            expires_at_ns,
+            self.config.actor_id.clone(),
+            &self.signer,
+        )?;
+        Self::verify_temporal_authority_envelope(envelope, trusted_authority_bindings, now_ns)
     }
 
     /// Derives HTF window reference hash for compromise decisions.
@@ -2204,13 +2496,70 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         *hasher.finalize().as_bytes()
     }
 
-    /// Derives a digest binding sink identity metadata.
-    fn derive_sink_identity_digest(&self) -> Hash {
+    fn sink_endpoint_evidence(&self) -> SinkEndpointEvidenceV1 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.endpoint_key_fingerprint.v1");
+        hasher.update(&self.signer.public_key_bytes());
+        SinkEndpointEvidenceV1 {
+            endpoint_canonical_id: format!("github://{}", self.config.repo_id),
+            endpoint_key_fingerprint: hex::encode(hasher.finalize().as_bytes()),
+            key_epoch: 0,
+        }
+    }
+
+    fn validate_sink_endpoint_evidence(
+        endpoint_evidence: &SinkEndpointEvidenceV1,
+    ) -> Result<(), DivergenceError> {
+        if endpoint_evidence.endpoint_canonical_id.trim().is_empty() {
+            return Err(DivergenceError::MissingField("endpoint_canonical_id"));
+        }
+        if endpoint_evidence.endpoint_key_fingerprint.trim().is_empty() {
+            return Err(DivergenceError::MissingField("endpoint_key_fingerprint"));
+        }
+        if endpoint_evidence.endpoint_canonical_id.len() > MAX_ENDPOINT_CANONICAL_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "endpoint_canonical_id",
+                actual: endpoint_evidence.endpoint_canonical_id.len(),
+                max: MAX_ENDPOINT_CANONICAL_ID_LENGTH,
+            });
+        }
+        if endpoint_evidence.endpoint_key_fingerprint.len() > MAX_ENDPOINT_FINGERPRINT_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "endpoint_key_fingerprint",
+                actual: endpoint_evidence.endpoint_key_fingerprint.len(),
+                max: MAX_ENDPOINT_FINGERPRINT_LENGTH,
+            });
+        }
+        Ok(())
+    }
+
+    /// Derives a digest binding sink identity to concrete endpoint evidence.
+    fn derive_sink_identity_digest(
+        &self,
+        endpoint_evidence: &SinkEndpointEvidenceV1,
+    ) -> Result<Hash, DivergenceError> {
+        Self::validate_sink_endpoint_evidence(endpoint_evidence)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2.projection_compromise.sink_identity.v1");
         hasher.update(self.config.repo_id.as_bytes());
         hasher.update(self.config.actor_id.as_bytes());
-        *hasher.finalize().as_bytes()
+        hasher.update(endpoint_evidence.endpoint_canonical_id.as_bytes());
+        hasher.update(endpoint_evidence.endpoint_key_fingerprint.as_bytes());
+        hasher.update(&endpoint_evidence.key_epoch.to_be_bytes());
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// Derives endpoint binding digest independently from sink identity digest.
+    fn derive_endpoint_binding_digest(
+        endpoint_evidence: &SinkEndpointEvidenceV1,
+    ) -> Result<Hash, DivergenceError> {
+        Self::validate_sink_endpoint_evidence(endpoint_evidence)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.endpoint_binding.v1");
+        hasher.update(endpoint_evidence.endpoint_canonical_id.as_bytes());
+        hasher.update(endpoint_evidence.endpoint_key_fingerprint.as_bytes());
+        hasher.update(&endpoint_evidence.key_epoch.to_be_bytes());
+        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Checks for divergence between the merge receipt HEAD and external trunk
@@ -2294,10 +2643,18 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     ) -> Result<DivergenceResult, DivergenceError> {
         let freeze_id = self.generate_freeze_id();
         let defect_id = self.generate_defect_id();
-        let time_envelope_ref = self.generate_time_envelope_ref();
         let timestamp = self.time_source.now_nanos();
-        let time_authority_ref = self.derive_time_authority_ref(&time_envelope_ref, timestamp);
-        let window_ref = self.derive_window_ref(timestamp);
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let VerifiedTemporalAuthority {
+            envelope: time_authority_envelope,
+            time_authority_ref,
+        } = self.resolve_temporal_authority(timestamp, &trusted_authority_bindings)?;
+        let time_envelope_ref = time_authority_envelope.time_envelope_ref.clone();
+        let window_ref = time_authority_envelope.window_ref;
+        let sink_endpoint_evidence = self.sink_endpoint_evidence();
+        let sink_identity_digest = self.derive_sink_identity_digest(&sink_endpoint_evidence)?;
+        let endpoint_binding_digest =
+            Self::derive_endpoint_binding_digest(&sink_endpoint_evidence)?;
 
         let mut channel = ProjectionChannel::new(
             self.config.repo_id.clone(),
@@ -2333,9 +2690,9 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         };
         let sink_identity_snapshot = SinkIdentitySnapshotV1 {
             channel_id: self.config.repo_id.clone(),
-            sink_identity_digest: self.derive_sink_identity_digest(),
+            sink_identity_digest,
             observed_projection_digest: actual_head,
-            endpoint_binding_digest: self.derive_sink_identity_digest(),
+            endpoint_binding_digest,
             time_authority_ref,
             window_ref,
         };
@@ -2381,6 +2738,11 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
                     source_snapshot: source_trust_snapshot.clone(),
                     sink_snapshot: sink_identity_snapshot.clone(),
                     receipts: vec![replay_receipt.clone()],
+                    replay_sequence_bounds: ReplaySequenceBoundsV1 {
+                        required_start_sequence: 0,
+                        required_end_sequence: 0,
+                    },
+                    time_authority_envelope,
                 },
             );
         }
@@ -2394,6 +2756,10 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             "sink_identity_snapshot_digest": hex::encode(sink_identity_snapshot.snapshot_digest()),
             "time_authority_ref": hex::encode(time_authority_ref),
             "window_ref": hex::encode(window_ref),
+            "time_envelope_ref": time_envelope_ref,
+            "sink_endpoint_canonical_id": sink_endpoint_evidence.endpoint_canonical_id,
+            "sink_endpoint_key_fingerprint": sink_endpoint_evidence.endpoint_key_fingerprint,
+            "sink_endpoint_key_epoch": sink_endpoint_evidence.key_epoch,
         });
 
         let defect = DefectRecord::builder(&defect_id, "PROJECTION_DIVERGENCE")
@@ -2474,20 +2840,51 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         &self,
         freeze_id: &str,
     ) -> Result<ReconstructedProjectionState, DivergenceError> {
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let now_ns = self.time_source.now_nanos();
         let recovery_state = self
             .projection_recovery_state
             .lock()
             .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
-        let state = recovery_state.get(freeze_id).ok_or_else(|| {
-            DivergenceError::ProjectionRecoveryFailed(format!(
-                "missing recovery state for freeze_id={freeze_id}"
-            ))
-        })?;
+        let state = recovery_state
+            .get(freeze_id)
+            .ok_or_else(|| {
+                DivergenceError::ProjectionRecoveryFailed(format!(
+                    "missing recovery state for freeze_id={freeze_id}"
+                ))
+            })?
+            .clone();
+        drop(recovery_state);
+
+        let verified_temporal_authority = Self::verify_temporal_authority_envelope(
+            state.time_authority_envelope.clone(),
+            &trusted_authority_bindings,
+            now_ns,
+        )?;
+        if verified_temporal_authority.time_authority_ref
+            != state.source_snapshot.time_authority_ref
+            || verified_temporal_authority.time_authority_ref
+                != state.sink_snapshot.time_authority_ref
+        {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal authority reference mismatch in recovery state".to_string(),
+            ));
+        }
+        if verified_temporal_authority.envelope.window_ref != state.source_snapshot.window_ref
+            || verified_temporal_authority.envelope.window_ref != state.sink_snapshot.window_ref
+        {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal window reference mismatch in recovery state".to_string(),
+            ));
+        }
+
         reconstruct_projection_state(
             &state.channel_id,
             &state.receipts,
             &state.source_snapshot,
             &state.sink_snapshot,
+            &trusted_authority_bindings,
+            state.replay_sequence_bounds,
         )
         .map_err(|error| DivergenceError::ProjectionRecoveryFailed(error.to_string()))
     }
@@ -4272,9 +4669,12 @@ pub mod tests {
             .expect("compromise signal must verify");
         assert_eq!(result.source_trust_snapshot.channel_id, "test-repo");
         assert_eq!(result.sink_identity_snapshot.channel_id, "test-repo");
+        let trusted_authority_bindings = watchdog
+            .trusted_authority_bindings()
+            .expect("trusted authority bindings must be valid");
         result
             .replay_receipt
-            .verify_signature()
+            .verify_signature(&trusted_authority_bindings)
             .expect("replay receipt must verify");
     }
 

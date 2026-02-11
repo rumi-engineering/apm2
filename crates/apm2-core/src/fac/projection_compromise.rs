@@ -85,6 +85,38 @@ pub enum ProjectionCompromiseError {
         /// Failure detail.
         detail: String,
     },
+    /// Replay receipt signer actor is not in trusted authority mapping.
+    #[error("unknown replay signer actor: {actor_id}")]
+    UnknownSignerActor {
+        /// Actor identifier carried in replay receipt.
+        actor_id: String,
+    },
+    /// Replay receipt signer key is not trusted for the declared actor.
+    #[error("untrusted replay signer key for actor: {actor_id}")]
+    UntrustedSignerKey {
+        /// Actor identifier carried in replay receipt.
+        actor_id: String,
+    },
+    /// Replay sequence bounds are invalid.
+    #[error(
+        "invalid replay sequence bounds: start={required_start_sequence}, end={required_end_sequence}"
+    )]
+    InvalidReplaySequenceBounds {
+        /// Required inclusive start sequence.
+        required_start_sequence: u64,
+        /// Required inclusive end sequence.
+        required_end_sequence: u64,
+    },
+    /// Replay stream contains receipts beyond required sequence bounds.
+    #[error(
+        "unexpected replay receipt sequence beyond required end: required_end={required_end_sequence}, actual={actual}"
+    )]
+    UnexpectedReceiptSequence {
+        /// Required inclusive end sequence.
+        required_end_sequence: u64,
+        /// Unexpected sequence observed.
+        actual: u64,
+    },
     /// Replayed digest did not match authoritative source trust snapshot.
     #[error("reconstructed digest mismatch: expected={expected}, actual={actual}")]
     ReplayDigestMismatch {
@@ -93,6 +125,27 @@ pub enum ProjectionCompromiseError {
         /// Actual digest (hex).
         actual: String,
     },
+}
+
+/// Trusted authority binding for replay receipt verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityKeyBindingV1 {
+    /// Trusted actor identity.
+    pub actor_id: String,
+    /// Trusted Ed25519 public key bytes.
+    #[serde(with = "serde_bytes")]
+    pub verifying_key: [u8; 32],
+}
+
+/// Required contiguous replay sequence contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaySequenceBoundsV1 {
+    /// Required inclusive start sequence for reconstruction.
+    pub required_start_sequence: u64,
+    /// Required inclusive end sequence for reconstruction.
+    pub required_end_sequence: u64,
 }
 
 /// Projection surface type.
@@ -533,12 +586,30 @@ impl ProjectionReplayReceiptV1 {
         bytes
     }
 
-    /// Verifies replay receipt signature using embedded signer key.
+    /// Verifies replay receipt signature against trusted authority key
+    /// bindings.
     ///
     /// # Errors
     ///
-    /// Returns an error when key parsing or signature verification fails.
-    pub fn verify_signature(&self) -> Result<(), ProjectionCompromiseError> {
+    /// Returns an error when signer actor/key are untrusted or signature
+    /// verification fails.
+    pub fn verify_signature(
+        &self,
+        trusted_authority_bindings: &[AuthorityKeyBindingV1],
+    ) -> Result<(), ProjectionCompromiseError> {
+        validate_required_string(
+            "signer_actor_id",
+            &self.signer_actor_id,
+            MAX_ACTOR_ID_LENGTH,
+        )?;
+        let actor_keyset =
+            trusted_keyset_for_actor(&self.signer_actor_id, trusted_authority_bindings)?;
+        if !actor_keyset.contains(&self.signer_key) {
+            return Err(ProjectionCompromiseError::UntrustedSignerKey {
+                actor_id: self.signer_actor_id.clone(),
+            });
+        }
+
         let key = parse_verifying_key(&self.signer_key).map_err(|error| {
             ProjectionCompromiseError::InvalidSignerKey {
                 detail: error.to_string(),
@@ -745,8 +816,16 @@ pub fn reconstruct_projection_state(
     receipts: &[ProjectionReplayReceiptV1],
     source_snapshot: &SourceTrustSnapshotV1,
     sink_snapshot: &SinkIdentitySnapshotV1,
+    trusted_authority_bindings: &[AuthorityKeyBindingV1],
+    sequence_bounds: ReplaySequenceBoundsV1,
 ) -> Result<ReconstructedProjectionState, ProjectionCompromiseError> {
-    validate_reconstruction_inputs(channel_id, source_snapshot, sink_snapshot)?;
+    validate_reconstruction_inputs(
+        channel_id,
+        source_snapshot,
+        sink_snapshot,
+        trusted_authority_bindings,
+        sequence_bounds,
+    )?;
     let sorted = sorted_replay_receipts(receipts)?;
     let expected_source_digest = source_snapshot.snapshot_digest();
     let expected_sink_digest = sink_snapshot.snapshot_digest();
@@ -754,11 +833,41 @@ pub fn reconstruct_projection_state(
     let mut replay_hasher = blake3::Hasher::new();
     replay_hasher.update(b"apm2.projection_replay_trace.v1");
 
-    let mut expected_sequence = sorted[0].sequence;
-    let mut last_sequence = expected_sequence;
+    let expected_count = sequence_bounds
+        .required_end_sequence
+        .checked_sub(sequence_bounds.required_start_sequence)
+        .and_then(|delta| delta.checked_add(1))
+        .ok_or(ProjectionCompromiseError::InvalidReplaySequenceBounds {
+            required_start_sequence: sequence_bounds.required_start_sequence,
+            required_end_sequence: sequence_bounds.required_end_sequence,
+        })?;
+
+    let sorted_len_u64 = u64::try_from(sorted.len()).map_err(|_| {
+        ProjectionCompromiseError::InvalidReplaySequenceBounds {
+            required_start_sequence: sequence_bounds.required_start_sequence,
+            required_end_sequence: sequence_bounds.required_end_sequence,
+        }
+    })?;
+
+    let receipts_to_validate = sorted_len_u64.min(expected_count);
     let mut final_digest = [0u8; 32];
 
-    for receipt in &sorted {
+    for idx in 0..receipts_to_validate {
+        let expected_sequence = sequence_bounds
+            .required_start_sequence
+            .checked_add(idx)
+            .ok_or(ProjectionCompromiseError::InvalidReplaySequenceBounds {
+                required_start_sequence: sequence_bounds.required_start_sequence,
+                required_end_sequence: sequence_bounds.required_end_sequence,
+            })?;
+        let receipt_index = usize::try_from(idx).map_err(|_| {
+            ProjectionCompromiseError::InvalidReplaySequenceBounds {
+                required_start_sequence: sequence_bounds.required_start_sequence,
+                required_end_sequence: sequence_bounds.required_end_sequence,
+            }
+        })?;
+        let receipt = &sorted[receipt_index];
+
         validate_replay_receipt(
             channel_id,
             receipt,
@@ -766,13 +875,14 @@ pub fn reconstruct_projection_state(
             source_snapshot,
             expected_source_digest,
             expected_sink_digest,
+            trusted_authority_bindings,
         )?;
-        expected_sequence = expected_sequence.saturating_add(1);
-        last_sequence = receipt.sequence;
         replay_hasher.update(&receipt.canonical_bytes());
         replay_hasher.update(&receipt.signature);
         final_digest = receipt.projected_state_digest;
     }
+
+    validate_replay_receipt_count(&sorted, sequence_bounds, sorted_len_u64, expected_count)?;
 
     if final_digest != source_snapshot.expected_projection_digest {
         return Err(ProjectionCompromiseError::ReplayDigestMismatch {
@@ -786,18 +896,67 @@ pub fn reconstruct_projection_state(
         expected_state_digest: final_digest,
         replay_trace_digest: *replay_hasher.finalize().as_bytes(),
         replayed_receipt_count: sorted.len() as u64,
-        last_sequence,
+        last_sequence: sequence_bounds.required_end_sequence,
         time_authority_ref: source_snapshot.time_authority_ref,
         window_ref: source_snapshot.window_ref,
     })
+}
+
+fn validate_replay_receipt_count(
+    sorted: &[ProjectionReplayReceiptV1],
+    sequence_bounds: ReplaySequenceBoundsV1,
+    sorted_len_u64: u64,
+    expected_count: u64,
+) -> Result<(), ProjectionCompromiseError> {
+    if sorted_len_u64 < expected_count {
+        let expected_missing_sequence = sequence_bounds
+            .required_start_sequence
+            .checked_add(sorted_len_u64)
+            .ok_or(ProjectionCompromiseError::InvalidReplaySequenceBounds {
+                required_start_sequence: sequence_bounds.required_start_sequence,
+                required_end_sequence: sequence_bounds.required_end_sequence,
+            })?;
+        return Err(ProjectionCompromiseError::MissingReceipt {
+            expected: expected_missing_sequence,
+            actual: None,
+        });
+    }
+
+    if sorted_len_u64 > expected_count {
+        let extra_index = usize::try_from(expected_count).map_err(|_| {
+            ProjectionCompromiseError::InvalidReplaySequenceBounds {
+                required_start_sequence: sequence_bounds.required_start_sequence,
+                required_end_sequence: sequence_bounds.required_end_sequence,
+            }
+        })?;
+        let extra_sequence = sorted
+            .get(extra_index)
+            .map_or(sequence_bounds.required_end_sequence, |receipt| {
+                receipt.sequence
+            });
+        return Err(ProjectionCompromiseError::UnexpectedReceiptSequence {
+            required_end_sequence: sequence_bounds.required_end_sequence,
+            actual: extra_sequence,
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_reconstruction_inputs(
     channel_id: &str,
     source_snapshot: &SourceTrustSnapshotV1,
     sink_snapshot: &SinkIdentitySnapshotV1,
+    trusted_authority_bindings: &[AuthorityKeyBindingV1],
+    sequence_bounds: ReplaySequenceBoundsV1,
 ) -> Result<(), ProjectionCompromiseError> {
     validate_required_string("channel_id", channel_id, MAX_CHANNEL_ID_LENGTH)?;
+    if sequence_bounds.required_start_sequence > sequence_bounds.required_end_sequence {
+        return Err(ProjectionCompromiseError::InvalidReplaySequenceBounds {
+            required_start_sequence: sequence_bounds.required_start_sequence,
+            required_end_sequence: sequence_bounds.required_end_sequence,
+        });
+    }
     validate_non_zero_hash(
         "source_snapshot.time_authority_ref",
         &source_snapshot.time_authority_ref,
@@ -831,6 +990,7 @@ fn validate_reconstruction_inputs(
             detail: "source/sink window_ref mismatch".to_string(),
         });
     }
+    validate_trusted_authority_bindings(trusted_authority_bindings)?;
     Ok(())
 }
 
@@ -857,6 +1017,7 @@ fn validate_replay_receipt(
     source_snapshot: &SourceTrustSnapshotV1,
     expected_source_digest: Hash,
     expected_sink_digest: Hash,
+    trusted_authority_bindings: &[AuthorityKeyBindingV1],
 ) -> Result<(), ProjectionCompromiseError> {
     if receipt.sequence != expected_sequence {
         return Err(ProjectionCompromiseError::MissingReceipt {
@@ -903,8 +1064,48 @@ fn validate_replay_receipt(
             ),
         });
     }
-    receipt.verify_signature()?;
+    receipt.verify_signature(trusted_authority_bindings)?;
     Ok(())
+}
+
+fn validate_trusted_authority_bindings(
+    trusted_authority_bindings: &[AuthorityKeyBindingV1],
+) -> Result<(), ProjectionCompromiseError> {
+    if trusted_authority_bindings.is_empty() {
+        return Err(ProjectionCompromiseError::MissingField {
+            field: "trusted_authority_bindings",
+        });
+    }
+    for binding in trusted_authority_bindings {
+        validate_required_string(
+            "authority_binding.actor_id",
+            &binding.actor_id,
+            MAX_ACTOR_ID_LENGTH,
+        )?;
+        let _ = parse_verifying_key(&binding.verifying_key).map_err(|error| {
+            ProjectionCompromiseError::InvalidSignerKey {
+                detail: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn trusted_keyset_for_actor(
+    actor_id: &str,
+    trusted_authority_bindings: &[AuthorityKeyBindingV1],
+) -> Result<Vec<[u8; 32]>, ProjectionCompromiseError> {
+    let keys = trusted_authority_bindings
+        .iter()
+        .filter(|binding| binding.actor_id == actor_id)
+        .map(|binding| binding.verifying_key)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Err(ProjectionCompromiseError::UnknownSignerActor {
+            actor_id: actor_id.to_string(),
+        });
+    }
+    Ok(keys)
 }
 
 fn validate_required_string(
@@ -941,6 +1142,20 @@ mod tests {
 
     fn hash(seed: u8) -> Hash {
         [seed; 32]
+    }
+
+    fn authority_binding(actor_id: &str, signer: &Signer) -> AuthorityKeyBindingV1 {
+        AuthorityKeyBindingV1 {
+            actor_id: actor_id.to_string(),
+            verifying_key: signer.public_key_bytes(),
+        }
+    }
+
+    const fn bounds(start: u64, end: u64) -> ReplaySequenceBoundsV1 {
+        ReplaySequenceBoundsV1 {
+            required_start_sequence: start,
+            required_end_sequence: end,
+        }
     }
 
     fn make_snapshots(
@@ -1157,6 +1372,8 @@ mod tests {
             &[receipt_0, receipt_1],
             &source_snapshot,
             &sink_snapshot,
+            &[authority_binding("projector-actor", &signer)],
+            bounds(0, 1),
         )
         .expect("reconstruction must succeed");
 
@@ -1214,6 +1431,8 @@ mod tests {
             &[receipt_0, receipt_2],
             &source_snapshot,
             &sink_snapshot,
+            &[authority_binding("projector-actor", &signer)],
+            bounds(0, 2),
         )
         .expect_err("sequence gap must fail closed");
 
@@ -1260,9 +1479,15 @@ mod tests {
         .expect("receipt must be valid");
         receipt.signature[0] ^= 0xFF;
 
-        let err =
-            reconstruct_projection_state(channel_id, &[receipt], &source_snapshot, &sink_snapshot)
-                .expect_err("tampered signature must fail");
+        let err = reconstruct_projection_state(
+            channel_id,
+            &[receipt],
+            &source_snapshot,
+            &sink_snapshot,
+            &[authority_binding("projector-actor", &signer)],
+            bounds(0, 0),
+        )
+        .expect_err("tampered signature must fail");
 
         assert!(
             matches!(
@@ -1270,6 +1495,105 @@ mod tests {
                 ProjectionCompromiseError::SignatureVerificationFailed { .. }
             ),
             "expected signature failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_projection_state_missing_leading_receipt_fails_closed() {
+        let signer = Signer::generate();
+        let channel_id = "repo/main";
+        let time_authority_ref = hash(0x21);
+        let window_ref = hash(0x31);
+        let (source_snapshot, sink_snapshot) = make_snapshots(
+            channel_id,
+            hash(0x42),
+            hash(0x55),
+            time_authority_ref,
+            window_ref,
+        );
+        let source_digest = source_snapshot.snapshot_digest();
+        let sink_digest = sink_snapshot.snapshot_digest();
+
+        let receipt_1 = ProjectionReplayReceiptV1::create_signed(
+            "receipt-1",
+            channel_id,
+            1,
+            hash(0x42),
+            time_authority_ref,
+            window_ref,
+            source_digest,
+            sink_digest,
+            "projector-actor",
+            &signer,
+        )
+        .expect("receipt must be valid");
+
+        let err = reconstruct_projection_state(
+            channel_id,
+            &[receipt_1],
+            &source_snapshot,
+            &sink_snapshot,
+            &[authority_binding("projector-actor", &signer)],
+            bounds(0, 1),
+        )
+        .expect_err("missing leading sequence must fail");
+
+        assert!(
+            matches!(
+                err,
+                ProjectionCompromiseError::MissingReceipt {
+                    expected: 0,
+                    actual: Some(1)
+                }
+            ),
+            "expected leading MissingReceipt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_projection_state_rejects_untrusted_signer_key() {
+        let trusted_signer = Signer::generate();
+        let rogue_signer = Signer::generate();
+        let channel_id = "repo/main";
+        let time_authority_ref = hash(0x21);
+        let window_ref = hash(0x31);
+        let (source_snapshot, sink_snapshot) = make_snapshots(
+            channel_id,
+            hash(0x41),
+            hash(0x55),
+            time_authority_ref,
+            window_ref,
+        );
+        let source_digest = source_snapshot.snapshot_digest();
+        let sink_digest = sink_snapshot.snapshot_digest();
+
+        let rogue_receipt = ProjectionReplayReceiptV1::create_signed(
+            "receipt-0",
+            channel_id,
+            0,
+            hash(0x41),
+            time_authority_ref,
+            window_ref,
+            source_digest,
+            sink_digest,
+            "projector-actor",
+            &rogue_signer,
+        )
+        .expect("rogue receipt must be structurally valid");
+
+        let err = reconstruct_projection_state(
+            channel_id,
+            &[rogue_receipt],
+            &source_snapshot,
+            &sink_snapshot,
+            &[authority_binding("projector-actor", &trusted_signer)],
+            bounds(0, 0),
+        )
+        .expect_err("rogue key must be rejected");
+
+        assert!(
+            matches!(err, ProjectionCompromiseError::UntrustedSignerKey { .. }),
+            "expected untrusted signer key error, got {err:?}"
         );
     }
 }
