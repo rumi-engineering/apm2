@@ -5,7 +5,7 @@ mod tests {
     #[test]
     fn test_legacy_v1_deserialization_success() {
         let zero_hash = vec![0u8; 32];
-        
+
         // Corrected JSON payload matching AuthorityJoinInputV1 fields (minus new ones)
         let legacy_json = serde_json::json!({
             "session_id": "session-123",
@@ -34,10 +34,13 @@ mod tests {
         });
 
         let result = serde_json::from_value::<AuthorityJoinInputV1>(legacy_json);
-        
+
         if let Err(e) = &result {
-            println!("Deserialization error: {}", e);
+            println!("Deserialization error: {e}");
         }
-        assert!(result.is_ok(), "Legacy V1 payload should deserialize successfully with defaults");
+        assert!(
+            result.is_ok(),
+            "Legacy V1 payload should deserialize successfully with defaults"
+        );
     }
 }

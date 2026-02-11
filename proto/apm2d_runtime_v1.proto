@@ -438,6 +438,21 @@ message WorkListResponse {
   repeated WorkStatusResponse work_items = 1;
 }
 
+// IPC-PRIV-073: VerifyLedgerChain (TCK-00487)
+// Explicit full-chain verification endpoint for operator maintenance/audit.
+message VerifyLedgerChainRequest {}
+
+message VerifyLedgerChainResponse {
+  // True when full-chain verification succeeded.
+  bool verified = 1;
+  // Number of rows validated from genesis.
+  uint64 rows_validated = 2;
+  // Final chain tip hash at verification completion.
+  string tip_hash = 3;
+  // Human-readable verification summary.
+  string message = 4;
+}
+
 // Projection uncertainty classification for fail-closed consumers.
 enum ProjectionUncertaintyFlag {
   PROJECTION_UNCERTAINTY_FLAG_UNSPECIFIED = 0;

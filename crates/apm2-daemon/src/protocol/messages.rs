@@ -410,6 +410,9 @@ impl_bounded_decode_simple!(
     // TCK-00340: Sublease delegation
     DelegateSubleaseRequest,
     DelegateSubleaseResponse,
+    // TCK-00487: Explicit full-chain verification
+    VerifyLedgerChainRequest,
+    VerifyLedgerChainResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields
