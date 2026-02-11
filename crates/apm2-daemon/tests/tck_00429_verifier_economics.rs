@@ -6,7 +6,7 @@
 //! - Proof-check-count enforcement works
 //! - Anti-entropy bounds enforcement works
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use apm2_core::consensus::SyncEvent;
@@ -14,10 +14,17 @@ use apm2_core::crypto::{EventHasher, Hash};
 use apm2_core::pcac::{
     AuthoritativeBindings, AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel,
     BindingExpectations, BoundaryIntentClass, DeterminismClass, FactClass, IdentityEvidenceLevel,
-    ReceiptAuthentication, RiskTier, VerifierEconomicsProfile, timed_anti_entropy_verification,
-    timed_classify_fact, timed_validate_authoritative_bindings,
+    ReceiptAuthentication, RiskTier, VerifierEconomicsChecker, VerifierEconomicsProfile,
+    VerifierOperation, timed_anti_entropy_verification, timed_classify_fact,
+    timed_validate_authoritative_bindings, timed_verify_receipt_authentication,
 };
+use apm2_daemon::episode::InMemorySessionRegistry;
+use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::pcac::{InProcessKernel, LifecycleGate};
+use apm2_daemon::session::SessionRegistry;
+use apm2_daemon::state::DispatcherState;
+use rusqlite::Connection;
+use tempfile::TempDir;
 
 const fn test_hash(byte: u8) -> Hash {
     [byte; 32]
@@ -103,6 +110,14 @@ fn make_sync_events(count: usize) -> Vec<SyncEvent> {
         prev_hash = event_hash;
     }
     events
+}
+
+fn make_file_backed_sqlite_conn(temp_dir: &TempDir) -> Arc<Mutex<Connection>> {
+    let db_path = temp_dir.path().join("tck_00429_runtime.sqlite");
+    let conn = Connection::open(&db_path).expect("file-backed sqlite should open");
+    SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema should initialize");
+    SqliteWorkRegistry::init_schema(&conn).expect("work schema should initialize");
+    Arc::new(Mutex::new(conn))
 }
 
 fn elapsed_us_since(start: Instant) -> u64 {
@@ -244,6 +259,138 @@ fn test_proof_check_count_enforcement() {
 }
 
 #[test]
+fn tck_00429_direct_receipt_auth_proof_count_enforced() {
+    let kernel =
+        InProcessKernel::new(220).with_verifier_economics(permissive_timing_profile(u64::MAX));
+    let input = valid_input(RiskTier::Tier2Plus, 1, 0x31);
+    let cert = kernel
+        .join(&input)
+        .expect("join should pass under permissive proof-check profile");
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("revalidate should pass under permissive profile");
+
+    let timed = timed_verify_receipt_authentication(
+        &ReceiptAuthentication::Direct {
+            authority_seal_hash: cert.ajc_id,
+        },
+        &cert.ajc_id,
+        None,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        cert.issued_at_tick.saturating_add(1),
+    );
+    assert!(timed.result.is_ok(), "direct receipt auth should verify");
+    assert_eq!(timed.proof_check_count, 1);
+
+    let checker = VerifierEconomicsChecker::new(permissive_timing_profile(0));
+    let deny = checker
+        .check_proof_count(
+            VerifierOperation::VerifyReceiptAuthentication,
+            timed.proof_check_count,
+            RiskTier::Tier2Plus,
+        )
+        .expect_err("Tier2+ must deny direct receipt auth when max_proof_checks=0");
+    assert!(matches!(
+        deny,
+        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+            if operation == "verify_receipt_authentication" && risk_tier == RiskTier::Tier2Plus
+    ));
+}
+
+#[test]
+fn tck_00429_unbatched_receipt_auth_proof_count_enforced() {
+    let kernel =
+        InProcessKernel::new(320).with_verifier_economics(permissive_timing_profile(u64::MAX));
+    let input = valid_input(RiskTier::Tier2Plus, 1, 0x32);
+    let cert = kernel
+        .join(&input)
+        .expect("join should pass under permissive proof-check profile");
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("revalidate should pass under permissive profile");
+
+    let receipt_hash = test_hash(0x7A);
+    let timed = timed_verify_receipt_authentication(
+        &ReceiptAuthentication::PointerUnbatched {
+            receipt_hash,
+            authority_seal_hash: cert.ajc_id,
+        },
+        &cert.ajc_id,
+        Some(&receipt_hash),
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        cert.issued_at_tick.saturating_add(1),
+    );
+    assert!(timed.result.is_ok(), "unbatched receipt auth should verify");
+    assert_eq!(timed.proof_check_count, 1);
+
+    let checker = VerifierEconomicsChecker::new(permissive_timing_profile(0));
+    let deny = checker
+        .check_proof_count(
+            VerifierOperation::VerifyReceiptAuthentication,
+            timed.proof_check_count,
+            RiskTier::Tier2Plus,
+        )
+        .expect_err("Tier2+ must deny unbatched receipt auth when max_proof_checks=0");
+    assert!(matches!(
+        deny,
+        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+            if operation == "verify_receipt_authentication" && risk_tier == RiskTier::Tier2Plus
+    ));
+}
+
+#[test]
+fn tck_00429_runtime_anti_entropy_bounds_enforced() {
+    let temp_dir = TempDir::new().expect("temp dir should be created");
+    let sqlite_conn = make_file_backed_sqlite_conn(&temp_dir);
+    let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+
+    let state = DispatcherState::with_persistence(
+        session_registry,
+        None,
+        Some(Arc::clone(&sqlite_conn)),
+        None,
+    )
+    .expect("dispatcher state should initialize with runtime PCAC gate");
+
+    let events = make_sync_events(250_000);
+    let digest = test_hash(0x66);
+
+    let err = state
+        .enforce_anti_entropy_catchup(
+            RiskTier::Tier2Plus,
+            Some(&digest),
+            Some(&digest),
+            &events,
+            &[0u8; 32],
+            Some(1),
+            None,
+            None,
+            test_hash(0x67),
+            test_hash(0x68),
+            999,
+        )
+        .expect_err("Tier2+ runtime anti-entropy path must deny when timing bound exceeds");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+            if operation == "anti_entropy_verification" && risk_tier == RiskTier::Tier2Plus
+    ));
+}
+
+#[test]
 fn test_anti_entropy_bounds_enforcement() {
     let tick_kernel =
         Arc::new(InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(0)));
@@ -325,7 +472,7 @@ fn test_crypto_operations_report_non_zero_proof_checks() {
         },
     );
     assert_eq!(timed_classification.result, FactClass::AcceptanceFact);
-    assert_eq!(timed_classification.proof_check_count, 3);
+    assert_eq!(timed_classification.proof_check_count, 4);
 }
 
 #[test]
