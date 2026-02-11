@@ -502,6 +502,25 @@ pub struct WorkListResponse {
     #[prost(message, repeated, tag = "1")]
     pub work_items: ::prost::alloc::vec::Vec<WorkStatusResponse>,
 }
+/// IPC-PRIV-073: VerifyLedgerChain (TCK-00487)
+/// Explicit full-chain verification endpoint for operator maintenance/audit.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct VerifyLedgerChainRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VerifyLedgerChainResponse {
+    /// True when full-chain verification succeeded.
+    #[prost(bool, tag = "1")]
+    pub verified: bool,
+    /// Number of rows validated from genesis.
+    #[prost(uint64, tag = "2")]
+    pub rows_validated: u64,
+    /// Final chain tip hash at verification completion.
+    #[prost(string, tag = "3")]
+    pub tip_hash: ::prost::alloc::string::String,
+    /// Human-readable verification summary.
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+}
 /// IPC-PRIV-020: AuditorLaunchProjection (TCK-00452)
 /// Return launch-lineage and boundary-conformance projection for auditors.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
