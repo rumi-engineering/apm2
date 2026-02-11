@@ -81,6 +81,12 @@ pub struct PrAuthSetupCliArgs {
     /// Optional keyring account name (defaults to `app-{app_id}`).
     #[arg(long)]
     pub keyring_account: Option<String>,
+    /// Persist and allow PEM file fallback in `github_app.toml`.
+    ///
+    /// By default, auth material is keyring-first and does not persist a
+    /// private key file path.
+    #[arg(long, default_value_t = false)]
+    pub allow_private_key_file_fallback: bool,
     /// Keep the source key file instead of deleting it.
     #[arg(long, default_value_t = false)]
     pub keep_private_key_file: bool,

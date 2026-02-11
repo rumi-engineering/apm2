@@ -1,15 +1,14 @@
 //! Intelligent pipeline restart: reads CI state and re-enters the DAG at the
 //! optimal point (evidence gates, review dispatch, or noop).
 
-use std::process::Command;
-
 use serde::Serialize;
 
 use super::barrier::{fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::ci_status::{CiStatus, find_status_comment};
 use super::dispatch::dispatch_single_review;
 use super::evidence::run_evidence_gates_with_status;
-use super::types::{DispatchReviewResult, ReviewKind, parse_pr_url};
+use super::target::resolve_pr_target;
+use super::types::{DispatchReviewResult, ReviewKind};
 use crate::exit_codes::codes as exit_codes;
 
 // ── Strategy ────────────────────────────────────────────────────────────────
@@ -66,17 +65,7 @@ fn resolve_pr_context(
     pr: Option<u32>,
     pr_url: Option<&str>,
 ) -> Result<PrContext, String> {
-    let (owner_repo, pr_number) = if let Some(url) = pr_url {
-        let (repo_from_url, number) = parse_pr_url(url)?;
-        (repo_from_url, number)
-    } else if let Some(number) = pr {
-        (repo.to_string(), number)
-    } else {
-        // Auto-detect from current branch via gh pr list.
-        let branch = current_branch()?;
-        let number = find_pr_for_branch(repo, &branch)?;
-        (repo.to_string(), number)
-    };
+    let (owner_repo, pr_number) = resolve_pr_target(repo, pr, pr_url)?;
 
     let pr_url_resolved = format!("https://github.com/{owner_repo}/pull/{pr_number}");
     let head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
@@ -87,49 +76,6 @@ fn resolve_pr_context(
         pr_url: pr_url_resolved,
         head_sha,
     })
-}
-
-fn current_branch() -> Result<String, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_err(|e| format!("failed to resolve current branch: {e}"))?;
-    if !output.status.success() {
-        return Err("git rev-parse --abbrev-ref HEAD failed".to_string());
-    }
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if branch.is_empty() || branch == "HEAD" {
-        return Err("could not determine current branch (detached HEAD?)".to_string());
-    }
-    Ok(branch)
-}
-
-fn find_pr_for_branch(repo: &str, branch: &str) -> Result<u32, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            branch,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ])
-        .output()
-        .map_err(|e| format!("failed to find PR for branch {branch}: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh pr list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let num_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    num_str
-        .parse::<u32>()
-        .map_err(|_| format!("no open PR found for branch {branch} in {repo}"))
 }
 
 // ── Strategy determination ──────────────────────────────────────────────────
@@ -170,6 +116,7 @@ fn analyze_ci_status(status: &CiStatus) -> RestartStrategy {
 
     // Evidence gate names (must match evidence.rs gate definitions).
     let evidence_gates = [
+        "merge_conflict_main",
         "rustfmt",
         "clippy",
         "doc",

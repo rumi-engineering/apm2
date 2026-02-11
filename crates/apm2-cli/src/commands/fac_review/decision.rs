@@ -7,9 +7,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
-use super::types::{
-    COMMENT_CONFIRM_MAX_PAGES, now_iso8601, parse_pr_url, validate_expected_head_sha,
-};
+use super::target::resolve_pr_target;
+use super::types::{COMMENT_CONFIRM_MAX_PAGES, now_iso8601, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-decision:v1";
@@ -137,6 +136,7 @@ pub fn run_decision_set(
     dimension: &str,
     decision: DecisionValueArg,
     reason: Option<&str>,
+    keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
     ensure_gh_cli_ready()?;
@@ -195,28 +195,14 @@ pub fn run_decision_set(
         Vec::new(),
     );
     emit_show_report(&report, json_output)?;
-    Ok(exit_codes::SUCCESS)
-}
-
-fn resolve_pr_target(
-    repo: &str,
-    pr_number: Option<u32>,
-    pr_url: Option<&str>,
-) -> Result<(String, u32), String> {
-    let from_url = pr_url.map(parse_pr_url).transpose()?;
-    match (pr_number, from_url) {
-        (Some(number), Some((owner_repo, url_number))) => {
-            if number != url_number {
-                return Err(format!(
-                    "review target mismatch: --pr={number} but --pr-url resolves to #{url_number}"
-                ));
-            }
-            Ok((owner_repo, number))
-        },
-        (Some(number), None) => Ok((repo.to_string(), number)),
-        (None, Some((owner_repo, number))) => Ok((owner_repo, number)),
-        (None, None) => Err("provide either --pr or --pr-url".to_string()),
+    if !keep_prepared_inputs {
+        if let Err(err) =
+            super::prepare::cleanup_prepared_review_inputs(&owner_repo, resolved_pr, &head_sha)
+        {
+            eprintln!("WARNING: failed to clean prepared review inputs: {err}");
+        }
     }
+    Ok(exit_codes::SUCCESS)
 }
 
 fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {

@@ -23,7 +23,7 @@ variables:
 
 notes:
   - "Discovery-first policy: run the START-node help checklist (`fac`, `pr`, `pr auth-check`, `review`, `review status`, `review project`, `review tail`, `logs`, `gates`, `push`, `restart`) before execution."
-  - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
+  - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, enables auto-merge, and starts an async FAC pipeline."
   - "Use `apm2 fac gates --quick` for implementor short-loop checks and `apm2 fac gates` for full pre-push verification. Full results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
   - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
@@ -108,17 +108,20 @@ push_workflow:
     - "Pushes the current branch to remote."
     - "Creates or updates the PR from ticket YAML metadata (title, body)."
     - "Enables auto-merge (squash) and exits immediately."
-    - "The Forge Admission Cycle CI workflow auto-triggers on the new HEAD and dispatches reviews."
-  implication: "Agents MUST NOT manually dispatch reviews after pushing. Reviews start automatically via CI."
+    - "Spawns an async FAC pipeline for the pushed SHA."
+    - "Pipeline runs evidence gates and dispatches reviews only when gates pass."
+  implication: "Agents do not manually dispatch reviews after pushing. Use FAC liveness/recovery commands if async review processes stall or die."
 
 runtime_review_protocol:
-  automatic_trigger: "Reviews are auto-dispatched by the `apm2 fac push` pipeline on every push. Agents do NOT need to manually trigger reviews after pushing."
+  automatic_trigger: "Reviews are auto-dispatched by the async `apm2 fac push` pipeline after evidence gates pass for that SHA."
   manual_restart: "apm2 fac restart --pr <PR_NUMBER> (use ONLY when auto-dispatch has failed or for recovery)"
   recovery_entrypoint: "apm2 fac restart --pr <PR_NUMBER>"
   monitoring:
     primary: "apm2 fac review project --pr <PR_NUMBER> --emit-errors (1Hz projection of review + CI gate states)"
-    secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
+    secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state and run_id/SHA binding)"
     log_discovery: "apm2 fac logs --pr <PR_NUMBER> (lists all local log files for evidence gates, pipeline runs, review dispatch, and events)"
+    liveness_check: "If no review progress appears for ~120s after push, run `apm2 fac review project --pr <PR_NUMBER> --emit-errors`, then `apm2 fac review status --pr <PR_NUMBER>`, then `apm2 fac logs --pr <PR_NUMBER>`."
+    liveness_recovery: "If processes are stalled/dead or review state is ambiguous, run `apm2 fac restart --pr <PR_NUMBER>`."
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
     findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
   observability_surfaces:

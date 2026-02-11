@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::selector::render_finding_selector;
-use super::types::{COMMENT_CONFIRM_MAX_PAGES, parse_pr_url, validate_expected_head_sha};
+use super::target::resolve_pr_target;
+use super::types::{COMMENT_CONFIRM_MAX_PAGES, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
 
 const FINDINGS_SCHEMA: &str = "apm2.fac.review.findings.v1";
@@ -160,27 +161,6 @@ pub fn run_findings(
         Ok(exit_codes::GENERIC_ERROR)
     } else {
         Ok(exit_codes::SUCCESS)
-    }
-}
-
-fn resolve_pr_target(
-    repo: &str,
-    pr_number: Option<u32>,
-    pr_url: Option<&str>,
-) -> Result<(String, u32), String> {
-    let from_url = pr_url.map(parse_pr_url).transpose()?;
-    match (pr_number, from_url) {
-        (Some(number), Some((owner_repo, url_number))) => {
-            if number != url_number {
-                return Err(format!(
-                    "review target mismatch: --pr={number} but --pr-url resolves to #{url_number}"
-                ));
-            }
-            Ok((owner_repo, number))
-        },
-        (Some(number), None) => Ok((repo.to_string(), number)),
-        (None, Some((owner_repo, number))) => Ok((owner_repo, number)),
-        (None, None) => Err("provide either --pr or --pr-url".to_string()),
     }
 }
 
