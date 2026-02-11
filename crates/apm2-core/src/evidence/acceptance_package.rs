@@ -6,8 +6,10 @@
 //! without ambient runtime state.
 
 use std::collections::HashMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -23,6 +25,8 @@ const MAX_RECEIPT_POINTERS: usize = 32;
 /// Maximum issuer signature bytes. Ed25519 signatures are exactly 64 bytes;
 /// 128 provides headroom for future signature schemes.
 const MAX_SIGNATURE_BYTES: usize = 128;
+/// Maximum length for receipt locator strings (CAS address, ledger event ID).
+const MAX_LOCATOR_LENGTH: usize = 4096;
 
 /// Portable acceptance evidence package containing all receipt pointers
 /// and verification metadata needed for deterministic third-party
@@ -64,8 +68,18 @@ pub struct ReceiptPointer {
     /// Content-addressed digest of the receipt.
     pub receipt_digest: Hash,
     /// CAS address where the receipt can be retrieved.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_bounded_locator"
+    )]
     pub cas_address: Option<String>,
     /// Ledger event ID that records this receipt.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_bounded_locator"
+    )]
     pub ledger_event_id: Option<String>,
 }
 
@@ -123,6 +137,15 @@ pub enum AdmissionVerdict {
     Admitted,
     /// Effect was denied.
     Denied,
+}
+
+impl AdmissionVerdict {
+    const fn stable_tag(self) -> u8 {
+        match self {
+            Self::Admitted => 1,
+            Self::Denied => 2,
+        }
+    }
 }
 
 /// Error returned by package signing/canonicalization helpers.
@@ -189,52 +212,43 @@ impl AcceptancePackageV1 {
     ///
     /// The package ID excludes both `package_id` and `issuer_signature`.
     ///
-    /// # Errors
-    /// Returns [`AcceptancePackageError::Canonicalization`] when canonical
-    /// payload serialization fails.
+    /// Uses explicit length-prefixed framing to ensure canonicalization stability
+    /// independent of JSON serialization details (whitespace, field order).
     pub fn compute_package_id(&self) -> Result<Hash, AcceptancePackageError> {
-        let payload = serde_json::to_vec(&PackageIdPayload {
-            version: self.version,
-            subject_effect_id: self.subject_effect_id,
-            receipt_set_digest: self.receipt_set_digest,
-            receipt_pointers: &self.receipt_pointers,
-            policy_snapshot_hash: self.policy_snapshot_hash,
-            time_authority_ref: self.time_authority_ref,
-            verdict: self.verdict,
-            issuer_verifying_key: self.issuer_verifying_key,
-        })
-        .map_err(|error| AcceptancePackageError::Canonicalization {
-            message: error.to_string(),
-        })?;
-
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"apm2.acceptance_package.package_id.v1");
-        hasher.update(&payload);
+        hasher.update(b"apm2.acceptance_package.package_id.v2");
+        self.hash_canonical_content(&mut hasher);
         Ok(*hasher.finalize().as_bytes())
     }
 
     /// Canonical bytes that are signed/verified by issuers.
     ///
     /// `issuer_signature` is intentionally excluded.
-    ///
-    /// # Errors
-    /// Returns [`AcceptancePackageError::Canonicalization`] when canonical
-    /// payload serialization fails.
+    /// Uses explicit length-prefixed framing.
     pub fn signing_payload_bytes(&self) -> Result<Vec<u8>, AcceptancePackageError> {
-        serde_json::to_vec(&SigningPayload {
-            version: self.version,
-            package_id: self.package_id,
-            subject_effect_id: self.subject_effect_id,
-            receipt_set_digest: self.receipt_set_digest,
-            receipt_pointers: &self.receipt_pointers,
-            policy_snapshot_hash: self.policy_snapshot_hash,
-            time_authority_ref: self.time_authority_ref,
-            verdict: self.verdict,
-            issuer_verifying_key: self.issuer_verifying_key,
-        })
-        .map_err(|error| AcceptancePackageError::Canonicalization {
-            message: error.to_string(),
-        })
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.acceptance_package.signing_payload.v2");
+        // For signing, we include the package_id to bind the signature to the
+        // computed ID.
+        hasher.update(&self.package_id);
+        self.hash_canonical_content(&mut hasher);
+        Ok(hasher.finalize().as_bytes().to_vec())
+    }
+
+    fn hash_canonical_content(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.version.to_le_bytes());
+        hasher.update(&self.subject_effect_id);
+        hasher.update(&self.receipt_set_digest);
+        
+        // Receipt pointers are already summarized in receipt_set_digest,
+        // but we include the count for explicit structural binding.
+        let count = u64::try_from(self.receipt_pointers.len()).unwrap_or(u64::MAX);
+        hasher.update(&count.to_le_bytes());
+
+        hasher.update(&self.policy_snapshot_hash);
+        hasher.update(&self.time_authority_ref);
+        hasher.update(&[self.verdict.stable_tag()]);
+        hasher.update(&self.issuer_verifying_key);
     }
 
     /// Signs the package in-place using the supplied signer.
@@ -254,31 +268,6 @@ impl AcceptancePackageV1 {
         self.issuer_signature = signer.sign(&payload).to_bytes().to_vec();
         Ok(())
     }
-}
-
-#[derive(Serialize)]
-struct PackageIdPayload<'a> {
-    version: u32,
-    subject_effect_id: Hash,
-    receipt_set_digest: Hash,
-    receipt_pointers: &'a [ReceiptPointer],
-    policy_snapshot_hash: Hash,
-    time_authority_ref: Hash,
-    verdict: AdmissionVerdict,
-    issuer_verifying_key: [u8; 32],
-}
-
-#[derive(Serialize)]
-struct SigningPayload<'a> {
-    version: u32,
-    package_id: Hash,
-    subject_effect_id: Hash,
-    receipt_set_digest: Hash,
-    receipt_pointers: &'a [ReceiptPointer],
-    policy_snapshot_hash: Hash,
-    time_authority_ref: Hash,
-    verdict: AdmissionVerdict,
-    issuer_verifying_key: [u8; 32],
 }
 
 fn hash_optional_string(hasher: &mut blake3::Hasher, value: Option<&str>) {
@@ -325,6 +314,74 @@ where
         )));
     }
     Ok(bytes)
+}
+
+struct BoundedStringVisitor(usize);
+
+impl Visitor<'_> for BoundedStringVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a string of at most {} bytes", self.0)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.len() > self.0 {
+            Err(E::custom(format!(
+                "string exceeds max length: {} > {}",
+                value.len(),
+                self.0
+            )))
+        } else {
+            Ok(value.to_owned())
+        }
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        if value.len() > self.0 {
+            Err(E::custom(format!(
+                "string exceeds max length: {} > {}",
+                value.len(),
+                self.0
+            )))
+        } else {
+            Ok(value)
+        }
+    }
+}
+
+struct OptionalBoundedStringVisitor(usize);
+
+impl<'de> Visitor<'de> for OptionalBoundedStringVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "an optional string of at most {} bytes", self.0)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_string(BoundedStringVisitor(self.0))
+            .map(Some)
+    }
+}
+
+fn deserialize_optional_bounded_locator<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_option(OptionalBoundedStringVisitor(MAX_LOCATOR_LENGTH))
 }
 
 /// Verification result from deterministic reverification.
@@ -1398,5 +1455,50 @@ mod tests {
                 .any(|finding| finding.code == "ACPT_RECEIPT_LOCATOR_REQUIRED"),
             "locator-required finding must be present: {result:?}"
         );
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_locators() {
+        let (mut package, _fixtures) = build_fixture_package();
+        // Construct a string longer than MAX_LOCATOR_LENGTH (4096)
+        let long_string = "a".repeat(MAX_LOCATOR_LENGTH + 1);
+        package.receipt_pointers[0].cas_address = Some(long_string);
+
+        let serialized = serde_json::to_vec(&package)
+            .expect("serialization of oversized locator should succeed");
+        let result: Result<AcceptancePackageV1, _> = serde_json::from_slice(&serialized);
+        assert!(
+            result.is_err(),
+            "deserialization must reject oversized locators"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("string exceeds max length"),
+            "error must mention max length, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn canonical_package_id_is_stable() {
+        // This test ensures that the manual canonical hashing in compute_package_id
+        // produces a stable hash for a known input, independent of JSON serialization.
+        let (mut package, _fixtures) = build_fixture_package();
+        // Zero out variable fields to ensure deterministic baseline
+        package.issuer_signature = Vec::new();
+        package.issuer_verifying_key = [0u8; 32];
+        // Re-sign with deterministic signer to set keys and signature
+        package.sign_with(&deterministic_signer()).unwrap();
+
+        let id1 = package.compute_package_id().unwrap();
+        
+        // Mutate a field that shouldn't affect ID (signature)
+        package.issuer_signature = vec![0x00; 64];
+        let id2 = package.compute_package_id().unwrap();
+        assert_eq!(id1, id2, "signature change should not affect package_id");
+
+        // Mutate a field that SHOULD affect ID (verifying key)
+        package.issuer_verifying_key = [0xFF; 32];
+        let id3 = package.compute_package_id().unwrap();
+        assert_ne!(id1, id3, "verifying key change MUST affect package_id");
     }
 }

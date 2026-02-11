@@ -83,7 +83,7 @@ use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 use apm2_core::evidence::{
     AcceptancePackageV1, AdmissionVerdict as AcceptanceAdmissionVerdict, CasReceiptProvider,
     LedgerReceiptProvider, ReceiptPointer as AcceptanceReceiptPointer,
-    ReceiptType as AcceptanceReceiptType, verify_acceptance_package,
+    ReceiptType as AcceptanceReceiptType, TrustedIssuerSet, verify_acceptance_package,
 };
 #[cfg(test)]
 use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
@@ -3710,10 +3710,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .sign_with(self.channel_context_signer.as_ref())
             .map_err(|error| format!("acceptance package signing failed: {error}"))?;
 
-        // Internal structural reverification: the daemon just signed this
-        // package with its own key, so trust-anchor binding is not applicable
-        // here. External verifiers must pass a TrustedIssuerSet.
-        let cas_result = verify_acceptance_package(&package, &cas_provider, None);
+        // Internal structural reverification: enforcing trust-anchor binding using
+        // the daemon's own key (since we just signed it).
+        let trusted_issuers = TrustedIssuerSet::from_keys(&[self
+            .channel_context_signer
+            .verifying_key()
+            .to_bytes()]);
+
+        let cas_result = verify_acceptance_package(&package, &cas_provider, Some(&trusted_issuers));
         if !cas_result.verified {
             return Err(Self::format_acceptance_verification_failure(
                 "cas",
@@ -3721,7 +3725,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        let ledger_result = verify_acceptance_package(&package, &ledger_provider, None);
+        let ledger_result =
+            verify_acceptance_package(&package, &ledger_provider, Some(&trusted_issuers));
         if !ledger_result.verified {
             return Err(Self::format_acceptance_verification_failure(
                 "ledger",
@@ -3785,6 +3790,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .map_err(|error| {
                     format!("acceptance package ledger persistence failed: {error}")
                 })?;
+        } else {
+            return Err(
+                "ledger unavailable for promotion-critical acceptance package recording (fail-closed)"
+                    .to_string(),
+            );
         }
 
         Ok(())
