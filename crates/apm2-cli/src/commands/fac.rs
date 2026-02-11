@@ -459,6 +459,18 @@ pub struct LogsArgs {
     /// Filter logs to a specific pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
+
+    /// Repository in owner/repo format (used for finding selector zoom-in).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Selector type for digest-first zoom-in (`finding` or `tool_output`).
+    #[arg(long)]
+    pub selector_type: Option<String>,
+
+    /// Selector token to resolve (typed by `--selector-type`).
+    #[arg(long)]
+    pub selector: Option<String>,
 }
 
 /// Arguments for `apm2 fac pipeline` (hidden, internal).
@@ -931,7 +943,13 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             args.force,
             json_output,
         ),
-        FacSubcommand::Logs(args) => fac_review::run_logs(args.pr, json_output),
+        FacSubcommand::Logs(args) => fac_review::run_logs(
+            args.pr,
+            &args.repo,
+            args.selector_type.as_deref(),
+            args.selector.as_deref(),
+            json_output,
+        ),
         FacSubcommand::Pipeline(args) => {
             fac_review::run_pipeline(&args.repo, &args.pr_url, args.pr, &args.sha)
         },

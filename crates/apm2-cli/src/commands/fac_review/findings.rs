@@ -3,8 +3,10 @@
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
+use super::selector::render_finding_selector;
 use super::types::{COMMENT_CONFIRM_MAX_PAGES, parse_pr_url, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
 
@@ -50,6 +52,8 @@ struct FindingRecord {
     reviewer_type: String,
     sha: String,
     summary: String,
+    evidence_selector: String,
+    evidence_digest: String,
     raw_evidence_pointer: String,
 }
 
@@ -144,6 +148,7 @@ pub fn run_findings(
     let resolved_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
     let report = build_findings_report(
+        &owner_repo,
         resolved_pr,
         &resolved_sha,
         &comments,
@@ -215,6 +220,7 @@ fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueCom
 }
 
 fn build_findings_report(
+    owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
     comments: &[IssueComment],
@@ -225,8 +231,14 @@ fn build_findings_report(
     let mut fail_closed = false;
 
     for spec in DIMENSIONS {
-        let dimension =
-            evaluate_dimension(spec, pr_number, head_sha, comments, expected_author_login);
+        let dimension = evaluate_dimension(
+            spec,
+            owner_repo,
+            pr_number,
+            head_sha,
+            comments,
+            expected_author_login,
+        );
         let status_fail_closed = matches!(
             dimension.status.as_str(),
             "ERROR" | "MISSING" | "STALE" | "AMBIGUOUS"
@@ -261,6 +273,7 @@ fn build_findings_report(
 
 fn evaluate_dimension(
     spec: DimensionSpec,
+    owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
     comments: &[IssueComment],
@@ -380,6 +393,9 @@ fn evaluate_dimension(
 
     let findings = match parse_findings_from_comment(
         &selected.comment.body,
+        owner_repo,
+        pr_number,
+        selected.comment.id,
         head_sha,
         spec.dimension,
         &selected.comment.html_url,
@@ -501,12 +517,16 @@ fn extract_fenced_block<'a>(source: &'a str, language: &str) -> Option<&'a str> 
 
 fn parse_findings_from_comment(
     body: &str,
+    owner_repo: &str,
+    pr_number: u32,
+    comment_id: u64,
     head_sha: &str,
     reviewer_type: &str,
     comment_url: &str,
 ) -> Result<Vec<FindingRecord>, String> {
     let mut findings = Vec::new();
     let mut current_severity = None;
+    let evidence_digest = sha256_hex(body.as_bytes());
 
     for (line_idx, line) in body.lines().enumerate() {
         let trimmed = line.trim();
@@ -530,12 +550,27 @@ fn parse_findings_from_comment(
                 reviewer_type: reviewer_type.to_string(),
                 sha: head_sha.to_string(),
                 summary: text.to_string(),
+                evidence_selector: render_finding_selector(
+                    owner_repo,
+                    pr_number,
+                    head_sha,
+                    reviewer_type,
+                    comment_id,
+                    line_idx + 1,
+                ),
+                evidence_digest: evidence_digest.clone(),
                 raw_evidence_pointer: format!("{comment_url}#line-{}", line_idx + 1),
             });
         }
     }
 
     Ok(findings)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn is_heading(line: &str) -> bool {
@@ -685,6 +720,9 @@ mod tests {
 ";
         let findings = parse_findings_from_comment(
             body,
+            "guardian-intelligence/apm2",
+            482,
+            123_456,
             "0123456789abcdef0123456789abcdef01234567",
             CODE_QUALITY_DIMENSION,
             "https://example.invalid/comment/1",
@@ -695,6 +733,11 @@ mod tests {
         assert_eq!(findings[1].severity, "MAJOR");
         assert_eq!(findings[2].severity, "MINOR");
         assert_eq!(findings[3].severity, "NIT");
+        assert_eq!(
+            findings[0].evidence_selector,
+            "finding:v1:guardian-intelligence/apm2:482:0123456789abcdef0123456789abcdef01234567:code-quality:123456:3"
+        );
+        assert_eq!(findings[0].evidence_digest.len(), 64);
     }
 
     #[test]
@@ -705,6 +748,9 @@ mod tests {
 ";
         let err = parse_findings_from_comment(
             body,
+            "guardian-intelligence/apm2",
+            482,
+            123_456,
             "0123456789abcdef0123456789abcdef01234567",
             CODE_QUALITY_DIMENSION,
             "https://example.invalid/comment/1",
@@ -768,6 +814,7 @@ mod tests {
                 dimension: SECURITY_DIMENSION,
                 marker: SECURITY_MARKER,
             },
+            "guardian-intelligence/apm2",
             441,
             "0123456789abcdef0123456789abcdef01234567",
             &comments,
