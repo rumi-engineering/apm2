@@ -213,6 +213,81 @@ pub struct SignedLedgerEvent {
     pub timestamp_ns: u64,
 }
 
+/// Security class for ledger event namespaces.
+///
+/// Governance-class events are authoritative for policy-root derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTypeClass {
+    /// Governance-owned event namespace used for authoritative policy roots.
+    Governance,
+    /// Session-originated event namespace (default for untrusted emissions).
+    Session,
+    /// Daemon/system-managed operational namespace.
+    System,
+}
+
+impl EventTypeClass {
+    /// Returns the canonical storage encoding for this class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Governance => "governance",
+            Self::Session => "session",
+            Self::System => "system",
+        }
+    }
+}
+
+/// Returns true when an event type is a trusted governance policy event.
+#[must_use]
+pub fn is_governance_policy_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "gate.policy_resolved"
+            | "policy_root_published"
+            | "policy_updated"
+            | "gate_configuration_updated"
+    )
+}
+
+/// Returns true when an actor is authorized to emit governance policy events.
+#[must_use]
+pub fn is_governance_policy_actor(actor_id: &str) -> bool {
+    matches!(
+        actor_id,
+        "orchestrator:gate-lifecycle" | "governance:policy-root" | "governance:policy"
+    )
+}
+
+/// Classifies a ledger event into governance/session/system namespaces.
+#[must_use]
+pub fn classify_event_type(event_type: &str, actor_id: &str) -> EventTypeClass {
+    if is_governance_policy_event_type(event_type) && is_governance_policy_actor(actor_id) {
+        return EventTypeClass::Governance;
+    }
+
+    if matches!(
+        event_type,
+        "work_claimed"
+            | "session_started"
+            | "session_terminated"
+            | "work_transitioned"
+            | "stop_flags_mutated"
+            | "defect_recorded"
+            | "changeset_published"
+            | "review_receipt_recorded"
+            | "review_blocked_recorded"
+            | "redundancy_receipt_consumed"
+            | "SubleaseIssued"
+            | "gate_lease_issued"
+            | "episode_run_attributed"
+    ) {
+        return EventTypeClass::System;
+    }
+
+    EventTypeClass::Session
+}
+
 /// Authoritative binding for a consumed redundancy declassification receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedundancyReceiptConsumption {
@@ -550,6 +625,18 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
+    /// Returns the latest governance policy event eligible for authoritative
+    /// policy-root derivation.
+    ///
+    /// Default implementation scans replay-order events newest-first and
+    /// selects the first governance-class policy event.
+    fn get_latest_governance_policy_event(&self) -> Option<SignedLedgerEvent> {
+        self.get_all_events().into_iter().rev().find(|event| {
+            classify_event_type(&event.event_type, &event.actor_id) == EventTypeClass::Governance
+                && is_governance_policy_event_type(&event.event_type)
+        })
+    }
+
     /// Returns the latest trusted `gate.policy_resolved` lifecycle event.
     ///
     /// The default implementation scans events from newest to oldest and
@@ -558,7 +645,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
         self.get_all_events().into_iter().rev().find(|event| {
             event.event_type == "gate.policy_resolved"
-                && event.actor_id == "orchestrator:gate-lifecycle"
+                && classify_event_type(&event.event_type, &event.actor_id)
+                    == EventTypeClass::Governance
         })
     }
 
@@ -3246,13 +3334,25 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             .and_then(|event_id| events.get(event_id).cloned())
     }
 
+    fn get_latest_governance_policy_event(&self) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        let (order, events) = &*guard;
+        order.iter().rev().find_map(|event_id| {
+            let event = events.get(event_id)?;
+            (classify_event_type(&event.event_type, &event.actor_id) == EventTypeClass::Governance
+                && is_governance_policy_event_type(&event.event_type))
+            .then(|| event.clone())
+        })
+    }
+
     fn get_latest_gate_policy_resolved_event(&self) -> Option<SignedLedgerEvent> {
         let guard = self.events.read().expect("lock poisoned");
         let (order, events) = &*guard;
         order.iter().rev().find_map(|event_id| {
             let event = events.get(event_id)?;
             (event.event_type == "gate.policy_resolved"
-                && event.actor_id == "orchestrator:gate-lifecycle")
+                && classify_event_type(&event.event_type, &event.actor_id)
+                    == EventTypeClass::Governance)
                 .then(|| event.clone())
         })
     }
