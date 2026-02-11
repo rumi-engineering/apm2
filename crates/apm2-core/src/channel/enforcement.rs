@@ -3,8 +3,6 @@
 //! Restricts authoritative actuation to typed tool-intent channel events
 //! and emits structured defects for boundary violations.
 
-use std::sync::Once;
-
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -688,35 +686,11 @@ pub fn validate_channel_boundary(check: &ChannelBoundaryCheck) -> Vec<ChannelBou
 
     validate_boundary_admit_predicate(check, &mut defects);
     validate_declassification_constraints(check, &mut defects);
-    if is_legacy_v1_boundary_flow_absent(check) {
-        emit_legacy_v1_boundary_flow_deprecation_warning();
-    } else {
-        validate_boundary_flow_policy_binding(check, &mut defects);
-        validate_leakage_budget(check, &mut defects);
-        validate_timing_budget(check, &mut defects);
-    }
+    validate_boundary_flow_policy_binding(check, &mut defects);
+    validate_leakage_budget(check, &mut defects);
+    validate_timing_budget(check, &mut defects);
 
     defects
-}
-
-const fn is_legacy_v1_boundary_flow_absent(check: &ChannelBoundaryCheck) -> bool {
-    check.boundary_flow_policy_binding.is_none()
-        && check.leakage_budget_receipt.is_none()
-        && check.timing_channel_budget.is_none()
-        && check.leakage_budget_policy_max_bits.is_none()
-        && check.declared_leakage_budget_bits.is_none()
-        && check.timing_budget_policy_max_ticks.is_none()
-        && check.declared_timing_budget_ticks.is_none()
-}
-
-fn emit_legacy_v1_boundary_flow_deprecation_warning() {
-    static WARN_ONCE: Once = Once::new();
-    WARN_ONCE.call_once(|| {
-        tracing::warn!(
-            schema_id = CHANNEL_CONTEXT_TOKEN_SCHEMA_ID,
-            "legacy apm2.channel_context_token.v1 missing boundary-flow fields; skipping boundary-flow checks during rollout"
-        );
-    });
 }
 
 fn validate_boundary_flow_policy_binding(
@@ -765,7 +739,7 @@ fn validate_boundary_admit_predicate(
         ));
     }
 
-    if !check.classification_allow && !check.declass_receipt_valid {
+    if !check.classification_allow {
         defects.push(ChannelBoundaryDefect::new(
             ChannelViolationClass::ClassificationNotAdmitted,
             "boundary_admit classification_allow predicate is false",
@@ -1226,6 +1200,19 @@ mod tests {
     }
 
     #[test]
+    fn test_classification_defect_is_independent_of_declass_receipt_validity() {
+        let mut check = baseline_check();
+        check.classification_allow = false;
+        check.declass_receipt_valid = true;
+        check.declassification_intent = DeclassificationIntentScope::None;
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(
+            |defect| defect.violation_class == ChannelViolationClass::ClassificationNotAdmitted
+        ));
+    }
+
+    #[test]
     fn test_unknown_declassification_intent_denied() {
         let mut check = baseline_check();
         check.declassification_intent = DeclassificationIntentScope::Unknown;
@@ -1345,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_legacy_missing_boundary_flow_fields_uses_compat_path() {
+    fn test_missing_boundary_flow_fields_fail_closed() {
         let mut check = baseline_check();
         check.boundary_flow_policy_binding = None;
         check.leakage_budget_receipt = None;
@@ -1357,9 +1344,23 @@ mod tests {
 
         let defects = validate_channel_boundary(&check);
         assert!(
-            defects.is_empty(),
-            "v1 compatibility path should not deny solely for missing boundary-flow fields: {defects:?}"
+            defects.iter().any(|defect| defect.violation_class
+                == ChannelViolationClass::PolicyDigestBindingMismatch)
         );
+        assert!(defects.iter().any(|defect| defect.violation_class
+            == ChannelViolationClass::CanonicalizerTupleBindingMismatch));
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::LeakageBudgetExceeded
+                && defect
+                    .detail
+                    .contains("missing typed leakage-budget receipt")
+        }));
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::TimingChannelBudgetExceeded
+                && defect
+                    .detail
+                    .contains("missing timing-channel budget witness")
+        }));
     }
 
     #[test]
