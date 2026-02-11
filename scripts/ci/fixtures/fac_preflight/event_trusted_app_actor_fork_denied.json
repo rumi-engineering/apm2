@@ -1,0 +1,28 @@
+{
+  "pull_request": {
+    "number": 106,
+    "state": "open",
+    "author_association": "NONE",
+    "base": {
+      "ref": "main",
+      "repo": {
+        "full_name": "guardian-intelligence/apm2"
+      }
+    },
+    "head": {
+      "sha": "6666666666666666666666666666666666666666",
+      "repo": {
+        "full_name": "external-contributor/apm2",
+        "fork": true
+      }
+    },
+    "labels": [
+      {
+        "name": "fac-trusted-fork"
+      }
+    ]
+  },
+  "repository": {
+    "full_name": "guardian-intelligence/apm2"
+  }
+}

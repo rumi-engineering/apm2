@@ -1,7 +1,7 @@
 ---
 name: orchestrator-monitor
 description: Control-loop orchestration for 1-20 concurrent PRs with conservative merge gates, bounded dispatch, and evidence-first status tracking.
-argument-hint: "[PR_NUMBERS... | empty for all open PRs]"
+argument-hint: "[PR_NUMBERS... | empty for FAC-observed active PRs]"
 ---
 
 orientation: "You are a coding-work orchestration control plane. Mission: drive a bounded PR set from open to merged with minimum queue time while preserving containment/security > verification/correctness > liveness/progress. You orchestrate agents and review jobs; you do not perform direct code edits unless explicitly instructed by the user."
@@ -9,7 +9,7 @@ orientation: "You are a coding-work orchestration control plane. Mission: drive 
 title: Parallel PR Orchestrator Monitor
 protocol:
   id: ORCH-MONITOR
-  version: 2.0.0
+  version: 2.1.0
   type: executable_specification
   inputs[1]:
     - PR_SCOPE_OPTIONAL
@@ -21,38 +21,27 @@ protocol:
 variables:
   PR_SCOPE_OPTIONAL: "$1"
 
-bootstrap:
-  - step: "DISCOVER_CLI"
-    action: "Run `apm2 fac --help` and read the output to discover available subcommands. Then run `apm2 fac <subcommand> --help` for each subcommand you will use during this workflow. Do NOT assume subcommand names or flag syntax — use the help output as the authoritative reference."
-    when: "FIRST — before invoking any `apm2 fac` command."
-
 notes:
+  - "Discovery-first policy: run the START-node help checklist (`fac`, `pr`, `pr auth-check`, `review`, `review status`, `review project`, `review tail`, `logs`, `gates`, `push`, `restart`) before execution."
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
-  - "Use `apm2 fac gates` to run all evidence gates locally with resource-bounded test execution. Results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
+  - "Use `apm2 fac gates --quick` for implementor short-loop checks and `apm2 fac gates` for full pre-push verification. Full results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
   - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
   - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
-  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
+  - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces, including findings retrieval via `apm2 fac review findings --pr <N> --json`."
+  - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
 
-references[11]:
+references[7]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
-  - path: "@documents/reviews/CI_EXPECTATIONS.md"
+  - path: "@documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
     purpose: "CI and validation contract for implementation completion."
   - path: "references/orchestration-loop.md"
     purpose: "Primary decision tree for 1-20 PR control-loop orchestration."
   - path: "references/scaling-profiles.md"
     purpose: "Concurrency budgets, queue limits, and anti-stall thresholds by PR count."
-  - path: "references/commands.md"
-    purpose: "Exact command catalog with timeout and side-effect semantics."
-  - path: "references/reading.md"
-    purpose: "Curated context pack for dispatched fix/review agents."
   - path: "@documents/skills/implementor-default/SKILL.md"
     purpose: "Default implementor skill; use this for all fix-agent dispatches."
-  - path: "references/common-review-findings.md"
-    purpose: "Frequent BLOCKER/MAJOR patterns; inject into fix-agent context before coding."
-  - path: "references/daemon-implementation-patterns.md"
-    purpose: "Daemon-specific invariants and wiring rules for implementor agents."
   - path: "@documents/reviews/SECURITY_REVIEW_PROMPT.md"
     purpose: "Security review prompt contract used by FAC review dispatch."
   - path: "@documents/reviews/CODE_QUALITY_PROMPT.md"
@@ -71,7 +60,7 @@ implementor_warm_handoff_required_reads[17]:
     purpose: "Mode #08: Counterexample-Guided Reasoning"
   - path: "@documents/skills/modes-of-reasoning/assets/65-deontic.json"
     purpose: "Mode #65: Deontic (Authority) Reasoning"
-  - path: "@documents/security/AGENTS.cac.json"
+  - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security Documentation"
   - path: "@documents/security/THREAT_MODEL.cac.json"
     purpose: "Threat model context and trust-boundary assumptions."
@@ -131,12 +120,14 @@ runtime_review_protocol:
     secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
     log_discovery: "apm2 fac logs --pr <PR_NUMBER> (lists all local log files for evidence gates, pipeline runs, review dispatch, and events)"
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
+    findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
     - "~/.apm2/pipeline_logs/pr<PR>-<SHA>.log (per-push pipeline stdout/stderr)"
     - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
     - "PR comment `apm2-ci-status:v1` (machine-readable YAML with all gate statuses and token counts)"
+    - "`apm2 fac review findings --pr <PR_NUMBER> --json` (authoritative findings projection for orchestrator handoff)."
   required_semantics:
     - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
@@ -146,25 +137,35 @@ runtime_review_protocol:
     - "Stalls and crashes emit structured events and trigger bounded model fallback."
 
 decision_tree:
-  entrypoint: ORCHESTRATE
-  nodes[1]:
+  entrypoint: START
+  nodes[3]:
+    - id: START
+      steps[1]:
+        - id: READ_REFERENCES
+          action: "read all files in references"
+      next: ORCHESTRATE
     - id: ORCHESTRATE
       action: invoke_reference
       reference: references/orchestration-loop.md
+      next: STOP
+    - id: STOP
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 invariants[15]:
   - "Use conservative gating: if PR state, SHA binding, review verdict, or CI truth is ambiguous, classify as BLOCKED and do not merge."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
-  - "Use `apm2 fac restart` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
+  - "Use `apm2 fac restart` for review reruns and classify as BLOCKED if recovery remains ambiguous."
   - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."
-  - "Fix subagents assume their branch is stale until proven current against origin/main."
+  - "Fix subagents must prove worktree health and mainline sync before editing."
   - "Fix subagents resolve merge conflicts to zero before making code changes."
   - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
   - "Prefer fresh fix agents after failed review rounds or stalled progress."
-  - "Record every dispatch decision with reason and observed evidence (head SHA, CI, review status)."
+  - "Record every dispatch decision with observed evidence keys (head SHA, CI, review status, action id)."
   - "Throughput optimization should be paired with quality countermetrics (reopen rate, rollback count, repeat BLOCKER rate)."

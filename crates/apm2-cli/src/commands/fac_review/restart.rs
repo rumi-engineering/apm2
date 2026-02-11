@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use super::barrier::fetch_pr_head_sha;
+use super::barrier::{fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::ci_status::{CiStatus, find_status_comment};
 use super::dispatch::dispatch_single_review;
 use super::evidence::run_evidence_gates_with_status;
@@ -144,7 +144,17 @@ fn determine_restart_strategy(
         return Ok(RestartStrategy::FullRestart);
     }
 
-    let status_opt = find_status_comment(owner_repo, pr_number, head_sha)?;
+    let expected_author_login = resolve_authenticated_gh_login();
+    let Some(expected_author_login) = expected_author_login else {
+        return Ok(RestartStrategy::FullRestart);
+    };
+
+    let status_opt = find_status_comment(
+        owner_repo,
+        pr_number,
+        head_sha,
+        Some(&expected_author_login),
+    )?;
     let Some((_comment_id, status)) = status_opt else {
         // No status comment for this SHA — either never ran or SHA changed.
         return Ok(RestartStrategy::FullRestart);

@@ -12,10 +12,12 @@
 mod backend;
 mod barrier;
 mod ci_status;
+mod decision;
 mod detection;
 mod dispatch;
 mod events;
 mod evidence;
+mod findings;
 mod gate_cache;
 mod gates;
 mod liveness;
@@ -26,6 +28,7 @@ mod pipeline;
 mod projection;
 mod push;
 mod restart;
+mod selector;
 mod state;
 mod types;
 
@@ -40,13 +43,14 @@ use apm2_daemon::telemetry::reviewer::{ProjectionSummary, ProjectionSummaryEmitt
 use barrier::{
     emit_barrier_decision_event, enforce_barrier, ensure_gh_cli_ready, resolve_fac_event_context,
 };
+// Re-export public API for use by `fac.rs`
+pub use decision::DecisionValueArg;
 use dispatch::dispatch_single_review;
 use events::{read_last_event_values, review_events_path};
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
-// Re-export public API for use by `fac.rs`
 pub use types::ReviewRunType;
 use types::{
     BarrierSummary, DispatchSummary, KickoffSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
@@ -344,6 +348,103 @@ pub fn run_status(pr_number: Option<u32>, pr_url: Option<&str>, json_output: boo
     }
 }
 
+pub fn run_findings(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match findings::run_findings(repo, pr_number, pr_url, sha, json_output) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_findings_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_decision_set(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    dimension: &str,
+    decision: DecisionValueArg,
+    reason: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match decision::run_decision_set(
+        repo,
+        pr_number,
+        pr_url,
+        sha,
+        dimension,
+        decision,
+        reason,
+        json_output,
+    ) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_decision_set_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_decision_show(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match decision::run_decision_show(repo, pr_number, pr_url, sha, json_output) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_decision_show_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output: bool) -> u8 {
     match resolve_fac_event_context(repo, event_path, event_name) {
         Ok(ctx) => {
@@ -590,12 +691,19 @@ pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
     pipeline::run_pipeline(repo, pr_url, pr_number, sha)
 }
 
-pub fn run_logs(pr_number: Option<u32>, json_output: bool) -> u8 {
-    logs::run_logs(pr_number, json_output)
+pub fn run_logs(
+    pr_number: Option<u32>,
+    repo: &str,
+    selector_type: Option<&str>,
+    selector: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    logs::run_logs(pr_number, repo, selector_type, selector, json_output)
 }
 
 pub fn run_gates(
     force: bool,
+    quick: bool,
     timeout_seconds: u64,
     memory_max: &str,
     pids_max: u64,
@@ -604,6 +712,7 @@ pub fn run_gates(
 ) -> u8 {
     gates::run_gates(
         force,
+        quick,
         timeout_seconds,
         memory_max,
         pids_max,

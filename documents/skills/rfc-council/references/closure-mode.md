@@ -2,7 +2,7 @@ title: RFC FINALIZE Mode (v2 -> v4)
 
 decision_tree:
   entrypoint: CLOSURE_FLOW
-  nodes[1]:
+  nodes[2]:
     - id: CLOSURE_FLOW
       purpose: "Final architectural convergence to transition RFC from v2 (Grounded) to v4 (Standard)."
       steps[6]:
@@ -42,7 +42,7 @@ decision_tree:
           action: |
             1. Update `00_meta.yaml` to `version: v4`.
             2. Set status to `APPROVED`.
-            3. Generate final governance summary in `09_governance_and_gates.yaml`.
+            3. Generate final governance gate content in `09_governance_and_gates.yaml`.
 
         - id: COMMIT_V4
           action: |
@@ -54,4 +54,10 @@ decision_tree:
         - id: FINISHED
           if: "always"
           then:
-            stop: true
+            next: STOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

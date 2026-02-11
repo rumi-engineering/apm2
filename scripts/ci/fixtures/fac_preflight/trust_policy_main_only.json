@@ -13,6 +13,9 @@
   "trusted_fork_labels": [
     "fac-trusted-fork"
   ],
+  "trusted_app_actors": [
+    "forge-admission-cycle-projector[bot]"
+  ],
   "credential_posture": {
     "projection_credential_source": "github_token",
     "allow_personal_access_tokens": false,

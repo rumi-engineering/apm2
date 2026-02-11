@@ -2,9 +2,9 @@ title: RFC REVIEW Mode
 
 decision_tree:
   entrypoint: REVIEW_AND_REFINE
-  nodes[1]:
+  nodes[2]:
     - id: REVIEW_AND_REFINE
-      purpose: "Execute formal review gates with iterative refinement and emit findings."
+      purpose: "Execute formal review gates with iterative refinement and persist findings artifacts."
       steps[9]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <RFC_ID> and <PRD_ID> placeholders before running commands."
@@ -55,13 +55,19 @@ decision_tree:
         - id: CRITICAL_FAILURE
           if: "any gate status is FAILED after refinement"
           then:
-            stop: true
+            next: STOP
             verdict: REJECTED
         - id: COMPLETED
           if: "all gates executed and refined"
           then:
-            stop: true
+            next: STOP
             verdict: compute_verdict()
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 ---
 

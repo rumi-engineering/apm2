@@ -2,7 +2,7 @@ title: RFC EXPLORE Mode (v0 -> v2)
 
 decision_tree:
   entrypoint: EXPLORATION_FLOW
-  nodes[1]:
+  nodes[2]:
     - id: EXPLORATION_FLOW
       purpose: "Active codebase investigation to transition RFC from v0 (Discovery) to v2 (Grounded)."
       steps[6]:
@@ -46,4 +46,10 @@ decision_tree:
         - id: FINISHED
           if: "always"
           then:
-            stop: true
+            next: STOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

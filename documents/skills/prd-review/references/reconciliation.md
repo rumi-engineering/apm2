@@ -4,7 +4,7 @@
 
 decision_tree:
   entrypoint: RECONCILIATION
-  nodes[1]:
+  nodes[2]:
     - id: RECONCILIATION
       purpose: "Detect variance between implementation and PRD specification after merge."
       steps[3]:
@@ -28,4 +28,10 @@ decision_tree:
         - id: DONE
           if: "always"
           then:
-            stop: true
+            next: STOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
