@@ -609,9 +609,12 @@ async fn tck_00403_fac_lifecycle_end_to_end() {
         tool_error.code, "SessionErrorToolNotAllowed",
         "RequestTool must fail with tool-not-allowed when denied by scope enforcement"
     );
+    let scope_or_taint_denial = tool_error.message.contains("V1 scope enforcement denied")
+        || tool_error.message.contains("taint ingress denied")
+        || tool_error.message.contains("taint flow denied");
     assert!(
-        tool_error.message.contains("V1 scope enforcement denied"),
-        "RequestTool error must be from V1 scope enforcement, got: {}",
+        scope_or_taint_denial,
+        "RequestTool error must be from scope or taint fail-closed enforcement, got: {}",
         tool_error.message
     );
     let message_lower = tool_error.message.to_ascii_lowercase();

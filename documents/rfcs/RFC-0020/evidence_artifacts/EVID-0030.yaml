@@ -23,12 +23,21 @@ evidence_artifact:
 
     Regression tests cover exhaustive tier/component combinations to
     prevent bypass reintroduction.
+
+    Umbrella rollout linkage (TCK-00438) additionally validates:
+    - typed launch-channel boundary evidence is required and decoded
+      fail-closed when witness metadata is missing,
+    - launch + receipt projections remain non-admissible when lineage or
+      boundary evidence is incomplete,
+    - replayed projection requests remain deterministic across unchanged
+      ledger state.
   requirement_ids:
     - "REQ-0030"
   source_refs:
     - "crates/apm2-daemon/src/episode/path_ratchet.rs"
     - "crates/apm2-daemon/src/episode/broker.rs"
     - "documents/rfcs/RFC-0020/requirements/REQ-0030.yaml"
+    - "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
   artifacts:
     - type: "test_output"
       description: |
@@ -92,3 +101,21 @@ evidence_artifact:
         Full daemon regression suite covering REQ-0030 contract surfaces.
       ref:
         - "cargo test -p apm2-daemon"
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
+      description: |
+        `tck_00438_launch_rollout_e2e_lineage_liveness_and_projection`
+        validates boundary-admissible launch execution with receipt-backed
+        projection outputs and deterministic replay.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
+      description: |
+        `tck_00438_launch_rollout_fails_closed_on_missing_or_inconsistent_slices`
+        validates fail-closed boundary defects (missing channel witness)
+        and non-admissible projection states when lineage/boundary evidence
+        is malformed.
+    - type: "test_output"
+      description: |
+        Umbrella launch rollout integration suite command.
+      ref:
+        - "cargo test -p apm2-daemon --test tck_00438_launch_rollout"
