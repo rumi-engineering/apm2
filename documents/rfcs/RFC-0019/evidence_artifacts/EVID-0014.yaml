@@ -13,6 +13,8 @@ evidence_artifact:
     - ambiguous role profile hash mismatch denial,
     - stale context recipe hash mismatch denial,
     - missing lineage hash-chain denial.
+    - umbrella launch rollout linkage from claim/spawn/session to
+      authoritative receipts and projection surfaces.
   requirement_ids:
     - "REQ-0018"
     - "REQ-0019"
@@ -20,6 +22,7 @@ evidence_artifact:
     - "documents/rfcs/RFC-0019/requirements/REQ-0018.yaml"
     - "documents/rfcs/RFC-0019/requirements/REQ-0019.yaml"
     - "crates/apm2-daemon/tests/tck_00437_rolespec_vnext.rs"
+    - "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
   artifacts:
     - type: "integration_test"
       path: "crates/apm2-daemon/tests/tck_00437_rolespec_vnext.rs"
@@ -39,3 +42,21 @@ evidence_artifact:
         Authoritative spawn-path enforcement via
         `validate_claim_authority_context_lineage` and fail-closed deny
         response mapping for authority-context faults.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
+      description: |
+        `tck_00438_launch_rollout_e2e_lineage_liveness_and_projection`
+        validates cross-slice lineage continuity from claim role/context
+        bindings through session start, authoritative receipt payload hashes,
+        and admissible auditor/orchestrator projections.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
+      description: |
+        `tck_00438_launch_rollout_fails_closed_on_missing_or_inconsistent_slices`
+        validates launch-lineage tamper denial and projection fail-closed
+        behavior under malformed lineage evidence.
+    - type: "test_output"
+      description: |
+        Umbrella launch rollout integration suite command.
+      ref:
+        - "cargo test -p apm2-daemon --test tck_00438_launch_rollout"

@@ -73,6 +73,7 @@ fn emit_review_receipt_with_tick(
         .event_emitter()
         .emit_review_receipt(
             "LEASE-TCK-00452",
+            "W-00452",
             receipt_id,
             &hash32(0x11),
             &hash32(0x12),

@@ -19,6 +19,13 @@ evidence_artifact:
       non-admitted files so excluded siblings cannot exhaust search budget
     - Read/Search/ListFiles consume only pre-verified bytes when TOCTOU
       verification is required (fail-closed)
+
+    Umbrella rollout linkage (TCK-00438) additionally validates:
+    - launch-lineage continuity from role/context admission through
+      session start, authoritative receipts, and projection outputs,
+    - replay-consistent projection responses over unchanged ledger state,
+    - stale/adversarial fail-closed outcomes across launch, boundary,
+      and liveness slices.
   requirement_ids:
     - "REQ-0029"
   source_refs:
@@ -27,6 +34,7 @@ evidence_artifact:
     - "crates/apm2-daemon/src/episode/broker.rs"
     - "crates/apm2-daemon/src/episode/handlers.rs"
     - "crates/apm2-daemon/src/episode/verified_content.rs"
+    - "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
   artifacts:
     - type: "test_output"
       description: |
@@ -58,3 +66,22 @@ evidence_artifact:
         Full daemon regression suite covering REQ-0029 contract surfaces.
       ref:
         - "cargo test -p apm2-daemon"
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
+      description: |
+        `tck_00438_launch_rollout_e2e_lineage_liveness_and_projection`
+        validates end-to-end launch lineage continuity and replay-consistent
+        auditor/orchestrator projection outputs with admissible boundary +
+        liveness evidence.
+    - type: "integration_test"
+      path: "crates/apm2-daemon/tests/tck_00438_launch_rollout.rs"
+      description: |
+        `tck_00438_launch_rollout_fails_closed_on_missing_or_inconsistent_slices`
+        validates fail-closed outcomes for tampered launch lineage, missing
+        channel witness metadata, stale heartbeat progression checks, and
+        malformed receipt projection surfaces.
+    - type: "test_output"
+      description: |
+        Umbrella launch rollout integration suite command.
+      ref:
+        - "cargo test -p apm2-daemon --test tck_00438_launch_rollout"
