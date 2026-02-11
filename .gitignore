@@ -65,6 +65,7 @@ secrets.json
 # Local agent prompt/debug artifacts
 AGENT_PROMPT.md
 FIX_PROMPT*.md
+IMPL_PROMPT*.md
 CLIPPY_FIX.md
 MERGE_CONFLICT*.md
 security_findings.md

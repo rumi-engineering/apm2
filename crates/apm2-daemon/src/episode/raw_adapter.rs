@@ -18,13 +18,13 @@
 //! #[tokio::main(flavor = "multi_thread")]
 //! async fn main() {
 //!     // Safe to use RawAdapterHolon here
-//! }
 //!
-//! // Or explicitly:
-//! let rt = tokio::runtime::Builder::new_multi_thread()
-//!     .worker_threads(4)
-//!     .build()
-//!     .unwrap();
+//!     // Or explicitly:
+//!     let rt = tokio::runtime::Builder::new_multi_thread()
+//!         .worker_threads(4)
+//!         .build()
+//!         .unwrap();
+//! }
 //! ```
 //!
 //! The `apm2-daemon` binary uses a multi-threaded runtime by default.

@@ -74,6 +74,7 @@
 //! ```
 
 pub mod aat_receipt;
+mod acceptance_package;
 mod cas;
 mod category;
 mod classification;
@@ -90,6 +91,11 @@ mod tests;
 pub use aat_receipt::{
     AATReceipt, AATReceiptError, AATReceiptGenerator, BudgetConsumed as AATBudgetConsumed,
     TestSummary, verify_aat_receipt,
+};
+pub use acceptance_package::{
+    AcceptancePackageError, AcceptancePackageV1, AdmissionVerdict, CasReceiptProvider,
+    FindingSeverity, LedgerReceiptProvider, ReceiptPointer, ReceiptProvider, ReceiptType,
+    TrustedIssuerSet, VerificationFinding, VerificationResult, verify_acceptance_package,
 };
 pub use cas::{CasError, ContentAddressedStore, MemoryCas, StoreResult};
 pub use category::EvidenceCategory;
