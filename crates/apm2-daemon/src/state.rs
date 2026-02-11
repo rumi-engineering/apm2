@@ -1727,6 +1727,12 @@ impl DispatcherState {
         mut self,
         watchdog: Arc<DivergenceWatchdog<SystemTimeSource>>,
     ) -> Self {
+        // TCK-00469: Wire watchdog into privileged dispatcher so
+        // RegisterRecoveryEvidence and RequestUnfreeze handlers can call
+        // through to the watchdog methods.
+        self.privileged_dispatcher = self
+            .privileged_dispatcher
+            .with_divergence_watchdog(Arc::clone(&watchdog));
         self.divergence_watchdog = Some(watchdog);
         self
     }

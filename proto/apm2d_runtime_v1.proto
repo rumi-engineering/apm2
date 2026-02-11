@@ -764,6 +764,8 @@ enum PrivilegedErrorCode {
   CREDENTIAL_REFRESH_NOT_SUPPORTED = 17;
   // Invalid credential provider or auth method.
   CREDENTIAL_INVALID_CONFIG = 18;
+  // Invalid argument in request (generic validation failure).
+  INVALID_ARGUMENT = 19;
 }
 
 // Generic error response for privileged endpoints.
@@ -1798,4 +1800,50 @@ message DelegateSubleaseResponse {
   uint64 expires_at_ns = 5;
   // Ledger event ID for the SubleaseIssued event.
   string event_id = 6;
+}
+
+// IPC-PRIV-074: RegisterRecoveryEvidence (TCK-00469)
+// Operator registers durable replay evidence to transition projection recovery
+// state from non-durable to durable provenance, enabling subsequent unfreeze.
+message RegisterRecoveryEvidenceRequest {
+  // Freeze ID that this evidence applies to.
+  string freeze_id = 1;
+  // BLAKE3 digest of the durable evidence bundle.
+  bytes durable_evidence_digest = 2;
+  // Required inclusive start sequence for reconstruction.
+  uint64 required_start_sequence = 3;
+  // Required inclusive end sequence for reconstruction.
+  uint64 required_end_sequence = 4;
+  // Serialized replay receipts (JSON array of ProjectionReplayReceiptV1).
+  bytes receipts_json = 5;
+}
+
+message RegisterRecoveryEvidenceResponse {
+  // True when evidence was accepted and durable provenance set.
+  bool accepted = 1;
+  // Freeze ID that was updated.
+  string freeze_id = 2;
+  // Human-readable message.
+  string message = 3;
+}
+
+// IPC-PRIV-075: RequestUnfreeze (TCK-00469)
+// Operator requests lifting a projection freeze after durable recovery evidence
+// has been registered and verified.
+message RequestUnfreezeRequest {
+  // Freeze ID to lift.
+  string freeze_id = 1;
+  // Resolution type: ADJUDICATION, MANUAL, ROLLBACK, or ACCEPT_DIVERGENCE.
+  string resolution_type = 2;
+  // Adjudication ID (required when resolution_type is ADJUDICATION).
+  string adjudication_id = 3;
+}
+
+message RequestUnfreezeResponse {
+  // True when unfreeze succeeded.
+  bool success = 1;
+  // Freeze ID that was lifted.
+  string freeze_id = 2;
+  // Human-readable message.
+  string message = 3;
 }

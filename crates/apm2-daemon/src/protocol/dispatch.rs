@@ -126,10 +126,14 @@ use super::messages::{
     PublishChangeSetResponse,
     RefreshCredentialRequest,
     RefreshCredentialResponse,
+    RegisterRecoveryEvidenceRequest,
+    RegisterRecoveryEvidenceResponse,
     ReloadProcessRequest,
     ReloadProcessResponse,
     RemoveCredentialRequest,
     RemoveCredentialResponse,
+    RequestUnfreezeRequest,
+    RequestUnfreezeResponse,
     RestartProcessRequest,
     RestartProcessResponse,
     ReviewReceiptVerdict,
@@ -5925,6 +5929,11 @@ pub enum PrivilegedMessageType {
     // --- Ledger Integrity Audit (TCK-00487) ---
     /// `VerifyLedgerChain` request (IPC-PRIV-073)
     VerifyLedgerChain   = 73,
+    // --- Projection Recovery (TCK-00469) ---
+    /// `RegisterRecoveryEvidence` request (IPC-PRIV-074)
+    RegisterRecoveryEvidence = 74,
+    /// `RequestUnfreeze` request (IPC-PRIV-075)
+    RequestUnfreeze     = 75,
 }
 
 impl PrivilegedMessageType {
@@ -6507,6 +6516,14 @@ impl PrivilegedResponse {
             },
             Self::VerifyLedgerChain(resp) => {
                 buf.push(PrivilegedMessageType::VerifyLedgerChain.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::RegisterRecoveryEvidence(resp) => {
+                buf.push(PrivilegedMessageType::RegisterRecoveryEvidence.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::RequestUnfreeze(resp) => {
+                buf.push(PrivilegedMessageType::RequestUnfreeze.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -8724,6 +8741,179 @@ impl PrivilegedDispatcher {
             },
         };
         Ok(PrivilegedResponse::VerifyLedgerChain(response))
+    }
+
+    // =========================================================================
+    // TCK-00469: Projection Recovery Handlers
+    // =========================================================================
+
+    /// Handles `RegisterRecoveryEvidence` requests (IPC-PRIV-074).
+    ///
+    /// Registers durable recovery evidence for a frozen projection, setting
+    /// `has_durable_provenance = true` to enable subsequent unfreeze.
+    ///
+    /// # Security
+    ///
+    /// - Requires privileged connection (checked in dispatch)
+    /// - Validates the watchdog is configured (fail-closed if missing)
+    /// - Delegates admission checks to `DivergenceWatchdog`
+    fn handle_register_recovery_evidence(
+        &self,
+        payload: &[u8],
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = RegisterRecoveryEvidenceRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid RegisterRecoveryEvidenceRequest: {e}"),
+            })?;
+
+        let watchdog =
+            self.divergence_watchdog
+                .as_ref()
+                .ok_or_else(|| ProtocolError::Serialization {
+                    reason: "divergence watchdog not configured".to_string(),
+                })?;
+
+        if request.freeze_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "freeze_id must not be empty",
+            ));
+        }
+
+        if request.durable_evidence_digest.len() != 32 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "durable_evidence_digest must be exactly 32 bytes",
+            ));
+        }
+
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&request.durable_evidence_digest);
+
+        let receipts: Vec<apm2_core::fac::projection_compromise::ProjectionReplayReceiptV1> =
+            serde_json::from_slice(&request.receipts_json).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid receipts_json: {e}"),
+                }
+            })?;
+
+        let sequence_bounds = apm2_core::fac::projection_compromise::ReplaySequenceBoundsV1 {
+            required_start_sequence: request.required_start_sequence,
+            required_end_sequence: request.required_end_sequence,
+        };
+
+        match watchdog.register_durable_recovery_evidence(
+            &request.freeze_id,
+            receipts,
+            digest,
+            sequence_bounds,
+        ) {
+            Ok(()) => Ok(PrivilegedResponse::RegisterRecoveryEvidence(
+                RegisterRecoveryEvidenceResponse {
+                    accepted: true,
+                    freeze_id: request.freeze_id.clone(),
+                    message: format!(
+                        "durable recovery evidence registered for freeze_id={}",
+                        request.freeze_id
+                    ),
+                },
+            )),
+            Err(e) => Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("recovery evidence registration failed: {e}"),
+            )),
+        }
+    }
+
+    /// Handles `RequestUnfreeze` requests (IPC-PRIV-075).
+    ///
+    /// Creates an unfreeze event for a frozen projection, verifies durable
+    /// provenance, and applies the unfreeze to clear the freeze state.
+    ///
+    /// # Security
+    ///
+    /// - Requires privileged connection (checked in dispatch)
+    /// - Validates the watchdog is configured (fail-closed if missing)
+    /// - Delegates admission and signature checks to `DivergenceWatchdog`
+    /// - Follows create -> apply pattern per watchdog contract
+    fn handle_request_unfreeze(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request = RequestUnfreezeRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid RequestUnfreezeRequest: {e}"),
+            })?;
+
+        let watchdog =
+            self.divergence_watchdog
+                .as_ref()
+                .ok_or_else(|| ProtocolError::Serialization {
+                    reason: "divergence watchdog not configured".to_string(),
+                })?;
+
+        if request.freeze_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "freeze_id must not be empty",
+            ));
+        }
+
+        if request.resolution_type.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "resolution_type must not be empty",
+            ));
+        }
+
+        let resolution_type = match request.resolution_type.as_str() {
+            "ADJUDICATION" => crate::projection::ResolutionType::Adjudication,
+            "MANUAL" => crate::projection::ResolutionType::Manual,
+            "ROLLBACK" => crate::projection::ResolutionType::Rollback,
+            "ACCEPT_DIVERGENCE" => crate::projection::ResolutionType::AcceptDivergence,
+            other => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!(
+                        "unknown resolution_type: {other}; expected one of: \
+                         ADJUDICATION, MANUAL, ROLLBACK, ACCEPT_DIVERGENCE"
+                    ),
+                ));
+            },
+        };
+
+        let adjudication_id = if request.adjudication_id.is_empty() {
+            None
+        } else {
+            Some(request.adjudication_id.as_str())
+        };
+
+        // Step 1: Create the unfreeze event (validates durable provenance)
+        let unfreeze =
+            match watchdog.create_unfreeze(&request.freeze_id, resolution_type, adjudication_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!("unfreeze creation failed: {e}"),
+                    ));
+                },
+            };
+
+        // Step 2: Apply unfreeze to local registry (signature verified)
+        match watchdog.apply_unfreeze(&unfreeze) {
+            Ok(()) => Ok(PrivilegedResponse::RequestUnfreeze(
+                RequestUnfreezeResponse {
+                    success: true,
+                    freeze_id: request.freeze_id.clone(),
+                    message: format!(
+                        "projection freeze lifted for freeze_id={}",
+                        request.freeze_id
+                    ),
+                },
+            )),
+            Err(e) => Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("unfreeze apply failed: {e}"),
+            )),
+        }
     }
 
     /// Returns a reference to the token minter.
@@ -29008,6 +29198,195 @@ mod tests {
             assert_eq!(
                 PrivilegedMessageType::from_tag(73),
                 Some(PrivilegedMessageType::VerifyLedgerChain)
+            );
+        }
+
+        // =================================================================
+        // TCK-00469: Projection Recovery IPC Tests
+        // =================================================================
+
+        #[test]
+        fn test_register_recovery_evidence_tag_and_routing() {
+            assert_eq!(PrivilegedMessageType::RegisterRecoveryEvidence.tag(), 74);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(74),
+                Some(PrivilegedMessageType::RegisterRecoveryEvidence)
+            );
+        }
+
+        #[test]
+        fn test_request_unfreeze_tag_and_routing() {
+            assert_eq!(PrivilegedMessageType::RequestUnfreeze.tag(), 75);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(75),
+                Some(PrivilegedMessageType::RequestUnfreeze)
+            );
+        }
+
+        #[test]
+        fn test_register_recovery_evidence_without_watchdog_fails_closed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = RegisterRecoveryEvidenceRequest {
+                freeze_id: "freeze-001".to_string(),
+                durable_evidence_digest: vec![0xAA; 32],
+                required_start_sequence: 0,
+                required_end_sequence: 10,
+                receipts_json: b"[]".to_vec(),
+            };
+            let mut frame = vec![PrivilegedMessageType::RegisterRecoveryEvidence.tag()];
+            request.encode(&mut frame).expect("encode");
+            let result = dispatcher.dispatch(&Bytes::from(frame), &ctx);
+            assert!(
+                result.is_err(),
+                "should fail closed when watchdog not configured"
+            );
+        }
+
+        #[test]
+        fn test_request_unfreeze_without_watchdog_fails_closed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = RequestUnfreezeRequest {
+                freeze_id: "freeze-001".to_string(),
+                resolution_type: "MANUAL".to_string(),
+                adjudication_id: String::new(),
+            };
+            let mut frame = vec![PrivilegedMessageType::RequestUnfreeze.tag()];
+            request.encode(&mut frame).expect("encode");
+            let result = dispatcher.dispatch(&Bytes::from(frame), &ctx);
+            assert!(
+                result.is_err(),
+                "should fail closed when watchdog not configured"
+            );
+        }
+
+        #[test]
+        fn test_register_recovery_evidence_empty_freeze_id_rejected() {
+            use apm2_core::crypto::Signer;
+
+            use crate::projection::{
+                DivergenceWatchdog, DivergenceWatchdogConfig, FreezeRegistry, SystemTimeSource,
+            };
+
+            let signer = Signer::generate();
+            let config = DivergenceWatchdogConfig::new("test-repo").unwrap();
+            let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+            let watchdog: DivergenceWatchdog<SystemTimeSource> =
+                DivergenceWatchdog::with_registry(signer, config, registry);
+            let dispatcher =
+                PrivilegedDispatcher::new().with_divergence_watchdog(Arc::new(watchdog));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = RegisterRecoveryEvidenceRequest {
+                freeze_id: String::new(), // empty => rejected
+                durable_evidence_digest: vec![0xAA; 32],
+                required_start_sequence: 0,
+                required_end_sequence: 10,
+                receipts_json: b"[]".to_vec(),
+            };
+            let mut frame = vec![PrivilegedMessageType::RegisterRecoveryEvidence.tag()];
+            request.encode(&mut frame).expect("encode");
+            let result = dispatcher.dispatch(&Bytes::from(frame), &ctx).unwrap();
+            match result {
+                PrivilegedResponse::Error(e) => {
+                    assert!(
+                        e.message.contains("freeze_id"),
+                        "error should mention freeze_id: {}",
+                        e.message
+                    );
+                },
+                other => panic!("expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_request_unfreeze_invalid_resolution_type_rejected() {
+            use apm2_core::crypto::Signer;
+
+            use crate::projection::{
+                DivergenceWatchdog, DivergenceWatchdogConfig, FreezeRegistry, SystemTimeSource,
+            };
+
+            let signer = Signer::generate();
+            let config = DivergenceWatchdogConfig::new("test-repo").unwrap();
+            let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+            let watchdog: DivergenceWatchdog<SystemTimeSource> =
+                DivergenceWatchdog::with_registry(signer, config, registry);
+            let dispatcher =
+                PrivilegedDispatcher::new().with_divergence_watchdog(Arc::new(watchdog));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = RequestUnfreezeRequest {
+                freeze_id: "freeze-001".to_string(),
+                resolution_type: "INVALID_TYPE".to_string(),
+                adjudication_id: String::new(),
+            };
+            let mut frame = vec![PrivilegedMessageType::RequestUnfreeze.tag()];
+            request.encode(&mut frame).expect("encode");
+            let result = dispatcher.dispatch(&Bytes::from(frame), &ctx).unwrap();
+            match result {
+                PrivilegedResponse::Error(e) => {
+                    assert!(
+                        e.message.contains("unknown resolution_type"),
+                        "error should mention resolution_type: {}",
+                        e.message
+                    );
+                },
+                other => panic!("expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_register_recovery_evidence_response_encoding() {
+            let resp =
+                PrivilegedResponse::RegisterRecoveryEvidence(RegisterRecoveryEvidenceResponse {
+                    accepted: true,
+                    freeze_id: "freeze-001".to_string(),
+                    message: "evidence accepted".to_string(),
+                });
+            let encoded = resp.encode();
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::RegisterRecoveryEvidence.tag(),
+                "first byte should be RegisterRecoveryEvidence tag (74)"
+            );
+            assert!(
+                encoded.len() > 1,
+                "encoded response should have payload after tag"
+            );
+        }
+
+        #[test]
+        fn test_request_unfreeze_response_encoding() {
+            let resp = PrivilegedResponse::RequestUnfreeze(RequestUnfreezeResponse {
+                success: true,
+                freeze_id: "freeze-001".to_string(),
+                message: "freeze lifted".to_string(),
+            });
+            let encoded = resp.encode();
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::RequestUnfreeze.tag(),
+                "first byte should be RequestUnfreeze tag (75)"
+            );
+            assert!(
+                encoded.len() > 1,
+                "encoded response should have payload after tag"
             );
         }
 

@@ -1749,6 +1749,66 @@ pub struct DelegateSubleaseResponse {
     #[prost(string, tag = "6")]
     pub event_id: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-074: RegisterRecoveryEvidence (TCK-00469)
+/// Operator registers durable replay evidence to transition projection recovery
+/// state from non-durable to durable provenance, enabling subsequent unfreeze.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterRecoveryEvidenceRequest {
+    /// Freeze ID that this evidence applies to.
+    #[prost(string, tag = "1")]
+    pub freeze_id: ::prost::alloc::string::String,
+    /// BLAKE3 digest of the durable evidence bundle.
+    #[prost(bytes = "vec", tag = "2")]
+    pub durable_evidence_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Required inclusive start sequence for reconstruction.
+    #[prost(uint64, tag = "3")]
+    pub required_start_sequence: u64,
+    /// Required inclusive end sequence for reconstruction.
+    #[prost(uint64, tag = "4")]
+    pub required_end_sequence: u64,
+    /// Serialized replay receipts (JSON array of ProjectionReplayReceiptV1).
+    #[prost(bytes = "vec", tag = "5")]
+    pub receipts_json: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterRecoveryEvidenceResponse {
+    /// True when evidence was accepted and durable provenance set.
+    #[prost(bool, tag = "1")]
+    pub accepted: bool,
+    /// Freeze ID that was updated.
+    #[prost(string, tag = "2")]
+    pub freeze_id: ::prost::alloc::string::String,
+    /// Human-readable message.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+/// IPC-PRIV-075: RequestUnfreeze (TCK-00469)
+/// Operator requests lifting a projection freeze after durable recovery evidence
+/// has been registered and verified.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestUnfreezeRequest {
+    /// Freeze ID to lift.
+    #[prost(string, tag = "1")]
+    pub freeze_id: ::prost::alloc::string::String,
+    /// Resolution type: ADJUDICATION, MANUAL, ROLLBACK, or ACCEPT_DIVERGENCE.
+    #[prost(string, tag = "2")]
+    pub resolution_type: ::prost::alloc::string::String,
+    /// Adjudication ID (required when resolution_type is ADJUDICATION).
+    #[prost(string, tag = "3")]
+    pub adjudication_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestUnfreezeResponse {
+    /// True when unfreeze succeeded.
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    /// Freeze ID that was lifted.
+    #[prost(string, tag = "2")]
+    pub freeze_id: ::prost::alloc::string::String,
+    /// Human-readable message.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -2275,6 +2335,8 @@ pub enum PrivilegedErrorCode {
     CredentialRefreshNotSupported = 17,
     /// Invalid credential provider or auth method.
     CredentialInvalidConfig = 18,
+    /// Invalid argument in request (generic validation failure).
+    InvalidArgument = 19,
 }
 impl PrivilegedErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2298,6 +2360,7 @@ impl PrivilegedErrorCode {
             Self::CredentialOperationFailed => "CREDENTIAL_OPERATION_FAILED",
             Self::CredentialRefreshNotSupported => "CREDENTIAL_REFRESH_NOT_SUPPORTED",
             Self::CredentialInvalidConfig => "CREDENTIAL_INVALID_CONFIG",
+            Self::InvalidArgument => "INVALID_ARGUMENT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2320,6 +2383,7 @@ impl PrivilegedErrorCode {
                 Some(Self::CredentialRefreshNotSupported)
             }
             "CREDENTIAL_INVALID_CONFIG" => Some(Self::CredentialInvalidConfig),
+            "INVALID_ARGUMENT" => Some(Self::InvalidArgument),
             _ => None,
         }
     }
