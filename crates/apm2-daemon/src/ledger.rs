@@ -355,7 +355,15 @@ impl SqliteLedgerEventEmitter {
         conn: &Connection,
         migration_changes_applied: bool,
     ) -> Result<(), String> {
-        let chain_tip = Self::derive_event_chain_hash_from_db(conn)?;
+        // O(1) startup check: compare persisted checkpoint to current tip hash.
+        // Full-chain recomputation is available via `derive_event_chain_hash_from_db`
+        // for explicit maintenance/forensics flows.
+        let chain_tip = Self::latest_event_hash_opt(conn)
+            .map_err(|e| format!("failed to read current hash-chain tip: {e}"))?
+            .unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string());
+        if chain_tip.is_empty() || chain_tip == "legacy-uninitialized" {
+            return Err("current hash-chain tip is uninitialized".to_string());
+        }
         let checkpoint = Self::get_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY)
             .map_err(|e| format!("failed to read hash-chain checkpoint metadata: {e}"))?;
         let Some(checkpoint) = checkpoint else {
