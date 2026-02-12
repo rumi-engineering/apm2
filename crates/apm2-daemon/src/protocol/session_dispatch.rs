@@ -10036,6 +10036,518 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    // ================================================================
+    // TCK-00498: Shared helper for AdmissionKernel lifecycle enforcement
+    // on session-scoped endpoints (EmitEvent, PublishEvidence).
+    //
+    // These endpoints are effect-capable (ledger writes, CAS writes) and
+    // MUST route through AdmissionKernel in authoritative mode for
+    // fail-closed tiers (REQ-0026).
+    //
+    // Returns `Some(AdmissionResultV1)` when the kernel admits the
+    // request, `None` when the kernel is not required (non-authoritative
+    // mode or monitor-tier without kernel), or `Err(SessionResponse)` on
+    // deny.
+    // ================================================================
+    #[allow(clippy::too_many_lines, clippy::result_large_err)]
+    fn enforce_session_endpoint_kernel_lifecycle(
+        &self,
+        endpoint_class: &str,
+        token: &SessionToken,
+        content_digest: Hash,
+    ) -> Result<Option<crate::admission_kernel::types::AdmissionResultV1>, SessionResponse> {
+        // Only applies in authoritative mode.
+        if !self.is_authoritative_mode() {
+            return Ok(None);
+        }
+
+        // TCK-00498: In authoritative mode, session-scoped effect-capable
+        // endpoints (EmitEvent, PublishEvidence) are treated as inherently
+        // fail-closed because they perform authoritative state mutations
+        // (ledger writes, CAS writes). The kernel guard MUST be enforced.
+        //
+        // If neither AdmissionKernel nor PCAC LifecycleGate is wired,
+        // deny the request (fail-closed, no bypass).
+        if self.admission_kernel.is_none() && self.pcac_lifecycle_gate.is_none() {
+            error!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "session endpoint denied: no authority lifecycle gate wired in \
+                 authoritative mode (TCK-00498, fail-closed)"
+            );
+            return Err(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!(
+                    "no authority lifecycle gate wired for {endpoint_class} in authoritative \
+                     mode (fail-closed, no legacy fallback)"
+                ),
+            ));
+        }
+
+        // If PCAC LifecycleGate is wired, it handles lifecycle enforcement
+        // at the PCAC level. The kernel cutover only applies when the kernel
+        // is the sole authority gate (no PCAC gate).
+        if self.pcac_lifecycle_gate.is_some() {
+            // PCAC gate handles lifecycle -- kernel cutover not needed.
+            return Ok(None);
+        }
+
+        // At this point: authoritative mode, kernel is wired, no PCAC gate.
+        // Route through kernel plan/execute.
+        let Some(kernel) = self.admission_kernel.as_ref() else {
+            // Should not reach here given the guard above, but fail-closed.
+            return Err(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("admission kernel unavailable for {endpoint_class} (fail-closed)"),
+            ));
+        };
+
+        // Resolve dependencies for KernelRequestV1.
+        let clock = self.clock.as_ref().ok_or_else(|| {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel denied: clock unavailable (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!(
+                    "admission kernel denied for {endpoint_class}: clock unavailable (fail-closed)"
+                ),
+            )
+        })?;
+
+        let hlc = clock.now_hlc().map_err(|e| {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                error = %e,
+                "AdmissionKernel denied: clock read failed (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("admission kernel denied for {endpoint_class}: clock read failed: {e}"),
+            )
+        })?;
+
+        let session_registry = self.session_registry.as_ref().ok_or_else(|| {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel denied: session registry unavailable (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("admission kernel denied for {endpoint_class}: session registry unavailable (fail-closed)"),
+            )
+        })?;
+
+        let session_state = session_registry.get_session(&token.session_id).ok_or_else(|| {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel denied: session state unavailable (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("admission kernel denied for {endpoint_class}: session state unavailable (fail-closed)"),
+            )
+        })?;
+
+        let freshness_witness_tick = hlc.wall_ns / 1_000_000_000;
+        if freshness_witness_tick == 0 {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel denied: freshness witness tick is zero"
+            );
+            return Err(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!(
+                    "admission kernel denied for {endpoint_class}: freshness witness tick is zero (fail-closed)"
+                ),
+            ));
+        }
+
+        let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
+        let directory_head_hash =
+            *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
+        let identity_proof_hash = *blake3::hash(token.session_id.as_bytes()).as_bytes();
+        let capability_manifest_hash: Hash = session_state
+            .capability_manifest_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                warn!(
+                    session_id = %token.session_id,
+                    endpoint = %endpoint_class,
+                    "AdmissionKernel denied: capability_manifest_hash malformed"
+                );
+                SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    format!("admission kernel denied for {endpoint_class}: malformed capability manifest hash (fail-closed)"),
+                )
+            })?;
+
+        let freshness_policy_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-freshness-policy-v1");
+            hasher.update(session_state.policy_resolved_ref.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let revocation_head_hash =
+            *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
+
+        let stop_budget_digest = {
+            let stop_authority = self.stop_authority.as_ref();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-stop-budget-profile-v1");
+            let (emergency, governance) = stop_authority.map_or((false, false), |a| {
+                (a.emergency_stop_active(), a.governance_stop_active())
+            });
+            hasher.update(&[u8::from(emergency)]);
+            hasher.update(&[u8::from(governance)]);
+            hasher.update(endpoint_class.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        // Derive endpoint-specific intent digest (domain-separated).
+        let intent_digest = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"admission-kernel-session-endpoint-intent-v1");
+            hasher.update(endpoint_class.as_bytes());
+            hasher.update(token.session_id.as_bytes());
+            hasher.update(&content_digest);
+            *hasher.finalize().as_bytes()
+        };
+
+        // Effect descriptor: hash of endpoint class + content.
+        let effect_descriptor_digest = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"admission-kernel-session-endpoint-effect-v1");
+            hasher.update(endpoint_class.as_bytes());
+            hasher.update(&content_digest);
+            *hasher.finalize().as_bytes()
+        };
+
+        let hsi_contract_manifest_digest =
+            *blake3::hash(b"apm2-hsi-contract-manifest-v1").as_bytes();
+        let hsi_envelope_binding_digest =
+            *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes();
+
+        let request_id_hash = {
+            let request_id = format!("{}-{}", endpoint_class, uuid::Uuid::new_v4());
+            *blake3::hash(request_id.as_bytes()).as_bytes()
+        };
+
+        // Session endpoints are inherently Tier2Plus in authoritative mode:
+        // they perform authoritative state mutations (ledger/CAS writes).
+        let pcac_risk_tier = apm2_core::pcac::RiskTier::Tier2Plus;
+
+        // TCK-00498: Enforce authoritative policy-root prerequisite for
+        // fail-closed tiers. EmitEvent/PublishEvidence are effect-capable
+        // endpoints that require governance policy root when the kernel is
+        // enforcing fail-closed semantics.
+        let ledger_ref = self.ledger.as_ref().ok_or_else(|| {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel denied: ledger unavailable for policy root resolution (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("admission kernel denied for {endpoint_class}: ledger unavailable for policy root resolution (fail-closed)"),
+            )
+        })?;
+        let authoritative_policy_root_digest =
+            Self::resolve_authoritative_policy_root_digest_from_ledger(ledger_ref.as_ref());
+        if authoritative_policy_root_digest.is_none() {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel denied: authoritative governance policy root unavailable (fail-closed)"
+            );
+            return Err(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!(
+                    "admission kernel denied for {endpoint_class}: authoritative governance \
+                     policy root unavailable (fail-closed)"
+                ),
+            ));
+        }
+
+        let pcac_policy = session_state.pcac_policy.unwrap_or_default();
+
+        let kernel_request = crate::admission_kernel::types::KernelRequestV1 {
+            request_id: request_id_hash,
+            session_id: token.session_id.clone(),
+            tool_class: endpoint_class.to_string(),
+            boundary_profile_id: format!("session-{}", token.session_id),
+            risk_tier: pcac_risk_tier,
+            effect_descriptor_digest,
+            intent_digest,
+            hsi_contract_manifest_digest,
+            hsi_envelope_binding_digest,
+            stop_budget_digest,
+            pcac_policy,
+            declared_idempotent: false,
+            lease_id: token.lease_id.clone(),
+            identity_proof_hash,
+            capability_manifest_hash,
+            time_envelope_ref,
+            freshness_witness_tick,
+            directory_head_hash,
+            freshness_policy_hash,
+            revocation_head_hash,
+            identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+            pointer_only_waiver_hash: None,
+        };
+
+        // Phase 1: plan()
+        let mut plan = kernel.plan(&kernel_request).map_err(|e| {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                error = %e,
+                "AdmissionKernel plan() denied for session endpoint (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("admission kernel plan denied for {endpoint_class}: {e}"),
+            )
+        })?;
+
+        // Derive fresh revalidation inputs for execute() phase.
+        let (exec_time_envelope_ref, _exec_ledger_anchor, exec_revocation_head) = self
+            .derive_fresh_pcac_revalidation_inputs(&token.session_id)
+            .map_err(|e| {
+                warn!(
+                    session_id = %token.session_id,
+                    endpoint = %endpoint_class,
+                    error = %e,
+                    "AdmissionKernel denied: revalidation inputs unavailable"
+                );
+                SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    format!(
+                        "admission kernel denied for {endpoint_class}: revalidation inputs unavailable: {e}"
+                    ),
+                )
+            })?;
+
+        // Phase 2: execute()
+        let result = kernel
+            .execute(&mut plan, exec_time_envelope_ref, exec_revocation_head)
+            .map_err(|e| {
+                warn!(
+                    session_id = %token.session_id,
+                    endpoint = %endpoint_class,
+                    error = %e,
+                    "AdmissionKernel execute() denied for session endpoint (fail-closed)"
+                );
+                SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    format!("admission kernel execute denied for {endpoint_class}: {e}"),
+                )
+            })?;
+
+        info!(
+            session_id = %token.session_id,
+            endpoint = %endpoint_class,
+            bundle_digest = %hex::encode(result.bundle_digest),
+            ajc_id = %hex::encode(result.bundle.ajc_id),
+            enforcement_tier = %result.boundary_span.enforcement_tier,
+            "AdmissionKernel plan+execute completed for session endpoint: admission granted"
+        );
+
+        Ok(Some(result))
+    }
+
+    /// Persist `AdmissionBundleV1` evidence to the ledger BEFORE the
+    /// session-endpoint effect (TCK-00498, same pattern as TCK-00494
+    /// `ToolActuation`).
+    ///
+    /// Fail-closed: serialization or persistence failure denies the request.
+    #[allow(clippy::result_large_err)]
+    fn persist_session_endpoint_admission_evidence(
+        &self,
+        endpoint_class: &str,
+        token: &SessionToken,
+        result: &crate::admission_kernel::types::AdmissionResultV1,
+    ) -> Result<(), SessionResponse> {
+        let evidence_timestamp = self.get_htf_timestamp().map_err(|e| {
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                format!("admission kernel {endpoint_class} evidence: clock failed: {e}"),
+            )
+        })?;
+        let evidence_ts_ns = evidence_timestamp.wall_ns;
+
+        let actuation_payload = serde_json::json!({
+            "event_kind": "SessionEndpointActuation",
+            "source": "admission_kernel",
+            "endpoint_class": endpoint_class,
+            "bundle_digest": hex::encode(result.bundle_digest),
+            "ajc_id": hex::encode(result.bundle.ajc_id),
+            "session_id": result.bundle.session_id,
+            "intent_digest": hex::encode(result.bundle.intent_digest),
+            "consume_time_intent_digest": hex::encode(result.bundle.consume_time_intent_digest),
+            "enforcement_tier": format!("{}", result.boundary_span.enforcement_tier),
+            "risk_tier": format!("{:?}", result.bundle.risk_tier),
+            "consume_selector_digest": hex::encode(result.bundle.consume_selector_digest),
+            "authority_join_hash": hex::encode(result.bundle.authority_join_hash),
+            "time_envelope_ref": hex::encode(result.bundle.time_envelope_ref),
+            "freshness_witness_tick": result.bundle.freshness_witness_tick,
+            "revocation_head_hash": hex::encode(result.bundle.revocation_head_hash),
+            "spine_ext_hash": hex::encode(result.bundle.spine_ext_hash),
+            "policy_root_digest": hex::encode(result.bundle.policy_root_digest),
+            "policy_root_epoch": result.bundle.policy_root_epoch,
+        });
+        let payload_bytes = serde_json::to_vec(&actuation_payload).map_err(|e| {
+            error!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                error = %e,
+                "AdmissionKernel {endpoint_class} payload serialization failed (fail-closed)"
+            );
+            SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!(
+                    "admission kernel authority denied before {endpoint_class} effect: \
+                     payload serialization failed: {e}"
+                ),
+            )
+        })?;
+
+        let event_type = format!("kernel_session_endpoint_actuation_{endpoint_class}");
+
+        if let Some(ref ledger) = self.ledger {
+            ledger
+                .emit_session_event(
+                    &token.session_id,
+                    &event_type,
+                    &payload_bytes,
+                    "admission_kernel:lifecycle",
+                    evidence_ts_ns,
+                )
+                .map_err(|e| {
+                    warn!(
+                        session_id = %token.session_id,
+                        endpoint = %endpoint_class,
+                        error = %e,
+                        "AdmissionKernel {endpoint_class} actuation ledger event persistence \
+                         failed (fail-closed)"
+                    );
+                    SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!(
+                            "admission kernel {endpoint_class} actuation evidence \
+                             persistence failed: {e}"
+                        ),
+                    )
+                })?;
+
+            info!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                bundle_digest = %hex::encode(result.bundle_digest),
+                ajc_id = %hex::encode(result.bundle.ajc_id),
+                "AdmissionKernel {endpoint_class} actuation event persisted before effect"
+            );
+        } else if result.boundary_span.enforcement_tier
+            == crate::admission_kernel::types::EnforcementTier::FailClosed
+        {
+            // Fail-closed tier without ledger: cannot persist evidence.
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                "AdmissionKernel {endpoint_class} actuation denied: ledger unavailable \
+                 for fail-closed tier"
+            );
+            return Err(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                format!(
+                    "admission kernel {endpoint_class} actuation evidence persistence \
+                     failed: ledger unavailable for fail-closed tier"
+                ),
+            ));
+        }
+        // Monitor tier without ledger: log warning but proceed.
+
+        Ok(())
+    }
+
+    /// Construct and persist `AdmissionOutcomeIndexV1` after a successful
+    /// session-endpoint effect (TCK-00498).
+    fn persist_session_endpoint_outcome_index(
+        &self,
+        endpoint_class: &str,
+        token: &SessionToken,
+        result: &crate::admission_kernel::types::AdmissionResultV1,
+    ) {
+        let outcome_index = crate::admission_kernel::types::AdmissionOutcomeIndexV1 {
+            schema_version: crate::admission_kernel::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+            bundle_digest: result.bundle_digest,
+            request_id: result.bundle.request_id,
+            ajc_id: result.bundle.ajc_id,
+            // Session endpoints do not produce post-effect witness evidence
+            // hashes (no daemon-measured boundary witnesses for these paths).
+            post_effect_witness_evidence_hashes: vec![],
+            receipt_digests: vec![],
+        };
+
+        if let Err(e) = outcome_index.validate() {
+            warn!(
+                session_id = %token.session_id,
+                endpoint = %endpoint_class,
+                error = %e,
+                "AdmissionOutcomeIndexV1 validation failed for {endpoint_class} \
+                 (non-fatal for outcome index)"
+            );
+            return;
+        }
+
+        let outcome_bytes = match outcome_index.to_canonical_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    session_id = %token.session_id,
+                    endpoint = %endpoint_class,
+                    error = %e,
+                    "AdmissionOutcomeIndexV1 serialization failed for {endpoint_class}"
+                );
+                return;
+            },
+        };
+
+        if let Some(ref ledger) = self.ledger {
+            let outcome_ts_ns = self.get_htf_timestamp().map_or(0, |ts| ts.wall_ns);
+            let event_type = format!("post_effect_outcome_index_{endpoint_class}");
+            if let Err(e) = ledger.emit_session_event(
+                &token.session_id,
+                &event_type,
+                &outcome_bytes,
+                "admission_kernel:session_endpoint_closure",
+                outcome_ts_ns,
+            ) {
+                warn!(
+                    session_id = %token.session_id,
+                    endpoint = %endpoint_class,
+                    error = %e,
+                    "AdmissionOutcomeIndexV1 ledger persistence failed for {endpoint_class}"
+                );
+            } else {
+                info!(
+                    session_id = %token.session_id,
+                    endpoint = %endpoint_class,
+                    outcome_index_digest = %hex::encode(outcome_index.content_hash()),
+                    bundle_digest = %hex::encode(outcome_index.bundle_digest),
+                    "session endpoint {endpoint_class} admission closure complete: outcome index persisted"
+                );
+            }
+        }
+    }
+
     /// Handles `EmitEvent` requests (IPC-SESS-002).
     ///
     /// # TCK-00290: Real Ledger Persistence
@@ -10044,6 +10556,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// signed and stored with HTF-compliant timestamps. The handler requires
     /// a ledger to be configured; without it, returns `SESSION_ERROR_INTERNAL`
     /// (fail-closed).
+    ///
+    /// # TCK-00498: `AdmissionKernel` Cutover
+    ///
+    /// In authoritative mode, `EmitEvent` routes through `AdmissionKernel`
+    /// plan/execute API, enforcing PCAC lifecycle, bundle binding, and
+    /// policy-root trust prerequisites for fail-closed tiers (REQ-0026).
     ///
     /// # Security (INV-TCK-00290-002)
     ///
@@ -10141,6 +10659,32 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         };
 
+        // ================================================================
+        // TCK-00498: AdmissionKernel lifecycle enforcement for EmitEvent.
+        //
+        // EmitEvent is an effect-capable endpoint (ledger write). In
+        // authoritative mode, it MUST route through AdmissionKernel
+        // plan/execute for fail-closed tiers (REQ-0026).
+        // ================================================================
+        let content_digest = *blake3::hash(&request.payload).as_bytes();
+        let admission_result = match self.enforce_session_endpoint_kernel_lifecycle(
+            "emit_event",
+            &token,
+            content_digest,
+        ) {
+            Ok(result) => result,
+            Err(deny_response) => return Ok(deny_response),
+        };
+
+        // Persist admission evidence BEFORE the effect (ledger write).
+        if let Some(ref result) = admission_result {
+            if let Err(deny_response) =
+                self.persist_session_endpoint_admission_evidence("emit_event", &token, result)
+            {
+                return Ok(deny_response);
+            }
+        }
+
         // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
         let now_ns = self.get_htf_timestamp()?.wall_ns;
 
@@ -10167,10 +10711,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
+                // TCK-00498: Persist AdmissionOutcomeIndexV1 after successful
+                // effect (ledger write). This durably records the admission
+                // closure for the session endpoint.
+                if let Some(ref result) = admission_result {
+                    self.persist_session_endpoint_outcome_index("emit_event", &token, result);
+                }
+
                 info!(
                     session_id = %token.session_id,
                     event_id = %signed_event.event_id,
                     seq = seq,
+                    admission_bundle_digest = ?admission_result.as_ref().map(|r| hex::encode(r.bundle_digest)),
                     "EmitEvent persisted to ledger"
                 );
                 Ok(SessionResponse::EmitEvent(EmitEventResponse {
@@ -10201,6 +10753,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// content-addressed store. Artifacts are stored with BLAKE3 content
     /// addressing and verified on retrieval. The handler requires a CAS to be
     /// configured; without it, returns `SESSION_ERROR_INTERNAL` (fail-closed).
+    ///
+    /// # TCK-00498: `AdmissionKernel` Cutover
+    ///
+    /// In authoritative mode, `PublishEvidence` routes through
+    /// `AdmissionKernel` plan/execute API, enforcing PCAC lifecycle, bundle
+    /// binding, and policy-root trust prerequisites for fail-closed tiers
+    /// (REQ-0026).
     ///
     /// # Security (INV-TCK-00290-003)
     ///
@@ -10274,6 +10833,33 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         };
 
+        // ================================================================
+        // TCK-00498: AdmissionKernel lifecycle enforcement for
+        // PublishEvidence.
+        //
+        // PublishEvidence is an effect-capable endpoint (CAS write). In
+        // authoritative mode, it MUST route through AdmissionKernel
+        // plan/execute for fail-closed tiers (REQ-0026).
+        // ================================================================
+        let content_digest = *blake3::hash(&request.artifact).as_bytes();
+        let admission_result = match self.enforce_session_endpoint_kernel_lifecycle(
+            "publish_evidence",
+            &token,
+            content_digest,
+        ) {
+            Ok(result) => result,
+            Err(deny_response) => return Ok(deny_response),
+        };
+
+        // Persist admission evidence BEFORE the effect (CAS write).
+        if let Some(ref result) = admission_result {
+            if let Err(deny_response) =
+                self.persist_session_endpoint_admission_evidence("publish_evidence", &token, result)
+            {
+                return Ok(deny_response);
+            }
+        }
+
         // Store artifact in CAS
         let evidence_publish_started = Instant::now();
         let hash = cas.store(&request.artifact);
@@ -10332,6 +10918,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // TCK-00498: Persist AdmissionOutcomeIndexV1 after successful
+        // effect (CAS write).
+        if let Some(ref result) = admission_result {
+            self.persist_session_endpoint_outcome_index("publish_evidence", &token, result);
+        }
+
         // Build storage path using hash prefix sharding (consistent with DurableCas)
         let hex_hash = hex::encode(hash);
         let storage_path = format!("evidence/{}/{}", &hex_hash[..4], &hex_hash[4..]);
@@ -10340,6 +10932,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_id = %token.session_id,
             artifact_hash = %hex_hash,
             storage_path = %storage_path,
+            admission_bundle_digest = ?admission_result.as_ref().map(|r| hex::encode(r.bundle_digest)),
             "PublishEvidence stored in CAS"
         );
 
@@ -23378,6 +23971,397 @@ mod tests {
                     .is_some(),
                 "policy_root_digest must be present"
             );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00498: AdmissionKernel cutover for EmitEvent + PublishEvidence
+    // ========================================================================
+
+    mod tck_00498_session_endpoint_kernel_cutover {
+        use std::time::Duration;
+
+        use secrecy::SecretString;
+
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::protocol::credentials::PeerCredentials;
+        use crate::protocol::dispatch::StubLedgerEventEmitter;
+        use crate::session::{SessionRegistry, SessionState};
+
+        fn test_minter() -> TokenMinter {
+            TokenMinter::new(SecretString::from("test-daemon-secret-key-32bytes!!"))
+        }
+
+        fn test_token(minter: &TokenMinter) -> SessionToken {
+            let spawn_time = SystemTime::now();
+            let ttl = Duration::from_secs(3600);
+            minter
+                .mint("session-001", "lease-001", spawn_time, ttl)
+                .unwrap()
+        }
+
+        fn make_session_ctx() -> ConnectionContext {
+            ConnectionContext::session_open(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some("session-001".to_string()),
+            )
+        }
+
+        fn register_session(
+            registry: &Arc<InMemorySessionRegistry>,
+            session_id: &str,
+        ) -> Arc<dyn SessionRegistry> {
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-TCK-00498".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "L-TCK-00498".to_string(),
+                    ephemeral_handle: "handle-tck-00498".to_string(),
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: blake3::hash(b"tck-00498-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration should succeed");
+            Arc::clone(registry) as Arc<dyn SessionRegistry>
+        }
+
+        // ----------------------------------------------------------------
+        // EmitEvent: deny on missing kernel for fail-closed authoritative
+        // ----------------------------------------------------------------
+
+        /// **TCK-00498, REQ-0026**: `EmitEvent` MUST be denied in
+        /// authoritative mode when no authority lifecycle gate (kernel or
+        /// PCAC) is wired.
+        #[test]
+        fn emit_event_denied_when_kernel_missing_in_authoritative_mode() {
+            let minter = test_minter();
+
+            // Wire ledger to make is_authoritative_mode() return true,
+            // but do NOT wire admission_kernel or pcac_lifecycle_gate.
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger)
+                .with_session_registry(session_registry_dyn);
+            // NOTE: no .with_admission_kernel() or .with_pcac_lifecycle_gate()
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload".to_vec(),
+                correlation_id: "corr-001".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "EmitEvent MUST be denied when no authority gate is wired: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("no authority lifecycle gate wired"),
+                        "Error must identify kernel-missing denial: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("emit_event"),
+                        "Error must identify the endpoint class: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected SessionErrorToolNotAllowed for EmitEvent without kernel, got: {other:?}"
+                ),
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // PublishEvidence: deny on missing kernel for fail-closed
+        // ----------------------------------------------------------------
+
+        /// **TCK-00498, REQ-0026**: `PublishEvidence` MUST be denied in
+        /// authoritative mode when no authority lifecycle gate is wired.
+        #[test]
+        fn publish_evidence_denied_when_kernel_missing_in_authoritative_mode() {
+            let minter = test_minter();
+
+            // Wire CAS to make is_authoritative_mode() return true via CAS.
+            // Wire ledger too since PublishEvidence also checks CAS.
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+            let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger)
+                .with_cas(cas)
+                .with_session_registry(session_registry_dyn);
+            // NOTE: no .with_admission_kernel() or .with_pcac_lifecycle_gate()
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-data".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "PublishEvidence MUST be denied when no authority gate is wired: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("no authority lifecycle gate wired"),
+                        "Error must identify kernel-missing denial: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("publish_evidence"),
+                        "Error must identify the endpoint class: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected SessionErrorToolNotAllowed for PublishEvidence without kernel, got: {other:?}"
+                ),
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // EmitEvent: non-authoritative mode does NOT require kernel
+        // ----------------------------------------------------------------
+
+        /// **TCK-00498**: `EmitEvent` in non-authoritative mode (no ledger/CAS
+        /// configured) should not be blocked by the kernel guard. The handler
+        /// will fail for other reasons (no ledger) but NOT from the kernel
+        /// guard.
+        #[test]
+        fn emit_event_non_authoritative_not_blocked_by_kernel_guard() {
+            let minter = test_minter();
+
+            // No ledger, no CAS -> non-authoritative mode.
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let dispatcher =
+                SessionDispatcher::new(minter.clone()).with_session_registry(session_registry_dyn);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload".to_vec(),
+                correlation_id: "corr-002".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Should fail for ledger unavailability, NOT for kernel guard.
+            if let SessionResponse::Error(err) = &response {
+                assert!(
+                    !err.message.contains("no authority lifecycle gate wired"),
+                    "Non-authoritative mode must NOT trigger kernel guard denial. Got: {}",
+                    err.message
+                );
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // PublishEvidence: non-authoritative mode does NOT require kernel
+        // ----------------------------------------------------------------
+
+        /// **TCK-00498**: `PublishEvidence` in non-authoritative mode should
+        /// not be blocked by the kernel guard.
+        #[test]
+        fn publish_evidence_non_authoritative_not_blocked_by_kernel_guard() {
+            let minter = test_minter();
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let dispatcher =
+                SessionDispatcher::new(minter.clone()).with_session_registry(session_registry_dyn);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-data".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Should fail for CAS unavailability, NOT for kernel guard.
+            if let SessionResponse::Error(err) = &response {
+                assert!(
+                    !err.message.contains("no authority lifecycle gate wired"),
+                    "Non-authoritative mode must NOT trigger kernel guard denial. Got: {}",
+                    err.message
+                );
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // EmitEvent: PCAC lifecycle gate satisfies kernel guard
+        // ----------------------------------------------------------------
+
+        /// **TCK-00498**: When a PCAC lifecycle gate IS wired (but not the
+        /// kernel), the handler should NOT trigger the kernel-missing denial
+        /// for `EmitEvent`.
+        #[test]
+        fn emit_event_pcac_gate_satisfies_kernel_guard() {
+            let minter = test_minter();
+
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            // Wire a PCAC lifecycle gate (stub) to satisfy the guard.
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(Arc::new(
+                crate::pcac::InProcessKernel::new(1),
+            )));
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger)
+                .with_session_registry(session_registry_dyn)
+                .with_pcac_lifecycle_gate(pcac_gate);
+            // NOTE: No kernel, but PCAC gate is wired -- should NOT trigger
+            // the "no authority lifecycle gate" denial.
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload".to_vec(),
+                correlation_id: "corr-003".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let dispatch_result = dispatcher.dispatch(&frame, &ctx);
+
+            // The dispatch may fail for unrelated reasons (e.g., clock not
+            // configured), but it must NOT fail with the kernel-guard denial.
+            match dispatch_result {
+                Ok(response) => {
+                    if let SessionResponse::Error(err) = &response {
+                        assert!(
+                            !err.message.contains("no authority lifecycle gate wired"),
+                            "PCAC gate should satisfy kernel guard for EmitEvent. Got: {}",
+                            err.message
+                        );
+                    }
+                },
+                Err(e) => {
+                    // Protocol-level errors (clock, serialization) are not
+                    // the kernel-guard denial -- acceptable for this test.
+                    let err_msg = format!("{e}");
+                    assert!(
+                        !err_msg.contains("no authority lifecycle gate wired"),
+                        "PCAC gate should satisfy kernel guard for EmitEvent. Got: {err_msg}",
+                    );
+                },
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // PublishEvidence: PCAC lifecycle gate satisfies kernel guard
+        // ----------------------------------------------------------------
+
+        /// **TCK-00498**: When a PCAC lifecycle gate IS wired, the handler
+        /// should NOT trigger the kernel-missing denial for `PublishEvidence`.
+        #[test]
+        fn publish_evidence_pcac_gate_satisfies_kernel_guard() {
+            let minter = test_minter();
+
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+            let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(Arc::new(
+                crate::pcac::InProcessKernel::new(1),
+            )));
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger)
+                .with_cas(cas)
+                .with_session_registry(session_registry_dyn)
+                .with_pcac_lifecycle_gate(pcac_gate);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-data".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let dispatch_result = dispatcher.dispatch(&frame, &ctx);
+
+            match dispatch_result {
+                Ok(response) => {
+                    if let SessionResponse::Error(err) = &response {
+                        assert!(
+                            !err.message.contains("no authority lifecycle gate wired"),
+                            "PCAC gate should satisfy kernel guard for PublishEvidence. Got: {}",
+                            err.message
+                        );
+                    }
+                },
+                Err(e) => {
+                    let err_msg = format!("{e}");
+                    assert!(
+                        !err_msg.contains("no authority lifecycle gate wired"),
+                        "PCAC gate should satisfy kernel guard for PublishEvidence. Got: {err_msg}",
+                    );
+                },
+            }
         }
     }
 }
