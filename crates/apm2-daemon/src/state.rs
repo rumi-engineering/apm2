@@ -59,6 +59,7 @@ use crate::governance::{
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use crate::metrics::SharedMetricsRegistry;
+use crate::projection::{DivergenceWatchdog, SystemTimeSource};
 use crate::protocol::dispatch::{
     PolicyResolutionError, PolicyResolver, PrivilegedDispatcher, PrivilegedPcacPolicy,
 };
@@ -583,6 +584,15 @@ pub struct DispatcherState {
 
     /// Runtime anti-entropy economics hook wired to the production PCAC gate.
     anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>>,
+
+    /// TCK-00469: Shared divergence watchdog for IPC-accessible unfreeze and
+    /// durable recovery evidence registration.
+    ///
+    /// When present, operator IPC handlers can call
+    /// `register_durable_recovery_evidence`, `create_unfreeze`, and
+    /// `apply_unfreeze` on the same watchdog instance that the background
+    /// polling task uses.
+    divergence_watchdog: Option<Arc<DivergenceWatchdog<SystemTimeSource>>>,
 }
 
 impl DispatcherState {
@@ -693,6 +703,7 @@ impl DispatcherState {
             governance_freshness_monitor: None,
             evidence_cas: None,
             anti_entropy_pcac_gate: None,
+            divergence_watchdog: None,
         }
     }
 
@@ -783,6 +794,7 @@ impl DispatcherState {
             governance_freshness_monitor: None,
             evidence_cas: None,
             anti_entropy_pcac_gate: None,
+            divergence_watchdog: None,
         }
     }
 
@@ -1138,6 +1150,7 @@ impl DispatcherState {
             // orchestrator will need a fallback MemoryCas if wired here.
             evidence_cas: None,
             anti_entropy_pcac_gate,
+            divergence_watchdog: None,
         })
     }
 
@@ -1527,6 +1540,7 @@ impl DispatcherState {
             // store the dispatcher reads during `validate_lease_time_authority`.
             evidence_cas: Some(evidence_cas),
             anti_entropy_pcac_gate: Some(anti_entropy_pcac_gate),
+            divergence_watchdog: None,
         })
     }
 
@@ -1699,6 +1713,34 @@ impl DispatcherState {
     #[must_use]
     pub const fn merge_executor(&self) -> Option<&Arc<MergeExecutor>> {
         self.merge_executor.as_ref()
+    }
+
+    /// Sets the divergence watchdog for IPC-accessible unfreeze and durable
+    /// recovery evidence registration (TCK-00469).
+    ///
+    /// When set, operator IPC handlers can invoke
+    /// `register_durable_recovery_evidence`, `create_unfreeze`, and
+    /// `apply_unfreeze` on the shared watchdog instance that the background
+    /// polling task also uses.
+    #[must_use]
+    pub fn with_divergence_watchdog(
+        mut self,
+        watchdog: Arc<DivergenceWatchdog<SystemTimeSource>>,
+    ) -> Self {
+        // TCK-00469: Wire watchdog into privileged dispatcher so
+        // RegisterRecoveryEvidence and RequestUnfreeze handlers can call
+        // through to the watchdog methods.
+        self.privileged_dispatcher = self
+            .privileged_dispatcher
+            .with_divergence_watchdog(Arc::clone(&watchdog));
+        self.divergence_watchdog = Some(watchdog);
+        self
+    }
+
+    /// Returns a reference to the divergence watchdog, if configured.
+    #[must_use]
+    pub const fn divergence_watchdog(&self) -> Option<&Arc<DivergenceWatchdog<SystemTimeSource>>> {
+        self.divergence_watchdog.as_ref()
     }
 
     /// Notifies the gate orchestrator that a session has terminated.

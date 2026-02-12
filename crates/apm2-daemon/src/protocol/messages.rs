@@ -66,6 +66,7 @@
     clippy::missing_const_for_fn,
     clippy::redundant_closure,
     clippy::struct_field_names,
+    clippy::too_long_first_doc_paragraph,
     missing_docs
 )]
 mod generated {
@@ -413,6 +414,11 @@ impl_bounded_decode_simple!(
     // TCK-00487: Explicit full-chain verification
     VerifyLedgerChainRequest,
     VerifyLedgerChainResponse,
+    // TCK-00469: Projection recovery
+    RegisterRecoveryEvidenceRequest,
+    RegisterRecoveryEvidenceResponse,
+    RequestUnfreezeRequest,
+    RequestUnfreezeResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

@@ -115,7 +115,9 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.sublease.delegate"
         | "hsi.tool.request"
         | "hsi.event.emit"
-        | "hsi.evidence.publish" => Some(AUTH_IDEMPOTENT_RECEIPT),
+        | "hsi.evidence.publish"
+        | "hsi.projection.register_recovery_evidence"
+        | "hsi.projection.request_unfreeze" => Some(AUTH_IDEMPOTENT_RECEIPT),
 
         // =================================================================
         // Authoritative + best-effort idempotency + receipt-required
@@ -193,6 +195,8 @@ mod tests {
             "hsi.launch.auditor_projection",
             "hsi.launch.orchestrator_projection",
             "hsi.ledger.verify_chain",
+            "hsi.projection.register_recovery_evidence",
+            "hsi.projection.request_unfreeze",
         ];
         for route in &known_routes {
             assert!(
@@ -223,6 +227,8 @@ mod tests {
             "hsi.tool.request",
             "hsi.event.emit",
             "hsi.evidence.publish",
+            "hsi.projection.register_recovery_evidence",
+            "hsi.projection.request_unfreeze",
             "hsi.process.stop",
             "hsi.process.restart",
             "hsi.process.reload",
@@ -332,6 +338,8 @@ mod tests {
             "hsi.tool.request",
             "hsi.event.emit",
             "hsi.evidence.publish",
+            "hsi.projection.register_recovery_evidence",
+            "hsi.projection.request_unfreeze",
             // Lifecycle operations
             "hsi.process.stop",
             "hsi.process.restart",

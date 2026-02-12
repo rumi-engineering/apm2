@@ -58,7 +58,7 @@ use apm2_core::supervisor::Supervisor;
 use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig};
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
-use apm2_daemon::projection::{DivergenceWatchdog, DivergenceWatchdogConfig};
+use apm2_daemon::projection::{DivergenceWatchdog, DivergenceWatchdogConfig, SystemTimeSource};
 use apm2_daemon::protocol; // Import from library
 use apm2_daemon::protocol::socket_manager::{SocketManager, SocketManagerConfig};
 use apm2_daemon::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
@@ -1468,7 +1468,12 @@ async fn async_main(args: Args) -> Result<()> {
     //   - Ledger database must be configured (sqlite_conn is Some)
     //   - Divergence watchdog must be enabled in ecosystem config
     //   - GitHub token must be available via environment variable
-    {
+    //
+    // TCK-00469: The watchdog is wrapped in Arc so both the background polling
+    // task and the DispatcherState share the same instance, enabling IPC
+    // handlers to call register_durable_recovery_evidence / create_unfreeze /
+    // apply_unfreeze.
+    let watchdog_arc_for_dispatcher: Option<Arc<DivergenceWatchdog<SystemTimeSource>>> = {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
             // TCK-00408: Fail closed when mandatory persistence dependencies
@@ -1491,12 +1496,13 @@ async fn async_main(args: Args) -> Result<()> {
                 .as_deref()
                 .unwrap_or("GITHUB_TOKEN");
             let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
-            let github_token = std::env::var(token_env).map_err(|_| {
-                anyhow::anyhow!(
-                    "divergence_watchdog.enabled=true but GitHub token env var \
-                     ({token_env}) is not set"
-                )
-            })?;
+            let github_token =
+                secrecy::SecretString::from(std::env::var(token_env).map_err(|_| {
+                    anyhow::anyhow!(
+                        "divergence_watchdog.enabled=true but GitHub token env var \
+                         ({token_env}) is not set"
+                    )
+                })?);
 
             // Build watchdog configuration
             let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);
@@ -1512,7 +1518,7 @@ async fn async_main(args: Args) -> Result<()> {
                 Signer::from_bytes(&lifecycle_signing_key_bytes).map_err(|e| {
                     anyhow::anyhow!("failed to derive watchdog signer from lifecycle key: {e}")
                 })?;
-            let watchdog = DivergenceWatchdog::new(watchdog_signer, watchdog_config);
+            let watchdog = Arc::new(DivergenceWatchdog::new(watchdog_signer, watchdog_config));
 
             info!(
                 repo = %repo_id,
@@ -1536,12 +1542,16 @@ async fn async_main(args: Args) -> Result<()> {
             let github_repo = dw_config.github_repo.clone();
             let trunk_branch = dw_config.trunk_branch.clone();
             let watchdog_state = state.clone();
+            let watchdog_repo_id = repo_id;
 
+            // TCK-00469: Clone the Arc for the background task; the original
+            // is returned from this block for dispatcher wiring.
+            let watchdog_task_ref = Arc::clone(&watchdog);
             tokio::spawn(async move {
+                let watchdog = watchdog_task_ref;
                 let mut interval = tokio::time::interval(poll_interval);
-                // Track the last known merge receipt HEAD to avoid redundant API
-                // calls when no new merges have happened.
-                let mut last_divergence_detected = false;
+                let precautionary_freeze_id = format!("precautionary-{watchdog_repo_id}");
+                let mut consecutive_check_errors: u32 = 0;
 
                 loop {
                     interval.tick().await;
@@ -1595,6 +1605,7 @@ async fn async_main(args: Args) -> Result<()> {
                     // Step 3: Check for divergence.
                     match watchdog.check_divergence(merge_receipt_head, external_head) {
                         Ok(Some(result)) => {
+                            consecutive_check_errors = 0;
                             // Divergence detected! Emit DefectRecorded event.
                             error!(
                                 expected_head = %hex::encode(merge_receipt_head),
@@ -1625,21 +1636,38 @@ async fn async_main(args: Args) -> Result<()> {
                                     );
                                 }
 
+                                let emit_trace_event =
+                                    |event_type: &str,
+                                     payload: &[u8],
+                                     actor_id: &str,
+                                     timestamp_ns: u64| {
+                                        match emitter.emit_session_event(
+                                            "divergence-watchdog",
+                                            event_type,
+                                            payload,
+                                            actor_id,
+                                            timestamp_ns,
+                                        ) {
+                                            Ok(_) => true,
+                                            Err(error) => {
+                                                error!(
+                                                    event_type = %event_type,
+                                                    error = %error,
+                                                    "Failed to persist divergence watchdog trace event"
+                                                );
+                                                false
+                                            },
+                                        }
+                                    };
+
                                 match serde_json::to_vec(&result.freeze) {
                                     Ok(freeze_payload) => {
-                                        if let Err(e) = emitter.emit_session_event(
-                                            "divergence-watchdog",
+                                        if emit_trace_event(
                                             "intervention.freeze",
                                             &freeze_payload,
                                             &result.freeze.gate_actor_id,
                                             result.freeze.frozen_at,
                                         ) {
-                                            error!(
-                                                error = %e,
-                                                freeze_id = %result.freeze.freeze_id,
-                                                "Failed to persist InterventionFreeze transition event"
-                                            );
-                                        } else {
                                             info!(
                                                 freeze_id = %result.freeze.freeze_id,
                                                 "Persisted divergence InterventionFreeze transition event"
@@ -1653,32 +1681,122 @@ async fn async_main(args: Args) -> Result<()> {
                                         );
                                     },
                                 }
-                            }
 
-                            last_divergence_detected = true;
+                                if let Ok(payload) = serde_json::to_vec(&result.compromise_signal) {
+                                    emit_trace_event(
+                                        "projection.compromise.signal",
+                                        &payload,
+                                        &result.compromise_signal.issuer_actor_id,
+                                        result.compromise_signal.quarantined_at_ns,
+                                    );
+                                } else {
+                                    error!(
+                                        "Failed to serialize projection compromise signal payload"
+                                    );
+                                }
+
+                                if let Ok(payload) =
+                                    serde_json::to_vec(&result.source_trust_snapshot)
+                                {
+                                    emit_trace_event(
+                                        "projection.source.trust_snapshot",
+                                        &payload,
+                                        &result.freeze.gate_actor_id,
+                                        result.freeze.frozen_at,
+                                    );
+                                } else {
+                                    error!(
+                                        "Failed to serialize projection source trust snapshot payload"
+                                    );
+                                }
+
+                                if let Ok(payload) =
+                                    serde_json::to_vec(&result.sink_identity_snapshot)
+                                {
+                                    emit_trace_event(
+                                        "projection.sink.identity_snapshot",
+                                        &payload,
+                                        &result.freeze.gate_actor_id,
+                                        result.freeze.frozen_at,
+                                    );
+                                } else {
+                                    error!(
+                                        "Failed to serialize projection sink identity snapshot payload"
+                                    );
+                                }
+
+                                if let Ok(payload) = serde_json::to_vec(&result.replay_receipt) {
+                                    emit_trace_event(
+                                        "projection.replay.receipt",
+                                        &payload,
+                                        &result.replay_receipt.signer_actor_id,
+                                        result.freeze.frozen_at,
+                                    );
+                                } else {
+                                    error!("Failed to serialize projection replay receipt payload");
+                                }
+                            }
                         },
                         Ok(None) => {
-                            // No divergence, or already frozen (idempotent).
-                            if last_divergence_detected {
-                                // Still frozen from prior detection -- no
-                                // new event.
-                                // This is the idempotent path.
+                            let had_check_errors = consecutive_check_errors > 0;
+                            consecutive_check_errors = 0;
+
+                            // Successful checks after transient watchdog errors
+                            // can remove precautionary freezes, but only when
+                            // no non-precautionary (divergence) freeze is active.
+                            if had_check_errors {
+                                let registry = watchdog.registry();
+                                let has_active_divergence_freeze = registry
+                                    .is_frozen(&watchdog_repo_id)
+                                    .as_deref()
+                                    .is_some_and(|freeze_id| {
+                                        !freeze_id.starts_with("precautionary-")
+                                    });
+                                if !has_active_divergence_freeze {
+                                    registry.remove_precautionary_freeze(
+                                        &watchdog_repo_id,
+                                        &precautionary_freeze_id,
+                                    );
+                                }
                             }
                         },
                         Err(e) => {
+                            consecutive_check_errors = consecutive_check_errors.saturating_add(1);
                             error!(
                                 error = %e,
-                                "Divergence check failed (fail-closed: check will \
-                                 retry on next poll)"
+                                consecutive_check_errors,
+                                "Divergence check failed; precautionary freeze applied until next successful check"
+                            );
+                            watchdog.registry().register_precautionary_freeze(
+                                &watchdog_repo_id,
+                                precautionary_freeze_id.clone(),
                             );
                         },
                     }
                 }
             });
+
+            Some(watchdog)
         } else {
             info!("Divergence watchdog disabled");
+            None
         }
-    }
+    };
+
+    // TCK-00469: Wire divergence watchdog Arc into dispatcher state so IPC
+    // handlers can call register_durable_recovery_evidence / create_unfreeze /
+    // apply_unfreeze.
+    // Safety: dispatcher_state has not yet been cloned at this point in startup.
+    let dispatcher_state = if let Some(watchdog) = watchdog_arc_for_dispatcher {
+        match Arc::try_unwrap(dispatcher_state) {
+            Ok(inner) => Arc::new(inner.with_divergence_watchdog(watchdog)),
+            Err(_arc) => {
+                unreachable!("dispatcher_state Arc should have single owner at watchdog bootstrap");
+            },
+        }
+    } else {
+        dispatcher_state
+    };
 
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
@@ -1872,7 +1990,7 @@ async fn fetch_external_trunk_head(
     owner: &str,
     repo: &str,
     branch: &str,
-    token: &str,
+    token: &secrecy::SecretString,
 ) -> Result<[u8; 32]> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -1901,7 +2019,10 @@ async fn fetch_external_trunk_head(
     let request = http::Request::builder()
         .method("GET")
         .uri(&url)
-        .header("Authorization", format!("Bearer {token}"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", secrecy::ExposeSecret::expose_secret(token)),
+        )
         .header("Accept", "application/vnd.github.v3+json")
         .header("User-Agent", "apm2-daemon/divergence-watchdog")
         .body(Full::new(Bytes::new()))

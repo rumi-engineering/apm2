@@ -146,6 +146,16 @@ pub const REVIEW_RECEIPT_RECORDED_PREFIX: &[u8] = b"REVIEW_RECEIPT_RECORDED:";
 /// This records successful projection outcomes with artifact bundle bindings.
 pub const PROJECTION_RECEIPT_RECORDED_PREFIX: &[u8] = b"PROJECTION_RECEIPT_RECORDED:";
 
+/// Domain prefix for projection compromise signal events.
+///
+/// Used when signing/verifying divergence compromise/quarantine decisions.
+pub const PROJECTION_COMPROMISE_SIGNAL_PREFIX: &[u8] = b"PROJECTION_COMPROMISE_SIGNAL:";
+
+/// Domain prefix for projection replay recovery receipts.
+///
+/// Used when signing/verifying post-containment replay receipts.
+pub const PROJECTION_REPLAY_RECEIPT_PREFIX: &[u8] = b"PROJECTION_REPLAY_RECEIPT:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================

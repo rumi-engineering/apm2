@@ -1,33 +1,8 @@
 // AGENT-AUTHORED (TCK-00213)
 //! Divergence watchdog for the FAC (Forge Admission Cycle).
 //!
-//! # TODO (TCK-00307 Security Review - BLOCKER 2)
-//!
-//! The `DivergenceWatchdog` is fully implemented but not yet wired into the
-//! daemon's main execution path. To complete the integration:
-//!
-//! 1. **Instantiate watchdog in `main.rs`**: Create a `DivergenceWatchdog` with
-//!    a signer from the daemon's key material and a `DivergenceWatchdogConfig`.
-//!
-//! 2. **Wire to ledger**: Pass the `ledger` (from `DispatcherState` or
-//!    `SqliteLedgerEventEmitter`) to emit `DefectRecorded` events via
-//!    `ledger.emit_defect_recorded()`.
-//!
-//! 3. **Source external trunk HEAD**: Implement a polling mechanism that
-//!    fetches the external trunk HEAD from GitHub (via
-//!    `GitHubProjectionAdapter` or direct API calls) and compares against the
-//!    ledger's `MergeReceipt` HEAD.
-//!
-//! 4. **Spawn background task**: Add a `tokio::spawn` that runs
-//!    `watchdog.check_divergence()` at `poll_interval` intervals.
-//!
-//! 5. **Handle results**: When divergence is detected, emit the
-//!    `DefectRecorded` event from `DivergenceResult::defect_event` to the
-//!    ledger.
-//!
-//! This integration is out of scope for TCK-00307 (which focuses on fixing the
-//! `DefectRecorded` event format), but is required for full S0 severity defect
-//! detection. See RFC-0015 for the full specification.
+//! The watchdog is wired into the daemon runtime via `main.rs`, where a
+//! background task periodically calls `check_divergence` and emits defects.
 //!
 //! This module implements the [`DivergenceWatchdog`] which monitors for
 //! divergence between the ledger's merge receipts and the external trunk HEAD.
@@ -83,21 +58,26 @@
 //! }
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use apm2_core::crypto::{Signer, VerifyingKey};
+use apm2_core::crypto::{Hash, Signature, Signer, VerifyingKey, parse_verifying_key};
 use apm2_core::events::{
     DefectRecorded, DefectSource, InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
 };
 use apm2_core::fac::{
-    INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
+    AuthorityKeyBindingV1, INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX,
+    ProjectionChannel, ProjectionCompromiseSignalV1, ProjectionReplayReceiptV1,
+    ProjectionSurfaceType, ReconstructedProjectionState, ReplaySequenceBoundsV1,
+    SinkIdentitySnapshotV1, SourceTrustSnapshotV1, detect_projection_divergence,
+    quarantine_channel, reconstruct_projection_state, sign_with_domain, verify_with_domain,
 };
-use apm2_holon::defect::DefectRecord;
+use apm2_holon::defect::{DefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 // =============================================================================
@@ -115,6 +95,27 @@ pub const MAX_DEFECT_ID_LENGTH: usize = 256;
 
 /// Maximum length for actor IDs (CTR-2602 compliance).
 pub const MAX_ACTOR_ID_LENGTH: usize = 256;
+
+/// Domain separator for signed temporal authority envelopes.
+const TIME_AUTHORITY_ENVELOPE_PREFIX: &[u8] = b"TIME_AUTHORITY_ENVELOPE:";
+
+/// Signed temporal envelope lifetime for compromise/quarantine decisions.
+const DEFAULT_TIME_AUTHORITY_TTL: Duration = Duration::from_secs(300);
+
+/// Maximum supported endpoint canonical identifier length.
+const MAX_ENDPOINT_CANONICAL_ID_LENGTH: usize = 1024;
+
+/// Maximum supported endpoint fingerprint length.
+const MAX_ENDPOINT_FINGERPRINT_LENGTH: usize = 512;
+
+/// Maximum supported temporal envelope reference length.
+const MAX_TIME_ENVELOPE_REF_LENGTH: usize = 1024;
+
+/// Maximum supported trusted authority bindings in watchdog config.
+const MAX_TRUSTED_AUTHORITY_BINDINGS: usize = 64;
+
+/// Prefix reserved for fail-closed precautionary freezes.
+const PRECAUTIONARY_FREEZE_ID_PREFIX: &str = "precautionary-";
 
 // =============================================================================
 // Type-Safe Identifiers (CTR-2602)
@@ -371,6 +372,228 @@ pub struct DivergenceResult {
     pub defect: DefectRecord,
     /// The defect event to emit to the ledger.
     pub defect_event: DefectRecorded,
+    /// Signed compromise signal bound to source/sink snapshots.
+    pub compromise_signal: ProjectionCompromiseSignalV1,
+    /// Source trust snapshot (CAS+ledger rooted expectation).
+    pub source_trust_snapshot: SourceTrustSnapshotV1,
+    /// Sink identity snapshot (observed projection identity).
+    pub sink_identity_snapshot: SinkIdentitySnapshotV1,
+    /// Durable replay receipt for reconstruction checks.
+    pub replay_receipt: ProjectionReplayReceiptV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedTemporalAuthority {
+    envelope: TimeAuthorityEnvelopeV1,
+    time_authority_ref: Hash,
+}
+
+/// Concrete sink endpoint evidence bound into compromise snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkEndpointEvidenceV1 {
+    /// Canonical sink endpoint identifier (URL or hostname form).
+    pub endpoint_canonical_id: String,
+    /// Endpoint key fingerprint. When `endpoint_identity_verified` is true,
+    /// this is derived from remote endpoint identity (TLS SPKI/SSH host key).
+    /// When false, this is derived from local signer key material as a
+    /// placeholder binding.
+    pub endpoint_key_fingerprint: String,
+    /// Key epoch for endpoint key rotation continuity.
+    pub key_epoch: u64,
+    /// Whether the endpoint key fingerprint was verified against remote
+    /// endpoint identity material. When `false`, the fingerprint is derived
+    /// from local signer key material as a placeholder binding.
+    pub endpoint_identity_verified: bool,
+}
+
+/// Signed temporal authority envelope for compromise and recovery decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeAuthorityEnvelopeV1 {
+    /// HTF envelope reference.
+    pub time_envelope_ref: String,
+    /// Declared HTF decision window reference.
+    #[serde(with = "serde_bytes")]
+    pub window_ref: Hash,
+    /// Issuance time for this temporal authority assertion.
+    pub issued_at_ns: u64,
+    /// Expiration time for this temporal authority assertion.
+    pub expires_at_ns: u64,
+    /// Signer actor identity.
+    pub signer_actor_id: String,
+    /// Signer public key bytes.
+    #[serde(with = "serde_bytes")]
+    pub signer_key: [u8; 32],
+    /// Signature over canonical bytes.
+    #[serde(with = "serde_bytes")]
+    pub signature: [u8; 64],
+}
+
+impl TimeAuthorityEnvelopeV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn create_signed(
+        time_envelope_ref: impl Into<String>,
+        window_ref: Hash,
+        issued_at_ns: u64,
+        expires_at_ns: u64,
+        signer_actor_id: impl Into<String>,
+        signer: &Signer,
+    ) -> Result<Self, DivergenceError> {
+        let time_envelope_ref = time_envelope_ref.into();
+        let signer_actor_id = signer_actor_id.into();
+
+        if time_envelope_ref.trim().is_empty() {
+            return Err(DivergenceError::MissingTemporalAuthority(
+                "time_envelope_ref".to_string(),
+            ));
+        }
+        if time_envelope_ref.len() > MAX_TIME_ENVELOPE_REF_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "time_envelope_ref",
+                actual: time_envelope_ref.len(),
+                max: MAX_TIME_ENVELOPE_REF_LENGTH,
+            });
+        }
+        if signer_actor_id.trim().is_empty() {
+            return Err(DivergenceError::MissingField(
+                "time_authority_signer_actor_id",
+            ));
+        }
+        if signer_actor_id.len() > MAX_ACTOR_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "time_authority_signer_actor_id",
+                actual: signer_actor_id.len(),
+                max: MAX_ACTOR_ID_LENGTH,
+            });
+        }
+        if window_ref.iter().all(|byte| *byte == 0) {
+            return Err(DivergenceError::MissingTemporalAuthority(
+                "window_ref".to_string(),
+            ));
+        }
+        if expires_at_ns <= issued_at_ns {
+            return Err(DivergenceError::InvalidTemporalAuthority(
+                "expires_at_ns must be greater than issued_at_ns".to_string(),
+            ));
+        }
+
+        let mut envelope = Self {
+            time_envelope_ref,
+            window_ref,
+            issued_at_ns,
+            expires_at_ns,
+            signer_actor_id,
+            signer_key: signer.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        let signature = sign_with_domain(
+            signer,
+            TIME_AUTHORITY_ENVELOPE_PREFIX,
+            &envelope.canonical_bytes(),
+        );
+        envelope.signature = signature.to_bytes();
+        Ok(envelope)
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+        bytes.extend_from_slice(&self.window_ref);
+        bytes.extend_from_slice(&self.issued_at_ns.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at_ns.to_be_bytes());
+        bytes.extend_from_slice(&(self.signer_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.signer_actor_id.as_bytes());
+        bytes.extend_from_slice(&self.signer_key);
+        bytes
+    }
+
+    fn validate_signature(
+        &self,
+        trusted_time_authority_bindings: &[AuthorityKeyBindingV1],
+    ) -> Result<(), DivergenceError> {
+        if trusted_time_authority_bindings.is_empty() {
+            return Err(DivergenceError::MissingTemporalAuthority(
+                "trusted_time_authority_bindings".to_string(),
+            ));
+        }
+
+        let actor_bindings = trusted_time_authority_bindings
+            .iter()
+            .filter(|binding| binding.actor_id == self.signer_actor_id)
+            .collect::<Vec<_>>();
+        if actor_bindings.is_empty() {
+            return Err(DivergenceError::InvalidTemporalAuthority(format!(
+                "unknown time authority actor {}",
+                self.signer_actor_id
+            )));
+        }
+        if !actor_bindings
+            .iter()
+            .any(|binding| bool::from(binding.verifying_key.ct_eq(&self.signer_key)))
+        {
+            return Err(DivergenceError::InvalidTemporalAuthority(format!(
+                "untrusted key for time authority actor {}",
+                self.signer_actor_id
+            )));
+        }
+
+        let key = parse_verifying_key(&self.signer_key)
+            .map_err(|error| DivergenceError::InvalidTemporalAuthority(error.to_string()))?;
+        let signature = Signature::from_bytes(&self.signature);
+        verify_with_domain(
+            &key,
+            TIME_AUTHORITY_ENVELOPE_PREFIX,
+            &self.canonical_bytes(),
+            &signature,
+        )
+        .map_err(|error| DivergenceError::InvalidTemporalAuthority(error.to_string()))
+    }
+
+    fn validate_freshness(&self, now_ns: u64) -> Result<(), DivergenceError> {
+        if self.expires_at_ns <= self.issued_at_ns {
+            return Err(DivergenceError::InvalidTemporalAuthority(
+                "expires_at_ns must be greater than issued_at_ns".to_string(),
+            ));
+        }
+        if now_ns < self.issued_at_ns {
+            return Err(DivergenceError::InvalidTemporalAuthority(format!(
+                "time authority envelope issued in the future: now={now_ns}, issued_at={}",
+                self.issued_at_ns
+            )));
+        }
+        if now_ns > self.expires_at_ns {
+            return Err(DivergenceError::StaleTemporalAuthority {
+                now_ns,
+                expires_at_ns: self.expires_at_ns,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    fn derive_time_authority_ref(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.time_authority_envelope_ref.v1");
+        hasher.update(&self.canonical_bytes());
+        hasher.update(&self.signature);
+        *hasher.finalize().as_bytes()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionRecoveryState {
+    channel_id: String,
+    source_snapshot: SourceTrustSnapshotV1,
+    sink_snapshot: SinkIdentitySnapshotV1,
+    receipts: Vec<ProjectionReplayReceiptV1>,
+    replay_sequence_bounds: ReplaySequenceBoundsV1,
+    time_authority_envelope: TimeAuthorityEnvelopeV1,
+    has_durable_provenance: bool,
+    durable_evidence_digest: Option<Hash>,
 }
 
 /// Default poll interval for divergence checks (30 seconds).
@@ -393,6 +616,10 @@ pub enum DivergenceError {
     /// Invalid configuration.
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
+
+    /// Projection compromise validation failed.
+    #[error("projection compromise validation failed: {0}")]
+    ProjectionCompromiseValidationFailed(String),
 
     /// The freeze signature is invalid.
     #[error("invalid freeze signature: {0}")]
@@ -446,6 +673,37 @@ pub enum DivergenceError {
         scope_value: String,
         /// The existing freeze ID for this scope.
         existing_freeze_id: String,
+    },
+
+    /// Replay recovery failed during post-containment unfreeze checks.
+    #[error("projection replay recovery failed: {0}")]
+    ProjectionRecoveryFailed(String),
+
+    /// Replay recovery state exists but has no durable provenance proof.
+    #[error(
+        "recovery state exists but lacks durable provenance — unfreeze requires CAS/ledger-backed replay evidence (freeze_id: {freeze_id})"
+    )]
+    ProjectionRecoveryNotDurable {
+        /// Freeze identifier requiring durable recovery provenance.
+        freeze_id: String,
+    },
+
+    /// Temporal authority envelope is missing for a compromise/recovery
+    /// decision.
+    #[error("temporal authority envelope missing: {0}")]
+    MissingTemporalAuthority(String),
+
+    /// Temporal authority envelope verification failed.
+    #[error("temporal authority envelope invalid: {0}")]
+    InvalidTemporalAuthority(String),
+
+    /// Temporal authority envelope is stale for the decision window.
+    #[error("temporal authority envelope stale: now={now_ns}, expires_at={expires_at_ns}")]
+    StaleTemporalAuthority {
+        /// Current decision timestamp.
+        now_ns: u64,
+        /// Envelope expiration timestamp.
+        expires_at_ns: u64,
     },
 }
 
@@ -659,33 +917,19 @@ impl TryFrom<i32> for ResolutionType {
 
 impl From<&InterventionFreeze> for ProtoInterventionFreeze {
     fn from(freeze: &InterventionFreeze) -> Self {
-        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef.
+        // Empty string maps to None; non-empty string stores raw UTF-8 bytes
+        // in the proto `hash` field for lossless roundtrip.
         //
-        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
-        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
+        // TCK-00469 FIX: Store original string as UTF-8 bytes (lossless).
+        // Previous implementation hashed non-hex strings (e.g. "htf:tick:*"),
+        // breaking canonical bytes and signature verification after roundtrip.
         let time_envelope_ref = if freeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Try hex decode first; if invalid (e.g., URI format), hash the string
-            let hash = if freeze.time_envelope_ref.len() == 64
-                && freeze
-                    .time_envelope_ref
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit())
-            {
-                hex::decode(&freeze.time_envelope_ref).unwrap_or_else(|_| {
-                    blake3::hash(freeze.time_envelope_ref.as_bytes())
-                        .as_bytes()
-                        .to_vec()
-                })
-            } else {
-                // URI format -> hash to derive 32 bytes
-                blake3::hash(freeze.time_envelope_ref.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            };
-            Some(TimeEnvelopeRef { hash })
+            Some(TimeEnvelopeRef {
+                hash: freeze.time_envelope_ref.as_bytes().to_vec(),
+            })
         };
 
         Self {
@@ -742,13 +986,22 @@ impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
                 ))
             })?;
 
-        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain (hex
-        // String) None maps to empty string; Some(TimeEnvelopeRef) maps to
-        // hex-encoded hash
+        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain
+        // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
+        // the original UTF-8 string from the proto `hash` bytes (lossless).
+        //
+        // TCK-00469 FIX: Recover original UTF-8 string instead of hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| {
+                String::from_utf8(ter.hash.clone()).map_err(|_| {
+                    DivergenceError::InvalidConfiguration(
+                        "time_envelope_ref contains invalid UTF-8".to_string(),
+                    )
+                })
+            })
+            .transpose()?
             .unwrap_or_default();
 
         Ok(Self {
@@ -776,33 +1029,19 @@ impl TryFrom<ProtoInterventionFreeze> for InterventionFreeze {
 
 impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
     fn from(unfreeze: &InterventionUnfreeze) -> Self {
-        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef.
+        // Empty string maps to None; non-empty string stores raw UTF-8 bytes
+        // in the proto `hash` field for lossless roundtrip.
         //
-        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
-        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
+        // TCK-00469 FIX: Store original string as UTF-8 bytes (lossless).
+        // Previous implementation hashed non-hex strings (e.g. "htf:tick:*"),
+        // breaking canonical bytes and signature verification after roundtrip.
         let time_envelope_ref = if unfreeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Try hex decode first; if invalid (e.g., URI format), hash the string
-            let hash = if unfreeze.time_envelope_ref.len() == 64
-                && unfreeze
-                    .time_envelope_ref
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit())
-            {
-                hex::decode(&unfreeze.time_envelope_ref).unwrap_or_else(|_| {
-                    blake3::hash(unfreeze.time_envelope_ref.as_bytes())
-                        .as_bytes()
-                        .to_vec()
-                })
-            } else {
-                // URI format -> hash to derive 32 bytes
-                blake3::hash(unfreeze.time_envelope_ref.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            };
-            Some(TimeEnvelopeRef { hash })
+            Some(TimeEnvelopeRef {
+                hash: unfreeze.time_envelope_ref.as_bytes().to_vec(),
+            })
         };
 
         Self {
@@ -845,13 +1084,22 @@ impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
             Some(proto.adjudication_id.clone())
         };
 
-        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain (hex
-        // String) None maps to empty string; Some(TimeEnvelopeRef) maps to
-        // hex-encoded hash
+        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain
+        // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
+        // the original UTF-8 string from the proto `hash` bytes (lossless).
+        //
+        // TCK-00469 FIX: Recover original UTF-8 string instead of hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| {
+                String::from_utf8(ter.hash.clone()).map_err(|_| {
+                    DivergenceError::InvalidConfiguration(
+                        "time_envelope_ref contains invalid UTF-8".to_string(),
+                    )
+                })
+            })
+            .transpose()?
             .unwrap_or_default();
 
         Ok(Self {
@@ -1410,6 +1658,8 @@ pub struct DivergenceWatchdogConfig {
     pub actor_id: String,
     /// Time envelope reference pattern.
     pub time_envelope_pattern: String,
+    /// External trusted time authority key bindings (CAC/HTF root).
+    pub trusted_time_authority_bindings: Vec<AuthorityKeyBindingV1>,
 }
 
 impl DivergenceWatchdogConfig {
@@ -1433,6 +1683,7 @@ impl DivergenceWatchdogConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             actor_id: "divergence-watchdog".to_string(),
             time_envelope_pattern: "htf:tick:{}".to_string(),
+            trusted_time_authority_bindings: Vec::new(),
         })
     }
 
@@ -1467,6 +1718,42 @@ impl DivergenceWatchdogConfig {
         let actor_id = actor_id.into();
         validate_string_length("actor_id", &actor_id)?;
         self.actor_id = actor_id;
+        Ok(self)
+    }
+
+    /// Sets externally trusted time authority bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DivergenceError::InvalidConfiguration`] if the binding count
+    /// exceeds `MAX_TRUSTED_AUTHORITY_BINDINGS` or any verifying key fails to
+    /// parse.
+    pub fn with_trusted_time_authority_bindings(
+        mut self,
+        bindings: Vec<AuthorityKeyBindingV1>,
+    ) -> Result<Self, DivergenceError> {
+        if bindings.len() > MAX_TRUSTED_AUTHORITY_BINDINGS {
+            return Err(DivergenceError::InvalidConfiguration(format!(
+                "trusted authority bindings exceed limit: {} > {MAX_TRUSTED_AUTHORITY_BINDINGS}",
+                bindings.len()
+            )));
+        }
+
+        for binding in &bindings {
+            if binding.actor_id.trim().is_empty() {
+                return Err(DivergenceError::MissingField(
+                    "trusted_time_authority_bindings.actor_id",
+                ));
+            }
+            validate_string_length(
+                "trusted_time_authority_bindings.actor_id",
+                &binding.actor_id,
+            )?;
+            parse_verifying_key(&binding.verifying_key)
+                .map_err(|error| DivergenceError::InvalidConfiguration(error.to_string()))?;
+        }
+
+        self.trusted_time_authority_bindings = bindings;
         Ok(self)
     }
 }
@@ -1599,6 +1886,67 @@ impl FreezeRegistry {
         self.hydrated.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn is_precautionary_freeze_id(freeze_id: &str) -> bool {
+        freeze_id.starts_with(PRECAUTIONARY_FREEZE_ID_PREFIX)
+    }
+
+    /// Registers a fail-closed precautionary freeze for a scope.
+    ///
+    /// This path is used when divergence checks fail internally and the daemon
+    /// must block admissions until a successful follow-up check confirms state.
+    ///
+    /// Returns `true` only when a new freeze is inserted.
+    pub fn register_precautionary_freeze(&self, scope_value: &str, freeze_id: String) -> bool {
+        if !Self::is_precautionary_freeze_id(&freeze_id) {
+            return false;
+        }
+
+        let Ok(mut active) = self.active_freezes.write() else {
+            return false;
+        };
+        let Ok(mut scope) = self.scope_map.write() else {
+            return false;
+        };
+
+        if scope.contains_key(scope_value) {
+            return false;
+        }
+
+        active.insert(freeze_id.clone());
+        scope.insert(scope_value.to_string(), freeze_id);
+        true
+    }
+
+    /// Removes a fail-closed precautionary freeze for a scope if IDs match.
+    ///
+    /// Returns `true` only when the mapped freeze exactly matches
+    /// `freeze_id` and follows the precautionary ID prefix contract.
+    pub fn remove_precautionary_freeze(&self, scope_value: &str, freeze_id: &str) -> bool {
+        if !Self::is_precautionary_freeze_id(freeze_id) {
+            return false;
+        }
+
+        let Ok(mut active) = self.active_freezes.write() else {
+            return false;
+        };
+        let Ok(mut scope) = self.scope_map.write() else {
+            return false;
+        };
+
+        let should_remove = scope
+            .get(scope_value)
+            .is_some_and(|existing| existing == freeze_id)
+            && Self::is_precautionary_freeze_id(freeze_id);
+
+        if !should_remove {
+            return false;
+        }
+
+        scope.remove(scope_value);
+        active.remove(freeze_id);
+        true
+    }
+
     /// Replays a freeze event from ledger during rehydration.
     ///
     /// This method registers a freeze in the registry after verifying its
@@ -1673,11 +2021,15 @@ impl FreezeRegistry {
         // Prevent duplicate registrations for the same scope.
         // This prevents unbounded memory growth in active_freezes if multiple
         // freeze events are registered for the same scope without unfreeze.
-        if let Some(existing_freeze_id) = scope.get(&freeze.scope_value) {
-            return Err(DivergenceError::ScopeAlreadyFrozen {
-                scope_value: freeze.scope_value.clone(),
-                existing_freeze_id: existing_freeze_id.clone(),
-            });
+        if let Some(existing_freeze_id) = scope.get(&freeze.scope_value).cloned() {
+            if Self::is_precautionary_freeze_id(&existing_freeze_id) {
+                active.remove(&existing_freeze_id);
+            } else {
+                return Err(DivergenceError::ScopeAlreadyFrozen {
+                    scope_value: freeze.scope_value.clone(),
+                    existing_freeze_id,
+                });
+            }
         }
 
         active.insert(freeze.freeze_id.clone());
@@ -2031,6 +2383,11 @@ pub struct DivergenceWatchdog<T: TimeSource = SystemTimeSource> {
     defect_counter: std::sync::atomic::AtomicU64,
     /// Time source for obtaining current time.
     time_source: T,
+    /// Per-freeze replay recovery state used for post-containment
+    /// reconstruction checks before unfreeze.
+    projection_recovery_state: std::sync::Mutex<HashMap<String, ProjectionRecoveryState>>,
+    /// Pending externally provided temporal authority envelope.
+    pending_time_authority_envelope: std::sync::Mutex<Option<TimeAuthorityEnvelopeV1>>,
 }
 
 impl DivergenceWatchdog<SystemTimeSource> {
@@ -2044,12 +2401,14 @@ impl DivergenceWatchdog<SystemTimeSource> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source: SystemTimeSource,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 
     /// Creates a new divergence watchdog with a shared freeze registry.
     #[must_use]
-    pub const fn with_registry(
+    pub fn with_registry(
         signer: Signer,
         config: DivergenceWatchdogConfig,
         registry: Arc<FreezeRegistry>,
@@ -2061,6 +2420,8 @@ impl DivergenceWatchdog<SystemTimeSource> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source: SystemTimeSource,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 }
@@ -2083,13 +2444,15 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 
     /// Creates a new divergence watchdog with a shared registry and custom time
     /// source.
     #[must_use]
-    pub const fn with_registry_and_time_source(
+    pub fn with_registry_and_time_source(
         signer: Signer,
         config: DivergenceWatchdogConfig,
         registry: Arc<FreezeRegistry>,
@@ -2102,6 +2465,8 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source,
+            projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 
@@ -2147,6 +2512,237 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             .time_envelope_ref(&self.config.time_envelope_pattern)
     }
 
+    fn trusted_authority_bindings(&self) -> Result<Vec<AuthorityKeyBindingV1>, DivergenceError> {
+        let bindings = if self.config.trusted_time_authority_bindings.is_empty() {
+            if self.config.actor_id.trim().is_empty() {
+                return Err(DivergenceError::MissingField("actor_id"));
+            }
+            if self.config.actor_id.len() > MAX_ACTOR_ID_LENGTH {
+                return Err(DivergenceError::StringTooLong {
+                    field: "actor_id",
+                    actual: self.config.actor_id.len(),
+                    max: MAX_ACTOR_ID_LENGTH,
+                });
+            }
+            vec![AuthorityKeyBindingV1 {
+                actor_id: self.config.actor_id.clone(),
+                verifying_key: self.signer.public_key_bytes(),
+            }]
+        } else {
+            self.config.trusted_time_authority_bindings.clone()
+        };
+
+        if bindings.len() > MAX_TRUSTED_AUTHORITY_BINDINGS {
+            return Err(DivergenceError::InvalidConfiguration(format!(
+                "trusted authority bindings exceed limit: {} > {MAX_TRUSTED_AUTHORITY_BINDINGS}",
+                bindings.len()
+            )));
+        }
+
+        for binding in &bindings {
+            if binding.actor_id.trim().is_empty() {
+                return Err(DivergenceError::MissingField(
+                    "trusted_time_authority_bindings.actor_id",
+                ));
+            }
+            if binding.actor_id.len() > MAX_ACTOR_ID_LENGTH {
+                return Err(DivergenceError::StringTooLong {
+                    field: "trusted_time_authority_bindings.actor_id",
+                    actual: binding.actor_id.len(),
+                    max: MAX_ACTOR_ID_LENGTH,
+                });
+            }
+            parse_verifying_key(&binding.verifying_key)
+                .map_err(|error| DivergenceError::InvalidConfiguration(error.to_string()))?;
+        }
+
+        Ok(bindings)
+    }
+
+    fn verify_temporal_authority_envelope(
+        envelope: TimeAuthorityEnvelopeV1,
+        trusted_authority_bindings: &[AuthorityKeyBindingV1],
+        now_ns: u64,
+    ) -> Result<VerifiedTemporalAuthority, DivergenceError> {
+        envelope.validate_signature(trusted_authority_bindings)?;
+        envelope.validate_freshness(now_ns)?;
+        Ok(VerifiedTemporalAuthority {
+            time_authority_ref: envelope.derive_time_authority_ref(),
+            envelope,
+        })
+    }
+
+    fn resolve_temporal_authority(
+        &self,
+        now_ns: u64,
+        trusted_authority_bindings: &[AuthorityKeyBindingV1],
+    ) -> Result<VerifiedTemporalAuthority, DivergenceError> {
+        let pending_envelope = self
+            .pending_time_authority_envelope
+            .lock()
+            .map_err(|error| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {error}"))
+            })?
+            .take();
+        if let Some(envelope) = pending_envelope {
+            return Self::verify_temporal_authority_envelope(
+                envelope,
+                trusted_authority_bindings,
+                now_ns,
+            );
+        }
+
+        let time_envelope_ref = self.generate_time_envelope_ref();
+        let window_ref = self.derive_window_ref(now_ns);
+        let ttl_ns = u64::try_from(DEFAULT_TIME_AUTHORITY_TTL.as_nanos()).map_err(|_| {
+            DivergenceError::InvalidConfiguration("time authority ttl exceeds u64".to_string())
+        })?;
+        let expires_at_ns = now_ns.checked_add(ttl_ns).ok_or_else(|| {
+            DivergenceError::InvalidConfiguration("time authority expiry overflow".to_string())
+        })?;
+        let envelope = TimeAuthorityEnvelopeV1::create_signed(
+            time_envelope_ref,
+            window_ref,
+            now_ns,
+            expires_at_ns,
+            self.config.actor_id.clone(),
+            &self.signer,
+        )?;
+        Self::verify_temporal_authority_envelope(envelope, trusted_authority_bindings, now_ns)
+    }
+
+    /// Provides an externally signed temporal authority envelope for the next
+    /// divergence decision.
+    ///
+    /// The envelope is validated before it is accepted and stored.
+    pub fn provide_time_authority_envelope(
+        &self,
+        envelope: TimeAuthorityEnvelopeV1,
+    ) -> Result<(), DivergenceError> {
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let now_ns = self.time_source.now_nanos();
+        let _verified = Self::verify_temporal_authority_envelope(
+            envelope.clone(),
+            &trusted_authority_bindings,
+            now_ns,
+        )?;
+        let mut pending = self
+            .pending_time_authority_envelope
+            .lock()
+            .map_err(|error| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {error}"))
+            })?;
+        *pending = Some(envelope);
+        Ok(())
+    }
+
+    /// Derives HTF window reference hash for compromise decisions.
+    fn derive_window_ref(&self, timestamp_ns: u64) -> Hash {
+        // 5-minute windows match active quarantine TTL granularity in the daemon.
+        const WINDOW_NS: u64 = 300 * 1_000_000_000;
+        let window_start = timestamp_ns - (timestamp_ns % WINDOW_NS);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.window_ref.v1");
+        hasher.update(self.config.repo_id.as_bytes());
+        hasher.update(&window_start.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Constructs sink-side endpoint evidence for projection-compromise
+    /// detection.
+    ///
+    /// # Trust Boundary
+    ///
+    /// When `remote_fingerprint` is `None`, the returned evidence uses a
+    /// fingerprint derived from the **local** daemon signer key. This is a
+    /// self-attested identity claim and MUST NOT be trusted for remote
+    /// endpoint verification. The `endpoint_identity_verified` field will be
+    /// `false` and a warning is emitted to the `tracing` subsystem.
+    fn sink_endpoint_evidence(&self, remote_fingerprint: Option<&str>) -> SinkEndpointEvidenceV1 {
+        remote_fingerprint.map_or_else(
+            || {
+                tracing::warn!(
+                    repo_id = %self.config.repo_id,
+                    "sink_endpoint_evidence: using local-signer fallback fingerprint \
+                     (unverified mode) — endpoint identity is self-attested"
+                );
+                let mut hasher = blake3::Hasher::new();
+                hasher
+                    .update(b"apm2.projection_compromise.endpoint_key_fingerprint.local_signer.v1");
+                hasher.update(&self.signer.public_key_bytes());
+                SinkEndpointEvidenceV1 {
+                    endpoint_canonical_id: format!("github://{}", self.config.repo_id),
+                    endpoint_key_fingerprint: hex::encode(hasher.finalize().as_bytes()),
+                    key_epoch: 0,
+                    endpoint_identity_verified: false,
+                }
+            },
+            |fingerprint| SinkEndpointEvidenceV1 {
+                endpoint_canonical_id: format!("github://{}", self.config.repo_id),
+                endpoint_key_fingerprint: fingerprint.to_string(),
+                key_epoch: 0,
+                endpoint_identity_verified: true,
+            },
+        )
+    }
+
+    fn validate_sink_endpoint_evidence(
+        endpoint_evidence: &SinkEndpointEvidenceV1,
+    ) -> Result<(), DivergenceError> {
+        if endpoint_evidence.endpoint_canonical_id.trim().is_empty() {
+            return Err(DivergenceError::MissingField("endpoint_canonical_id"));
+        }
+        if endpoint_evidence.endpoint_key_fingerprint.trim().is_empty() {
+            return Err(DivergenceError::MissingField("endpoint_key_fingerprint"));
+        }
+        if endpoint_evidence.endpoint_canonical_id.len() > MAX_ENDPOINT_CANONICAL_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "endpoint_canonical_id",
+                actual: endpoint_evidence.endpoint_canonical_id.len(),
+                max: MAX_ENDPOINT_CANONICAL_ID_LENGTH,
+            });
+        }
+        if endpoint_evidence.endpoint_key_fingerprint.len() > MAX_ENDPOINT_FINGERPRINT_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "endpoint_key_fingerprint",
+                actual: endpoint_evidence.endpoint_key_fingerprint.len(),
+                max: MAX_ENDPOINT_FINGERPRINT_LENGTH,
+            });
+        }
+        Ok(())
+    }
+
+    /// Derives a digest binding sink identity to concrete endpoint evidence.
+    fn derive_sink_identity_digest(
+        &self,
+        endpoint_evidence: &SinkEndpointEvidenceV1,
+    ) -> Result<Hash, DivergenceError> {
+        Self::validate_sink_endpoint_evidence(endpoint_evidence)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.sink_identity.v1");
+        hasher.update(self.config.repo_id.as_bytes());
+        hasher.update(self.config.actor_id.as_bytes());
+        hasher.update(endpoint_evidence.endpoint_canonical_id.as_bytes());
+        hasher.update(endpoint_evidence.endpoint_key_fingerprint.as_bytes());
+        hasher.update(&endpoint_evidence.key_epoch.to_be_bytes());
+        hasher.update(&[u8::from(endpoint_evidence.endpoint_identity_verified)]);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// Derives endpoint binding digest independently from sink identity digest.
+    fn derive_endpoint_binding_digest(
+        endpoint_evidence: &SinkEndpointEvidenceV1,
+    ) -> Result<Hash, DivergenceError> {
+        Self::validate_sink_endpoint_evidence(endpoint_evidence)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.projection_compromise.endpoint_binding.v1");
+        hasher.update(endpoint_evidence.endpoint_canonical_id.as_bytes());
+        hasher.update(endpoint_evidence.endpoint_key_fingerprint.as_bytes());
+        hasher.update(&endpoint_evidence.key_epoch.to_be_bytes());
+        hasher.update(&[u8::from(endpoint_evidence.endpoint_identity_verified)]);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
     /// Checks for divergence between the merge receipt HEAD and external trunk
     /// HEAD.
     ///
@@ -2181,7 +2777,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         external_trunk_head: [u8; 32],
     ) -> Result<Option<DivergenceResult>, DivergenceError> {
         // No divergence if heads match
-        if merge_receipt_head == external_trunk_head {
+        if bool::from(merge_receipt_head.ct_eq(&external_trunk_head)) {
             return Ok(None);
         }
 
@@ -2189,7 +2785,9 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         // If the repository is already frozen (from a prior divergence), we don't
         // need to create another freeze event. This makes the operation idempotent
         // and prevents DoS via accumulated freeze IDs in the registry.
-        if self.registry.is_frozen(&self.config.repo_id).is_some() {
+        if let Some(freeze_id) = self.registry.is_frozen(&self.config.repo_id)
+            && !FreezeRegistry::is_precautionary_freeze_id(&freeze_id)
+        {
             return Ok(None);
         }
 
@@ -2228,18 +2826,151 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     ) -> Result<DivergenceResult, DivergenceError> {
         let freeze_id = self.generate_freeze_id();
         let defect_id = self.generate_defect_id();
-        let time_envelope_ref = self.generate_time_envelope_ref();
         let timestamp = self.time_source.now_nanos();
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let VerifiedTemporalAuthority {
+            envelope: time_authority_envelope,
+            time_authority_ref,
+        } = self.resolve_temporal_authority(timestamp, &trusted_authority_bindings)?;
+        let time_envelope_ref = time_authority_envelope.time_envelope_ref.clone();
+        let window_ref = time_authority_envelope.window_ref;
+        let sink_endpoint_evidence = self.sink_endpoint_evidence(None);
+        let sink_identity_digest = self.derive_sink_identity_digest(&sink_endpoint_evidence)?;
+        let endpoint_binding_digest =
+            Self::derive_endpoint_binding_digest(&sink_endpoint_evidence)?;
 
-        // Create the DefectRecord(PROJECTION_DIVERGENCE) first
-        let defect = DefectRecord::projection_divergence(
-            &defect_id,
-            &self.config.repo_id,
+        let mut channel = ProjectionChannel::new(
+            self.config.repo_id.clone(),
+            ProjectionSurfaceType::GitRepository,
             expected_head,
+        )
+        .map_err(|error| {
+            DivergenceError::ProjectionCompromiseValidationFailed(error.to_string())
+        })?;
+
+        let divergence = detect_projection_divergence(
+            &channel,
             actual_head,
+            expected_head,
+            expected_head,
+            time_authority_ref,
+            window_ref,
+        )
+        .map_err(|error| DivergenceError::ProjectionCompromiseValidationFailed(error.to_string()))?
+        .ok_or_else(|| {
+            DivergenceError::ProjectionCompromiseValidationFailed(
+                "mismatched heads did not produce divergence".to_string(),
+            )
+        })?;
+
+        let source_trust_snapshot = SourceTrustSnapshotV1 {
+            channel_id: self.config.repo_id.clone(),
+            cas_state_digest: expected_head,
+            ledger_state_digest: expected_head,
+            expected_projection_digest: expected_head,
+            time_authority_ref,
+            window_ref,
+        };
+        let sink_identity_snapshot = SinkIdentitySnapshotV1 {
+            channel_id: self.config.repo_id.clone(),
+            sink_identity_digest,
+            observed_projection_digest: actual_head,
+            endpoint_binding_digest,
+            time_authority_ref,
+            window_ref,
+        };
+
+        let compromise_signal = quarantine_channel(
+            &mut channel,
+            &divergence,
+            &source_trust_snapshot,
+            &sink_identity_snapshot,
+            format!("projection-compromise-{freeze_id}"),
+            self.config.actor_id.clone(),
+            &self.signer,
             timestamp,
         )
-        .map_err(|e| DivergenceError::InvalidConfiguration(format!("defect record error: {e}")))?;
+        .map_err(|error| {
+            DivergenceError::ProjectionCompromiseValidationFailed(error.to_string())
+        })?;
+
+        let replay_receipt = ProjectionReplayReceiptV1::create_signed(
+            format!("projection-replay-{freeze_id}-0"),
+            self.config.repo_id.clone(),
+            0,
+            expected_head,
+            time_authority_ref,
+            window_ref,
+            source_trust_snapshot.snapshot_digest(),
+            sink_identity_snapshot.snapshot_digest(),
+            self.config.actor_id.clone(),
+            &self.signer,
+        )
+        .map_err(|error| {
+            DivergenceError::ProjectionCompromiseValidationFailed(error.to_string())
+        })?;
+
+        {
+            let mut recovery_state = self.projection_recovery_state.lock().map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}"))
+            })?;
+            recovery_state.insert(
+                freeze_id.clone(),
+                ProjectionRecoveryState {
+                    channel_id: self.config.repo_id.clone(),
+                    source_snapshot: source_trust_snapshot.clone(),
+                    sink_snapshot: sink_identity_snapshot.clone(),
+                    receipts: vec![replay_receipt.clone()],
+                    replay_sequence_bounds: ReplaySequenceBoundsV1 {
+                        required_start_sequence: 0,
+                        required_end_sequence: 0,
+                    },
+                    time_authority_envelope,
+                    has_durable_provenance: false,
+                    durable_evidence_digest: None,
+                },
+            );
+        }
+
+        let defect_details = serde_json::json!({
+            "channel_id": divergence.channel_id,
+            "expected_digest": hex::encode(divergence.expected_digest),
+            "observed_digest": hex::encode(divergence.observed_digest),
+            "divergence_evidence_digest": hex::encode(divergence.evidence_digest()),
+            "source_trust_snapshot_digest": hex::encode(source_trust_snapshot.snapshot_digest()),
+            "sink_identity_snapshot_digest": hex::encode(sink_identity_snapshot.snapshot_digest()),
+            "time_authority_ref": hex::encode(time_authority_ref),
+            "window_ref": hex::encode(window_ref),
+            "time_envelope_ref": time_envelope_ref,
+            "sink_endpoint_canonical_id": sink_endpoint_evidence.endpoint_canonical_id,
+            "sink_endpoint_key_fingerprint": sink_endpoint_evidence.endpoint_key_fingerprint,
+            "sink_endpoint_key_epoch": sink_endpoint_evidence.key_epoch,
+            "sink_endpoint_identity_verified": sink_endpoint_evidence.endpoint_identity_verified,
+        });
+
+        let defect = DefectRecord::builder(&defect_id, "PROJECTION_DIVERGENCE")
+            .severity(DefectSeverity::S0)
+            .work_id(&self.config.repo_id)
+            .detected_at(timestamp)
+            .signal(DefectSignal::new(
+                SignalType::ProjectionDivergence,
+                defect_details.to_string(),
+            ))
+            .context(
+                DefectContext::new()
+                    .with_actor_id(self.config.actor_id.clone())
+                    .with_requested_stable_id(self.config.repo_id.clone()),
+            )
+            .add_evidence(divergence.evidence_digest())
+            .add_evidence(source_trust_snapshot.snapshot_digest())
+            .add_evidence(sink_identity_snapshot.snapshot_digest())
+            .add_remediation("quarantine compromised projection channel")
+            .add_remediation("continue FAC authority using CAS+ledger trust roots")
+            .add_remediation("reconstruct projection state from durable receipts before unfreeze")
+            .build()
+            .map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("defect record error: {e}"))
+            })?;
 
         // Create the freeze event referencing the defect
         let freeze = InterventionFreezeBuilder::new(&freeze_id)
@@ -2267,31 +2998,6 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         // Use BLAKE3 for CAS hash (RFC-0018)
         let cas_hash = blake3::hash(&defect_bytes).as_bytes().to_vec();
 
-        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
-        // The time_envelope_ref is a URI like "htf:tick:{ts}", NOT a hex string.
-        // We need to derive a deterministic hash from it for the proto TimeEnvelopeRef.
-        //
-        // Strategy:
-        // 1. If it's valid hex (64 chars = 32 bytes), decode directly (future HTF
-        //    integration)
-        // 2. Otherwise, hash the URI string with BLAKE3 to get deterministic 32 bytes
-        //    that preserve temporal binding information
-        let time_ref_hash: Vec<u8> = if time_envelope_ref.len() == 64
-            && time_envelope_ref.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            // Valid 64-char hex string -> decode to 32 bytes
-            hex::decode(&time_envelope_ref).unwrap_or_else(|_| {
-                blake3::hash(time_envelope_ref.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            })
-        } else {
-            // URI format (e.g., "htf:tick:12345") -> hash to derive 32 bytes
-            blake3::hash(time_envelope_ref.as_bytes())
-                .as_bytes()
-                .to_vec()
-        };
-
         let defect_event = DefectRecorded {
             defect_id,
             defect_type: defect.defect_class().to_string(),
@@ -2301,7 +3007,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             severity: defect.severity().as_str().to_string(),
             detected_at: timestamp,
             time_envelope_ref: Some(TimeEnvelopeRef {
-                hash: time_ref_hash,
+                hash: time_authority_ref.to_vec(),
             }),
         };
 
@@ -2309,7 +3015,199 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             freeze,
             defect,
             defect_event,
+            compromise_signal,
+            source_trust_snapshot,
+            sink_identity_snapshot,
+            replay_receipt,
         })
+    }
+
+    fn verify_projection_recovery_state(
+        &self,
+        freeze_id: &str,
+    ) -> Result<ReconstructedProjectionState, DivergenceError> {
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let now_ns = self.time_source.now_nanos();
+        let recovery_state = self
+            .projection_recovery_state
+            .lock()
+            .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
+        let state = recovery_state
+            .get(freeze_id)
+            .ok_or_else(|| {
+                DivergenceError::ProjectionRecoveryFailed(format!(
+                    "missing recovery state for freeze_id={freeze_id}"
+                ))
+            })?
+            .clone();
+        drop(recovery_state);
+
+        if !state.has_durable_provenance {
+            return Err(DivergenceError::ProjectionRecoveryNotDurable {
+                freeze_id: freeze_id.to_string(),
+            });
+        }
+        match state.durable_evidence_digest {
+            Some(digest) if !is_zero_hash(&digest) => {},
+            Some(_) => {
+                return Err(DivergenceError::ProjectionRecoveryFailed(
+                    "durable evidence digest must be non-zero".to_string(),
+                ));
+            },
+            None => {
+                return Err(DivergenceError::ProjectionRecoveryFailed(
+                    "durable evidence digest missing".to_string(),
+                ));
+            },
+        }
+
+        let verified_temporal_authority = Self::verify_temporal_authority_envelope(
+            state.time_authority_envelope.clone(),
+            &trusted_authority_bindings,
+            now_ns,
+        )?;
+        if !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.source_snapshot.time_authority_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.sink_snapshot.time_authority_ref),
+        ) {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal authority reference mismatch in recovery state".to_string(),
+            ));
+        }
+        if !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.source_snapshot.window_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.sink_snapshot.window_ref),
+        ) {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal window reference mismatch in recovery state".to_string(),
+            ));
+        }
+
+        reconstruct_projection_state(
+            &state.channel_id,
+            &state.receipts,
+            &state.source_snapshot,
+            &state.sink_snapshot,
+            &trusted_authority_bindings,
+            state.replay_sequence_bounds,
+        )
+        .map_err(|error| DivergenceError::ProjectionRecoveryFailed(error.to_string()))
+    }
+
+    /// Registers durable post-compromise replay evidence for a freeze.
+    ///
+    /// This upgrades the recovery state from synthetic/in-memory evidence to
+    /// durable provenance that can satisfy unfreeze gating.
+    pub fn register_durable_recovery_evidence(
+        &self,
+        freeze_id: &str,
+        receipts: Vec<ProjectionReplayReceiptV1>,
+        durable_evidence_digest: Hash,
+        sequence_bounds: ReplaySequenceBoundsV1,
+    ) -> Result<(), DivergenceError> {
+        let active =
+            self.registry.active_freezes.read().map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}"))
+            })?;
+        if !active.contains(freeze_id) {
+            return Err(DivergenceError::FreezeNotFound {
+                freeze_id: freeze_id.to_string(),
+            });
+        }
+        drop(active);
+
+        if is_zero_hash(&durable_evidence_digest) {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "durable evidence digest must be non-zero".to_string(),
+            ));
+        }
+
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let now_ns = self.time_source.now_nanos();
+        let state = {
+            let recovery_state = self.projection_recovery_state.lock().map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}"))
+            })?;
+            recovery_state
+                .get(freeze_id)
+                .ok_or_else(|| {
+                    DivergenceError::ProjectionRecoveryFailed(format!(
+                        "missing recovery state for freeze_id={freeze_id}"
+                    ))
+                })?
+                .clone()
+        };
+
+        let verified_temporal_authority = Self::verify_temporal_authority_envelope(
+            state.time_authority_envelope.clone(),
+            &trusted_authority_bindings,
+            now_ns,
+        )?;
+        if !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.source_snapshot.time_authority_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.sink_snapshot.time_authority_ref),
+        ) {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal authority reference mismatch in recovery state".to_string(),
+            ));
+        }
+        if !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.source_snapshot.window_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.sink_snapshot.window_ref),
+        ) {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal window reference mismatch in recovery state".to_string(),
+            ));
+        }
+
+        reconstruct_projection_state(
+            &state.channel_id,
+            &receipts,
+            &state.source_snapshot,
+            &state.sink_snapshot,
+            &trusted_authority_bindings,
+            sequence_bounds,
+        )
+        .map_err(|error| DivergenceError::ProjectionRecoveryFailed(error.to_string()))?;
+
+        let mut recovery_state = self
+            .projection_recovery_state
+            .lock()
+            .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
+        let entry = recovery_state.get_mut(freeze_id).ok_or_else(|| {
+            DivergenceError::ProjectionRecoveryFailed(format!(
+                "missing recovery state for freeze_id={freeze_id}"
+            ))
+        })?;
+        entry.receipts = receipts;
+        entry.replay_sequence_bounds = sequence_bounds;
+        entry.has_durable_provenance = true;
+        entry.durable_evidence_digest = Some(durable_evidence_digest);
+        Ok(())
     }
 
     /// Creates an unfreeze event for a given freeze ID.
@@ -2368,6 +3266,11 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             });
         }
         drop(active);
+
+        // RFC-0028 REQ-0009: Post-containment projection replay must be
+        // reconstructable from durable receipts before unfreeze.
+        // Temporal ambiguity or receipt invalidity fails closed.
+        let _reconstructed = self.verify_projection_recovery_state(freeze_id)?;
 
         let time_envelope_ref = self.generate_time_envelope_ref();
 
@@ -2429,7 +3332,13 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     /// ```
     pub fn apply_unfreeze(&self, unfreeze: &InterventionUnfreeze) -> Result<(), DivergenceError> {
         self.registry
-            .unregister(unfreeze, &self.signer.verifying_key())
+            .unregister(unfreeze, &self.signer.verifying_key())?;
+        let mut recovery_state = self
+            .projection_recovery_state
+            .lock()
+            .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
+        recovery_state.remove(&unfreeze.freeze_id);
+        Ok(())
     }
 
     /// Checks if admission is allowed for the configured repository.
@@ -2464,6 +3373,10 @@ fn current_timestamp_ns() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_zero_hash(hash: &Hash) -> bool {
+    hash.iter().all(|byte| *byte == 0)
+}
+
 /// Validates that a string field does not exceed the maximum length.
 const fn validate_string_length(field: &'static str, value: &str) -> Result<(), DivergenceError> {
     if value.len() > MAX_STRING_LENGTH {
@@ -2495,6 +3408,37 @@ pub mod tests {
         // Use a hydrated registry for tests to bypass fail-closed checks
         let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
         DivergenceWatchdog::with_registry(signer, config, registry)
+    }
+
+    fn derive_test_durable_digest(freeze_id: &str, receipts: &[ProjectionReplayReceiptV1]) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.test.projection_durable_evidence_digest.v1");
+        hasher.update(freeze_id.as_bytes());
+        for receipt in receipts {
+            hasher.update(&receipt.canonical_bytes());
+            hasher.update(&receipt.signature);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    fn register_test_durable_recovery(
+        watchdog: &DivergenceWatchdog,
+        freeze_id: &str,
+        replay_receipt: &ProjectionReplayReceiptV1,
+    ) {
+        let receipts = vec![replay_receipt.clone()];
+        let digest = derive_test_durable_digest(freeze_id, &receipts);
+        watchdog
+            .register_durable_recovery_evidence(
+                freeze_id,
+                receipts,
+                digest,
+                ReplaySequenceBoundsV1 {
+                    required_start_sequence: 0,
+                    required_end_sequence: 0,
+                },
+            )
+            .expect("durable recovery evidence should register");
     }
 
     // =========================================================================
@@ -2702,8 +3646,8 @@ pub mod tests {
     #[test]
     fn test_intervention_freeze_proto_conversion() {
         let signer = Signer::generate();
-        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
-        let time_envelope_hash = hex::encode([0xab; 32]);
+        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
             .scope_value("test-repo")
@@ -2712,7 +3656,7 @@ pub mod tests {
             .expected_trunk_head([0x42; 32])
             .actual_trunk_head([0x99; 32])
             .gate_actor_id("watchdog-001")
-            .time_envelope_ref(&time_envelope_hash)
+            .time_envelope_ref(time_envelope_ref_str)
             .build_and_sign(&signer);
 
         // Manual -> Proto
@@ -2729,11 +3673,11 @@ pub mod tests {
         assert_eq!(proto.actual_trunk_head, freeze.actual_trunk_head.to_vec());
         assert_eq!(proto.gate_actor_id, freeze.gate_actor_id);
         assert_eq!(proto.gate_signature, freeze.gate_signature.to_vec());
-        // Compare time_envelope_ref by converting proto back to hex string
+        // TCK-00469: proto hash field stores raw UTF-8 bytes of the original string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| String::from_utf8(ter.hash.clone()).unwrap())
             .unwrap_or_default();
         assert_eq!(proto_time_envelope_ref, freeze.time_envelope_ref);
 
@@ -2742,17 +3686,62 @@ pub mod tests {
         assert_eq!(recovered, freeze);
     }
 
+    /// TCK-00469: Verify that freeze with htf:tick format survives proto
+    /// roundtrip and signature verification still passes.
+    #[test]
+    fn test_intervention_freeze_proto_roundtrip_htf_tick_signature() {
+        use ed25519_dalek::Verifier;
+
+        let signer = Signer::generate();
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
+        let freeze = InterventionFreezeBuilder::new("freeze-sig-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-sig-001")
+            .frozen_at(1_000_000_000)
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref(time_envelope_ref_str)
+            .try_build_and_sign(&signer)
+            .unwrap();
+
+        // Roundtrip through proto
+        let proto: ProtoInterventionFreeze = freeze.clone().into();
+        let recovered = InterventionFreeze::try_from(proto).unwrap();
+
+        // Canonical bytes must match (lossless roundtrip)
+        assert_eq!(
+            freeze.canonical_bytes(),
+            recovered.canonical_bytes(),
+            "canonical bytes must survive proto roundtrip for htf:tick format"
+        );
+
+        // Signature must still verify on the recovered struct
+        let verifying_key = signer.verifying_key();
+        let signature = ed25519_dalek::Signature::from_bytes(&recovered.gate_signature);
+        let domain_sep = b"INTERVENTION_FREEZE:";
+        let canonical = recovered.canonical_bytes();
+        let mut msg = Vec::with_capacity(domain_sep.len() + canonical.len());
+        msg.extend_from_slice(domain_sep);
+        msg.extend_from_slice(&canonical);
+        assert!(
+            verifying_key.verify(&msg, &signature).is_ok(),
+            "signature must verify after proto roundtrip with htf:tick format"
+        );
+    }
+
     #[test]
     fn test_intervention_unfreeze_proto_conversion() {
         let signer = Signer::generate();
-        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
-        let time_envelope_hash = hex::encode([0xcd; 32]);
+        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Adjudication)
             .adjudication_id("adj-001")
             .unfrozen_at(2_000_000_000)
             .gate_actor_id("operator-001")
-            .time_envelope_ref(&time_envelope_hash)
+            .time_envelope_ref(time_envelope_ref_str)
             .build_and_sign(&signer);
 
         // Manual -> Proto
@@ -2763,11 +3752,11 @@ pub mod tests {
         assert_eq!(proto.unfrozen_at, unfreeze.unfrozen_at);
         assert_eq!(proto.gate_actor_id, unfreeze.gate_actor_id);
         assert_eq!(proto.gate_signature, unfreeze.gate_signature.to_vec());
-        // Compare time_envelope_ref by converting proto back to hex string
+        // TCK-00469: proto hash field stores raw UTF-8 bytes of the original string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| String::from_utf8(ter.hash.clone()).unwrap())
             .unwrap_or_default();
         assert_eq!(proto_time_envelope_ref, unfreeze.time_envelope_ref);
 
@@ -2776,16 +3765,58 @@ pub mod tests {
         assert_eq!(recovered, unfreeze);
     }
 
+    /// TCK-00469: Verify that unfreeze with htf:tick format survives proto
+    /// roundtrip and signature verification still passes.
+    #[test]
+    fn test_intervention_unfreeze_proto_roundtrip_htf_tick_signature() {
+        use ed25519_dalek::Verifier;
+
+        let signer = Signer::generate();
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
+        let unfreeze = InterventionUnfreezeBuilder::new("freeze-sig-002")
+            .resolution_type(ResolutionType::Adjudication)
+            .adjudication_id("adj-sig-002")
+            .unfrozen_at(2_000_000_000)
+            .gate_actor_id("operator-001")
+            .time_envelope_ref(time_envelope_ref_str)
+            .try_build_and_sign(&signer)
+            .unwrap();
+
+        // Roundtrip through proto
+        let proto: ProtoInterventionUnfreeze = unfreeze.clone().into();
+        let recovered = InterventionUnfreeze::try_from(proto).unwrap();
+
+        // Canonical bytes must match (lossless roundtrip)
+        assert_eq!(
+            unfreeze.canonical_bytes(),
+            recovered.canonical_bytes(),
+            "canonical bytes must survive proto roundtrip for htf:tick format"
+        );
+
+        // Signature must still verify on the recovered struct
+        let verifying_key = signer.verifying_key();
+        let signature = ed25519_dalek::Signature::from_bytes(&recovered.gate_signature);
+        let domain_sep = b"INTERVENTION_UNFREEZE:";
+        let canonical = recovered.canonical_bytes();
+        let mut msg = Vec::with_capacity(domain_sep.len() + canonical.len());
+        msg.extend_from_slice(domain_sep);
+        msg.extend_from_slice(&canonical);
+        assert!(
+            verifying_key.verify(&msg, &signature).is_ok(),
+            "signature must verify after proto roundtrip with htf:tick format"
+        );
+    }
+
     #[test]
     fn test_intervention_unfreeze_proto_conversion_none_adjudication() {
         let signer = Signer::generate();
-        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
-        let time_envelope_hash = hex::encode([0xef; 32]);
+        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Manual)
             .unfrozen_at(2_000_000_000)
             .gate_actor_id("operator-001")
-            .time_envelope_ref(&time_envelope_hash)
+            .time_envelope_ref(time_envelope_ref_str)
             .build_and_sign(&signer);
 
         // Manual -> Proto (None -> empty string)
@@ -3261,6 +4292,71 @@ pub mod tests {
     }
 
     #[test]
+    fn test_register_precautionary_freeze_registers_scope_and_exposes_freeze_id() {
+        let registry = FreezeRegistry::new_hydrated_for_testing();
+        let freeze_id = "precautionary-test-repo".to_string();
+
+        assert!(registry.register_precautionary_freeze("test-repo", freeze_id.clone()));
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.is_frozen("test-repo"), Some(freeze_id));
+
+        // Duplicate scope should not create an additional freeze.
+        assert!(
+            !registry.register_precautionary_freeze(
+                "test-repo",
+                "precautionary-test-repo-2".to_string()
+            )
+        );
+        assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_precautionary_freeze_only_removes_matching_precautionary_id() {
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
+        let precautionary_id = "precautionary-test-repo".to_string();
+        assert!(registry.register_precautionary_freeze("test-repo", precautionary_id.clone()));
+
+        // Wrong pattern must not remove.
+        assert!(!registry.remove_precautionary_freeze("test-repo", "freeze-001"));
+        assert_eq!(
+            registry.is_frozen("test-repo"),
+            Some(precautionary_id.clone())
+        );
+
+        // Mismatched precautionary ID must not remove.
+        assert!(!registry.remove_precautionary_freeze("test-repo", "precautionary-other"));
+        assert_eq!(
+            registry.is_frozen("test-repo"),
+            Some(precautionary_id.clone())
+        );
+
+        // Exact precautionary ID removes successfully.
+        assert!(registry.remove_precautionary_freeze("test-repo", &precautionary_id));
+        assert!(registry.is_frozen("test-repo").is_none());
+
+        // Non-precautionary freeze IDs must not be removable through this API.
+        let signed_freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("signed-repo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+        registry
+            .register(&signed_freeze, &signer.verifying_key())
+            .unwrap();
+
+        assert!(!registry.remove_precautionary_freeze("signed-repo", &signed_freeze.freeze_id));
+        assert_eq!(
+            registry.is_frozen("signed-repo"),
+            Some(signed_freeze.freeze_id)
+        );
+    }
+
+    #[test]
     fn test_registry_unregister_with_adjudication_succeeds() {
         // Verify that unfreeze with Adjudication type + adjudication_id works
         let signer = Signer::generate();
@@ -3563,6 +4659,32 @@ pub mod tests {
     }
 
     #[test]
+    fn test_watchdog_replaces_precautionary_freeze_with_divergence_freeze() {
+        let watchdog = create_test_watchdog();
+        let precautionary_id = "precautionary-test-repo".to_string();
+        assert!(
+            watchdog
+                .registry()
+                .register_precautionary_freeze("test-repo", precautionary_id.clone())
+        );
+        assert_eq!(
+            watchdog.registry().is_frozen("test-repo"),
+            Some(precautionary_id.clone())
+        );
+
+        let result = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should replace precautionary freeze");
+
+        assert_ne!(result.freeze.freeze_id, precautionary_id);
+        assert_eq!(
+            watchdog.registry().is_frozen("test-repo"),
+            Some(result.freeze.freeze_id)
+        );
+    }
+
+    #[test]
     fn test_registry_fail_closed_when_not_hydrated() {
         // F-002 fix: Registry should block all admissions when not hydrated
         let registry = FreezeRegistry::new_fail_closed();
@@ -3667,6 +4789,11 @@ pub mod tests {
             .unwrap()
             .unwrap();
         let freeze = &divergence_result.freeze;
+        register_test_durable_recovery(
+            &watchdog,
+            &freeze.freeze_id,
+            &divergence_result.replay_receipt,
+        );
 
         assert!(watchdog.check_admission().is_err());
 
@@ -3697,9 +4824,44 @@ pub mod tests {
         // Now apply the unfreeze (simulating successful ledger persistence)
         // The signature is verified during apply_unfreeze
         watchdog.apply_unfreeze(&unfreeze).unwrap();
+        {
+            let recovery_state = watchdog
+                .projection_recovery_state
+                .lock()
+                .expect("projection recovery lock should not be poisoned");
+            assert!(
+                !recovery_state.contains_key(&freeze.freeze_id),
+                "projection recovery state should be removed after unfreeze apply",
+            );
+        }
 
         // Should allow admission after applying unfreeze
         assert!(watchdog.check_admission().is_ok());
+    }
+
+    #[test]
+    fn test_unfreeze_fails_without_durable_provenance() {
+        let watchdog = create_test_watchdog();
+        let divergence = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should create freeze");
+
+        let error = watchdog
+            .create_unfreeze(
+                &divergence.freeze.freeze_id,
+                ResolutionType::Adjudication,
+                Some("adj-001"),
+            )
+            .expect_err("unfreeze should fail without durable provenance");
+        assert!(
+            matches!(
+                error,
+                DivergenceError::ProjectionRecoveryNotDurable { ref freeze_id }
+                if freeze_id == &divergence.freeze.freeze_id
+            ),
+            "expected ProjectionRecoveryNotDurable, got {error:?}"
+        );
     }
 
     #[test]
@@ -3932,6 +5094,11 @@ pub mod tests {
             .unwrap()
             .unwrap();
         let freeze = &divergence_result.freeze;
+        register_test_durable_recovery(
+            &watchdog,
+            &freeze.freeze_id,
+            &divergence_result.replay_receipt,
+        );
 
         // 3. Admission is now blocked
         let err = watchdog.check_admission().unwrap_err();
@@ -3965,6 +5132,16 @@ pub mod tests {
         // 9. Apply unfreeze to registry after successful persistence
         // The signature is verified during apply_unfreeze
         watchdog.apply_unfreeze(&unfreeze).unwrap();
+        {
+            let recovery_state = watchdog
+                .projection_recovery_state
+                .lock()
+                .expect("projection recovery lock should not be poisoned");
+            assert!(
+                !recovery_state.contains_key(&freeze.freeze_id),
+                "projection recovery state should be removed after unfreeze apply",
+            );
+        }
 
         // 10. Admission is allowed again
         assert!(watchdog.check_admission().is_ok());
@@ -4016,12 +5193,30 @@ pub mod tests {
             result.defect.signal().signal_type(),
             apm2_holon::defect::SignalType::ProjectionDivergence
         );
+        let details: serde_json::Value =
+            serde_json::from_str(result.defect.signal().details()).expect("details must be JSON");
+        let expected_hex = hex::encode(expected_head);
+        let actual_hex = hex::encode(actual_head);
+        assert_eq!(details["channel_id"].as_str(), Some("test-repo"));
+        assert_eq!(
+            details["expected_digest"].as_str(),
+            Some(expected_hex.as_str())
+        );
+        assert_eq!(
+            details["observed_digest"].as_str(),
+            Some(actual_hex.as_str())
+        );
         assert!(
-            result
-                .defect
-                .signal()
-                .details()
-                .contains("divergence detected")
+            details["time_authority_ref"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "time_authority_ref must be present"
+        );
+        assert!(
+            details["window_ref"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "window_ref must be present"
         );
 
         // Verify the freeze references the defect
@@ -4037,5 +5232,161 @@ pub mod tests {
         assert_eq!(result.defect_event.work_id, "test-repo");
         assert_eq!(result.defect_event.severity, "S0");
         assert!(!result.defect_event.cas_hash.is_empty()); // Hash should be present
+        result
+            .compromise_signal
+            .verify_signature(&watchdog.verifying_key())
+            .expect("compromise signal must verify");
+        assert_eq!(result.source_trust_snapshot.channel_id, "test-repo");
+        assert_eq!(result.sink_identity_snapshot.channel_id, "test-repo");
+        let trusted_authority_bindings = watchdog
+            .trusted_authority_bindings()
+            .expect("trusted authority bindings must be valid");
+        result
+            .replay_receipt
+            .verify_signature(&trusted_authority_bindings)
+            .expect("replay receipt must verify");
+    }
+
+    #[test]
+    fn test_sink_endpoint_evidence_local_placeholder_is_unverified() {
+        let watchdog = create_test_watchdog();
+        let evidence = watchdog.sink_endpoint_evidence(None);
+
+        assert!(!evidence.endpoint_identity_verified);
+        assert_eq!(evidence.endpoint_canonical_id, "github://test-repo");
+        assert!(!evidence.endpoint_key_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn test_sink_endpoint_evidence_remote_fingerprint_is_verified() {
+        let watchdog = create_test_watchdog();
+        let evidence = watchdog.sink_endpoint_evidence(Some("remote-fingerprint"));
+
+        assert!(evidence.endpoint_identity_verified);
+        assert_eq!(evidence.endpoint_canonical_id, "github://test-repo");
+        assert_eq!(evidence.endpoint_key_fingerprint, "remote-fingerprint");
+    }
+
+    #[test]
+    fn test_endpoint_identity_verified_flag_domain_separates_digests() {
+        let watchdog = create_test_watchdog();
+        let unverified = SinkEndpointEvidenceV1 {
+            endpoint_canonical_id: "github://test-repo".to_string(),
+            endpoint_key_fingerprint: "fingerprint".to_string(),
+            key_epoch: 0,
+            endpoint_identity_verified: false,
+        };
+        let verified = SinkEndpointEvidenceV1 {
+            endpoint_identity_verified: true,
+            ..unverified.clone()
+        };
+
+        let unverified_sink_digest = watchdog
+            .derive_sink_identity_digest(&unverified)
+            .expect("unverified sink identity digest should derive");
+        let verified_sink_digest = watchdog
+            .derive_sink_identity_digest(&verified)
+            .expect("verified sink identity digest should derive");
+        assert_ne!(unverified_sink_digest, verified_sink_digest);
+
+        let unverified_binding_digest =
+            DivergenceWatchdog::<SystemTimeSource>::derive_endpoint_binding_digest(&unverified)
+                .expect("unverified endpoint binding digest should derive");
+        let verified_binding_digest =
+            DivergenceWatchdog::<SystemTimeSource>::derive_endpoint_binding_digest(&verified)
+                .expect("verified endpoint binding digest should derive");
+        assert_ne!(unverified_binding_digest, verified_binding_digest);
+    }
+
+    #[test]
+    fn test_temporal_authority_rejects_self_issued_when_external_configured() {
+        let watchdog_signer = Signer::generate();
+        let external_signer = Signer::generate();
+        let config = create_test_config()
+            .with_trusted_time_authority_bindings(vec![AuthorityKeyBindingV1 {
+                actor_id: "external-time-authority".to_string(),
+                verifying_key: external_signer.public_key_bytes(),
+            }])
+            .expect("external authority bindings should be valid");
+        let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+        let watchdog = DivergenceWatchdog::with_registry(watchdog_signer, config, registry);
+
+        let error = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect_err("self-issued temporal authority must be rejected");
+        assert!(
+            matches!(error, DivergenceError::InvalidTemporalAuthority(ref message) if message.contains("unknown time authority actor")),
+            "expected InvalidTemporalAuthority unknown actor, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_authority_accepts_external_envelope() {
+        let watchdog_signer = Signer::generate();
+        let external_signer = Signer::generate();
+        let external_actor_id = "external-time-authority";
+        let config = create_test_config()
+            .with_trusted_time_authority_bindings(vec![AuthorityKeyBindingV1 {
+                actor_id: external_actor_id.to_string(),
+                verifying_key: external_signer.public_key_bytes(),
+            }])
+            .expect("external authority bindings should be valid");
+        let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+        let watchdog = DivergenceWatchdog::with_registry(watchdog_signer, config, registry);
+
+        let issued_at_ns = current_timestamp_ns();
+        let ttl_ns =
+            u64::try_from(DEFAULT_TIME_AUTHORITY_TTL.as_nanos()).expect("ttl must fit in u64");
+        let expires_at_ns = issued_at_ns
+            .checked_add(ttl_ns)
+            .expect("time authority expiry should not overflow");
+        let envelope = TimeAuthorityEnvelopeV1::create_signed(
+            "htf:tick:external-1",
+            watchdog.derive_window_ref(issued_at_ns),
+            issued_at_ns,
+            expires_at_ns,
+            external_actor_id,
+            &external_signer,
+        )
+        .expect("external envelope should be signable");
+        let expected_time_authority_ref = envelope.derive_time_authority_ref();
+        watchdog
+            .provide_time_authority_envelope(envelope)
+            .expect("external envelope should be accepted");
+
+        let divergence = watchdog
+            .check_divergence([0x12; 32], [0x34; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should create freeze");
+        assert_eq!(
+            divergence.source_trust_snapshot.time_authority_ref,
+            expected_time_authority_ref
+        );
+    }
+
+    #[test]
+    fn test_create_unfreeze_fails_closed_when_recovery_state_missing() {
+        let watchdog = create_test_watchdog();
+
+        let result = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should create freeze");
+        let freeze_id = result.freeze.freeze_id;
+        {
+            let mut recovery_state = watchdog
+                .projection_recovery_state
+                .lock()
+                .expect("projection recovery lock should not be poisoned");
+            recovery_state.remove(&freeze_id);
+        }
+
+        let error = watchdog
+            .create_unfreeze(&freeze_id, ResolutionType::Adjudication, Some("adj-001"))
+            .expect_err("missing recovery state must fail closed");
+        assert!(
+            matches!(error, DivergenceError::ProjectionRecoveryFailed(ref message) if message.contains("missing recovery state")),
+            "expected projection recovery failure, got {error:?}"
+        );
     }
 }
