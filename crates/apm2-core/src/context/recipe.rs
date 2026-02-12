@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+use super::selector_closure::{
+    CompletenessVerdict, SelectorClosureInput, is_high_risk, verify_selector_completeness,
+};
 use crate::determinism::canonicalize_json;
 use crate::events::Canonicalize;
 use crate::evidence::{CasError, ContentAddressedStore};
@@ -68,6 +71,37 @@ pub struct ContextPackSelectorInput {
     pub context_manifest_hash: [u8; 32],
     /// Hash of the budget profile.
     pub budget_profile_hash: [u8; 32],
+    /// Loss profile declarations keyed by selector path.
+    ///
+    /// Required for high-risk tiers (Tier1+). Empty by default for backward
+    /// compatibility with Tier0 callers.
+    pub loss_profiles: BTreeMap<String, super::selector_closure::LossProfileDeclaration>,
+    /// Resolved risk tier for selector closure completeness checks.
+    ///
+    /// Defaults to `RiskTier::Tier0` (backward-compatible: no loss-profile
+    /// requirement). Callers that set Tier1+ trigger the completeness gate
+    /// during compilation.
+    pub resolved_risk_tier: crate::pcac::RiskTier,
+}
+
+impl ContextPackSelectorInput {
+    /// Sets the resolved risk tier, enabling selector closure completeness
+    /// checks for tiers at or above Tier1.
+    #[must_use]
+    pub const fn with_risk_tier(mut self, tier: crate::pcac::RiskTier) -> Self {
+        self.resolved_risk_tier = tier;
+        self
+    }
+
+    /// Sets loss profile declarations for selector closure completeness.
+    #[must_use]
+    pub fn with_loss_profiles(
+        mut self,
+        profiles: BTreeMap<String, super::selector_closure::LossProfileDeclaration>,
+    ) -> Self {
+        self.loss_profiles = profiles;
+        self
+    }
 }
 
 /// Result of recipe compilation.
@@ -185,6 +219,9 @@ pub enum RecipeCompilerReasonCode {
     FingerprintMismatch,
     /// Integer conversion overflowed.
     IntegerOverflow,
+    /// Selector closure completeness check failed (incomplete selectors/loss
+    /// profiles).
+    SelectorClosureIncomplete,
 }
 
 impl std::fmt::Display for RecipeCompilerReasonCode {
@@ -231,6 +268,7 @@ impl std::fmt::Display for RecipeCompilerReasonCode {
             Self::RecipeHashMismatch => "recipe_hash_mismatch",
             Self::FingerprintMismatch => "fingerprint_mismatch",
             Self::IntegerOverflow => "integer_overflow",
+            Self::SelectorClosureIncomplete => "selector_closure_incomplete",
         };
         write!(f, "{value}")
     }
@@ -427,6 +465,34 @@ impl ContextPackRecipeCompiler {
             &selector.required_read_digests,
             &mut path_validation,
         )?;
+
+        // RFC-0029 REQ-0002: Selector closure completeness gate.
+        // High-risk tiers (Tier1+) require complete loss-profile declarations
+        // for every selector digest. Tier0 callers skip this gate (backward
+        // compat).
+        if is_high_risk(selector.resolved_risk_tier) {
+            let closure_input = SelectorClosureInput {
+                selector_digests: selector.required_read_digests.clone(),
+                loss_profiles: selector.loss_profiles.clone(),
+                resolved_risk_tier: selector.resolved_risk_tier,
+            };
+            match verify_selector_completeness(&closure_input) {
+                CompletenessVerdict::Complete { .. } => {},
+                CompletenessVerdict::Incomplete { defects } => {
+                    let messages: Vec<String> = defects.iter().map(|d| d.message.clone()).collect();
+                    return Err(RecipeCompilerError::SelectorClosure {
+                        code: RecipeCompilerReasonCode::SelectorClosureIncomplete,
+                        message: format!(
+                            "selector closure completeness check failed with {} defect(s): {}",
+                            defects.len(),
+                            messages.join("; ")
+                        ),
+                        path: None,
+                    });
+                },
+            }
+        }
+
         let required_read_digest_set_hash =
             compute_required_read_digest_set_hash(&normalized_digest_map)?;
 
@@ -1590,6 +1656,8 @@ mod tests {
             required_read_digests,
             context_manifest_hash,
             budget_profile_hash,
+            loss_profiles: BTreeMap::new(),
+            resolved_risk_tier: crate::pcac::RiskTier::Tier0,
         }
     }
 
@@ -1673,6 +1741,8 @@ mod tests {
             required_read_digests: required_read_digests_a,
             context_manifest_hash: [0x32; 32],
             budget_profile_hash: [0x33; 32],
+            loss_profiles: BTreeMap::new(),
+            resolved_risk_tier: crate::pcac::RiskTier::Tier0,
         };
 
         let mut required_read_paths_b = BTreeSet::new();
@@ -1686,6 +1756,8 @@ mod tests {
             required_read_digests: required_read_digests_b,
             context_manifest_hash: [0x32; 32],
             budget_profile_hash: [0x33; 32],
+            loss_profiles: BTreeMap::new(),
+            resolved_risk_tier: crate::pcac::RiskTier::Tier0,
         };
 
         let first = compiler
@@ -1740,6 +1812,8 @@ mod tests {
             required_read_digests: mixed_digests,
             context_manifest_hash: [0x42; 32],
             budget_profile_hash: [0x43; 32],
+            loss_profiles: BTreeMap::new(),
+            resolved_risk_tier: crate::pcac::RiskTier::Tier0,
         };
 
         let mut canonical_paths = BTreeSet::new();
@@ -1753,6 +1827,8 @@ mod tests {
             required_read_digests: canonical_digests,
             context_manifest_hash: [0x42; 32],
             budget_profile_hash: [0x43; 32],
+            loss_profiles: BTreeMap::new(),
+            resolved_risk_tier: crate::pcac::RiskTier::Tier0,
         };
 
         let mixed = compiler
@@ -1887,6 +1963,8 @@ mod tests {
             required_read_digests,
             context_manifest_hash: [0x42; 32],
             budget_profile_hash: [0x43; 32],
+            loss_profiles: BTreeMap::new(),
+            resolved_risk_tier: crate::pcac::RiskTier::Tier0,
         };
 
         let error = compiler

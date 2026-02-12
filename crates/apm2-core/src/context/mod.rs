@@ -99,4 +99,5 @@ pub use selector_closure::{
     MAX_REPLAY_EVIDENCE_BYTES, MAX_SELECTOR_DIGESTS, REPLAY_ZOOM_DOMAIN, SelectorClosureDefect,
     SelectorClosureDefectCode, SelectorClosureError, SelectorClosureInput, is_high_risk,
     replay_zoom_in, replay_zoom_in_batch, verify_selector_completeness,
+    verify_selector_completeness_with_cas,
 };

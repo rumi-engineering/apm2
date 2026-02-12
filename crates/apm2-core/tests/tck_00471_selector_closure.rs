@@ -1,12 +1,15 @@
 //! TCK-00471: RFC-0029 REQ-0002 integration tests for selector closure
 //! completeness and deterministic replay zoom-in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use apm2_core::context::selector_closure::{
     CompletenessVerdict, LossProfileDeclaration, MAX_REPLAY_EVIDENCE_BYTES, SelectorClosureDefect,
     SelectorClosureDefectCode, SelectorClosureError, SelectorClosureInput, replay_zoom_in,
     replay_zoom_in_batch, verify_selector_completeness,
+};
+use apm2_core::context::{
+    ContextPackRecipeCompiler, ContextPackSelectorInput, RecipeCompilerReasonCode,
 };
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::pcac::RiskTier;
@@ -228,4 +231,220 @@ fn oversized_replay_evidence_rejected() {
             ..
         })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Compile-path integration: selector closure wired into admission
+// ---------------------------------------------------------------------------
+
+fn setup_compile_workspace() -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().expect("tempdir should be created");
+    std::fs::create_dir_all(workspace.path().join("src")).expect("src dir should be created");
+    std::fs::write(workspace.path().join("src/lib.rs"), b"pub fn main() {}\n")
+        .expect("src/lib.rs should be created");
+    std::fs::write(workspace.path().join("README.md"), b"# test\n")
+        .expect("README.md should be created");
+    workspace
+}
+
+fn selector_for_compile(
+    paths: &[&str],
+    risk_tier: RiskTier,
+    loss_profiles: BTreeMap<String, LossProfileDeclaration>,
+) -> ContextPackSelectorInput {
+    let mut required_read_paths = BTreeSet::new();
+    let mut required_read_digests = BTreeMap::new();
+    for path in paths {
+        let owned = (*path).to_string();
+        required_read_paths.insert(owned.clone());
+        required_read_digests.insert(owned.clone(), *blake3::hash(owned.as_bytes()).as_bytes());
+    }
+    ContextPackSelectorInput {
+        role_spec_hash: [0x11; 32],
+        required_read_paths,
+        required_read_digests,
+        context_manifest_hash: [0x22; 32],
+        budget_profile_hash: [0x33; 32],
+        loss_profiles,
+        resolved_risk_tier: risk_tier,
+    }
+}
+
+#[test]
+fn compile_tier1_missing_loss_profiles_denied() {
+    let workspace = setup_compile_workspace();
+    let compiler =
+        ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+    // Tier1 with no loss profiles must be denied.
+    let selector = selector_for_compile(&["README.md"], RiskTier::Tier1, BTreeMap::new());
+
+    let error = compiler
+        .compile(&selector)
+        .expect_err("Tier1 with missing loss profiles must fail selector closure");
+    assert_eq!(
+        error.reason_code(),
+        RecipeCompilerReasonCode::SelectorClosureIncomplete
+    );
+}
+
+#[test]
+fn compile_tier0_no_loss_profiles_succeeds() {
+    let workspace = setup_compile_workspace();
+    let compiler =
+        ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+    // Tier0 without loss profiles should succeed (backward compat).
+    let selector = selector_for_compile(&["README.md"], RiskTier::Tier0, BTreeMap::new());
+
+    let result = compiler.compile(&selector);
+    assert!(
+        result.is_ok(),
+        "Tier0 compilation without loss profiles must succeed for backward compatibility"
+    );
+}
+
+#[test]
+fn compile_tier1_with_complete_loss_profiles_succeeds() {
+    let workspace = setup_compile_workspace();
+    let compiler =
+        ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+    let path = "README.md";
+    let digest = *blake3::hash(path.as_bytes()).as_bytes();
+    let mut loss_profiles = BTreeMap::new();
+    loss_profiles.insert(
+        path.to_string(),
+        LossProfileDeclaration {
+            digest,
+            entry_count: 3,
+            risk_tier: RiskTier::Tier1,
+        },
+    );
+
+    let selector = selector_for_compile(&[path], RiskTier::Tier1, loss_profiles);
+
+    let result = compiler.compile(&selector);
+    assert!(
+        result.is_ok(),
+        "Tier1 compilation with complete loss profiles must succeed"
+    );
+}
+
+#[test]
+fn compile_tier2plus_partial_loss_profiles_denied() {
+    let workspace = setup_compile_workspace();
+    std::fs::write(workspace.path().join("extra.txt"), b"extra\n")
+        .expect("extra.txt should be created");
+    let compiler =
+        ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+    let path_a = "README.md";
+    let digest_a = *blake3::hash(path_a.as_bytes()).as_bytes();
+    let mut loss_profiles = BTreeMap::new();
+    // Only provide loss profile for one of two paths.
+    loss_profiles.insert(
+        path_a.to_string(),
+        LossProfileDeclaration {
+            digest: digest_a,
+            entry_count: 2,
+            risk_tier: RiskTier::Tier2Plus,
+        },
+    );
+
+    let selector = selector_for_compile(&[path_a, "extra.txt"], RiskTier::Tier2Plus, loss_profiles);
+
+    let error = compiler
+        .compile(&selector)
+        .expect_err("Tier2Plus with partial loss profiles must fail");
+    assert_eq!(
+        error.reason_code(),
+        RecipeCompilerReasonCode::SelectorClosureIncomplete
+    );
+}
+
+#[test]
+fn loss_profile_cas_retrieve_and_verify_integrity() {
+    // When CAS contains the loss profile content,
+    // verify_selector_completeness_with_cas retrieves and validates hash
+    // integrity (not just existence).
+    use apm2_core::context::selector_closure::verify_selector_completeness_with_cas;
+
+    let cas = MemoryCas::new();
+
+    let content = b"loss-profile-content-for-verification";
+    let stored = cas.store(content.as_slice()).expect("CAS store");
+
+    let mut selector_digests = BTreeMap::new();
+    let path = "verified.rs".to_string();
+    selector_digests.insert(path.clone(), stored.hash);
+
+    let mut loss_profiles = BTreeMap::new();
+    loss_profiles.insert(
+        path,
+        LossProfileDeclaration {
+            digest: stored.hash,
+            entry_count: 1,
+            risk_tier: RiskTier::Tier1,
+        },
+    );
+
+    let input = SelectorClosureInput {
+        selector_digests,
+        loss_profiles,
+        resolved_risk_tier: RiskTier::Tier1,
+    };
+
+    let verdict = verify_selector_completeness_with_cas(&input, &cas);
+    assert!(
+        matches!(verdict, CompletenessVerdict::Complete { .. }),
+        "valid loss profile in CAS must yield Complete verdict"
+    );
+}
+
+#[test]
+fn loss_profile_cas_missing_content_detected() {
+    use apm2_core::context::selector_closure::verify_selector_completeness_with_cas;
+
+    let cas = MemoryCas::new();
+
+    let mut selector_digests = BTreeMap::new();
+    let path = "missing.rs".to_string();
+    let fake_digest = [0xBB; 32];
+    selector_digests.insert(path.clone(), fake_digest);
+
+    let mut loss_profiles = BTreeMap::new();
+    loss_profiles.insert(
+        path,
+        LossProfileDeclaration {
+            digest: fake_digest,
+            entry_count: 1,
+            risk_tier: RiskTier::Tier1,
+        },
+    );
+
+    let input = SelectorClosureInput {
+        selector_digests,
+        loss_profiles,
+        resolved_risk_tier: RiskTier::Tier1,
+    };
+
+    let verdict = verify_selector_completeness_with_cas(&input, &cas);
+    match verdict {
+        CompletenessVerdict::Incomplete { defects } => {
+            assert_eq!(defects.len(), 1);
+            assert_eq!(
+                defects[0].code,
+                SelectorClosureDefectCode::LossProfileDigestMismatch
+            );
+            assert!(
+                defects[0].message.contains("not found in CAS"),
+                "message should indicate CAS absence: {}",
+                defects[0].message
+            );
+        },
+        CompletenessVerdict::Complete { .. } => {
+            panic!("missing CAS content must yield Incomplete verdict")
+        },
+    }
 }

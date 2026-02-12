@@ -189,15 +189,24 @@ fn verify_selector_completeness_impl(
                     }
 
                     if let Some(cas) = cas {
-                        match cas.exists(&lp.digest) {
-                            Ok(true) => {},
-                            Ok(false) | Err(CasError::NotFound { .. }) => {
+                        match cas.retrieve(&lp.digest) {
+                            Ok(content) => {
+                                let computed = blake3::hash(&content);
+                                if computed.as_bytes() != &lp.digest {
+                                    defects.push(SelectorClosureDefect {
+                                        code: SelectorClosureDefectCode::LossProfileDigestMismatch,
+                                        message: format!(
+                                            "loss profile digest mismatch for '{path}'"
+                                        ),
+                                        selector_digest_hex: Some(hex::encode(lp.digest)),
+                                    });
+                                }
+                            },
+                            Err(CasError::NotFound { .. }) => {
                                 defects.push(SelectorClosureDefect {
                                     code: SelectorClosureDefectCode::LossProfileDigestMismatch,
-                                    message: format!(
-                                        "loss profile digest for '{path}' does not match CAS content"
-                                    ),
-                                    selector_digest_hex: Some(hex::encode(digest)),
+                                    message: format!("loss profile not found in CAS for '{path}'"),
+                                    selector_digest_hex: Some(hex::encode(lp.digest)),
                                 });
                             },
                             Err(err) => {
@@ -206,7 +215,7 @@ fn verify_selector_completeness_impl(
                                     message: format!(
                                         "unable to verify loss profile digest for '{path}' in CAS: {err}"
                                     ),
-                                    selector_digest_hex: Some(hex::encode(digest)),
+                                    selector_digest_hex: Some(hex::encode(lp.digest)),
                                 });
                             },
                         }
