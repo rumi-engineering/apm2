@@ -1,0 +1,27 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0022"
+  title: "Spine conformance suite: CI-blocking invariant tests"
+  category: "TEST_SUITE"
+  status: "STUB"
+  description: |
+    Evidence that a comprehensive conformance test suite exists and fails CI on
+    no-bypass violations, replay across restart, tamper detection failures,
+    fail-closed prerequisite missing, anti-rollback anchor bypass, downgrade
+    by client, and bounded-work regressions.
+  requirement_ids:
+    - "REQ-0027"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0027.yaml"
+  expected_contents:
+    - "No-bypass tests: authoritative endpoints cannot invoke effect/consume/quarantine outside kernel."
+    - "Replay tests: duplicate consume denied across restart."
+    - "Tamper tests: payload tampering detected via signature verification; chain breaks detected."
+    - "Fail-closed prerequisite tests: missing governance policy root or witnesses denies."
+    - "Anti-rollback tests: rollback-to-earlier-seal denied when external anchor enforced."
+    - "Bounded-work tests: admission hot paths do not scan unbounded ledger history."
+    - "Output gating tests: fail-closed tiers cannot release output before post-effect checks."
+    - "Digest-cycle regression tests."
+    - "Downgrade resistance tests: client cannot force lower tier."
+    - "Crash-window tests: restart during various states yields fail-closed behavior."
+  artifacts: []

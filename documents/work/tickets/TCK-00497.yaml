@@ -1,0 +1,49 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00497"
+    title: "Authoritative witness closure: require daemon-instrumented witnesses for fail-closed tiers and bind to AJC join + AdmissionBundle"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0028"
+    requirements:
+      - requirement_id: "REQ-0004"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0004.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0011"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0011.yaml#evidence_artifact"
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER", "AGENT_REVIEWER", "AGENT_QA"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME", "DOMAIN_OBSERVABILITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00488"
+        reason: "Kernel must enforce fail-closed behavior and own join-input wiring."
+      - ticket_id: "TCK-00489"
+        reason: "AdmissionBundle must reference witness objects + hashes."
+  scope:
+    in_scope:
+      - "Define/confirm authoritative witness schemas and deterministic domain-separated hashing."
+      - "For fail-closed tiers: stubbed/None witnesses are forbidden; missing witnesses MUST deny."
+      - "Bind leakage/timing witness SEED hashes into AJC join inputs for boundary-enforced tool classes (seed-at-join)."
+      - "Materialize post-effect witness evidence objects and bind them into AdmissionBundleV1 (evidence-post-effect)."
+      - "Persist witness objects (or references) and include them in AdmissionBundleV1 for replay verification."
+      - "Bind witness provider identity/version into seed objects to mitigate measurement substitution."
+      - "Explicit non-strict path (monitor tiers) allowed only via explicit waiver binding + defect emission; no silent permissive defaults."
+    out_of_scope:
+      - "Quarantine eviction policy (TCK-00496)."
+  plan:
+    steps:
+      - "Implement witness seed creation in kernel plan phase and bind seed hashes into join extension digest."
+      - "Implement witness evidence finalization in post-effect phase and bind evidence hashes/refs into AdmissionBundleV1."
+      - "Delete monitor-only fallback for fail-closed tiers."
+      - "Add tests: missing seed denies (join-time); missing post-effect evidence denies output release; client-reported hints rejected; measured violations trigger quarantine; waiver path works only for monitor tiers and is logged."
+  definition_of_done:
+    evidence_ids: ["EVID-0011"]
+    criteria:
+      - "Fail-closed tiers deny on missing witness SEEDS at join."
+      - "Fail-closed tiers deny output release on missing post-effect witness evidence."
+      - "Witness seed hashes are bound into AJC join input and referenced in AdmissionBundle; post-effect evidence hashes/refs are in AdmissionBundle."
+      - "Positive-path fail-closed tiers succeed when witnesses exist and are within budget."

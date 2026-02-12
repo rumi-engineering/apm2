@@ -1,0 +1,51 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00496"
+    title: "Quarantine lifecycle hardening: priority-aware eviction, saturation-safe insertion (deny), per-session quota isolation, and restart-safe persistence for fail-closed tiers"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0028"
+    requirements:
+      - requirement_id: "REQ-0004"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0004.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0010"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0010.yaml#evidence_artifact"
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER", "AGENT_REVIEWER", "AGENT_QA"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00488"
+        reason: "Kernel should own quarantine insertion/containment actions (no-bypass)."
+  scope:
+    in_scope:
+      - "Add priority/severity to quarantine entries and implement priority-aware eviction."
+      - "Implement saturation-safe insertion: if quarantine is mandatory and capacity has no evictable entry, deny request (fail closed)."
+      - "Implement per-session quota isolation so one adversarial session cannot exhaust global quarantine capacity."
+      - "Wire boundary-flow admission to deny on quarantine insertion failure (no 'warn and proceed')."
+      - "Implement restart-safe persistence for fail-closed tiers: quarantine state MUST survive daemon restart; if storage is unavailable, fail-closed tiers MUST deny."
+      - "Implement a durable quarantine-capacity guard/reservation token interface for policies that require quarantine-on-violation for fail-closed tiers."
+      - "Ensure the guard is compatible with the canonical lifecycle: guard acquisition is consume-adjacent (part of durable consume barrier) and prevents post-effect 'cannot quarantine' states."
+      - "Ensure quarantine insert/evict is audit-bindable (HE-representable) and includes RequestId + AdmissionBundleDigest."
+    out_of_scope:
+      - "Global quarantine federation across multiple daemons (future)."
+  plan:
+    steps:
+      - "Implement priority-aware eviction algorithm (expired first, then lowest priority; never evict >= incoming priority unexpired entries)."
+      - "Implement quota isolation (bounded slice per session)."
+      - "Implement persistent storage and restart recovery path for active quarantines."
+      - "Implement durable capacity guard API (with TTL/cleanup semantics) and integrate with kernel consume barrier."
+      - "Add adversarial flood tests + saturation tests + restart persistence tests."
+  definition_of_done:
+    evidence_ids: ["EVID-0010"]
+    criteria:
+      - "Active unexpired high-severity quarantines are never evicted by lower priority entries."
+      - "Quarantine saturation causes deny when quarantine is mandatory."
+      - "Per-session quota prevents cross-session starvation."
+      - "Quarantine state persists across restart for fail-closed tiers."
+      - "Durable capacity guard prevents 'cannot quarantine later' for fail-closed tiers."
+      - "Adversarial flood + restart tests exist and pass in CI."

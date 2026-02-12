@@ -1,0 +1,24 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0025"
+  title: "Anti-rollback anchoring: external anchor provider(s) and fail-closed tier gating"
+  category: "CODE_AND_TEST"
+  status: "STUB"
+  description: |
+    Evidence that at least one AntiRollbackAnchor provider is implemented with
+    verify_committed(anchor) semantics, integrated into startup verification and
+    admission request-time checks, and that fail-closed tiers deny when the external
+    anchor is unavailable or inconsistent.
+  requirement_ids:
+    - "REQ-0030"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0030.yaml"
+  expected_contents:
+    - "AntiRollbackAnchor trait implementation with at least one production-suitable provider."
+    - "Test provider for CI/integration testing."
+    - "Startup integration: fail-closed tiers deny if latest seal is not externally committed."
+    - "Request-time integration: fail-closed tiers deny if external anchor unavailable."
+    - "Tests: rollback-to-earlier-seal denied via external anchor."
+    - "Tests: external anchor unavailability causes deny for fail-closed tiers."
+    - "Tests: monitor tiers may run without external anchor (marked non-authoritative)."
+  artifacts: []

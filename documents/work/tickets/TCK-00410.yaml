@@ -57,7 +57,7 @@ ticket_meta:
   plan:
     steps:
       - "Update `.github/workflows/ci.yml` to run primary gates on self-hosted OVH runner labels (for example `[self-hosted, linux, x64, fac-ovh]`) while keeping `pull_request` and `merge_group` triggers."
-      - "Keep/verify required status contract in `documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md`: `CI Success` on `main`, merge queue required, and `merge_group` check emission."
+      - "Keep/verify required status contract: `CI Success` on `main`, merge queue required, and `merge_group` check emission."
       - "Implement `scripts/ci/test_safety_guard.sh` to fail on dangerous patterns in test code (for example destructive filesystem operations, unbounded shell invocations, unsafe recursive deletes) with allowlist file support (`scripts/ci/test_safety_allowlist.txt`)."
       - "Implement `scripts/ci/workspace_integrity_guard.sh` to snapshot tracked repository state before tests and fail if post-test tracked content changes unexpectedly."
       - "Implement `scripts/ci/run_bounded_tests.sh` wrapper to execute `cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci` under hard limits (timeout + cgroup/systemd scope + kill escalation)."
@@ -66,7 +66,7 @@ ticket_meta:
       - "Use `crates/apm2-daemon/src/gate/orchestrator.rs` for gate orchestration and `crates/apm2-daemon/src/projection/github_sync.rs` + `crates/apm2-daemon/src/projection/worker.rs` for status projection mapping to merge-queue-required contexts."
       - "Use cgroup control primitives from `crates/apm2-daemon/src/telemetry/cgroup.rs` and sandbox constraints from `crates/apm2-daemon/src/episode/handlers.rs` (`SandboxConfig`) to enforce containment in gate execution workers."
       - "Add failure-injection tests for: destructive test signature blocked, hung test terminated, cgroup limit breach fails gate, projection idempotency preserved, and flaky-test quarantine path."
-      - "Document operator runbook (service bootstrap, runner labels, limits, failure triage) in `documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md` or a new FAC runbook doc."
+      - "Document operator runbook (service bootstrap, runner labels, limits, failure triage) in a FAC runbook doc."
       - "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test --workspace."
   definition_of_done:
     evidence_ids:
@@ -124,7 +124,7 @@ ticket_meta:
       - scripts/ci/workspace_integrity_guard.sh
       - scripts/ci/run_bounded_tests.sh
       - scripts/ci/test_safety_allowlist.txt
-      - documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md
+      - documents/reviews/CODE_QUALITY_PROMPT.md
     security: |
       - Test execution must occur in isolated, least-privilege environments with explicit resource ceilings.
       - Any missing safety control (sandbox, timeout, integrity check, receipt persistence) must fail closed.

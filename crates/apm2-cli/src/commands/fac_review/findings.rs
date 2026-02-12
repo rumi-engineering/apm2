@@ -40,8 +40,6 @@ struct DimensionFindings {
     source_comment_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verdict: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    severity_counts: Option<SeverityCounts>,
     findings: Vec<FindingRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -58,14 +56,6 @@ struct FindingRecord {
     raw_evidence_pointer: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SeverityCounts {
-    blocker: u64,
-    major: u64,
-    minor: u64,
-    nit: u64,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct ReviewMetadata {
     schema: String,
@@ -73,7 +63,6 @@ struct ReviewMetadata {
     pr_number: u32,
     head_sha: String,
     verdict: String,
-    severity_counts: SeverityCounts,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,7 +269,6 @@ fn evaluate_dimension(
             source_comment_id: None,
             source_comment_url: None,
             verdict: None,
-            severity_counts: None,
             findings: Vec::new(),
             error: Some(if marker_count == 0 {
                 "no marker comment found".to_string()
@@ -308,7 +296,6 @@ fn evaluate_dimension(
             source_comment_id: None,
             source_comment_url: None,
             verdict: None,
-            severity_counts: None,
             findings: Vec::new(),
             error: Some(format!(
                 "all marker comments were invalid ({})",
@@ -329,7 +316,6 @@ fn evaluate_dimension(
             source_comment_id: None,
             source_comment_url: None,
             verdict: None,
-            severity_counts: None,
             findings: Vec::new(),
             error: Some(format!("no marker comment for head sha {head_sha}")),
         };
@@ -352,7 +338,6 @@ fn evaluate_dimension(
             source_comment_id: None,
             source_comment_url: None,
             verdict: None,
-            severity_counts: None,
             findings: Vec::new(),
             error: Some("multiple matching comments disagree on verdict".to_string()),
         };
@@ -365,7 +350,6 @@ fn evaluate_dimension(
             source_comment_id: None,
             source_comment_url: None,
             verdict: None,
-            severity_counts: None,
             findings: Vec::new(),
             error: Some("internal selection error".to_string()),
         };
@@ -388,32 +372,11 @@ fn evaluate_dimension(
                 source_comment_id: Some(selected.comment.id),
                 source_comment_url: Some(selected.comment.html_url),
                 verdict: Some(selected.metadata.verdict),
-                severity_counts: Some(selected.metadata.severity_counts),
                 findings: Vec::new(),
                 error: Some(err),
             };
         },
     };
-
-    let expected_findings = selected.metadata.severity_counts.blocker
-        + selected.metadata.severity_counts.major
-        + selected.metadata.severity_counts.minor
-        + selected.metadata.severity_counts.nit;
-    if expected_findings > 0 && findings.is_empty() {
-        return DimensionFindings {
-            dimension: spec.dimension.to_string(),
-            status: "ERROR".to_string(),
-            source_comment_id: Some(selected.comment.id),
-            source_comment_url: Some(selected.comment.html_url),
-            verdict: Some(selected.metadata.verdict),
-            severity_counts: Some(selected.metadata.severity_counts),
-            findings: Vec::new(),
-            error: Some(
-                "metadata reports findings but comment body had no parseable finding items"
-                    .to_string(),
-            ),
-        };
-    }
 
     DimensionFindings {
         dimension: spec.dimension.to_string(),
@@ -421,7 +384,6 @@ fn evaluate_dimension(
         source_comment_id: Some(selected.comment.id),
         source_comment_url: Some(selected.comment.html_url),
         verdict: Some(selected.metadata.verdict),
-        severity_counts: Some(selected.metadata.severity_counts),
         findings,
         error: None,
     }
@@ -649,8 +611,8 @@ fn emit_report(report: &FindingsReport, json_output: bool) -> Result<(), String>
 mod tests {
     use super::{
         CODE_QUALITY_DIMENSION, DimensionSpec, IssueComment, IssueUser, SECURITY_DIMENSION,
-        SECURITY_MARKER, SeverityCounts, evaluate_dimension, normalize_review_type,
-        parse_findings_from_comment, parse_metadata_from_comment,
+        SECURITY_MARKER, evaluate_dimension, normalize_review_type, parse_findings_from_comment,
+        parse_metadata_from_comment,
     };
 
     #[test]
@@ -665,13 +627,7 @@ mod tests {
   "review_type": "security",
   "pr_number": 441,
   "head_sha": "0123456789abcdef0123456789abcdef01234567",
-  "verdict": "PASS",
-  "severity_counts": {
-    "blocker": 0,
-    "major": 0,
-    "minor": 1,
-    "nit": 2
-  }
+  "verdict": "PASS"
 }
 ```
 "#;
@@ -749,17 +705,6 @@ mod tests {
     }
 
     #[test]
-    fn test_severity_counts_deserialize() {
-        let json = r#"{"blocker":1,"major":2,"minor":3,"nit":4}"#;
-        let parsed: SeverityCounts =
-            serde_json::from_str(json).expect("severity counts should deserialize");
-        assert_eq!(parsed.blocker, 1);
-        assert_eq!(parsed.major, 2);
-        assert_eq!(parsed.minor, 3);
-        assert_eq!(parsed.nit, 4);
-    }
-
-    #[test]
     fn test_evaluate_dimension_rejects_untrusted_marker_comments() {
         let body = r#"
 <!-- apm2-review-metadata:v1:security -->
@@ -769,13 +714,7 @@ mod tests {
   "review_type": "security",
   "pr_number": 441,
   "head_sha": "0123456789abcdef0123456789abcdef01234567",
-  "verdict": "PASS",
-  "severity_counts": {
-    "blocker": 0,
-    "major": 0,
-    "minor": 0,
-    "nit": 0
-  }
+  "verdict": "PASS"
 }
 ```
 "#;
