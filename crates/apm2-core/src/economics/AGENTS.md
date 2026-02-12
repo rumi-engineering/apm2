@@ -563,6 +563,77 @@ Ensures FAC authoritative progression remains admissible during projection sink 
 - `validate_deferred_replay_boundedness(receipts, ...)` -- Deferred replay boundedness validation
 - `evaluate_projection_continuity(window, profile, snapshot, ..., deferred_replay: &DeferredReplayMode)` -- Combined TP-EIO29-005 + deferred replay evaluation
 
+## Reconstruction Admissibility (REQ-0010)
+
+The `reconstruction_admissibility` submodule implements tiered erasure+BFT reconstruction admissibility closure (RFC-0029 REQ-0010).
+
+### Overview
+
+Ensures reconstruction of mandatory artifact tiers (source snapshots, policy roots, promotion-critical evidence manifests) is admissible only when erasure decode validity, BFT quorum certification, and SourceTrustSnapshot digest match are all satisfied. All checks are bound to TP-EIO29-001 and TP-EIO29-004 temporal authority references.
+
+### Receipt and Gate Types
+
+- `ReconstructionAdmissibilityReceiptV1` -- Signed receipt proving reconstruction admissibility with full erasure+BFT+digest closure. Carries `time_authority_ref`, `window_ref`, `digest_proof_ref`, and `quorum_cert_ref`. Uses `RECONSTRUCTION_ADMISSIBILITY_RECEIPT:` domain prefix for Ed25519 domain-separated signatures.
+- `ErasureProfile` -- Erasure coding profile with tier binding, shard counts, and expected artifact digest.
+- `ErasureDecodeResult` -- Result of erasure decode validity checking.
+- `BftQuorumCertificate` -- BFT quorum certificate over a recovered digest with individual signer attestations.
+- `QuorumSigner` -- Individual signer entry with Ed25519 key and signature.
+- `SourceTrustSnapshot` -- Trust bindings (CAS root, ledger head, policy signatures) for digest match verification.
+
+### Gate Evaluation Order
+
+1. **Erasure decode validity** (TP-EIO29-004) -- Profile structural validity, shard threshold satisfaction, decode success, and recovered digest matching expected artifact digest.
+2. **BFT quorum certification** (TP-EIO29-004) -- Quorum threshold (ceil(2n/3)), signer uniqueness, trusted signer enforcement, Ed25519 signature verification, and certified digest matching recovered digest.
+3. **Source trust snapshot digest match** (TP-EIO29-004) -- Snapshot structural validity, CAS root non-zero, and recovered digest matching CAS root binding.
+4. **Receipt validation** (TP-EIO29-001) -- Receipt structural validity, Ed25519 signature verification, trusted signer enforcement, context binding (boundary, time_authority_ref, window_ref), and admitted status.
+
+### Key Types
+
+- `ReconstructionCheckInput` -- Complete input for reconstruction admissibility evaluation
+- `ReconstructionMode` -- Typed enum (`NotReconstructing` / `Active(Box<ReconstructionCheckInput>)`) preventing fail-open bypass via Option
+- `ReconstructionDecision` -- Combined verdict with structured deny defect and predicate results
+- `ReconstructionVerdict` -- Allow / Deny enum
+- `ReconstructionDenyDefect` -- Auditable deny defect with reason, predicate ID, boundary, tick, hash bindings, and failure mode classification
+- `ReconstructionFailureMode` -- Enum classifying failure modes: ErasureDecodeFailed, QuorumCertificationFailed, DigestMismatch, MissingProofComponent, TemporalAuthorityInvalid, ReceiptValidationFailed
+
+### Invariants
+
+- [INV-RA01] All unknown, missing, stale, unsigned, or invalid reconstruction states deny fail-closed.
+- [INV-RA02] Erasure decode requires available shards >= required shards from the declared profile.
+- [INV-RA03] BFT quorum threshold is ceil(2n/3); insufficient signers deny fail-closed.
+- [INV-RA04] All quorum signer keys must be unique (no duplicate signers).
+- [INV-RA05] Recovered digest must match both the quorum-certified digest and the SourceTrustSnapshot CAS root.
+- [INV-RA06] Digest comparisons use constant-time equality (`subtle::ConstantTimeEq`).
+- [INV-RA07] Trusted signer enforcement uses non-short-circuiting constant-time fold to prevent timing side-channels.
+- [INV-RA08] Domain-separated signatures prevent cross-receipt-type replay.
+- [INV-RA09] Collections are hard-capped: MAX_ERASURE_SHARDS=256, MAX_QUORUM_SIGNERS=128, MAX_RECONSTRUCTION_RECEIPTS=256, MAX_POLICY_SIGNATURES=64.
+- [INV-RA10] All protocol-boundary `String` fields use bounded serde deserializers (Check-Before-Allocate pattern).
+- [INV-RA11] `create_signed` methods validate string field lengths BEFORE allocation to prevent DoS via oversized input.
+- [INV-RA12] Duplicate receipt IDs are rejected to prevent signature amplification attacks.
+- [INV-RA13] `ReconstructionMode` forces callers to explicitly declare reconstruction intent; `Option`-based bypass is eliminated.
+- [INV-RA14] `content_hash` on receipt structs is caller-provided (external content digest, not self-referential).
+- [INV-RA15] Receipt carries `digest_proof_ref` and `quorum_cert_ref` hash bindings for cross-referencing proof components.
+
+### Contracts
+
+- [CTR-RA01] `validate_erasure_decode()` enforces profile presence, structural validity, shard counts, shard threshold, non-zero digests, and recovered digest match.
+- [CTR-RA02] `validate_bft_quorum_certification()` enforces certificate presence, total nodes, quorum threshold, signer uniqueness, trusted signer enforcement, Ed25519 signature verification, and certified digest match.
+- [CTR-RA03] `validate_source_trust_snapshot()` enforces snapshot presence, non-zero fields (CAS root, ledger head, policy digest, content hash), policy signature bounds, and recovered digest match against CAS root.
+- [CTR-RA04] `validate_reconstruction_receipts()` enforces receipt presence, count bounds, duplicate ID detection, structural validity, Ed25519 signature verification, trusted signer enforcement, context binding, and admitted status.
+- [CTR-RA05] `evaluate_reconstruction_admissibility()` combines all four gates (erasure, quorum, trust snapshot, receipt) in order, producing `ReconstructionDecision` with structured deny defects and failure mode classification.
+- [CTR-RA06] All deny decisions produce a `ReconstructionDenyDefect` with stable reason code, predicate ID, boundary, tick, hash bindings, and failure mode.
+
+### Public API
+
+- `ReconstructionAdmissibilityReceiptV1::create_signed(receipt_id, ...)` -- Create and sign a reconstruction admissibility receipt (validates before allocating)
+- `ReconstructionAdmissibilityReceiptV1::verify_signature()` -- Verify receipt Ed25519 signature
+- `ReconstructionAdmissibilityReceiptV1::validate()` -- Structural validation (no signature check)
+- `validate_erasure_decode(profile, decode_result)` -- Erasure decode validity gate
+- `validate_bft_quorum_certification(cert, recovered_digest, trusted_quorum_keys)` -- BFT quorum certification gate
+- `validate_source_trust_snapshot(snapshot, recovered_digest)` -- Source trust snapshot digest match gate
+- `validate_reconstruction_receipts(receipts, eval_boundary_id, trusted_signers, expected_time_authority_ref, expected_window_ref)` -- Receipt validation gate
+- `evaluate_reconstruction_admissibility(input, eval_boundary_id, eval_tick, envelope_hash, window_ref_hash)` -- Combined gate evaluation
+
 ## Related Modules
 
 - [`apm2_core::evidence`](../evidence/AGENTS.md) -- CAS (`ContentAddressedStore`, `MemoryCas`) used for profile storage
