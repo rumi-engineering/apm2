@@ -136,8 +136,9 @@ pub use intent_buffer::{
     ProjectionIntent,
 };
 pub use projection_receipt::{
-    IdempotencyKey, MAX_STRING_LENGTH, ProjectedStatus, ProjectionReceipt,
-    ProjectionReceiptBuilder, ProjectionReceiptError,
+    DeferredReplayReceiptInput, IdempotencyKey, MAX_BOUNDARY_ID_LENGTH, MAX_STRING_LENGTH,
+    ProjectedStatus, ProjectionAdmissionReceipt, ProjectionAdmissionReceiptBuilder,
+    ProjectionReceipt, ProjectionReceiptBuilder, ProjectionReceiptError,
 };
 pub use worker::{
     LedgerTailer, PrMetadata, ProjectionWorker, ProjectionWorkerConfig, ProjectionWorkerError,

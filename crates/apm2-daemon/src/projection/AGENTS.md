@@ -10,7 +10,9 @@ The `projection` module implements write-only projection adapters that synchroni
 
 - **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub
 - **`GitHubProjectionAdapter`**: Write-only GitHub commit status projection with signed receipts
-- **`ProjectionReceipt`**: Signed proof of projection with idempotency keys
+- **`ProjectionReceipt`**: Signed proof of projection with idempotency keys (legacy, backwards-compatible)
+- **`ProjectionAdmissionReceipt`**: Temporal-bound projection receipt bridging daemon receipts to economics `DeferredReplayReceiptV1` (TCK-00506)
+- **`DeferredReplayReceiptInput`**: Input assembly for constructing `DeferredReplayReceiptV1` from admission receipts
 - **`DivergenceWatchdog`**: Monitors for ledger/trunk HEAD divergence (TCK-00213)
 - **`FreezeRegistry`**: Tracks active intervention freezes
 - **`IntentBuffer`**: SQLite-backed durable buffer for projection intents and deferred replay backlog (TCK-00504)
@@ -19,9 +21,11 @@ The `projection` module implements write-only projection adapters that synchroni
 
 - **Write-only**: Adapters NEVER read external state as truth
 - **Ledger is truth**: All decisions are based on ledger state
-- **Signed receipts**: Every projection generates a signed receipt with domain separation (`PROJECTION_RECEIPT:`)
+- **Signed receipts**: Every projection generates a signed receipt with domain separation (`PROJECTION_RECEIPT:` for legacy, `PROJECTION_ADMISSION_RECEIPT:` for temporal-bound)
+- **Domain isolation**: Legacy `PROJECTION_RECEIPT:` signatures MUST NOT be accepted as proof of temporal binding; admission receipts use a distinct domain
 - **Idempotent**: Safe for retries with `(work_id, changeset_digest, ledger_head)` key
 - **Persistent cache**: Idempotency cache survives restarts
+- **Bounded deserialization**: String fields (`boundary_id`, `receipt_id`, `work_id`) reject oversized values before allocation
 
 ## Key Types
 
@@ -91,6 +95,53 @@ pub struct ProjectionReceipt {
 
 - [CTR-PJ05] Domain separation with `PROJECTION_RECEIPT:` prefix.
 - [CTR-PJ06] `IdempotencyKey = (work_id, changeset_digest, ledger_head)`.
+- [CTR-PJ09] Optional temporal fields (`boundary_id`, `time_authority_ref`, `window_ref`, `eval_tick`) are backwards-compatible: old payloads deserialize with `None`.
+
+### `ProjectionAdmissionReceipt` (TCK-00506)
+
+```rust
+pub struct ProjectionAdmissionReceipt {
+    pub receipt_id: String,
+    pub work_id: String,
+    pub changeset_digest: [u8; 32],
+    pub ledger_head: [u8; 32],
+    pub projected_status: ProjectedStatus,
+    pub projected_at: u64,
+    pub boundary_id: String,            // required
+    pub time_authority_ref: [u8; 32],   // required, non-zero
+    pub window_ref: [u8; 32],           // required, non-zero
+    pub eval_tick: u64,                 // required
+    pub adapter_signature: [u8; 64],
+}
+```
+
+Temporal-bound projection receipt for economics gate compatibility. All temporal fields are required (non-Option). Uses `PROJECTION_ADMISSION_RECEIPT:` domain for signing.
+
+**Invariants:**
+
+- [INV-PJ07] `PROJECTION_ADMISSION_RECEIPT:` domain is distinct from `PROJECTION_RECEIPT:` -- cross-type signature confusion is prevented.
+- [INV-PJ08] `time_authority_ref` and `window_ref` must not be zero (fail-closed at construction).
+- [INV-PJ09] `boundary_id` must not be empty and must not exceed `MAX_BOUNDARY_ID_LENGTH` (256).
+
+**Contracts:**
+
+- [CTR-PJ07] `From<&ProjectionAdmissionReceipt>` produces `DeferredReplayReceiptInput` with lossless field mapping.
+- [CTR-PJ08] Bounded serde deserialization rejects oversized `boundary_id` before allocation.
+
+### `DeferredReplayReceiptInput` (TCK-00506)
+
+Bridge type for assembling `DeferredReplayReceiptV1::create_signed` inputs from admission receipts.
+
+**Field mapping:**
+
+| Admission Receipt | DeferredReplayReceiptInput | DeferredReplayReceiptV1 |
+|---|---|---|
+| `receipt_id` | `receipt_id` | `receipt_id` |
+| `boundary_id` | `boundary_id` | `boundary_id` |
+| `changeset_digest` | `backlog_digest` | `backlog_digest` |
+| `time_authority_ref` | `time_authority_ref` | `time_authority_ref` |
+| `window_ref` | `window_ref` | `window_ref` |
+| `eval_tick` | `eval_tick` | `replay_horizon_tick` |
 
 ### `ProjectedStatus`
 
@@ -156,6 +207,7 @@ Fail-closed: unknown verdict values parsed from the database are treated as `Den
 - `ProjectionWorker`, `ProjectionWorkerConfig`, `ProjectionWorkerError`
 - `GitHubProjectionAdapter`, `GitHubAdapterConfig`, `ProjectionAdapter`, `ProjectionError`
 - `ProjectionReceipt`, `ProjectionReceiptBuilder`, `ProjectedStatus`, `IdempotencyKey`
+- `ProjectionAdmissionReceipt`, `ProjectionAdmissionReceiptBuilder`, `DeferredReplayReceiptInput`, `MAX_BOUNDARY_ID_LENGTH`
 - `DivergenceWatchdog`, `DivergenceWatchdogConfig`, `DivergenceError`
 - `FreezeRegistry`, `InterventionFreeze`, `InterventionUnfreeze`
 - `TamperEvent`, `TamperResult`
@@ -177,3 +229,4 @@ Fail-closed: unknown verdict values parsed from the database are treated as `Den
 - TCK-00214: Tamper detection
 - TCK-00322: Projection worker implementation
 - TCK-00504: Projection intent schema and durable buffer for economics-gated admission
+- TCK-00506: Projection receipt format bridge for economics gate compatibility

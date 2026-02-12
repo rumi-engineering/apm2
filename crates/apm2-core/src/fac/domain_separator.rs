@@ -156,6 +156,15 @@ pub const PROJECTION_COMPROMISE_SIGNAL_PREFIX: &[u8] = b"PROJECTION_COMPROMISE_S
 /// Used when signing/verifying post-containment replay receipts.
 pub const PROJECTION_REPLAY_RECEIPT_PREFIX: &[u8] = b"PROJECTION_REPLAY_RECEIPT:";
 
+/// Domain prefix for projection admission receipts with temporal binding.
+///
+/// Used when signing/verifying projection receipts that include temporal
+/// fields (`boundary_id`, `time_authority_ref`, `window_ref`, `eval_tick`).
+/// This domain is distinct from `PROJECTION_RECEIPT:` to prevent
+/// cross-type signature confusion: a legacy receipt signature MUST NOT
+/// be accepted as proof of temporal binding.
+pub const PROJECTION_ADMISSION_RECEIPT_PREFIX: &[u8] = b"PROJECTION_ADMISSION_RECEIPT:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -368,7 +377,7 @@ pub mod tests {
 
     #[test]
     fn test_all_domain_prefixes_defined() {
-        // Verify all 16 required domain prefixes are defined
+        // Verify all required domain prefixes are defined
         let prefixes = [
             GATE_LEASE_ISSUED_PREFIX,
             LEASE_REVOKED_PREFIX,
@@ -386,6 +395,7 @@ pub mod tests {
             REVIEW_BLOCKED_RECORDED_PREFIX,
             REVIEW_RECEIPT_RECORDED_PREFIX,
             PROJECTION_RECEIPT_RECORDED_PREFIX,
+            PROJECTION_ADMISSION_RECEIPT_PREFIX,
         ];
 
         // All prefixes should be non-empty and end with ':'
