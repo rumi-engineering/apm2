@@ -37,7 +37,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
-use crate::crypto::{Hash, Signer, SignerError, parse_signature, parse_verifying_key};
+use crate::crypto::{EventHasher, Hash, Signer, SignerError, parse_signature, parse_verifying_key};
 use crate::fac::{sign_with_domain, verify_with_domain};
 use crate::pcac::MAX_REASON_LENGTH;
 use crate::pcac::temporal_arbitration::TemporalPredicateId;
@@ -242,6 +242,12 @@ pub const DENY_DEFERRED_REPLAY_RECEIPT_BACKLOG_MISMATCH: &str =
     "projection_deferred_replay_receipt_backlog_digest_mismatch";
 /// Deny: continuity window content hash is zero.
 pub const DENY_CONTINUITY_WINDOW_HASH_ZERO: &str = "projection_continuity_window_content_hash_zero";
+/// Deny: continuity window boundary ID exceeds maximum length.
+pub const DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED: &str =
+    "projection_continuity_window_boundary_id_length_exceeded";
+/// Deny: sink snapshot digest mismatch between profile and snapshot.
+pub const DENY_SINK_SNAPSHOT_DIGEST_MISMATCH: &str =
+    "projection_sink_identity_snapshot_digest_mismatch";
 
 // ============================================================================
 // Bounded serde helpers (OOM-safe deserialization)
@@ -300,7 +306,9 @@ where
         }
     }
 
-    deserializer.deserialize_string(BoundedStringVisitor {
+    // Use `deserialize_str` to hint the deserializer to provide a borrowed
+    // `&str` via `visit_str`, so length is checked before allocation.
+    deserializer.deserialize_str(BoundedStringVisitor {
         max_len,
         field_name,
     })
@@ -647,10 +655,10 @@ impl ProjectionContinuityWindowV1 {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        // Fixed-size fields: 6 * 8 (ticks) + 5 * 32 (hashes) = 48 + 160 = 208
+        // Fixed-size fields: 4 * 8 (ticks) + 5 * 32 (hashes) = 32 + 160 = 192
         // Three length-prefixed strings: 3 * 4 = 12 bytes of length headers
         let estimated_size =
-            208 + 12 + self.window_id.len() + self.boundary_id.len() + self.signer_actor_id.len();
+            192 + 12 + self.window_id.len() + self.boundary_id.len() + self.signer_actor_id.len();
         let mut bytes = Vec::with_capacity(estimated_size);
 
         bytes.extend_from_slice(&(self.window_id.len() as u32).to_be_bytes());
@@ -720,8 +728,11 @@ impl ProjectionContinuityWindowV1 {
         if self.window_id.is_empty() || self.window_id.len() > MAX_RECEIPT_ID_LENGTH {
             return Err(DENY_CONTINUITY_WINDOW_ID_INVALID);
         }
-        if self.boundary_id.is_empty() || self.boundary_id.len() > MAX_BOUNDARY_ID_LENGTH {
-            return Err(DENY_CONTINUITY_WINDOW_BOUNDARY_MISMATCH);
+        if self.boundary_id.is_empty() {
+            return Err(DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED);
+        }
+        if self.boundary_id.len() > MAX_BOUNDARY_ID_LENGTH {
+            return Err(DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED);
         }
         if is_zero_hash(&self.outage_window_ref) {
             return Err(DENY_CONTINUITY_WINDOW_OUTAGE_REF_ZERO);
@@ -749,6 +760,19 @@ impl ProjectionContinuityWindowV1 {
         }
         if self.replay_window_start > self.replay_window_end {
             return Err(DENY_REPLAY_WINDOW_TICK_RANGE_INVALID);
+        }
+        // Enforce maximum outage and replay window spans (Finding 1: DoS prevention).
+        let outage_span = self
+            .outage_window_end
+            .saturating_sub(self.outage_window_start);
+        if outage_span > MAX_OUTAGE_WINDOW_TICKS {
+            return Err(DENY_OUTAGE_WINDOW_TICKS_EXCEEDED);
+        }
+        let replay_span = self
+            .replay_window_end
+            .saturating_sub(self.replay_window_start);
+        if replay_span > MAX_REPLAY_WINDOW_TICKS {
+            return Err(DENY_REPLAY_WINDOW_TICKS_EXCEEDED);
         }
         Ok(())
     }
@@ -1061,6 +1085,39 @@ pub struct SinkIdentitySnapshotV1 {
 }
 
 impl SinkIdentitySnapshotV1 {
+    /// Computes the canonical digest of the sink identities collection.
+    ///
+    /// Hashes each sink identity entry (length-prefixed `sink_id` +
+    /// `identity_digest`) in order to produce a deterministic
+    /// content-addressed digest of the snapshot.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn compute_digest(&self) -> Hash {
+        let mut canonical = Vec::new();
+        // Encode the entry count as a 4-byte big-endian prefix.
+        canonical.extend_from_slice(&(self.sink_identities.len() as u32).to_be_bytes());
+        for entry in &self.sink_identities {
+            canonical.extend_from_slice(&(entry.sink_id.len() as u32).to_be_bytes());
+            canonical.extend_from_slice(entry.sink_id.as_bytes());
+            canonical.extend_from_slice(&entry.identity_digest);
+        }
+        EventHasher::hash_content(&canonical)
+    }
+
+    /// Verifies that `snapshot_digest` is the actual hash of `sink_identities`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DENY_SINK_SNAPSHOT_DIGEST_MISMATCH`] if the computed digest
+    /// does not match `self.snapshot_digest`.
+    pub fn verify_digest(&self) -> Result<(), &'static str> {
+        let computed = self.compute_digest();
+        if computed.ct_eq(&self.snapshot_digest).unwrap_u8() == 0 {
+            return Err(DENY_SINK_SNAPSHOT_DIGEST_MISMATCH);
+        }
+        Ok(())
+    }
+
     /// Validates structural invariants.
     ///
     /// # Errors
@@ -1354,8 +1411,8 @@ pub fn validate_projection_continuity_tp005(
         return Err(DENY_CONTINUITY_WINDOW_SIGNER_UNTRUSTED);
     }
 
-    // Context binding.
-    if window.boundary_id != eval_boundary_id {
+    // Context binding (constant-time via hash comparison, INV-PC10).
+    if !ct_eq_str(&window.boundary_id, eval_boundary_id) {
         return Err(DENY_CONTINUITY_WINDOW_BOUNDARY_MISMATCH);
     }
     if window
@@ -1386,8 +1443,9 @@ pub fn validate_projection_continuity_tp005(
         return Err(DENY_CONTINUITY_PROFILE_SIGNER_UNTRUSTED);
     }
 
-    // Context binding: profile must match evaluation boundary.
-    if profile.boundary_id != eval_boundary_id {
+    // Context binding: profile must match evaluation boundary (constant-time,
+    // INV-PC10).
+    if !ct_eq_str(&profile.boundary_id, eval_boundary_id) {
         return Err(DENY_CONTINUITY_PROFILE_BOUNDARY_MISMATCH);
     }
     if profile
@@ -1406,14 +1464,18 @@ pub fn validate_projection_continuity_tp005(
     let snapshot = sink_snapshot.ok_or(DENY_SINK_SNAPSHOT_MISSING)?;
     snapshot.validate()?;
 
-    // Profile's sink_snapshot_digest must match the snapshot's digest.
+    // Verify the snapshot_digest is the actual hash of the sink_identities
+    // collection (prevents identity spoofing via digest substitution).
+    snapshot.verify_digest()?;
+
+    // Profile's sink_snapshot_digest must match the snapshot's verified digest.
     if profile
         .sink_snapshot_digest
         .ct_eq(&snapshot.snapshot_digest)
         .unwrap_u8()
         == 0
     {
-        return Err(DENY_SINK_SNAPSHOT_DIGEST_ZERO);
+        return Err(DENY_SINK_SNAPSHOT_DIGEST_MISMATCH);
     }
 
     // ---- Scenario verdict evaluation ----
@@ -1515,8 +1577,8 @@ pub fn validate_deferred_replay_boundedness(
             return Err(DENY_DEFERRED_REPLAY_RECEIPT_SIGNER_UNTRUSTED);
         }
 
-        // Context binding.
-        if receipt.boundary_id != eval_boundary_id {
+        // Context binding (constant-time via hash comparison, INV-PC10).
+        if !ct_eq_str(&receipt.boundary_id, eval_boundary_id) {
             return Err(DENY_DEFERRED_REPLAY_RECEIPT_BOUNDARY_MISMATCH);
         }
         if receipt
@@ -1549,7 +1611,13 @@ pub fn validate_deferred_replay_boundedness(
             return Err(DENY_DEFERRED_REPLAY_NOT_CONVERGED);
         }
 
-        // Retention envelope check.
+        // Hard cap: replayed_item_count must not exceed MAX_BACKLOG_ITEMS
+        // regardless of the caller-supplied retention envelope.
+        if receipt.replayed_item_count > MAX_BACKLOG_ITEMS as u64 {
+            return Err(DENY_BACKLOG_ITEMS_EXCEEDED);
+        }
+
+        // Retention envelope check (caller-supplied bound, may be tighter).
         if receipt.replayed_item_count > input.max_backlog_items {
             return Err(DENY_BACKLOG_EXCEEDS_RETENTION);
         }
@@ -1716,6 +1784,17 @@ fn is_zero_hash(hash: &[u8; 32]) -> bool {
     hash.ct_eq(&ZERO_HASH).unwrap_u8() == 1
 }
 
+/// Constant-time string comparison via Blake3 hash equality (INV-PC10).
+///
+/// Hashes both operands to fixed-size digests and compares via
+/// `ConstantTimeEq`, preventing timing side-channel leaks on
+/// variable-length boundary identifiers.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let hash_a = EventHasher::hash_content(a.as_bytes());
+    let hash_b = EventHasher::hash_content(b.as_bytes());
+    hash_a.ct_eq(&hash_b).unwrap_u8() == 1
+}
+
 fn validate_required_string(
     field: &str,
     value: &str,
@@ -1807,6 +1886,8 @@ mod tests {
     }
 
     fn valid_continuity_profile(signer: &Signer) -> ProjectionSinkContinuityProfileV1 {
+        // Use the computed digest from valid_sink_snapshot() to ensure binding.
+        let snapshot = valid_sink_snapshot();
         ProjectionSinkContinuityProfileV1::create_signed(
             "cp-001",
             "boundary-1",
@@ -1815,7 +1896,7 @@ mod tests {
                 valid_scenario_verdict("churn-1"),
                 valid_scenario_verdict("partition-1"),
             ],
-            test_hash(0xEE), // sink_snapshot_digest matching snapshot
+            snapshot.snapshot_digest, // computed digest matching snapshot
             test_hash(0xBB),
             test_hash(0xCC),
             test_hash(0xDD),
@@ -1826,7 +1907,7 @@ mod tests {
     }
 
     fn valid_sink_snapshot() -> SinkIdentitySnapshotV1 {
-        SinkIdentitySnapshotV1 {
+        let mut snapshot = SinkIdentitySnapshotV1 {
             sink_identities: vec![
                 SinkIdentityEntry {
                     sink_id: "github-main".to_string(),
@@ -1837,8 +1918,10 @@ mod tests {
                     identity_digest: test_hash(0x02),
                 },
             ],
-            snapshot_digest: test_hash(0xEE), // matches profile sink_snapshot_digest
-        }
+            snapshot_digest: [0u8; 32], // placeholder, will be computed below
+        };
+        snapshot.snapshot_digest = snapshot.compute_digest();
+        snapshot
     }
 
     fn valid_deferred_replay_receipt(signer: &Signer) -> DeferredReplayReceiptV1 {
@@ -2272,7 +2355,7 @@ mod tests {
             "cp-bad",
             "boundary-1",
             vec![bad_verdict],
-            test_hash(0xEE),
+            snapshot.snapshot_digest,
             test_hash(0xBB),
             test_hash(0xCC),
             test_hash(0xDD),
@@ -2307,7 +2390,7 @@ mod tests {
             "cp-bad2",
             "boundary-1",
             vec![bad_verdict],
-            test_hash(0xEE),
+            snapshot.snapshot_digest,
             test_hash(0xBB),
             test_hash(0xCC),
             test_hash(0xDD),
@@ -2760,6 +2843,327 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             DENY_CONTINUITY_WINDOW_SIGNATURE_INVALID
+        );
+    }
+
+    // ========================================================================
+    // Finding 1: Unbounded continuity window horizon enforcement in validate()
+    // ========================================================================
+
+    #[test]
+    fn continuity_window_validate_outage_span_at_max_allowed() {
+        let signer = valid_signer();
+        // outage_span = MAX_OUTAGE_WINDOW_TICKS (exactly at boundary)
+        let window = ProjectionContinuityWindowV1::create_signed(
+            "cw-boundary-outage",
+            "boundary-1",
+            0,
+            MAX_OUTAGE_WINDOW_TICKS,
+            0,
+            1000,
+            test_hash(0xA1),
+            test_hash(0xA2),
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("window at boundary");
+        assert!(
+            window.validate().is_ok(),
+            "exact boundary should be allowed"
+        );
+    }
+
+    #[test]
+    fn continuity_window_validate_outage_span_exceeds_max_denied() {
+        let signer = valid_signer();
+        // outage_span = MAX_OUTAGE_WINDOW_TICKS + 1 (exceeds boundary)
+        let result = ProjectionContinuityWindowV1::create_signed(
+            "cw-over-outage",
+            "boundary-1",
+            0,
+            MAX_OUTAGE_WINDOW_TICKS + 1,
+            0,
+            1000,
+            test_hash(0xA1),
+            test_hash(0xA2),
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        );
+        assert!(
+            result.is_err(),
+            "exceeding max outage span must fail creation"
+        );
+
+        // Also test validate() directly on a pre-built struct.
+        let mut window = valid_continuity_window(&signer);
+        window.outage_window_start = 0;
+        window.outage_window_end = MAX_OUTAGE_WINDOW_TICKS + 1;
+        assert_eq!(
+            window.validate().unwrap_err(),
+            DENY_OUTAGE_WINDOW_TICKS_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn continuity_window_validate_replay_span_at_max_allowed() {
+        let signer = valid_signer();
+        let window = ProjectionContinuityWindowV1::create_signed(
+            "cw-boundary-replay",
+            "boundary-1",
+            0,
+            1000,
+            0,
+            MAX_REPLAY_WINDOW_TICKS,
+            test_hash(0xA1),
+            test_hash(0xA2),
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("window at replay boundary");
+        assert!(
+            window.validate().is_ok(),
+            "exact replay boundary should be allowed"
+        );
+    }
+
+    #[test]
+    fn continuity_window_validate_replay_span_exceeds_max_denied() {
+        let signer = valid_signer();
+        let result = ProjectionContinuityWindowV1::create_signed(
+            "cw-over-replay",
+            "boundary-1",
+            0,
+            1000,
+            0,
+            MAX_REPLAY_WINDOW_TICKS + 1,
+            test_hash(0xA1),
+            test_hash(0xA2),
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        );
+        assert!(
+            result.is_err(),
+            "exceeding max replay span must fail creation"
+        );
+
+        let mut window = valid_continuity_window(&signer);
+        window.replay_window_start = 0;
+        window.replay_window_end = MAX_REPLAY_WINDOW_TICKS + 1;
+        assert_eq!(
+            window.validate().unwrap_err(),
+            DENY_REPLAY_WINDOW_TICKS_EXCEEDED
+        );
+    }
+
+    // ========================================================================
+    // Finding 2: Sink identity snapshot digest verification
+    // ========================================================================
+
+    #[test]
+    fn sink_snapshot_compute_digest_deterministic() {
+        let s1 = valid_sink_snapshot();
+        let s2 = valid_sink_snapshot();
+        assert_eq!(s1.compute_digest(), s2.compute_digest());
+        // Digest is non-zero.
+        assert_ne!(s1.compute_digest(), [0u8; 32]);
+    }
+
+    #[test]
+    fn sink_snapshot_compute_digest_changes_with_content() {
+        let s1 = valid_sink_snapshot();
+        let mut s2 = valid_sink_snapshot();
+        s2.sink_identities[0].sink_id = "altered-sink".to_string();
+        assert_ne!(s1.compute_digest(), s2.compute_digest());
+    }
+
+    #[test]
+    fn sink_snapshot_verify_digest_passes_for_valid() {
+        let snapshot = valid_sink_snapshot();
+        assert!(snapshot.verify_digest().is_ok());
+    }
+
+    #[test]
+    fn sink_snapshot_verify_digest_fails_for_tampered_identities() {
+        let mut snapshot = valid_sink_snapshot();
+        // Tamper with identity after computing digest.
+        snapshot.sink_identities[0].sink_id = "tampered".to_string();
+        assert_eq!(
+            snapshot.verify_digest().unwrap_err(),
+            DENY_SINK_SNAPSHOT_DIGEST_MISMATCH
+        );
+    }
+
+    #[test]
+    fn sink_snapshot_verify_digest_fails_for_wrong_digest_field() {
+        let mut snapshot = valid_sink_snapshot();
+        snapshot.snapshot_digest = test_hash(0x99);
+        assert_eq!(
+            snapshot.verify_digest().unwrap_err(),
+            DENY_SINK_SNAPSHOT_DIGEST_MISMATCH
+        );
+    }
+
+    #[test]
+    fn tp005_snapshot_digest_mismatch_returns_correct_error_code() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        let window = valid_continuity_window(&signer);
+        let snapshot = valid_sink_snapshot();
+
+        // Create profile with a DIFFERENT sink_snapshot_digest than snapshot.
+        let profile = ProjectionSinkContinuityProfileV1::create_signed(
+            "cp-digest-mismatch",
+            "boundary-1",
+            vec![valid_scenario_verdict("outage-1")],
+            test_hash(0x99), // does not match snapshot.snapshot_digest
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("profile created");
+
+        let result = validate_projection_continuity_tp005(
+            Some(&window),
+            Some(&profile),
+            Some(&snapshot),
+            "boundary-1",
+            &trusted,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_SINK_SNAPSHOT_DIGEST_MISMATCH);
+    }
+
+    // ========================================================================
+    // Finding 3: Constant-time boundary_id comparison
+    // ========================================================================
+
+    #[test]
+    fn ct_eq_str_equal_strings_match() {
+        assert!(ct_eq_str("boundary-1", "boundary-1"));
+    }
+
+    #[test]
+    fn ct_eq_str_different_strings_no_match() {
+        assert!(!ct_eq_str("boundary-1", "boundary-2"));
+    }
+
+    #[test]
+    fn ct_eq_str_empty_vs_nonempty_no_match() {
+        assert!(!ct_eq_str("", "boundary-1"));
+    }
+
+    #[test]
+    fn ct_eq_str_both_empty_match() {
+        assert!(ct_eq_str("", ""));
+    }
+
+    // ========================================================================
+    // Finding 4: MAX_BACKLOG_ITEMS hard cap enforcement
+    // ========================================================================
+
+    #[test]
+    fn deferred_replay_max_backlog_items_hard_cap_denied() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create a receipt with replayed_item_count exceeding MAX_BACKLOG_ITEMS.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-hardcap",
+            "boundary-1",
+            test_hash(0xFF),
+            MAX_BACKLOG_ITEMS as u64 + 1, // exceeds hard cap
+            5000,
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: u64::MAX, // very large retention, but hard cap still applies
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert_eq!(result.unwrap_err(), DENY_BACKLOG_ITEMS_EXCEEDED);
+    }
+
+    #[test]
+    fn deferred_replay_max_backlog_items_at_hard_cap_allowed() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-hardcap-ok",
+            "boundary-1",
+            test_hash(0xFF),
+            MAX_BACKLOG_ITEMS as u64, // exactly at hard cap
+            5000,
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: MAX_BACKLOG_ITEMS as u64,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert!(result.is_ok(), "at hard cap boundary should be allowed");
+    }
+
+    // ========================================================================
+    // Finding 6: Boundary ID length exceeded error code
+    // ========================================================================
+
+    #[test]
+    fn continuity_window_validate_empty_boundary_id_uses_length_exceeded_code() {
+        let signer = valid_signer();
+        let mut window = valid_continuity_window(&signer);
+        window.boundary_id = String::new();
+        assert_eq!(
+            window.validate().unwrap_err(),
+            DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn continuity_window_validate_oversized_boundary_id_uses_length_exceeded_code() {
+        let signer = valid_signer();
+        let mut window = valid_continuity_window(&signer);
+        window.boundary_id = "x".repeat(MAX_BOUNDARY_ID_LENGTH + 1);
+        assert_eq!(
+            window.validate().unwrap_err(),
+            DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED
         );
     }
 }
