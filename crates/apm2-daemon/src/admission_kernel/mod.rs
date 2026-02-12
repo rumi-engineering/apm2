@@ -34,6 +34,7 @@
 //! ```
 
 pub mod capabilities;
+pub mod effect_journal;
 pub mod prerequisites;
 pub mod trust_stack;
 pub mod types;
@@ -49,6 +50,7 @@ use apm2_core::pcac::{
     IdentityEvidenceLevel,
 };
 use capabilities::{EffectCapability, LedgerWriteCapability, QuarantineCapability};
+use effect_journal::{EffectJournal, EffectJournalBindingV1, IdempotencyKeyV1};
 use prerequisites::{
     AntiRollbackAnchor, LedgerAnchorV1, LedgerTrustVerifier, PolicyRootResolver, TrustError,
 };
@@ -179,6 +181,12 @@ pub struct AdmissionKernelV1 {
     anti_rollback: Option<Arc<dyn AntiRollbackAnchor>>,
     /// Quarantine capacity guard (fail-closed on error for fail-closed tiers).
     quarantine_guard: Option<Arc<dyn QuarantineGuard>>,
+    /// Effect execution journal for crash-safe state tracking (TCK-00501).
+    ///
+    /// When wired, the kernel records effect execution transitions
+    /// (`Started` before effect dispatch, `Completed` after success)
+    /// and classifies crash windows on restart.
+    effect_journal: Option<Arc<dyn EffectJournal>>,
     /// Witness provider configuration.
     ///
     /// `pub(crate)` to allow the post-effect witness evidence
@@ -196,6 +204,7 @@ impl std::fmt::Debug for AdmissionKernelV1 {
             .field("has_policy_resolver", &self.policy_resolver.is_some())
             .field("has_anti_rollback", &self.anti_rollback.is_some())
             .field("has_quarantine_guard", &self.quarantine_guard.is_some())
+            .field("has_effect_journal", &self.effect_journal.is_some())
             .field("witness_provider", &self.witness_provider)
             .finish_non_exhaustive()
     }
@@ -219,6 +228,7 @@ impl AdmissionKernelV1 {
             policy_resolver: None,
             anti_rollback: None,
             quarantine_guard: None,
+            effect_journal: None,
             witness_provider,
         }
     }
@@ -248,6 +258,22 @@ impl AdmissionKernelV1 {
     #[must_use]
     pub fn with_quarantine_guard(mut self, guard: Arc<dyn QuarantineGuard>) -> Self {
         self.quarantine_guard = Some(guard);
+        self
+    }
+
+    /// Set the effect execution journal for crash-safe state tracking
+    /// (TCK-00501, REQ-0029).
+    ///
+    /// When wired, the kernel integrates journal transitions into the
+    /// execute phase:
+    /// - `Started` is recorded after durable consume and before capability
+    ///   minting (the effect dispatch boundary).
+    /// - `Completed` should be recorded by the caller after effect execution
+    ///   succeeds (via the journal reference in the result).
+    /// - On restart, `Started` without `Completed` -> `Unknown` (in-doubt).
+    #[must_use]
+    pub fn with_effect_journal(mut self, journal: Arc<dyn EffectJournal>) -> Self {
+        self.effect_journal = Some(journal);
         self
     }
 
@@ -536,11 +562,48 @@ impl AdmissionKernelV1 {
         //
         // See: finalize_anti_rollback() method below.
 
-        // Phase Q: Mint capability tokens.
+        // Phase P.2: Derive idempotency key and build journal binding
+        // (TCK-00501).
+        //
+        // After durable consume and before capability minting, derive
+        // the idempotency key and prepare the journal binding data.
+        // The actual `record_started` call is deferred to the caller
+        // (see Phase P.2 comment below near journal_binding construction)
+        // to avoid false in-doubt classification from orphaned Started
+        // entries.
         let ajc_id = plan.certificate.ajc_id;
         let request_id = plan.request.request_id;
         let intent_digest = plan.request.intent_digest;
 
+        if let Some(ref journal) = self.effect_journal {
+            let binding = EffectJournalBindingV1 {
+                request_id,
+                request_digest: plan.spine_ext.canonical_request_digest,
+                as_of_ledger_anchor: plan.as_of_ledger_anchor.clone(),
+                policy_root_digest: plan.policy_root_digest,
+                policy_root_epoch: plan.policy_root_epoch,
+                leakage_witness_seed_hash: plan.leakage_witness_seed.content_hash(),
+                timing_witness_seed_hash: plan.timing_witness_seed.content_hash(),
+                boundary_profile_id: plan.request.boundary_profile_id.clone(),
+                enforcement_tier: plan.enforcement_tier,
+                ajc_id,
+                authority_join_hash: plan.certificate.authority_join_hash,
+                session_id: plan.request.session_id.clone(),
+                tool_class: plan.request.tool_class.clone(),
+                declared_idempotent: plan.request.declared_idempotent,
+            };
+
+            journal
+                .record_started(&binding)
+                .map_err(|e| AdmitError::BundleSealFailure {
+                    reason: format!("effect journal record_started failed: {e}"),
+                })?;
+        }
+
+        // Derive idempotency key for propagation to tool/broker adapters.
+        let idempotency_key = IdempotencyKeyV1::derive(request_id, ajc_id);
+
+        // Phase Q: Mint capability tokens.
         let effect_capability = EffectCapability::new(ajc_id, intent_digest, request_id);
 
         // Gate LedgerWriteCapability to fail-closed tiers only (CTR-2617).
@@ -635,6 +698,8 @@ impl AdmissionKernelV1 {
             boundary_span,
             leakage_witness_seed,
             timing_witness_seed,
+            idempotency_key,
+            effect_journal: self.effect_journal.clone(),
         })
     }
 

@@ -1409,6 +1409,23 @@ pub struct AdmissionResultV1 {
     ///
     /// See `leakage_witness_seed` for rationale.
     pub timing_witness_seed: WitnessSeedV1,
+    /// Idempotency key for propagation into tool/broker adapter calls
+    /// (TCK-00501, REQ-0029).
+    ///
+    /// Deterministically derived from `RequestId` + AJC ID. External
+    /// systems that support idempotency keys should use this to
+    /// deduplicate effect execution.
+    pub idempotency_key: super::effect_journal::IdempotencyKeyV1,
+    /// Reference to the effect execution journal for post-effect
+    /// completion recording (TCK-00501).
+    ///
+    /// The caller MUST call `record_completed(request_id)` after
+    /// successful effect execution to transition the journal state
+    /// from `Started` to `Completed`. Without this, the next restart
+    /// will classify the effect as `Unknown` (in-doubt).
+    ///
+    /// `None` when no effect journal is wired.
+    pub effect_journal: Option<std::sync::Arc<dyn super::effect_journal::EffectJournal>>,
 }
 
 // Intentionally no Clone or Serialize — capability tokens are non-cloneable.
@@ -1432,6 +1449,8 @@ impl std::fmt::Debug for AdmissionResultV1 {
                 "timing_seed_hash",
                 &hex::encode(self.timing_witness_seed.content_hash()),
             )
+            .field("idempotency_key", &hex::encode(self.idempotency_key.key))
+            .field("has_effect_journal", &self.effect_journal.is_some())
             .finish()
     }
 }
