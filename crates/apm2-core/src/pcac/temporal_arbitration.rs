@@ -110,9 +110,18 @@ pub enum TemporalPredicateId {
     /// Anti-entropy convergence horizon satisfied.
     #[serde(rename = "TP-EIO29-003")]
     TpEio29003,
+    /// Replay convergence horizon satisfied (RFC-0029 REQ-0005).
+    #[serde(rename = "TP-EIO29-004")]
+    TpEio29004,
+    /// Replay idempotency monotone (RFC-0029 REQ-0005).
+    #[serde(rename = "TP-EIO29-007")]
+    TpEio29007,
     /// Promotion temporal ambiguity is false.
     #[serde(rename = "TP-EIO29-008")]
     TpEio29008,
+    /// Recovery admissibility gate (RFC-0029 REQ-0005).
+    #[serde(rename = "TP-EIO29-009")]
+    TpEio29009,
 }
 
 impl std::fmt::Display for TemporalPredicateId {
@@ -121,7 +130,10 @@ impl std::fmt::Display for TemporalPredicateId {
             Self::TpEio29001 => write!(f, "TP-EIO29-001"),
             Self::TpEio29002 => write!(f, "TP-EIO29-002"),
             Self::TpEio29003 => write!(f, "TP-EIO29-003"),
+            Self::TpEio29004 => write!(f, "TP-EIO29-004"),
+            Self::TpEio29007 => write!(f, "TP-EIO29-007"),
             Self::TpEio29008 => write!(f, "TP-EIO29-008"),
+            Self::TpEio29009 => write!(f, "TP-EIO29-009"),
         }
     }
 }
@@ -648,7 +660,10 @@ const fn predicate_tag(predicate: TemporalPredicateId) -> u8 {
         TemporalPredicateId::TpEio29001 => 1,
         TemporalPredicateId::TpEio29002 => 2,
         TemporalPredicateId::TpEio29003 => 3,
+        TemporalPredicateId::TpEio29004 => 4,
+        TemporalPredicateId::TpEio29007 => 7,
         TemporalPredicateId::TpEio29008 => 8,
+        TemporalPredicateId::TpEio29009 => 9,
     }
 }
 
