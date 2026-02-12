@@ -2,8 +2,9 @@
 //!
 //! Canonical economics profiles, deterministic budget admission,
 //! HTF-bound queue admission, replay-recovery bounds,
-//! security-interlocked optimization gates, and authority-surface
-//! monotonicity enforcement.
+//! security-interlocked optimization gates, authority-surface
+//! monotonicity enforcement, and tiered erasure+BFT reconstruction
+//! admissibility.
 //!
 //! This module implements RFC-0029 baseline primitives:
 //! - REQ-0001: canonical, content-addressed economics profiles keyed by
@@ -20,12 +21,15 @@
 //!   enforcement for optimization candidates
 //! - REQ-0009: projection multi-sink outage continuity and deferred replay
 //!   boundedness with TP-EIO29-005 enforcement
+//! - REQ-0010: tiered erasure+BFT reconstruction admissibility closure with
+//!   TP-EIO29-001 and TP-EIO29-004 enforcement
 
 pub mod admission;
 pub mod optimization_gate;
 pub mod profile;
 pub mod projection_continuity;
 pub mod queue_admission;
+pub mod reconstruction_admissibility;
 pub mod replay_recovery;
 
 pub use admission::{
@@ -78,6 +82,14 @@ pub use queue_admission::{
     QueueDenyDefect, QueueLane, QueueSchedulerState, RevocationFrontierSnapshot, SignatureVerifier,
     TimeAuthorityEnvelopeV1, evaluate_anti_entropy_admission, evaluate_queue_admission,
     validate_convergence_horizon_tp003, validate_envelope_tp001, validate_freshness_horizon_tp002,
+};
+pub use reconstruction_admissibility::{
+    BftQuorumCertificate, ErasureDecodeResult, ErasureProfile, QuorumSigner,
+    ReconstructionAdmissibilityError, ReconstructionAdmissibilityReceiptV1,
+    ReconstructionCheckInput, ReconstructionDecision, ReconstructionDenyDefect,
+    ReconstructionFailureMode, ReconstructionMode, ReconstructionVerdict, SourceTrustSnapshot,
+    evaluate_reconstruction_admissibility, validate_bft_quorum_certification,
+    validate_erasure_decode, validate_reconstruction_receipts, validate_source_trust_snapshot,
 };
 pub use replay_recovery::{
     AdjacentWindowPair, BacklogState, IdempotencyCheckInput, IdempotencyMode,
