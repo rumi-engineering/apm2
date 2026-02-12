@@ -78,6 +78,7 @@
 pub mod firewall;
 mod manifest;
 mod recipe;
+pub mod selector_closure;
 
 pub use manifest::{
     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, MAX_ENTRIES, MAX_PATH_COMPONENTS,
@@ -92,4 +93,11 @@ pub use recipe::{
     MAX_REQUIRED_READ_PATH_COMPONENTS, MAX_REQUIRED_READ_PATH_LENGTH, MAX_REQUIRED_READ_PATHS,
     MAX_WORKSPACE_ROOT_LENGTH, RecipeCompilerError, RecipeCompilerReasonCode,
     load_fingerprint_from_cas, reconstruct_from_receipts,
+};
+pub use selector_closure::{
+    CompletenessVerdict, LossProfileDeclaration, MAX_LOSS_PROFILE_ENTRIES,
+    MAX_REPLAY_EVIDENCE_BYTES, MAX_SELECTOR_DIGESTS, REPLAY_ZOOM_DOMAIN, SelectorClosureDefect,
+    SelectorClosureDefectCode, SelectorClosureError, SelectorClosureInput, is_high_risk,
+    replay_zoom_in, replay_zoom_in_batch, verify_selector_completeness,
+    verify_selector_completeness_with_cas,
 };
