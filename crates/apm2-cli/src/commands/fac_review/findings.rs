@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::projection_store;
 use super::selector::render_finding_selector;
+use super::state::{ReviewRunStateLoad, load_review_run_state, read_pulse_file};
 use super::target::resolve_pr_target;
 use super::types::{COMMENT_CONFIRM_MAX_PAGES, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
@@ -196,6 +197,10 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(value.to_ascii_lowercase());
     }
 
+    if let Some(value) = resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
+    }
+
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
         return Ok(identity.head_sha.to_ascii_lowercase());
@@ -220,6 +225,32 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         "gh-fallback:findings.resolve_head_sha",
     );
     Ok(value)
+}
+
+fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
+    for review_type in ["security", "quality"] {
+        let Ok(state) = load_review_run_state(pr_number, review_type) else {
+            continue;
+        };
+        if let ReviewRunStateLoad::Present(entry) = state {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    for review_type in ["security", "quality"] {
+        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
+            continue;
+        };
+        if let Some(entry) = pulse {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    None
 }
 
 fn fetch_issue_comments(

@@ -37,6 +37,14 @@ struct ParsedPrBody {
     has_gate_markers: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GateMarkerSpan {
+    start_line_start: usize,
+    section_start: usize,
+    section_end: usize,
+    end_line_end: usize,
+}
+
 pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, String> {
     if let Some(snapshot) = projection_store::load_pr_body_snapshot(owner_repo, pr_number)? {
         return Ok(snapshot);
@@ -91,18 +99,71 @@ fn parse_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
     statuses
 }
 
-fn parse_pr_body(body: &str) -> ParsedPrBody {
-    let Some(start_idx) = body.find(GATE_STATUS_START) else {
-        return ParsedPrBody {
-            before_markers: body.to_string(),
-            existing_gate_statuses: Vec::new(),
-            after_markers: String::new(),
-            has_gate_markers: false,
-        };
-    };
+fn fence_delimiter(trimmed_line: &str) -> Option<char> {
+    let bytes = trimmed_line.as_bytes();
+    if bytes.len() < 3 {
+        return None;
+    }
+    let first = bytes[0];
+    if !(first == b'`' || first == b'~') {
+        return None;
+    }
+    if bytes[1] == first && bytes[2] == first {
+        Some(char::from(first))
+    } else {
+        None
+    }
+}
 
-    let section_start = start_idx + GATE_STATUS_START.len();
-    let Some(relative_end) = body[section_start..].find(GATE_STATUS_END) else {
+fn find_gate_marker_span(body: &str) -> Option<GateMarkerSpan> {
+    let mut offset = 0usize;
+    let mut open_fence: Option<char> = None;
+    let mut start_line_start: Option<usize> = None;
+    let mut section_start: Option<usize> = None;
+
+    for line in body.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let line_end = offset;
+        let trimmed_start = line.trim_start();
+        let trimmed = line.trim();
+
+        if let Some(delimiter) = fence_delimiter(trimmed_start) {
+            match open_fence {
+                Some(open) if open == delimiter => open_fence = None,
+                None => open_fence = Some(delimiter),
+                _ => {},
+            }
+            continue;
+        }
+
+        if open_fence.is_some() {
+            continue;
+        }
+
+        if start_line_start.is_none() {
+            if trimmed == GATE_STATUS_START {
+                start_line_start = Some(line_start);
+                section_start = Some(line_end);
+            }
+            continue;
+        }
+
+        if trimmed == GATE_STATUS_END {
+            return Some(GateMarkerSpan {
+                start_line_start: start_line_start.unwrap_or(0),
+                section_start: section_start.unwrap_or(line_start),
+                section_end: line_start,
+                end_line_end: line_end,
+            });
+        }
+    }
+
+    None
+}
+
+fn parse_pr_body(body: &str) -> ParsedPrBody {
+    let Some(span) = find_gate_marker_span(body) else {
         return ParsedPrBody {
             before_markers: body.to_string(),
             existing_gate_statuses: Vec::new(),
@@ -110,12 +171,11 @@ fn parse_pr_body(body: &str) -> ParsedPrBody {
             has_gate_markers: false,
         };
     };
-    let end_idx = section_start + relative_end;
-    let section = &body[section_start..end_idx];
-    let after_markers = body[end_idx + GATE_STATUS_END.len()..].to_string();
+    let section = &body[span.section_start..span.section_end];
+    let after_markers = body[span.end_line_end..].to_string();
 
     ParsedPrBody {
-        before_markers: body[..start_idx].to_string(),
+        before_markers: body[..span.start_line_start].to_string(),
         existing_gate_statuses: parse_gate_statuses(section),
         after_markers,
         has_gate_markers: true,
@@ -357,5 +417,35 @@ mod tests {
         let updated = build_updated_pr_body(&existing, &latest).expect("updated");
         let details_count = updated.matches("<details>").count();
         assert_eq!(details_count, 5);
+    }
+
+    #[test]
+    fn parse_pr_body_ignores_markers_inside_fenced_blocks() {
+        let existing = format!(
+            "intro\n\n```yaml\nexample: |\n  {GATE_STATUS_START}\n  this marker is part of ticket content\n  {GATE_STATUS_END}\n```\n\ntail\n"
+        );
+        let parsed = parse_pr_body(&existing);
+        assert!(!parsed.has_gate_markers);
+        assert_eq!(parsed.before_markers, existing);
+        assert!(parsed.existing_gate_statuses.is_empty());
+    }
+
+    #[test]
+    fn build_updated_pr_body_appends_when_markers_only_exist_in_code_block() {
+        let existing = format!(
+            "```yaml\n- literal: |\n    {GATE_STATUS_START}\n    sample\n    {GATE_STATUS_END}\n```\n"
+        );
+        let latest = sample_status(
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "2026-02-12T10:00:00Z",
+            true,
+        );
+        let updated = build_updated_pr_body(&existing, &latest).expect("updated");
+        assert!(updated.contains(
+            "```yaml\n- literal: |\n    <!-- apm2-gate-status:start -->\n    sample\n    <!-- apm2-gate-status:end -->\n```"
+        ));
+        assert!(updated.contains("## FAC Gate Status"));
+        assert_eq!(updated.matches(GATE_STATUS_START).count(), 2);
+        assert_eq!(updated.matches(GATE_STATUS_END).count(), 2);
     }
 }
