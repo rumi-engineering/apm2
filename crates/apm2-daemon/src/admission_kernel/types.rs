@@ -157,6 +157,7 @@ mod bounded_deser {
         super::MAX_WITNESS_PROVIDER_ID_LENGTH
     );
     bounded_string_deser!(deser_witness_class, super::MAX_KERNEL_STRING_LENGTH);
+    bounded_string_deser!(deser_waiver_reason, super::MAX_WAIVER_REASON_LENGTH);
 
     // Bounded Vec deserializers for collection fields.
     // These enforce MAX_* limits DURING deserialization via SeqAccess Visitor,
@@ -175,6 +176,11 @@ mod bounded_deser {
         deser_post_effect_witness_evidence_hashes,
         apm2_core::crypto::Hash,
         super::MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES
+    );
+    bounded_vec_deser!(
+        deser_measured_values,
+        apm2_core::crypto::Hash,
+        super::MAX_WITNESS_EVIDENCE_MEASURED_VALUES
     );
 }
 
@@ -199,6 +205,12 @@ pub const MAX_ALGORITHM_ID_LENGTH: usize = 64;
 
 /// Maximum length for the witness provider identifier.
 pub const MAX_WITNESS_PROVIDER_ID_LENGTH: usize = 256;
+
+/// Maximum length for a monitor-tier waiver reason string.
+pub const MAX_WAIVER_REASON_LENGTH: usize = 512;
+
+/// Maximum number of measured values in a witness evidence object.
+pub const MAX_WITNESS_EVIDENCE_MEASURED_VALUES: usize = 16;
 
 // =============================================================================
 // Enforcement tier
@@ -570,6 +582,230 @@ impl WitnessSeedV1 {
         hasher.update(&(self.provider_id.len() as u32).to_le_bytes());
         hasher.update(&self.provider_build_digest);
         *hasher.finalize().as_bytes()
+    }
+}
+
+// =============================================================================
+// WitnessEvidenceV1
+// =============================================================================
+
+/// Post-effect witness evidence object (RFC-0028 REQ-0004, TCK-00497).
+///
+/// Materialized AFTER the effect executes. Binds daemon-measured values
+/// (leakage metrics, timing measurements) to the witness seed that was
+/// committed at join time. For fail-closed tiers, output release is
+/// denied unless valid witness evidence is present.
+///
+/// # Digest Domain Separation
+///
+/// Content hash: `b"apm2-witness-evidence-v1" || witness_class_len ||
+/// witness_class || seed_hash || request_id || session_id_len ||
+/// session_id || ht_end_le || measured_values_count || measured_values...
+/// || provider_id_len || provider_id || provider_build_digest`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessEvidenceV1 {
+    /// Witness class (must match the seed's class, e.g., "leakage", "timing").
+    #[serde(deserialize_with = "bounded_deser::deser_witness_class")]
+    pub witness_class: String,
+    /// Content hash of the [`WitnessSeedV1`] this evidence fulfills.
+    pub seed_hash: Hash,
+    /// Stable request identifier (must match the seed's `request_id`).
+    pub request_id: Hash,
+    /// Session identifier (must match the seed's `session_id`).
+    #[serde(deserialize_with = "bounded_deser::deser_kernel_string")]
+    pub session_id: String,
+    /// Holonic time at evidence finalization (end of effect).
+    pub ht_end: u64,
+    /// Daemon-measured values. Bounded by
+    /// [`MAX_WITNESS_EVIDENCE_MEASURED_VALUES`]. Each entry is a
+    /// domain-separated hash of a (key, value) measurement.
+    /// Deserialization enforces the limit via visitor-based counting
+    /// (no oversized pre-allocation from malicious size hints).
+    #[serde(deserialize_with = "bounded_deser::deser_measured_values")]
+    pub measured_values: Vec<Hash>,
+    /// Witness provider identifier (must match the seed's `provider_id`).
+    #[serde(deserialize_with = "bounded_deser::deser_witness_provider_id")]
+    pub provider_id: String,
+    /// Witness provider build digest (must match the seed's
+    /// `provider_build_digest`).
+    pub provider_build_digest: Hash,
+}
+
+impl WitnessEvidenceV1 {
+    /// Compute a deterministic content hash for this witness evidence.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // String fields bounded by MAX_* (<=512), safe for u32.
+    pub fn content_hash(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2-witness-evidence-v1");
+        hasher.update(self.witness_class.as_bytes());
+        hasher.update(&(self.witness_class.len() as u32).to_le_bytes());
+        hasher.update(&self.seed_hash);
+        hasher.update(&self.request_id);
+        hasher.update(self.session_id.as_bytes());
+        hasher.update(&(self.session_id.len() as u32).to_le_bytes());
+        hasher.update(&self.ht_end.to_le_bytes());
+        hasher.update(&(self.measured_values.len() as u32).to_le_bytes());
+        for mv in &self.measured_values {
+            hasher.update(mv);
+        }
+        hasher.update(self.provider_id.as_bytes());
+        hasher.update(&(self.provider_id.len() as u32).to_le_bytes());
+        hasher.update(&self.provider_build_digest);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Validate boundary constraints on this witness evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first violation found (fail-closed).
+    pub fn validate(&self) -> Result<(), AdmitError> {
+        const ZERO: Hash = [0u8; 32];
+
+        if self.witness_class.is_empty() || self.witness_class.len() > MAX_KERNEL_STRING_LENGTH {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "witness_class empty or exceeds maximum length".into(),
+            });
+        }
+        if self.seed_hash == ZERO {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "seed_hash is zero (unbound evidence)".into(),
+            });
+        }
+        if self.request_id == ZERO {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "request_id is zero".into(),
+            });
+        }
+        if self.session_id.is_empty() || self.session_id.len() > MAX_KERNEL_STRING_LENGTH {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "session_id empty or exceeds maximum length".into(),
+            });
+        }
+        if self.ht_end == 0 {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "ht_end is zero (missing finalization timestamp)".into(),
+            });
+        }
+        if self.measured_values.len() > MAX_WITNESS_EVIDENCE_MEASURED_VALUES {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: format!(
+                    "measured_values exceeds maximum of {MAX_WITNESS_EVIDENCE_MEASURED_VALUES}, \
+                     got {}",
+                    self.measured_values.len()
+                ),
+            });
+        }
+        if self.provider_id.is_empty() || self.provider_id.len() > MAX_WITNESS_PROVIDER_ID_LENGTH {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "provider_id empty or exceeds maximum length".into(),
+            });
+        }
+        if self.provider_build_digest == ZERO {
+            return Err(AdmitError::WitnessEvidenceFailure {
+                reason: "provider_build_digest is zero (unbound measurement)".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+// =============================================================================
+// MonitorWaiverV1
+// =============================================================================
+
+/// Explicit waiver for monitor-tier witness bypass (TCK-00497).
+///
+/// Monitor tiers may skip witness enforcement ONLY when an explicit
+/// waiver is provided. Silent permissive defaults are forbidden.
+/// The waiver is committed into the admission decision for audit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorWaiverV1 {
+    /// Waiver identifier (governance-issued or policy-derived).
+    pub waiver_id: Hash,
+    /// Human-readable reason for the waiver (bounded).
+    #[serde(deserialize_with = "bounded_deser::deser_waiver_reason")]
+    pub reason: String,
+    /// Tick at which this waiver expires (0 = no expiry, but
+    /// governance must periodically re-issue).
+    pub expires_at_tick: u64,
+    /// Request ID this waiver applies to.
+    pub request_id: Hash,
+    /// Enforcement tier this waiver targets (must be Monitor).
+    pub enforcement_tier: EnforcementTier,
+}
+
+impl MonitorWaiverV1 {
+    /// Compute a deterministic content hash for this waiver.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // reason bounded by MAX_WAIVER_REASON_LENGTH (512), safe for u32.
+    pub fn content_hash(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2-monitor-waiver-v1");
+        hasher.update(&self.waiver_id);
+        hasher.update(self.reason.as_bytes());
+        hasher.update(&(self.reason.len() as u32).to_le_bytes());
+        hasher.update(&self.expires_at_tick.to_le_bytes());
+        hasher.update(&self.request_id);
+        hasher.update(match self.enforcement_tier {
+            EnforcementTier::FailClosed => &[0x01],
+            EnforcementTier::Monitor => &[0x02],
+        });
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Validate boundary constraints on this waiver, including expiry
+    /// enforcement against the current tick.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - The current holonic time tick. If `expires_at_tick`
+    ///   is non-zero and less than `current_tick`, the waiver is considered
+    ///   expired and validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first violation found (fail-closed).
+    pub fn validate(&self, current_tick: u64) -> Result<(), AdmitError> {
+        const ZERO: Hash = [0u8; 32];
+
+        if self.waiver_id == ZERO {
+            return Err(AdmitError::WitnessWaiverInvalid {
+                reason: "waiver_id is zero".into(),
+            });
+        }
+        if self.reason.is_empty() || self.reason.len() > MAX_WAIVER_REASON_LENGTH {
+            return Err(AdmitError::WitnessWaiverInvalid {
+                reason: "reason empty or exceeds maximum length".into(),
+            });
+        }
+        if self.request_id == ZERO {
+            return Err(AdmitError::WitnessWaiverInvalid {
+                reason: "request_id is zero".into(),
+            });
+        }
+        if self.enforcement_tier != EnforcementTier::Monitor {
+            return Err(AdmitError::WitnessWaiverInvalid {
+                reason: "waiver is only valid for Monitor tier, not FailClosed".into(),
+            });
+        }
+        // SECURITY MAJOR 2 (TCK-00497): Enforce waiver expiry.
+        // A non-zero expires_at_tick that is less than the current tick
+        // means the waiver has expired. Expired waivers MUST NOT bypass
+        // witness enforcement — otherwise a stale waiver could be reused
+        // indefinitely.
+        if self.expires_at_tick != 0 && self.expires_at_tick < current_tick {
+            return Err(AdmitError::WitnessWaiverInvalid {
+                reason: format!(
+                    "waiver expired: expires_at_tick ({}) < current_tick ({})",
+                    self.expires_at_tick, current_tick
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1131,6 +1367,12 @@ pub struct BoundarySpanV1 {
 ///
 /// Contains the sealed admission bundle, its digest, capability tokens
 /// for effect execution, and lifecycle receipts.
+///
+/// Witness seeds are carried through from the plan so the runtime
+/// post-effect path can invoke `finalize_post_effect_witness` with the
+/// actual seeds (not just their hashes). This closes the gap where the
+/// runtime path previously did ad-hoc hash-only validation instead of
+/// calling the kernel's canonical validator (QUALITY MAJOR 1, TCK-00497).
 pub struct AdmissionResultV1 {
     /// Digest of the sealed `AdmissionBundleV1` CAS object
     /// (v1.1 `AdmissionBindingHash`).
@@ -1155,6 +1397,18 @@ pub struct AdmissionResultV1 {
     pub consume_record: AuthorityConsumeRecordV1,
     /// Boundary span for output mediation.
     pub boundary_span: BoundarySpanV1,
+    /// Leakage witness seed from plan time (TCK-00497 QUALITY MAJOR 1).
+    ///
+    /// Carried through from the consumed plan so the runtime post-effect
+    /// path can pass the actual seed (not just its hash) to
+    /// `AdmissionKernelV1::finalize_post_effect_witness`. This enables
+    /// full seed/provider binding validation instead of ad-hoc hash-only
+    /// checks.
+    pub leakage_witness_seed: WitnessSeedV1,
+    /// Timing witness seed from plan time (TCK-00497 QUALITY MAJOR 1).
+    ///
+    /// See `leakage_witness_seed` for rationale.
+    pub timing_witness_seed: WitnessSeedV1,
 }
 
 // Intentionally no Clone or Serialize — capability tokens are non-cloneable.
@@ -1170,6 +1424,14 @@ impl std::fmt::Debug for AdmissionResultV1 {
             .field("consumed_witness", &self.consumed_witness)
             .field("consume_record", &self.consume_record)
             .field("boundary_span", &self.boundary_span)
+            .field(
+                "leakage_seed_hash",
+                &hex::encode(self.leakage_witness_seed.content_hash()),
+            )
+            .field(
+                "timing_seed_hash",
+                &hex::encode(self.timing_witness_seed.content_hash()),
+            )
             .finish()
     }
 }
@@ -1257,6 +1519,31 @@ pub enum AdmitError {
         /// Bounded reason string.
         reason: String,
     },
+    /// Post-effect witness evidence is missing or invalid (TCK-00497).
+    ///
+    /// For fail-closed tiers, output release is denied when witness
+    /// evidence is missing, incomplete, or fails validation.
+    WitnessEvidenceFailure {
+        /// Bounded reason string.
+        reason: String,
+    },
+    /// Boundary output release denied (TCK-00497).
+    ///
+    /// Fail-closed tiers deny output release when post-effect witness
+    /// evidence is missing or invalid. The output remains held.
+    OutputReleaseDenied {
+        /// Bounded reason string.
+        reason: String,
+    },
+    /// Monitor-tier witness waiver is invalid (TCK-00497).
+    ///
+    /// Monitor tiers require an explicit waiver to bypass witness
+    /// enforcement. This error is raised when the waiver is missing,
+    /// expired, or structurally invalid.
+    WitnessWaiverInvalid {
+        /// Bounded reason string.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AdmitError {
@@ -1298,6 +1585,15 @@ impl std::fmt::Display for AdmitError {
             },
             Self::BundleSealFailure { reason } => {
                 write!(f, "bundle seal failure: {reason}")
+            },
+            Self::WitnessEvidenceFailure { reason } => {
+                write!(f, "witness evidence failure: {reason}")
+            },
+            Self::OutputReleaseDenied { reason } => {
+                write!(f, "output release denied: {reason}")
+            },
+            Self::WitnessWaiverInvalid { reason } => {
+                write!(f, "witness waiver invalid: {reason}")
             },
         }
     }

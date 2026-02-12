@@ -49,6 +49,11 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK07] Identity evidence level and pointer-only waiver hash are passed through from `KernelRequestV1` to `AuthorityJoinInputV1` (not hardcoded).
 - [CTR-AK08] `execute()` constructs and seals `AdmissionBundleV1` BEFORE capability minting and receipt emission. Bundle digest becomes the `AdmissionBindingHash` (TCK-00493).
 - [CTR-AK09] `AdmissionResultV1` includes both the sealed `bundle` and `bundle_digest`. The digest is recomputable from the bundle via `content_hash()`.
+- [CTR-AK10] `validate_witness_seeds_at_join()` denies fail-closed tiers when seeds have zero provider digests or reused nonces. Monitor tiers require an explicit `MonitorWaiverV1` (TCK-00497). Integrated into `plan()` for fail-closed tiers.
+- [CTR-AK11] `finalize_post_effect_witness()` validates post-effect evidence objects against their seeds (seed hash, provider provenance, temporal ordering). Fail-closed tiers deny on missing evidence. Monitor tiers require explicit waiver with expiry enforcement (TCK-00497). Monitor-tier evidence is also checked for seed/provider binding when provided (QUALITY MINOR 1). Integrated into `handle_request_tool` post-effect path.
+- [CTR-AK12] `release_boundary_output()` denies output release for fail-closed tiers when evidence hashes are empty. Marks `BoundarySpanV1` as released exactly once (TCK-00497). Integrated into `handle_request_tool` post-effect path.
+- [CTR-AK13] `MonitorWaiverV1::validate()` enforces `expires_at_tick` against current tick. Non-zero `expires_at_tick < current_tick` means expired waiver, which is denied (SECURITY MAJOR 2, TCK-00497).
+- [CTR-AK14] `WitnessEvidenceV1.measured_values` uses bounded visitor deserialization (`bounded_vec_deser!`) with max `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` to prevent unbounded allocation from untrusted input (QUALITY MAJOR 1 + SECURITY MAJOR 1, TCK-00497).
 
 ### `KernelRequestV1` (types.rs)
 
@@ -60,7 +65,11 @@ Single-use admission plan containing join-time bindings. Not `Clone`, `Copy`, `S
 
 ### `AdmissionResultV1` (types.rs)
 
-Result of successful execution containing capability tokens, consume receipts, and boundary span.
+Result of successful execution containing capability tokens, consume receipts, boundary span, and witness seeds. The `leakage_witness_seed` and `timing_witness_seed` fields are carried through from the consumed plan so the runtime post-effect path can invoke `finalize_post_effect_witness` with actual seeds rather than ad-hoc hash-only checks (TCK-00497 QUALITY MAJOR 1).
+
+- [CTR-AK15] Seeds in `AdmissionResultV1` match the plan-time seeds (same content hash).
+- [CTR-AK16] Runtime post-effect path MUST use `kernel.finalize_post_effect_witness()` with the result's seeds as the single source of truth for seed/provider/temporal binding validation. Ad-hoc validation is forbidden.
+- [CTR-AK17] Monitor tiers MUST construct a `MonitorWaiverV1` and pass it to `finalize_post_effect_witness()`. Silent log-and-continue bypass is forbidden (QUALITY MAJOR 2).
 
 ### `AdmissionSpineJoinExtV1` (types.rs)
 
@@ -69,6 +78,29 @@ Spine join extension committed into PCAC join. Domain-separated BLAKE3 content h
 ### `WitnessSeedV1` (types.rs)
 
 Witness seed created at join time with provider provenance binding and domain-separated content hash.
+
+### `WitnessEvidenceV1` (types.rs)
+
+Post-effect witness evidence object (TCK-00497). Materialized AFTER the effect executes. Binds daemon-measured values (leakage metrics, timing measurements) to the witness seed committed at join time. For fail-closed tiers, output release is denied unless valid witness evidence is present. Domain-separated BLAKE3 content hash.
+
+**Invariants:**
+
+- [INV-AK30] Evidence `seed_hash` must match the seed's `content_hash()` (constant-time comparison).
+- [INV-AK31] Evidence `witness_class`, `request_id`, `session_id` must match the seed's fields.
+- [INV-AK32] Evidence `provider_id` and `provider_build_digest` must match the seed (anti-substitution).
+- [INV-AK33] Evidence `ht_end` must be >= seed `ht_start` (temporal ordering).
+- [INV-AK34] `measured_values` bounded by `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` (16). Bounded visitor deserialization enforced via `bounded_vec_deser!` macro (SECURITY MAJOR 1).
+
+### `MonitorWaiverV1` (types.rs)
+
+Explicit waiver for monitor-tier witness bypass (TCK-00497). Monitor tiers may skip witness enforcement ONLY via explicit waiver. Silent permissive defaults are forbidden. Domain-separated BLAKE3 content hash.
+
+**Invariants:**
+
+- [INV-AK35] Waiver `enforcement_tier` must be `Monitor`, never `FailClosed`.
+- [INV-AK36] Waiver `reason` must be non-empty and bounded by `MAX_WAIVER_REASON_LENGTH`.
+- [INV-AK37] Waiver hash is included in audit binding (outcome index evidence hashes).
+- [INV-AK38] Waiver `expires_at_tick` is enforced against current tick. Non-zero expired waivers are denied (SECURITY MAJOR 2).
 
 ### `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability` (capabilities.rs)
 
@@ -114,13 +146,14 @@ Individual quarantine action record within `AdmissionBundleV1`. Contains `reserv
 
 ### `AdmitError` (types.rs)
 
-Error type with 14 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute and `BundleSealFailure` for bundle validation/serialization failures (TCK-00493).
+Error type with 17 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute, `BundleSealFailure` for bundle validation/serialization failures (TCK-00493), and `WitnessEvidenceFailure`/`OutputReleaseDenied`/`WitnessWaiverInvalid` for witness enforcement (TCK-00497).
 
 ## Phase Ordering
 
 ```text
 plan():    validate -> prerequisite resolution -> witness seed creation ->
-           spine join extension -> PCAC join -> PCAC revalidate
+           witness seed validation (fail-closed) -> spine join extension ->
+           PCAC join -> PCAC revalidate
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
            durable consume -> bundle seal (TCK-00493) ->
@@ -132,7 +165,7 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
 - `AdmissionKernelV1`, `WitnessProviderConfig`, `QuarantineGuard`
 - `AdmissionPlanV1`, `AdmissionResultV1`, `AdmissionSpineJoinExtV1`
 - `AdmissionBundleV1`, `AdmissionOutcomeIndexV1`, `QuarantineActionV1`
-- `KernelRequestV1`, `WitnessSeedV1`, `BoundarySpanV1`
+- `KernelRequestV1`, `WitnessSeedV1`, `WitnessEvidenceV1`, `MonitorWaiverV1`, `BoundarySpanV1`
 - `EnforcementTier`, `AdmitError`
 - `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability`
 - `LedgerTrustVerifier`, `PolicyRootResolver`, `AntiRollbackAnchor`
@@ -178,3 +211,4 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 - TCK-00492: Implementation ticket (kernel plan/execute API)
 - TCK-00493: Implementation ticket (bundle + outcome index)
 - TCK-00494: Implementation ticket (handler refactoring + kernel wiring)
+- TCK-00497: Implementation ticket (witness closure -- post-effect evidence, monitor waivers, boundary output gating)

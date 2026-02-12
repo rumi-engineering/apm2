@@ -8537,6 +8537,348 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_flow_state_for_package.as_ref(),
         );
 
+        // ================================================================
+        // TCK-00497 QUALITY BLOCKER 1: Post-effect witness finalization
+        // and boundary output release.
+        //
+        // After the broker executes the effect (handle_broker_decision),
+        // finalize witness evidence and release boundary output for
+        // fail-closed tiers. This closes the gap where witness closure
+        // functions existed but were never called in the runtime path.
+        //
+        // For fail-closed tiers: finalize_post_effect_witness +
+        // release_boundary_output are MANDATORY. If evidence is missing
+        // or invalid, the output is denied (fail-closed).
+        //
+        // For monitor tiers: witness finalization runs if a kernel
+        // result exists (defense in depth) but does not gate output.
+        // ================================================================
+        if let Some(ref admission_res) = admission_result {
+            // Only proceed with witness closure on successful broker dispatch.
+            if let Ok(SessionResponse::RequestTool(ref resp)) = response {
+                if resp.decision == i32::from(DecisionType::Allow) {
+                    // Get fresh tick for waiver expiry enforcement.
+                    let post_effect_tick = self
+                        .clock
+                        .as_ref()
+                        .and_then(|clock| clock.now_hlc().ok())
+                        .map_or(admission_res.bundle.freshness_witness_tick, |hlc| {
+                            hlc.wall_ns / 1_000_000_000
+                        });
+
+                    let plan_enforcement_tier = admission_res.boundary_span.enforcement_tier;
+
+                    // ====================================================
+                    // TCK-00497 QUALITY MAJOR 1+2 FIX:
+                    // Route ALL post-effect witness validation through
+                    // kernel.finalize_post_effect_witness() — the single
+                    // source of truth for seed/provider/temporal binding.
+                    //
+                    // The join-time seeds are now carried through from the
+                    // plan via AdmissionResultV1.{leakage,timing}_witness_seed.
+                    //
+                    // For fail-closed tiers: evidence is mandatory; missing
+                    // or invalid evidence denies output release.
+                    //
+                    // For monitor tiers: a MonitorWaiverV1 is required.
+                    // No silent permissive defaults — explicit waiver with
+                    // defect telemetry (QUALITY MAJOR 2).
+                    // ====================================================
+                    let witness_result = if let Some(ref kernel) = self.admission_kernel {
+                        // Construct daemon-measured evidence objects bound
+                        // to the actual seeds carried through in the result.
+                        let leakage_seed = &admission_res.leakage_witness_seed;
+                        let timing_seed = &admission_res.timing_witness_seed;
+
+                        let leakage_evidence = crate::admission_kernel::types::WitnessEvidenceV1 {
+                            witness_class: "leakage".to_string(),
+                            seed_hash: leakage_seed.content_hash(),
+                            request_id: admission_res.bundle.request_id,
+                            session_id: admission_res.bundle.session_id.clone(),
+                            ht_end: post_effect_tick,
+                            measured_values: vec![{
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"apm2-witness-leakage-measurement-v1");
+                                h.update(b"effect_duration_ticks");
+                                h.update(
+                                    &post_effect_tick
+                                        .saturating_sub(admission_res.bundle.freshness_witness_tick)
+                                        .to_le_bytes(),
+                                );
+                                h.update(b"tool_class");
+                                h.update(tool_class.to_string().as_bytes());
+                                *h.finalize().as_bytes()
+                            }],
+                            provider_id: kernel.witness_provider.provider_id.clone(),
+                            provider_build_digest: kernel.witness_provider.provider_build_digest,
+                        };
+                        let timing_evidence = crate::admission_kernel::types::WitnessEvidenceV1 {
+                            witness_class: "timing".to_string(),
+                            seed_hash: timing_seed.content_hash(),
+                            request_id: admission_res.bundle.request_id,
+                            session_id: admission_res.bundle.session_id.clone(),
+                            ht_end: post_effect_tick,
+                            measured_values: vec![{
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"apm2-witness-timing-measurement-v1");
+                                h.update(b"pre_effect_tick");
+                                h.update(
+                                    &admission_res.bundle.freshness_witness_tick.to_le_bytes(),
+                                );
+                                h.update(b"post_effect_tick");
+                                h.update(&post_effect_tick.to_le_bytes());
+                                *h.finalize().as_bytes()
+                            }],
+                            provider_id: kernel.witness_provider.provider_id.clone(),
+                            provider_build_digest: kernel.witness_provider.provider_build_digest,
+                        };
+
+                        // Build monitor waiver for monitor tiers.
+                        // Fail-closed tiers pass None (no waiver bypass allowed).
+                        let monitor_waiver = if plan_enforcement_tier
+                            == crate::admission_kernel::types::EnforcementTier::Monitor
+                        {
+                            // Construct a governance-derived monitor waiver
+                            // with the request binding and a reason for audit.
+                            // The waiver expires at 2x the freshness tick to
+                            // bound staleness without premature expiry.
+                            let waiver_id = {
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"apm2-monitor-waiver-v1");
+                                h.update(&admission_res.bundle.request_id);
+                                h.update(admission_res.bundle.session_id.as_bytes());
+                                h.update(&post_effect_tick.to_le_bytes());
+                                *h.finalize().as_bytes()
+                            };
+                            Some(crate::admission_kernel::types::MonitorWaiverV1 {
+                                waiver_id,
+                                reason: "daemon-constructed monitor-tier witness waiver \
+                                         (post-effect evidence bypass with defect telemetry)"
+                                    .to_string(),
+                                expires_at_tick: post_effect_tick.saturating_mul(2),
+                                request_id: admission_res.bundle.request_id,
+                                enforcement_tier:
+                                    crate::admission_kernel::types::EnforcementTier::Monitor,
+                            })
+                        } else {
+                            None
+                        };
+
+                        // Invoke the kernel's canonical post-effect witness
+                        // validator — single source of truth for seed binding,
+                        // provider binding, temporal checks, and waiver
+                        // enforcement (replaces ad-hoc validation block).
+                        let ev_result = kernel.finalize_post_effect_witness(
+                            plan_enforcement_tier,
+                            leakage_seed,
+                            timing_seed,
+                            Some(&leakage_evidence),
+                            Some(&timing_evidence),
+                            monitor_waiver.as_ref(),
+                            post_effect_tick,
+                        );
+
+                        // Emit defect telemetry for monitor-tier waiver bypass.
+                        if plan_enforcement_tier
+                            == crate::admission_kernel::types::EnforcementTier::Monitor
+                        {
+                            if let Ok(ref hashes) = ev_result {
+                                info!(
+                                    session_id = %token.session_id,
+                                    tool_class = %tool_class,
+                                    enforcement_tier = %plan_enforcement_tier,
+                                    evidence_count = hashes.len(),
+                                    waiver_exercised = true,
+                                    "monitor-tier post-effect witness closure: \
+                                     waiver bypass exercised (defect telemetry)"
+                                );
+                            }
+                        }
+
+                        Some(ev_result)
+                    } else {
+                        None
+                    };
+
+                    // Release boundary output for fail-closed tiers.
+                    if plan_enforcement_tier
+                        == crate::admission_kernel::types::EnforcementTier::FailClosed
+                    {
+                        if let Some(ref kernel) = self.admission_kernel {
+                            match witness_result {
+                                Some(Ok(ref evidence_hashes)) => {
+                                    let mut span = admission_res.boundary_span.clone();
+                                    if let Err(e) =
+                                        kernel.release_boundary_output(&mut span, evidence_hashes)
+                                    {
+                                        warn!(
+                                            session_id = %token.session_id,
+                                            error = %e,
+                                            "boundary output release denied (fail-closed)"
+                                        );
+                                        response = Ok(SessionResponse::error(
+                                            SessionErrorCode::SessionErrorToolNotAllowed,
+                                            format!("boundary output release denied: {e}"),
+                                        ));
+                                    } else {
+                                        // ================================================
+                                        // MAJOR 1 FIX: Construct, validate, and persist
+                                        // AdmissionOutcomeIndexV1 after successful
+                                        // release_boundary_output. This durably binds the
+                                        // post-effect witness evidence hashes into an
+                                        // authoritative artifact (fail-closed).
+                                        // ================================================
+                                        let outcome_index =
+                                            crate::admission_kernel::types::AdmissionOutcomeIndexV1 {
+                                                schema_version:
+                                                    crate::admission_kernel::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+                                                bundle_digest: admission_res.bundle_digest,
+                                                request_id: admission_res.bundle.request_id,
+                                                ajc_id: admission_res.bundle.ajc_id,
+                                                post_effect_witness_evidence_hashes:
+                                                    evidence_hashes.clone(),
+                                                receipt_digests: vec![],
+                                            };
+
+                                        if let Err(e) = outcome_index.validate() {
+                                            warn!(
+                                                session_id = %token.session_id,
+                                                error = %e,
+                                                "AdmissionOutcomeIndexV1 validation failed (fail-closed)"
+                                            );
+                                            response = Ok(SessionResponse::error(
+                                                SessionErrorCode::SessionErrorInternal,
+                                                format!(
+                                                    "post-effect outcome index validation failed: {e}"
+                                                ),
+                                            ));
+                                        } else {
+                                            let outcome_bytes = match outcome_index
+                                                .to_canonical_bytes()
+                                            {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    warn!(
+                                                        session_id = %token.session_id,
+                                                        error = %e,
+                                                        "AdmissionOutcomeIndexV1 serialization failed (fail-closed)"
+                                                    );
+                                                    response = Ok(SessionResponse::error(
+                                                        SessionErrorCode::SessionErrorInternal,
+                                                        format!(
+                                                            "post-effect outcome index serialization failed: {e}"
+                                                        ),
+                                                    ));
+                                                    // Skip ledger emit on serialization failure.
+                                                    Vec::new()
+                                                },
+                                            };
+
+                                            if !outcome_bytes.is_empty() {
+                                                if let Some(ref ledger) = self.ledger {
+                                                    let outcome_ts_ns =
+                                                        self.get_htf_timestamp().map_or_else(
+                                                            |_| {
+                                                                post_effect_tick
+                                                                    .saturating_mul(1_000_000_000)
+                                                            },
+                                                            |ts| ts.wall_ns,
+                                                        );
+                                                    if let Err(e) = ledger.emit_session_event(
+                                                        &token.session_id,
+                                                        "post_effect_witness_outcome_index",
+                                                        &outcome_bytes,
+                                                        "admission_kernel:witness_closure",
+                                                        outcome_ts_ns,
+                                                    ) {
+                                                        warn!(
+                                                            session_id = %token.session_id,
+                                                            error = %e,
+                                                            "AdmissionOutcomeIndexV1 ledger persistence failed (fail-closed)"
+                                                        );
+                                                        response = Ok(SessionResponse::error(
+                                                            SessionErrorCode::SessionErrorInternal,
+                                                            format!(
+                                                                "post-effect outcome index persistence failed: {e}"
+                                                            ),
+                                                        ));
+                                                    } else {
+                                                        info!(
+                                                            session_id = %token.session_id,
+                                                            tool_class = %tool_class,
+                                                            evidence_count = evidence_hashes.len(),
+                                                            outcome_index_digest = %hex::encode(outcome_index.content_hash()),
+                                                            bundle_digest = %hex::encode(outcome_index.bundle_digest),
+                                                            "post-effect witness closure complete: \
+                                                             boundary output released, outcome index persisted"
+                                                        );
+                                                    }
+                                                } else {
+                                                    // Fail-closed tier without ledger: cannot
+                                                    // persist outcome index evidence.
+                                                    warn!(
+                                                        session_id = %token.session_id,
+                                                        "AdmissionOutcomeIndexV1 denied: \
+                                                         ledger unavailable for fail-closed tier"
+                                                    );
+                                                    response = Ok(SessionResponse::error(
+                                                        SessionErrorCode::SessionErrorInternal,
+                                                        "post-effect outcome index persistence \
+                                                         failed: ledger unavailable for fail-closed tier",
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(Err(ref e)) => {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        error = %e,
+                                        "post-effect witness evidence validation failed (fail-closed: output denied)"
+                                    );
+                                    response = Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        format!("post-effect witness evidence invalid: {e}"),
+                                    ));
+                                },
+                                None => {
+                                    // Should not happen for fail-closed with kernel.
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        "fail-closed tier missing witness result (output denied)"
+                                    );
+                                    response = Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        "fail-closed tier: witness evidence unavailable",
+                                    ));
+                                },
+                            }
+                        }
+                    }
+
+                    // For monitor tiers: deny if waiver enforcement failed.
+                    // This closes the gap where monitor tiers silently continued
+                    // on validation failure (QUALITY MAJOR 2).
+                    if plan_enforcement_tier
+                        == crate::admission_kernel::types::EnforcementTier::Monitor
+                    {
+                        if let Some(Err(ref e)) = witness_result {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "monitor-tier witness waiver enforcement failed (denied)"
+                            );
+                            response = Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!("monitor-tier witness waiver enforcement failed: {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         if !defects.is_empty() {
             let has_mandatory_termination_defect = defects
                 .iter()

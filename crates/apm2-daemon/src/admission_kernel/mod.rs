@@ -54,7 +54,8 @@ use subtle::ConstantTimeEq;
 use types::{
     ADMISSION_BUNDLE_SCHEMA_VERSION, AdmissionBundleV1, AdmissionPlanV1, AdmissionResultV1,
     AdmissionSpineJoinExtV1, AdmitError, BoundarySpanV1, EnforcementTier, KernelRequestV1,
-    MAX_WITNESS_PROVIDER_ID_LENGTH, PlanState, QuarantineActionV1, WitnessSeedV1,
+    MAX_WITNESS_PROVIDER_ID_LENGTH, MonitorWaiverV1, PlanState, QuarantineActionV1,
+    WitnessEvidenceV1, WitnessSeedV1,
 };
 
 // =============================================================================
@@ -176,7 +177,11 @@ pub struct AdmissionKernelV1 {
     /// Quarantine capacity guard (fail-closed on error for fail-closed tiers).
     quarantine_guard: Option<Arc<dyn QuarantineGuard>>,
     /// Witness provider configuration.
-    witness_provider: WitnessProviderConfig,
+    ///
+    /// `pub(crate)` to allow the post-effect witness evidence
+    /// construction path in `SessionDispatcher::handle_request_tool`
+    /// to access provider identity and build digest (TCK-00497).
+    pub(crate) witness_provider: WitnessProviderConfig,
 }
 
 impl std::fmt::Debug for AdmissionKernelV1 {
@@ -308,6 +313,27 @@ impl AdmissionKernelV1 {
             provider_id: self.witness_provider.provider_id.clone(),
             provider_build_digest: self.witness_provider.provider_build_digest,
         };
+
+        // Phase E.1: Validate witness seeds at join (TCK-00497 QUALITY BLOCKER 1).
+        //
+        // For fail-closed tiers: deny if seeds are zero, unbound, or have
+        // reused nonces. This is the critical gate that prevents requests
+        // from proceeding without valid witness instrumentation.
+        //
+        // For monitor tiers: seed structural validation is still performed
+        // (same checks) but waiver enforcement is deferred to the
+        // post-effect path (`finalize_post_effect_witness`) where the
+        // caller supplies the governance waiver. At plan time, monitor
+        // tiers validate seed integrity without requiring a waiver.
+        if enforcement_tier == EnforcementTier::FailClosed {
+            self.validate_witness_seeds_at_join(
+                enforcement_tier,
+                &leakage_seed,
+                &timing_seed,
+                None,
+                request.freshness_witness_tick,
+            )?;
+        }
 
         // Phase F: Compute canonical request digest for spine extension.
         let canonical_request_digest = compute_canonical_request_digest(request);
@@ -576,6 +602,15 @@ impl AdmissionKernelV1 {
         // Seal: compute the deterministic content hash.
         let bundle_digest = bundle.content_hash();
 
+        // Clone the witness seeds from the plan BEFORE returning.
+        // The plan is already consumed (state = Consumed) but its fields
+        // are still accessible. The runtime post-effect path needs the
+        // actual seeds (not just hashes) to call
+        // `finalize_post_effect_witness` with full seed/provider binding
+        // validation (TCK-00497 QUALITY MAJOR 1).
+        let leakage_witness_seed = plan.leakage_witness_seed.clone();
+        let timing_witness_seed = plan.timing_witness_seed.clone();
+
         Ok(AdmissionResultV1 {
             bundle_digest,
             bundle,
@@ -585,7 +620,240 @@ impl AdmissionKernelV1 {
             consumed_witness,
             consume_record,
             boundary_span,
+            leakage_witness_seed,
+            timing_witness_seed,
         })
+    }
+
+    // =========================================================================
+    // Witness closure: seed validation at join (TCK-00497)
+    // =========================================================================
+
+    /// Validate that witness seeds are present and non-zero for fail-closed
+    /// tiers. Called during `plan()` after seed creation.
+    ///
+    /// For fail-closed tiers: missing or zero witness seed hashes deny
+    /// the join. Stubbed/None seeds are forbidden.
+    ///
+    /// For monitor tiers: an explicit `monitor_waiver` MUST be provided.
+    /// Silent permissive defaults are forbidden. A defect is emitted
+    /// (returned as part of the result) if the waiver path is exercised.
+    ///
+    /// # Errors
+    ///
+    /// - [`AdmitError::WitnessSeedFailure`] if seeds are zero/missing at
+    ///   fail-closed tier.
+    /// - [`AdmitError::WitnessWaiverInvalid`] if monitor tier lacks a valid
+    ///   waiver.
+    pub fn validate_witness_seeds_at_join(
+        &self,
+        enforcement_tier: EnforcementTier,
+        leakage_seed: &WitnessSeedV1,
+        timing_seed: &WitnessSeedV1,
+        monitor_waiver: Option<&MonitorWaiverV1>,
+        current_tick: u64,
+    ) -> Result<Option<Hash>, AdmitError> {
+        const ZERO: Hash = [0u8; 32];
+
+        let leakage_hash = leakage_seed.content_hash();
+        let timing_hash = timing_seed.content_hash();
+
+        match enforcement_tier {
+            EnforcementTier::FailClosed => {
+                // Fail-closed: both seed hashes MUST be non-zero.
+                if leakage_hash == ZERO {
+                    return Err(AdmitError::WitnessSeedFailure {
+                        reason: "leakage witness seed hash is zero at join \
+                                 (fail-closed tier denies missing seeds)"
+                            .into(),
+                    });
+                }
+                if timing_hash == ZERO {
+                    return Err(AdmitError::WitnessSeedFailure {
+                        reason: "timing witness seed hash is zero at join \
+                                 (fail-closed tier denies missing seeds)"
+                            .into(),
+                    });
+                }
+                // Verify provider provenance binding is non-zero.
+                if leakage_seed.provider_build_digest == ZERO {
+                    return Err(AdmitError::WitnessSeedFailure {
+                        reason: "leakage witness seed provider_build_digest is zero \
+                                 (unbound measurement at fail-closed tier)"
+                            .into(),
+                    });
+                }
+                if timing_seed.provider_build_digest == ZERO {
+                    return Err(AdmitError::WitnessSeedFailure {
+                        reason: "timing witness seed provider_build_digest is zero \
+                                 (unbound measurement at fail-closed tier)"
+                            .into(),
+                    });
+                }
+                // Verify seeds are unique (distinct nonces).
+                if bool::from(leakage_seed.nonce.ct_eq(&timing_seed.nonce)) {
+                    return Err(AdmitError::WitnessSeedFailure {
+                        reason: "leakage and timing witness seeds have identical \
+                                 nonces (nonce reuse detected)"
+                            .into(),
+                    });
+                }
+                Ok(None)
+            },
+            EnforcementTier::Monitor => {
+                // Monitor tier: explicit waiver required. No silent bypass.
+                match monitor_waiver {
+                    Some(waiver) => {
+                        waiver.validate(current_tick)?;
+                        // Return the waiver hash for audit binding.
+                        Ok(Some(waiver.content_hash()))
+                    },
+                    None => Err(AdmitError::WitnessWaiverInvalid {
+                        reason: "monitor tier requires explicit waiver for \
+                                 witness seed bypass (no silent permissive defaults)"
+                            .into(),
+                    }),
+                }
+            },
+        }
+    }
+
+    // =========================================================================
+    // Witness closure: post-effect evidence finalization (TCK-00497)
+    // =========================================================================
+
+    /// Finalize post-effect witness evidence and validate for output release.
+    ///
+    /// For fail-closed tiers: both leakage and timing witness evidence
+    /// MUST be present, valid, and bound to the correct seeds. Output
+    /// release is denied if evidence is missing or invalid.
+    ///
+    /// For monitor tiers: an explicit `monitor_waiver` MUST be provided
+    /// to bypass evidence requirements. A defect hash is returned for
+    /// audit binding.
+    ///
+    /// Returns the content hashes of the finalized evidence objects for
+    /// binding into
+    /// `AdmissionOutcomeIndexV1::post_effect_witness_evidence_hashes`.
+    ///
+    /// # Errors
+    ///
+    /// - [`AdmitError::WitnessEvidenceFailure`] if evidence is missing,
+    ///   invalid, or unbound at fail-closed tier.
+    /// - [`AdmitError::OutputReleaseDenied`] if output cannot be released due
+    ///   to missing evidence at fail-closed tier.
+    /// - [`AdmitError::WitnessWaiverInvalid`] if monitor tier lacks a valid
+    ///   waiver.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_post_effect_witness(
+        &self,
+        enforcement_tier: EnforcementTier,
+        leakage_seed: &WitnessSeedV1,
+        timing_seed: &WitnessSeedV1,
+        leakage_evidence: Option<&WitnessEvidenceV1>,
+        timing_evidence: Option<&WitnessEvidenceV1>,
+        monitor_waiver: Option<&MonitorWaiverV1>,
+        current_tick: u64,
+    ) -> Result<Vec<Hash>, AdmitError> {
+        match enforcement_tier {
+            EnforcementTier::FailClosed => {
+                // Fail-closed: both evidence objects MUST be present.
+                let leakage_ev =
+                    leakage_evidence.ok_or_else(|| AdmitError::OutputReleaseDenied {
+                        reason: "missing leakage witness evidence for \
+                                 fail-closed tier (output release denied)"
+                            .into(),
+                    })?;
+                let timing_ev = timing_evidence.ok_or_else(|| AdmitError::OutputReleaseDenied {
+                    reason: "missing timing witness evidence for \
+                                 fail-closed tier (output release denied)"
+                        .into(),
+                })?;
+
+                // Validate evidence objects.
+                leakage_ev.validate()?;
+                timing_ev.validate()?;
+
+                // Verify evidence binds to the correct seeds.
+                validate_evidence_seed_binding(leakage_ev, leakage_seed)?;
+                validate_evidence_seed_binding(timing_ev, timing_seed)?;
+
+                // Verify provider provenance matches between seed and evidence.
+                validate_evidence_provider_binding(leakage_ev, leakage_seed)?;
+                validate_evidence_provider_binding(timing_ev, timing_seed)?;
+
+                Ok(vec![leakage_ev.content_hash(), timing_ev.content_hash()])
+            },
+            EnforcementTier::Monitor => {
+                // Monitor tier: explicit waiver required.
+                match monitor_waiver {
+                    Some(waiver) => {
+                        waiver.validate(current_tick)?;
+                        // If evidence is provided for monitor tier, validate
+                        // including seed and provider binding checks
+                        // (QUALITY MINOR 1: ensure caller-supplied evidence
+                        // is actually bound to the correct plan seeds and
+                        // provider, preventing evidence substitution even
+                        // under monitor-tier waivers).
+                        let mut hashes = Vec::new();
+                        if let Some(ev) = leakage_evidence {
+                            ev.validate()?;
+                            validate_evidence_seed_binding(ev, leakage_seed)?;
+                            validate_evidence_provider_binding(ev, leakage_seed)?;
+                            hashes.push(ev.content_hash());
+                        }
+                        if let Some(ev) = timing_evidence {
+                            ev.validate()?;
+                            validate_evidence_seed_binding(ev, timing_seed)?;
+                            validate_evidence_provider_binding(ev, timing_seed)?;
+                            hashes.push(ev.content_hash());
+                        }
+                        // Include waiver hash in evidence hashes for audit.
+                        hashes.push(waiver.content_hash());
+                        Ok(hashes)
+                    },
+                    None => Err(AdmitError::WitnessWaiverInvalid {
+                        reason: "monitor tier requires explicit waiver for \
+                                 witness evidence bypass (no silent permissive defaults)"
+                            .into(),
+                    }),
+                }
+            },
+        }
+    }
+
+    /// Release held boundary output after successful witness evidence
+    /// finalization (fail-closed tiers only).
+    ///
+    /// # Errors
+    ///
+    /// - [`AdmitError::OutputReleaseDenied`] if evidence hashes are empty for
+    ///   fail-closed tiers.
+    /// - [`AdmitError::BoundaryMediationFailure`] if the span is not in the
+    ///   expected held state.
+    pub fn release_boundary_output(
+        &self,
+        boundary_span: &mut BoundarySpanV1,
+        evidence_hashes: &[Hash],
+    ) -> Result<(), AdmitError> {
+        if boundary_span.enforcement_tier == EnforcementTier::FailClosed {
+            if evidence_hashes.is_empty() {
+                return Err(AdmitError::OutputReleaseDenied {
+                    reason: "no witness evidence hashes for fail-closed tier \
+                             (boundary output remains held)"
+                        .into(),
+                });
+            }
+            if !boundary_span.output_held {
+                return Err(AdmitError::BoundaryMediationFailure {
+                    reason: "boundary output already released (double-release \
+                             attempt)"
+                        .into(),
+                });
+            }
+        }
+        boundary_span.output_held = false;
+        Ok(())
     }
 
     // =========================================================================
@@ -961,4 +1229,108 @@ const fn synthetic_monitor_anchor() -> LedgerAnchorV1 {
         height: 1,
         he_time: 1,
     }
+}
+
+/// Validate that witness evidence binds to its claimed seed.
+///
+/// Checks that the evidence's `seed_hash` matches the actual
+/// content hash of the seed, and that identity fields (class,
+/// `request_id`, `session_id`) are consistent.
+///
+/// # Errors
+///
+/// Returns [`AdmitError::WitnessEvidenceFailure`] if the binding is
+/// invalid.
+fn validate_evidence_seed_binding(
+    evidence: &WitnessEvidenceV1,
+    seed: &WitnessSeedV1,
+) -> Result<(), AdmitError> {
+    // Verify seed hash binding (constant-time comparison).
+    let seed_hash = seed.content_hash();
+    if !bool::from(evidence.seed_hash.ct_eq(&seed_hash)) {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: format!(
+                "evidence seed_hash does not match seed content_hash \
+                 (expected {}, got {})",
+                hex::encode(seed_hash),
+                hex::encode(evidence.seed_hash)
+            ),
+        });
+    }
+
+    // Verify witness class consistency.
+    if evidence.witness_class != seed.witness_class {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: format!(
+                "evidence witness_class '{}' does not match seed witness_class '{}'",
+                evidence.witness_class, seed.witness_class
+            ),
+        });
+    }
+
+    // Verify request_id consistency (constant-time).
+    if !bool::from(evidence.request_id.ct_eq(&seed.request_id)) {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: "evidence request_id does not match seed request_id".into(),
+        });
+    }
+
+    // Verify session_id consistency.
+    if evidence.session_id != seed.session_id {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: "evidence session_id does not match seed session_id".into(),
+        });
+    }
+
+    // Verify evidence finalization time is after seed creation time.
+    if evidence.ht_end < seed.ht_start {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: format!(
+                "evidence ht_end ({}) is before seed ht_start ({}) \
+                 (evidence cannot precede seed creation)",
+                evidence.ht_end, seed.ht_start
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate that witness evidence provider matches the seed provider.
+///
+/// The provider identity and build digest MUST match between seed
+/// and evidence to prevent measurement substitution attacks.
+///
+/// # Errors
+///
+/// Returns [`AdmitError::WitnessEvidenceFailure`] if the provider
+/// binding is invalid.
+fn validate_evidence_provider_binding(
+    evidence: &WitnessEvidenceV1,
+    seed: &WitnessSeedV1,
+) -> Result<(), AdmitError> {
+    // Verify provider_id consistency.
+    if evidence.provider_id != seed.provider_id {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: format!(
+                "evidence provider_id '{}' does not match seed provider_id '{}'",
+                evidence.provider_id, seed.provider_id
+            ),
+        });
+    }
+
+    // Verify provider_build_digest consistency (constant-time).
+    if !bool::from(
+        evidence
+            .provider_build_digest
+            .ct_eq(&seed.provider_build_digest),
+    ) {
+        return Err(AdmitError::WitnessEvidenceFailure {
+            reason: "evidence provider_build_digest does not match seed \
+                     provider_build_digest (measurement substitution detected)"
+                .into(),
+        });
+    }
+
+    Ok(())
 }
