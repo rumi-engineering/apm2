@@ -28,38 +28,127 @@ use super::prerequisites::LedgerAnchorV1;
 // Bounded deserialization helpers (SECURITY BLOCKER 2, TCK-00492)
 // =============================================================================
 
-/// Bounded string deserialization module.
+/// Bounded deserialization module (SECURITY: visitor-based bounds enforcement).
 ///
 /// Prevents denial-of-service via unbounded allocation when deserializing
-/// string fields from untrusted input. Each string is rejected if it exceeds
-/// the corresponding `MAX_*` limit.
+/// string and collection fields from untrusted input. Uses serde `Visitor`
+/// patterns that enforce length/count limits DURING parsing, before
+/// allocating the full payload.
+///
+/// # String Visitor
+///
+/// The `bounded_string_deser!` macro generates a `Visitor` that intercepts
+/// `visit_str` / `visit_string` and rejects strings exceeding `MAX_*`
+/// bytes BEFORE copying into a new `String`. This prevents an attacker
+/// from forcing allocation of a multi-gigabyte string that is only
+/// rejected post-allocation.
+///
+/// # Vec Visitor
+///
+/// The `bounded_vec_deser!` macro generates a `Visitor` that consumes a
+/// JSON array element-by-element via `SeqAccess`, counting entries and
+/// rejecting the payload as soon as the count exceeds `MAX_*`. This
+/// prevents pre-allocation of an oversized `Vec` from a malicious
+/// `serde_json` size hint.
 mod bounded_deser {
-    use serde::{self, Deserialize, Deserializer};
+    use serde::{self, Deserializer, de};
 
-    /// Macro to generate bounded deserializer functions with compile-time
-    /// maximum length constants.
+    /// Macro to generate bounded string deserializer functions with a
+    /// visitor that enforces the limit DURING parsing (before allocation).
     macro_rules! bounded_string_deser {
         ($fn_name:ident, $max:expr) => {
             pub fn $fn_name<'de, D>(deserializer: D) -> Result<String, D::Error>
             where
                 D: Deserializer<'de>,
             {
-                let s = String::deserialize(deserializer)?;
-                if s.len() > $max {
-                    return Err(serde::de::Error::custom(concat!(
-                        "string exceeds maximum length of ",
-                        stringify!($max),
-                        " bytes"
-                    )));
+                struct BoundedStringVisitor;
+
+                impl<'de> de::Visitor<'de> for BoundedStringVisitor {
+                    type Value = String;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "a string of at most {} bytes", $max)
+                    }
+
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                        if v.len() > $max {
+                            return Err(E::custom(concat!(
+                                "string exceeds maximum length of ",
+                                stringify!($max),
+                                " bytes"
+                            )));
+                        }
+                        Ok(v.to_owned())
+                    }
+
+                    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                        if v.len() > $max {
+                            return Err(E::custom(concat!(
+                                "string exceeds maximum length of ",
+                                stringify!($max),
+                                " bytes"
+                            )));
+                        }
+                        Ok(v)
+                    }
                 }
-                Ok(s)
+
+                deserializer.deserialize_str(BoundedStringVisitor)
             }
         };
     }
 
-    // Bounded deserializers for each field type.
-    // These enforce MAX_* limits at deserialization time, preventing
-    // attackers from forcing large allocations via malicious payloads.
+    /// Macro to generate bounded `Vec<T>` deserializer functions with a
+    /// visitor that enforces the count limit DURING parsing. The visitor
+    /// consumes elements one-by-one via `SeqAccess` and rejects as soon
+    /// as the count exceeds `$max`, preventing oversized pre-allocation.
+    macro_rules! bounded_vec_deser {
+        ($fn_name:ident, $elem_ty:ty, $max:expr) => {
+            pub fn $fn_name<'de, D>(deserializer: D) -> Result<Vec<$elem_ty>, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct BoundedVecVisitor;
+
+                impl<'de> de::Visitor<'de> for BoundedVecVisitor {
+                    type Value = Vec<$elem_ty>;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "a sequence of at most {} elements", $max)
+                    }
+
+                    fn visit_seq<A: de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        // Cap pre-allocation to MAX to prevent a malicious
+                        // size hint from causing a massive allocation.
+                        let cap = seq.size_hint().unwrap_or(0).min($max);
+                        let mut vec = Vec::with_capacity(cap);
+
+                        while let Some(elem) = seq.next_element::<$elem_ty>()? {
+                            if vec.len() >= $max {
+                                return Err(de::Error::custom(concat!(
+                                    "sequence exceeds maximum of ",
+                                    stringify!($max),
+                                    " elements"
+                                )));
+                            }
+                            vec.push(elem);
+                        }
+
+                        Ok(vec)
+                    }
+                }
+
+                deserializer.deserialize_seq(BoundedVecVisitor)
+            }
+        };
+    }
+
+    // Bounded string deserializers for each field type.
+    // These enforce MAX_* limits DURING deserialization via Visitor,
+    // preventing attackers from forcing large allocations.
     bounded_string_deser!(deser_kernel_string, super::MAX_KERNEL_STRING_LENGTH);
     bounded_string_deser!(deser_tool_class, super::MAX_TOOL_CLASS_LENGTH);
     bounded_string_deser!(deser_boundary_profile, super::MAX_BOUNDARY_PROFILE_LENGTH);
@@ -68,6 +157,25 @@ mod bounded_deser {
         super::MAX_WITNESS_PROVIDER_ID_LENGTH
     );
     bounded_string_deser!(deser_witness_class, super::MAX_KERNEL_STRING_LENGTH);
+
+    // Bounded Vec deserializers for collection fields.
+    // These enforce MAX_* limits DURING deserialization via SeqAccess Visitor,
+    // preventing oversized pre-allocation from malicious size hints.
+    bounded_vec_deser!(
+        deser_quarantine_actions,
+        super::QuarantineActionV1,
+        super::MAX_BUNDLE_QUARANTINE_ACTIONS
+    );
+    bounded_vec_deser!(
+        deser_receipt_digests,
+        apm2_core::crypto::Hash,
+        super::MAX_OUTCOME_INDEX_RECEIPT_DIGESTS
+    );
+    bounded_vec_deser!(
+        deser_post_effect_witness_evidence_hashes,
+        apm2_core::crypto::Hash,
+        super::MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES
+    );
 }
 
 // =============================================================================
@@ -556,6 +664,447 @@ impl std::fmt::Debug for AdmissionPlanV1 {
 }
 
 // =============================================================================
+// Resource limits — AdmissionBundleV1
+// =============================================================================
+
+/// Maximum number of quarantine actions in an admission bundle.
+pub const MAX_BUNDLE_QUARANTINE_ACTIONS: usize = 16;
+
+/// Maximum number of post-effect witness evidence hashes in an admission
+/// bundle.
+pub const MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES: usize = 32;
+
+/// Maximum number of receipt digests in an `AdmissionOutcomeIndexV1`.
+pub const MAX_OUTCOME_INDEX_RECEIPT_DIGESTS: usize = 64;
+
+// =============================================================================
+// QuarantineActionV1
+// =============================================================================
+
+/// A quarantine action committed at bundle seal time (RFC-0019 §7).
+///
+/// Records the type and reservation hash for a quarantine action that
+/// was reserved as part of admission. This is sealed into the bundle
+/// BEFORE any receipts/events reference it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineActionV1 {
+    /// Quarantine reservation hash (proves capacity was reserved).
+    pub reservation_hash: Hash,
+    /// Request ID associated with this quarantine action.
+    pub request_id: Hash,
+    /// AJC ID that authorized this quarantine action.
+    pub ajc_id: Hash,
+}
+
+// =============================================================================
+// AdmissionBundleV1 (RFC-0019 REQ-0024, TCK-00493)
+// =============================================================================
+
+/// Deterministic, bounded, `deny_unknown_fields` CAS admission bundle.
+///
+/// Sealed BEFORE emission of authoritative receipts/events that reference
+/// its digest. The bundle digest IS the v1.1 `AdmissionBindingHash`
+/// (semantic equality) and MUST be included in all authoritative
+/// receipts/events.
+///
+/// # Digest Cycle Avoidance
+///
+/// This bundle MUST NOT include hashes/ids of receipts/events created
+/// after the bundle is sealed. Discovery of "what receipts were emitted"
+/// uses reverse-edge correlation: receipts carry the bundle digest.
+///
+/// # Fields (RFC-0019 §8.2 Normative Fields)
+///
+/// - HSI envelope bindings
+/// - Authoritative policy-root reference + provenance
+/// - AJC id + join/consume selector digests
+/// - Intent digest + consume-time intent digest
+/// - Witness SEED hashes + post-effect witness evidence hashes/refs
+/// - Effect digest
+/// - Quarantine actions
+/// - HT/HE anchors for audit
+///
+/// # Security Model
+///
+/// - Bounded: all collection fields have hard `MAX_*` limits.
+/// - `deny_unknown_fields`: rejects unknown JSON fields at deserialization.
+/// - Deterministic digest via domain-separated BLAKE3 with canonical ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionBundleV1 {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+
+    // -- Session + HSI envelope bindings --
+    /// Stable request identifier.
+    pub request_id: Hash,
+    /// Session identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_kernel_string")]
+    pub session_id: String,
+    /// HSI contract manifest digest.
+    pub hsi_contract_manifest_digest: Hash,
+    /// HSI envelope binding digest.
+    pub hsi_envelope_binding_digest: Hash,
+
+    // -- Authoritative policy-root reference + provenance --
+    /// Policy root digest at admission time.
+    pub policy_root_digest: Hash,
+    /// Policy root epoch (monotonic generation).
+    pub policy_root_epoch: u64,
+
+    // -- AJC id + join/consume selector digests --
+    /// AJC ID that authorized this admission.
+    pub ajc_id: Hash,
+    /// Authority join hash (join selector digest).
+    pub authority_join_hash: Hash,
+    /// Consume selector digest (effect selector).
+    pub consume_selector_digest: Hash,
+
+    // -- Intent digests --
+    /// Intent digest at join time.
+    pub intent_digest: Hash,
+    /// Consume-time intent digest (should match join-time for valid admission).
+    pub consume_time_intent_digest: Hash,
+
+    // -- Witness SEED hashes --
+    /// Leakage witness seed content hash.
+    pub leakage_witness_seed_hash: Hash,
+    /// Timing witness seed content hash.
+    pub timing_witness_seed_hash: Hash,
+
+    // -- Effect digest --
+    /// Effect descriptor digest (tool identity + arguments hash).
+    pub effect_descriptor_digest: Hash,
+
+    // -- Quarantine actions --
+    /// Quarantine actions committed at bundle seal time. Bounded by
+    /// `MAX_BUNDLE_QUARANTINE_ACTIONS`. Deserialization enforces the
+    /// limit via visitor-based counting (no oversized pre-allocation).
+    #[serde(deserialize_with = "bounded_deser::deser_quarantine_actions")]
+    pub quarantine_actions: Vec<QuarantineActionV1>,
+
+    // -- HT/HE anchors for audit --
+    /// Ledger anchor at admission time.
+    pub ledger_anchor: LedgerAnchorV1,
+    /// Time envelope reference (HTF) at admission.
+    pub time_envelope_ref: Hash,
+    /// Freshness witness tick at admission.
+    pub freshness_witness_tick: u64,
+    /// Revocation head hash at consume time.
+    pub revocation_head_hash: Hash,
+
+    // -- Enforcement context --
+    /// Policy-derived enforcement tier.
+    pub enforcement_tier: EnforcementTier,
+    /// Spine join extension content hash (binds to all spine fields).
+    pub spine_ext_hash: Hash,
+    /// Stop/budget profile digest.
+    pub stop_budget_digest: Hash,
+    /// Risk tier for this admission.
+    pub risk_tier: RiskTier,
+}
+
+/// Current schema version for `AdmissionBundleV1`.
+pub const ADMISSION_BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+impl AdmissionBundleV1 {
+    /// Validate all boundary constraints on this bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first violation found (fail-closed).
+    pub fn validate(&self) -> Result<(), AdmitError> {
+        const ZERO: Hash = [0u8; 32];
+
+        if self.schema_version != ADMISSION_BUNDLE_SCHEMA_VERSION {
+            return Err(AdmitError::BundleSealFailure {
+                reason: format!(
+                    "unsupported schema_version: expected {ADMISSION_BUNDLE_SCHEMA_VERSION}, got {}",
+                    self.schema_version
+                ),
+            });
+        }
+
+        // Bounded collection checks
+        if self.quarantine_actions.len() > MAX_BUNDLE_QUARANTINE_ACTIONS {
+            return Err(AdmitError::BundleSealFailure {
+                reason: format!(
+                    "quarantine_actions exceeds maximum of \
+                     {MAX_BUNDLE_QUARANTINE_ACTIONS}, got {}",
+                    self.quarantine_actions.len()
+                ),
+            });
+        }
+
+        // Required hash fields must be non-zero
+        if self.request_id == ZERO {
+            return Err(AdmitError::BundleSealFailure {
+                reason: "request_id is zero".into(),
+            });
+        }
+        if self.ajc_id == ZERO {
+            return Err(AdmitError::BundleSealFailure {
+                reason: "ajc_id is zero".into(),
+            });
+        }
+        if self.intent_digest == ZERO {
+            return Err(AdmitError::BundleSealFailure {
+                reason: "intent_digest is zero".into(),
+            });
+        }
+
+        // String length bounds
+        if self.session_id.is_empty() || self.session_id.len() > MAX_KERNEL_STRING_LENGTH {
+            return Err(AdmitError::BundleSealFailure {
+                reason: "session_id empty or exceeds maximum length".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Compute the deterministic content hash (digest) for this bundle.
+    ///
+    /// This digest IS the v1.1 `AdmissionBindingHash` — a **logical
+    /// binding hash** for semantic equality of the admission decision.
+    /// It is NOT the CAS storage key. The CAS storage key is derived
+    /// from `to_canonical_bytes()` (`serde_json` serialization), while
+    /// this hash is a domain-separated BLAKE3 digest over normative
+    /// fields in canonical order. The two serve different purposes:
+    ///
+    /// - `content_hash()` / `bundle_digest`: logical identity for receipts,
+    ///   events, and cross-component binding references.
+    /// - `to_canonical_bytes()`: byte-level representation for
+    ///   content-addressed storage (CAS) keying.
+    ///
+    /// # Digest Stability
+    ///
+    /// Field ordering MUST NOT change across versions. New optional
+    /// fields MUST be appended (never inserted) to maintain backward
+    /// compatibility.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // String fields bounded by MAX_* (<=256), safe for u32.
+    pub fn content_hash(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2-admission-bundle-v1");
+        hasher.update(&self.schema_version.to_le_bytes());
+
+        // Session + HSI envelope bindings
+        hasher.update(&self.request_id);
+        hasher.update(self.session_id.as_bytes());
+        hasher.update(&(self.session_id.len() as u32).to_le_bytes());
+        hasher.update(&self.hsi_contract_manifest_digest);
+        hasher.update(&self.hsi_envelope_binding_digest);
+
+        // Policy-root reference + provenance
+        hasher.update(&self.policy_root_digest);
+        hasher.update(&self.policy_root_epoch.to_le_bytes());
+
+        // AJC id + selectors
+        hasher.update(&self.ajc_id);
+        hasher.update(&self.authority_join_hash);
+        hasher.update(&self.consume_selector_digest);
+
+        // Intent digests
+        hasher.update(&self.intent_digest);
+        hasher.update(&self.consume_time_intent_digest);
+
+        // Witness SEED hashes
+        hasher.update(&self.leakage_witness_seed_hash);
+        hasher.update(&self.timing_witness_seed_hash);
+
+        // Effect digest
+        hasher.update(&self.effect_descriptor_digest);
+
+        // Quarantine actions (length-prefixed array)
+        hasher.update(&(self.quarantine_actions.len() as u32).to_le_bytes());
+        for qa in &self.quarantine_actions {
+            hasher.update(&qa.reservation_hash);
+            hasher.update(&qa.request_id);
+            hasher.update(&qa.ajc_id);
+        }
+
+        // HT/HE anchors
+        hasher.update(&self.ledger_anchor.ledger_id);
+        hasher.update(&self.ledger_anchor.event_hash);
+        hasher.update(&self.ledger_anchor.height.to_le_bytes());
+        hasher.update(&self.ledger_anchor.he_time.to_le_bytes());
+        hasher.update(&self.time_envelope_ref);
+        hasher.update(&self.freshness_witness_tick.to_le_bytes());
+        hasher.update(&self.revocation_head_hash);
+
+        // Enforcement context
+        hasher.update(match self.enforcement_tier {
+            EnforcementTier::FailClosed => &[0x01],
+            EnforcementTier::Monitor => &[0x02],
+        });
+        hasher.update(&self.spine_ext_hash);
+        hasher.update(&self.stop_budget_digest);
+        hasher.update(match self.risk_tier {
+            RiskTier::Tier0 => &[0x00],
+            RiskTier::Tier1 => &[0x01],
+            RiskTier::Tier2Plus => &[0x02],
+            _ => &[0xFF], // Unknown variant — deterministic fallback tag.
+        });
+
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Serialize to canonical JSON bytes for CAS storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdmitError::BundleSealFailure` if serialization fails.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, AdmitError> {
+        serde_json::to_vec(self).map_err(|e| AdmitError::BundleSealFailure {
+            reason: format!("bundle serialization failed: {e}"),
+        })
+    }
+}
+
+// =============================================================================
+// AdmissionOutcomeIndexV1 (RFC-0019 REQ-0024, TCK-00493)
+// =============================================================================
+
+/// Forward index emitted AFTER authoritative receipts/events are created.
+///
+/// This object references the already-sealed `AdmissionBundleV1` digest
+/// and lists the receipt/event digests that were emitted for this
+/// admission. It is emitted post-bundle to avoid digest cycles.
+///
+/// Post-effect witness evidence hashes live here (not in the bundle)
+/// because they are populated AFTER the effect executes, which is after
+/// bundle sealing. Placing them in the bundle would mutate the sealed
+/// content hash and orphan the original `AdmissionBindingHash`.
+///
+/// # Digest Cycle Avoidance
+///
+/// The bundle is sealed BEFORE receipts/events. This index is created
+/// AFTER receipts/events and references the bundle digest (not vice
+/// versa). The bundle NEVER references receipt/event IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionOutcomeIndexV1 {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// Digest of the sealed `AdmissionBundleV1` this index references.
+    pub bundle_digest: Hash,
+    /// Request ID for correlation.
+    pub request_id: Hash,
+    /// AJC ID for correlation.
+    pub ajc_id: Hash,
+    /// Post-effect witness evidence hashes (populated after effect
+    /// execution). These live in the outcome index rather than the
+    /// bundle because the bundle is sealed BEFORE the effect executes.
+    /// Bounded by `MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES`.
+    /// Deserialization enforces the limit via visitor-based counting.
+    #[serde(deserialize_with = "bounded_deser::deser_post_effect_witness_evidence_hashes")]
+    pub post_effect_witness_evidence_hashes: Vec<Hash>,
+    /// Receipt/event digests emitted for this admission. Bounded by
+    /// `MAX_OUTCOME_INDEX_RECEIPT_DIGESTS`. Deserialization enforces
+    /// the limit via visitor-based counting (no oversized pre-allocation).
+    #[serde(deserialize_with = "bounded_deser::deser_receipt_digests")]
+    pub receipt_digests: Vec<Hash>,
+}
+
+/// Current schema version for `AdmissionOutcomeIndexV1`.
+pub const ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION: u32 = 1;
+
+impl AdmissionOutcomeIndexV1 {
+    /// Validate all boundary constraints on this outcome index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first violation found (fail-closed).
+    pub fn validate(&self) -> Result<(), AdmitError> {
+        const ZERO: Hash = [0u8; 32];
+
+        if self.schema_version != ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION {
+            return Err(AdmitError::BundleSealFailure {
+                reason: format!(
+                    "unsupported outcome index schema_version: expected \
+                     {ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION}, got {}",
+                    self.schema_version
+                ),
+            });
+        }
+
+        if self.post_effect_witness_evidence_hashes.len() > MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES {
+            return Err(AdmitError::BundleSealFailure {
+                reason: format!(
+                    "post_effect_witness_evidence_hashes exceeds maximum of \
+                     {MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES}, got {}",
+                    self.post_effect_witness_evidence_hashes.len()
+                ),
+            });
+        }
+
+        if self.receipt_digests.len() > MAX_OUTCOME_INDEX_RECEIPT_DIGESTS {
+            return Err(AdmitError::BundleSealFailure {
+                reason: format!(
+                    "receipt_digests exceeds maximum of \
+                     {MAX_OUTCOME_INDEX_RECEIPT_DIGESTS}, got {}",
+                    self.receipt_digests.len()
+                ),
+            });
+        }
+
+        if self.bundle_digest == ZERO {
+            return Err(AdmitError::BundleSealFailure {
+                reason: "bundle_digest is zero in outcome index".into(),
+            });
+        }
+
+        if self.request_id == ZERO {
+            return Err(AdmitError::BundleSealFailure {
+                reason: "request_id is zero in outcome index".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Compute the deterministic content hash for this outcome index.
+    ///
+    /// This is a **logical binding hash** (domain-separated BLAKE3),
+    /// not the CAS storage key. See [`AdmissionBundleV1::content_hash`]
+    /// for the distinction between logical hash and CAS key.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Collections bounded by MAX_* constants (<=64), safe for u32.
+    pub fn content_hash(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2-admission-outcome-index-v1");
+        hasher.update(&self.schema_version.to_le_bytes());
+        hasher.update(&self.bundle_digest);
+        hasher.update(&self.request_id);
+        hasher.update(&self.ajc_id);
+        // Post-effect witness evidence hashes (length-prefixed array)
+        hasher.update(&(self.post_effect_witness_evidence_hashes.len() as u32).to_le_bytes());
+        for h in &self.post_effect_witness_evidence_hashes {
+            hasher.update(h);
+        }
+        // Receipt digests (length-prefixed array)
+        hasher.update(&(self.receipt_digests.len() as u32).to_le_bytes());
+        for d in &self.receipt_digests {
+            hasher.update(d);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Serialize to canonical JSON bytes for CAS storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdmitError::BundleSealFailure` if serialization fails.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, AdmitError> {
+        serde_json::to_vec(self).map_err(|e| AdmitError::BundleSealFailure {
+            reason: format!("outcome index serialization failed: {e}"),
+        })
+    }
+}
+
+// =============================================================================
 // BoundarySpanV1
 // =============================================================================
 
@@ -580,11 +1129,15 @@ pub struct BoundarySpanV1 {
 
 /// Result of successful admission plan execution (RFC-0019 Appendix A).
 ///
-/// Contains the admission bundle digest, capability tokens for effect
-/// execution, and lifecycle receipts.
+/// Contains the sealed admission bundle, its digest, capability tokens
+/// for effect execution, and lifecycle receipts.
 pub struct AdmissionResultV1 {
-    /// Digest of the sealed `AdmissionBundleV1` CAS object.
+    /// Digest of the sealed `AdmissionBundleV1` CAS object
+    /// (v1.1 `AdmissionBindingHash`).
     pub bundle_digest: Hash,
+    /// The sealed `AdmissionBundleV1` ready for CAS storage.
+    /// Sealed BEFORE any authoritative receipts/events reference it.
+    pub bundle: AdmissionBundleV1,
     /// Capability token for effect execution.
     pub effect_capability: EffectCapability,
     /// Capability token for authoritative ledger writes.
@@ -610,6 +1163,7 @@ impl std::fmt::Debug for AdmissionResultV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdmissionResultV1")
             .field("bundle_digest", &hex::encode(self.bundle_digest))
+            .field("bundle_ajc_id", &hex::encode(self.bundle.ajc_id))
             .field("effect_capability", &self.effect_capability)
             .field("ledger_write_capability", &self.ledger_write_capability)
             .field("quarantine_capability", &self.quarantine_capability)
@@ -698,6 +1252,11 @@ pub enum AdmitError {
         /// Bounded reason string.
         reason: String,
     },
+    /// Bundle sealing failed (validation, serialization, or CAS storage).
+    BundleSealFailure {
+        /// Bounded reason string.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AdmitError {
@@ -736,6 +1295,9 @@ impl std::fmt::Display for AdmitError {
                 reason,
             } => {
                 write!(f, "execute prerequisite drift: {prerequisite}: {reason}")
+            },
+            Self::BundleSealFailure { reason } => {
+                write!(f, "bundle seal failure: {reason}")
             },
         }
     }

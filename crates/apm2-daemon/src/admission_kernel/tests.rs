@@ -1219,13 +1219,16 @@ fn test_admit_error_display() {
             prerequisite: "test".into(),
             reason: "test".into(),
         },
+        AdmitError::BundleSealFailure {
+            reason: "test".into(),
+        },
     ];
 
     for err in &errors {
         let display = format!("{err}");
         assert!(!display.is_empty(), "display must not be empty for {err:?}");
     }
-    assert_eq!(errors.len(), 13, "all 13 error variants must be tested");
+    assert_eq!(errors.len(), 14, "all 14 error variants must be tested");
 }
 
 // =============================================================================
@@ -1781,5 +1784,920 @@ fn test_canonical_request_digest_differs_by_pcac_policy() {
     assert_ne!(
         digest_a, digest_b,
         "canonical request digest must differ when pcac_policy differs"
+    );
+}
+
+// =============================================================================
+// TCK-00493: AdmissionBundleV1 — sealed CAS bundle with no digest cycles
+// =============================================================================
+
+#[test]
+fn test_bundle_contains_all_normative_fields() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    let bundle = &result.bundle;
+
+    // Session + HSI envelope bindings
+    assert_eq!(bundle.request_id, request.request_id);
+    assert_eq!(bundle.session_id, request.session_id);
+    assert_eq!(
+        bundle.hsi_contract_manifest_digest,
+        request.hsi_contract_manifest_digest
+    );
+    assert_eq!(
+        bundle.hsi_envelope_binding_digest,
+        request.hsi_envelope_binding_digest
+    );
+
+    // Policy-root reference
+    assert_ne!(
+        bundle.policy_root_digest, [0u8; 32],
+        "policy_root_digest must not be zero"
+    );
+    assert!(
+        bundle.policy_root_epoch > 0,
+        "policy_root_epoch must be positive"
+    );
+
+    // AJC id + selectors
+    assert_eq!(bundle.ajc_id, test_hash(50));
+    assert_ne!(
+        bundle.authority_join_hash, [0u8; 32],
+        "authority_join_hash must not be zero"
+    );
+    assert_ne!(
+        bundle.consume_selector_digest, [0u8; 32],
+        "consume_selector_digest must not be zero"
+    );
+
+    // Intent digests
+    assert_eq!(bundle.intent_digest, request.intent_digest);
+    assert_ne!(
+        bundle.consume_time_intent_digest, [0u8; 32],
+        "consume_time_intent_digest must not be zero"
+    );
+
+    // Witness SEED hashes
+    assert_ne!(
+        bundle.leakage_witness_seed_hash, [0u8; 32],
+        "leakage_witness_seed_hash must not be zero"
+    );
+    assert_ne!(
+        bundle.timing_witness_seed_hash, [0u8; 32],
+        "timing_witness_seed_hash must not be zero"
+    );
+    assert_ne!(
+        bundle.leakage_witness_seed_hash, bundle.timing_witness_seed_hash,
+        "leakage and timing seed hashes must differ"
+    );
+
+    // Effect digest
+    assert_eq!(
+        bundle.effect_descriptor_digest,
+        request.effect_descriptor_digest
+    );
+
+    // Quarantine actions (fail-closed tier has quarantine guard)
+    assert_eq!(
+        bundle.quarantine_actions.len(),
+        1,
+        "fail-closed tier must have exactly 1 quarantine action"
+    );
+    assert_eq!(bundle.quarantine_actions[0].ajc_id, test_hash(50));
+    assert_eq!(bundle.quarantine_actions[0].request_id, request.request_id);
+    assert_eq!(bundle.quarantine_actions[0].reservation_hash, test_hash(70));
+
+    // HT/HE anchors
+    assert_ne!(
+        bundle.ledger_anchor.ledger_id, [0u8; 32],
+        "ledger_id must not be zero"
+    );
+    assert_ne!(
+        bundle.time_envelope_ref, [0u8; 32],
+        "time_envelope_ref must not be zero"
+    );
+    assert!(
+        bundle.freshness_witness_tick > 0,
+        "freshness_witness_tick must be positive"
+    );
+
+    // Enforcement context
+    assert_eq!(bundle.enforcement_tier, EnforcementTier::FailClosed);
+    assert_ne!(
+        bundle.spine_ext_hash, [0u8; 32],
+        "spine_ext_hash must not be zero"
+    );
+    assert_eq!(bundle.stop_budget_digest, request.stop_budget_digest);
+    assert_eq!(bundle.risk_tier, RiskTier::Tier2Plus);
+
+    // Schema version
+    assert_eq!(
+        bundle.schema_version,
+        super::types::ADMISSION_BUNDLE_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn test_bundle_digest_is_deterministic_content_hash() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // The bundle_digest field must equal content_hash() of the bundle.
+    let recomputed = result.bundle.content_hash();
+    assert_eq!(
+        result.bundle_digest, recomputed,
+        "bundle_digest must equal bundle.content_hash()"
+    );
+
+    // Re-computing must be deterministic.
+    let recomputed_again = result.bundle.content_hash();
+    assert_eq!(
+        recomputed, recomputed_again,
+        "content_hash must be deterministic across calls"
+    );
+
+    // Must not be zero.
+    assert_ne!(
+        result.bundle_digest, [0u8; 32],
+        "bundle digest must not be zero"
+    );
+}
+
+#[test]
+fn test_bundle_sealed_before_receipt_emission_no_digest_cycle() {
+    // Structural regression test: the bundle MUST NOT contain any
+    // receipt/event IDs or digests that are only available after the
+    // bundle is sealed. Verify by checking that AdmissionBundleV1 has
+    // no fields for receipt IDs or post-effect data.
+    //
+    // The bundle contains: request_id, session_id, HSI bindings,
+    // policy root, AJC fields, intent digests, witness seed hashes,
+    // effect digest, quarantine actions, HT/HE anchors, enforcement
+    // context. NONE of these are receipt/event IDs created post-seal.
+    //
+    // Post-effect witness evidence hashes live in
+    // AdmissionOutcomeIndexV1 (emitted post-bundle, post-effect).
+    // Forward indexing also uses AdmissionOutcomeIndexV1.
+
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // The bundle exists and has a valid digest.
+    assert_ne!(result.bundle_digest, [0u8; 32]);
+
+    // Verify the bundle can be serialized (CAS-storable).
+    let bytes = result
+        .bundle
+        .to_canonical_bytes()
+        .expect("bundle serialization must succeed");
+    assert!(!bytes.is_empty(), "serialized bundle must not be empty");
+
+    // Verify round-trip: deserialize and re-hash to confirm stability.
+    let deserialized: super::types::AdmissionBundleV1 =
+        serde_json::from_slice(&bytes).expect("bundle deserialization must succeed");
+    let rehash = deserialized.content_hash();
+    assert_eq!(
+        result.bundle_digest, rehash,
+        "bundle digest must be stable after round-trip serialization"
+    );
+}
+
+#[test]
+fn test_bundle_digest_changes_when_any_field_changes() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    let original_digest = result.bundle.content_hash();
+
+    // Mutate each major field and verify the digest changes.
+    let mut bundle = result.bundle.clone();
+
+    // Field: intent_digest
+    bundle.intent_digest = test_hash(200);
+    assert_ne!(
+        bundle.content_hash(),
+        original_digest,
+        "digest must change when intent_digest changes"
+    );
+    bundle.intent_digest = result.bundle.intent_digest;
+
+    // Field: ajc_id
+    bundle.ajc_id = test_hash(201);
+    assert_ne!(
+        bundle.content_hash(),
+        original_digest,
+        "digest must change when ajc_id changes"
+    );
+    bundle.ajc_id = result.bundle.ajc_id;
+
+    // Field: policy_root_epoch
+    bundle.policy_root_epoch = 99999;
+    assert_ne!(
+        bundle.content_hash(),
+        original_digest,
+        "digest must change when policy_root_epoch changes"
+    );
+    bundle.policy_root_epoch = result.bundle.policy_root_epoch;
+
+    // Field: enforcement_tier
+    bundle.enforcement_tier = EnforcementTier::Monitor;
+    assert_ne!(
+        bundle.content_hash(),
+        original_digest,
+        "digest must change when enforcement_tier changes"
+    );
+    bundle.enforcement_tier = result.bundle.enforcement_tier;
+
+    // Field: quarantine_actions (add one)
+    bundle
+        .quarantine_actions
+        .push(super::types::QuarantineActionV1 {
+            reservation_hash: test_hash(202),
+            request_id: test_hash(203),
+            ajc_id: test_hash(204),
+        });
+    assert_ne!(
+        bundle.content_hash(),
+        original_digest,
+        "digest must change when quarantine_actions changes"
+    );
+    bundle.quarantine_actions = result.bundle.quarantine_actions;
+
+    // Verify no changes results in same digest
+    assert_eq!(
+        bundle.content_hash(),
+        original_digest,
+        "digest must match after reverting all changes"
+    );
+}
+
+#[test]
+fn test_bundle_deny_unknown_fields() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // Serialize to JSON, add an unknown field, and attempt deserialization.
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&result.bundle).expect("serialize must succeed");
+    json_value
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_malicious_field".into(), serde_json::json!("evil"));
+
+    let deser_result: Result<super::types::AdmissionBundleV1, _> =
+        serde_json::from_value(json_value);
+    assert!(
+        deser_result.is_err(),
+        "deny_unknown_fields must reject unknown JSON fields"
+    );
+}
+
+#[test]
+fn test_bundle_validation_rejects_zero_request_id() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    let mut bundle = result.bundle;
+    bundle.request_id = [0u8; 32];
+    let validation = bundle.validate();
+    assert!(
+        validation.is_err(),
+        "validation must reject zero request_id"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)] // test-only: MAX_BUNDLE_QUARANTINE_ACTIONS < 256
+fn test_bundle_validation_rejects_oversized_quarantine_actions() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    let mut bundle = result.bundle;
+    // Exceed MAX_BUNDLE_QUARANTINE_ACTIONS
+    for i in 0..=super::types::MAX_BUNDLE_QUARANTINE_ACTIONS {
+        bundle
+            .quarantine_actions
+            .push(super::types::QuarantineActionV1 {
+                reservation_hash: test_hash(i as u8),
+                request_id: test_hash(i as u8),
+                ajc_id: test_hash(i as u8),
+            });
+    }
+    let validation = bundle.validate();
+    assert!(
+        validation.is_err(),
+        "validation must reject oversized quarantine_actions"
+    );
+    match validation.unwrap_err() {
+        AdmitError::BundleSealFailure { reason } => {
+            assert!(
+                reason.contains("quarantine_actions"),
+                "reason should mention quarantine_actions: {reason}"
+            );
+        },
+        other => panic!("expected BundleSealFailure, got: {other}"),
+    }
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)] // test-only: MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES < 256
+fn test_outcome_index_validation_rejects_oversized_witness_evidence() {
+    // post_effect_witness_evidence_hashes now lives in AdmissionOutcomeIndexV1
+    // (moved from bundle because post-effect data cannot be in the sealed bundle).
+    let mut index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: test_hash(100),
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: Vec::new(),
+    };
+
+    // Exceed MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES
+    for i in 0..=super::types::MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES {
+        index
+            .post_effect_witness_evidence_hashes
+            .push(test_hash(i as u8));
+    }
+    let validation = index.validate();
+    assert!(
+        validation.is_err(),
+        "validation must reject oversized post_effect_witness_evidence_hashes"
+    );
+    match validation.unwrap_err() {
+        AdmitError::BundleSealFailure { reason } => {
+            assert!(
+                reason.contains("post_effect_witness_evidence_hashes"),
+                "reason should mention post_effect_witness_evidence_hashes: {reason}"
+            );
+        },
+        other => panic!("expected BundleSealFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_monitor_tier_bundle_has_no_quarantine_actions() {
+    let kernel = minimal_kernel();
+    let request = valid_request(RiskTier::Tier1);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    assert!(
+        result.bundle.quarantine_actions.is_empty(),
+        "monitor tier must have no quarantine actions"
+    );
+    assert_eq!(result.bundle.enforcement_tier, EnforcementTier::Monitor);
+}
+
+// =============================================================================
+// TCK-00493: AdmissionOutcomeIndexV1 — forward index (no digest cycle)
+// =============================================================================
+
+#[test]
+fn test_outcome_index_references_bundle_digest() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // Simulate creating an outcome index after receipts are emitted.
+    let fake_receipt_digest_1 = test_hash(150);
+    let fake_receipt_digest_2 = test_hash(151);
+
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: result.bundle_digest,
+        request_id: result.bundle.request_id,
+        ajc_id: result.bundle.ajc_id,
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: vec![fake_receipt_digest_1, fake_receipt_digest_2],
+    };
+
+    // Index references the sealed bundle digest.
+    assert_eq!(
+        index.bundle_digest, result.bundle_digest,
+        "outcome index must reference the sealed bundle digest"
+    );
+
+    // The bundle DOES NOT reference the index or any receipt digests.
+    // This is the digest cycle avoidance invariant.
+    // The bundle was sealed before receipts were created, and the
+    // index was created after receipts.
+
+    // Validate the index.
+    index.validate().expect("outcome index must be valid");
+
+    // Content hash is deterministic.
+    let hash1 = index.content_hash();
+    let hash2 = index.content_hash();
+    assert_eq!(hash1, hash2, "outcome index hash must be deterministic");
+    assert_ne!(hash1, [0u8; 32], "outcome index hash must not be zero");
+
+    // Serialization round-trip.
+    let bytes = index
+        .to_canonical_bytes()
+        .expect("serialization must succeed");
+    let deser: super::types::AdmissionOutcomeIndexV1 =
+        serde_json::from_slice(&bytes).expect("deserialization must succeed");
+    assert_eq!(
+        index.content_hash(),
+        deser.content_hash(),
+        "hash must be stable after round-trip"
+    );
+}
+
+#[test]
+fn test_outcome_index_deny_unknown_fields() {
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: test_hash(100),
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: vec![test_hash(150)],
+    };
+
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&index).expect("serialize must succeed");
+    json_value
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_field".into(), serde_json::json!(42));
+
+    let deser_result: Result<super::types::AdmissionOutcomeIndexV1, _> =
+        serde_json::from_value(json_value);
+    assert!(
+        deser_result.is_err(),
+        "deny_unknown_fields must reject unknown JSON fields in outcome index"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)] // test-only: MAX_OUTCOME_INDEX_RECEIPT_DIGESTS < 256
+fn test_outcome_index_validation_rejects_oversized_receipt_digests() {
+    let mut index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: test_hash(100),
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: Vec::new(),
+    };
+
+    for i in 0..=super::types::MAX_OUTCOME_INDEX_RECEIPT_DIGESTS {
+        index.receipt_digests.push(test_hash(i as u8));
+    }
+
+    let validation = index.validate();
+    assert!(
+        validation.is_err(),
+        "validation must reject oversized receipt_digests"
+    );
+}
+
+#[test]
+fn test_outcome_index_validation_rejects_zero_bundle_digest() {
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: [0u8; 32],
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: vec![test_hash(150)],
+    };
+
+    let validation = index.validate();
+    assert!(
+        validation.is_err(),
+        "validation must reject zero bundle_digest"
+    );
+}
+
+// =============================================================================
+// TCK-00493: Digest cycle regression test — bundle never references receipts
+// =============================================================================
+
+#[test]
+fn test_bundle_receipt_digest_cycle_regression() {
+    // This test structurally proves that the AdmissionBundleV1 type does
+    // NOT contain any field for receipt/event IDs that would be created
+    // after the bundle is sealed. The compilation of this test proves
+    // the structural invariant: the bundle only contains pre-seal data.
+
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // 1. The bundle is sealed (has a digest).
+    let bundle_digest = result.bundle_digest;
+    assert_ne!(bundle_digest, [0u8; 32]);
+
+    // 2. Simulate creating receipts that reference the bundle digest.
+    let receipt_a_content = format!(
+        "receipt-A-referencing-bundle-{}",
+        hex::encode(bundle_digest)
+    );
+    let receipt_a_digest = {
+        let mut h = blake3::Hasher::new();
+        h.update(receipt_a_content.as_bytes());
+        *h.finalize().as_bytes()
+    };
+
+    // 3. The bundle was sealed BEFORE receipt_a was created. Therefore the bundle
+    //    cannot contain receipt_a_digest. Verify by checking that re-computing the
+    //    bundle digest produces the same value — the bundle is immutable.
+    let recomputed = result.bundle.content_hash();
+    assert_eq!(
+        bundle_digest, recomputed,
+        "bundle digest must not change after receipt creation (no cycle)"
+    );
+
+    // 4. Create an outcome index that bridges bundle -> receipts.
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest,
+        request_id: result.bundle.request_id,
+        ajc_id: result.bundle.ajc_id,
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: vec![receipt_a_digest],
+    };
+
+    // 5. The outcome index is a separate object — it does NOT change the bundle
+    //    digest.
+    assert_eq!(
+        result.bundle.content_hash(),
+        bundle_digest,
+        "bundle is immutable; outcome index is a separate object"
+    );
+
+    // 6. Validate the index.
+    index.validate().expect("outcome index must be valid");
+}
+
+// =============================================================================
+// TCK-00493: CAC overlay digest cycle regression
+// =============================================================================
+
+#[test]
+fn test_cac_overlay_digest_cycle_regression() {
+    // CAC overlay objects that need receipt IDs MUST be emitted
+    // post-bundle as separate objects referencing AdmissionBundleDigest.
+    //
+    // This test proves the pattern: overlay objects reference the
+    // bundle digest, NOT vice versa.
+
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    let bundle_digest = result.bundle_digest;
+
+    // Simulate a CAC overlay that references the bundle.
+    let overlay_content = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"apm2-cac-overlay-v1");
+        h.update(&bundle_digest);
+        h.update(&test_hash(160)); // receipt ID created post-seal
+        *h.finalize().as_bytes()
+    };
+
+    // The overlay references the bundle, NOT vice versa.
+    assert_ne!(overlay_content, [0u8; 32]);
+
+    // The bundle digest is unchanged.
+    assert_eq!(
+        result.bundle.content_hash(),
+        bundle_digest,
+        "bundle must not be affected by overlay creation"
+    );
+}
+
+// =============================================================================
+// TCK-00493: AdmitError::BundleSealFailure Display coverage
+// =============================================================================
+
+#[test]
+fn test_admit_error_bundle_seal_failure_display() {
+    let err = AdmitError::BundleSealFailure {
+        reason: "test failure".into(),
+    };
+    let display = format!("{err}");
+    assert!(
+        display.contains("bundle seal failure"),
+        "display must contain 'bundle seal failure': {display}"
+    );
+    assert!(
+        display.contains("test failure"),
+        "display must contain reason: {display}"
+    );
+}
+
+// =============================================================================
+// TCK-00493 fix: post_effect_witness_evidence_hashes in outcome index
+// =============================================================================
+
+#[test]
+fn test_outcome_index_digest_changes_when_witness_evidence_hashes_change() {
+    let index_base = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: test_hash(100),
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: vec![test_hash(150)],
+    };
+    let digest_base = index_base.content_hash();
+
+    // Adding witness evidence hashes changes the digest.
+    let mut index_with_evidence = index_base.clone();
+    index_with_evidence
+        .post_effect_witness_evidence_hashes
+        .push(test_hash(200));
+    let digest_with_evidence = index_with_evidence.content_hash();
+    assert_ne!(
+        digest_base, digest_with_evidence,
+        "outcome index digest must change when post_effect_witness_evidence_hashes changes"
+    );
+
+    // Different evidence hashes produce different digests.
+    let mut index_diff_evidence = index_base.clone();
+    index_diff_evidence
+        .post_effect_witness_evidence_hashes
+        .push(test_hash(201));
+    let digest_diff = index_diff_evidence.content_hash();
+    assert_ne!(
+        digest_with_evidence, digest_diff,
+        "different evidence hashes must produce different digests"
+    );
+
+    // Reverting produces the original digest.
+    let reverted = index_base.content_hash();
+    assert_eq!(digest_base, reverted, "digest must be deterministic");
+}
+
+#[test]
+fn test_bundle_does_not_contain_post_effect_witness_evidence_hashes() {
+    // Structural regression: AdmissionBundleV1 must NOT have a field for
+    // post-effect witness evidence hashes. That data belongs in
+    // AdmissionOutcomeIndexV1 because it is populated after effect
+    // execution (post-seal).
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // Serialize the bundle to JSON and verify no post_effect field.
+    let json_value: serde_json::Value =
+        serde_json::to_value(&result.bundle).expect("serialize must succeed");
+    let obj = json_value
+        .as_object()
+        .expect("bundle must be a JSON object");
+    assert!(
+        !obj.contains_key("post_effect_witness_evidence_hashes"),
+        "AdmissionBundleV1 must NOT contain post_effect_witness_evidence_hashes \
+         (it belongs in AdmissionOutcomeIndexV1)"
+    );
+}
+
+// =============================================================================
+// TCK-00493 fix: bounded deserialization (visitor-based) tests
+// =============================================================================
+
+#[test]
+fn test_bounded_string_deser_rejects_oversized_string() {
+    // Verify the bounded string visitor rejects strings exceeding MAX_*.
+    // Use AdmissionSpineJoinExtV1::session_id which is bounded by
+    // MAX_KERNEL_STRING_LENGTH (256).
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // Serialize the bundle, inject an oversized session_id, and attempt deser.
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&result.bundle).expect("serialize must succeed");
+    let oversized_string = "x".repeat(super::types::MAX_KERNEL_STRING_LENGTH + 1);
+    json_value
+        .as_object_mut()
+        .unwrap()
+        .insert("session_id".into(), serde_json::json!(oversized_string));
+
+    let deser_result: Result<super::types::AdmissionBundleV1, _> =
+        serde_json::from_value(json_value);
+    assert!(
+        deser_result.is_err(),
+        "bounded string deserialization must reject oversized session_id"
+    );
+}
+
+#[test]
+fn test_bounded_vec_deser_rejects_oversized_quarantine_actions_at_parse_time() {
+    // Verify the bounded vec visitor rejects sequences exceeding MAX_*
+    // DURING parsing (not post-allocation). Build JSON with too many
+    // quarantine_actions and attempt deserialization.
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&result.bundle).expect("serialize must succeed");
+
+    // Build oversized quarantine_actions array
+    let oversized: Vec<serde_json::Value> = (0..=super::types::MAX_BUNDLE_QUARANTINE_ACTIONS)
+        .map(|i| {
+            serde_json::json!({
+                "reservation_hash": format!("{:064x}", i),
+                "request_id": format!("{:064x}", i),
+                "ajc_id": format!("{:064x}", i),
+            })
+        })
+        .collect();
+    json_value
+        .as_object_mut()
+        .unwrap()
+        .insert("quarantine_actions".into(), serde_json::json!(oversized));
+
+    let deser_result: Result<super::types::AdmissionBundleV1, _> =
+        serde_json::from_value(json_value);
+    assert!(
+        deser_result.is_err(),
+        "bounded vec deserialization must reject oversized quarantine_actions"
+    );
+}
+
+#[test]
+fn test_bounded_vec_deser_rejects_oversized_receipt_digests_at_parse_time() {
+    // Verify the bounded vec visitor rejects sequences exceeding MAX_*
+    // for receipt_digests in AdmissionOutcomeIndexV1.
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: test_hash(100),
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: vec![test_hash(150)],
+    };
+
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&index).expect("serialize must succeed");
+
+    // Build oversized receipt_digests array
+    let oversized: Vec<serde_json::Value> = (0..=super::types::MAX_OUTCOME_INDEX_RECEIPT_DIGESTS)
+        .map(|i| serde_json::json!(format!("{:064x}", i)))
+        .collect();
+    json_value
+        .as_object_mut()
+        .unwrap()
+        .insert("receipt_digests".into(), serde_json::json!(oversized));
+
+    let deser_result: Result<super::types::AdmissionOutcomeIndexV1, _> =
+        serde_json::from_value(json_value);
+    assert!(
+        deser_result.is_err(),
+        "bounded vec deserialization must reject oversized receipt_digests"
+    );
+}
+
+#[test]
+fn test_bounded_vec_deser_rejects_oversized_witness_evidence_at_parse_time() {
+    // Verify the bounded vec visitor rejects sequences exceeding MAX_*
+    // for post_effect_witness_evidence_hashes in AdmissionOutcomeIndexV1.
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: test_hash(100),
+        request_id: test_hash(1),
+        ajc_id: test_hash(50),
+        post_effect_witness_evidence_hashes: Vec::new(),
+        receipt_digests: Vec::new(),
+    };
+
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&index).expect("serialize must succeed");
+
+    // Build oversized post_effect_witness_evidence_hashes array
+    let oversized: Vec<serde_json::Value> = (0
+        ..=super::types::MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES)
+        .map(|i| serde_json::json!(format!("{:064x}", i)))
+        .collect();
+    json_value.as_object_mut().unwrap().insert(
+        "post_effect_witness_evidence_hashes".into(),
+        serde_json::json!(oversized),
+    );
+
+    let deser_result: Result<super::types::AdmissionOutcomeIndexV1, _> =
+        serde_json::from_value(json_value);
+    assert!(
+        deser_result.is_err(),
+        "bounded vec deserialization must reject oversized post_effect_witness_evidence_hashes"
+    );
+}
+
+#[test]
+fn test_bounded_vec_deser_accepts_valid_sized_collections() {
+    // Positive test: verify that collections at or below MAX_* are accepted.
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // Round-trip the bundle: should succeed with valid-sized collections.
+    let bytes = result
+        .bundle
+        .to_canonical_bytes()
+        .expect("serialization must succeed");
+    let deserialized: super::types::AdmissionBundleV1 =
+        serde_json::from_slice(&bytes).expect("deserialization of valid bundle must succeed");
+    assert_eq!(
+        result.bundle.content_hash(),
+        deserialized.content_hash(),
+        "round-trip must preserve digest"
+    );
+
+    // Round-trip outcome index with non-empty witness evidence.
+    let index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: result.bundle_digest,
+        request_id: result.bundle.request_id,
+        ajc_id: result.bundle.ajc_id,
+        post_effect_witness_evidence_hashes: vec![test_hash(200), test_hash(201)],
+        receipt_digests: vec![test_hash(150)],
+    };
+    let index_bytes = index
+        .to_canonical_bytes()
+        .expect("serialization must succeed");
+    let index_deser: super::types::AdmissionOutcomeIndexV1 =
+        serde_json::from_slice(&index_bytes).expect("deserialization of valid index must succeed");
+    assert_eq!(
+        index.content_hash(),
+        index_deser.content_hash(),
+        "round-trip must preserve outcome index digest"
+    );
+    assert_eq!(
+        index_deser.post_effect_witness_evidence_hashes.len(),
+        2,
+        "witness evidence hashes must survive round-trip"
     );
 }

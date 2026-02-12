@@ -47,6 +47,8 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK05] `LedgerWriteCapability` is only minted for fail-closed tiers (CTR-2617). Monitor tiers receive `None`.
 - [CTR-AK06] `build_pcac_join_input()` uses the verifier-selected ledger anchor, NOT the client-supplied `directory_head_hash`, for the AJC's `as_of_ledger_anchor` field.
 - [CTR-AK07] Identity evidence level and pointer-only waiver hash are passed through from `KernelRequestV1` to `AuthorityJoinInputV1` (not hardcoded).
+- [CTR-AK08] `execute()` constructs and seals `AdmissionBundleV1` BEFORE capability minting and receipt emission. Bundle digest becomes the `AdmissionBindingHash` (TCK-00493).
+- [CTR-AK09] `AdmissionResultV1` includes both the sealed `bundle` and `bundle_digest`. The digest is recomputable from the bundle via `content_hash()`.
 
 ### `KernelRequestV1` (types.rs)
 
@@ -88,9 +90,31 @@ Trait for durable quarantine capacity reservation. Implementations provided by T
 
 Policy-derived enforcement tier: `FailClosed` or `Monitor`.
 
+### `AdmissionBundleV1` (types.rs)
+
+Deterministic, bounded, `deny_unknown_fields` CAS object that captures all normative admission state at seal time. The bundle is sealed BEFORE emission of authoritative receipts/events that reference it. The bundle digest is the v1.1 `AdmissionBindingHash` and is included in all authoritative receipts/events.
+
+**Invariants:**
+
+- [INV-AK20] Bundle is sealed before any receipt/event emission (no digest cycles).
+- [INV-AK21] Bundle digest equals `content_hash()` (deterministic BLAKE3 with domain separation). This is a logical binding hash, NOT the CAS storage key.
+- [INV-AK22] Bundle validated before sealing (`validate()` checks zero fields and collection bounds).
+- [INV-AK23] `deny_unknown_fields` rejects unknown JSON fields at deserialization boundary.
+- [INV-AK24] Collection fields bounded by `MAX_BUNDLE_QUARANTINE_ACTIONS` (16). Deserialization enforces bounds via visitor-based counting (no oversized pre-allocation).
+- [INV-AK25] Post-effect data (witness evidence hashes) does NOT live in the bundle. The bundle represents the sealed decision to admit; post-effect data belongs in `AdmissionOutcomeIndexV1`.
+- [INV-AK26] All string fields use bounded visitor deserialization that checks length DURING parsing, not after allocation.
+
+### `AdmissionOutcomeIndexV1` (types.rs)
+
+Forward index emitted AFTER receipts/events to bridge bundle -> receipt digests without creating digest cycles. Contains `post_effect_witness_evidence_hashes` (populated after effect execution) and `receipt_digests`. Bounded by `MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES` (32) and `MAX_OUTCOME_INDEX_RECEIPT_DIGESTS` (64). Deserialization enforces bounds via visitor-based counting.
+
+### `QuarantineActionV1` (types.rs)
+
+Individual quarantine action record within `AdmissionBundleV1`. Contains `reservation_hash`, `request_id`, and `ajc_id`.
+
 ### `AdmitError` (types.rs)
 
-Error type with 13 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute.
+Error type with 14 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute and `BundleSealFailure` for bundle validation/serialization failures (TCK-00493).
 
 ## Phase Ordering
 
@@ -99,14 +123,15 @@ plan():    validate -> prerequisite resolution -> witness seed creation ->
            spine join extension -> PCAC join -> PCAC revalidate
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
-           durable consume -> capability mint (tier-gated) -> boundary span ->
-           result
+           durable consume -> bundle seal (TCK-00493) ->
+           capability mint (tier-gated) -> boundary span -> result
 ```
 
 ## Public API
 
 - `AdmissionKernelV1`, `WitnessProviderConfig`, `QuarantineGuard`
 - `AdmissionPlanV1`, `AdmissionResultV1`, `AdmissionSpineJoinExtV1`
+- `AdmissionBundleV1`, `AdmissionOutcomeIndexV1`, `QuarantineActionV1`
 - `KernelRequestV1`, `WitnessSeedV1`, `BoundarySpanV1`
 - `EnforcementTier`, `AdmitError`
 - `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability`
@@ -135,4 +160,6 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
 - REQ-0023: AdmissionKernel plan/execute + capability-gated effect surfaces
 - REQ-0002: Fail-closed enforcement tiers
 - REQ-0004: Lifecycle ordering
-- TCK-00492: Implementation ticket
+- REQ-0024: AdmissionBundleV1 deterministic CAS bundle
+- TCK-00492: Implementation ticket (kernel plan/execute API)
+- TCK-00493: Implementation ticket (bundle + outcome index)

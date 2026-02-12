@@ -52,8 +52,9 @@ use prerequisites::{AntiRollbackAnchor, LedgerAnchorV1, LedgerTrustVerifier, Pol
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 use types::{
-    AdmissionPlanV1, AdmissionResultV1, AdmissionSpineJoinExtV1, AdmitError, BoundarySpanV1,
-    EnforcementTier, KernelRequestV1, MAX_WITNESS_PROVIDER_ID_LENGTH, PlanState, WitnessSeedV1,
+    ADMISSION_BUNDLE_SCHEMA_VERSION, AdmissionBundleV1, AdmissionPlanV1, AdmissionResultV1,
+    AdmissionSpineJoinExtV1, AdmitError, BoundarySpanV1, EnforcementTier, KernelRequestV1,
+    MAX_WITNESS_PROVIDER_ID_LENGTH, PlanState, QuarantineActionV1, WitnessSeedV1,
 };
 
 // =============================================================================
@@ -519,16 +520,60 @@ impl AdmissionKernelV1 {
             enforcement_tier: plan.enforcement_tier,
         };
 
-        // Phase S: Compute bundle digest.
-        let bundle_digest = compute_bundle_digest(
-            &plan.spine_ext,
-            &consume_record.effect_selector_digest,
-            &plan.leakage_witness_seed,
-            &plan.timing_witness_seed,
-        );
+        // Phase S: Construct and seal AdmissionBundleV1 (TCK-00493).
+        //
+        // The bundle is sealed BEFORE any receipts/events reference it.
+        // The bundle digest IS the v1.1 AdmissionBindingHash.
+        //
+        // DIGEST CYCLE AVOIDANCE: The bundle MUST NOT include hashes/ids
+        // of receipts/events created after this point. Forward indexing
+        // is handled by AdmissionOutcomeIndexV1 (emitted post-bundle).
+        let quarantine_actions: Vec<QuarantineActionV1> = quarantine_reservation_hash
+            .map(|rh| {
+                vec![QuarantineActionV1 {
+                    reservation_hash: rh,
+                    request_id,
+                    ajc_id,
+                }]
+            })
+            .unwrap_or_default();
+
+        let bundle = AdmissionBundleV1 {
+            schema_version: ADMISSION_BUNDLE_SCHEMA_VERSION,
+            request_id,
+            session_id: plan.request.session_id.clone(),
+            hsi_contract_manifest_digest: plan.request.hsi_contract_manifest_digest,
+            hsi_envelope_binding_digest: plan.request.hsi_envelope_binding_digest,
+            policy_root_digest: plan.policy_root_digest,
+            policy_root_epoch: plan.policy_root_epoch,
+            ajc_id,
+            authority_join_hash: plan.certificate.authority_join_hash,
+            consume_selector_digest: consume_record.effect_selector_digest,
+            intent_digest,
+            consume_time_intent_digest: consumed_witness.intent_digest,
+            leakage_witness_seed_hash: plan.leakage_witness_seed.content_hash(),
+            timing_witness_seed_hash: plan.timing_witness_seed.content_hash(),
+            effect_descriptor_digest: plan.request.effect_descriptor_digest,
+            quarantine_actions,
+            ledger_anchor: plan.as_of_ledger_anchor.clone(),
+            time_envelope_ref: current_time_envelope_ref,
+            freshness_witness_tick: plan.request.freshness_witness_tick,
+            revocation_head_hash: current_revocation_head_hash,
+            enforcement_tier: plan.enforcement_tier,
+            spine_ext_hash: plan.spine_ext.content_hash(),
+            stop_budget_digest: plan.request.stop_budget_digest,
+            risk_tier: plan.request.risk_tier,
+        };
+
+        // Validate bundle before sealing (fail-closed).
+        bundle.validate()?;
+
+        // Seal: compute the deterministic content hash.
+        let bundle_digest = bundle.content_hash();
 
         Ok(AdmissionResultV1 {
             bundle_digest,
+            bundle,
             effect_capability,
             ledger_write_capability,
             quarantine_capability,
@@ -888,22 +933,6 @@ fn build_pcac_join_input(
         time_envelope_ref: request.time_envelope_ref,
         as_of_ledger_anchor: verifier_anchor.content_hash(),
     }
-}
-
-/// Compute the admission bundle digest from all lifecycle artifacts.
-fn compute_bundle_digest(
-    spine_ext: &AdmissionSpineJoinExtV1,
-    consume_selector_digest: &Hash,
-    leakage_seed: &WitnessSeedV1,
-    timing_seed: &WitnessSeedV1,
-) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"apm2-admission-bundle-v1");
-    hasher.update(&spine_ext.content_hash());
-    hasher.update(consume_selector_digest);
-    hasher.update(&leakage_seed.content_hash());
-    hasher.update(&timing_seed.content_hash());
-    *hasher.finalize().as_bytes()
 }
 
 /// Synthetic monitor-tier ledger anchor for when no verifier is configured.
