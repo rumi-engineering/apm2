@@ -1,0 +1,36 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00555"
+    title: "RFC-0028 leakage budgets integration: enforce evidence/log export caps and declassification receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00527"
+        reason: "Bundle import/export exists."
+      - ticket_id: "TCK-00520"
+        reason: "Logs have caps and bundles."
+  scope:
+    in_scope:
+      - "Use RFC-0028 leakage budgets to bound exported evidence bundles (bytes and classes)."
+      - "Require a declassification receipt (RFC-0028) for any export that includes logs/artifacts beyond a configured cap."
+      - "Bind leakage budget decisions into export receipts."
+    out_of_scope:
+      - "Network transport security."
+  plan:
+    steps:
+      - "Define leakage budget policy defaults."
+      - "Wire export path to consult channel policy and require receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Evidence export cannot exceed configured leakage budgets without explicit declassification receipts."

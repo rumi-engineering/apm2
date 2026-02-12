@@ -1,0 +1,35 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00570"
+    title: "Lane CORRUPT persistence + refusal semantics: marker file, reasons, and operator workflow"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00569"
+        reason: "Cleanup failures produce CORRUPT state."
+  scope:
+    in_scope:
+      - "Define `lanes/<lane_id>/corrupt.v1.json` marker schema (reason, receipt digest, detected_at)."
+      - "Worker refuses to lease a CORRUPT lane and optionally enqueues a control job recommending reset."
+      - "CLI: `apm2 fac lane mark-corrupt <lane_id> --reason ...` (optional) for operators."
+    out_of_scope:
+      - "Automated remediation policies beyond refusal."
+  plan:
+    steps:
+      - "Implement marker and status integration."
+      - "Implement refusal paths and messaging."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "CORRUPT lanes are never used inadvertently."
+      - "Operators have clear reset workflow."

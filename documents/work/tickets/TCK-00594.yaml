@@ -2,7 +2,7 @@ ticket_meta:
   schema_version: "2026-01-29"
   template_version: "2026-01-29"
   ticket:
-    id: "TCK-00510"
+    id: "TCK-00594"
     title: "FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)"
     status: "OPEN"
   binds:

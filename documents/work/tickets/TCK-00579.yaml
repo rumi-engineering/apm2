@@ -1,0 +1,38 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00579"
+    title: "Strict job spec validation policy: allowed kinds/repos; size caps; patch backend allowlist; deny unknown"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00512"
+        reason: "Job spec schema exists."
+  scope:
+    in_scope:
+      - "Implement strict validation for `FacJobSpecV1` beyond serde deny_unknown_fields:"
+      - "  - max JSON bytes on read"
+      - "  - allowed `kind` values only"
+      - "  - allowed `repo_id` set (policy-driven allowlist)"
+      - "  - allowed patch bytes_backend values only"
+      - "  - reject absolute paths or filesystem paths in job specs (repo_id is logical only)"
+      - "Deny/quarantine any job failing these validations, emit receipts."
+    out_of_scope:
+      - "General job schema for non-FAC subsystems."
+  plan:
+    steps:
+      - "Implement validator function and call from enqueue and worker pre-claim."
+      - "Add adversarial fixtures."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Malformed or oversized job specs cannot cause memory blowups or undefined behavior; they are denied/quarantined deterministically."
