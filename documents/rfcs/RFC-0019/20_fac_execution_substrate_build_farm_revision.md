@@ -9,13 +9,23 @@
 * **Document:** `documents/rfcs/RFC-0019/19_fac_execution_substrate_local_kernel.md`
 * **Amends:** RFC-0019 (APPROVED) — operational substrate addendum (no PCAC/crypto changes)
 * **Informs:** RFC-0007 — build-tooling decisions are constrained by this substrate (cache safety, isolation)
+* **Integrates:** RFC-0028 + RFC-0029 (implemented) — external I/O security + economics primitives; this amendment defines explicit FAC↔EIO integration seams so these controls do not rot unused.
 * **Date:** 2026-02-12
+* **Target outcome (measurable; required for acceptance):**
+  * **10x host-safe throughput** of FAC evidence cycles on the current host class **without** any increase in "catastrophic host failure" incidents (disk full, OOM, PID exhaustion, runaway CPU/IO thrash).
+  * **0 "unauthorized actuation" executions** (jobs executed without RFC-0028 typed tool-intent authorization) in the default path.
+  * **RFC-0028 + RFC-0029 are exercised in default flows**:
+    * Every FAC job execution MUST validate a daemon-signed RFC-0028 `ChannelBoundaryCheck` (fail-closed).
+    * Every job admission/order decision MUST produce an RFC-0029 admission trace (fail-closed), even in local-only mode.
+  * **Forensic integrity**: evidence logs and receipts remain non-clobbering and attributable under ≥3 concurrent runs.
 * **Primary surfaces touched by this amendment:**
 
   * `crates/apm2-cli/src/commands/fac.rs`
   * `crates/apm2-cli/src/commands/fac_review/{gates,evidence,gate_attestation,gate_cache}.rs`
   * `scripts/ci/run_bounded_tests.sh`
   * `flake.nix`
+  * (INTEGRATION) `crates/apm2-core/src/channel/*` (RFC-0028 external I/O boundary enforcement; transport seam)
+  * (INTEGRATION) `crates/apm2-core/src/economics/{admission,queue_admission}.rs` (RFC-0029 economics + queue admission; scheduler seam)
   * `documents/skills/implementor-default/SKILL.md`
   * (NEW) `crates/apm2-cli/src/commands/fac_review/{fac_resources,target_pool,repo_mirror,io_safety}.rs` (layout flexible; semantics are not)
   * (OPTIONAL, Phase ≥2) `crates/apm2-daemon/src/htf/HolonicClock` integration for authoritative time-stamping
@@ -26,7 +36,7 @@
   * Frequently **≤ 3 simultaneous** `gate` executions across **3 worktrees**
   * Often **~13 worktrees exist concurrently** (not all active)
   * Near-term: heavy bash → Rust migration (security + perf)
-  * Long-term: assimilate to **NixOS substrate** across the holonic network
+  * Long-term: standardize **toolchain parity via Nix flakes** across the holonic network (NixOS is optional on greenfield nodes only; do **not** migrate the current host OS as part of FESv1)
   * Primary goal: **maximize FAC loop throughput** while guaranteeing **no catastrophic host failure** (disk/mem/CPU exhaustion), with **automatic/enforced cleanup**
   * Networking is **not available yet**; all semantics MUST be local-first with clean seams for later distribution.
 
@@ -38,11 +48,13 @@ This amendment is a build-farm "kernel" spec. The following are MUSTs:
 
 1. **Safety > speed.** The substrate MUST prevent catastrophic host failure (disk/mem/CPU/PIDs/IO exhaustion) even with multiple autonomous agents.
 2. **Incremental deployability.** Every phase MUST be useful on a single VPS, MUST have rollback, and MUST NOT require a distributed system.
-3. **Networkless control-plane semantics.** Job/lane semantics MUST NOT assume inter-node networking or remote services. Networking MAY exist for tool/dependency retrieval (e.g., crates.io), but MUST NOT be required for correctness of scheduling, leases, receipts, or cache-reuse decisions. Any network use MUST be explicit, best-effort, and never authoritative.
-4. **Declarative substrate target.** The design MUST map cleanly to flakes now and future NixOS modules later.
+3. **Networkless control-plane semantics.** Job/lane semantics MUST NOT assume inter-node networking or remote services. Networking MAY exist for tool/dependency retrieval (e.g., crates.io), but MUST NOT be required for correctness of scheduling, leases, receipts, or cache-reuse decisions. Any network use MUST be explicit, best-effort, and never authoritative. If/when networking is added for job/receipt transport, remote inputs MUST be treated as **external I/O** and validated via RFC-0028 channel boundary enforcement + RFC-0029 economics (fail-closed).
+4. **Declarative substrate target.** The design MUST map cleanly to flakes now and to a systemd-first Debian/Ubuntu host baseline. NixOS modules MAY be added later for greenfield nodes, but must not be assumed or required by FESv1.
 5. **Fail-closed attestation semantics.** If anything that can affect correctness changes, gate-cache reuse MUST NOT silently continue.
 6. **No ambient user state reliance.** FAC MUST NOT depend on aliases/dotfiles/`~/.cargo/config.toml`; FAC MUST set policy explicitly.
 7. **No new long-lived bash daemons.** Control plane MUST be Rust and/or systemd-managed units. Bash scripts may exist only as transitional leaf executors.
+8. **Brokered actuation is mandatory (RFC-0028).** Any FAC job that executes code (gates/warm/pipeline evidence/GC/reset) MUST be authorized by a **daemon-signed** RFC-0028 `ChannelContextToken` and MUST validate via `apm2_core::channel::decode_channel_context_token` + `validate_channel_boundary` before execution. Jobs lacking a valid token MUST be denied (fail-closed) and quarantined.
+9. **RFC-0029 admission is mandatory.** Any job scheduling/admission decision MUST be representable as RFC-0029 and MUST emit an RFC-0029 decision trace (queue admission, and where applicable budget admission). "Local FIFO without trace" is explicitly forbidden in default mode.
 
 ## 0.2 Scope and non-goals (normative)
 
@@ -67,19 +79,72 @@ To avoid inventing redundant mechanisms, FESv1 MUST reuse existing repo primitiv
 * **Existing v2 gate cache + attestation:** `private/fac/gate_cache_v2` and `fac_review/gate_attestation.rs` are the current authority for reuse decisions; amendments must compose with that, not fork it.
 * **Proven slot leasing pattern:** `fac_review/model_pool.rs::acquire_provider_slot` is the existing file-lock + jitter + RAII pattern; reuse it rather than inventing a second locking scheme.
 * **Canonical JSON:** `apm2_core::determinism::canonicalize_json` is the canonicalizer; do not create ad-hoc "sorted keys" serializers.
-* **Hash vocabulary alignment:** the repo already standardizes BLAKE3 "hash refs" with the `b3-256:` prefix (see `apm2_core::crypto` / schema registry traits). New substrate digests MUST use the same prefix and encoding unless explicitly justified.
+* **RFC-0028 channel boundary enforcement:** `apm2_core::channel` implements fail-closed boundary checks (typed intent, declassification receipts, leakage budgets). Any future FAC transport/evidence ingress MUST route through these primitives instead of inventing parallel auth.
+* **RFC-0029 economics + queue admission:** `apm2_core::economics` implements deterministic budget admission and HTF-bound queue admission (lane reservations + anti-starvation). FESv1 MUST treat these as the canonical semantics surface for scheduler admission once HTF envelopes are available.
+* **Hash vocabulary alignment:** the repo already standardizes BLAKE3 "hash refs" with the `b3-256:` prefix (see `apm2_core::crypto` / schema registry traits).
+  * New FESv1 substrate objects (job specs, receipts, logs, blobs) MUST use `b3-256:`.
+  * Legacy FAC v0/v1 artifacts that still use SHA-256 (notably the current gate-cache v2 key material) MUST be explicitly tagged as `sha256:` when referenced.
+  * The `blake3:` prefix MUST NOT be introduced; use `b3-256:` for BLAKE3-256 digests.
 
 If this amendment proposes a new primitive that overlaps an existing one, it MUST justify why reuse is insufficient (and what the migration path is).
+
+## 0.4 RFC-0028 / RFC-0029 integration seams (normative)
+
+RFC-0028 and RFC-0029 are already implemented in this repository (`apm2_core::channel` and `apm2_core::economics`), but they are not meaningfully exercised by the current FAC local execution path. Unused security/economics primitives rot; late integration turns into a high-risk "big bang" change.
+
+FESv1 MUST therefore introduce **explicit integration seams** so that:
+
+1. **Transport seam = External I/O boundary.**
+   Any future transport of FAC jobs, receipts, cache artifacts, or evidence bundles across process/node boundaries MUST be mediated by RFC-0028 channel boundary enforcement, with policy-digest binding and fail-closed behavior.
+
+2. **Queue admission seam.**
+   Scheduler admission and ordering MUST be **executed** in terms of RFC-0029 queue admission traces from day one.
+   **Default mode MUST NOT use `NoOpVerifier`** because RFC-0029 explicitly fail-closes TP001 when signature verification is not configured.
+   Local-only mode therefore requires the broker to expose a verifying key and workers to verify envelope signatures.
+
+3. **Economics/budget seam.**
+   Any budgets that become authoritative beyond local systemd/cgroup limits (e.g., evidence streaming backpressure, anti-entropy pull limits, network byte caps in distributed mode) MUST use RFC-0029 budget admission primitives rather than inventing new ad-hoc counters.
+
+## 0.5 Authority surfaces and trust boundaries (normative)
+
+FESv1 makes one security stance explicit:
+
+*Everything under `$APM2_HOME/private/fac/**` is attacker-writable by A2 (local hostile process) unless proven otherwise.*
+
+Therefore:
+
+1. **Filesystem state is never authoritative by itself.** Queue items, lease files, cached receipts, evidence bundles, patch blobs, and logs MUST be treated as **external inputs** to the current process. Any state that can cause actuation or cache reuse MUST be authenticated and validated.
+2. **FAC has a required broker.** A local Rust broker (implemented as part of `apm2-daemon` or a dedicated `fac-broker` unit) is the authority that:
+   * issues RFC-0028 channel context tokens for job actuation,
+   * issues RFC-0029 time authority envelopes (TP-EIO29-001),
+   * and maintains the admitted policy roots used for RFC-0028 policy binding checks.
+3. **Workers never trust "raw ChannelBoundaryCheck JSON".** A `ChannelBoundaryCheck` is authoritative only if reconstructed by decoding a daemon-signed channel context token (`decode_channel_context_token`). Accepting raw JSON is forbidden.
+4. **Quarantine is first-class.** Any job/evidence/cache artifact that fails RFC-0028 or RFC-0029 validation MUST be moved to a quarantine directory and MUST NOT be deleted blindly. Quarantine is how you preserve forensics for A2/A1 events.
 
 ## 0.1 Terminology (local build-farm primitives)
 
 * **Lane**: A bounded, cullable execution context with deterministic identity, dedicated workspace+target namespace, and a fixed resource profile.
-  **Normative clarification:** In FESv1, *lanes are the sole concurrency primitive*. Any "slot/compute slot" terminology elsewhere is an alias for "lane" and MUST NOT be implemented as a second independent semaphore.
+  **Normative clarification:** In FESv1, *lanes are the sole concurrency primitive*. Any "slot" terminology elsewhere is an alias for "lane" and MUST NOT be implemented as a second independent semaphore. ("Lane leases" are the lease records for lanes, not a separate concurrency unit.)
+  **Normative clarification 2:** The term **compute slot** is forbidden in FESv1. If the codebase uses "slot" in legacy modules (e.g., model pool), that is an implementation detail; the substrate contract is **lane**.
 * **Job**: An immutable spec (what to run, against which inputs) that is queued, leased to a lane, executed, and yields receipts.
+* **Queue lane (RFC-0029):** A *scheduling class* used for fairness/anti-starvation and control-plane priority (e.g., `stop_revoke`, `control`, `bulk`).
+  This is **not** an execution lane. FESv1 records queue lanes in `FacJobSpecV1.queue_lane` to align with `apm2_core::economics::QueueLane` and to make RFC-0029 queue admission pluggable without schema churn.
 * **Receipt stream**: An append-only, mergeable set of immutable receipts; receipts are the ground truth, not runtime state.
   Ordering for presentation MUST be derived from HTF stamps when available, otherwise from a deterministic fallback tuple
   `(monotonic_time_ns, node_fingerprint, receipt_digest)`.
 * **Execution profile**: The attested environment+policy facts (including lane profile hash + toolchain fingerprint) that gate-cache keys depend on.
+
+* **FAC Broker**: The local authority service (Rust; systemd-managed) that issues:
+  * RFC-0028 channel context tokens (typed tool-intent actuation authorization),
+  * RFC-0029 time authority envelopes (TP-EIO29-001) and horizon references (TP-EIO29-002/003),
+  * and admitted policy root digests for RFC-0028 policy-binding checks.
+  The broker is required for default-mode execution.
+
+* **Channel context token (RFC-0028):** A base64-encoded, daemon-signed token that reconstructs a `ChannelBoundaryCheck` via `decode_channel_context_token`.
+  This is the only acceptable authorization carrier for FAC actuation.
+
+* **Time authority envelope (RFC-0029):** A signed `TimeAuthorityEnvelopeV1` used for queue admission TP-EIO29-001.
+  In local-only mode, this is still required and MUST be issued by the broker (not synthesized by workers).
 
 ## 1. Repo-grounded baseline: what actually runs today
 
@@ -249,6 +314,10 @@ This substrate is a **host-safety kernel**. We therefore model both accidental o
 * **A0: Accidental overload** — multiple agents trigger overlapping builds/tests/logging.
 * **A1: Malicious repo content** — PR introduces tests/build scripts that attempt to exhaust resources, escape containment, or sabotage cleanup.
 * **A2: Local hostile process** — another process on the host attempts symlink/TOCTOU attacks against GC/reset, or races queue/lease files.
+* **A3: Local artifact forgery** — a process writes forged queue items, forged "successful gate receipts", or forged evidence bundles under `$APM2_HOME/private/fac/**` to trick the system into:
+  * executing unauthorized actuation,
+  * accepting false-positive gate cache reuse,
+  * or suppressing alerts by overwriting logs.
 
 #### 2.3.2 In-scope attacks and required mitigations
 1) **Unbounded stdout/stderr capture → RAM blow-up**
@@ -267,6 +336,13 @@ This substrate is a **host-safety kernel**. We therefore model both accidental o
 
 5) **Queue/lease corruption and double execution**
    * Queue claim MUST be atomic; lease ownership MUST be exclusive; crash recovery MUST be defined by receipts (see §4.5–§4.6).
+
+6) **Forged job specs / forged receipts / forged evidence bundles**
+   * Default mode MUST require RFC-0028 daemon-signed tokens for actuation authorization; workers MUST deny/quarantine jobs lacking valid tokens (§4.5).
+   * Gate-cache reuse MUST be fail-closed if the cached artifact cannot be bound to:
+     * a valid attestation digest, AND
+     * a receipt that includes RFC-0028 authorization + RFC-0029 admission traces.
+     Legacy `gate_cache_v2` entries without these bindings MUST be treated as "untrusted legacy" and MAY be reused only under explicit `--allow-legacy-cache` (unsafe).
 
 ---
 
@@ -371,8 +447,10 @@ Queue is a filesystem-backed ordered set of job specs under `$APM2_HOME/private/
 
 Required properties:
 
-* FIFO within a priority band
-* explicit priority levels (small integer; higher wins)
+* FIFO within a **(queue_lane, priority)** band
+* explicit priority levels (small integer; higher wins within the same queue lane)
+* explicit **queue lanes** aligned with RFC-0029 (`apm2_core::economics::QueueLane`)
+  * minimum v1 set: `stop_revoke`, `control`, `bulk`
 * cancellation by job id
 * atomic claiming (no double-execution)
 * crash tolerance (claimed jobs must requeue or be marked failed with receipt)
@@ -383,12 +461,59 @@ Minimal viable layout:
 * `queue/claimed/`
 * `queue/done/`
 * `queue/cancelled/`
+* `queue/denied/` (new; RFC-0028/0029 fail-closed outcomes with reason sidecar)
+* `queue/quarantine/` (new; malformed/tampered/unparseable inputs preserved for forensics)
+
+Ordering rule (v1, local):
+
+1. `queue_lane` priority order MUST match RFC-0029 lane ordering (highest first): `stop_revoke > control > consume > replay > projection_replay > bulk`.
+   (FESv1 may initially only emit `{stop_revoke, control, bulk}`, but MUST preserve ordering semantics for forward compatibility.)
+2. Within a `queue_lane`, `priority` (descending) wins.
+3. Ties break by `enqueue_time` (oldest first), then `job_id` (lexicographic) for determinism.
 
 Claim algorithm (local-only):
 
 1. Workers (either CLI or daemonized `apm2-daemon` later) scan `pending/` for highest priority then oldest `enqueued_at`.
 2. Claim uses atomic `rename()` from `pending/<job_id>.json` → `claimed/<job_id>.json`.
 3. The claiming worker then acquires a lane lease and executes the job.
+
+Claim algorithm (required amendments for RFC-0028 + RFC-0029):
+
+0. **Precondition:** workers MUST treat `queue/pending/*.json` as untrusted external input.
+1. Before claiming, worker MUST parse `FacJobSpecV1` with bounded deserialization and verify:
+   * `job_spec_digest` is correct (§5.3.3),
+   * `actuation.channel_context_token` is present,
+   * token decodes with `decode_channel_context_token(...)` and passes `validate_channel_boundary(...)`.
+   If any check fails, worker MUST move the job file to `queue/quarantine/` (new) and MUST emit a denial receipt.
+2. Worker MUST compute an RFC-0029 `QueueAdmissionDecision` for the job (using broker-issued envelopes/horizons; §4.5.1).
+   If verdict != Allow, worker MUST not claim the job; instead it MUST leave it pending (or move to `queue/denied/` with reason).
+3. Only after RFC-0028 + RFC-0029 checks pass may the worker claim via atomic `rename()`.
+
+RFC-0029 integration seam:
+
+* Phase 1 MUST still compute and record an RFC-0029 `QueueAdmissionDecision` (see `apm2_core::economics::evaluate_queue_admission`) using broker-issued local envelopes/horizons.
+* Phase ≥2 strengthens the authority source (HTF-backed envelopes from HolonicClock) but does **not** introduce new semantics.
+
+#### 4.5.1 Local RFC-0029 envelope/horizon strategy (mandatory; v1)
+
+To avoid "economics implemented but unused", FESv1 defines a local-only strategy that still satisfies TP-EIO29-001/002/003:
+
+* **Boundary id:** `boundary_id = "apm2.fac.local"` (stable).
+* **Authority clock id:** `authority_clock = "apm2-daemon.holonic_clock.v1"` (stable string).
+* **Tick source:** broker uses `HolonicClock` (or equivalent monotonic authority) to produce current tick and short-lived envelopes.
+* **TP-EIO29-001 envelope:** broker issues `TimeAuthorityEnvelopeV1` signed by the daemon signing key; workers verify signatures (no `NoOpVerifier` in default mode).
+* **TP-EIO29-002 freshness horizon:** broker maintains a resolved `FreshnessHorizonRef` whose `tick_end` is always ≥ current evaluation window end; `horizon_hash` binds to broker state.
+  The broker also maintains a `RevocationFrontierSnapshot { current: true }` with a non-zero `frontier_hash`.
+  In local-only mode these hashes can be commitments to "single-node trivially current" state, but they MUST still be non-zero and replay-stable.
+* **TP-EIO29-003 convergence horizon:** broker emits `ConvergenceHorizonRef { resolved: true }` plus a single "local authority set" hash and a `ConvergenceReceipt { converged: true }`.
+  This exercises the predicate without requiring multi-node networking.
+
+Workers MUST:
+* build `QueueAdmissionRequest` from broker-issued state + job cost,
+* build `QueueSchedulerState` from observed queue snapshot,
+* call `evaluate_queue_admission(...)`,
+* deny/quarantine if verdict != Allow,
+* write the decision trace into receipts (§5.3.4).
 
 This is the networkless seam: a future distributed scheduler can transport `FacJobSpecV1` objects and still use the same lane/job semantics.
 
@@ -478,11 +603,19 @@ Required layout:
 * `private/fac/lanes/<lane_id>/logs/`
 * `private/fac/lanes/<lane_id>/logs/<job_id>/` (per-job log namespace; required once queueing/concurrency exists)
 * `private/fac/queue/{pending,claimed,done,cancelled}/`
+* `private/fac/queue/{denied,quarantine}/` (new; §4.5)
 * `private/fac/receipts/` (content-addressed receipt objects; see §5.3)
 * `private/fac/locks/` (lane locks, queue locks, optional global locks)
 * `private/fac/evidence/` (**legacy**; existing global per-gate logs; will be deprecated in favor of per-lane/per-job logs)
 * `private/fac/repo_mirror/` (bare mirrors; §4.2.1)
 * `private/fac/cargo_home/` (FAC-managed `CARGO_HOME`; §5.4 / §10.4)
+* `private/fac/broker/` (new; broker-admitted roots + RFC-0029 horizons; §0.5, §4.5.1)
+  * `private/fac/broker/admitted_policy_root.v1` (non-secret; digest only)
+  * `private/fac/broker/admitted_canonicalizer_tuple.v1` (non-secret; digest only)
+  * `private/fac/broker/time_envelopes/` (short-lived envelopes; optional cache)
+  * `private/fac/broker/horizons/` (freshness + convergence refs; replay-stable commitments)
+* `private/fac/scheduler/` (new; RFC-0029 scheduler snapshot persistence)
+  * `private/fac/scheduler/state.v1.json` (serialized queue lane backlog + max_wait_ticks)
 
 Legacy compatibility:
 * `private/fac/gate_cache_v2/` remains during migration; new receipts MUST record enough to migrate away from it later.
@@ -546,8 +679,27 @@ Rules:
 * MUST fail closed if nextest is missing
 * MUST enforce the 240s/24G test policy (no override without explicit unsafe flag)
 
-Queueing:
-* `apm2 fac gates --queued` MUST translate into `FacJobSpecV1(kind="gates")` and enqueue, then optionally wait for completion (`--wait` default true).
+Default execution mode change (required):
+* `apm2 fac gates` MUST default to **brokered queue execution**:
+  * create `FacJobSpecV1(kind="gates")`,
+  * obtain an RFC-0028 channel context token from the broker for this job spec digest,
+  * enqueue to `queue/pending/`,
+  * and wait for completion by default.
+* `apm2 fac gates --direct` is allowed only as **explicit unsafe mode** and MUST:
+  * disable gate-cache read/write,
+  * emit a receipt marked `unsafe_direct: true`,
+  * still acquire a lane lease and enforce containment, but MUST NOT be considered an authoritative "acceptance fact".
+
+#### 5.2.7 `apm2 fac worker` (new; mandatory for default mode)
+
+Consumes the local queue and executes jobs in lanes.
+
+* `apm2 fac worker --once` runs a single claim/execute cycle then exits.
+* `apm2 fac worker` without `--once` runs continuously (systemd-managed recommended).
+* Worker MUST implement RFC-0028 authorization checks and RFC-0029 admission checks (§4.5).
+* Worker MUST write receipts for:
+  * deny/quarantine outcomes (authorization/admission failures),
+  * and execution outcomes (success/failure).
 
 ### 5.3 JSON schemas (required; with hashing rules + storage locations)
 
@@ -612,6 +764,10 @@ It MUST include (at minimum):
 * log/output caps: `max_gate_log_bytes`, `max_gate_capture_bytes`
 * safe deletion root allowlist (GC and resets)
 * provenance policy (mirror_commit vs patch_injection admission rules)
+* **economics profile binding (RFC-0029):**
+  * `economics_profile_hash` (content-addressed hash of an `EconomicsProfile` in CAS)
+  * `default_risk_tier` (e.g., `tier1`)
+  * `default_boundary_intent_class` (for FAC actuation this is normally `actuate`)
 
 Required environment policy fields (normative minimum):
 * `env_clear_by_default: bool` (default true for bounded execution)
@@ -628,6 +784,13 @@ If `env_clear_by_default` is true, implementations MUST ensure required runtime 
 Any change to `FacPolicyV1` MUST change `FacPolicyHash` (fail-closed).
 `FacPolicyHash` MUST be computed using the same `b3-256:` hash ref rules as other substrate objects.
 
+Economics admission (normative):
+* Before executing a job, the worker MUST run `apm2_core::economics::BudgetAdmissionEvaluator` with:
+  * `profile_hash = FacPolicyV1.economics_profile_hash`,
+  * `(tier, intent_class)` resolved from job kind (defaults from policy unless explicitly escalated),
+  * `ObservedUsage` constructed from the job's declared budgets (timeouts, log caps, expected I/O caps).
+* Any unresolved/missing profile state MUST deny (fail-closed), by design of RFC-0029.
+
 #### 5.3.2 `LaneLeaseV1`
 
 ```jsonc
@@ -638,8 +801,8 @@ Any change to `FacPolicyV1` MUST change `FacPolicyHash` (fail-closed).
   "pid": 12345,
   "state": "RUNNING",
   "started_at": "2026-02-12T03:15:00Z",
-  "lane_profile_hash": "blake3:…",
-  "toolchain_fingerprint": "blake3:…"
+  "lane_profile_hash": "b3-256:…",
+  "toolchain_fingerprint": "b3-256:…"
 }
 ```
 
@@ -652,14 +815,22 @@ Storage:
 {
   "schema": "apm2.fac.job_spec.v1",
   "job_id": "job_20260212T031500Z_…",
+  "job_spec_digest": "b3-256:…", // REQUIRED: digest of canonical JSON with `actuation.channel_context_token` = null
   "kind": "gates",
+  "queue_lane": "bulk",
   "priority": 50,
   "enqueue_time": "2026-02-12T03:15:00Z",
+  "actuation": {
+    "lease_id": "L-FAC-LOCAL",              // REQUIRED; token binding input
+    "request_id": "b3-256:…",              // REQUIRED; MUST equal job_spec_digest
+    "channel_context_token": "BASE64…",    // REQUIRED in default mode; RFC-0028 token
+    "decoded_source": "typed_tool_intent"  // OPTIONAL hint; worker ignores unless token verifies
+  },
   "source": {
     "kind": "mirror_commit", // mirror_commit | patch_injection
     "repo_id": "guardian-intelligence/apm2", // stable logical id, not a filesystem path
     "head_sha": "012345…",
-    "patch": null // if kind=patch_injection: { "format":"git_diff_v1", "digest":"blake3:…", "bytes_cas":"blake3:…" }
+    "patch": null // if kind=patch_injection: { "format":"git_diff_v1", "digest":"b3-256:…", "bytes_cas":"b3-256:…" }
   },
   "lane_requirements": {
     "lane_profile_hash": null
@@ -671,6 +842,12 @@ Storage:
   }
 }
 ```
+
+`job_spec_digest` computation rules (normative):
+* Serialize the job spec to canonical JSON (using `apm2_core::determinism::canonicalize_json`).
+* Set `actuation.channel_context_token = null` before hashing (so the digest is stable across token rotations).
+* Hash bytes as `b3-256(schema_id || "\0" || canonical_json_bytes)` (same domain separation as §5.3).
+* `actuation.request_id` MUST equal `job_spec_digest`. Workers MUST decode the token using this request id.
 
 Dirty-tree rule (reframed to match FESv1 provenance):
 * `patch_injection` is the **only** way to run dirty content while preserving fail-closed cache semantics.
@@ -684,27 +861,44 @@ This amendment allows two storage backends (choose one; do not invent a third):
 
 If `bytes_backend` is omitted or unknown, gate-cache reuse MUST be disabled (fail-closed).
 
+Queue lane rule:
+* `queue_lane` MUST be one of the RFC-0029 `QueueLane` strings (`snake_case`).
+* v1 producers SHOULD default:
+  * `bulk` for `gates` and `warm` jobs
+  * `control` for `gc` / lane reset / maintenance
+  * `stop_revoke` for cancellation / kill / revoke operations
+
 #### 5.3.4 `FacJobReceiptV1`
 
 ```jsonc
 {
   "schema": "apm2.fac.job_receipt.v1",
   "job_id": "job_…",
+  "job_spec_digest": "b3-256:…",
   "kind": "gates",
+  "queue_lane": "bulk",
   "lane_id": "lane-00",
-  "lane_profile_hash": "blake3:…",
-  "toolchain_fingerprint": "blake3:…",
-  "fac_policy_hash": "sha256:…",
+  "lane_profile_hash": "b3-256:…",
+  "toolchain_fingerprint": "b3-256:…",
+  "fac_policy_hash": "b3-256:…",
+  "eio29_queue_admission": { /* REQUIRED: serialized apm2_core::economics::QueueAdmissionDecision */ },
+  "eio29_budget_admission": { /* REQUIRED when job kind implies external effect: serialized apm2_core::economics::BudgetAdmissionDecision */ },
+  "rfc0028_channel_boundary": { /* REQUIRED: reconstructed ChannelBoundaryCheck (post-decode), for receipt audit */ },
   "started_at": "…",
   "finished_at": "…",
   "status": "SUCCESS",
   "exit_code": 0,
   "artifacts": {
-    "log_bundle_hash": "blake3:…",
-    "gate_cache_keys": ["sha256:…"]
+    "log_bundle_hash": "b3-256:…",
+    "gate_cache_keys": ["b3-256:…"]
   }
 }
 ```
+
+Notes (normative):
+* `eio29_queue_admission` is REQUIRED and MUST be compatible with `apm2_core::economics::QueueAdmissionDecision`.
+* `eio29_budget_admission` is REQUIRED for any job that executes commands (gates/warm/gc/reset), and MUST be compatible with `apm2_core::economics::BudgetAdmissionDecision`.
+* `rfc0028_channel_boundary` is REQUIRED and MUST be the decoded+validated `ChannelBoundaryCheck` used to authorize actuation.
 
 #### 5.3.5 `WarmReceiptV1`
 
@@ -712,8 +906,8 @@ If `bytes_backend` is omitted or unknown, gate-cache reuse MUST be disabled (fai
 {
   "schema": "apm2.fac.warm_receipt.v1",
   "lane_id": "lane-00",
-  "lane_profile_hash": "blake3:…",
-  "toolchain_fingerprint": "blake3:…",
+  "lane_profile_hash": "b3-256:…",
+  "toolchain_fingerprint": "b3-256:…",
   "started_at": "…",
   "finished_at": "…",
   "steps": [
@@ -813,10 +1007,14 @@ Deliverables:
 * remove cargo-test fallback for FAC tests; nextest required (fail fast if missing)
 * add dirty-tree protection (disable cache or incorporate diff digest)
 * add disk preflight checks (warn-only at first; no GC yet)
+* integrate RFC-0028 + RFC-0029 in "audit-only" mode:
+  * generate and record RFC-0028 channel boundary checks in receipts (but do not deny yet),
+  * generate and record RFC-0029 admission traces in receipts (but do not deny yet).
 
 Acceptance criteria:
 * no regressions to existing `apm2 fac gates` UX on a healthy machine
 * cache keys change when `.cargo/config.toml` changes
+* receipts include RFC-0028 + RFC-0029 traces for every run (even if not enforced yet)
 
 Rollback:
 * single PR revert (no persistent state changes required)
@@ -829,11 +1027,17 @@ Deliverables:
 * implement per-lane `CARGO_TARGET_DIR` under lane target namespace (**this is the target pool; no separate target_pool root**)
 * implement `apm2 fac lane status`
 * implement `apm2 fac gates` acquiring a lane lease internally
+* introduce broker + worker:
+  * broker issues RFC-0028 channel context tokens
+  * broker issues RFC-0029 time authority envelopes + horizon refs
+  * worker validates RFC-0028 + RFC-0029 and executes jobs
 
 Acceptance criteria:
 * three concurrent `apm2 fac gates` invocations never exceed lane count
 * target reuse collapses disk usage vs many worktrees (qualitative)
 * evidence logs are per-lane/per-job and do not clobber across concurrent runs
+* in default mode, workers deny/quarantine any job lacking a valid RFC-0028 token
+* in default mode, workers deny any job with RFC-0029 verdict != Allow (except stop_revoke emergency semantics)
 
 Rollback:
 * `APM2_FAC_LANES=0` (or `--legacy`) runs old path; lane directories remain but are inert
@@ -854,7 +1058,7 @@ Acceptance criteria:
 Rollback:
 * disable queue consumption; run direct lane acquisition mode
 
-### Phase 3 — Assimilate second VPS (Nix + flakes) with minimal interop seam
+### Phase 3 — Add a second VPS with flake-pinned toolchain parity (Ubuntu baseline; NixOS optional only on greenfield)
 
 Deliverables:
 * "assimilate node" playbook:
@@ -895,18 +1099,29 @@ An evidence bundle is a content-addressed set with a manifest:
 
 * each blob is addressed by `b3-256:<hex>`
 * manifest schema (proposed): `apm2.fac.evidence_bundle_manifest.v1`
-* bundle id = blake3(canonical(manifest))
+* bundle id = b3-256(canonical(manifest))
 
 ### 8.3 Transport-agnostic envelope
 
-Define an envelope format that can be shipped later over any transport:
+Define an envelope format that can be shipped later over any transport.
+**Normative:** even in local-only mode, any "export/import" of evidence bundles across process boundaries MUST use this envelope and MUST validate RFC-0028 + RFC-0029 fields.
 
 * `schema: apm2.fac.evidence_bundle_envelope.v1`
 * `bundle_id`
+* `origin_node_fingerprint` (same semantics as `LaneProfileV1.node_fingerprint`)
+* `boundary_id` (stable string boundary identifier; MUST be consistent with RFC-0029 `HtfEvaluationWindow.boundary_id` when HTF is used)
 * `compression` (none|zstd)
 * `chunks[]` (each chunk references a blob hash)
+* OPTIONAL forward-compat fields (reserved for RFC-0028/RFC-0029 integration):
+  * `channel_boundary_check` (serialized `apm2_core::channel::ChannelBoundaryCheck`)  // REQUIRED for any import/export operation
+  * `pcac_chain_hash` (content-addressed reference to the PCAC/AJC chain used to authorize the execution)
+  * `economics_receipts[]` (content-addressed refs to RFC-0029 budget/admission receipts for transport/backpressure decisions)
 
 No networking code is defined here; only the object contract.
+
+Normative enforcement:
+* `apm2 fac bundle export` MUST emit `channel_boundary_check` and MUST bind it to the active `FacPolicyHash`.
+* `apm2 fac bundle import` MUST fail-closed unless `validate_channel_boundary(channel_boundary_check)` passes and embedded economics receipts validate.
 
 ### 8.4 Receipt stream merge (CRDT-ish)
 
@@ -919,12 +1134,19 @@ Receipt streams MUST be mergeable by set union:
 
 ### 8.5 Authentication boundary (future PCAC/AJC seam)
 
-Future distributed mode MUST authenticate:
+Future distributed mode MUST authenticate + authorize **at the boundary**:
 
 * which node produced the bundle (node identity)
 * which capabilities authorized job execution (PCAC/AJC chain)
+* which channel/source produced the envelope (typed intent vs free-form), using RFC-0028 channel boundary enforcement
 
-In v1 (local-only), these fields may be present but unsigned; v2 adds signatures without changing schema semantics.
+Normative integration requirements:
+
+* Any envelope ingested from outside the local host MUST be treated as an **external I/O actuation input** and MUST pass `apm2_core::channel::validate_channel_boundary(...)` checks (fail-closed).
+* `channel_boundary_check` (if present) MUST be validated (including `channel_source_witness` via `verify_channel_source_witness`) and MUST bind the same policy digest used by the receiver.
+* RFC-0029 economics receipts (if present) MUST be validated before being used to relax backpressure limits; unknown receipts MUST be ignored (fail-closed).
+
+In v1 (local-only), these fields may be present but unsigned; v2 adds signatures and broker verification without changing schema semantics.
 
 ---
 
@@ -976,15 +1198,15 @@ Key: **do not override `test`**. Provide a new alias.
 
 ## 10. Build cache substrate: target pool (primary), sccache (optional)
 
-### 10.1 Primary accelerator: slot-scoped `CARGO_TARGET_DIR` ("target pool")
+### 10.1 Primary accelerator: lane-scoped `CARGO_TARGET_DIR` ("target pool")
 
 Why this exists:
 
 * The dominant real-world cost in your described regime is **duplicated `target/` trees** across worktrees.
 * RFC-0007 rejected a global shared `CARGO_TARGET_DIR` because cargo uses a target-dir lock that prevents parallel builds.
-* This amendment introduces a global concurrency governor (compute slots). **Once you have slots, you can have "N target dirs"**:
-  * each slot has its own target dir
-  * at most one heavy build runs per slot
+* This amendment introduces a global concurrency governor (lane leases). **Once you have lanes, you can have "N target dirs"**:
+  * each lane has its own target dir
+  * at most one heavy build runs per lane
   * parallelism is preserved up to N without cargo lock contention
 
 Policy:
@@ -1173,20 +1395,21 @@ Warm must not stampede, but **do not serialize warm globally**: global warm lock
 
 Instead:
 
-* warm acquires a compute slot; that is the concurrency control.
+* warm acquires a lane lease; that is the concurrency control.
 * per-slot target pool already eliminates "13 worktrees compiling 13 times" — the stampede surface is drastically reduced.
 
 Behavior:
 
-* If no compute slots are available:
+* If no lanes are available:
   * default: wait (bounded by a reasonable max, or with `--no-wait` to fail fast)
 
 ### 11.5 Warm receipts
 
 Warm must write a durable receipt:
 
-* Path: `$APM2_HOME/private/fac/maintenance/warm/<ts>_<sha256>.json`
+* Content-addressed receipt path: `$APM2_HOME/private/fac/receipts/<b3-256-hex>.json`
 * Schema: `apm2.fac.warm_receipt.v1`
+* Optional human index: `$APM2_HOME/private/fac/maintenance/warm/<ts>_<lane_id>.ref` containing the receipt digest (or a symlink to `receipts/<hex>.json`)
 
 Suggested fields:
 
@@ -1288,7 +1511,7 @@ Everything else is eligible for target pruning.
 
 Required amendment: "active" must be defined in terms of the actual global governor, not heuristics.
 
-* A worktree is active iff it is referenced by an active compute-slot lease record (see §13.2.3).
+* A worktree is active iff it is referenced by an active lane lease record (see §4.4 and `LaneLeaseV1`).
 * Heuristics (mtime) may be used as a fallback only when lease metadata is missing.
 
 ### 12.5 Default policy for your current box
@@ -1319,8 +1542,9 @@ Missing detail: enforce on both relevant mounts.
 
 GC writes:
 
-* `$APM2_HOME/private/fac/maintenance/gc/<ts>_<sha256>.json`
+* Content-addressed receipt path: `$APM2_HOME/private/fac/receipts/<b3-256-hex>.json`
 * Schema: `apm2.fac.gc_receipt.v1`
+* Optional human index: `$APM2_HOME/private/fac/maintenance/gc/<ts>.ref` containing the receipt digest (or a symlink to `receipts/<hex>.json`)
 
 Include:
 
@@ -1349,7 +1573,7 @@ All "heavy" FAC operations MUST acquire a lane lease:
 
 ### 13.2 Lane-aware `CARGO_BUILD_JOBS` + `NEXTEST_TEST_THREADS` (Phase 1)
 
-When a process acquires a compute slot, it computes a default `CARGO_BUILD_JOBS`:
+When a process acquires a lane lease, it computes a default `CARGO_BUILD_JOBS`:
 
 Inputs:
 
@@ -1402,6 +1626,9 @@ This is the correct "control surface" for scaling to many nodes and many agents.
 ---
 
 ## 14. Nix integration: environment must be declarative
+
+> **Non-goal:** converting the current primary host to NixOS. The baseline for FESv1 is an existing Debian/Ubuntu VPS with systemd.
+> Nix is used for toolchain pinning (`nix develop`) and optional packaging; NixOS modules are a future convenience, not a requirement.
 
 ### 14.1 flake.nix updates
 
@@ -1562,78 +1789,21 @@ Add a new section (or amendment file) describing:
 
 ## 17. Ticket YAMLs (drop-in proposals)
 
-Below are proposed new tickets using the current ticket schema (`schema_version: "2026-01-29"`). IDs start from `TCK-00503` (next available after existing tickets).
+Below are proposed tickets aligned with the latest amendments (brokered RFC-0028 actuation + mandatory RFC-0029 admission traces, lane-only governor, queue quarantine/denied, receipts-as-ground-truth). All ticket IDs are placeholder numbers; renumber as needed.
 
-Required correction: the original draft omitted a ticket for "mandate nextest everywhere" and conflated sccache with the primary acceleration lever.
-This amendment adds an explicit ticket for nextest mandate and moves "cross-worktree reuse" to the target pool.
-
-### TCK-00503 — Add `apm2 fac warm` command with receipts + compute-slot integration
+### TCK-00510 — FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)
 
 ```yaml
 ticket_meta:
   schema_version: "2026-01-29"
   template_version: "2026-01-29"
   ticket:
-    id: "TCK-00503"
-    title: "Implement `apm2 fac warm` pre-warm command with receipt (compute-slot + target pool)"
+    id: "TCK-00510"
+    title: "FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)"
     status: "OPEN"
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0007"
-    requirements: []
-    evidence_artifacts: []
-  custody:
-    agent_roles: ["AGENT_IMPLEMENTER"]
-    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
-  dependencies:
-    tickets:
-      - ticket_id: "TCK-00506"
-        reason: "Warm must acquire a compute slot and use the target pool; do not implement a second locking scheme."
-  scope:
-    in_scope:
-      - "Add `apm2 fac warm` subcommand routed via crates/apm2-cli/src/commands/fac.rs."
-      - "Acquire a FAC compute slot for warm (reuse compute-slot leasing from TCK-00506)."
-      - "Enable target pool by default (CARGO_TARGET_DIR derived from slot + toolchain fingerprint)."
-      - "Implement warm phases (selectable): cargo fetch --locked; cargo build --workspace --all-targets --all-features --locked; cargo nextest run ... --no-run; optional clippy/doc phases."
-      - "Set CARGO_BUILD_JOBS and NEXTEST_TEST_THREADS from compute-slot policy unless explicitly overridden."
-      - "Write warm receipt under $APM2_HOME/private/fac/maintenance/warm/ with schema apm2.fac.warm_receipt.v1."
-      - "Do NOT add a global warm lock; compute slots are the stampede control."
-    out_of_scope:
-      - "Distributed cache or remote build farm."
-      - "Replacing run_bounded_tests.sh."
-  plan:
-    steps:
-      - "Add FacSubcommand::Warm and WarmArgs in fac.rs and route to fac_review::warm::run_warm."
-      - "Implement warm.rs: phase runner with timings, env injection (target pool + jobs + test threads), receipt writer."
-      - "Add JSON output mode and human output mode."
-      - "Run fmt/clippy/doc/nextest checks."
-  definition_of_done:
-    evidence_ids: []
-    criteria:
-      - "`apm2 fac warm` succeeds on a clean main branch and writes a receipt."
-      - "Warm respects compute-slot capacity (concurrent warm invocations block or fail fast according to flags)."
-      - "Warm increases target-pool artifact reuse: running `apm2 fac gates` immediately after warm is measurably faster than a cold run (qualitative confirmation acceptable initially)."
-  notes:
-    security: |
-      Warm must not read secrets or propagate uncontrolled env into subprocesses beyond
-      an allowlist. Receipt must not include credentials.
-    verification: |
-      Manual: run apm2 fac warm twice; second run should be faster. Confirm that CARGO_TARGET_DIR is under APM2_HOME/private/fac/target_pool.
-```
-
-### TCK-00504 — Attestation surfacing for sccache + include `.cargo/config.toml` in input digests
-
-```yaml
-ticket_meta:
-  schema_version: "2026-01-29"
-  template_version: "2026-01-29"
-  ticket:
-    id: "TCK-00504"
-    title: "Fail-closed attestation: include .cargo/config.toml + rustfmt version; future-proof sccache env"
-    status: "OPEN"
-  binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0007"
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
     requirements: []
     evidence_artifacts: []
   custody:
@@ -1643,98 +1813,232 @@ ticket_meta:
     tickets: []
   scope:
     in_scope:
-      - "Update gate_input_paths to include .cargo/config.toml for cargo-based gates (rustfmt/clippy/doc/test)."
-      - "Add rustfmt --version to environment_facts (environment_digest) to eliminate fmt-gate fail-open across toolchain updates."
-      - "(Future-proof) Update command_digest allowlist to include RUSTC_WRAPPER and SCCACHE_* env vars (harmless when unset)."
-      - "(Optional) Add sccache --version to environment_facts (record if present; do not make mandatory unless a FAC profile requires it)."
-      - "Add/adjust tests to ensure digests change when cargo config changes and when rustfmt version changes (fail-closed)."
+      - "Implement a local broker authority service (systemd-managed Rust) responsible for FAC actuation authorization and economics/time authority."
+      - "Expose an API to issue RFC-0028 ChannelContextToken bound to `job_spec_digest` + lease_id."
+      - "Expose an API to issue RFC-0029 `TimeAuthorityEnvelopeV1` for boundary_id + evaluation window (TP-EIO29-001)."
+      - "Expose APIs to serve TP-EIO29-002 freshness horizon refs and revocation frontier snapshot (resolved/current)."
+      - "Expose APIs to serve TP-EIO29-003 convergence horizon refs and convergence receipts (resolved/converged) for local-only mode."
+      - "Publish a verifying key for envelope signature verification to workers (no `NoOpVerifier` in default mode)."
+      - "Persist broker non-secret state under `$APM2_HOME/private/fac/broker/**` per RFC."
     out_of_scope:
-      - "Expanding environment_digest to every tool on the machine."
+      - "Multi-node networking or remote trust distribution."
+      - "PCAC/AJC redesign."
   plan:
     steps:
-      - "Modify allowlisted env array in command_digest()."
-      - "Modify gate_input_paths() to include .cargo/config.toml."
-      - "Extend environment_facts() to include sccache version."
-      - "Run existing attestation tests and update expected digests accordingly."
+      - "Define broker API surface (local-only transport: unix socket or loopback HTTP; implementation detail)."
+      - "Implement RFC-0028 token issuance using the existing daemon signing key."
+      - "Implement RFC-0029 envelope/horizon issuance using HolonicClock (or broker-owned monotonic authority) and real signature verification support."
+      - "Add broker state persistence for horizon refs and admitted policy digests."
+      - "Provide CLI diagnostics: `apm2 fac broker status` (optional) and structured logs."
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "Attestation digest changes when RUSTC_WRAPPER changes."
-      - "Attestation digest changes when .cargo/config.toml changes."
-      - "Attestation digest changes when rustfmt version changes."
-      - "No gate cache reuse occurs across these changes."
-
-5. Concurrency + log safety checks (new; mandatory):
-   * Run two simultaneous `apm2 fac gates` runs and confirm:
-     * logs do not clobber each other (distinct per-lane/per-job paths),
-     * log caps are enforced without deadlocking child processes,
-     * evidence digests (when recorded) refer to the correct job's logs.
+      - "A worker can obtain a broker-issued ChannelContextToken and successfully decode+validate it via `decode_channel_context_token` + `validate_channel_boundary`."
+      - "A worker can obtain a broker-issued `TimeAuthorityEnvelopeV1` and verify signatures with a real verifier."
+      - "Broker serves TP002 and TP003 refs/receipts with non-zero, replay-stable hashes in local-only mode."
+  notes:
+    security: |
+      Broker must be the only authority issuing actuation tokens and economics envelopes in default mode.
+      Key material must never be stored under `$APM2_HOME/private/fac/**` in plaintext.
+    verification: |
+      Integration test: request token for a known digest; validate; request envelope; verify signature; request horizons; verify non-zero commitments.
 ```
 
-### TCK-00505 — Implement `apm2 fac gc` with enforced disk preflight (worktree targets + target pool + caches)
+### TCK-00511 — FAC Worker: queue consumer with RFC-0028 authorization + RFC-0029 admission gating (default-mode executor)
 
 ```yaml
 ticket_meta:
   schema_version: "2026-01-29"
   template_version: "2026-01-29"
   ticket:
-    id: "TCK-00505"
-    title: "Implement `apm2 fac gc` with enforced disk preflight (worktree targets + target pool + caches)"
+    id: "TCK-00511"
+    title: "FAC Worker: queue consumer with RFC-0028 authorization + RFC-0029 admission gating (default-mode executor)"
     status: "OPEN"
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0007"
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
     requirements: []
     evidence_artifacts: []
   custody:
     agent_roles: ["AGENT_IMPLEMENTER"]
     responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
   dependencies:
-    tickets: []
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Worker requires broker-issued RFC-0028 tokens and RFC-0029 envelopes/horizons."
+      - ticket_id: "TCK-00515"
+        reason: "Worker must acquire lane leases and execute within lanes."
   scope:
     in_scope:
-      - "Add `apm2 fac gc` subcommand producing a deterministic plan and optional enforcement."
-      - "Implement disk preflight helper (min-free) used by gates/warm/pipeline to auto-invoke gc when below threshold."
-      - "Enumerate git worktrees and delete target/ dirs for cold worktrees (policy: keep hot N, TTL days)."
-      - "If target pool is enabled: delete target-pool slot dirs that are not currently leased (LRU policy) when disk is still below min-free after pruning cold worktrees."
-      - "(Optional) If sccache is enabled: delete SCCACHE_DIR as a last resort (do not rely on non-existent `sccache --trim`)."
-      - "Write gc receipt under $APM2_HOME/private/fac/maintenance/gc/ with schema apm2.fac.gc_receipt.v1."
-      - "Support --dry-run and --json."
+      - "Add `apm2 fac worker` command (`--once` and continuous modes)."
+      - "Scan pending queue; treat queue files as untrusted external input."
+      - "Validate job spec bounded-deserialization + `job_spec_digest` correctness."
+      - "RFC-0028: decode+validate ChannelContextToken before claim; deny/quarantine on failure."
+      - "RFC-0029: compute QueueAdmissionDecision before claim using broker-issued TP001/002/003 state; deny on non-Allow."
+      - "Atomic claim via rename pending→claimed."
+      - "Acquire lane lease, execute job under containment, write authoritative receipts."
+      - "Write denial/quarantine receipts for failed validations (with reason codes)."
     out_of_scope:
-      - "Deleting worktrees or branches."
-      - "Backing up state to the headscale peer (separate ticket)."
+      - "Distributed routing."
   plan:
     steps:
-      - "Define GC policy defaults (min-free, ttl-days, keep-hot-worktrees)."
-      - "Implement worktree enumeration and target pruning."
-      - "Implement target-pool pruning logic using compute-slot lease metadata (do not delete leased slots)."
-      - "Implement receipt writer + dry-run mode."
-      - "Add a basic integration test for plan generation (unit test style)."
+      - "Implement queue scanning + deterministic ordering."
+      - "Implement RFC-0028 pre-claim validation using broker token decode."
+      - "Implement RFC-0029 admission path: build request/state, call `evaluate_queue_admission`, persist trace."
+      - "Implement claimed execution path + receipt emission."
+      - "Implement systemd unit recommendation / sample unit for long-running worker."
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "`apm2 fac gc --dry-run` prints a coherent plan without side effects."
-      - "`apm2 fac gc` reclaims space by deleting cold worktree targets."
-      - "Receipt is written and includes bytes freed."
+      - "Worker denies jobs without valid RFC-0028 token (moves to quarantine/denied) and emits denial receipts."
+      - "Worker produces RFC-0029 admission traces for every attempted job and denies non-Allow."
+      - "Worker never double-executes a job under concurrent workers."
   notes:
     security: |
-      GC must never delete identity material. Only delete explicitly permitted cache paths.
-      MUST protect against symlink traversal: only delete canonical paths under allowed roots, and refuse if any path component is a symlink.
+      Worker must not accept raw ChannelBoundaryCheck JSON. Authorization must come from token decode.
+      Queue is attacker-writable; all reads must be bounded and fail-closed.
 ```
 
-### TCK-00506 — Lane leasing + lane-scoped target pool (cap concurrency, reuse builds)
+### TCK-00512 — Job spec hardening: add `job_spec_digest` + `actuation` block (RFC-0028 binding) to FacJobSpecV1
 
 ```yaml
 ticket_meta:
   schema_version: "2026-01-29"
   template_version: "2026-01-29"
   ticket:
-    id: "TCK-00506"
-    title: "Add FAC lane leasing + lane-scoped target pool (cap concurrency, reuse builds across worktrees)"
+    id: "TCK-00512"
+    title: "Job spec hardening: add `job_spec_digest` + `actuation` block (RFC-0028 binding) to FacJobSpecV1"
     status: "OPEN"
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0007"
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Define and implement `job_spec_digest` computation (canonical JSON; token field null; schema_id domain separation)."
+      - "Extend `FacJobSpecV1` schema with `actuation{ lease_id, request_id, channel_context_token }`."
+      - "Update queue writer paths (`fac enqueue`, `fac gates`, etc.) to populate digest + request_id."
+      - "Update worker parser to validate digest and request_id match."
+      - "Update receipts to include `job_spec_digest`."
+    out_of_scope:
+      - "Any PCAC/AJC redesign."
+  plan:
+    steps:
+      - "Add schema structs with `deny_unknown_fields`."
+      - "Add canonical JSON hashing helper for job specs."
+      - "Wire into enqueue path and worker validation."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A tampered job spec file is detected (digest mismatch) and denied/quarantined."
+      - "Token request_id mismatch is detected and denied."
+```
+
+### TCK-00513 — Receipt hardening: require RFC-0028 boundary + RFC-0029 queue/budget decisions in FacJobReceiptV1
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00513"
+    title: "Receipt hardening: require RFC-0028 boundary + RFC-0029 queue/budget decisions in FacJobReceiptV1"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00511"
+        reason: "Worker is responsible for generating authoritative receipts."
+  scope:
+    in_scope:
+      - "Extend `FacJobReceiptV1` to include `job_spec_digest`."
+      - "Add required fields: `rfc0028_channel_boundary`, `eio29_queue_admission`, `eio29_budget_admission` (as applicable)."
+      - "Standardize denial receipts (authorization denied, economics denied, malformed input, etc.)."
+      - "Persist receipts content-addressed under `$APM2_HOME/private/fac/receipts/<hex>.json`."
+      - "Ensure receipts are emitted for BOTH deny/quarantine outcomes and execution outcomes."
+    out_of_scope:
+      - "Receipt stream merge tooling (separate ticket)."
+  plan:
+    steps:
+      - "Define receipt schema extensions + serialization rules."
+      - "Update worker to always emit these artifacts."
+      - "Add minimal tests: receipt includes required fields in default mode."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No successful execution receipt exists without RFC-0028 boundary + RFC-0029 admission artifacts."
+      - "Denied jobs produce denial receipts with stable reason codes."
+```
+
+### TCK-00514 — Queue hygiene: add denied/quarantine dirs + denial/quarantine receipts + retention policy
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00514"
+    title: "Queue hygiene: add denied/quarantine dirs + denial/quarantine receipts + retention policy"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Denial/quarantine receipts schema must exist."
+  scope:
+    in_scope:
+      - "Add queue layout: `queue/denied/` and `queue/quarantine/`."
+      - "Implement deterministic move rules for malformed/tampered jobs vs policy-denied jobs."
+      - "Write denial/quarantine receipts and link them to moved job files."
+      - "Define retention policy: quarantined jobs preserved until GC prunes by TTL/quota (never silently deleted)."
+      - "Ensure `apm2 fac gc` respects quarantine retention rules and emits receipts for prunes."
+    out_of_scope:
+      - "Remote forensics transport."
+  plan:
+    steps:
+      - "Implement directory creation and atomic rename targets."
+      - "Implement reason sidecar file format (e.g., `<job_id>.reason.json`) or embed in denial receipt."
+      - "Implement basic quota (max bytes) and TTL policy for quarantine."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Poison jobs do not loop forever; they are moved aside and a denial receipt is emitted."
+      - "Quarantine is not deleted by routine cleanup; only by explicit GC policy with receipts."
+```
+
+### TCK-00515 — Lanes v1: lane directories + LaneProfileV1 + LaneLeaseV1 + `apm2 fac lane status`
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00515"
+    title: "Lanes v1: lane directories + LaneProfileV1 + LaneLeaseV1 + `apm2 fac lane status`"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
     requirements: []
     evidence_artifacts: []
   custody:
@@ -1744,76 +2048,3459 @@ ticket_meta:
     tickets: []
   scope:
     in_scope:
-      - "Introduce file-lock-based lane leases under $APM2_HOME/private/fac/locks/lanes/<lane_id>.lock."
-      - "Acquire a lane for apm2 fac warm, apm2 fac gates (full mode), and pipeline evidence execution."
-      - "Use slot count default derived from memory policy (96GB -> 3 slots)."
-      - "Compute conservative default CARGO_BUILD_JOBS based on cpu_count / slots."
-      - "Set NEXTEST_TEST_THREADS based on cpu_count / slots to prevent runtime oversubscription."
-      - "Implement slot metadata sidecar ($APM2_HOME/private/fac/locks/compute_slot_<i>.json) for GC safety + debugging."
-      - "Implement target pool: on lane acquisition set CARGO_TARGET_DIR=$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint> (override any ambient CARGO_TARGET_DIR)."
+      - "Create lane directory layout under `$APM2_HOME/private/fac/lanes/<lane_id>/{workspace,target,logs}`."
+      - "Implement `LaneProfileV1` persistence per lane and hash computation."
+      - "Implement lock+lease record mechanism (`locks/lanes/<lane_id>.lock`, `lanes/<lane_id>/lease.v1.json`)."
+      - "Implement stale lease detection rules (pid alive vs dead)."
+      - "Add `apm2 fac lane status` (human + JSON)."
     out_of_scope:
-      - "Distributed leasing across nodes (future holonic lease integration)."
+      - "Distributed lanes."
   plan:
     steps:
-      - "Reuse the existing slot-leasing implementation pattern from fac_review/model_pool.rs (RAII + jitter) to implement compute slots."
-      - "Implement toolchain fingerprint derivation (rustc -Vv hash) for target pool namespace."
-      - "Integrate slot acquisition + env setting into gates/warm/pipeline."
-      - "Expose slot count override via env var (FAC_MAX_CONCURRENT_SLOTS)."
+      - "Implement lane ID allocation (static default set; configurable lane_count)."
+      - "Implement lock acquisition using existing proven pattern (RAII + jitter)."
+      - "Implement lease record updates and crash recovery semantics."
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "Concurrent invocations of warm/gates do not exceed configured slot count."
-      - "Slots release on process exit even on failure."
-      - "CARGO_TARGET_DIR is set by FAC to the slot target pool for all cargo-based gates (including bounded tests via env allowlist propagation)."
+      - "At most one job executes in a lane at a time under concurrency."
+      - "Lane status reports correct state derived from lock + lease record + last receipt."
 ```
 
-### TCK-00507 — Mandate nextest for all FAC test execution paths + enforce bounded test caps
+### TCK-00516 — Symlink-safe deletion primitive: `safe_rmtree_v1` + lane reset command
 
 ```yaml
 ticket_meta:
   schema_version: "2026-01-29"
   template_version: "2026-01-29"
   ticket:
-    id: "TCK-00507"
-    title: "Mandate nextest for all FAC test execution paths + enforce bounded test caps"
+    id: "TCK-00516"
+    title: "Symlink-safe deletion primitive: `safe_rmtree_v1` + lane reset command"
     status: "OPEN"
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0007"
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
     requirements: []
     evidence_artifacts: []
   custody:
-    agent_roles:
-      - "AGENT_IMPLEMENTER"
-    responsibility_domains:
-      - "DOMAIN_RUNTIME"
-      - "DOMAIN_SECURITY"
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Lane reset targets lane roots and uses lane metadata."
+  scope:
+    in_scope:
+      - "Implement `safe_rmtree_v1(root, allowed_parent)` using fd-relative walking (preferred) or conservative refuse-on-ambiguity."
+      - "Refuse symlink traversal; refuse unexpected file types; refuse crossing FS boundaries unless allowed."
+      - "Emit `refused_delete` receipts and mark lane CORRUPT on ambiguity."
+      - "Implement `apm2 fac lane reset <lane_id>` with `--force` that killstops cgroup then deletes."
+    out_of_scope:
+      - "Generic filesystem library publication."
+  plan:
+    steps:
+      - "Implement primitive + unit tests (symlink tests, TOCTOU resilience smoke tests)."
+      - "Wire into lane reset and GC codepaths."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Deletion refuses if a symlink is encountered along the path."
+      - "Lane reset cannot delete outside allowed parent even if attacker races path components."
+```
+
+### TCK-00517 — Repo substrate: bare mirror + lane checkouts + patch injection provenance (eliminate pipeline SHA drift)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00517"
+    title: "Repo substrate: bare mirror + lane checkouts + patch injection provenance (eliminate pipeline SHA drift)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Lane workspaces must be created/reset from mirror."
+      - ticket_id: "TCK-00516"
+        reason: "Repo reset/clean operations must not risk rmtree disasters."
+  scope:
+    in_scope:
+      - "Implement node-local bare mirror under `$APM2_HOME/private/fac/repo_mirror/<repo_id>.git`."
+      - "Lane workspace checkouts MUST be sourced from mirror, not caller worktree."
+      - "Implement source kinds: `mirror_commit` and `patch_injection`."
+      - "Define patch bytes backend (fac_blobs_v1 or existing CAS) and bind patch digest into attestation."
+      - "Ensure pipeline-style execution cannot run on drifting/dirty workspace without explicit patch injection."
+    out_of_scope:
+      - "Remote mirroring."
+  plan:
+    steps:
+      - "Implement mirror bootstrap/update logic."
+      - "Implement lane workspace reset to SHA + clean."
+      - "Implement patch application + digest binding."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A job targeting SHA always executes on that SHA in lane workspace."
+      - "Dirty content execution requires patch injection and changes cache/attestation material."
+```
+
+### TCK-00518 — Default-mode gates: enqueue+wait; add `--direct` unsafe; integrate with worker + broker
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00518"
+    title: "Default-mode gates: enqueue+wait; add `--direct` unsafe; integrate with worker + broker"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Need broker to issue actuation tokens."
+      - ticket_id: "TCK-00511"
+        reason: "Need worker to consume queue."
+      - ticket_id: "TCK-00512"
+        reason: "Need job spec digest + actuation schema."
+  scope:
+    in_scope:
+      - "`apm2 fac gates` creates job spec, obtains token, enqueues, and waits by default."
+      - "Implement `apm2 fac gates --direct` as explicit unsafe mode that disables cache read/write and marks receipt `unsafe_direct:true`."
+      - "Implement `apm2 fac enqueue` paths to request tokens from broker."
+      - "Implement wait-for-completion using receipt presence (not process state)."
+    out_of_scope:
+      - "Distributed queue transport."
+  plan:
+    steps:
+      - "Refactor gates entrypoint to produce job specs rather than running gates inline."
+      - "Add waiter that watches done/receipt stream with bounded polling/backoff."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Default `apm2 fac gates` path exercises broker token issuance, worker claim, RFC-0029 admission, lane lease execution, and receipt emission."
+      - "Direct mode produces receipts but never writes gate cache."
+```
+
+### TCK-00519 — Nextest mandate: remove cargo-test fallbacks across all call paths; enforce caps; propagate env into bounded runner
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00519"
+    title: "Nextest mandate: remove cargo-test fallbacks across all call paths; enforce caps; propagate env into bounded runner"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Nextest thread/jobserver policy is lane-derived."
+  scope:
+    in_scope:
+      - "Remove ALL cargo-test fallbacks (pipeline + local) and require explicit `cargo nextest run ...`."
+      - "Fail closed if nextest missing in default mode."
+      - "Enforce test caps: timeout ≤240s and MemoryMax ≤24G unless explicit unsafe override."
+      - "Set `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` based on lane policy."
+      - "Update bounded runner env allowlist to pass: `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`."
+    out_of_scope:
+      - "Nextest config redesign."
+  plan:
+    steps:
+      - "Unify test command construction in one helper used by both pipeline and local gates."
+      - "Update run_bounded_tests.sh allowlist."
+      - "Add regression tests ensuring nextest is used everywhere."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No FAC path executes `cargo test`."
+      - "Bounded test runner receives and respects computed env knobs."
+```
+
+### TCK-00520 — Logs v1: per-(lane,job,gate) log namespaces + streaming/caps + log bundle hashing
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00520"
+    title: "Logs v1: per-(lane,job,gate) log namespaces + streaming/caps + log bundle hashing"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Logs are lane/job scoped."
+      - ticket_id: "TCK-00513"
+        reason: "Receipts must reference log bundle hashes."
+  scope:
+    in_scope:
+      - "Replace global `private/fac/evidence/{gate}.log` with `private/fac/lanes/<lane_id>/logs/<job_id>/<gate>.log`."
+      - "Stream stdout/stderr to files; enforce max bytes; continue draining after cap."
+      - "Record truncation metadata in receipts."
+      - "Build a content-addressed log bundle and record `log_bundle_hash` (b3-256)."
+    out_of_scope:
+      - "Remote log shipping."
+  plan:
+    steps:
+      - "Implement streaming logger with truncation sentinel + byte counters."
+      - "Implement bundle manifest and hashing."
+      - "Update evidence execution to use streaming logger."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "≥3 concurrent runs do not clobber logs."
+      - "Log caps prevent disk blowups and do not deadlock child processes."
+```
+
+### TCK-00521 — FacPolicyV1: implement authoritative policy object + hashing + policy binding for RFC-0028
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00521"
+    title: "FacPolicyV1: implement authoritative policy object + hashing + policy binding for RFC-0028"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker must admit/publish policy digests used for RFC-0028 policy binding."
+  scope:
+    in_scope:
+      - "Implement `FacPolicyV1` struct, canonicalization, and `FacPolicyHash` computation (b3-256)."
+      - "Persist policy to `$APM2_HOME/private/fac/policy/fac_policy.v1.json` (inspection) and record hash in receipts."
+      - "Include env clear/allowlist/denylist prefixes; enforced env_set for CARGO_HOME/CARGO_TARGET_DIR/etc."
+      - "Bind RFC-0028 channel boundary checks to admitted policy digest; deny if mismatch."
+    out_of_scope:
+      - "User-facing policy editor UI."
+  plan:
+    steps:
+      - "Define policy schema + default policy for current host class."
+      - "Integrate policy hash into gate attestation and receipts."
+      - "Broker publishes admitted policy digest; worker validates binding."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Changing policy changes FacPolicyHash and invalidates cache reuse."
+      - "Authorization tokens fail validation if policy digest binding mismatches."
+```
+
+### TCK-00522 — Economics integration: enforce RFC-0029 BudgetAdmissionDecision using EconomicsProfile bound in FacPolicyV1
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00522"
+    title: "Economics integration: enforce RFC-0029 BudgetAdmissionDecision using EconomicsProfile bound in FacPolicyV1"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00521"
+        reason: "Policy must include economics_profile_hash and defaults."
+      - ticket_id: "TCK-00511"
+        reason: "Worker must evaluate budgets before execution."
+  scope:
+    in_scope:
+      - "Add `economics_profile_hash` and default tier/intent class fields to policy."
+      - "Worker evaluates `BudgetAdmissionEvaluator` prior to job execution and records decision in receipt."
+      - "Denies on missing/unknown economics profile state (fail-closed)."
+      - "Define job-kind to (tier,intent_class) mapping: gates/warm/gc/reset are actuation intents."
+    out_of_scope:
+      - "Tuning economics parameters for multi-node throughput."
+  plan:
+    steps:
+      - "Define baseline EconomicsProfile artifact (CAS content-addressed)."
+      - "Wire worker evaluation and receipt emission."
+      - "Add tests: missing profile → deny; valid profile → allow."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Every executed job receipt includes `eio29_budget_admission`."
+      - "Budget admission denies when profile/horizons/envelopes are absent or invalid."
+```
+
+### TCK-00523 — Attestation fail-closed fixes: include .cargo/config.toml + rustfmt version; extend env allowlist (future-proof wrappers)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00523"
+    title: "Attestation fail-closed fixes: include .cargo/config.toml + rustfmt version; extend env allowlist (future-proof wrappers)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
   dependencies:
     tickets: []
   scope:
     in_scope:
-      - "Remove cargo-test fallback for FAC tests across all call paths (pipeline + local gates)."
-      - "Update gate_attestation default test command to nextest (eliminate reliance on callers passing overrides correctly)."
-      - "Enforce bounded test caps in code: reject timeout_seconds > 240 unless explicit unsafe override is set."
-      - "Propagate NEXTEST_TEST_THREADS (and other required env) through run_bounded_tests.sh allowlist."
-      - "Improve error messaging when nextest is missing: fail fast with actionable remediation (nix develop / install cargo-nextest)."
+      - "Add `.cargo/config.toml` to gate input digests for cargo-based gates."
+      - "Add `rustfmt --version` to environment digest."
+      - "Extend command/environment allowlist to include `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `RUSTC_WRAPPER`, `SCCACHE_*`."
+      - "Optionally record `sccache --version` if present."
     out_of_scope:
-      - "Changing nextest config semantics or profiles beyond concurrency defaults."
+      - "Gate cache v2 redesign."
   plan:
     steps:
-      - "Update evidence.rs: build_pipeline_test_command() returns nextest always; remove cargo test fallback."
-      - "Update gates.rs: ensure non-bounded local gates still use nextest; do not silently fall back to cargo test."
-      - "Update gate_attestation.rs: default 'test' gate command uses cargo nextest run ... (matching policy)."
-      - "Update run_bounded_tests.sh allowlist to include NEXTEST_TEST_THREADS (+ any missing env required by new policy)."
-      - "Add regression tests: verify that nextest is used; verify caps enforcement; verify attestation uses nextest command."
+      - "Modify gate_attestation input paths and environment facts."
+      - "Update tests/fixtures expecting digest changes."
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "No FAC test run path uses cargo test."
-      - "Bounded test timeout cannot be increased above 240s without explicit unsafe override."
-      - "Bounded test runner sees NEXTEST_TEST_THREADS when set by FAC policy."
+      - "Changing `.cargo/config.toml` changes attestation digest and prevents cache reuse."
+      - "Changing rustfmt version changes environment digest and prevents cache reuse."
+```
+
+### TCK-00524 — Disk preflight + enforced GC: implement `apm2 fac gc` + auto-GC escalation + GC receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00524"
+    title: "Disk preflight + enforced GC: implement `apm2 fac gc` + auto-GC escalation + GC receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00516"
+        reason: "GC must use safe_rmtree_v1 for all deletions."
+      - ticket_id: "TCK-00515"
+        reason: "GC must respect lane leases and lane roots."
+  scope:
+    in_scope:
+      - "Implement disk preflight before RUNNING: check `$APM2_HOME` FS and lane workspace FS."
+      - "If below min-free threshold: run GC enforcement, re-check, fail closed if still low."
+      - "GC allowed deletions per RFC allowlist (lane targets/logs, fac cargo_home caches, legacy evidence logs, optional gate cache TTL)."
+      - "Write `GcReceiptV1` content-addressed receipt with before/after free space and actions."
+      - "GC respects quarantine retention rules and emits receipts when pruning quarantine by policy."
+    out_of_scope:
+      - "Deleting worktrees outside lane roots."
+  plan:
+    steps:
+      - "Implement preflight helper and wire into worker before executing jobs."
+      - "Implement GC planner + executor + receipt writer."
+      - "Add dry-run + json output."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Low disk triggers auto-GC and prevents starting risky jobs."
+      - "GC never deletes outside allowed roots; uses safe_rmtree_v1."
+```
+
+### TCK-00525 — `apm2 fac warm`: lane-scoped prewarm with receipts + economics + authorization
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00525"
+    title: "`apm2 fac warm`: lane-scoped prewarm with receipts + economics + authorization"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Warm requires broker-issued RFC-0028 token and RFC-0029 admissions."
+      - ticket_id: "TCK-00511"
+        reason: "Warm runs as a queued job executed by worker."
+      - ticket_id: "TCK-00515"
+        reason: "Warm must acquire a lane lease and use lane target namespace."
+  scope:
+    in_scope:
+      - "Add `apm2 fac warm` that enqueues warm jobs (default) and optionally waits."
+      - "Warm phases: fetch/build/nextest --no-run/clippy/doc; selectable via flags."
+      - "Warm uses lane target namespace and FAC-managed CARGO_HOME."
+      - "Warm emits WarmReceiptV1 and job receipt with RFC-0028/0029 artifacts."
+    out_of_scope:
+      - "sccache enablement (separate ticket)."
+  plan:
+    steps:
+      - "Implement warm job kind and executor."
+      - "Integrate with worker and receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Warm is runnable as queued job and produces receipts."
+      - "Warm reduces cold compile probability for subsequent gates in same lane target namespace."
+```
+
+### TCK-00526 — FAC-managed CARGO_HOME + env clearing policy (eliminate ambient user state)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00526"
+    title: "FAC-managed CARGO_HOME + env clearing policy (eliminate ambient user state)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00521"
+        reason: "Policy must define deny_ambient_cargo_home and env clearing/allowlist."
+  scope:
+    in_scope:
+      - "Set `CARGO_HOME=$APM2_HOME/private/fac/cargo_home` for all FAC jobs."
+      - "Clear environment by default and pass only allowlisted env vars into bounded units."
+      - "Deny ambient cargo home and ambient cargo config reliance."
+      - "Ensure bounded runner allowlist includes required env for correct execution."
+    out_of_scope:
+      - "Rustup toolchain installation automation."
+  plan:
+    steps:
+      - "Implement env builder from policy."
+      - "Propagate into systemd-run invocation and non-bounded paths."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "FAC runs are reproducible without relying on `~/.cargo/*` state."
+      - "Ambient secret env vars are not propagated into jobs by default."
+```
+
+### TCK-00527 — Evidence bundle export/import commands exercising RFC-0028 boundary validation + RFC-0029 receipt validation (local-only)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00527"
+    title: "Evidence bundle export/import commands exercising RFC-0028 boundary validation + RFC-0029 receipt validation (local-only)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts must include required RFC-0028/0029 artifacts."
+      - ticket_id: "TCK-00510"
+        reason: "Import/export must validate broker-admitted policy bindings."
+  scope:
+    in_scope:
+      - "Implement `apm2 fac bundle export <job_id>` producing envelope + blobs."
+      - "Implement `apm2 fac bundle import <path>` that fails closed unless `validate_channel_boundary(...)` passes and embedded economics receipts validate."
+      - "Use this tool as a forced integration harness to ensure RFC-0028 and RFC-0029 are exercised."
+    out_of_scope:
+      - "Network transfer."
+  plan:
+    steps:
+      - "Define manifest/envelope serialization; store under fac blobs or temp export dir."
+      - "Implement import validation pipeline."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Import refuses when boundary check invalid or policy binding mismatched."
+      - "Import refuses when economics receipts unverifiable."
+```
+
+### TCK-00528 — Systemd units + runbook: broker + worker as managed services (user+system modes)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00528"
+    title: "Systemd units + runbook: broker + worker as managed services (user+system modes)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker must exist before unit packaging."
+      - ticket_id: "TCK-00511"
+        reason: "Worker must exist before unit packaging."
+  scope:
+    in_scope:
+      - "Provide systemd unit templates for: FAC Broker and FAC Worker."
+      - "Support both user-mode units (with linger guidance) and system-mode units (preferred hardening)."
+      - "Define dedicated runtime directories under `$APM2_HOME/private/fac/**` with strict permissions."
+      - "Provide a minimal runbook: start/stop/status, logs, key rotation notes, failure modes."
+      - "Add `apm2 fac services status` command (optional) that reports unit health."
+    out_of_scope:
+      - "Multi-node orchestration."
+  plan:
+    steps:
+      - "Author unit files with explicit WorkingDirectory, EnvironmentFile (optional), Restart policies, and hardening knobs."
+      - "For system units: run as dedicated service user; define slices if needed."
+      - "Add docs: how to enable linger for user-mode; how to run system-mode safely."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "On a clean Ubuntu VPS, broker and worker can be started and stay running under systemd."
+      - "Worker can execute at least one queued job end-to-end under unit management."
   notes:
     security: |
-      This ticket is policy enforcement. The goal is to eliminate ambient-state ambiguity and
-      prevent accidental host-destabilizing overrides.
+      Ensure units do not run with excessive privileges by default.
+      Default should avoid reliance on a user-bus for correctness.
+```
+
+### TCK-00529 — System-mode execution path: run jobs without user-bus dependency (broker-managed transient units)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00529"
+    title: "System-mode execution path: run jobs without user-bus dependency (broker-managed transient units)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Needs service deployment model for broker/worker."
+      - ticket_id: "TCK-00515"
+        reason: "Needs lanes and lane profiles."
+  scope:
+    in_scope:
+      - "Add an execution backend that does NOT require `systemd-run --user`."
+      - "Broker (or worker) creates system-scoped transient units (or uses a system service template) for job execution."
+      - "Jobs run as a dedicated low-privilege service user, with KillMode=control-group."
+      - "Preserve the same semantics: lane lease -> bounded unit -> streaming logs -> receipts."
+      - "Auto-select backend: prefer system-mode if configured, otherwise user-mode with explicit failure messaging."
+    out_of_scope:
+      - "Containers/VM sandboxing."
+  plan:
+    steps:
+      - "Implement systemd D-Bus integration or a safe wrapper for system transient units."
+      - "Implement backend selection + clear diagnostic errors."
+      - "Add kill/stop support used by cancellation and lane reset."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "On a headless VPS without a working user-bus, FAC jobs can still run bounded via system-mode backend."
+      - "Cgroup membership is correct (child processes remain inside the job unit)."
+```
+
+### TCK-00530 — LaneProfile→systemd unit properties: single authoritative builder for CPU/mem/PIDs/IO/timeouts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00530"
+    title: "LaneProfile→systemd unit properties: single authoritative builder for CPU/mem/PIDs/IO/timeouts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "LaneProfileV1 must exist."
+  scope:
+    in_scope:
+      - "Implement a single builder that maps LaneProfileV1 + FacPolicyV1 to systemd properties."
+      - "Ensure consistent enforcement across backends (user-mode/system-mode)."
+      - "Centralize defaults for CPUQuota, MemoryMax, TasksMax(PIDs), IOWeight, TimeoutStartSec/RuntimeMaxSec, KillMode."
+      - "Expose a `--print-unit` debug mode (optional) to show computed properties."
+    out_of_scope:
+      - "Dynamic per-testcase tuning."
+  plan:
+    steps:
+      - "Define property mapping table."
+      - "Implement builder + tests verifying deterministic output."
+      - "Wire into both execution backends."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "All job executions use the builder (no ad-hoc unit property duplication)."
+      - "Changing LaneProfileV1 changes runtime unit properties deterministically."
+```
+
+### TCK-00531 — RFC-0029 scheduler state persistence: stable state file + restart safety + anti-starvation continuity
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00531"
+    title: "RFC-0029 scheduler state persistence: stable state file + restart safety + anti-starvation continuity"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00511"
+        reason: "Worker must compute admissions."
+      - ticket_id: "TCK-00510"
+        reason: "Broker provides envelopes/horizons."
+  scope:
+    in_scope:
+      - "Persist scheduler state under `$APM2_HOME/private/fac/scheduler/state.v1.json`."
+      - "State must include: lane backlog snapshots, max_wait_ticks per lane, last evaluation tick, and any RFC-0029 state required to preserve anti-starvation across restarts."
+      - "Worker loads state on startup; if missing/corrupt, reconstructs conservatively and emits a recovery receipt."
+      - "State file writes are atomic and symlink-safe."
+    out_of_scope:
+      - "Distributed scheduler convergence."
+  plan:
+    steps:
+      - "Define SchedulerStateV1 schema."
+      - "Implement atomic writer and bounded reader."
+      - "Integrate with RFC-0029 evaluation input construction."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Restarting worker preserves fairness/anti-starvation behavior (no permanent starvation regression)."
+      - "Malformed state triggers fail-closed conservative behavior and a recovery receipt."
+```
+
+### TCK-00532 — RFC-0029 cost model: job cost estimation + post-run calibration from receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00532"
+    title: "RFC-0029 cost model: job cost estimation + post-run calibration from receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts must include admissions and runtime stats."
+      - ticket_id: "TCK-00531"
+        reason: "Scheduler state must exist."
+  scope:
+    in_scope:
+      - "Define per-job-kind cost estimates used for queue admission (e.g., expected ticks or wait units)."
+      - "Record observed runtime/cost metrics in receipts."
+      - "Implement a calibration mechanism that updates cost estimates conservatively over time (bounded, monotone-safe)."
+      - "Expose `apm2 fac scheduler stats` (optional) showing cost model and denial reasons."
+    out_of_scope:
+      - "ML-based prediction."
+  plan:
+    steps:
+      - "Define CostModelV1 with conservative defaults."
+      - "Add receipt fields for duration/cpu_time/bytes_written (best-effort)."
+      - "Update worker to refine estimates within policy bounds."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Queue admission inputs contain a deterministic cost estimate for every job."
+      - "Calibration never makes the system less safe (never increases concurrency or budgets)."
+```
+
+### TCK-00533 — Cancellation semantics: stop_revoke lane + kill running unit + receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00533"
+    title: "Cancellation semantics: stop_revoke lane + kill running unit + receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00511"
+        reason: "Worker must interpret stop_revoke jobs and manage running units."
+      - ticket_id: "TCK-00529"
+        reason: "System-mode kill path should be supported."
+  scope:
+    in_scope:
+      - "Add `apm2 fac job cancel <job_id>` command."
+      - "If pending: move to cancelled and emit cancellation receipt."
+      - "If claimed/running: enqueue a `stop_revoke` job (highest priority) to kill the active unit (KillMode=control-group) and mark the target job cancelled."
+      - "Ensure cancellations are authenticated (RFC-0028) and admitted (RFC-0029)."
+      - "Ensure cancellation never deletes evidence/logs; it only stops execution and writes receipts."
+    out_of_scope:
+      - "Remote cancellation transport."
+  plan:
+    steps:
+      - "Implement cancel command and job kind."
+      - "Implement worker logic to locate and kill job unit."
+      - "Write receipts and update job state deterministically."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A running job can be cancelled reliably without leaving orphan processes."
+      - "Cancellation produces receipts in all cases (pending/claimed/running)."
+```
+
+### TCK-00534 — Crash recovery + reconcile: repair queue/leases on worker startup; emit recovery receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00534"
+    title: "Crash recovery + reconcile: repair queue/leases on worker startup; emit recovery receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Leases exist and must be reconciled."
+      - ticket_id: "TCK-00511"
+        reason: "Worker is the reconciler in default mode."
+  scope:
+    in_scope:
+      - "On worker startup: reconcile `queue/claimed` and lane leases."
+      - "Detect stale leases (pid dead) and transition lane through CLEANUP to IDLE with receipts."
+      - "Detect claimed jobs without running unit: requeue or mark failed deterministically (policy-driven)."
+      - "Implement `apm2 fac reconcile --dry-run|--apply` command (optional)."
+      - "All reconciliations emit receipts."
+    out_of_scope:
+      - "Distributed reconciliation."
+  plan:
+    steps:
+      - "Define recovery policy defaults."
+      - "Implement reconciler and atomic moves."
+      - "Add integration test simulating crash mid-job."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "After an unclean shutdown, the system converges to a consistent queue+lane state without manual file edits."
+      - "No job is silently dropped; outcomes are recorded as receipts."
+```
+
+### TCK-00535 — Introspection CLI: queue status + job show + receipts list (forensics-first UX)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00535"
+    title: "Introspection CLI: queue status + job show + receipts list (forensics-first UX)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts are authoritative and must be queryable."
+  scope:
+    in_scope:
+      - "Add `apm2 fac queue status` (counts by dir, oldest job, denial/quarantine stats)."
+      - "Add `apm2 fac job show <job_id>` (spec + last receipt + logs pointers)."
+      - "Add `apm2 fac receipts list --since ...` with deterministic ordering rules."
+      - "All commands support `--json` and bounded reads."
+    out_of_scope:
+      - "GUI."
+  plan:
+    steps:
+      - "Implement directory scans with bounded parsing."
+      - "Implement receipt index scanning (best-effort)."
+      - "Add basic filtering and output."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Operators can diagnose denial/quarantine/cancellation states without reading raw JSON files manually."
+```
+
+### TCK-00536 — Permissions hardening: enforce 0700 roots, safe ownership checks, and refuse unsafe `$APM2_HOME/private/fac` perms
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00536"
+    title: "Permissions hardening: enforce 0700 roots, safe ownership checks, and refuse unsafe `$APM2_HOME/private/fac` perms"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "On any FAC command entry, verify `$APM2_HOME/private/fac` and critical subdirs are owned by the current user/service user and are mode 0700 (or stricter)."
+      - "Refuse to run in default mode if permissions are unsafe; print actionable remediation."
+      - "Ensure all newly created FAC dirs/files are created with safe perms (umask handling)."
+    out_of_scope:
+      - "SELinux/AppArmor policy authoring."
+  plan:
+    steps:
+      - "Implement a FAC root validator."
+      - "Add to broker/worker startup and CLI entrypoints."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "FAC refuses to run if fac roots are group/world-writable or owned by unexpected user."
+```
+
+### TCK-00537 — Safe atomic file I/O primitives: atomic JSON write + O_NOFOLLOW open + bounded read helper (queue/leases/receipts)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00537"
+    title: "Safe atomic file I/O primitives: atomic JSON write + O_NOFOLLOW open + bounded read helper (queue/leases/receipts)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Implement atomic writer: write to temp file in same directory, fsync, rename."
+      - "Implement safe opener: refuse symlinks with O_NOFOLLOW (where available) and verify metadata."
+      - "Implement bounded JSON reader (size cap, deny_unknown_fields) reused across queue and receipts."
+      - "Migrate queue/lease/scheduler state writers to these helpers."
+    out_of_scope:
+      - "General-purpose FS library."
+  plan:
+    steps:
+      - "Implement helper module."
+      - "Refactor call sites to use helper."
+      - "Add tests for symlink refusal and atomicity."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Queue and lease files cannot be replaced via symlink tricks in default mode."
+      - "Partial writes do not produce malformed state; atomic rename ensures consistency."
+```
+
+### TCK-00538 — ToolchainFingerprintV1: stable derivation, caching, and inclusion in receipts/attestation
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00538"
+    title: "ToolchainFingerprintV1: stable derivation, caching, and inclusion in receipts/attestation"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Lane target namespaces require toolchain fingerprint."
+  scope:
+    in_scope:
+      - "Define toolchain fingerprint derivation (e.g., rustc -Vv + cargo -V + nextest -V + systemd-run -V as needed)."
+      - "Compute a stable `b3-256:` fingerprint."
+      - "Cache fingerprint per boot/session under `$APM2_HOME/private/fac/toolchain/` with safe perms."
+      - "Ensure all job receipts include toolchain_fingerprint and lane target dir uses it."
+    out_of_scope:
+      - "Pinning toolchain via nix (handled separately)."
+  plan:
+    steps:
+      - "Define fingerprint inputs and canonicalization."
+      - "Implement derivation and caching."
+      - "Wire into lane profile and target path computation."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Fingerprint changes when underlying toolchain changes."
+      - "Fingerprint is consistent across processes on the same node."
+```
+
+### TCK-00539 — Lane init/reconcile: create lanes, write profiles, and repair missing lane roots (operator-friendly bootstrap)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00539"
+    title: "Lane init/reconcile: create lanes, write profiles, and repair missing lane roots (operator-friendly bootstrap)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Lane structures must exist."
+  scope:
+    in_scope:
+      - "Implement `apm2 fac lanes init` to create lane directories and default profiles."
+      - "Implement `apm2 fac lanes reconcile` to repair missing dirs and mark lanes CORRUPT if unrecoverable."
+      - "Allow configuring lane_count via config/env; ensure deterministic lane IDs."
+      - "Emit receipts for init/reconcile operations."
+    out_of_scope:
+      - "Auto-scaling lane count based on load."
+  plan:
+    steps:
+      - "Implement init and reconcile commands."
+      - "Add docs for first-time bootstrap."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A fresh `$APM2_HOME` can be bootstrapped into a ready lane pool with one command."
+```
+
+### TCK-00540 — Legacy gate cache v2 reuse policy: default deny unless bound to RFC-0028/0029 receipts; add unsafe override flag
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00540"
+    title: "Legacy gate cache v2 reuse policy: default deny unless bound to RFC-0028/0029 receipts; add unsafe override flag"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts must contain RFC-0028/0029 binding info."
+  scope:
+    in_scope:
+      - "Define legacy cache reuse posture: gate_cache_v2 entries are treated as untrusted unless a corresponding receipt exists with RFC-0028 authorization + RFC-0029 admissions."
+      - "Default-mode behavior: do not reuse unbound legacy cache entries."
+      - "Add explicit `--allow-legacy-cache` (unsafe) flag that permits fallback reuse and marks receipts accordingly."
+      - "Document migration expectation: gradually populate bound receipts; legacy cache becomes safe over time."
+    out_of_scope:
+      - "Full gate cache redesign (separate ticket)."
+  plan:
+    steps:
+      - "Implement mapping between cache entries and receipts (best-effort)."
+      - "Enforce default deny on unbound legacy cache."
+      - "Add CLI flag and receipt markings."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Default mode never accepts a cache hit unless there is an auditable receipt with RFC-0028/0029 bindings."
+```
+
+### TCK-00541 — Gate cache v3 (optional): receipt-indexed cache store keyed by attestation+policy+toolchain (fail-closed by construction)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00541"
+    title: "Gate cache v3 (optional): receipt-indexed cache store keyed by attestation+policy+toolchain (fail-closed by construction)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts and bindings are required."
+      - ticket_id: "TCK-00523"
+        reason: "Attestation inputs must be fail-closed."
+  scope:
+    in_scope:
+      - "Define a v3 cache index driven by receipts rather than ad-hoc paths."
+      - "Cache hit requires: matching attestation digest + FacPolicyHash + ToolchainFingerprint + RFC-0028/0029 receipt bindings."
+      - "Provide read compatibility: can read v2 but only writes v3 in default mode."
+      - "Define GC policy and on-disk layout under `$APM2_HOME/private/fac/gate_cache_v3/`."
+    out_of_scope:
+      - "Remote cache distribution."
+  plan:
+    steps:
+      - "Define v3 index schema and storage layout."
+      - "Implement read/write paths and migrate hot entries opportunistically."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A cache hit in v3 is provably tied to an authoritative receipt and cannot be forged by simple file writes."
+```
+
+### TCK-00542 — Evidence bundle schemas in code: manifest+envelope + hashing + bounded parsing + export/import integration
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00542"
+    title: "Evidence bundle schemas in code: manifest+envelope + hashing + bounded parsing + export/import integration"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00527"
+        reason: "Export/import commands need formal schemas and validation."
+  scope:
+    in_scope:
+      - "Define `apm2.fac.evidence_bundle_manifest.v1` and `apm2.fac.evidence_bundle_envelope.v1` structs with deny_unknown_fields."
+      - "Implement canonical hashing rules and b3-256 addressing."
+      - "Implement bounded parsing for import; fail-closed on unknown/malformed fields."
+      - "Ensure `channel_boundary_check` is required for import/export operations."
+    out_of_scope:
+      - "Network transport."
+  plan:
+    steps:
+      - "Define structs and hashing helpers."
+      - "Refactor export/import to use them."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Bundle import refuses malformed or oversized manifests/envelopes."
+      - "Bundle hashes are stable and deterministic."
+```
+
+### TCK-00543 — Receipt stream merge tool: set-union merge + deterministic ordering + conflict audit report
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00543"
+    title: "Receipt stream merge tool: set-union merge + deterministic ordering + conflict audit report"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts must be content-addressed and queryable."
+  scope:
+    in_scope:
+      - "Implement `apm2 fac receipts merge --from <dir> --into <dir>` as set union on receipt digests."
+      - "Provide deterministic presentation ordering: HTF stamp if present else fallback tuple."
+      - "Emit audit report: duplicates, mismatched job_id for same digest (should never happen), parse failures."
+    out_of_scope:
+      - "CRDT beyond set-union."
+  plan:
+    steps:
+      - "Implement directory scanning + digest validation."
+      - "Implement merge with atomic writes."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Receipt sets can be merged without semantic refactor and without losing provenance."
+```
+
+### TCK-00544 — `apm2 fac pipeline` integration: route evidence phase through queue/lanes (eliminate SHA drift + dirty attests-clean hazard)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00544"
+    title: "`apm2 fac pipeline` integration: route evidence phase through queue/lanes (eliminate SHA drift + dirty attests-clean hazard)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00517"
+        reason: "Pipeline must run on lane checkout from mirror."
+      - ticket_id: "TCK-00518"
+        reason: "Default gates path already uses queue; pipeline should align."
+  scope:
+    in_scope:
+      - "Modify pipeline evidence execution to enqueue job specs rather than running in caller cwd."
+      - "Ensure pipeline provides a `mirror_commit` source with head_sha binding (no implicit HEAD)."
+      - "Prohibit dirty workspace execution unless via patch injection."
+      - "Ensure receipts produced include RFC-0028/0029 artifacts."
+    out_of_scope:
+      - "Pipeline protocol redesign."
+  plan:
+    steps:
+      - "Refactor pipeline evidence phase to produce job spec and wait for completion."
+      - "Verify attestation now reflects executed content."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Pipeline evidence runs cannot execute against drifting or dirty caller workspace."
+      - "Cache reuse no longer fails open due to HEAD:<path> ignoring dirty state."
+```
+
+### TCK-00545 — Patch bytes backend: implement `fac_blobs_v1` store under `$APM2_HOME/private/fac/blobs` + GC policy
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00545"
+    title: "Patch bytes backend: implement `fac_blobs_v1` store under `$APM2_HOME/private/fac/blobs` + GC policy"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00517"
+        reason: "Patch injection needs a bytes store."
+      - ticket_id: "TCK-00524"
+        reason: "GC must know how to prune blobs."
+  scope:
+    in_scope:
+      - "Implement content-addressed blob store for patch bytes: `$APM2_HOME/private/fac/blobs/<hex>`."
+      - "Write/read APIs with bounded sizes and safe permissions."
+      - "Define blob retention policy and integrate with GC."
+      - "Bind patch digest in job spec and attestation."
+    out_of_scope:
+      - "Dedup across nodes."
+  plan:
+    steps:
+      - "Implement blob writer/reader and hashing."
+      - "Wire into patch injection flow."
+      - "Add GC pruning based on reachability from recent receipts/jobs."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Patch injection can execute without relying on ambient caller worktree."
+      - "Blobs are safely prunable without breaking active jobs."
+```
+
+### TCK-00546 — Optional patch bytes backend: integrate existing APM2 CAS as storage (with explicit GC decisions)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00546"
+    title: "Optional patch bytes backend: integrate existing APM2 CAS as storage (with explicit GC decisions)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00545"
+        reason: "Start with fac_blobs_v1; CAS backend is optional."
+  scope:
+    in_scope:
+      - "Add support for `bytes_backend: apm2_cas` in patch injection."
+      - "Define how CAS blobs are retained and pruned by FAC GC (explicit allowlist)."
+      - "Fail-closed if backend is unknown or CAS policies not configured."
+    out_of_scope:
+      - "CAS redesign."
+  plan:
+    steps:
+      - "Implement CAS read/write integration."
+      - "Implement explicit FAC GC hooks for CAS paths used."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "CAS-backed patch bytes can be used safely without expanding GC authority to unrelated CAS data."
+```
+
+### TCK-00547 — `apm2 fac doctor`: verify prerequisites (cgroup v2, systemd backend, broker reachable, nextest present, permissions safe)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00547"
+    title: "`apm2 fac doctor`: verify prerequisites (cgroup v2, systemd backend, broker reachable, nextest present, permissions safe)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Doctor should check service units."
+      - ticket_id: "TCK-00519"
+        reason: "Doctor should verify nextest requirement."
+  scope:
+    in_scope:
+      - "Add `apm2 fac doctor` command."
+      - "Checks: cgroup v2 availability, systemd backend selection viability, broker status, worker status, nextest availability, FAC root permissions, disk free policy."
+      - "Outputs actionable remediation steps."
+    out_of_scope:
+      - "Automated remediation."
+  plan:
+    steps:
+      - "Implement checks with clear categorization (ERROR/WARN/OK)."
+      - "Add `--json` output for automation."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "`apm2 fac doctor` correctly identifies common failure modes (user-bus missing, nextest missing, unsafe perms)."
+```
+
+### TCK-00548 — Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00548"
+    title: "Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00529"
+        reason: "Containment checks depend on the execution backend."
+  scope:
+    in_scope:
+      - "Implement a containment check routine: verify child processes (rustc/nextest) share the same cgroup as the job unit."
+      - "Expose `apm2 fac verify containment --job <job_id>` (or similar)."
+      - "When sccache is enabled, require this check to pass (else auto-disable sccache and emit receipt)."
+      - "Record containment verdict in receipts."
+    out_of_scope:
+      - "Kernel-level sandboxing."
+  plan:
+    steps:
+      - "Implement process discovery during job execution and sample cgroup paths."
+      - "Implement verdict logic and receipt recording."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Containment mismatches are detected reliably."
+      - "System refuses to run with unsafe sccache containment in default mode."
+```
+
+### TCK-00549 — Bounded executor rewrite: replace bash bounded runner with Rust streaming executor (policy-driven env + caps)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00549"
+    title: "Bounded executor rewrite: replace bash bounded runner with Rust streaming executor (policy-driven env + caps)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00520"
+        reason: "Streaming logs/caps must exist."
+      - ticket_id: "TCK-00521"
+        reason: "Policy-driven env allowlist/denylist required."
+  scope:
+    in_scope:
+      - "Implement Rust bounded executor that creates transient systemd units and streams logs with caps."
+      - "Replace `scripts/ci/run_bounded_tests.sh` usage in FAC paths (keep script as fallback only during transition)."
+      - "Use FacPolicyV1 env_clear/allowlist/denylist to pass env; no ad-hoc allowlists."
+      - "Ensure timeouts/memory/pids are enforced by unit properties, not by shell timers."
+    out_of_scope:
+      - "Replacing other CI scripts unrelated to execution."
+  plan:
+    steps:
+      - "Implement executor library used by gates/warm/pipeline."
+      - "Add feature flag for transition period."
+      - "Deprecate shell runner once stable."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Bounded tests run with streaming logs and hard caps without relying on a brittle shell allowlist."
+      - "Failure modes produce receipts with actionable diagnostics."
+```
+
+### TCK-00550 — CI guardrails: ban NoOpVerifier in default builds; enforce RFC-0028/0029 fields present in execution receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00550"
+    title: "CI guardrails: ban NoOpVerifier in default builds; enforce RFC-0028/0029 fields present in execution receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipt fields must exist."
+      - ticket_id: "TCK-00510"
+        reason: "Verifier integration must be real."
+  scope:
+    in_scope:
+      - "Add compile-time/CI checks that `NoOpVerifier` is not used in default mode."
+      - "Add integration tests asserting: execution receipts include RFC-0028 boundary + RFC-0029 admission traces."
+      - "Add tests asserting: jobs without broker token are denied/quarantined."
+    out_of_scope:
+      - "Full formal verification."
+  plan:
+    steps:
+      - "Add feature flags if needed: `--features unsafe_no_verify` only for dev/testing."
+      - "Add CI checks and minimal end-to-end harness."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A PR that reintroduces NoOpVerifier or omits RFC-0028/0029 receipt fields fails CI."
+```
+
+### TCK-00551 — Observability: metrics from receipts (throughput, queue latency, denial/quarantine rate, disk usage) + status summaries
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00551"
+    title: "Observability: metrics from receipts (throughput, queue latency, denial/quarantine rate, disk usage) + status summaries"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts are the data source."
+  scope:
+    in_scope:
+      - "Implement metrics extraction from receipts."
+      - "Expose `apm2 fac metrics --since ... --json` for automation."
+      - "Include: throughput (jobs/hour), queue wait, denial counts (by reason), quarantine volume, GC freed bytes, disk preflight failures."
+    out_of_scope:
+      - "Prometheus exporter (optional future)."
+  plan:
+    steps:
+      - "Define metrics schema."
+      - "Implement scanner and summary."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Operator can quantify progress toward 10x throughput and detect regressions from receipt-derived metrics."
+```
+
+### TCK-00552 — Benchmark harness: measure cold/warm gate times, disk footprint collapse, and concurrency stability (prove 10x claim)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00552"
+    title: "Benchmark harness: measure cold/warm gate times, disk footprint collapse, and concurrency stability (prove 10x claim)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00525"
+        reason: "Warm must exist."
+      - ticket_id: "TCK-00524"
+        reason: "GC and preflight affect stability."
+  scope:
+    in_scope:
+      - "Add `apm2 fac bench` that runs a standardized sequence: cold gates, warm, warm gates, multi-concurrent gates."
+      - "Record results as receipts/artifacts."
+      - "Compute headline deltas: cold->warm improvement, target dir size collapse vs many worktrees, denial rate."
+    out_of_scope:
+      - "Performance tuning beyond reporting."
+  plan:
+    steps:
+      - "Define benchmark scenario and guardrails."
+      - "Implement runner and report generator."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Bench results can be compared across commits to validate 10x improvements and detect regressions."
+```
+
+### TCK-00553 — sccache explicit activation (optional): policy-gated enablement + receipt/attestation surfacing + safe defaults
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00553"
+    title: "sccache explicit activation (optional): policy-gated enablement + receipt/attestation surfacing + safe defaults"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00523"
+        reason: "Attestation must surface wrapper/env/version."
+      - ticket_id: "TCK-00548"
+        reason: "Containment verification required when enabling sccache."
+  scope:
+    in_scope:
+      - "Add explicit `--sccache` enablement flag or policy knob (default off)."
+      - "Ensure sccache env is injected explicitly (no ambient .cargo wrapper requirement)."
+      - "Set SCCACHE_DIR under APM2_HOME and integrate with GC."
+      - "Record sccache enablement and version in receipts and attestation."
+    out_of_scope:
+      - "Remote sccache caches."
+  plan:
+    steps:
+      - "Add policy knob and CLI flag."
+      - "Wire env injection."
+      - "Add receipts for sccache stats (best-effort)."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "sccache can be enabled explicitly and is visible in attestation."
+      - "Default remains safe: disabled unless containment is proven."
+```
+
+### TCK-00554 — sccache containment protocol: per-unit server lifecycle + refusal to attach to out-of-cgroup servers
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00554"
+    title: "sccache containment protocol: per-unit server lifecycle + refusal to attach to out-of-cgroup servers"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00553"
+        reason: "sccache activation exists."
+      - ticket_id: "TCK-00529"
+        reason: "System-mode backend needed for reliable containment."
+  scope:
+    in_scope:
+      - "Define and implement a protocol that ensures sccache server (if used) runs inside the job unit cgroup."
+      - "Refuse to connect to a pre-existing server that is outside the unit cgroup."
+      - "Start server inside unit and stop at unit end (or ensure same-cgroup server)."
+      - "Record containment check verdict in receipt; auto-disable if mismatch."
+    out_of_scope:
+      - "Optimizing sccache performance."
+  plan:
+    steps:
+      - "Implement per-unit server start/stop hooks."
+      - "Integrate with containment verification routine."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "With sccache enabled, rustc processes remain inside the bounded unit cgroup."
+      - "If not possible, system fails closed or auto-disables sccache with receipt."
+```
+
+### TCK-00555 — RFC-0028 leakage budgets integration: enforce evidence/log export caps and declassification receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00555"
+    title: "RFC-0028 leakage budgets integration: enforce evidence/log export caps and declassification receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00527"
+        reason: "Bundle import/export exists."
+      - ticket_id: "TCK-00520"
+        reason: "Logs have caps and bundles."
+  scope:
+    in_scope:
+      - "Use RFC-0028 leakage budgets to bound exported evidence bundles (bytes and classes)."
+      - "Require a declassification receipt (RFC-0028) for any export that includes logs/artifacts beyond a configured cap."
+      - "Bind leakage budget decisions into export receipts."
+    out_of_scope:
+      - "Network transport security."
+  plan:
+    steps:
+      - "Define leakage budget policy defaults."
+      - "Wire export path to consult channel policy and require receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Evidence export cannot exceed configured leakage budgets without explicit declassification receipts."
+```
+
+### TCK-00556 — Node identity primitives: node_fingerprint derivation + boundary_id configuration + stable emission into LaneProfileV1
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00556"
+    title: "Node identity primitives: node_fingerprint derivation + boundary_id configuration + stable emission into LaneProfileV1"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "LaneProfileV1 contains node_fingerprint."
+  scope:
+    in_scope:
+      - "Implement node_fingerprint derivation and persistence (stable across restarts; changes only on explicit reset)."
+      - "Define and persist boundary_id (default `apm2.fac.local`)."
+      - "Ensure broker and worker consistently use same boundary_id."
+    out_of_scope:
+      - "Multi-node identity distribution."
+  plan:
+    steps:
+      - "Define fingerprint inputs and persistence path."
+      - "Update LaneProfileV1 writer and broker config."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Receipts and lane profiles include stable node_fingerprint and boundary_id; RFC-0029 evaluation uses it consistently."
+```
+
+### TCK-00557 — flake.nix + packaging: ensure devShell invariants and (optional) package broker/worker binaries
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00557"
+    title: "flake.nix + packaging: ensure devShell invariants and (optional) package broker/worker binaries"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Ensure devShell includes required tools (cargo-nextest, git, any broker/worker deps)."
+      - "Optionally provide Nix packages for broker/worker for reproducible deployment."
+      - "Document how to run broker/worker under nix develop on Ubuntu baseline."
+    out_of_scope:
+      - "NixOS migration."
+  plan:
+    steps:
+      - "Update flake devShell."
+      - "Optionally define packages and apps."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "`nix develop` provides all mandatory FAC substrate tools for running gates/warm/worker locally."
+```
+
+### TCK-00558 — Docs updates: Implementor SKILL + RFC-0007 amendments + operational runbooks (broker/worker/lanes/gc)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00558"
+    title: "Docs updates: Implementor SKILL + RFC-0007 amendments + operational runbooks (broker/worker/lanes/gc)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Update SKILL.md to include warm lifecycle, queue-based execution, and failure mode handling."
+      - "Update RFC-0007: mandate nextest and add containment constraints for caching."
+      - "Add runbook docs: bootstrap lanes, start services, respond to quarantine/denials, do safe lane reset."
+    out_of_scope:
+      - "Marketing docs."
+  plan:
+    steps:
+      - "Draft doc changes and cross-link from RFC-0019 amendment."
+      - "Add example commands and expected outputs."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A new operator can bootstrap and run default-mode FAC with broker/worker without tribal knowledge."
+```
+
+### TCK-00559 — Security regression tests: fuzz job spec parsing + adversarial queue file tests + safe_rmtree property tests
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00559"
+    title: "Security regression tests: fuzz job spec parsing + adversarial queue file tests + safe_rmtree property tests"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00537"
+        reason: "Safe bounded parsing primitives should exist."
+      - ticket_id: "TCK-00516"
+        reason: "safe_rmtree_v1 must exist to test it."
+  scope:
+    in_scope:
+      - "Add fuzzing targets for FacJobSpecV1 bounded parsing and denial/quarantine behavior."
+      - "Add tests for queue tampering (digest mismatch, token mismatch, unknown fields)."
+      - "Add property-style tests for safe_rmtree (symlink refusal, no parent escape, TOCTOU smoke)."
+    out_of_scope:
+      - "Full formal proofs."
+  plan:
+    steps:
+      - "Add fuzz harness and CI hooks (time-bounded)."
+      - "Add deterministic adversarial fixtures."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Common tamper vectors are caught by tests, preventing regression to fail-open behaviors."
+```
+
+### TCK-00560 — Receipt Index v1: rebuildable index for fast job/receipt lookup (non-authoritative cache)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00560"
+    title: "Receipt Index v1: rebuildable index for fast job/receipt lookup (non-authoritative cache)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts must be content-addressed and include required fields."
+      - ticket_id: "TCK-00537"
+        reason: "Needs atomic safe file I/O primitives for index updates."
+  scope:
+    in_scope:
+      - "Implement a **non-authoritative**, rebuildable index to avoid scanning all receipts repeatedly."
+      - "Index lives under `$APM2_HOME/private/fac/receipts/index/`."
+      - "Index entries map at minimum:"
+      - "  - job_id -> latest receipt digest"
+      - "  - receipt digest -> parsed header fields (kind, status, started_at, finished_at, lane_id, queue_lane)"
+      - "  - optional: time bucket -> list of receipt digests for efficient `--since` queries"
+      - "Index MUST be treated as a cache: on any inconsistency, rebuild from receipt store."
+      - "Index writes MUST be atomic and symlink-safe; index reads bounded."
+      - "Add `apm2 fac receipts reindex` (optional) to force rebuild."
+      - "Update waiters (`gates` enqueue+wait, job show, metrics) to consult index first."
+    out_of_scope:
+      - "Distributed indexing."
+      - "Making index authoritative for any decision (forbidden)."
+  plan:
+    steps:
+      - "Define `ReceiptIndexV1` schema(s): a small stable header index plus optional per-job pointers."
+      - "Implement incremental update on receipt write: append/update pointer atomically."
+      - "Implement rebuild: scan receipts directory, validate digests, rebuild index deterministically."
+      - "Add integrity checks: if index references missing receipt or mismatched digest, trigger rebuild."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Common operations do not require full receipt directory scans (job show, wait, metrics, list)."
+      - "Corrupt/missing index never breaks correctness: system rebuilds or falls back safely."
+  notes:
+    security: |
+      Index is attacker-writable under A2 assumptions; never trust it for authorization/admission/caching.
+      Only receipts (validated by digest) are ground truth.
+```
+
+### TCK-00561 — Policy update + adoption protocol: broker-admitted FacPolicyHash rotation with receipts + rollback
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00561"
+    title: "Policy update + adoption protocol: broker-admitted FacPolicyHash rotation with receipts + rollback"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker must exist as the authority for admitted policy digests."
+      - ticket_id: "TCK-00521"
+        reason: "FacPolicyV1 + FacPolicyHash must exist."
+      - ticket_id: "TCK-00513"
+        reason: "Need receipts to record policy adoption events."
+  scope:
+    in_scope:
+      - "Define how a new `FacPolicyV1` becomes authoritative (admitted) in default mode."
+      - "Broker maintains admitted policy digest under `$APM2_HOME/private/fac/broker/admitted_policy_root.v1` (digest only; non-secret)."
+      - "Introduce a CLI surface:"
+      - "  - `apm2 fac policy show` (prints current policy + hash)"
+      - "  - `apm2 fac policy validate <path|stdin>` (checks schema + computes hash)"
+      - "  - `apm2 fac policy adopt <path|stdin>` (requests broker to adopt new policy digest)"
+      - "Policy adoption MUST be atomic and rollbackable:"
+      - "  - broker writes `admitted_policy_root.v1` via atomic rename"
+      - "  - broker retains `admitted_policy_root.prev.v1` for rollback"
+      - "  - worker refuses actuation tokens whose policy binding does not match admitted digest"
+      - "Every policy adoption and rollback MUST emit a durable receipt:"
+      - "  - `apm2.fac.policy_adoption_receipt.v1` (new) OR a FacJobReceiptV1(kind=policy_adopt)"
+      - "Receipt includes old_digest, new_digest, actor identity (broker), and reason string."
+    out_of_scope:
+      - "Remote policy distribution."
+      - "UI for policy editing."
+  plan:
+    steps:
+      - "Implement broker endpoint: adopt_policy(fac_policy_hash) with atomic persistence."
+      - "Implement CLI commands and guardrails (must be run by operator role / local admin)."
+      - "Implement adoption receipt emission."
+      - "Implement rollback command: `apm2 fac policy rollback`."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Policy changes are reflected in new actuation tokens and validated by workers."
+      - "Workers fail-closed when policy binding mismatches (no silent drift)."
+      - "Rollback works and is recorded as receipts."
+  notes:
+    security: |
+      This is a critical control plane. Adoption must not accept an arbitrary file path without schema+hash validation.
+      Policy adoption should require explicit operator action (not something an untrusted job can trigger).
+```
+
+### TCK-00562 — Quarantine management: explicit prune policy (TTL+quota) + commands + GC integration + receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00562"
+    title: "Quarantine management: explicit prune policy (TTL+quota) + commands + GC integration + receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00514"
+        reason: "Queue denied/quarantine directories and move rules must exist."
+      - ticket_id: "TCK-00524"
+        reason: "GC must exist and be able to prune allowed roots with receipts."
+      - ticket_id: "TCK-00513"
+        reason: "Denial/quarantine receipts must exist."
+  scope:
+    in_scope:
+      - "Implement explicit retention policy for `queue/quarantine/` and `queue/denied/`:"
+      - "  - `quarantine_max_bytes` (hard quota; default conservative)"
+      - "  - `quarantine_ttl_days` (default e.g. 14)"
+      - "  - `denied_ttl_days` (default e.g. 7)"
+      - "Quarantine deletion MUST be explicit and receipted; never silent."
+      - "Add commands:"
+      - "  - `apm2 fac quarantine list` (shows size/age/reason summary; --json)"
+      - "  - `apm2 fac quarantine prune --dry-run|--apply` (policy-driven)"
+      - "Integrate with `apm2 fac gc`:"
+      - "  - GC may prune quarantine ONLY after reaching deeper escalation stage (and must emit receipts)."
+      - "  - GC must never delete quarantined items newer than TTL unless quota hard exceeded (still receipted)."
+    out_of_scope:
+      - "Remote forensic upload."
+  plan:
+    steps:
+      - "Define policy knobs in FacPolicyV1 for quarantine quotas/TTLs."
+      - "Implement scanner (bounded parsing) for quarantine/denied directories."
+      - "Implement prune planner with deterministic ordering (oldest-first, then largest) and atomic deletes using safe_rmtree_v1."
+      - "Emit prune receipts with counts and bytes reclaimed."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Quarantine does not grow unbounded; pruning is deterministic and always receipted."
+      - "Operators can inspect and prune quarantine without manual filesystem spelunking."
+  notes:
+    security: |
+      Quarantine content is potentially attacker-supplied. Parsing must be bounded; display must avoid terminal escapes; do not auto-execute or auto-open files.
+```
+
+### TCK-00563 — Canonicalizer Tuple pinning: broker-admitted canonicalization version commitment + worker enforcement
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00563"
+    title: "Canonicalizer Tuple pinning: broker-admitted canonicalization version commitment + worker enforcement"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker stores admitted canonicalizer tuple commitment."
+      - ticket_id: "TCK-00537"
+        reason: "Atomic safe file IO for storing the tuple."
+      - ticket_id: "TCK-00512"
+        reason: "Job spec digest relies on canonicalization semantics."
+  scope:
+    in_scope:
+      - "Define a `CanonicalizerTupleV1` commitment describing canonical JSON semantics used for digesting job specs/receipts."
+      - "Broker stores admitted tuple digest under `$APM2_HOME/private/fac/broker/admitted_canonicalizer_tuple.v1`."
+      - "Worker verifies canonicalizer tuple digest matches the broker-admitted digest at startup."
+      - "If mismatch: default mode MUST fail-closed (deny execution) with actionable remediation."
+      - "Record canonicalizer tuple digest in receipts for audit."
+    out_of_scope:
+      - "Cross-node tuple negotiation."
+  plan:
+    steps:
+      - "Define tuple inputs (e.g., `apm2_core::determinism` version string + schema canonicalization mode id)."
+      - "Implement broker persistence and CLI introspection."
+      - "Implement worker validation and denial behavior."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Digest/canonicalization drift between broker and worker is detected and blocks actuation in default mode."
+      - "Receipts include canonicalizer tuple digest for forensic audit."
+  notes:
+    security: |
+      Without tuple pinning, a canonicalization behavior change can silently break digest binding, opening tamper windows.
+```
+
+### TCK-00564 — Receipt write pipeline: emit receipt + update index + link job state atomically (avoid torn states)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00564"
+    title: "Receipt write pipeline: emit receipt + update index + link job state atomically (avoid torn states)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts schema exists."
+      - ticket_id: "TCK-00560"
+        reason: "Receipt index exists."
+      - ticket_id: "TCK-00537"
+        reason: "Needs atomic safe I/O helpers."
+  scope:
+    in_scope:
+      - "Define and implement an atomic 'commit protocol' when finishing a job:"
+      - "  1) write receipt content-addressed file"
+      - "  2) update receipt index pointer(s)"
+      - "  3) move job file claimed→done (or claimed→denied/cancelled) with atomic rename"
+      - "Ensure crash safety: after crash, reconcile can complete or rollback without losing receipts."
+      - "Emit recovery receipts if torn state is detected and repaired."
+    out_of_scope:
+      - "Distributed commit/consensus."
+  plan:
+    steps:
+      - "Implement a small transaction-like helper for these three steps."
+      - "Update worker completion paths to use it."
+      - "Add crash simulation test (kill worker mid-commit) and ensure reconcile converges."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No scenario exists where a job is marked done without its receipt present."
+      - "Receipt index does not point to missing receipts after crashes (or triggers rebuild automatically)."
+```
+---
+
+### TCK-00565 — RFC-0028 token binding contract: bind tokens to (job_spec_digest, FacPolicyHash, canonicalizer tuple, boundary_id) + expiry
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00565"
+    title: "RFC-0028 token binding contract: bind tokens to (job_spec_digest, FacPolicyHash, canonicalizer tuple, boundary_id) + expiry"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker issues tokens."
+      - ticket_id: "TCK-00521"
+        reason: "FacPolicyHash exists."
+      - ticket_id: "TCK-00563"
+        reason: "Canonicalizer tuple commitment exists."
+      - ticket_id: "TCK-00556"
+        reason: "Boundary id is stabilized."
+  scope:
+    in_scope:
+      - "Define and enforce a token binding schema for FAC actuation tokens:"
+      - "  - request_id MUST equal job_spec_digest"
+      - "  - token MUST bind FacPolicyHash"
+      - "  - token MUST bind canonicalizer tuple digest"
+      - "  - token MUST bind boundary_id"
+      - "  - token MUST include issued_at_tick + expiry_tick (short TTL)"
+      - "Worker validation MUST deny if any binding mismatches or token expired."
+      - "Receipt MUST record token bindings used (from decoded boundary check)."
+    out_of_scope:
+      - "PCAC/AJC redesign."
+  plan:
+    steps:
+      - "Extend broker token issuance to include binding fields."
+      - "Extend worker token validation to enforce bindings."
+      - "Add tests: policy rotation invalidates old tokens; canonicalizer drift invalidates; expired token invalidates."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A token cannot be replayed across policy or canonicalization changes."
+      - "Tokens expire and workers fail-closed on expiration."
+```
+---
+
+### TCK-00566 — Token replay protection: broker-side one-time use (or bounded reuse) ledger + revocation
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00566"
+    title: "Token replay protection: broker-side one-time use (or bounded reuse) ledger + revocation"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00565"
+        reason: "Token binding and expiry must exist first."
+  scope:
+    in_scope:
+      - "Implement replay resistance for RFC-0028 tokens in default mode:"
+      - "  - broker maintains a small token-use ledger keyed by request_id/job_spec_digest"
+      - "  - worker reports token use to broker (or broker encodes single-use nonce)"
+      - "  - broker can revoke tokens (explicit) and workers consult revocation state when validating"
+      - "Define bounded retention (TTL) for the ledger to avoid unbounded growth."
+      - "Emit receipts for token revocation events."
+    out_of_scope:
+      - "Distributed replay protection."
+  plan:
+    steps:
+      - "Define broker storage for used tokens under `$APM2_HOME/private/fac/broker/token_ledger/`."
+      - "Implement worker callback or nonce scheme."
+      - "Add denial path: reused token -> deny/quarantine + receipt."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A token reused for the same digest is detected and denied."
+      - "Revoked tokens are denied even if unexpired."
+```
+---
+
+### TCK-00567 — RFC-0028 intent taxonomy for FAC: typed tool-intent classes and per-kind authorization policy
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00567"
+    title: "RFC-0028 intent taxonomy for FAC: typed tool-intent classes and per-kind authorization policy"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker issues typed intent tokens."
+      - ticket_id: "TCK-00521"
+        reason: "FacPolicyV1 must define allowed intents."
+  scope:
+    in_scope:
+      - "Define a stable mapping from FAC job kinds to RFC-0028 typed intents:"
+      - "  - gates -> intent.fac.execute_gates"
+      - "  - warm -> intent.fac.warm"
+      - "  - gc -> intent.fac.gc"
+      - "  - lane_reset -> intent.fac.lane_reset"
+      - "  - stop_revoke -> intent.fac.cancel"
+      - "  - bundle_export/import -> intent.fac.bundle"
+      - "Broker issues tokens only for allowed intents per FacPolicyV1."
+      - "Worker denies if token intent does not match job kind."
+    out_of_scope:
+      - "User-defined arbitrary intents."
+  plan:
+    steps:
+      - "Add intent fields to broker token issuance."
+      - "Add intent checks to worker validation."
+      - "Add policy knobs: allowed_intents list."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A token for GC cannot be used to execute gates (kind/intent mismatch denial)."
+```
+---
+
+### TCK-00568 — Broker rate limits + quotas: bound token issuance, queue growth, and expensive operations using RFC-0029 budgets
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00568"
+    title: "Broker rate limits + quotas: bound token issuance, queue growth, and expensive operations using RFC-0029 budgets"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00522"
+        reason: "Budget admission evaluator integration exists."
+      - ticket_id: "TCK-00510"
+        reason: "Broker implements the authority surface."
+  scope:
+    in_scope:
+      - "Apply RFC-0029 budget admission to control-plane actions:"
+      - "  - token issuance rate"
+      - "  - queue enqueue rate and maximum queue bytes"
+      - "  - bundle export bytes"
+      - "Broker denies requests exceeding configured budgets and emits receipts."
+      - "Expose broker metrics for denial counts (optional)."
+    out_of_scope:
+      - "Distributed quotas."
+  plan:
+    steps:
+      - "Define control-plane budgets in EconomicsProfile."
+      - "Add budget checks in broker APIs."
+      - "Add denial receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Flooding enqueue/token requests hits a deny path with receipts, not host resource collapse."
+```
+---
+
+### TCK-00569 — Lane cleanup state machine: post-job cleanup, failure handling, CORRUPT transitions, and cleanup receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00569"
+    title: "Lane cleanup state machine: post-job cleanup, failure handling, CORRUPT transitions, and cleanup receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Lane leasing exists."
+      - ticket_id: "TCK-00516"
+        reason: "safe_rmtree_v1 exists for controlled deletion."
+      - ticket_id: "TCK-00517"
+        reason: "Lane workspace provenance exists (mirror checkout)."
+  scope:
+    in_scope:
+      - "Implement lane lifecycle transitions with explicit cleanup phase:"
+      - "  - after job execution, run cleanup: reset to SHA, git clean -ffdx, prune lane temp, enforce log quota hooks"
+      - "  - if cleanup fails, mark lane CORRUPT and refuse future leases until reset"
+      - "Persist CORRUPT marker and cleanup receipts."
+      - "Expose in `lane status`."
+    out_of_scope:
+      - "Automatic lane reset without operator policy (optional later)."
+  plan:
+    steps:
+      - "Define LaneCleanupReceiptV1 (or reuse FacJobReceiptV1(kind=lane_cleanup))."
+      - "Implement cleanup runner and CORRUPT marker file."
+      - "Wire worker to enforce cleanup before lane returns IDLE."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A cleanup failure prevents lane reuse and is visible via status."
+      - "Cleanup actions are receipted for audit."
+```
+---
+
+### TCK-00570 — Lane CORRUPT persistence + refusal semantics: marker file, reasons, and operator workflow
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00570"
+    title: "Lane CORRUPT persistence + refusal semantics: marker file, reasons, and operator workflow"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00569"
+        reason: "Cleanup failures produce CORRUPT state."
+  scope:
+    in_scope:
+      - "Define `lanes/<lane_id>/corrupt.v1.json` marker schema (reason, receipt digest, detected_at)."
+      - "Worker refuses to lease a CORRUPT lane and optionally enqueues a control job recommending reset."
+      - "CLI: `apm2 fac lane mark-corrupt <lane_id> --reason ...` (optional) for operators."
+    out_of_scope:
+      - "Automated remediation policies beyond refusal."
+  plan:
+    steps:
+      - "Implement marker and status integration."
+      - "Implement refusal paths and messaging."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "CORRUPT lanes are never used inadvertently."
+      - "Operators have clear reset workflow."
+```
+---
+
+### TCK-00571 — Lane log retention + quotas: per-lane max bytes + per-job retention windows; GC integration
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00571"
+    title: "Lane log retention + quotas: per-lane max bytes + per-job retention windows; GC integration"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00520"
+        reason: "Per-job logs exist."
+      - ticket_id: "TCK-00524"
+        reason: "GC exists."
+  scope:
+    in_scope:
+      - "Define log retention policy knobs in FacPolicyV1:"
+      - "  - per_lane_log_max_bytes"
+      - "  - per_job_log_ttl_days"
+      - "  - keep_last_n_jobs_per_lane"
+      - "Implement pruning logic that runs:"
+      - "  - after job completion (best-effort), and"
+      - "  - in `apm2 fac gc` escalation."
+      - "Emit pruning receipts (bytes freed)."
+    out_of_scope:
+      - "Remote log archival."
+  plan:
+    steps:
+      - "Implement lane log directory scanner and deterministic prune planner."
+      - "Wire into cleanup and GC."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Logs cannot grow without bound; retention is deterministic and auditable."
+```
+---
+
+### TCK-00572 — Cgroup usage accounting: record cpu/mem/IO stats per job and store in receipts (feeds economics calibration)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00572"
+    title: "Cgroup usage accounting: record cpu/mem/IO stats per job and store in receipts (feeds economics calibration)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00530"
+        reason: "Unit properties and cgroup identity exist."
+      - ticket_id: "TCK-00513"
+        reason: "Receipts schema exists."
+  scope:
+    in_scope:
+      - "Collect best-effort runtime stats from job unit cgroup:"
+      - "  - CPU time"
+      - "  - peak memory / MemoryCurrent"
+      - "  - IO bytes read/write"
+      - "  - tasks count high watermark"
+      - "Store in FacJobReceiptV1 under `observed_usage` block."
+      - "Expose to economics calibration and metrics."
+    out_of_scope:
+      - "Perfect accuracy across all kernels."
+  plan:
+    steps:
+      - "Implement cgroup stat reader for v2."
+      - "Wire into job completion path."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Receipts contain observed usage stats for executed jobs in bounded mode."
+```
+---
+
+### TCK-00573 — Job unit sandbox hardening: NoNewPrivileges, PrivateTmp, Protect*, Restrict*, safe defaults without breaking builds
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00573"
+    title: "Job unit sandbox hardening: NoNewPrivileges, PrivateTmp, Protect*, Restrict*, safe defaults without breaking builds"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00530"
+        reason: "Need centralized unit builder."
+  scope:
+    in_scope:
+      - "Add systemd hardening directives to job units (prefer system-mode backend):"
+      - "  - NoNewPrivileges=yes"
+      - "  - PrivateTmp=yes"
+      - "  - ProtectControlGroups=yes"
+      - "  - ProtectKernelTunables=yes"
+      - "  - ProtectKernelLogs=yes"
+      - "  - RestrictSUIDSGID=yes"
+      - "  - LockPersonality=yes"
+      - "  - RestrictRealtime=yes"
+      - "  - RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 (policy controlled)"
+      - "  - SystemCallArchitectures=native"
+      - "Make hardening policy-driven (FacPolicyV1), with a known-good default profile."
+      - "Emit unit hardening settings into receipts for audit (hash or normalized list)."
+    out_of_scope:
+      - "Container sandboxing."
+  plan:
+    steps:
+      - "Define hardening profile knobs in policy."
+      - "Update unit builder."
+      - "Run gates suite and iteratively tighten without breaking."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Default hardening reduces attack surface measurably (documented directives) while preserving successful gates execution."
+```
+---
+
+### TCK-00574 — Network policy for job units: default deny network for gates, allow only for explicit fetch/warm phases (policy-driven)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00574"
+    title: "Network policy for job units: default deny network for gates, allow only for explicit fetch/warm phases (policy-driven)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00573"
+        reason: "Unit hardening framework exists."
+  scope:
+    in_scope:
+      - "Define policy knobs for network access by job kind and phase."
+      - "Default posture:"
+      - "  - gates/test/clippy/doc: network denied"
+      - "  - warm/fetch: network allowed (if needed)"
+      - "Enforce via systemd directives (IPAddressDeny/Allow, PrivateNetwork) where feasible."
+      - "Record network policy decision in receipts."
+    out_of_scope:
+      - "Network shaping and bandwidth accounting."
+  plan:
+    steps:
+      - "Add network policy fields to FacPolicyV1."
+      - "Implement unit builder mapping."
+      - "Add smoke tests (gates still run after warm)."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "In default mode, evidence gates cannot open network connections unless explicitly allowed by policy."
+```
+---
+
+### TCK-00575 — Env & path hygiene completion: set HOME/TMPDIR/XDG dirs per lane; prevent writes to ambient user locations
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00575"
+    title: "Env & path hygiene completion: set HOME/TMPDIR/XDG dirs per lane; prevent writes to ambient user locations"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00526"
+        reason: "FAC-managed env clearing exists."
+  scope:
+    in_scope:
+      - "Set deterministic per-lane/per-job environment roots:"
+      - "  - HOME=$APM2_HOME/private/fac/lanes/<lane_id>/home"
+      - "  - TMPDIR=$APM2_HOME/private/fac/lanes/<lane_id>/tmp"
+      - "  - XDG_CACHE_HOME=$APM2_HOME/private/fac/lanes/<lane_id>/xdg_cache"
+      - "  - XDG_CONFIG_HOME=$APM2_HOME/private/fac/lanes/<lane_id>/xdg_config"
+      - "Enforce directory creation and quotas via GC policy."
+      - "Ensure cargo/git respect these envs in job units."
+    out_of_scope:
+      - "Rewriting third-party tools."
+  plan:
+    steps:
+      - "Add env_set entries to FacPolicyV1 defaults."
+      - "Update executor to create dirs safely and set env."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "FAC jobs do not write into `~/.cache`, `~/.cargo`, or other ambient user dirs by default."
+```
+---
+
+### TCK-00576 — Signed receipts: broker/worker signature on receipts + verification tooling + gate-cache requires valid signature in default mode
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00576"
+    title: "Signed receipts: broker/worker signature on receipts + verification tooling + gate-cache requires valid signature in default mode"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker has signing key."
+      - ticket_id: "TCK-00513"
+        reason: "Receipt schema exists."
+  scope:
+    in_scope:
+      - "Wrap receipts in a signed container (reuse existing signing primitives; no PCAC redesign)."
+      - "Receipt verification MUST be performed when:"
+      - "  - reading receipts for gate-cache reuse decisions"
+      - "  - importing evidence bundles"
+      - "Provide `apm2 fac receipts verify <digest|path>` command."
+      - "Default mode: gate-cache reuse MUST require signature verification success."
+    out_of_scope:
+      - "Ledger protocol changes."
+  plan:
+    steps:
+      - "Define SignedReceiptV1 container: payload digest + signature + signer id."
+      - "Implement signing on write (worker) and verifying on read."
+      - "Wire verification into cache reuse logic."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Forged receipts (unsigned or invalid signature) are rejected for cache reuse."
+      - "Receipt verify tooling works and is bounded."
+  notes:
+    security: |
+      This is the A3 mitigation that makes "receipts are ground truth" true under realistic local threat models.
+```
+---
+
+### TCK-00577 — Receipt store permissions model: dedicated service user ownership + CLI writes only via broker APIs (minimize attacker write access)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00577"
+    title: "Receipt store permissions model: dedicated service user ownership + CLI writes only via broker APIs (minimize attacker write access)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Systemd units and service user model exist."
+      - ticket_id: "TCK-00536"
+        reason: "Permissions validation exists."
+  scope:
+    in_scope:
+      - "Define a dedicated FAC service user (system-mode recommended)."
+      - "Ensure `$APM2_HOME/private/fac/receipts` and queue directories are owned and writable only by that user."
+      - "CLI commands that enqueue jobs MUST interact with broker/worker APIs rather than writing directly to queue when not running as service user."
+      - "Maintain backward compatibility only via explicit `--unsafe-local-write` mode."
+    out_of_scope:
+      - "Multi-user ACL UI."
+  plan:
+    steps:
+      - "Update runbooks and systemd units to run broker/worker as service user."
+      - "Update CLI to request enqueue via broker endpoint when not privileged."
+      - "Add permission checks and clear errors."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Non-service-user processes cannot forge receipts/queue files in default deployment."
+      - "CLI still works via broker-mediated enqueue."
+```
+---
+
+### TCK-00578 — Queue bounds + backpressure: max pending jobs/bytes; denial with receipts; integrate RFC-0029 control-plane budgets
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00578"
+    title: "Queue bounds + backpressure: max pending jobs/bytes; denial with receipts; integrate RFC-0029 control-plane budgets"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00568"
+        reason: "Broker quotas/budgets exist."
+      - ticket_id: "TCK-00514"
+        reason: "Denied/quarantine queues exist."
+  scope:
+    in_scope:
+      - "Define policy knobs:"
+      - "  - max_pending_jobs"
+      - "  - max_pending_bytes"
+      - "  - per_lane_max_pending_jobs (optional)"
+      - "Enforce at enqueue time (broker), fail-closed with denial receipts."
+      - "Add `queue/quota_exceeded` denial reason."
+    out_of_scope:
+      - "Distributed rate limiting."
+  plan:
+    steps:
+      - "Implement enqueue-side checks."
+      - "Emit denial receipts and place job in denied dir (or refuse creation)."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Queue cannot grow unbounded and exhaust disk; excess enqueue attempts are denied with receipts."
+```
+---
+
+### TCK-00579 — Strict job spec validation policy: allowed kinds/repos; size caps; patch backend allowlist; deny unknown
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00579"
+    title: "Strict job spec validation policy: allowed kinds/repos; size caps; patch backend allowlist; deny unknown"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00512"
+        reason: "Job spec schema exists."
+  scope:
+    in_scope:
+      - "Implement strict validation for `FacJobSpecV1` beyond serde deny_unknown_fields:"
+      - "  - max JSON bytes on read"
+      - "  - allowed `kind` values only"
+      - "  - allowed `repo_id` set (policy-driven allowlist)"
+      - "  - allowed patch bytes_backend values only"
+      - "  - reject absolute paths or filesystem paths in job specs (repo_id is logical only)"
+      - "Deny/quarantine any job failing these validations, emit receipts."
+    out_of_scope:
+      - "General job schema for non-FAC subsystems."
+  plan:
+    steps:
+      - "Implement validator function and call from enqueue and worker pre-claim."
+      - "Add adversarial fixtures."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Malformed or oversized job specs cannot cause memory blowups or undefined behavior; they are denied/quarantined deterministically."
+```
+---
+
+### TCK-00580 — Git safety hardening in lane workspaces: disable hooks, enforce safe.directory, refuse unsafe configs
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00580"
+    title: "Git safety hardening in lane workspaces: disable hooks, enforce safe.directory, refuse unsafe configs"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00517"
+        reason: "Lane workspaces are created from mirror."
+  scope:
+    in_scope:
+      - "Ensure lane workspace git config is hardened:"
+      - "  - disable hooks (`core.hooksPath` to empty dir controlled by FAC)"
+      - "  - enforce `safe.directory` for lane workspace path"
+      - "  - refuse repo configs that attempt to run external commands via filters/smudge if policy forbids"
+      - "Record git hardening status in receipts."
+    out_of_scope:
+      - "Git sandboxing beyond configuration."
+  plan:
+    steps:
+      - "Implement post-checkout git config setup for lanes."
+      - "Add tests ensuring hooks do not run."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Malicious repo hooks do not execute during lane operations in default mode."
+```
+---
+
+### TCK-00581 — Patch injection hardening: path traversal rejection, safe apply mode, and patch provenance receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00581"
+    title: "Patch injection hardening: path traversal rejection, safe apply mode, and patch provenance receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00517"
+        reason: "Patch injection flow exists."
+      - ticket_id: "TCK-00545"
+        reason: "Patch bytes store exists."
+  scope:
+    in_scope:
+      - "Validate patch content before apply:"
+      - "  - reject paths containing `..`, absolute paths, or weird prefixes"
+      - "  - restrict patch format to git_diff_v1 rules"
+      - "Apply patch in safe mode and verify resulting tree matches expected patch digest binding."
+      - "Emit PatchApplyReceiptV1 including patch digest, applied files count, and any refusals."
+    out_of_scope:
+      - "Binary patch formats."
+  plan:
+    steps:
+      - "Implement patch parser/validator."
+      - "Implement safe apply and post-apply verification."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A patch attempting to write outside the workspace is denied/quarantined with receipts."
+```
+---
+
+### TCK-00582 — Repo mirror update hardening: locked updates, bounded fetch, remote URL allowlist, and receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00582"
+    title: "Repo mirror update hardening: locked updates, bounded fetch, remote URL allowlist, and receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00517"
+        reason: "Repo mirror is used for lanes."
+  scope:
+    in_scope:
+      - "Protect mirror updates against races and malicious configuration:"
+      - "  - lock mirror update with file lock"
+      - "  - enforce remote URL allowlist (policy-driven)"
+      - "  - bound fetch size/time (best-effort) to prevent disk blowups"
+      - "  - refuse symlink components in mirror path"
+      - "Emit mirror update receipts with before/after refs."
+    out_of_scope:
+      - "Mirroring across multiple remotes."
+  plan:
+    steps:
+      - "Implement mirror update function with locking."
+      - "Add policy config for allowed remotes."
+      - "Emit receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Mirror update is deterministic, bounded, and auditable."
+```
+---
+
+### TCK-00583 — Receipt/index compaction + GC: prune old index buckets, rebuild deterministically, and emit compaction receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00583"
+    title: "Receipt/index compaction + GC: prune old index buckets, rebuild deterministically, and emit compaction receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00560"
+        reason: "Receipt index exists."
+      - ticket_id: "TCK-00524"
+        reason: "GC exists."
+  scope:
+    in_scope:
+      - "Implement policies for index retention (not receipt retention)."
+      - "Allow pruning old time buckets and rebuilding from receipts as needed."
+      - "Integrate with `apm2 fac gc` escalation as a low-impact step."
+      - "Emit `IndexCompactionReceiptV1`."
+    out_of_scope:
+      - "Deleting receipts as routine GC (forbidden by default)."
+  plan:
+    steps:
+      - "Define index bucket layout and compaction rules."
+      - "Implement prune/rebuild and receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Index remains bounded in disk usage without sacrificing correctness (rebuildable)."
+```
+---
+
+### TCK-00584 — EconomicsProfile adoption protocol: broker-admitted economics_profile_hash with rollback + receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00584"
+    title: "EconomicsProfile adoption protocol: broker-admitted economics_profile_hash with rollback + receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker authority exists."
+      - ticket_id: "TCK-00522"
+        reason: "Economics profile binding is used."
+  scope:
+    in_scope:
+      - "Define broker-admitted economics profile digest storage:"
+      - "  - `$APM2_HOME/private/fac/broker/admitted_economics_profile.v1`"
+      - "Add CLI:"
+      - "  - `apm2 fac economics show`"
+      - "  - `apm2 fac economics adopt <hash|path>`"
+      - "  - `apm2 fac economics rollback`"
+      - "Worker denies budget admissions if profile hash mismatches admitted digest."
+      - "Emit adoption/rollback receipts."
+    out_of_scope:
+      - "Multi-node economics coordination."
+  plan:
+    steps:
+      - "Implement broker endpoints + atomic persistence."
+      - "Implement CLI and receipts."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Economics parameters become an auditable, broker-admitted control surface with rollback."
+```
+---
+
+### TCK-00585 — Horizon/authority health monitoring: broker validates TP001/TP002/TP003 invariants and emits health receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00585"
+    title: "Horizon/authority health monitoring: broker validates TP001/TP002/TP003 invariants and emits health receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker serves envelopes/horizons."
+  scope:
+    in_scope:
+      - "Broker periodically self-checks RFC-0029 invariants:"
+      - "  - TP001 envelope signature validity"
+      - "  - TP002 refs resolved/current with non-zero commitments"
+      - "  - TP003 refs resolved/converged with non-zero commitments"
+      - "Expose `apm2 fac broker health` (optional) and emit periodic HealthReceiptV1."
+      - "Worker refuses to admit jobs if broker health is degraded (policy-driven)."
+    out_of_scope:
+      - "Distributed horizon resolution."
+  plan:
+    steps:
+      - "Implement health checker and receipts."
+      - "Add worker gate on health status."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "If horizons/envelopes are misconfigured, the system fails closed with clear diagnostic receipts."
+```
+---
+
+### TCK-00586 — Multi-worker fairness & scan efficiency: avoid stampede scanning; optional queue scan lease; deterministic behavior preserved
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00586"
+    title: "Multi-worker fairness & scan efficiency: avoid stampede scanning; optional queue scan lease; deterministic behavior preserved"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00511"
+        reason: "Worker exists."
+  scope:
+    in_scope:
+      - "Reduce overhead of multiple workers scanning large pending dirs:"
+      - "  - optional short-lived `queue/scan.lock` lease for scan ownership"
+      - "  - others wait/jitter and rely on atomic claim"
+      - "Maintain determinism of claim selection order."
+      - "Emit a receipt if scan lock is held too long (stuck worker detection)."
+    out_of_scope:
+      - "Distributed queue sharding."
+  plan:
+    steps:
+      - "Implement optional scan lock with TTL and jitter."
+      - "Integrate with worker loop."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Multiple workers do not cause excessive CPU/IO overhead scanning pending jobs."
+```
+---
+
+### TCK-00587 — stop_revoke semantics: guarantee cancellation progress under load while still enforcing RFC-0028/0029 (explicit policy)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00587"
+    title: "stop_revoke semantics: guarantee cancellation progress under load while still enforcing RFC-0028/0029 (explicit policy)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00533"
+        reason: "Cancellation job kind exists."
+      - ticket_id: "TCK-00511"
+        reason: "Worker admission gating exists."
+  scope:
+    in_scope:
+      - "Define explicit policy for stop_revoke jobs:"
+      - "  - still require valid RFC-0028 token (no unauth cancel)"
+      - "  - RFC-0029 admission: policy may allow a reserved lane share for stop_revoke to avoid deadlock"
+      - "  - stop_revoke executes even when queue is congested (anti-starvation)"
+      - "Record explicit stop_revoke admission trace in receipts."
+    out_of_scope:
+      - "Remote kill protocols."
+  plan:
+    steps:
+      - "Add economics lane reservation for stop_revoke."
+      - "Add worker logic to prioritize cancellation safely."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Cancellation is reliable under heavy load without opening a bypass for unauthorized actuation."
+```
+---
+
+### TCK-00588 — End-to-end default-mode harness: spin up broker+worker, enqueue gates, verify RFC-0028/0029 receipts, and test denial paths
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00588"
+    title: "End-to-end default-mode harness: spin up broker+worker, enqueue gates, verify RFC-0028/0029 receipts, and test denial paths"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker exists."
+      - ticket_id: "TCK-00511"
+        reason: "Worker exists."
+      - ticket_id: "TCK-00518"
+        reason: "gates defaults to enqueue+wait."
+  scope:
+    in_scope:
+      - "Implement an e2e test harness runnable in CI or local dev that:"
+      - "  - starts broker and worker (in-process or subprocess)"
+      - "  - enqueues a minimal job"
+      - "  - asserts receipt contains: RFC-0028 boundary, RFC-0029 queue admission, budget admission"
+      - "  - asserts missing token job is denied/quarantined"
+      - "  - asserts expired token job is denied"
+      - "  - asserts NoOpVerifier is not used (signature verified)"
+    out_of_scope:
+      - "Benchmarking (separate)."
+  plan:
+    steps:
+      - "Add harness as integration test crate or script."
+      - "Use lightweight job kind for CI if full gates too heavy."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "CI proves RFC-0028/0029 are exercised and enforced end-to-end."
+```
+---
+
+### TCK-00589 — Legacy evidence log deprecation: migrate to per-job logs, keep legacy read-only, and remove clobbering paths
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00589"
+    title: "Legacy evidence log deprecation: migrate to per-job logs, keep legacy read-only, and remove clobbering paths"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00520"
+        reason: "Per-job logs exist."
+  scope:
+    in_scope:
+      - "Ensure no writes occur to `private/fac/evidence/{gate}.log` once worker mode is default."
+      - "Provide compatibility reads (optional) for old tooling."
+      - "Add a one-time migration helper to move legacy logs into a `legacy/` namespace and emit a migration receipt."
+    out_of_scope:
+      - "Remote log archival."
+  plan:
+    steps:
+      - "Search and remove remaining global log writes."
+      - "Implement migration command."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Concurrent runs never clobber logs because legacy path is not written."
+```
+---
+
+### TCK-00590 — `apm2 fac config show`: show resolved policy, boundary id, backend, lane count, admitted digests (operator correctness tool)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00590"
+    title: "`apm2 fac config show`: show resolved policy, boundary id, backend, lane count, admitted digests (operator correctness tool)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00561"
+        reason: "Policy adoption exists."
+      - ticket_id: "TCK-00584"
+        reason: "Economics adoption exists."
+      - ticket_id: "TCK-00556"
+        reason: "Boundary id exists."
+  scope:
+    in_scope:
+      - "Implement a single introspection command that prints:"
+      - "  - current FacPolicyHash and path"
+      - "  - admitted policy digest (broker) and canonicalizer tuple digest"
+      - "  - admitted economics profile digest"
+      - "  - boundary_id"
+      - "  - execution backend (system/user)"
+      - "  - lane_count and lane ids"
+      - "  - queue bounds"
+      - "Supports `--json`."
+    out_of_scope:
+      - "Editing config (separate)."
+  plan:
+    steps:
+      - "Aggregate info from broker and filesystem state in bounded manner."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Operators can validate the system is configured as intended without reading files manually."
+```
+---
+
+### TCK-00591 — Backup/restore tooling (minimal set): export/import FAC control-plane state (receipts, policy, horizons) without bulky caches
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00591"
+    title: "Backup/restore tooling (minimal set): export/import FAC control-plane state (receipts, policy, horizons) without bulky caches"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00543"
+        reason: "Receipt merge tools help restore."
+      - ticket_id: "TCK-00542"
+        reason: "Bundle schemas exist."
+  scope:
+    in_scope:
+      - "Implement `apm2 fac backup export <path>`:"
+      - "  - exports: receipts, receipt index, admitted policy/economics digests, broker horizons/refs"
+      - "  - excludes: target dirs, cargo caches, sccache by default"
+      - "Implement `apm2 fac backup import <path>`:"
+      - "  - imports into a fresh node with bounded validation"
+      - "  - emits receipts for import event"
+    out_of_scope:
+      - "Encrypting backups (optional future)."
+  plan:
+    steps:
+      - "Define backup manifest."
+      - "Implement export/import with signature verification for receipts if enabled."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A node can be rebuilt with minimal authoritative state and warmed after restore, matching the RFC restore story."
+```
+---
+
+### TCK-00592 — Explicit cache purge command: `apm2 fac caches nuke` (dangerous) with hard confirmations and receipts
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00592"
+    title: "Explicit cache purge command: `apm2 fac caches nuke` (dangerous) with hard confirmations and receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00516"
+        reason: "safe_rmtree_v1 used for deletion."
+      - ticket_id: "TCK-00524"
+        reason: "GC policy exists; nuke is separate."
+  scope:
+    in_scope:
+      - "Add an explicit operator-only command to delete bulky caches:"
+      - "  - lane targets"
+      - "  - cargo_home"
+      - "  - sccache dir (if present)"
+      - "  - optional gate cache dirs"
+      - "Must require multiple confirmations / `--i-know-what-im-doing` flag."
+      - "Must never delete receipts or broker keys."
+      - "Must emit a nuke receipt recording what was deleted."
+    out_of_scope:
+      - "Automated nuking."
+  plan:
+    steps:
+      - "Implement deletion plan with allowed roots."
+      - "Add safety prompts and `--json` dry-run."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Operators can recover disk space deterministically without ad-hoc rm -rf, with audit receipts."
+```
+---
+
+### TCK-00593 — Schema registry + bounded deserialization enforcement for all new FAC schemas (job/lease/profile/receipts/manifests)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00593"
+    title: "Schema registry + bounded deserialization enforcement for all new FAC schemas (job/lease/profile/receipts/manifests)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Ensure every new schema in this RFC is implemented with:"
+      - "  - stable schema id strings"
+      - "  - deny_unknown_fields"
+      - "  - bounded read size caps"
+      - "  - canonicalization via apm2_core::determinism::canonicalize_json"
+      - "Add a central registry list (or tests) preventing accidental schema id drift."
+    out_of_scope:
+      - "General schema evolution framework beyond FAC."
+  plan:
+    steps:
+      - "Add schema structs and unit tests verifying schema ids."
+      - "Add bounded parsing wrappers reused across code."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No schema is parsed without size bounds and deny_unknown_fields in default mode."
 ```

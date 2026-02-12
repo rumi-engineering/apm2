@@ -1,0 +1,43 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00590"
+    title: "`apm2 fac config show`: show resolved policy, boundary id, backend, lane count, admitted digests (operator correctness tool)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00561"
+        reason: "Policy adoption exists."
+      - ticket_id: "TCK-00584"
+        reason: "Economics adoption exists."
+      - ticket_id: "TCK-00556"
+        reason: "Boundary id exists."
+  scope:
+    in_scope:
+      - "Implement a single introspection command that prints:"
+      - "  - current FacPolicyHash and path"
+      - "  - admitted policy digest (broker) and canonicalizer tuple digest"
+      - "  - admitted economics profile digest"
+      - "  - boundary_id"
+      - "  - execution backend (system/user)"
+      - "  - lane_count and lane ids"
+      - "  - queue bounds"
+      - "Supports `--json`."
+    out_of_scope:
+      - "Editing config (separate)."
+  plan:
+    steps:
+      - "Aggregate info from broker and filesystem state in bounded manner."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Operators can validate the system is configured as intended without reading files manually."

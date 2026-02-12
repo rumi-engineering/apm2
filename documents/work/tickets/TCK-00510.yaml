@@ -1,0 +1,48 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00510"
+    title: "FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Implement a local broker authority service (systemd-managed Rust) responsible for FAC actuation authorization and economics/time authority."
+      - "Expose an API to issue RFC-0028 ChannelContextToken bound to `job_spec_digest` + lease_id."
+      - "Expose an API to issue RFC-0029 `TimeAuthorityEnvelopeV1` for boundary_id + evaluation window (TP-EIO29-001)."
+      - "Expose APIs to serve TP-EIO29-002 freshness horizon refs and revocation frontier snapshot (resolved/current)."
+      - "Expose APIs to serve TP-EIO29-003 convergence horizon refs and convergence receipts (resolved/converged) for local-only mode."
+      - "Publish a verifying key for envelope signature verification to workers (no `NoOpVerifier` in default mode)."
+      - "Persist broker non-secret state under `$APM2_HOME/private/fac/broker/**` per RFC."
+    out_of_scope:
+      - "Multi-node networking or remote trust distribution."
+      - "PCAC/AJC redesign."
+  plan:
+    steps:
+      - "Define broker API surface (local-only transport: unix socket or loopback HTTP; implementation detail)."
+      - "Implement RFC-0028 token issuance using the existing daemon signing key."
+      - "Implement RFC-0029 envelope/horizon issuance using HolonicClock (or broker-owned monotonic authority) and real signature verification support."
+      - "Add broker state persistence for horizon refs and admitted policy digests."
+      - "Provide CLI diagnostics: `apm2 fac broker status` (optional) and structured logs."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A worker can obtain a broker-issued ChannelContextToken and successfully decode+validate it via `decode_channel_context_token` + `validate_channel_boundary`."
+      - "A worker can obtain a broker-issued `TimeAuthorityEnvelopeV1` and verify signatures with a real verifier."
+      - "Broker serves TP002 and TP003 refs/receipts with non-zero, replay-stable hashes in local-only mode."
+  notes:
+    security: |
+      Broker must be the only authority issuing actuation tokens and economics envelopes in default mode.
+      Key material must never be stored under `$APM2_HOME/private/fac/**` in plaintext.
+    verification: |
+      Integration test: request token for a known digest; validate; request envelope; verify signature; request horizons; verify non-zero commitments.

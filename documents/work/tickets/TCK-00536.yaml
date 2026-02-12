@@ -1,0 +1,32 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00536"
+    title: "Permissions hardening: enforce 0700 roots, safe ownership checks, and refuse unsafe `$APM2_HOME/private/fac` perms"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "On any FAC command entry, verify `$APM2_HOME/private/fac` and critical subdirs are owned by the current user/service user and are mode 0700 (or stricter)."
+      - "Refuse to run in default mode if permissions are unsafe; print actionable remediation."
+      - "Ensure all newly created FAC dirs/files are created with safe perms (umask handling)."
+    out_of_scope:
+      - "SELinux/AppArmor policy authoring."
+  plan:
+    steps:
+      - "Implement a FAC root validator."
+      - "Add to broker/worker startup and CLI entrypoints."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "FAC refuses to run if fac roots are group/world-writable or owned by unexpected user."

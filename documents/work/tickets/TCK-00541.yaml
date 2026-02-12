@@ -1,0 +1,37 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00541"
+    title: "Gate cache v3 (optional): receipt-indexed cache store keyed by attestation+policy+toolchain (fail-closed by construction)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts and bindings are required."
+      - ticket_id: "TCK-00523"
+        reason: "Attestation inputs must be fail-closed."
+  scope:
+    in_scope:
+      - "Define a v3 cache index driven by receipts rather than ad-hoc paths."
+      - "Cache hit requires: matching attestation digest + FacPolicyHash + ToolchainFingerprint + RFC-0028/0029 receipt bindings."
+      - "Provide read compatibility: can read v2 but only writes v3 in default mode."
+      - "Define GC policy and on-disk layout under `$APM2_HOME/private/fac/gate_cache_v3/`."
+    out_of_scope:
+      - "Remote cache distribution."
+  plan:
+    steps:
+      - "Define v3 index schema and storage layout."
+      - "Implement read/write paths and migrate hot entries opportunistically."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A cache hit in v3 is provably tied to an authoritative receipt and cannot be forged by simple file writes."
