@@ -280,6 +280,34 @@ let result = EcosystemConfig::from_toml(toml);
 assert!(result.is_err()); // DD-009: legacy socket rejected
 ```
 
+### `ProjectionSinkProfileConfig` (TCK-00507)
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionSinkProfileConfig {
+    pub outage_window_ticks: u64,
+    pub replay_window_ticks: u64,
+    pub churn_tolerance: u32,
+    pub partition_tolerance: u32,
+    pub trusted_signers: Vec<String>,   // Hex-encoded Ed25519 public keys
+}
+```
+
+Per-sink continuity profile for economics gate input assembly. Configured under `[daemon.projection.sinks.<sink_id>]`.
+
+**Security:** Trusted signer keys are validated eagerly at config parse time. Invalid hex, wrong key length (not 32 bytes), odd-length hex, non-hex characters, or empty signers lists prevent daemon startup.
+
+**Invariants:**
+- [INV-CFG-13] Sink count bounded by `MAX_PROJECTION_SINKS` (64).
+- [INV-CFG-14] Trusted signers per sink bounded by `MAX_TRUSTED_SIGNERS_PER_SINK` (32).
+- [INV-CFG-15] All trusted signer hex strings decode to valid 32-byte Ed25519 public keys.
+- [INV-CFG-16] Validation at startup -- not lazily at first use.
+
+**Contracts:**
+- [CTR-CFG-07] `ProjectionConfig::validate_sink_profiles()` runs at `from_toml()` time.
+- [CTR-CFG-08] Invalid signer keys produce `ConfigError::Validation`, halting daemon startup.
+
 ## Embedded Configuration Types
 
 The following types are imported from other modules and embedded in `ProcessConfig`:
@@ -307,6 +335,10 @@ INV-CFG-09  Audit retention defaults to 30 days / 1GB
 INV-CFG-10  operator_socket and session_socket are required in TOML (TCK-00280)
 INV-CFG-11  Legacy 'socket' field is rejected with DD-009 error
 INV-CFG-12  cas_path must be absolute, symlink-free, and created with mode 0700 (TCK-00383)
+INV-CFG-13  Projection sink count bounded by MAX_PROJECTION_SINKS (TCK-00507)
+INV-CFG-14  Trusted signers per sink bounded by MAX_TRUSTED_SIGNERS_PER_SINK (TCK-00507)
+INV-CFG-15  All trusted signer hex decode to valid Ed25519 public keys (TCK-00507)
+INV-CFG-16  Signer key validation runs at startup, not lazily (TCK-00507)
 ```
 
 ## Contract Summary
@@ -318,6 +350,8 @@ CTR-CFG-03  Profile IDs referenced by ProcessConfig are validated
 CTR-CFG-04  Embedded configs re-exported from respective modules
 CTR-CFG-05  ConfigError is structured for cause branching
 CTR-CFG-06  Error Display messages are stable
+CTR-CFG-07  validate_sink_profiles runs at from_toml time (TCK-00507)
+CTR-CFG-08  Invalid signer keys produce ConfigError::Validation (TCK-00507)
 ```
 
 ## Related Modules

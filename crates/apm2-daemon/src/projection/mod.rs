@@ -49,6 +49,10 @@
 //! - [`TamperResult`]: Result of handling a tamper event
 //! - [`IntentBuffer`]: Durable SQLite-backed buffer for projection intents and
 //!   deferred replay backlog (TCK-00504)
+//! - [`ConfigBackedResolver`]: Config-backed continuity profile resolver for
+//!   economics gate input assembly (TCK-00507)
+//! - [`ContinuityProfileResolver`]: Trait for resolving continuity profiles,
+//!   sink snapshots, and continuity windows
 //!
 //! # Divergence Watchdog (TCK-00213)
 //!
@@ -114,6 +118,7 @@
 //! assert!(receipt.validate_signature(&adapter.verifying_key()).is_ok());
 //! ```
 
+pub mod continuity_resolver;
 pub mod divergence_watchdog;
 pub mod github_sync;
 pub mod intent_buffer;
@@ -121,6 +126,10 @@ pub mod projection_receipt;
 pub mod worker;
 
 // Re-export main types
+pub use continuity_resolver::{
+    ConfigBackedResolver, ConfigResolverError, ContinuityProfileResolver, MAX_RESOLVED_PROFILES,
+    ResolvedContinuityProfile, ResolvedContinuityWindow,
+};
 pub use divergence_watchdog::{
     DivergenceError, DivergenceResult, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeCheck,
     FreezeCheckError, FreezeRegistry, FreezeScope, InterventionFreeze, InterventionFreezeBuilder,

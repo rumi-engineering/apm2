@@ -29,7 +29,7 @@ projection surfaces.
   authority bindings (`time_authority_ref`, `window_ref`).
 - `ProjectionReplayReceiptV1`: Signed durable receipt for replay-based
   reconstruction.
-- `SourceTrustSnapshotV1` and `SinkIdentitySnapshotV1`: Authoritative and
+- `SourceTrustSnapshotV1` and `ChannelIdentitySnapshotV1`: Authoritative and
   observed trust snapshots used for divergence and replay validation.
 - `ReplaySequenceBoundsV1`: Required contiguous replay range contract.
 - `ReconstructedProjectionState`: Deterministic replay output used to verify
