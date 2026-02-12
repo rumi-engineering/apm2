@@ -11767,6 +11767,41 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     self.persist_session_endpoint_outcome_index("emit_event", &token, result);
                 }
 
+                // ============================================================
+                // TCK-00501: Record effect completion in the journal after
+                // successful ledger persistence (EmitEvent).
+                //
+                // This transitions Started -> Completed so that a restart
+                // will NOT classify this effect as Unknown (in-doubt).
+                // Without this call, every successfully emitted event
+                // remains Started in the journal -> becomes Unknown on
+                // restart -> journal bloat + unnecessary fail-closed
+                // re-execution denials.
+                //
+                // Pattern mirrors handle_request_tool record_completed.
+                // ============================================================
+                if let Some(ref result) = admission_result {
+                    if let Some(ref journal) = result.effect_journal {
+                        if let Err(e) = journal.record_completed(&result.bundle.request_id) {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "effect journal record_completed failed for EmitEvent"
+                            );
+                            // For fail-closed tiers, completion recording failure
+                            // means restart will classify as Unknown.
+                            if result.boundary_span.enforcement_tier
+                                == crate::admission_kernel::types::EnforcementTier::FailClosed
+                            {
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    format!("effect journal completion recording failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 info!(
                     session_id = %token.session_id,
                     event_id = %signed_event.event_id,
@@ -12066,6 +12101,41 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // effect (CAS write).
         if let Some(ref result) = admission_result {
             self.persist_session_endpoint_outcome_index("publish_evidence", &token, result);
+        }
+
+        // ================================================================
+        // TCK-00501: Record effect completion in the journal after
+        // successful CAS persistence (PublishEvidence).
+        //
+        // This transitions Started -> Completed so that a restart
+        // will NOT classify this effect as Unknown (in-doubt).
+        // Without this call, every successfully published evidence
+        // artifact remains Started in the journal -> becomes Unknown
+        // on restart -> journal bloat + unnecessary fail-closed
+        // re-execution denials.
+        //
+        // Pattern mirrors handle_request_tool record_completed.
+        // ================================================================
+        if let Some(ref result) = admission_result {
+            if let Some(ref journal) = result.effect_journal {
+                if let Err(e) = journal.record_completed(&result.bundle.request_id) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_completed failed for PublishEvidence"
+                    );
+                    // For fail-closed tiers, completion recording failure
+                    // means restart will classify as Unknown.
+                    if result.boundary_span.enforcement_tier
+                        == crate::admission_kernel::types::EnforcementTier::FailClosed
+                    {
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorInternal,
+                            format!("effect journal completion recording failed: {e}"),
+                        ));
+                    }
+                }
+            }
         }
 
         // Build storage path using hash prefix sharding (consistent with DurableCas)
@@ -26279,6 +26349,564 @@ mod tests {
                     );
                 },
             }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00501: Effect journal record_completed for session endpoints
+    // ========================================================================
+
+    mod tck_00501_session_endpoint_record_completed {
+        use std::time::Duration;
+
+        use secrecy::SecretString;
+
+        use super::*;
+        use crate::admission_kernel::QuarantineGuard;
+        use crate::admission_kernel::prerequisites::{
+            AntiRollbackAnchor, ExternalAnchorStateV1, LedgerAnchorV1, LedgerTrustVerifier,
+            PolicyError, PolicyRootResolver, PolicyRootStateV1, TrustError, ValidatedLedgerStateV1,
+        };
+        use crate::episode::InMemorySessionRegistry;
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::protocol::credentials::PeerCredentials;
+        use crate::protocol::dispatch::StubLedgerEventEmitter;
+        use crate::session::{SessionRegistry, SessionState};
+
+        fn test_hash(byte: u8) -> apm2_core::crypto::Hash {
+            let mut h = [0u8; 32];
+            h[0] = byte;
+            h[31] = byte;
+            h
+        }
+
+        fn test_minter() -> TokenMinter {
+            TokenMinter::new(SecretString::from("test-daemon-secret-key-32bytes!!"))
+        }
+
+        fn test_token(minter: &TokenMinter) -> SessionToken {
+            let spawn_time = SystemTime::now();
+            let ttl = Duration::from_secs(3600);
+            minter
+                .mint("session-001", "lease-001", spawn_time, ttl)
+                .unwrap()
+        }
+
+        fn make_session_ctx() -> ConnectionContext {
+            ConnectionContext::session_open(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some("session-001".to_string()),
+            )
+        }
+
+        fn register_session(
+            registry: &Arc<InMemorySessionRegistry>,
+            session_id: &str,
+        ) -> Arc<dyn SessionRegistry> {
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-TCK-00501".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-tck-00501".to_string(),
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: blake3::hash(b"tck-00501-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration should succeed");
+            Arc::clone(registry) as Arc<dyn SessionRegistry>
+        }
+
+        // ---- Passing kernel prerequisites ----
+
+        struct PassingPcacKernel;
+        impl apm2_core::pcac::AuthorityJoinKernel for PassingPcacKernel {
+            fn join(
+                &self,
+                _input: &apm2_core::pcac::AuthorityJoinInputV1,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
+            ) -> Result<
+                apm2_core::pcac::AuthorityJoinCertificateV1,
+                Box<apm2_core::pcac::AuthorityDenyV1>,
+            > {
+                Ok(apm2_core::pcac::AuthorityJoinCertificateV1 {
+                    ajc_id: test_hash(0x60),
+                    authority_join_hash: test_hash(0x61),
+                    intent_digest: test_hash(0x03),
+                    boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
+                    risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                    issued_time_envelope_ref: test_hash(0x62),
+                    issued_at_tick: 40,
+                    as_of_ledger_anchor: test_hash(0x63),
+                    expires_at_tick: 999_999,
+                    revocation_head_hash: test_hash(0x64),
+                    identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                    admission_capacity_token: None,
+                })
+            }
+            fn revalidate(
+                &self,
+                _cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
+                _time: apm2_core::crypto::Hash,
+                _ledger: apm2_core::crypto::Hash,
+                _revocation: apm2_core::crypto::Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
+            ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
+                Ok(())
+            }
+            fn consume(
+                &self,
+                cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
+                _intent: apm2_core::crypto::Hash,
+                _class: apm2_core::pcac::BoundaryIntentClass,
+                _requires_auth: bool,
+                _time: apm2_core::crypto::Hash,
+                _revocation: apm2_core::crypto::Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
+            ) -> Result<
+                (
+                    apm2_core::pcac::AuthorityConsumedV1,
+                    apm2_core::pcac::AuthorityConsumeRecordV1,
+                ),
+                Box<apm2_core::pcac::AuthorityDenyV1>,
+            > {
+                Ok((
+                    apm2_core::pcac::AuthorityConsumedV1 {
+                        ajc_id: cert.ajc_id,
+                        intent_digest: test_hash(0x03),
+                        consumed_time_envelope_ref: test_hash(0x71),
+                        consumed_at_tick: 45,
+                    },
+                    apm2_core::pcac::AuthorityConsumeRecordV1 {
+                        ajc_id: cert.ajc_id,
+                        consumed_time_envelope_ref: test_hash(0x71),
+                        consumed_at_tick: 45,
+                        effect_selector_digest: test_hash(0x72),
+                    },
+                ))
+            }
+        }
+
+        struct PassingLedgerVerifier;
+        impl LedgerTrustVerifier for PassingLedgerVerifier {
+            fn validated_state(&self) -> Result<ValidatedLedgerStateV1, TrustError> {
+                Ok(ValidatedLedgerStateV1 {
+                    validated_anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    tip_anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    ledger_keyset_digest: test_hash(0x23),
+                    root_trust_bundle_digest: test_hash(0x24),
+                })
+            }
+        }
+
+        struct PassingPolicyResolver;
+        impl PolicyRootResolver for PassingPolicyResolver {
+            fn resolve(
+                &self,
+                _as_of: &LedgerAnchorV1,
+            ) -> Result<crate::admission_kernel::prerequisites::PolicyRootStateV1, PolicyError>
+            {
+                Ok(PolicyRootStateV1 {
+                    policy_root_digest: test_hash(0x30),
+                    policy_root_epoch: 5,
+                    anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    provenance: crate::admission_kernel::prerequisites::GovernanceProvenanceV1 {
+                        signer_key_id: test_hash(0x31),
+                        algorithm_id: "ed25519".to_string(),
+                    },
+                })
+            }
+        }
+
+        struct PassingAntiRollback;
+        impl AntiRollbackAnchor for PassingAntiRollback {
+            fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+                Ok(ExternalAnchorStateV1 {
+                    anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    mechanism_id: "test".to_string(),
+                    proof_hash: test_hash(0x40),
+                })
+            }
+            fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                Ok(())
+            }
+        }
+
+        struct PassingQuarantineGuardImpl;
+        impl QuarantineGuard for PassingQuarantineGuardImpl {
+            fn reserve(
+                &self,
+                _session_id: &str,
+                _request_id: &apm2_core::crypto::Hash,
+                _ajc_id: &apm2_core::crypto::Hash,
+            ) -> Result<apm2_core::crypto::Hash, String> {
+                Ok(test_hash(0x70))
+            }
+        }
+
+        // ---- MockEffectJournal with Arc-shared inspection ----
+
+        struct MockEffectJournal {
+            entries: std::sync::Mutex<
+                std::collections::HashMap<
+                    apm2_core::crypto::Hash,
+                    crate::admission_kernel::effect_journal::EffectExecutionState,
+                >,
+            >,
+            bindings: std::sync::Mutex<
+                std::collections::HashMap<
+                    apm2_core::crypto::Hash,
+                    crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                >,
+            >,
+        }
+
+        impl MockEffectJournal {
+            fn new() -> Self {
+                Self {
+                    entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
+                }
+            }
+
+            /// Returns all entries that are in Completed state.
+            fn completed_count(&self) -> usize {
+                self.entries
+                    .lock()
+                    .expect("lock")
+                    .values()
+                    .filter(|s| {
+                        **s == crate::admission_kernel::effect_journal::EffectExecutionState::Completed
+                    })
+                    .count()
+            }
+
+            /// Returns all entries that are in Started state.
+            fn started_count(&self) -> usize {
+                self.entries
+                    .lock()
+                    .expect("lock")
+                    .values()
+                    .filter(|s| {
+                        **s == crate::admission_kernel::effect_journal::EffectExecutionState::Started
+                    })
+                    .count()
+            }
+        }
+
+        impl crate::admission_kernel::effect_journal::EffectJournal for MockEffectJournal {
+            fn record_started(
+                &self,
+                binding: &crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+            ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+            {
+                binding.validate()?;
+                let mut entries = self.entries.lock().expect("lock");
+                entries.insert(
+                    binding.request_id,
+                    crate::admission_kernel::effect_journal::EffectExecutionState::Started,
+                );
+                self.bindings
+                    .lock()
+                    .expect("lock")
+                    .insert(binding.request_id, binding.clone());
+                Ok(())
+            }
+
+            fn record_completed(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+            ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+            {
+                let mut entries = self.entries.lock().expect("lock");
+                entries.insert(
+                    *request_id,
+                    crate::admission_kernel::effect_journal::EffectExecutionState::Completed,
+                );
+                Ok(())
+            }
+
+            fn query_state(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+            ) -> crate::admission_kernel::effect_journal::EffectExecutionState {
+                self.entries
+                    .lock()
+                    .expect("lock")
+                    .get(request_id)
+                    .copied()
+                    .unwrap_or(
+                        crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted,
+                    )
+            }
+
+            fn query_binding(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+            ) -> Option<crate::admission_kernel::effect_journal::EffectJournalBindingV1>
+            {
+                self.bindings.lock().expect("lock").get(request_id).cloned()
+            }
+
+            fn resolve_in_doubt(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+                _boundary_confirms_not_executed: bool,
+            ) -> Result<
+                crate::admission_kernel::effect_journal::InDoubtResolutionV1,
+                crate::admission_kernel::effect_journal::EffectJournalError,
+            > {
+                Err(
+                    crate::admission_kernel::effect_journal::EffectJournalError::ReExecutionDenied {
+                        request_id: *request_id,
+                        enforcement_tier:
+                            crate::admission_kernel::types::EnforcementTier::FailClosed,
+                        declared_idempotent: false,
+                        reason: "mock: not implemented".into(),
+                    },
+                )
+            }
+
+            fn len(&self) -> usize {
+                self.entries.lock().expect("lock").len()
+            }
+        }
+
+        /// Build a kernel with the given mock journal.
+        fn build_kernel(
+            mock_journal: Arc<MockEffectJournal>,
+        ) -> Arc<crate::admission_kernel::AdmissionKernelV1> {
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(PassingPcacKernel);
+            let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
+                provider_id: "test-provider/tck-00501".to_string(),
+                provider_build_digest: *blake3::hash(b"test-build-digest-501").as_bytes(),
+            };
+            Arc::new(
+                crate::admission_kernel::AdmissionKernelV1::new(pcac_kernel, witness_cfg)
+                    .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
+                    .with_policy_resolver(Arc::new(PassingPolicyResolver))
+                    .with_anti_rollback(Arc::new(PassingAntiRollback))
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuardImpl))
+                    .with_effect_journal(mock_journal),
+            )
+        }
+
+        /// Seed a governance policy event in the ledger so the kernel path
+        /// can resolve the authoritative policy root digest.
+        fn seed_governance_event(ledger: &StubLedgerEventEmitter) {
+            let policy_hash = test_hash(0x30); // Matches PassingPolicyResolver
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-TCK-00501-GOVERNANCE".to_string(),
+                    policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emission should succeed");
+        }
+
+        // ----------------------------------------------------------------
+        // TCK-00501 BLOCKER: EmitEvent must call record_completed
+        // ----------------------------------------------------------------
+
+        /// **TCK-00501**: After a successful `EmitEvent` through the
+        /// `AdmissionKernel` path, the journal state for the request MUST
+        /// be `Completed`, not `Started`.
+        ///
+        /// Before this fix, the journal entry stayed `Started` indefinitely,
+        /// becoming `Unknown` on restart, causing journal bloat and
+        /// unnecessary fail-closed re-execution denials.
+        #[test]
+        fn emit_event_records_completed_in_effect_journal() {
+            let minter = test_minter();
+            let mock_journal = Arc::new(MockEffectJournal::new());
+
+            let kernel = build_kernel(Arc::clone(&mock_journal));
+
+            let ledger = StubLedgerEventEmitter::new();
+            seed_governance_event(&ledger);
+            let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(ledger);
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let clock = Arc::new(
+                crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                    .expect("test clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_dyn)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload-for-journal".to_vec(),
+                correlation_id: "corr-journal-001".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                SessionResponse::EmitEvent(resp) => {
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "EmitEvent must return a non-empty event_id"
+                    );
+                },
+                SessionResponse::Error(err) => {
+                    panic!(
+                        "EmitEvent should succeed through kernel path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected EmitEvent response, got: {other:?}"),
+            }
+
+            // CRITICAL ASSERTION: journal must have transitioned to Completed.
+            assert_eq!(
+                mock_journal.completed_count(),
+                1,
+                "After successful EmitEvent, exactly 1 journal entry must be \
+                 Completed (not Started). Found {} completed, {} started.",
+                mock_journal.completed_count(),
+                mock_journal.started_count()
+            );
+            assert_eq!(
+                mock_journal.started_count(),
+                0,
+                "No journal entries should remain in Started state after \
+                 successful EmitEvent. Found {} still Started.",
+                mock_journal.started_count()
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // TCK-00501 BLOCKER: PublishEvidence must call record_completed
+        // ----------------------------------------------------------------
+
+        /// **TCK-00501**: After a successful `PublishEvidence` through the
+        /// `AdmissionKernel` path, the journal state for the request MUST
+        /// be `Completed`, not `Started`.
+        #[test]
+        fn publish_evidence_records_completed_in_effect_journal() {
+            let minter = test_minter();
+            let mock_journal = Arc::new(MockEffectJournal::new());
+
+            let kernel = build_kernel(Arc::clone(&mock_journal));
+
+            let ledger = StubLedgerEventEmitter::new();
+            seed_governance_event(&ledger);
+            let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(ledger);
+
+            let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let clock = Arc::new(
+                crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                    .expect("test clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_dyn)
+                .with_cas(cas)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-for-journal".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                SessionResponse::PublishEvidence(resp) => {
+                    assert!(
+                        !resp.artifact_hash.is_empty(),
+                        "PublishEvidence must return a non-empty artifact_hash"
+                    );
+                },
+                SessionResponse::Error(err) => {
+                    panic!(
+                        "PublishEvidence should succeed through kernel path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected PublishEvidence response, got: {other:?}"),
+            }
+
+            // CRITICAL ASSERTION: journal must have transitioned to Completed.
+            assert_eq!(
+                mock_journal.completed_count(),
+                1,
+                "After successful PublishEvidence, exactly 1 journal entry must \
+                 be Completed (not Started). Found {} completed, {} started.",
+                mock_journal.completed_count(),
+                mock_journal.started_count()
+            );
+            assert_eq!(
+                mock_journal.started_count(),
+                0,
+                "No journal entries should remain in Started state after \
+                 successful PublishEvidence. Found {} still Started.",
+                mock_journal.started_count()
+            );
         }
     }
 }

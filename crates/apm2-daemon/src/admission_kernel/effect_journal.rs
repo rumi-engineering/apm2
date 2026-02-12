@@ -89,6 +89,17 @@ const MAX_TOOL_CLASS_LENGTH: usize = 128;
 /// Maximum length for the session ID field in journal entries.
 const MAX_SESSION_ID_LENGTH: usize = 256;
 
+/// Maximum length for a single journal line during replay (denial-of-service
+/// prevention).
+///
+/// A well-formed `Started` line is: `S <64-hex> <JSON binding>`. The JSON
+/// binding contains bounded fields (`MAX_BOUNDARY_PROFILE_LENGTH`=128,
+/// `MAX_SESSION_ID_LENGTH`=256, `MAX_TOOL_CLASS_LENGTH`=128) plus fixed-size
+/// hex hashes. 64 KiB is generous for any legitimate entry while still
+/// preventing memory exhaustion from a malicious/corrupted journal file
+/// containing an extremely long line.
+const MAX_JOURNAL_LINE_LEN: usize = 64_000;
+
 // =============================================================================
 // EffectExecutionState
 // =============================================================================
@@ -340,6 +351,20 @@ impl EffectJournalBindingV1 {
         if self.authority_join_hash == ZERO {
             return Err(EffectJournalError::ValidationError {
                 reason: "authority_join_hash is zero".into(),
+            });
+        }
+        // TCK-00501 NIT: Validate witness seed hashes for zero-ness,
+        // consistent with other digest validation in this method.
+        // Zero witness seed hashes indicate missing/corrupted derivation
+        // binding data.
+        if self.leakage_witness_seed_hash == ZERO {
+            return Err(EffectJournalError::ValidationError {
+                reason: "leakage_witness_seed_hash is zero".into(),
+            });
+        }
+        if self.timing_witness_seed_hash == ZERO {
+            return Err(EffectJournalError::ValidationError {
+                reason: "timing_witness_seed_hash is zero".into(),
             });
         }
         if self.boundary_profile_id.is_empty()
@@ -698,18 +723,47 @@ impl FileBackedEffectJournal {
         })?;
 
         // Replay existing entries in streaming fashion.
+        // SECURITY: Use bounded read_line instead of unbounded
+        // reader.lines() to prevent memory exhaustion from a
+        // malicious/corrupted journal file with an extremely long line
+        // (DoS: RSK-1601, CTR-1603).
         let mut needs_truncate_to: Option<u64> = None;
         {
             let mut replay = file.try_clone()?;
             replay.seek(SeekFrom::Start(0))?;
-            let reader = BufReader::new(&mut replay);
+            let mut reader = BufReader::new(&mut replay);
 
             let mut byte_offset: u64 = 0;
             let mut line_idx: usize = 0;
             let mut pending_error: Option<(usize, u64, String)> = None;
+            let mut line = String::new();
 
-            for line_result in reader.lines() {
-                let line = line_result?;
+            loop {
+                line.clear();
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read == 0 {
+                    break; // EOF
+                }
+                // DoS prevention: reject oversized lines before any
+                // further processing. A legitimate journal line is well
+                // under MAX_JOURNAL_LINE_LEN; exceeding it indicates
+                // corruption or adversarial tampering.
+                if line.len() > MAX_JOURNAL_LINE_LEN {
+                    return Err(EffectJournalError::CorruptEntry {
+                        line: line_idx + 1,
+                        reason: format!(
+                            "journal line exceeds maximum length ({} > {MAX_JOURNAL_LINE_LEN})",
+                            line.len()
+                        ),
+                    });
+                }
+
+                // Strip trailing newline for consistent trimming.
+                let content = if line.ends_with('\n') {
+                    &line[..line.len() - 1]
+                } else {
+                    &line
+                };
 
                 // Mid-file corruption detection: if a previous line had a
                 // parse error and we have more lines after it, fail closed.
@@ -720,8 +774,8 @@ impl FileBackedEffectJournal {
                     });
                 }
 
-                let trimmed = line.trim();
-                let line_byte_len = (line.len() + 1) as u64; // +1 for newline
+                let trimmed = content.trim();
+                let line_byte_len = line.len() as u64;
 
                 if trimmed.is_empty() {
                     byte_offset += line_byte_len;
@@ -1137,6 +1191,14 @@ fn parse_journal_line(line: &str) -> Result<(char, Hash, Option<EffectJournalBin
 
             let binding: EffectJournalBindingV1 = serde_json::from_str(json_part)
                 .map_err(|e| format!("failed to parse binding JSON: {e}"))?;
+
+            // TCK-00501 MINOR: Validate replayed binding to prevent
+            // loading invalid/oversized entries into the in-memory index.
+            // Without this, a corrupted journal file could inject entries
+            // with zero hashes, empty strings, or oversized fields.
+            binding
+                .validate()
+                .map_err(|e| format!("binding validation failed: {e}"))?;
 
             Ok((TAG_STARTED, request_id, Some(binding)))
         },
@@ -2008,5 +2070,159 @@ mod tests {
             mode, 0o600,
             "journal file must be created with mode 0o600 (owner-only); got: {mode:o}"
         );
+    }
+
+    // =========================================================================
+    // TCK-00501: Bounded journal line read (DoS prevention)
+    // =========================================================================
+
+    /// A journal file containing a line exceeding `MAX_JOURNAL_LINE_LEN`
+    /// must be rejected with `CorruptEntry` during replay, preventing
+    /// memory exhaustion from a malicious/corrupted journal.
+    #[test]
+    fn replay_rejects_oversized_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        // Write a line that exceeds MAX_JOURNAL_LINE_LEN.
+        // Use a valid-looking prefix so the rejection is from length,
+        // not from parsing.
+        let oversized_line = format!("S {}\n", "a".repeat(MAX_JOURNAL_LINE_LEN + 10));
+        std::fs::write(&path, oversized_line).unwrap();
+
+        let err = FileBackedEffectJournal::open(&path).unwrap_err();
+        match err {
+            EffectJournalError::CorruptEntry { line, reason } => {
+                assert_eq!(line, 1, "error must reference the oversized line");
+                assert!(
+                    reason.contains("exceeds maximum length"),
+                    "error must mention max length: {reason}"
+                );
+            },
+            other => panic!("expected CorruptEntry for oversized line, got: {other:?}"),
+        }
+    }
+
+    /// A journal file with lines within `MAX_JOURNAL_LINE_LEN` must
+    /// replay successfully (regression: bounded reads must not reject
+    /// legitimate entries).
+    #[test]
+    fn replay_accepts_normal_length_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        // Write a valid Started + Completed pair.
+        let request_id = test_hash(0xAA);
+        let binding = test_binding(request_id, false);
+        let hex_id = hex::encode(request_id);
+        let json = serde_json::to_string(&binding).unwrap();
+
+        // Verify the line is under the limit.
+        let started_line = format!("S {hex_id} {json}\n");
+        assert!(
+            started_line.len() < MAX_JOURNAL_LINE_LEN,
+            "test line must be under limit"
+        );
+
+        let completed_line = format!("C {hex_id}\n");
+        let content = format!("{started_line}{completed_line}");
+        std::fs::write(&path, content).unwrap();
+
+        let journal = FileBackedEffectJournal::open(&path)
+            .expect("normal-length lines must replay successfully");
+        assert_eq!(
+            journal.query_state(&request_id),
+            EffectExecutionState::Completed,
+            "replayed entry must be Completed"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00501: Binding validation on replay (MINOR fix)
+    // =========================================================================
+
+    /// A journal file containing a Started entry with an invalid binding
+    /// (e.g., zero `request_digest`) must be rejected during replay.
+    ///
+    /// Note: A single invalid line as the only/last line is treated as
+    /// a torn tail (truncated, not an error). To trigger mid-file
+    /// corruption detection, a second valid line must follow.
+    #[test]
+    fn replay_rejects_invalid_binding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        let request_id = test_hash(0xBB);
+        let mut binding = test_binding(request_id, false);
+        // Corrupt the binding: set request_digest to zero.
+        binding.request_digest = [0u8; 32];
+        let hex_id = hex::encode(request_id);
+        let json = serde_json::to_string(&binding).unwrap();
+
+        // A second valid line after the invalid one triggers mid-file
+        // corruption detection (single-line errors are treated as torn
+        // tail and truncated).
+        let valid_id = test_hash(0xCC);
+        let valid_binding = test_binding(valid_id, false);
+        let valid_hex_id = hex::encode(valid_id);
+        let valid_json = serde_json::to_string(&valid_binding).unwrap();
+
+        let content = format!("S {hex_id} {json}\nS {valid_hex_id} {valid_json}\n");
+        std::fs::write(&path, content).unwrap();
+
+        let err = FileBackedEffectJournal::open(&path).unwrap_err();
+        match err {
+            EffectJournalError::CorruptEntry { reason, .. } => {
+                assert!(
+                    reason.contains("binding validation failed"),
+                    "error must mention binding validation: {reason}"
+                );
+            },
+            other => panic!("expected CorruptEntry for invalid binding, got: {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // TCK-00501: Witness seed hash zero-check (NIT fix)
+    // =========================================================================
+
+    /// A binding with a zero `leakage_witness_seed_hash` must fail
+    /// validation.
+    #[test]
+    fn validate_rejects_zero_leakage_witness_seed_hash() {
+        let request_id = test_hash(0xCC);
+        let mut binding = test_binding(request_id, false);
+        binding.leakage_witness_seed_hash = [0u8; 32];
+
+        let err = binding.validate().unwrap_err();
+        match err {
+            EffectJournalError::ValidationError { reason } => {
+                assert!(
+                    reason.contains("leakage_witness_seed_hash"),
+                    "error must identify the zero field: {reason}"
+                );
+            },
+            other => panic!("expected ValidationError, got: {other:?}"),
+        }
+    }
+
+    /// A binding with a zero `timing_witness_seed_hash` must fail
+    /// validation.
+    #[test]
+    fn validate_rejects_zero_timing_witness_seed_hash() {
+        let request_id = test_hash(0xDD);
+        let mut binding = test_binding(request_id, false);
+        binding.timing_witness_seed_hash = [0u8; 32];
+
+        let err = binding.validate().unwrap_err();
+        match err {
+            EffectJournalError::ValidationError { reason } => {
+                assert!(
+                    reason.contains("timing_witness_seed_hash"),
+                    "error must identify the zero field: {reason}"
+                );
+            },
+            other => panic!("expected ValidationError, got: {other:?}"),
+        }
     }
 }
