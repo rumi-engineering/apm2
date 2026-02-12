@@ -35,6 +35,7 @@
 
 pub mod capabilities;
 pub mod prerequisites;
+pub mod trust_stack;
 pub mod types;
 
 #[cfg(test)]

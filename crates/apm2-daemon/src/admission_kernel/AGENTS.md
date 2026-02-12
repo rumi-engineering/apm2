@@ -112,7 +112,40 @@ Capability tokens with `pub(super)` constructors. Non-cloneable, non-copyable, `
 
 ### `LedgerTrustVerifier`, `PolicyRootResolver`, `AntiRollbackAnchor` (prerequisites.rs)
 
-Trait interfaces for prerequisite resolution. Implementations provided by TCK-00500.
+Trait interfaces for prerequisite resolution. Concrete implementations provided by the `trust_stack` submodule (TCK-00500).
+
+### `trust_stack` submodule (trust_stack/mod.rs, TCK-00500)
+
+Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prerequisite traits, plus supporting infrastructure:
+
+- **`RootTrustBundle`**: Bounded trust anchor with crypto-agile key entries (algorithm ID + key ID + public key bytes). `deny_unknown_fields` serde, domain-separated BLAKE3 content hash. Max 64 keys (`MAX_TRUST_BUNDLE_KEYS`). Supports key rotation/revocation with `active_from_epoch` (inclusive) and `revoked_at_epoch` (exclusive).
+- **`TrustBundleKeyEntry`**: Individual key entry with epoch-aware `is_active_at()` validity check.
+- **`TrustedSealV1`**: Ledger event payload committing to `LedgerAnchorV1` with signature provenance chaining to the `RootTrustBundle`. Canonical `signing_payload()` for deterministic verification.
+- **`ConcreteLedgerTrustVerifier`**: Implements `LedgerTrustVerifier`. Performs checkpoint-bounded startup verification: seal location, seal signature verification, hash chain integrity, HT monotonicity, max seal-to-tip distance enforcement, optional full-chain fallback. Write-once state behind `RwLock<VerifiedState>`.
+- **`GovernancePolicyRootResolver`**: Implements `PolicyRootResolver`. Derives `PolicyRootStateV1` deterministically from governance-class events up to a given `LedgerAnchorV1`. Bounded LRU cache (`MAX_POLICY_ROOT_CACHE_ENTRIES` = 64). Rejects unsigned governance events (fail-closed).
+- **`SignatureVerifier`** trait: Crypto-agile dispatch. Unknown algorithms return `Err` (fail-closed).
+- **`Ed25519SignatureVerifier`**: Default `SignatureVerifier` implementation for ed25519.
+- **`LedgerEventSource`** trait: Abstraction over ledger reads for startup verification and governance event scanning.
+
+**Invariants:**
+
+- [INV-TS01] `RootTrustBundle` is bounded by `MAX_TRUST_BUNDLE_KEYS` (64). Empty bundles are rejected.
+- [INV-TS02] Key IDs must be unique within a bundle.
+- [INV-TS03] Event signature key validity is resolved per-event at the event's `he_time` epoch, not the seal epoch, to correctly handle post-seal key rotations (never "always latest keyset").
+- [INV-TS04] Seal signature must chain to an active key in the `RootTrustBundle` at `seal_epoch`.
+- [INV-TS05] Hash chain integrity is verified with constant-time comparisons (`subtle::ConstantTimeEq`).
+- [INV-TS06] HT monotonicity is enforced (non-decreasing `he_time`).
+- [INV-TS07] Seal-to-tip distance exceeding `max_seal_to_tip_distance` fails closed unless `allow_full_chain_fallback` is enabled.
+- [INV-TS08] Governance events MUST be signed; unsigned events are rejected.
+- [INV-TS09] Policy root cache is bounded by `MAX_POLICY_ROOT_CACHE_ENTRIES` (64) with oldest-epoch eviction.
+- [INV-TS10] All `usize` to `u32` casts in hash functions are safe because input lengths are bounded by MAX_* constants.
+- [INV-TS11] Chain segment verification binds the first event's `event_hash` to the seal's committed anchor hash (constant-time comparison). Prevents fork substitution.
+- [INV-TS12] Incomplete chain reads (event source returns empty before `end_height`) fail closed with `IntegrityFailure`. No silent acceptance of truncated chains.
+- [INV-TS13] Chain segment verification enforces strict height continuity: each event's height must equal the expected next height (no gaps, no duplicates, no backward jumps).
+- [INV-TS14] Full-chain fallback path validates the seal's anchor `event_hash` at `seal_height` AFTER completing `verify_chain_segment`. An internally valid but unrelated chain is rejected.
+- [INV-TS15] Governance event truncation is fail-closed: if `read_governance_events` returns `>= MAX_GOVERNANCE_EVENTS_PER_DERIVATION` events, `derive_policy_root` returns `DerivationFailed` (no silent partial derivation).
+- [INV-TS16] `content_hash()` and `active_keyset_digest()` sort keys by `key_id` before hashing to ensure deterministic output regardless of vector insertion order.
+- [INV-TS17] `RootTrustBundle::validate()` enforces `schema_version == ROOT_TRUST_BUNDLE_SCHEMA_VERSION` as the first check. Unknown/future schema versions are rejected.
 
 ### `QuarantineGuard` (mod.rs)
 
@@ -186,6 +219,7 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 
 ## Related Modules
 
+- [`admission_kernel::trust_stack`](trust_stack/mod.rs) -- `ConcreteLedgerTrustVerifier`, `GovernancePolicyRootResolver`, `RootTrustBundle` (TCK-00500)
 - [`apm2_daemon::quarantine_store`](../quarantine_store/AGENTS.md) -- `DurableQuarantineGuard` (TCK-00496)
 - [`apm2_daemon::pcac`](../pcac/AGENTS.md) -- PCAC lifecycle gate (`InProcessKernel`, `LifecycleGate`)
 - [`apm2_core::pcac`](../../../apm2-core/src/pcac/AGENTS.md) -- Core PCAC types (`AuthorityJoinKernel`, `RiskTier`, etc.)
@@ -212,3 +246,5 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 - TCK-00493: Implementation ticket (bundle + outcome index)
 - TCK-00494: Implementation ticket (handler refactoring + kernel wiring)
 - TCK-00497: Implementation ticket (witness closure -- post-effect evidence, monitor waivers, boundary output gating)
+- TCK-00500: Implementation ticket (ledger trust stack -- RootTrustBundle, trusted seals, checkpoint-bounded startup, governance-derived PolicyRootResolver)
+- REQ-0028: Ledger trust stack requirements
