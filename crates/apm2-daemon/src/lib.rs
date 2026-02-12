@@ -29,6 +29,8 @@
 //!
 //! # Modules
 //!
+//! - [`admission_kernel`]: `AdmissionKernel` plan/execute API with
+//!   capability-gated effect surfaces (RFC-0019 REQ-0023, TCK-00492)
 //! - [`episode`]: Episode runtime for bounded execution management
 //! - [`evidence`]: Flight recording and evidence retention
 //! - [`gate`]: Gate execution orchestrator for autonomous gate lifecycle
@@ -46,6 +48,7 @@
 //!   `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) for RFC-0020
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
+pub mod admission_kernel;
 pub mod cas;
 pub mod episode;
 pub mod evidence;
