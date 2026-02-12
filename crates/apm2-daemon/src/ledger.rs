@@ -2146,6 +2146,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         channel_key: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        receipt_hash: &[u8; 32],
+        admission_bundle_digest: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const RECEIPT_CONSUMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.redundancy_receipt_consumed:";
         let payload = serde_json::json!({
@@ -2159,6 +2161,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "channel_key": channel_key,
             "actor_id": actor_id,
             "timestamp_ns": timestamp_ns,
+            "receipt_hash": hex::encode(receipt_hash),
+            "admission_bundle_digest": hex::encode(admission_bundle_digest),
         });
 
         let conn = self
@@ -2187,6 +2191,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             tool_class = %tool_class,
             intent_digest = %hex::encode(intent_digest),
             channel_key = %channel_key,
+            receipt_hash = %hex::encode(receipt_hash),
+            admission_bundle_digest = %hex::encode(admission_bundle_digest),
             "Persisted RedundancyReceiptConsumed event"
         );
         Ok(signed_event)
@@ -2228,6 +2234,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                 .get("channel_key")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            receipt_hash: parse_hash32(payload.get("receipt_hash")),
+            admission_bundle_digest: parse_hash32(payload.get("admission_bundle_digest")),
         })
     }
 
@@ -6050,6 +6058,8 @@ mod tests {
                 "session-001::inference",
                 "session-consume-001",
                 1_700_000_000_000_000_101,
+                &[0xC3; 32],
+                &[0xD4; 32],
             )
             .expect("consumption event should succeed for same receipt_id as review receipt");
 
@@ -6063,6 +6073,16 @@ mod tests {
         assert_eq!(
             consumption.channel_key.as_deref(),
             Some("session-001::inference")
+        );
+        assert_eq!(
+            consumption.receipt_hash,
+            Some([0xC3; 32]),
+            "receipt_hash must be persisted and readable"
+        );
+        assert_eq!(
+            consumption.admission_bundle_digest,
+            Some([0xD4; 32]),
+            "admission_bundle_digest must be persisted and readable"
         );
     }
 

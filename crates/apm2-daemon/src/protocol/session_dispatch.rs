@@ -1301,6 +1301,8 @@ struct PendingRedundancyReceiptConsumption {
     intent_digest: Hash,
     argument_content_digest: Hash,
     channel_key: String,
+    /// BLAKE3 hash binding receipt identity fields at resolution time.
+    receipt_hash: Hash,
 }
 
 #[derive(Debug, Clone)]
@@ -3386,6 +3388,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         request_scope_intent_digest: Hash,
         argument_content_digest: Hash,
         channel_key: &str,
+        receipt_hash: &Hash,
+        admission_bundle_digest: &Hash,
     ) -> bool {
         let Some(ledger) = self.ledger.as_ref() else {
             return false;
@@ -3411,6 +3415,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             channel_key,
             session_id,
             timestamp_ns,
+            receipt_hash,
+            admission_bundle_digest,
         );
         persisted.is_ok()
     }
@@ -7541,6 +7547,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         intent_digest: request_scope_intent_digest,
                         argument_content_digest,
                         channel_key: boundary_channel_key.clone(),
+                        receipt_hash: authority.receipt_hash,
                     }
                 }),
             })
@@ -9123,6 +9130,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             redundancy_receipt.intent_digest,
                             redundancy_receipt.argument_content_digest,
                             &redundancy_receipt.channel_key,
+                            &redundancy_receipt.receipt_hash,
+                            &pending_pcac.certificate.ajc_id,
                         ) {
                             warn!(
                                 session_id = %session_id,
@@ -13076,6 +13085,11 @@ mod tests {
                 &channel_key,
                 first_argument_digest,
             );
+        let test_receipt_hash =
+            SessionDispatcher::<InMemoryManifestStore>::derive_declassification_receipt_hash(
+                receipt_id, lease_id, work_id, true, false,
+            );
+        let test_ajc_id = *blake3::hash(b"test-ajc-replay-001").as_bytes();
         assert!(
             dispatcher.consume_redundancy_receipt(
                 session_id,
@@ -13085,6 +13099,8 @@ mod tests {
                 first_intent_digest,
                 first_argument_digest,
                 &channel_key,
+                &test_receipt_hash,
+                &test_ajc_id,
             ),
             "first request must consume redundancy receipt after boundary admission",
         );
@@ -13241,6 +13257,11 @@ mod tests {
                 &channel_key,
                 first_argument_digest,
             );
+        let test_receipt_hash =
+            SessionDispatcher::<InMemoryManifestStore>::derive_declassification_receipt_hash(
+                receipt_id, lease_id, work_id, true, false,
+            );
+        let test_ajc_id = *blake3::hash(b"test-ajc-restart-001").as_bytes();
         assert!(
             dispatcher_before_restart.consume_redundancy_receipt(
                 session_id,
@@ -13250,6 +13271,8 @@ mod tests {
                 first_intent_digest,
                 first_argument_digest,
                 &channel_key,
+                &test_receipt_hash,
+                &test_ajc_id,
             ),
             "first request must persist receipt consumption before restart simulation",
         );
@@ -13388,6 +13411,11 @@ mod tests {
             intent_a, intent_b,
             "test setup requires distinct intent digests"
         );
+        let test_receipt_hash =
+            SessionDispatcher::<InMemoryManifestStore>::derive_declassification_receipt_hash(
+                receipt_id, lease_id, work_id, true, false,
+            );
+        let test_ajc_id = *blake3::hash(b"test-ajc-intent-001").as_bytes();
         assert!(
             dispatcher.consume_redundancy_receipt(
                 session_id,
@@ -13397,6 +13425,8 @@ mod tests {
                 intent_a,
                 digest_a,
                 &channel_key,
+                &test_receipt_hash,
+                &test_ajc_id,
             ),
             "first intent must persist receipt consumption",
         );
@@ -13428,6 +13458,363 @@ mod tests {
         assert!(
             !second_state.declass_receipt_valid,
             "receipt consumed under one intent must be denied for a mismatched intent",
+        );
+    }
+
+    /// TCK-00495: Verifies that consumption ledger events carry all
+    /// replay-critical binding fields including `receipt_hash` and
+    /// `admission_bundle_digest` for O(1) correlation.
+    #[test]
+    fn test_consumption_event_carries_all_binding_fields() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState};
+
+        let receipt_id = "RR-BINDING-001";
+        let session_id = "session-binding-001";
+        let lease_id = "lease-binding-001";
+        let work_id = "W-BINDING-FIELDS";
+
+        let ledger_event = make_authoritative_redundancy_receipt_event(
+            receipt_id,
+            lease_id,
+            work_id,
+            None,
+            Some(ToolClass::Read),
+        );
+        let ledger: Arc<dyn LedgerEventEmitter> =
+            Arc::new(StaticReceiptLookupLedger::new(vec![ledger_event]));
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: "handle-binding".to_string(),
+                policy_resolved_ref: "policy-resolved-ref-binding".to_string(),
+                capability_manifest_hash: blake3::hash(b"binding-manifest").as_bytes().to_vec(),
+                episode_id: Some(session_id.to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("session registration should succeed");
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default clock should initialize"),
+        );
+
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_ledger(Arc::clone(&ledger))
+            .with_session_registry(registry_dyn)
+            .with_clock(clock);
+
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            session_id,
+            ToolClass::Read,
+        );
+        let request_arguments = b"test-binding-arguments";
+        let argument_digest = *blake3::hash(request_arguments).as_bytes();
+        let intent_digest =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                argument_digest,
+            );
+        let receipt_hash =
+            SessionDispatcher::<InMemoryManifestStore>::derive_declassification_receipt_hash(
+                receipt_id, lease_id, work_id, true, false,
+            );
+        let ajc_id = *blake3::hash(b"test-ajc-binding-001").as_bytes();
+
+        assert!(
+            dispatcher.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-BINDING-001",
+                ToolClass::Read,
+                intent_digest,
+                argument_digest,
+                &channel_key,
+                &receipt_hash,
+                &ajc_id,
+            ),
+            "consumption must succeed for fresh receipt",
+        );
+
+        // Retrieve the consumption event and verify all binding fields.
+        let consumption = ledger
+            .get_redundancy_receipt_consumption(receipt_id)
+            .expect("consumption must be retrievable after persist");
+        assert_eq!(consumption.receipt_id, receipt_id);
+        assert_eq!(consumption.request_id, "REQ-BINDING-001");
+        assert_eq!(consumption.tool_class, "Read");
+        assert_eq!(
+            consumption.intent_digest,
+            Some(intent_digest),
+            "intent_digest must be persisted"
+        );
+        assert_eq!(
+            consumption.argument_content_digest,
+            Some(argument_digest),
+            "argument_content_digest must be persisted"
+        );
+        assert_eq!(
+            consumption.channel_key.as_deref(),
+            Some(channel_key.as_str()),
+            "channel_key must be persisted"
+        );
+        assert_eq!(
+            consumption.receipt_hash,
+            Some(receipt_hash),
+            "receipt_hash must be persisted for postmortem correlation"
+        );
+        assert_eq!(
+            consumption.admission_bundle_digest,
+            Some(ajc_id),
+            "admission_bundle_digest (ajc_id) must be persisted for O(1) PCAC correlation"
+        );
+
+        // Verify replay is denied (receipt already consumed).
+        assert!(
+            !dispatcher.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-BINDING-002",
+                ToolClass::Read,
+                intent_digest,
+                argument_digest,
+                &channel_key,
+                &receipt_hash,
+                &ajc_id,
+            ),
+            "second consume attempt must be denied (durable single-use enforcement)",
+        );
+    }
+
+    /// TCK-00495: Verifies that cross-request replay with distinct
+    /// request IDs is denied even when all other fields match.
+    #[test]
+    fn test_cross_request_replay_denied_by_durable_consume() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState};
+
+        let receipt_id = "RR-CROSS-REQ-001";
+        let session_id = "session-cross-req";
+        let lease_id = "lease-cross-req";
+        let work_id = "W-CROSS-REQ";
+
+        let ledger_event = make_authoritative_redundancy_receipt_event(
+            receipt_id,
+            lease_id,
+            work_id,
+            None,
+            Some(ToolClass::Read),
+        );
+        let ledger: Arc<dyn LedgerEventEmitter> =
+            Arc::new(StaticReceiptLookupLedger::new(vec![ledger_event]));
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: "handle-cross-req".to_string(),
+                policy_resolved_ref: "policy-resolved-ref-cross-req".to_string(),
+                capability_manifest_hash: blake3::hash(b"cross-req-manifest").as_bytes().to_vec(),
+                episode_id: Some(session_id.to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("session registration should succeed");
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default clock should initialize"),
+        );
+
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_ledger(Arc::clone(&ledger))
+            .with_session_registry(registry_dyn)
+            .with_clock(clock);
+
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            session_id,
+            ToolClass::Read,
+        );
+        let request_args = b"cross-request-args";
+        let argument_digest = *blake3::hash(request_args).as_bytes();
+        let intent_digest =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                argument_digest,
+            );
+        let receipt_hash =
+            SessionDispatcher::<InMemoryManifestStore>::derive_declassification_receipt_hash(
+                receipt_id, lease_id, work_id, true, false,
+            );
+        let ajc_id_a = *blake3::hash(b"ajc-cross-req-A").as_bytes();
+        let ajc_id_b = *blake3::hash(b"ajc-cross-req-B").as_bytes();
+
+        // First request consumes the receipt.
+        assert!(
+            dispatcher.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-CROSS-A",
+                ToolClass::Read,
+                intent_digest,
+                argument_digest,
+                &channel_key,
+                &receipt_hash,
+                &ajc_id_a,
+            ),
+            "first request must consume receipt",
+        );
+
+        // Second request with a DIFFERENT request ID and DIFFERENT ajc_id
+        // must be denied by durable consume record.
+        assert!(
+            !dispatcher.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-CROSS-B",
+                ToolClass::Read,
+                intent_digest,
+                argument_digest,
+                &channel_key,
+                &receipt_hash,
+                &ajc_id_b,
+            ),
+            "cross-request replay must be denied by durable consumption record",
+        );
+
+        // Verify the consumption record is bound to the first request.
+        let consumption = ledger
+            .get_redundancy_receipt_consumption(receipt_id)
+            .expect("consumption must exist");
+        assert_eq!(
+            consumption.request_id, "REQ-CROSS-A",
+            "consumption must be bound to the first request"
+        );
+        assert_eq!(
+            consumption.admission_bundle_digest,
+            Some(ajc_id_a),
+            "consumption must be bound to first request's admission authority"
+        );
+    }
+
+    /// TCK-00495: Verifies that consumption record survives simulated
+    /// daemon restart and still denies replay.
+    #[test]
+    fn test_consumption_survives_restart_with_binding_fields() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState};
+
+        let receipt_id = "RR-RESTART-FIELDS-001";
+        let session_id = "session-restart-fields";
+        let lease_id = "lease-restart-fields";
+        let work_id = "W-RESTART-FIELDS";
+
+        let ledger_event = make_authoritative_redundancy_receipt_event(
+            receipt_id,
+            lease_id,
+            work_id,
+            None,
+            Some(ToolClass::Read),
+        );
+        let ledger: Arc<dyn LedgerEventEmitter> =
+            Arc::new(StaticReceiptLookupLedger::new(vec![ledger_event]));
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: "handle-restart-fields".to_string(),
+                policy_resolved_ref: "policy-resolved-ref-restart-fields".to_string(),
+                capability_manifest_hash: blake3::hash(b"restart-fields-manifest")
+                    .as_bytes()
+                    .to_vec(),
+                episode_id: Some(session_id.to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("session registration should succeed");
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default clock should initialize"),
+        );
+
+        let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            session_id,
+            ToolClass::Read,
+        );
+        let args = b"restart-fields-args";
+        let argument_digest = *blake3::hash(args).as_bytes();
+        let intent_digest =
+            SessionDispatcher::<InMemoryManifestStore>::derive_request_scope_intent_digest(
+                ToolClass::Read,
+                &channel_key,
+                argument_digest,
+            );
+        let receipt_hash =
+            SessionDispatcher::<InMemoryManifestStore>::derive_declassification_receipt_hash(
+                receipt_id, lease_id, work_id, true, false,
+            );
+        let ajc_id = *blake3::hash(b"ajc-restart-fields-001").as_bytes();
+
+        // Pre-restart dispatcher consumes the receipt.
+        let dispatcher_pre = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_ledger(Arc::clone(&ledger))
+            .with_session_registry(Arc::clone(&registry_dyn))
+            .with_clock(Arc::clone(&clock));
+        assert!(
+            dispatcher_pre.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-PRE-RESTART",
+                ToolClass::Read,
+                intent_digest,
+                argument_digest,
+                &channel_key,
+                &receipt_hash,
+                &ajc_id,
+            ),
+            "pre-restart consumption must succeed",
+        );
+
+        // Simulate restart: new dispatcher, same ledger backend.
+        let dispatcher_post = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_ledger(ledger)
+            .with_session_registry(registry_dyn)
+            .with_clock(clock);
+
+        // Post-restart replay must be denied by durable consume record.
+        let new_ajc_id = *blake3::hash(b"ajc-post-restart").as_bytes();
+        assert!(
+            !dispatcher_post.consume_redundancy_receipt(
+                session_id,
+                receipt_id,
+                "REQ-POST-RESTART",
+                ToolClass::Read,
+                intent_digest,
+                argument_digest,
+                &channel_key,
+                &receipt_hash,
+                &new_ajc_id,
+            ),
+            "post-restart replay must be denied (durable consume survives restart)",
         );
     }
 

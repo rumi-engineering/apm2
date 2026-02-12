@@ -184,3 +184,4 @@ The module provides extensive re-exports. Key entries:
 - AD-DAEMON-003: Protocol message types
 - CTR-1603: Bounded message decoding
 - CTR-WH001: Constant-time HMAC comparison
+- TCK-00495: Consumption events carry `receipt_hash` and `admission_bundle_digest` for O(1) correlation; `RedundancyReceiptConsumption` extended with binding fields
