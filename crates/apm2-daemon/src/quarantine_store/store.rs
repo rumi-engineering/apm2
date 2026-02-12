@@ -1,0 +1,1380 @@
+// AGENT-AUTHORED (TCK-00496)
+//! Core quarantine store with priority-aware eviction, per-session quota,
+//! saturation-safe insertion, and `SQLite` persistence.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use apm2_core::crypto::Hash;
+use subtle::ConstantTimeEq;
+use thiserror::Error;
+
+use crate::admission_kernel::QuarantineGuard;
+
+// =============================================================================
+// Resource Limits
+// =============================================================================
+
+/// Maximum global quarantine entries (denial-of-service protection).
+pub const MAX_GLOBAL_ENTRIES: usize = 4096;
+
+/// Maximum quarantine entries per session (quota isolation).
+pub const MAX_PER_SESSION_ENTRIES: usize = 64;
+
+/// Maximum session ID length in bytes.
+pub const MAX_SESSION_ID_LENGTH: usize = 256;
+
+/// Maximum reason string length in bytes.
+pub const MAX_REASON_LENGTH: usize = 1024;
+
+/// Maximum number of tracked sessions (denial-of-service protection).
+pub const MAX_TRACKED_SESSIONS: usize = 4096;
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+/// Errors from quarantine store operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum QuarantineStoreError {
+    /// Global capacity exhausted and no evictable entry exists.
+    #[error("quarantine saturated: no evictable entry for priority {incoming_priority:?}")]
+    Saturated {
+        /// Priority of the entry that could not be inserted.
+        incoming_priority: QuarantinePriority,
+    },
+
+    /// Per-session quota exhausted.
+    #[error("per-session quota exceeded for session '{session_id}' ({count} >= {max})")]
+    SessionQuotaExceeded {
+        /// The session that hit its quota.
+        session_id: String,
+        /// Current count for that session.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Session ID too long.
+    #[error("session_id exceeds max length ({len} > {max})")]
+    SessionIdTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Reason string too long.
+    #[error("reason exceeds max length ({len} > {max})")]
+    ReasonTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Persistence backend error.
+    #[error("persistence error: {reason}")]
+    PersistenceError {
+        /// Human-readable error description.
+        reason: String,
+    },
+
+    /// Too many tracked sessions.
+    #[error("too many tracked sessions ({count} >= {max})")]
+    TooManySessions {
+        /// Current session count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+}
+
+// =============================================================================
+// Priority Type
+// =============================================================================
+
+/// Priority level for quarantine entries.
+///
+/// Higher values indicate higher priority. Entries with higher priority
+/// are never evicted by entries with equal or lower priority when unexpired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum QuarantinePriority {
+    /// Low priority — evictable by any higher priority entry.
+    Low      = 0,
+    /// Normal priority — default for standard quarantine entries.
+    Normal   = 1,
+    /// High priority — only evictable by Critical entries.
+    High     = 2,
+    /// Critical priority — never evicted by lower priority entries.
+    Critical = 3,
+}
+
+impl QuarantinePriority {
+    /// Convert from u8 tag, returning `None` for invalid values.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Low),
+            1 => Some(Self::Normal),
+            2 => Some(Self::High),
+            3 => Some(Self::Critical),
+            _ => None,
+        }
+    }
+
+    /// Convert to u8 tag.
+    #[must_use]
+    pub const fn as_tag(self) -> u8 {
+        self as u8
+    }
+}
+
+// =============================================================================
+// Entry Types
+// =============================================================================
+
+/// Unique identifier for a quarantine entry.
+pub type QuarantineEntryId = u64;
+
+/// A quarantine store entry with priority and expiry metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineEntry {
+    /// Unique entry identifier (monotonically increasing).
+    pub id: QuarantineEntryId,
+    /// Session that owns this entry.
+    pub session_id: String,
+    /// Priority level for eviction decisions.
+    pub priority: QuarantinePriority,
+    /// Request ID that created this entry (audit binding).
+    pub request_id: Hash,
+    /// Admission bundle digest at insertion time (audit binding).
+    pub bundle_digest: Hash,
+    /// Reservation hash proving capacity was reserved.
+    pub reservation_hash: Hash,
+    /// HTF tick at which this entry was created.
+    pub created_at_tick: u64,
+    /// HTF tick at which this entry expires. Expired entries are
+    /// evictable regardless of priority.
+    pub expires_at_tick: u64,
+    /// Human-readable reason for this quarantine reservation.
+    pub reason: String,
+}
+
+impl QuarantineEntry {
+    /// Returns `true` if this entry has expired at the given tick.
+    #[must_use]
+    pub const fn is_expired_at(&self, current_tick: u64) -> bool {
+        current_tick >= self.expires_at_tick
+    }
+}
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Configuration for the quarantine store.
+#[derive(Debug, Clone)]
+pub struct QuarantineStoreConfig {
+    /// Maximum global entries.
+    pub max_global_entries: usize,
+    /// Maximum entries per session.
+    pub max_per_session_entries: usize,
+    /// Maximum tracked sessions.
+    pub max_tracked_sessions: usize,
+}
+
+impl Default for QuarantineStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_global_entries: MAX_GLOBAL_ENTRIES,
+            max_per_session_entries: MAX_PER_SESSION_ENTRIES,
+            max_tracked_sessions: MAX_TRACKED_SESSIONS,
+        }
+    }
+}
+
+// =============================================================================
+// In-Memory Store
+// =============================================================================
+
+/// In-memory quarantine store with priority-aware eviction and per-session
+/// quota isolation.
+///
+/// # Synchronization Protocol
+///
+/// This type is NOT thread-safe. External synchronization (e.g., `Mutex`)
+/// is required for concurrent access. The `DurableQuarantineGuard` wraps
+/// this in a `Mutex` with documented happens-before edges.
+///
+/// # Eviction Strategy
+///
+/// When global capacity is reached and a new entry must be inserted:
+/// 1. Evict expired entries first (any priority).
+/// 2. Among non-expired entries, evict the lowest priority entry that is
+///    strictly less than the incoming priority.
+/// 3. If no evictable entry exists, deny insertion (fail-closed).
+#[derive(Debug)]
+pub struct QuarantineStore {
+    /// Configuration.
+    config: QuarantineStoreConfig,
+    /// Entries indexed by ID for O(1) lookup.
+    entries: BTreeMap<QuarantineEntryId, QuarantineEntry>,
+    /// Per-session entry count for quota isolation.
+    /// Protected data: entry counts per session.
+    /// Mutation: only via insert/remove on entries map.
+    /// Ordering: always update AFTER entries map mutation.
+    session_counts: HashMap<String, usize>,
+    /// Next entry ID (monotonically increasing).
+    next_id: QuarantineEntryId,
+}
+
+/// Result of a successful quarantine insertion, including any evicted
+/// entry for backend synchronization and rollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertResult {
+    /// The ID assigned to the newly inserted entry.
+    pub entry_id: QuarantineEntryId,
+    /// The ID of the entry that was evicted to make room, if any.
+    /// Callers with a persistence backend MUST delete this entry from
+    /// persistent storage to prevent ghost records (SECURITY BLOCKER:
+    /// evicted entries surviving in the DB cause permanent capacity loss
+    /// on restart via `load_all`).
+    pub evicted_id: Option<QuarantineEntryId>,
+    /// The full evicted entry data, preserved for atomic rollback.
+    /// If persistence of the eviction-delete fails, this entry MUST be
+    /// restored to the in-memory store to maintain memory/DB parity
+    /// (QUALITY MAJOR: eviction-delete failure divergence fix).
+    pub evicted_entry: Option<QuarantineEntry>,
+}
+
+impl QuarantineStore {
+    /// Creates a new empty store with default configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_config(QuarantineStoreConfig::default())
+    }
+
+    /// Creates a new empty store with the given configuration.
+    #[must_use]
+    pub fn with_config(config: QuarantineStoreConfig) -> Self {
+        Self {
+            config,
+            entries: BTreeMap::new(),
+            session_counts: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Returns the number of entries in the store.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the entry count for a specific session.
+    #[must_use]
+    pub fn session_count(&self, session_id: &str) -> usize {
+        self.session_counts.get(session_id).copied().unwrap_or(0)
+    }
+
+    /// Inserts a new quarantine entry with priority-aware eviction.
+    ///
+    /// # Eviction Order
+    ///
+    /// 1. Expired entries (any priority) — evicted first.
+    /// 2. Lowest priority entries strictly below incoming — evicted next.
+    /// 3. If no evictable entry exists — denied (fail-closed).
+    ///
+    /// # Returns
+    ///
+    /// On success, returns an `InsertResult` containing the new entry ID and
+    /// the evicted entry ID (if eviction occurred). Callers with a persistence
+    /// backend MUST delete the evicted entry from storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError` if:
+    /// - Per-session quota exceeded
+    /// - Global capacity saturated with no evictable entries
+    /// - Input validation fails
+    #[allow(clippy::too_many_arguments)] // quarantine insert requires all fields for audit binding
+    pub fn insert(
+        &mut self,
+        session_id: &str,
+        priority: QuarantinePriority,
+        request_id: Hash,
+        bundle_digest: Hash,
+        reservation_hash: Hash,
+        created_at_tick: u64,
+        expires_at_tick: u64,
+        reason: &str,
+        current_tick: u64,
+    ) -> Result<InsertResult, QuarantineStoreError> {
+        // Input validation (DoS protection)
+        if session_id.len() > MAX_SESSION_ID_LENGTH {
+            return Err(QuarantineStoreError::SessionIdTooLong {
+                len: session_id.len(),
+                max: MAX_SESSION_ID_LENGTH,
+            });
+        }
+        if reason.len() > MAX_REASON_LENGTH {
+            return Err(QuarantineStoreError::ReasonTooLong {
+                len: reason.len(),
+                max: MAX_REASON_LENGTH,
+            });
+        }
+
+        // Per-session quota check
+        let session_count = self.session_counts.get(session_id).copied().unwrap_or(0);
+        if session_count >= self.config.max_per_session_entries {
+            return Err(QuarantineStoreError::SessionQuotaExceeded {
+                session_id: session_id.to_string(),
+                count: session_count,
+                max: self.config.max_per_session_entries,
+            });
+        }
+
+        // New session tracking bound check
+        if session_count == 0 && self.session_counts.len() >= self.config.max_tracked_sessions {
+            return Err(QuarantineStoreError::TooManySessions {
+                count: self.session_counts.len(),
+                max: self.config.max_tracked_sessions,
+            });
+        }
+
+        // Global capacity check with priority-aware eviction
+        let evicted_entry = if self.entries.len() >= self.config.max_global_entries {
+            match self.try_evict_one(priority, current_tick) {
+                Some(evicted) => Some(evicted),
+                None => {
+                    return Err(QuarantineStoreError::Saturated {
+                        incoming_priority: priority,
+                    });
+                },
+            }
+        } else {
+            None
+        };
+
+        let evicted_id = evicted_entry.as_ref().map(|e| e.id);
+
+        // Create and insert the entry
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+
+        let entry = QuarantineEntry {
+            id,
+            session_id: session_id.to_string(),
+            priority,
+            request_id,
+            bundle_digest,
+            reservation_hash,
+            created_at_tick,
+            expires_at_tick,
+            reason: reason.to_string(),
+        };
+
+        self.entries.insert(id, entry);
+        *self
+            .session_counts
+            .entry(session_id.to_string())
+            .or_insert(0) += 1;
+
+        Ok(InsertResult {
+            entry_id: id,
+            evicted_id,
+            evicted_entry,
+        })
+    }
+
+    /// Removes an entry by ID.
+    ///
+    /// Returns `true` if the entry existed and was removed.
+    pub fn remove(&mut self, id: QuarantineEntryId) -> bool {
+        if let Some(entry) = self.entries.remove(&id) {
+            if let Some(count) = self.session_counts.get_mut(&entry.session_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.session_counts.remove(&entry.session_id);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes all expired entries at the given tick.
+    ///
+    /// Returns the number of entries removed.
+    pub fn evict_expired(&mut self, current_tick: u64) -> usize {
+        let expired_ids: Vec<QuarantineEntryId> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_expired_at(current_tick))
+            .map(|(&id, _)| id)
+            .collect();
+
+        let count = expired_ids.len();
+        for id in expired_ids {
+            self.remove(id);
+        }
+        count
+    }
+
+    /// Looks up an entry by its reservation hash.
+    ///
+    /// Uses constant-time comparison (`subtle::ConstantTimeEq`) and a full
+    /// linear scan (no short-circuit) to prevent timing side-channel leakage
+    /// about reservation hash values or match positions (RSK-1909).
+    #[must_use]
+    pub fn find_by_reservation_hash(&self, hash: &Hash) -> Option<&QuarantineEntry> {
+        let mut matched: Option<&QuarantineEntry> = None;
+        for entry in self.entries.values() {
+            // Constant-time equality: does not short-circuit on first
+            // differing byte.  We always scan every entry regardless of
+            // whether we already found a match, so lookup time is constant
+            // with respect to match position.
+            if bool::from(entry.reservation_hash.ct_eq(hash)) {
+                matched = Some(entry);
+            }
+        }
+        matched
+    }
+
+    /// Returns an iterator over all entries.
+    pub fn entries(&self) -> impl Iterator<Item = &QuarantineEntry> {
+        self.entries.values()
+    }
+
+    /// Restores an entry from persistent storage during recovery.
+    ///
+    /// This bypasses normal eviction logic and quota checks because we
+    /// are reconstituting previously-persisted state. The `next_id` counter
+    /// is advanced past the restored entry's ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the global capacity would be exceeded even
+    /// for restoration (hard safety bound).
+    pub fn restore_entry(&mut self, entry: QuarantineEntry) -> Result<(), QuarantineStoreError> {
+        if self.entries.len() >= self.config.max_global_entries {
+            return Err(QuarantineStoreError::Saturated {
+                incoming_priority: entry.priority,
+            });
+        }
+
+        // Advance next_id past restored entry
+        if entry.id >= self.next_id {
+            self.next_id = entry.id.saturating_add(1);
+        }
+
+        *self
+            .session_counts
+            .entry(entry.session_id.clone())
+            .or_insert(0) += 1;
+        self.entries.insert(entry.id, entry);
+        Ok(())
+    }
+
+    /// Try to evict one entry to make room for an incoming entry with the
+    /// given priority.
+    ///
+    /// # Eviction Order
+    ///
+    /// 1. Expired entries — any priority, oldest first (lowest ID).
+    /// 2. Non-expired entries with priority strictly below incoming — lowest
+    ///    priority first, then oldest (lowest ID) as tiebreaker.
+    ///
+    /// Returns `Some(evicted_entry)` if an entry was evicted, `None`
+    /// otherwise. The full entry is returned (not just the ID) so callers
+    /// can restore it on rollback if persistence of the eviction-delete
+    /// fails (QUALITY MAJOR: atomic rollback for eviction-delete failure).
+    fn try_evict_one(
+        &mut self,
+        incoming_priority: QuarantinePriority,
+        current_tick: u64,
+    ) -> Option<QuarantineEntry> {
+        // Phase 1: Try to evict an expired entry (any priority)
+        let expired_id = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_expired_at(current_tick))
+            .min_by_key(|(id, _)| **id)
+            .map(|(id, _)| *id);
+
+        if let Some(id) = expired_id {
+            return self.remove_and_return(id);
+        }
+
+        // Phase 2: Try to evict the lowest-priority entry strictly below incoming
+        let evictable_id = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.priority < incoming_priority)
+            .min_by(|(id_a, a), (id_b, b)| a.priority.cmp(&b.priority).then_with(|| id_a.cmp(id_b)))
+            .map(|(id, _)| *id);
+
+        if let Some(id) = evictable_id {
+            return self.remove_and_return(id);
+        }
+
+        None
+    }
+
+    /// Removes an entry by ID and returns the full entry data.
+    ///
+    /// Used by `try_evict_one` to preserve evicted entries for atomic
+    /// rollback when persistence fails.
+    fn remove_and_return(&mut self, id: QuarantineEntryId) -> Option<QuarantineEntry> {
+        if let Some(entry) = self.entries.remove(&id) {
+            if let Some(count) = self.session_counts.get_mut(&entry.session_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.session_counts.remove(&entry.session_id);
+                }
+            }
+            Some(entry)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for QuarantineStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// SQLite Backend
+// =============================================================================
+
+/// SQLite-backed persistence for quarantine entries.
+///
+/// # Synchronization Protocol
+///
+/// Access is serialized through the `Mutex<rusqlite::Connection>` inherited
+/// from the daemon's shared connection. All write operations use transactions
+/// for atomicity.
+///
+/// # Schema
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS quarantine_entries (
+///     id INTEGER PRIMARY KEY,
+///     session_id TEXT NOT NULL,
+///     priority INTEGER NOT NULL,
+///     request_id BLOB NOT NULL,
+///     bundle_digest BLOB NOT NULL,
+///     reservation_hash BLOB NOT NULL,
+///     created_at_tick INTEGER NOT NULL,
+///     expires_at_tick INTEGER NOT NULL,
+///     reason TEXT NOT NULL
+/// );
+/// ```
+pub struct SqliteQuarantineBackend {
+    /// Shared `SQLite` connection (`Mutex` for thread safety).
+    /// Protected data: `quarantine_entries` table.
+    /// Mutation: via SQL INSERT/DELETE/UPDATE within transactions.
+    /// Ordering: caller holds `Mutex` for full transaction scope.
+    conn: Arc<Mutex<rusqlite::Connection>>,
+}
+
+impl std::fmt::Debug for SqliteQuarantineBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteQuarantineBackend")
+            .field("conn", &"<sqlite>")
+            .finish()
+    }
+}
+
+impl SqliteQuarantineBackend {
+    /// Opens or creates the quarantine table in the given `SQLite` connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` if table creation
+    /// fails.
+    pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Result<Self, QuarantineStoreError> {
+        {
+            let db = conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS quarantine_entries (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    request_id BLOB NOT NULL,
+                    bundle_digest BLOB NOT NULL,
+                    reservation_hash BLOB NOT NULL,
+                    created_at_tick INTEGER NOT NULL,
+                    expires_at_tick INTEGER NOT NULL,
+                    reason TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to create quarantine_entries table: {e}"),
+            })?;
+        }
+        Ok(Self { conn })
+    }
+
+    /// Opens a standalone `SQLite` database at the given path for quarantine
+    /// persistence.
+    ///
+    /// Uses WAL mode for concurrent read/write and durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` if the database
+    /// cannot be opened or configured.
+    pub fn open(path: &Path) -> Result<Self, QuarantineStoreError> {
+        let conn = rusqlite::Connection::open(path).map_err(|e| {
+            QuarantineStoreError::PersistenceError {
+                reason: format!(
+                    "failed to open quarantine database at {}: {e}",
+                    path.display()
+                ),
+            }
+        })?;
+
+        // Restrict file permissions to owner-only (0600) for daemon state
+        // files. Default permissions (0644) would allow other users on the
+        // system to read quarantine state, which may leak session metadata.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "failed to set permissions on quarantine database at {}: {e}",
+                        path.display()
+                    ),
+                }
+            })?;
+        }
+
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to set WAL mode: {e}"),
+            })?;
+        // Synchronous FULL for durability guarantees on fail-closed tiers
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to set synchronous mode: {e}"),
+            })?;
+        let conn = Arc::new(Mutex::new(conn));
+        Self::new(conn)
+    }
+
+    /// Persists a quarantine entry to the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    #[allow(clippy::cast_possible_wrap)] // entry.id and tick values are within i64 range for practical use
+    pub fn persist_entry(&self, entry: &QuarantineEntry) -> Result<(), QuarantineStoreError> {
+        let db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        db.execute(
+            "INSERT OR REPLACE INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                entry.id as i64,
+                entry.session_id,
+                entry.priority.as_tag(),
+                entry.request_id.as_slice(),
+                entry.bundle_digest.as_slice(),
+                entry.reservation_hash.as_slice(),
+                entry.created_at_tick as i64,
+                entry.expires_at_tick as i64,
+                entry.reason,
+            ],
+        )
+        .map_err(|e| QuarantineStoreError::PersistenceError {
+            reason: format!("failed to persist quarantine entry {}: {e}", entry.id),
+        })?;
+        Ok(())
+    }
+
+    /// Removes a quarantine entry from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn remove_entry(&self, id: QuarantineEntryId) -> Result<(), QuarantineStoreError> {
+        let db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        db.execute(
+            "DELETE FROM quarantine_entries WHERE id = ?1",
+            rusqlite::params![id as i64],
+        )
+        .map_err(|e| QuarantineStoreError::PersistenceError {
+            reason: format!("failed to remove quarantine entry {id}: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Removes multiple quarantine entries from the database in a single
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    /// The transaction is rolled back on any failure so either all entries
+    /// are removed or none are.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn remove_entries(&self, ids: &[QuarantineEntryId]) -> Result<(), QuarantineStoreError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db
+            .transaction()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to begin transaction for batch remove: {e}"),
+            })?;
+        for &id in ids {
+            tx.execute(
+                "DELETE FROM quarantine_entries WHERE id = ?1",
+                rusqlite::params![id as i64],
+            )
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to remove quarantine entry {id} in batch: {e}"),
+            })?;
+        }
+        tx.commit()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to commit batch remove transaction: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Atomically removes an evicted entry and inserts a new entry in a single
+    /// `SQLite` transaction.
+    ///
+    /// This prevents partial state on crash: either both the eviction removal
+    /// and the new entry insertion succeed, or neither does (the transaction
+    /// is rolled back).
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    /// On failure the transaction is rolled back so neither the eviction
+    /// removal nor the new entry insertion is persisted.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn evict_and_insert(
+        &self,
+        evicted_id: QuarantineEntryId,
+        new_entry: &QuarantineEntry,
+    ) -> Result<(), QuarantineStoreError> {
+        let mut db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db
+            .transaction()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to begin evict_and_insert transaction: {e}"),
+            })?;
+        tx.execute(
+            "DELETE FROM quarantine_entries WHERE id = ?1",
+            rusqlite::params![evicted_id as i64],
+        )
+        .map_err(|e| QuarantineStoreError::PersistenceError {
+            reason: format!("failed to remove evicted entry {evicted_id}: {e}"),
+        })?;
+        tx.execute(
+            "INSERT OR REPLACE INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                new_entry.id as i64,
+                new_entry.session_id,
+                new_entry.priority.as_tag(),
+                new_entry.request_id.as_slice(),
+                new_entry.bundle_digest.as_slice(),
+                new_entry.reservation_hash.as_slice(),
+                new_entry.created_at_tick as i64,
+                new_entry.expires_at_tick as i64,
+                new_entry.reason,
+            ],
+        )
+        .map_err(|e| QuarantineStoreError::PersistenceError {
+            reason: format!(
+                "failed to insert new entry {} after eviction: {e}",
+                new_entry.id
+            ),
+        })?;
+        tx.commit()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to commit evict_and_insert transaction: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Removes all expired entries from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn remove_expired(&self, current_tick: u64) -> Result<usize, QuarantineStoreError> {
+        let db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = db
+            .execute(
+                "DELETE FROM quarantine_entries WHERE expires_at_tick <= ?1",
+                rusqlite::params![current_tick as i64],
+            )
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to remove expired entries: {e}"),
+            })?;
+        Ok(count)
+    }
+
+    /// Loads all persisted entries for restart recovery.
+    ///
+    /// Results are ordered by `id` (rowid tiebreaker for determinism).
+    /// Bounded by `MAX_GLOBAL_ENTRIES` to prevent memory exhaustion from
+    /// a corrupted database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure
+    /// or data corruption.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)] // SQL integers validated non-negative before cast; MAX_GLOBAL_ENTRIES fits in i64
+    pub fn load_all(&self) -> Result<Vec<QuarantineEntry>, QuarantineStoreError> {
+        let db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = db
+            .prepare(
+                "SELECT id, session_id, priority, request_id, bundle_digest,
+                        reservation_hash, created_at_tick, expires_at_tick, reason
+                 FROM quarantine_entries
+                 ORDER BY id ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to prepare load query: {e}"),
+            })?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![MAX_GLOBAL_ENTRIES as i64], |row| {
+                let id: i64 = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let priority_tag: u8 = row.get(2)?;
+                let request_id_blob: Vec<u8> = row.get(3)?;
+                let bundle_digest_blob: Vec<u8> = row.get(4)?;
+                let reservation_hash_blob: Vec<u8> = row.get(5)?;
+                let created_at_tick: i64 = row.get(6)?;
+                let expires_at_tick: i64 = row.get(7)?;
+                let reason: String = row.get(8)?;
+
+                Ok((
+                    id,
+                    session_id,
+                    priority_tag,
+                    request_id_blob,
+                    bundle_digest_blob,
+                    reservation_hash_blob,
+                    created_at_tick,
+                    expires_at_tick,
+                    reason,
+                ))
+            })
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to execute load query: {e}"),
+            })?;
+
+        let mut result = Vec::new();
+        for row_result in entries {
+            let (
+                id,
+                session_id,
+                priority_tag,
+                request_id_blob,
+                bundle_digest_blob,
+                reservation_hash_blob,
+                created_at_tick,
+                expires_at_tick,
+                reason,
+            ) = row_result.map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to read quarantine entry row: {e}"),
+            })?;
+
+            // Fail-closed validation: reject corrupted/tampered negative values
+            // for fields stored as SQL INTEGER (i64) but used as u64.
+            // Without this check, negative i64 values silently become huge u64
+            // values (e.g., -1 → u64::MAX), breaking expiry logic and capacity
+            // accounting (QUALITY MAJOR: signed integer field validation).
+            if id <= 0 {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!("invalid entry id {id}: must be positive"),
+                });
+            }
+            if created_at_tick < 0 {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "invalid created_at_tick {created_at_tick} in entry {id}: must be non-negative"
+                    ),
+                });
+            }
+            if expires_at_tick < 0 {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "invalid expires_at_tick {expires_at_tick} in entry {id}: must be non-negative"
+                    ),
+                });
+            }
+            if expires_at_tick < created_at_tick {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "invalid tick range in entry {id}: expires_at_tick ({expires_at_tick}) < created_at_tick ({created_at_tick})"
+                    ),
+                });
+            }
+
+            let priority = QuarantinePriority::from_tag(priority_tag).ok_or_else(|| {
+                QuarantineStoreError::PersistenceError {
+                    reason: format!("invalid priority tag {priority_tag} in entry {id}"),
+                }
+            })?;
+
+            let request_id: Hash =
+                request_id_blob
+                    .try_into()
+                    .map_err(|_| QuarantineStoreError::PersistenceError {
+                        reason: format!("invalid request_id length in entry {id}"),
+                    })?;
+            let bundle_digest: Hash = bundle_digest_blob.try_into().map_err(|_| {
+                QuarantineStoreError::PersistenceError {
+                    reason: format!("invalid bundle_digest length in entry {id}"),
+                }
+            })?;
+            let reservation_hash: Hash = reservation_hash_blob.try_into().map_err(|_| {
+                QuarantineStoreError::PersistenceError {
+                    reason: format!("invalid reservation_hash length in entry {id}"),
+                }
+            })?;
+
+            // Bounds check on string fields from DB (defense in depth)
+            if session_id.len() > MAX_SESSION_ID_LENGTH {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "session_id too long in entry {id} ({} > {MAX_SESSION_ID_LENGTH})",
+                        session_id.len()
+                    ),
+                });
+            }
+            if reason.len() > MAX_REASON_LENGTH {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "reason too long in entry {id} ({} > {MAX_REASON_LENGTH})",
+                        reason.len()
+                    ),
+                });
+            }
+            // Note: the SQL query already includes `LIMIT ?1` with
+            // `MAX_GLOBAL_ENTRIES`, so an additional length check here is
+            // redundant and was removed (SECURITY MINOR 1).
+
+            result.push(QuarantineEntry {
+                id: id as u64,
+                session_id,
+                priority,
+                request_id,
+                bundle_digest,
+                reservation_hash,
+                created_at_tick: created_at_tick as u64,
+                expires_at_tick: expires_at_tick as u64,
+                reason,
+            });
+        }
+
+        Ok(result)
+    }
+}
+
+// =============================================================================
+// DurableQuarantineGuard
+// =============================================================================
+
+/// Durable quarantine guard implementing the `QuarantineGuard` trait with
+/// `SQLite`-backed persistence, priority-aware eviction, and per-session quota.
+///
+/// # Synchronization Protocol
+///
+/// All mutable operations are serialized through `Mutex<Inner>`.
+/// - Protected data: `QuarantineStore` (entries, session counts, `next_id`).
+/// - Mutation: only via `reserve()` and `recover()`.
+/// - Lock ordering: `Inner` lock is always acquired first; the `SQLite`
+///   connection lock (inside `SqliteQuarantineBackend`) is acquired second. No
+///   other locks are held while `Inner` is locked.
+/// - Happens-before: the `Mutex` release at the end of `reserve()` establishes
+///   happens-before with any subsequent `reserve()` call.
+///
+/// # Fail-Closed Contract
+///
+/// If the `SQLite` backend is unavailable (e.g., disk full, corruption),
+/// `reserve()` returns `Err` and the admission kernel denies the request.
+pub struct DurableQuarantineGuard {
+    /// Inner mutable state behind a mutex.
+    inner: Mutex<QuarantineStore>,
+    /// `SQLite` persistence backend.
+    backend: SqliteQuarantineBackend,
+    /// Default priority for entries created via the trait interface.
+    default_priority: QuarantinePriority,
+    /// Default TTL in ticks for entry expiry.
+    default_ttl_ticks: u64,
+    /// Current tick provider (monotonically increasing).
+    /// This is a function pointer to allow testing with injected ticks.
+    tick_provider: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl std::fmt::Debug for DurableQuarantineGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableQuarantineGuard")
+            .field("default_priority", &self.default_priority)
+            .field("default_ttl_ticks", &self.default_ttl_ticks)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Default TTL in ticks (1 hour at 1MHz tick rate).
+pub const DEFAULT_TTL_TICKS: u64 = 3_600_000_000;
+
+impl DurableQuarantineGuard {
+    /// Creates a new durable quarantine guard with `SQLite` persistence.
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - `SQLite` persistence backend.
+    /// * `config` - Store configuration.
+    ///
+    /// # Recovery
+    ///
+    /// On creation, this loads all persisted entries from the database.
+    /// Entries that survived a restart are recovered into the in-memory store.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` if recovery fails.
+    pub fn new(
+        backend: SqliteQuarantineBackend,
+        config: QuarantineStoreConfig,
+    ) -> Result<Self, QuarantineStoreError> {
+        let mut store = QuarantineStore::with_config(config);
+
+        // Recover persisted entries
+        let persisted = backend.load_all()?;
+        for entry in persisted {
+            store.restore_entry(entry)?;
+        }
+
+        Ok(Self {
+            inner: Mutex::new(store),
+            backend,
+            default_priority: QuarantinePriority::Normal,
+            default_ttl_ticks: DEFAULT_TTL_TICKS,
+            tick_provider: Box::new(default_tick_provider),
+        })
+    }
+
+    /// Sets the default priority for trait-level reservations.
+    #[must_use]
+    pub const fn with_default_priority(mut self, priority: QuarantinePriority) -> Self {
+        self.default_priority = priority;
+        self
+    }
+
+    /// Sets the default TTL in ticks.
+    #[must_use]
+    pub const fn with_default_ttl_ticks(mut self, ttl: u64) -> Self {
+        self.default_ttl_ticks = ttl;
+        self
+    }
+
+    /// Sets a custom tick provider (for testing).
+    #[must_use]
+    pub fn with_tick_provider(mut self, provider: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.tick_provider = provider;
+        self
+    }
+
+    /// Inserts an entry with full parameters (bypassing trait-level defaults).
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError` on validation, saturation, or
+    /// persistence failure.
+    pub fn insert(
+        &self,
+        session_id: &str,
+        priority: QuarantinePriority,
+        request_id: Hash,
+        bundle_digest: Hash,
+        ttl_ticks: u64,
+        reason: &str,
+    ) -> Result<(QuarantineEntryId, Hash), QuarantineStoreError> {
+        let current_tick = (self.tick_provider)();
+        let expires_at_tick = current_tick.saturating_add(ttl_ticks);
+        let reservation_hash = compute_reservation_hash(&request_id, &bundle_digest, current_tick);
+
+        let mut store = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let result = store.insert(
+            session_id,
+            priority,
+            request_id,
+            bundle_digest,
+            reservation_hash,
+            current_tick,
+            expires_at_tick,
+            reason,
+            current_tick,
+        )?;
+
+        // Persist to SQLite atomically. If eviction occurred, the evicted
+        // entry DELETE and new entry INSERT are wrapped in a SINGLE SQLite
+        // transaction via `evict_and_insert()`. A crash between them cannot
+        // leave partial state (QUALITY MAJOR 1: non-atomic eviction fix).
+        let entry = store.entries.get(&result.entry_id).expect("just inserted");
+        let persist_result = result.evicted_id.map_or_else(
+            || self.backend.persist_entry(entry),
+            |evicted_id| self.backend.evict_and_insert(evicted_id, entry),
+        );
+
+        if let Err(e) = persist_result {
+            // Roll back in-memory state: remove the new entry and restore
+            // the evicted entry (if any) to maintain memory/DB parity.
+            store.remove(result.entry_id);
+            if let Some(evicted_entry) = result.evicted_entry {
+                // restore_entry can only fail if at capacity, but we just
+                // removed the new entry so there is room. Ignore the
+                // (practically unreachable) error to avoid masking `e`.
+                let _ = store.restore_entry(evicted_entry);
+            }
+            return Err(e);
+        }
+
+        Ok((result.entry_id, reservation_hash))
+    }
+
+    /// Removes an entry and updates persistence.
+    ///
+    /// Uses persist-first-then-memory-commit pattern: the database removal
+    /// is attempted first; only on success is the in-memory state updated.
+    /// This prevents memory/DB drift when persistence fails (QUALITY MAJOR 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` if the database
+    /// removal fails. In-memory state is NOT modified on persistence failure
+    /// to maintain memory/DB parity.
+    pub fn remove(&self, id: QuarantineEntryId) -> Result<bool, QuarantineStoreError> {
+        let mut store = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Check existence in memory before attempting DB operation to avoid
+        // unnecessary DB round-trips for non-existent entries.
+        let exists_in_memory = store.entries.contains_key(&id);
+        if !exists_in_memory {
+            return Ok(false);
+        }
+
+        // Persist first: remove from DB before touching in-memory state.
+        // If this fails, in-memory state remains unchanged (parity preserved).
+        self.backend.remove_entry(id)?;
+
+        // DB succeeded — now commit the in-memory removal.
+        store.remove(id);
+        Ok(true)
+    }
+
+    /// Evicts all expired entries from both in-memory store and database.
+    ///
+    /// Uses persist-first-then-memory-commit pattern: expired entries are
+    /// identified in memory, removed from the database first, and only then
+    /// removed from in-memory state. This prevents memory/DB drift when
+    /// persistence fails (QUALITY MAJOR 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on database failure.
+    /// In-memory state is NOT modified on persistence failure to maintain
+    /// memory/DB parity.
+    pub fn evict_expired(&self) -> Result<usize, QuarantineStoreError> {
+        let current_tick = (self.tick_provider)();
+        let mut store = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Identify expired entries in memory first.
+        let expired_ids: Vec<QuarantineEntryId> = store
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_expired_at(current_tick))
+            .map(|(&id, _)| id)
+            .collect();
+
+        if expired_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Persist first: remove expired entries from DB in a single
+        // transaction before touching in-memory state. If this fails,
+        // in-memory state remains unchanged (parity preserved).
+        self.backend.remove_entries(&expired_ids)?;
+
+        // DB succeeded — now commit the in-memory removals.
+        let count = expired_ids.len();
+        for id in expired_ids {
+            store.remove(id);
+        }
+        Ok(count)
+    }
+
+    /// Returns the number of entries in the store.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let store = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.len()
+    }
+
+    /// Returns `true` if the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the entry count for a session.
+    #[must_use]
+    pub fn session_count(&self, session_id: &str) -> usize {
+        let store = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.session_count(session_id)
+    }
+}
+
+/// Default tick provider using `std::time::Instant` for monotonic time.
+///
+/// Returns microseconds since an arbitrary epoch (process start).
+/// This is safe for relative comparisons within a single daemon lifecycle.
+fn default_tick_provider() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    let elapsed = epoch.elapsed();
+    // Microseconds fits in u64 for ~584,942 years; truncation is
+    // unreachable within any daemon lifecycle.
+    #[allow(clippy::cast_possible_truncation)]
+    let ticks = elapsed.as_micros() as u64;
+    ticks
+}
+
+/// Computes a reservation hash from `request_id`, `bundle_digest`, and tick.
+///
+/// Uses BLAKE3 with domain separation for collision resistance.
+#[must_use]
+pub fn compute_reservation_hash(request_id: &Hash, bundle_digest: &Hash, tick: u64) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2-quarantine-reservation-v1");
+    hasher.update(request_id);
+    hasher.update(bundle_digest);
+    hasher.update(&tick.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+// =============================================================================
+// QuarantineGuard Trait Implementation
+// =============================================================================
+
+impl QuarantineGuard for DurableQuarantineGuard {
+    fn reserve(&self, session_id: &str, request_id: &Hash, ajc_id: &Hash) -> Result<Hash, String> {
+        let current_tick = (self.tick_provider)();
+        let expires_at_tick = current_tick.saturating_add(self.default_ttl_ticks);
+        let reservation_hash = compute_reservation_hash(request_id, ajc_id, current_tick);
+
+        let mut store = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let result = store
+            .insert(
+                session_id,
+                self.default_priority,
+                *request_id,
+                *ajc_id,
+                reservation_hash,
+                current_tick,
+                expires_at_tick,
+                "kernel_reservation",
+                current_tick,
+            )
+            .map_err(|e| e.to_string())?;
+
+        // Persist to SQLite atomically. If eviction occurred, the evicted
+        // entry DELETE and new entry INSERT are wrapped in a SINGLE SQLite
+        // transaction via `evict_and_insert()` (QUALITY MAJOR 1 fix).
+        let entry = store.entries.get(&result.entry_id).expect("just inserted");
+        let persist_result = result.evicted_id.map_or_else(
+            || self.backend.persist_entry(entry),
+            |evicted_id| self.backend.evict_and_insert(evicted_id, entry),
+        );
+
+        if let Err(e) = persist_result {
+            // Roll back in-memory state: remove the new entry and restore
+            // the evicted entry (if any) to maintain memory/DB parity.
+            store.remove(result.entry_id);
+            if let Some(evicted_entry) = result.evicted_entry {
+                let _ = store.restore_entry(evicted_entry);
+            }
+            return Err(e.to_string());
+        }
+
+        Ok(reservation_hash)
+    }
+}
