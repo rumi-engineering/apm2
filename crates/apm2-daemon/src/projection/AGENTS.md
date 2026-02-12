@@ -13,6 +13,7 @@ The `projection` module implements write-only projection adapters that synchroni
 - **`ProjectionReceipt`**: Signed proof of projection with idempotency keys
 - **`DivergenceWatchdog`**: Monitors for ledger/trunk HEAD divergence (TCK-00213)
 - **`FreezeRegistry`**: Tracks active intervention freezes
+- **`IntentBuffer`**: SQLite-backed durable buffer for projection intents and deferred replay backlog (TCK-00504)
 
 ### Security Model
 
@@ -120,6 +121,36 @@ Maps `changeset_digest` to `work_id` to PR metadata for projection routing.
 
 Ledger event tailer that drives projection decisions.
 
+### `IntentBuffer` (TCK-00504)
+
+```rust
+pub struct IntentBuffer { /* conn: Arc<Mutex<Connection>> */ }
+```
+
+SQLite-backed durable buffer for projection intents and deferred replay backlog. Provides insert, admit, deny, evict, and query methods for economics-gated admission decisions.
+
+**Invariants:**
+
+- [INV-IB01] `deferred_replay_backlog` never exceeds `MAX_BACKLOG_ITEMS` (65536). When the cap is reached, oldest entries (by rowid) are evicted and recorded as denied.
+- [INV-IB02] Duplicate `(work_id, changeset_digest)` inserts into `projection_intents` are idempotent -- the existing row is preserved.
+- [INV-IB03] Evicted backlog entries are returned to the caller for deny receipt emission; they are never silently dropped.
+- [INV-IB04] All queries use `ORDER BY rowid` for deterministic ordering.
+
+**Contracts:**
+
+- [CTR-IB01] Schema uses `CREATE TABLE IF NOT EXISTS` -- does not alter existing `projection_receipts` or `comment_receipts` tables.
+- [CTR-IB02] All state mutations (admit/deny) check verdict == 'pending' BEFORE mutating -- no double-admit or double-deny.
+- [CTR-IB03] Eviction and insert happen within a single mutex acquisition to prevent TOCTOU between count-check and insert.
+- [CTR-IB04] String fields are bounded by `MAX_FIELD_LENGTH` (1024) -- prevents DoS via oversized input.
+
+### `IntentVerdict`
+
+```rust
+pub enum IntentVerdict { Pending, Admitted, Denied }
+```
+
+Fail-closed: unknown verdict values parsed from the database are treated as `Denied`.
+
 ## Public API
 
 - `ProjectionWorker`, `ProjectionWorkerConfig`, `ProjectionWorkerError`
@@ -129,6 +160,7 @@ Ledger event tailer that drives projection decisions.
 - `FreezeRegistry`, `InterventionFreeze`, `InterventionUnfreeze`
 - `TamperEvent`, `TamperResult`
 - `WorkIndex`, `PrMetadata`, `LedgerTailer`
+- `IntentBuffer`, `IntentBufferError`, `IntentVerdict`, `ProjectionIntent`, `DeferredReplayEntry`, `MAX_BACKLOG_ITEMS`
 
 ## Related Modules
 
@@ -144,3 +176,4 @@ Ledger event tailer that drives projection decisions.
 - TCK-00213: Divergence watchdog
 - TCK-00214: Tamper detection
 - TCK-00322: Projection worker implementation
+- TCK-00504: Projection intent schema and durable buffer for economics-gated admission

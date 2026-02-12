@@ -47,6 +47,8 @@
 //! - [`FreezeRegistry`]: Tracks active intervention freezes
 //! - [`TamperEvent`]: Event emitted when tamper is detected (TCK-00214)
 //! - [`TamperResult`]: Result of handling a tamper event
+//! - [`IntentBuffer`]: Durable SQLite-backed buffer for projection intents and
+//!   deferred replay backlog (TCK-00504)
 //!
 //! # Divergence Watchdog (TCK-00213)
 //!
@@ -114,6 +116,7 @@
 
 pub mod divergence_watchdog;
 pub mod github_sync;
+pub mod intent_buffer;
 pub mod projection_receipt;
 pub mod worker;
 
@@ -127,6 +130,10 @@ pub use divergence_watchdog::{
 pub use github_sync::{
     GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter, ProjectionError, TamperEvent,
     TamperResult,
+};
+pub use intent_buffer::{
+    DeferredReplayEntry, IntentBuffer, IntentBufferError, IntentVerdict, MAX_BACKLOG_ITEMS,
+    ProjectionIntent,
 };
 pub use projection_receipt::{
     IdempotencyKey, MAX_STRING_LENGTH, ProjectedStatus, ProjectionReceipt,
