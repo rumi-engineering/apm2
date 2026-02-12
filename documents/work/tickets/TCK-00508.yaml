@@ -39,9 +39,9 @@ ticket_meta:
     in_scope:
       - "Implement DeferredReplayWorker in crates/apm2-daemon/src/projection/ that periodically checks for buffered intents awaiting replay."
       - "On sink recovery detection (successful health probe or first ALLOW after prior DENY), drain backlog in ledger-order."
-      - "For each replayed intent: re-evaluate economics gate, call adapter.project_status() on ALLOW, emit DeferredReplayReceiptV1 on convergence."
+      - "For each replayed intent: re-evaluate economics gate AND re-execute PCAC lifecycle enforcement (join, revalidate authority freshness/revocation, single-use consume) — economics ALLOW alone is insufficient; call adapter.project_status() only after both economics gate and lifecycle enforcement pass; emit DeferredReplayReceiptV1 on convergence."
       - "Enforce replay_window_ref bounds from ProjectionContinuityWindowV1: intents older than replay window are expired with deny receipt, not replayed."
-      - "Idempotent replay: skip intents whose (work_id, changeset_digest) already have a successful projection receipt."
+      - "Idempotent replay: skip intents whose (work_id, changeset_digest) already have a successful projection receipt (consumed-token check also prevents double-projection through alternate paths)."
       - "Compute backlog_digest (Blake3 over ordered intent digests) and include in replay receipt."
       - "Bounded replay batch size to prevent post-outage thundering herd (configurable, default 64 per cycle)."
     out_of_scope:
@@ -52,7 +52,7 @@ ticket_meta:
     steps:
       - "Implement DeferredReplayWorker struct with reference to IntentBuffer, ProjectionAdapter, and ContinuityProfileResolver."
       - "Add periodic drain loop: query buffered intents ordered by created_at, batch by configurable limit."
-      - "For each batch: re-evaluate economics gate, project on ALLOW, record result."
+      - "For each batch: re-evaluate economics gate, enforce PCAC lifecycle (revalidate authority, consume token), project on ALLOW from both checks, record result."
       - "Compute running backlog_digest as Blake3 over replayed intent digests."
       - "On batch completion with no remaining backlog: emit converged DeferredReplayReceiptV1 with replayed_item_count."
       - "Expire intents outside replay_window_ref with DENY_REPLAY_HORIZON_OUT_OF_WINDOW."
@@ -65,6 +65,8 @@ ticket_meta:
       - "Buffered intents replay in ledger order after outage recovery."
       - "Intents outside replay window are expired with deny receipt, not silently dropped."
       - "Idempotent replay skips already-projected intents without error."
+      - "Replayed intent with revoked authority is denied even if economics gate returns ALLOW — authority revocation is dominant."
+      - "Replayed intent with already-consumed token is denied — single-use semantics hold across replay boundaries."
       - "Convergence receipt includes correct replayed_item_count and backlog_digest."
       - "Batch size limits prevent post-outage thundering herd."
   notes:
@@ -73,10 +75,22 @@ ticket_meta:
       previously-denied intent is now admissible just because the sink recovered.
       Gate inputs may have changed (revoked keys, updated profiles). Each replay
       is a fresh admission decision.
+
+      PCAC LIFECYCLE ENFORCEMENT: Each replayed intent must undergo full lifecycle
+      enforcement (join, revalidate, consume) in addition to economics re-evaluation.
+      A buffered intent may carry authority that was valid at buffer time but has
+      since been revoked. Economics gates check temporal windows, NOT authority
+      freshness — these are orthogonal concerns. Without lifecycle enforcement,
+      replay becomes an exploit vector: buffer an intent before revocation, replay
+      after revocation, bypass authority checks via economics-only path.
     verification: |
       Include outage simulation test: buffer N intents during simulated outage,
       recover, verify replay in order with correct receipts. Include window
       expiration test: buffer intent, advance tick past window, verify expiration.
+      Include replayed-revoked-authority test: buffer intent, revoke authority
+      during outage, verify replay DENY despite economics ALLOW.
+      Include replayed-consumed-token test: buffer intent, consume token through
+      alternate path during outage, verify replay DENY (single-use).
     general: |
       This ticket delivers the "continuity during outage" promise from RFC-0029 REQ-0009.
       Without it, denied projections during outages are permanently lost.
