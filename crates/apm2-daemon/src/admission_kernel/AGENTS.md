@@ -54,7 +54,7 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK12] `release_boundary_output()` denies output release for fail-closed tiers when evidence hashes are empty. Marks `BoundarySpanV1` as released exactly once (TCK-00497). Integrated into `handle_request_tool` post-effect path.
 - [CTR-AK13] `MonitorWaiverV1::validate()` enforces `expires_at_tick` against current tick. Non-zero `expires_at_tick < current_tick` means expired waiver, which is denied (SECURITY MAJOR 2, TCK-00497).
 - [CTR-AK14] `WitnessEvidenceV1.measured_values` uses bounded visitor deserialization (`bounded_vec_deser!`) with max `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` to prevent unbounded allocation from untrusted input (QUALITY MAJOR 1 + SECURITY MAJOR 1, TCK-00497).
-- [CTR-AK18] `finalize_anti_rollback()` commits the anti-rollback anchor AFTER confirmed effect success. For fail-closed tiers, this advances the external anchor watermark. For monitor tiers, this is a no-op. MUST NOT be called before effect confirmation (pre-commit hazard). Called from `handle_request_tool` post-effect path after `DecisionType::Allow` (TCK-00502 BLOCKER-2).
+- [CTR-AK18] `finalize_anti_rollback()` commits the anti-rollback anchor AFTER confirmed effect success. For fail-closed tiers, this advances the external anchor watermark. For monitor tiers, this is a no-op. MUST NOT be called before effect confirmation (pre-commit hazard). Called from all effect-capable handler post-effect paths: `handle_request_tool` (after `DecisionType::Allow`), `handle_emit_event` (after ledger write), and `handle_publish_evidence` (after CAS write) (TCK-00502).
 - [CTR-AK19] `verify_anti_rollback()` tolerates `ExternalAnchorUnavailable` from `verify_committed()` as the bootstrap path: on fresh install, no prior anchor exists to protect and the anti-rollback invariant is vacuously satisfied. Other `TrustError` variants still produce denial (TCK-00502 BLOCKER-1).
 
 ### `KernelRequestV1` (types.rs)
@@ -203,9 +203,15 @@ plan():    validate -> prerequisite resolution -> witness seed creation ->
            PCAC join -> PCAC revalidate
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
-           durable consume -> anti-rollback anchor commit [P.1] (fail-closed) ->
-           bundle seal (TCK-00493) ->
+           durable consume -> bundle seal (TCK-00493) ->
            capability mint (tier-gated) -> boundary span -> result
+
+POST-EFFECT FINALIZATION (caller responsibility, TCK-00502):
+finalize_anti_rollback(): anti-rollback anchor commit (fail-closed tiers only)
+
+Every effect-capable handler (RequestTool, EmitEvent, PublishEvidence)
+MUST call finalize_anti_rollback() AFTER confirmed effect success and
+BEFORE persisting the AdmissionOutcomeIndexV1.
 ```
 
 ## Public API

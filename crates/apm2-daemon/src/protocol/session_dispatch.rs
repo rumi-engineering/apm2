@@ -8563,6 +8563,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     // commit was moved out of execute() to prevent the
                     // pre-commit hazard where a failed effect would leave
                     // the anchor watermark ahead of the actual ledger head.
+                    //
+                    // TODO(SEC): finalize_anti_rollback performs blocking
+                    // file I/O (write+fsync+rename) on a synchronous
+                    // dispatch path called from an async Tokio task.
+                    // Consider wrapping in spawn_blocking or refactoring
+                    // dispatch to async. Tracked separately from TCK-00502.
                     // ====================================================
                     if let Some(ref kernel) = self.admission_kernel {
                         let plan_tier = admission_res.boundary_span.enforcement_tier;
@@ -11433,6 +11439,35 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
+                // ====================================================
+                // TCK-00502: Finalize anti-rollback anchor AFTER
+                // confirmed effect success (ledger write). Mirrors
+                // handle_request_tool post-effect path. The anchor
+                // commit was deferred from execute() to prevent the
+                // pre-commit hazard where a failed effect would leave
+                // the anchor watermark ahead of the actual ledger head.
+                // ====================================================
+                if let Some(ref result) = admission_result {
+                    if let Some(ref kernel) = self.admission_kernel {
+                        let plan_tier = result.boundary_span.enforcement_tier;
+                        if let Err(e) =
+                            kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor)
+                        {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "EmitEvent anti-rollback anchor finalization failed \
+                                 (effect succeeded but anchor not committed)"
+                            );
+                            // The effect already succeeded; anti-rollback
+                            // finalization failure is logged but does not
+                            // retroactively revoke the allow decision. The
+                            // next admission will detect the stale anchor
+                            // via verify_anti_rollback and deny if needed.
+                        }
+                    }
+                }
+
                 // TCK-00498: Persist AdmissionOutcomeIndexV1 after successful
                 // effect (ledger write). This durably records the admission
                 // closure for the session endpoint.
@@ -11636,6 +11671,35 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             "evidence-publish witness payload serialization failed"
                         );
                     },
+                }
+            }
+        }
+
+        // ====================================================
+        // TCK-00502: Finalize anti-rollback anchor AFTER
+        // confirmed effect success (CAS write). Mirrors
+        // handle_request_tool post-effect path. The anchor
+        // commit was deferred from execute() to prevent the
+        // pre-commit hazard where a failed effect would leave
+        // the anchor watermark ahead of the actual ledger head.
+        // ====================================================
+        if let Some(ref result) = admission_result {
+            if let Some(ref kernel) = self.admission_kernel {
+                let plan_tier = result.boundary_span.enforcement_tier;
+                if let Err(e) =
+                    kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor)
+                {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "PublishEvidence anti-rollback anchor finalization failed \
+                         (effect succeeded but anchor not committed)"
+                    );
+                    // The effect already succeeded; anti-rollback
+                    // finalization failure is logged but does not
+                    // retroactively revoke the allow decision. The
+                    // next admission will detect the stale anchor
+                    // via verify_anti_rollback and deny if needed.
                 }
             }
         }

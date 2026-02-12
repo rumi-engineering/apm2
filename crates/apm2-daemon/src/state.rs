@@ -1207,10 +1207,11 @@ impl DispatcherState {
                             )
                             .map_err(|e| {
                                 format!(
-                                    "failed to initialize anti-rollback anchor ({}): {e}",
+                                    "failed to initialize anti-rollback anchor ({}) [error: {:?}]: {e}",
                                     std::any::type_name::<
                                         crate::admission_kernel::trust_stack::DurableAntiRollbackAnchor,
-                                    >()
+                                    >(),
+                                    e,
                                 )
                             })?,
                         );
@@ -1695,7 +1696,9 @@ impl DispatcherState {
                 )
                 .map_err(|e| {
                     crate::cas::DurableCasError::InitializationFailed {
-                        message: format!("failed to initialize anti-rollback anchor: {e}"),
+                        message: format!(
+                            "failed to initialize anti-rollback anchor [error: {e:?}]: {e}"
+                        ),
                     }
                 })?,
             );

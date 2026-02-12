@@ -1592,7 +1592,7 @@ impl DurableAntiRollbackAnchor {
             reason: "anchor state path has no parent directory".into(),
         })?;
 
-        // Ensure parent directory exists.
+        // Ensure parent directory exists with restrictive permissions.
         if !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| TrustError::IntegrityFailure {
                 reason: truncate_reason(&format!(
@@ -1600,6 +1600,23 @@ impl DurableAntiRollbackAnchor {
                     parent.display()
                 )),
             })?;
+            // SEC: Restrict parent directory to owner-only access (0o700)
+            // to prevent local attackers from manipulating or deleting
+            // the anchor file. The anchor file itself has 0o600 from
+            // NamedTempFile; the parent directory must also be restricted.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o700);
+                std::fs::set_permissions(parent, perms).map_err(|e| {
+                    TrustError::IntegrityFailure {
+                        reason: truncate_reason(&format!(
+                            "failed to set 0o700 permissions on anchor parent directory {}: {e}",
+                            parent.display()
+                        )),
+                    }
+                })?;
+            }
         }
 
         let mut tmp =
