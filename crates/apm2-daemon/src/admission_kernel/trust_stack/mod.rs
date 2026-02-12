@@ -42,9 +42,10 @@
 //!
 //! ## Key Rotation/Revocation
 //!
-//! Key validity is resolved as-of anchor/epoch. The verifier never uses
-//! "always latest keyset" behavior; instead, it resolves the active keyset
-//! for the epoch at which verification is being performed.
+//! Key validity is resolved per-event at the event's `he_time` epoch.
+//! The verifier never uses "always latest keyset" behavior; instead, it
+//! resolves the active keyset for the epoch at which each event occurred,
+//! correctly handling post-seal key rotations.
 //!
 //! # Fail-Closed Contract
 //!
@@ -718,10 +719,18 @@ impl ConcreteLedgerTrustVerifier {
             }
             // Full-chain fallback: verify from height 1 to tip.
             // This is expensive but allows recovery when the seal is stale.
-            self.verify_chain_segment(1, tip_height, &ledger_id, seal.seal_epoch)?;
+            // No anchor binding for genesis-start (no seal anchor to bind to).
+            self.verify_chain_segment(1, tip_height, &ledger_id, seal.seal_epoch, None)?;
         } else {
             // Normal path: verify from seal to tip.
-            self.verify_chain_segment(seal_height, tip_height, &ledger_id, seal.seal_epoch)?;
+            // Bind the first event to the seal's committed event_hash.
+            self.verify_chain_segment(
+                seal_height,
+                tip_height,
+                &ledger_id,
+                seal.seal_epoch,
+                Some(seal.anchor.event_hash),
+            )?;
         }
 
         // Step 6: Construct the validated state.
@@ -809,17 +818,24 @@ impl ConcreteLedgerTrustVerifier {
     /// Verify a chain segment from `start_height` to `end_height`.
     ///
     /// Checks:
+    /// - Anchor binding: if `expected_start_hash` is `Some`, the first event's
+    ///   `event_hash` must match it (constant-time comparison).
     /// - Hash chain integrity (each event's `prev_hash` matches the previous
     ///   event's `event_hash`).
     /// - Monotonic HT (`he_time` is non-decreasing).
-    /// - Signature verification for signed events (optional — unsigned events
-    ///   are allowed in the chain but cannot provide governance authority).
+    /// - Signature verification for signed events using per-event `he_time`
+    ///   epoch (optional — unsigned events are allowed in the chain but cannot
+    ///   provide governance authority).
+    /// - Fail-closed on incomplete reads: if the event source cannot produce
+    ///   events for the full `[start_height, end_height]` range, verification
+    ///   fails.
     fn verify_chain_segment(
         &self,
         start_height: u64,
         end_height: u64,
         expected_ledger_id: &Hash,
-        verification_epoch: u64,
+        _seal_epoch: u64,
+        expected_start_hash: Option<Hash>,
     ) -> Result<(), TrustError> {
         // Read events in batches to avoid loading the entire chain into
         // memory at once. Batch size is bounded.
@@ -827,6 +843,7 @@ impl ConcreteLedgerTrustVerifier {
         let mut current_height = start_height;
         let mut prev_hash: Option<Hash> = None;
         let mut prev_he_time: u64 = 0;
+        let mut checked_anchor = false;
 
         while current_height <= end_height {
             let events = self
@@ -839,14 +856,50 @@ impl ConcreteLedgerTrustVerifier {
                 })?;
 
             if events.is_empty() {
-                // No more events — chain ends before end_height.
-                // This is valid if we've reached the tip.
-                break;
+                // Fail-closed: the event source cannot produce events for
+                // the entire [start_height, end_height] range.
+                return Err(TrustError::IntegrityFailure {
+                    reason: truncate_reason(&format!(
+                        "chain verification gap: no events returned at height {current_height}, \
+                         expected events up to height {end_height}"
+                    )),
+                });
             }
 
             for event in &events {
                 if event.height > end_height {
                     break;
+                }
+
+                // Anchor binding check: the first event MUST match the
+                // seal's committed event_hash (if provided).
+                if !checked_anchor {
+                    checked_anchor = true;
+
+                    // Defensive: verify the first event's height matches
+                    // the expected start_height.
+                    if event.height != start_height {
+                        return Err(TrustError::IntegrityFailure {
+                            reason: truncate_reason(&format!(
+                                "first event height {} does not match expected start height {start_height}",
+                                event.height
+                            )),
+                        });
+                    }
+
+                    if let Some(ref expected_anchor) = expected_start_hash {
+                        if !bool::from(event.event_hash.ct_eq(expected_anchor)) {
+                            return Err(TrustError::IntegrityFailure {
+                                reason: truncate_reason(&format!(
+                                    "first event at height {} does not match sealed anchor event_hash: \
+                                     expected {}, got {}",
+                                    event.height,
+                                    hex::encode(expected_anchor),
+                                    hex::encode(event.event_hash)
+                                )),
+                            });
+                        }
+                    }
                 }
 
                 // Check hash chain link.
@@ -874,13 +927,16 @@ impl ConcreteLedgerTrustVerifier {
                 }
 
                 // Verify signature if present (crypto-agile dispatch).
+                // Key validity is resolved at the event's own epoch
+                // (he_time), NOT the seal epoch, to correctly handle
+                // post-seal key rotations.
                 if !event.signature.is_empty() {
                     if let Some(ref signer_key_id) = event.signer_key_id {
                         self.verify_event_signature(
                             event,
                             signer_key_id,
                             expected_ledger_id,
-                            verification_epoch,
+                            event.he_time,
                         )?;
                     }
                 }

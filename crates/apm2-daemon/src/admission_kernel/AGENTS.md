@@ -131,7 +131,7 @@ Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prere
 
 - [INV-TS01] `RootTrustBundle` is bounded by `MAX_TRUST_BUNDLE_KEYS` (64). Empty bundles are rejected.
 - [INV-TS02] Key IDs must be unique within a bundle.
-- [INV-TS03] Key validity is resolved as-of epoch (never "always latest keyset").
+- [INV-TS03] Event signature key validity is resolved per-event at the event's `he_time` epoch, not the seal epoch, to correctly handle post-seal key rotations (never "always latest keyset").
 - [INV-TS04] Seal signature must chain to an active key in the `RootTrustBundle` at `seal_epoch`.
 - [INV-TS05] Hash chain integrity is verified with constant-time comparisons (`subtle::ConstantTimeEq`).
 - [INV-TS06] HT monotonicity is enforced (non-decreasing `he_time`).
@@ -139,6 +139,8 @@ Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prere
 - [INV-TS08] Governance events MUST be signed; unsigned events are rejected.
 - [INV-TS09] Policy root cache is bounded by `MAX_POLICY_ROOT_CACHE_ENTRIES` (64) with oldest-epoch eviction.
 - [INV-TS10] All `usize` to `u32` casts in hash functions are safe because input lengths are bounded by MAX_* constants.
+- [INV-TS11] Chain segment verification binds the first event's `event_hash` to the seal's committed anchor hash (constant-time comparison). Prevents fork substitution.
+- [INV-TS12] Incomplete chain reads (event source returns empty before `end_height`) fail closed with `IntegrityFailure`. No silent acceptance of truncated chains.
 
 ### `QuarantineGuard` (mod.rs)
 

@@ -27,6 +27,15 @@
 //! - (g) `Ed25519SignatureVerifier`: unknown algorithm -- fail-closed
 //! - (h) Tamper detection: modified `event_hash` detected
 //! - (i) Keyset digest changes with rotation
+//! - (j) Seal anchor binding:
+//!   - Forked chain (different `event_hash` at seal height) --
+//!     `IntegrityFailure`
+//!   - Correct chain with matching anchor -- success
+//! - (k) Incomplete chain reads fail-closed:
+//!   - Chain ends before `end_height` -- `IntegrityFailure`
+//! - (l) Per-event key epoch resolution:
+//!   - Post-seal key rotation accepted with per-event epoch
+//!   - Revoked key rejected at event epoch
 
 use std::sync::Arc;
 
@@ -1138,4 +1147,418 @@ fn policy_resolver_different_anchors_produce_different_roots() {
         result_3.policy_root_digest, result_5.policy_root_digest,
         "different anchor heights with different governance events should produce different roots"
     );
+}
+
+// =============================================================================
+// Finding 1: Seal anchor binding tests
+// =============================================================================
+
+/// Build a valid chain with a different starting `event_hash` than
+/// `forked_hash`, but internally consistent (valid hash chain, valid
+/// signatures, monotonic HT).
+fn build_forked_chain(
+    ledger_id: Hash,
+    start_height: u64,
+    count: u64,
+    signing_key: &ed25519_dalek::SigningKey,
+    key_id: &str,
+    fork_seed: u8,
+) -> Vec<LedgerEventView> {
+    use ed25519_dalek::Signer;
+
+    let mut events = Vec::new();
+    let mut prev_hash = [0u8; 32];
+
+    for i in 0..count {
+        let height = start_height + i;
+        let he_time = 1000 + i * 10;
+
+        // Compute event hash with a fork seed to produce a different chain.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"forked-event");
+        hasher.update(&[fork_seed]);
+        hasher.update(&prev_hash);
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&ledger_id);
+        let event_hash = *hasher.finalize().as_bytes();
+
+        let signature = signing_key.sign(&event_hash).to_bytes().to_vec();
+
+        events.push(LedgerEventView {
+            height,
+            event_hash,
+            prev_hash,
+            he_time,
+            event_type: "test.event".to_string(),
+            payload: Vec::new(),
+            signature,
+            signer_key_id: Some(key_id.to_string()),
+        });
+
+        prev_hash = event_hash;
+    }
+
+    events
+}
+
+#[test]
+fn verifier_anchor_binding_rejects_forked_chain() {
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Build a "canonical" chain to establish the seal anchor.
+    let canonical_events = build_test_chain(ledger_id, 1, 10, &signing_key, "test-key");
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: canonical_events[0].event_hash,
+        height: 1,
+        he_time: canonical_events[0].he_time,
+    };
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    // Build a FORKED chain that is internally consistent but starts with a
+    // different event_hash at height 1 than the seal commits to.
+    let forked_events = build_forked_chain(ledger_id, 1, 10, &signing_key, "test-key", 0xFF);
+
+    // Verify the forked chain's first event hash differs from the seal anchor.
+    assert_ne!(
+        forked_events[0].event_hash, canonical_events[0].event_hash,
+        "forked chain must have a different event_hash at height 1"
+    );
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(forked_events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        matches!(result, Err(TrustError::IntegrityFailure { .. })),
+        "forked chain should be rejected: {result:?}"
+    );
+    if let Err(TrustError::IntegrityFailure { reason }) = &result {
+        assert!(
+            reason.contains("does not match sealed anchor event_hash"),
+            "reason should mention anchor mismatch: {reason}"
+        );
+    }
+}
+
+#[test]
+fn verifier_anchor_binding_accepts_correct_chain() {
+    // This is essentially the same as verifier_startup_success but
+    // explicitly validates that anchor binding works on the happy path.
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+    let events = build_test_chain(ledger_id, 1, 10, &signing_key, "test-key");
+
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: events[0].event_hash,
+        height: 1,
+        he_time: events[0].he_time,
+    };
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        result.is_ok(),
+        "correct chain with matching anchor should succeed: {result:?}"
+    );
+}
+
+// =============================================================================
+// Finding 2: Incomplete chain reads fail-closed
+// =============================================================================
+
+/// Mock event source that delegates to an inner [`MockEventSource`] but
+/// overrides `tip_height()` to return a caller-specified value, simulating
+/// a ledger that claims a tip higher than the events it can actually produce.
+struct TruncatedEventSource {
+    inner: MockEventSource,
+    fake_tip: u64,
+}
+
+impl LedgerEventSource for TruncatedEventSource {
+    fn read_events(&self, start_height: u64, limit: usize) -> Result<Vec<LedgerEventView>, String> {
+        self.inner.read_events(start_height, limit)
+    }
+
+    fn tip_height(&self) -> Result<u64, String> {
+        Ok(self.fake_tip)
+    }
+
+    fn ledger_id(&self) -> Hash {
+        self.inner.ledger_id()
+    }
+
+    fn find_latest_seal(&self, max_height: u64) -> Result<Option<TrustedSealV1>, String> {
+        self.inner.find_latest_seal(max_height)
+    }
+
+    fn read_governance_events(
+        &self,
+        start_height: u64,
+        end_height: u64,
+        limit: usize,
+    ) -> Result<Vec<LedgerEventView>, String> {
+        self.inner
+            .read_governance_events(start_height, end_height, limit)
+    }
+}
+
+#[test]
+fn verifier_incomplete_chain_fails_closed() {
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Build a chain of 10 events, but only include events for heights 1-5.
+    // The mock event source will claim tip_height = 10 but return empty
+    // for heights 6+.
+    let full_events = build_test_chain(ledger_id, 1, 10, &signing_key, "test-key");
+    let partial_events: Vec<_> = full_events.into_iter().take(5).collect();
+
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: partial_events[0].event_hash,
+        height: 1,
+        he_time: partial_events[0].he_time,
+    };
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    let inner_source = MockEventSource::new(ledger_id)
+        .with_events(partial_events)
+        .with_seal(seal);
+
+    let event_source = Arc::new(TruncatedEventSource {
+        inner: inner_source,
+        fake_tip: 10,
+    });
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        matches!(result, Err(TrustError::IntegrityFailure { .. })),
+        "incomplete chain should fail closed: {result:?}"
+    );
+    if let Err(TrustError::IntegrityFailure { reason }) = &result {
+        assert!(
+            reason.contains("chain verification gap"),
+            "reason should mention chain gap: {reason}"
+        );
+    }
+}
+
+// =============================================================================
+// Finding 3: Per-event key epoch resolution tests
+// =============================================================================
+
+/// Build a chain where events have specific `he_time` values and are signed
+/// with a specific key.
+fn build_chain_with_key_rotation(
+    ledger_id: Hash,
+    start_height: u64,
+    entries: &[(u64, &ed25519_dalek::SigningKey, &str)], // (he_time, key, key_id)
+) -> Vec<LedgerEventView> {
+    use ed25519_dalek::Signer;
+
+    let mut events = Vec::new();
+    let mut prev_hash = [0u8; 32];
+
+    for (i, &(he_time, signing_key, key_id)) in entries.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let height = start_height + i as u64;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"test-event");
+        hasher.update(&prev_hash);
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&ledger_id);
+        let event_hash = *hasher.finalize().as_bytes();
+
+        let signature = signing_key.sign(&event_hash).to_bytes().to_vec();
+
+        events.push(LedgerEventView {
+            height,
+            event_hash,
+            prev_hash,
+            he_time,
+            event_type: "test.event".to_string(),
+            payload: Vec::new(),
+            signature,
+            signer_key_id: Some(key_id.to_string()),
+        });
+
+        prev_hash = event_hash;
+    }
+
+    events
+}
+
+#[test]
+fn verifier_post_seal_key_rotation_accepted() {
+    let (key1, pk1) = generate_test_keypair();
+    let (key2, pk2) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Trust bundle with two keys:
+    //   key-1: active [0, 100)
+    //   key-2: active [100, inf)
+    let bundle = RootTrustBundle {
+        schema_version: ROOT_TRUST_BUNDLE_SCHEMA_VERSION.to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-1".to_string(),
+                public_key_bytes: pk1.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: Some(100),
+            },
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-2".to_string(),
+                public_key_bytes: pk2.to_vec(),
+                active_from_epoch: 100,
+                revoked_at_epoch: None,
+            },
+        ],
+    };
+
+    // Build a chain where:
+    //   Events at he_time < 100 are signed with key-1
+    //   Events at he_time >= 100 are signed with key-2
+    let entries: Vec<(u64, &ed25519_dalek::SigningKey, &str)> = vec![
+        (10, &key1, "key-1"),
+        (30, &key1, "key-1"),
+        (50, &key1, "key-1"),
+        (80, &key1, "key-1"),
+        (100, &key2, "key-2"), // Post-rotation
+        (120, &key2, "key-2"),
+        (150, &key2, "key-2"),
+    ];
+    let events = build_chain_with_key_rotation(ledger_id, 1, &entries);
+
+    // Seal at epoch 50 using key-1 (anchored at first event).
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: events[0].event_hash,
+        height: 1,
+        he_time: events[0].he_time,
+    };
+    let seal = create_test_seal(&key1, &seal_anchor, "key-1", 50);
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        bundle,
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        result.is_ok(),
+        "post-seal key rotation should be accepted with per-event epoch resolution: {result:?}"
+    );
+}
+
+#[test]
+fn verifier_revoked_key_rejected_at_event_epoch() {
+    let (key1, pk1) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Trust bundle with one key that is revoked at epoch 50.
+    let bundle = RootTrustBundle {
+        schema_version: ROOT_TRUST_BUNDLE_SCHEMA_VERSION.to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![TrustBundleKeyEntry {
+            algorithm_id: "ed25519".to_string(),
+            key_id: "key-1".to_string(),
+            public_key_bytes: pk1.to_vec(),
+            active_from_epoch: 0,
+            revoked_at_epoch: Some(50),
+        }],
+    };
+
+    // Build a chain where an event at he_time=60 is signed with key-1.
+    // key-1 is NOT active at epoch 60 (revoked at 50), so this should fail.
+    let entries: Vec<(u64, &ed25519_dalek::SigningKey, &str)> = vec![
+        (10, &key1, "key-1"),
+        (20, &key1, "key-1"),
+        (30, &key1, "key-1"),
+        (60, &key1, "key-1"), // key-1 is revoked at epoch 50 -- should fail
+    ];
+    let events = build_chain_with_key_rotation(ledger_id, 1, &entries);
+
+    // Seal at epoch 10 using key-1 (valid at epoch 10).
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: events[0].event_hash,
+        height: 1,
+        he_time: events[0].he_time,
+    };
+    let seal = create_test_seal(&key1, &seal_anchor, "key-1", 10);
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        bundle,
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        matches!(result, Err(TrustError::IntegrityFailure { .. })),
+        "revoked key at event epoch should be rejected: {result:?}"
+    );
+    if let Err(TrustError::IntegrityFailure { reason }) = &result {
+        assert!(
+            reason.contains("not found or not active at epoch"),
+            "reason should mention key not active: {reason}"
+        );
+    }
 }
