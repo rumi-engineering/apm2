@@ -5,7 +5,7 @@
 //! Implements:
 //! - [`ProjectionContinuityWindowV1`] outage/replay horizon enforcement.
 //! - [`ProjectionSinkContinuityProfileV1`] per-sink-set scenario evaluation.
-//! - [`SinkIdentitySnapshotV1`] sink identity binding.
+//! - [`MultiSinkIdentitySnapshotV1`] sink identity binding.
 //! - TP-EIO29-005 (`projection_multi_sink_continuity_valid`) enforcement.
 //! - TP-EIO29-004 deferred replay boundedness validation (when active).
 //! - Authoritative progression independence from projection sink state.
@@ -1075,7 +1075,7 @@ impl ProjectionSinkContinuityProfileV1 {
 }
 
 // ============================================================================
-// SinkIdentitySnapshotV1
+// MultiSinkIdentitySnapshotV1
 // ============================================================================
 
 /// A single sink identity entry in the snapshot.
@@ -1091,10 +1091,15 @@ pub struct SinkIdentityEntry {
 
 /// Snapshot of projection sink identities used for scenario generation.
 ///
-/// Implements `SinkIdentitySnapshotV1` from RFC-0029 REQ-0009.
+/// Implements multi-sink identity snapshot from RFC-0029 REQ-0009.
+///
+/// Distinct from [`crate::fac::ChannelIdentitySnapshotV1`] which captures
+/// per-channel identity binding for compromise detection. This type
+/// aggregates ALL configured sink identities for multi-sink continuity
+/// evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SinkIdentitySnapshotV1 {
+pub struct MultiSinkIdentitySnapshotV1 {
     /// Sink identities.
     #[serde(deserialize_with = "deser_sink_identities")]
     pub sink_identities: Vec<SinkIdentityEntry>,
@@ -1102,7 +1107,7 @@ pub struct SinkIdentitySnapshotV1 {
     pub snapshot_digest: Hash,
 }
 
-impl SinkIdentitySnapshotV1 {
+impl MultiSinkIdentitySnapshotV1 {
     /// Computes the canonical digest of the sink identities collection.
     ///
     /// Hashes each sink identity entry (length-prefixed `sink_id` +
@@ -1428,7 +1433,7 @@ pub struct ContinuityDenyDefect {
 pub fn validate_projection_continuity_tp005(
     continuity_window: Option<&ProjectionContinuityWindowV1>,
     continuity_profile: Option<&ProjectionSinkContinuityProfileV1>,
-    sink_snapshot: Option<&SinkIdentitySnapshotV1>,
+    sink_snapshot: Option<&MultiSinkIdentitySnapshotV1>,
     eval_boundary_id: &str,
     trusted_signers: &[[u8; 32]],
     expected_time_authority_ref: &Hash,
@@ -1774,7 +1779,7 @@ impl ContinuityDecision {
 pub fn evaluate_projection_continuity(
     continuity_window: Option<&ProjectionContinuityWindowV1>,
     continuity_profile: Option<&ProjectionSinkContinuityProfileV1>,
-    sink_snapshot: Option<&SinkIdentitySnapshotV1>,
+    sink_snapshot: Option<&MultiSinkIdentitySnapshotV1>,
     eval_boundary_id: &str,
     eval_tick: u64,
     envelope_hash: Hash,
@@ -1966,8 +1971,8 @@ mod tests {
         .expect("valid continuity profile")
     }
 
-    fn valid_sink_snapshot() -> SinkIdentitySnapshotV1 {
-        let mut snapshot = SinkIdentitySnapshotV1 {
+    fn valid_sink_snapshot() -> MultiSinkIdentitySnapshotV1 {
+        let mut snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![
                 SinkIdentityEntry {
                     sink_id: "github-main".to_string(),
@@ -2148,7 +2153,7 @@ mod tests {
     }
 
     // ========================================================================
-    // SinkIdentitySnapshotV1
+    // MultiSinkIdentitySnapshotV1
     // ========================================================================
 
     #[test]
@@ -2159,7 +2164,7 @@ mod tests {
 
     #[test]
     fn sink_snapshot_empty_denied() {
-        let snapshot = SinkIdentitySnapshotV1 {
+        let snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![],
             snapshot_digest: test_hash(0xEE),
         };
@@ -2168,7 +2173,7 @@ mod tests {
 
     #[test]
     fn sink_snapshot_zero_digest_denied() {
-        let snapshot = SinkIdentitySnapshotV1 {
+        let snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![SinkIdentityEntry {
                 sink_id: "sink-1".to_string(),
                 identity_digest: test_hash(0x01),
@@ -2183,7 +2188,7 @@ mod tests {
 
     #[test]
     fn sink_snapshot_zero_identity_digest_denied() {
-        let snapshot = SinkIdentitySnapshotV1 {
+        let snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![SinkIdentityEntry {
                 sink_id: "sink-1".to_string(),
                 identity_digest: [0u8; 32],
@@ -3261,7 +3266,7 @@ mod tests {
 
     #[test]
     fn sink_snapshot_duplicate_sink_ids_denied() {
-        let mut snapshot = SinkIdentitySnapshotV1 {
+        let mut snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![
                 SinkIdentityEntry {
                     sink_id: "sink-dup".to_string(),
@@ -3283,7 +3288,7 @@ mod tests {
 
     #[test]
     fn sink_snapshot_single_sink_insufficient_denied() {
-        let mut snapshot = SinkIdentitySnapshotV1 {
+        let mut snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![SinkIdentityEntry {
                 sink_id: "only-one-sink".to_string(),
                 identity_digest: test_hash(0x01),
@@ -3308,7 +3313,7 @@ mod tests {
 
     #[test]
     fn sink_snapshot_three_distinct_sinks_allowed() {
-        let mut snapshot = SinkIdentitySnapshotV1 {
+        let mut snapshot = MultiSinkIdentitySnapshotV1 {
             sink_identities: vec![
                 SinkIdentityEntry {
                     sink_id: "sink-a".to_string(),

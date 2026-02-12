@@ -31,10 +31,10 @@ use std::collections::HashMap;
 
 use apm2_core::config::ProjectionSinkProfileConfig;
 use apm2_core::crypto::{EventHasher, Hash};
-use apm2_core::economics::{SinkIdentityEntry, SinkIdentitySnapshotV1};
+use apm2_core::economics::{MultiSinkIdentitySnapshotV1, SinkIdentityEntry};
 
-/// Maximum number of resolved profiles (mirrors config bound).
-pub const MAX_RESOLVED_PROFILES: usize = 64;
+/// Maximum number of resolved profiles (references config bound).
+pub const MAX_RESOLVED_PROFILES: usize = apm2_core::config::MAX_PROJECTION_SINKS;
 
 // ============================================================================
 // ContinuityProfileResolver trait
@@ -64,7 +64,7 @@ pub trait ContinuityProfileResolver: Send + Sync {
     ///
     /// Returns `None` when no snapshot is available for `sink_id`.
     /// Callers must treat `None` as DENY.
-    fn resolve_sink_snapshot(&self, sink_id: &str) -> Option<SinkIdentitySnapshotV1>;
+    fn resolve_sink_snapshot(&self, sink_id: &str) -> Option<MultiSinkIdentitySnapshotV1>;
 
     /// Resolves the continuity window for the given boundary identifier.
     ///
@@ -143,7 +143,7 @@ pub struct ConfigBackedResolver {
     /// Pre-resolved profiles keyed by sink identifier.
     profiles: HashMap<String, ResolvedContinuityProfile>,
     /// Pre-resolved sink identity snapshots keyed by sink identifier.
-    snapshots: HashMap<String, SinkIdentitySnapshotV1>,
+    snapshots: HashMap<String, MultiSinkIdentitySnapshotV1>,
     /// Pre-resolved continuity windows keyed by boundary identifier.
     ///
     /// For config-backed resolution, each sink ID also serves as a
@@ -171,8 +171,11 @@ impl ConfigBackedResolver {
         sinks: &HashMap<String, ProjectionSinkProfileConfig>,
     ) -> Result<Self, ConfigResolverError> {
         let mut profiles = HashMap::with_capacity(sinks.len());
-        let mut snapshots = HashMap::with_capacity(sinks.len());
         let mut windows = HashMap::with_capacity(sinks.len());
+
+        // Collect per-sink decoded key material so we can build the
+        // aggregate snapshot deterministically across ALL sinks.
+        let mut decoded_keys: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(sinks.len());
 
         for (sink_id, config) in sinks {
             // Decode trusted signer keys (already validated at config
@@ -206,20 +209,6 @@ impl ConfigBackedResolver {
                 trusted_signer_keys: trusted_signer_keys.clone(),
             };
 
-            // Build a sink identity snapshot for this sink.
-            // The identity digest is the hash of the sink ID + trusted
-            // signer key material, providing a content-addressed binding.
-            let identity_digest = compute_sink_identity_digest(sink_id, &trusted_signer_keys);
-            let entry = SinkIdentityEntry {
-                sink_id: sink_id.clone(),
-                identity_digest,
-            };
-            let mut snapshot = SinkIdentitySnapshotV1 {
-                sink_identities: vec![entry],
-                snapshot_digest: [0u8; 32],
-            };
-            snapshot.snapshot_digest = snapshot.compute_digest();
-
             // Build a continuity window for this sink using the sink ID
             // as the boundary ID.
             let window = ResolvedContinuityWindow {
@@ -228,9 +217,37 @@ impl ConfigBackedResolver {
                 replay_window_ticks: config.replay_window_ticks,
             };
 
+            decoded_keys.push((sink_id.clone(), trusted_signer_keys));
             profiles.insert(sink_id.clone(), profile);
-            snapshots.insert(sink_id.clone(), snapshot);
             windows.insert(sink_id.clone(), window);
+        }
+
+        // Build the aggregate multi-sink identity snapshot containing
+        // ALL configured sinks, sorted deterministically by sink_id.
+        // RFC-0029 REQ-0009 requires at least 2 distinct sinks for
+        // meaningful multi-sink continuity scenarios. Each per-sink
+        // resolution returns this same complete snapshot.
+        decoded_keys.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let mut all_entries: Vec<SinkIdentityEntry> = Vec::with_capacity(decoded_keys.len());
+        for (sink_id, keys) in &decoded_keys {
+            let identity_digest = compute_sink_identity_digest(sink_id, keys);
+            all_entries.push(SinkIdentityEntry {
+                sink_id: sink_id.clone(),
+                identity_digest,
+            });
+        }
+        let mut aggregate_snapshot = MultiSinkIdentitySnapshotV1 {
+            sink_identities: all_entries,
+            snapshot_digest: [0u8; 32],
+        };
+        aggregate_snapshot.snapshot_digest = aggregate_snapshot.compute_digest();
+
+        // Store the same aggregate snapshot for every sink key so that
+        // resolve_sink_snapshot(any_configured_sink_id) returns the
+        // complete multi-sink snapshot.
+        let mut snapshots = HashMap::with_capacity(decoded_keys.len());
+        for (sink_id, _) in &decoded_keys {
+            snapshots.insert(sink_id.clone(), aggregate_snapshot.clone());
         }
 
         Ok(Self {
@@ -252,7 +269,7 @@ impl ContinuityProfileResolver for ConfigBackedResolver {
         self.profiles.get(sink_id).cloned()
     }
 
-    fn resolve_sink_snapshot(&self, sink_id: &str) -> Option<SinkIdentitySnapshotV1> {
+    fn resolve_sink_snapshot(&self, sink_id: &str) -> Option<MultiSinkIdentitySnapshotV1> {
         self.snapshots.get(sink_id).cloned()
     }
 
@@ -841,5 +858,103 @@ mod tests {
             snap2.sink_identities[0].identity_digest
         );
         assert_ne!(snap1.snapshot_digest, snap2.snapshot_digest);
+    }
+
+    // ===================================================================
+    // Multi-sink aggregate snapshot (BLOCKER fix verification)
+    // ===================================================================
+
+    /// UT-00507-22: Aggregate snapshot contains ALL configured sinks,
+    /// sorted deterministically by `sink_id`.
+    #[test]
+    fn multi_sink_aggregate_snapshot_contains_all_sinks_sorted() {
+        let key1 = valid_test_key_hex();
+        let key2 = valid_test_key_hex_2();
+        let mut sinks = HashMap::new();
+        // Insert in non-sorted order to verify deterministic sorting.
+        sinks.insert(
+            "zeta-sink".to_string(),
+            make_sink_config(100, 200, 1, 1, vec![key1]),
+        );
+        sinks.insert(
+            "alpha-sink".to_string(),
+            make_sink_config(300, 400, 2, 2, vec![key2]),
+        );
+
+        let resolver =
+            ConfigBackedResolver::from_config(&sinks).expect("resolver construction must succeed");
+        assert_eq!(resolver.sink_count(), 2);
+
+        // Both sinks resolve to the SAME aggregate snapshot.
+        let snap_alpha = resolver
+            .resolve_sink_snapshot("alpha-sink")
+            .expect("snapshot must be present");
+        let snap_zeta = resolver
+            .resolve_sink_snapshot("zeta-sink")
+            .expect("snapshot must be present");
+
+        // Same snapshot for both lookups.
+        assert_eq!(snap_alpha, snap_zeta);
+
+        // Contains all sinks in sorted order.
+        assert_eq!(snap_alpha.sink_identities.len(), 2);
+        assert_eq!(snap_alpha.sink_identities[0].sink_id, "alpha-sink");
+        assert_eq!(snap_alpha.sink_identities[1].sink_id, "zeta-sink");
+
+        // Digest is non-zero and verifies.
+        assert_ne!(snap_alpha.snapshot_digest, [0u8; 32]);
+        assert!(snap_alpha.verify_digest().is_ok());
+
+        // Satisfies multi-sink validation (>= 2 distinct sinks).
+        assert!(snap_alpha.validate().is_ok());
+    }
+
+    /// UT-00507-23: Single-sink snapshot still has one entry but the
+    /// snapshot is the complete aggregate (which happens to be 1 sink).
+    #[test]
+    fn single_sink_snapshot_is_complete_aggregate() {
+        let key_hex = valid_test_key_hex();
+        let mut sinks = HashMap::new();
+        sinks.insert(
+            "only-sink".to_string(),
+            make_sink_config(100, 200, 1, 1, vec![key_hex]),
+        );
+
+        let resolver =
+            ConfigBackedResolver::from_config(&sinks).expect("resolver construction must succeed");
+
+        let snapshot = resolver
+            .resolve_sink_snapshot("only-sink")
+            .expect("snapshot must be present");
+        assert_eq!(snapshot.sink_identities.len(), 1);
+        assert_eq!(snapshot.sink_identities[0].sink_id, "only-sink");
+        assert!(snapshot.verify_digest().is_ok());
+    }
+
+    /// UT-00507-24: Aggregate snapshot digest is deterministic across
+    /// multiple constructions with the same config (`HashMap` iteration
+    /// order independence).
+    #[test]
+    fn aggregate_snapshot_deterministic_across_constructions() {
+        let key1 = valid_test_key_hex();
+        let key2 = valid_test_key_hex_2();
+        let mut sinks = HashMap::new();
+        sinks.insert(
+            "sink-b".to_string(),
+            make_sink_config(100, 200, 1, 1, vec![key1]),
+        );
+        sinks.insert(
+            "sink-a".to_string(),
+            make_sink_config(300, 400, 2, 2, vec![key2]),
+        );
+
+        let resolver1 = ConfigBackedResolver::from_config(&sinks).unwrap();
+        let resolver2 = ConfigBackedResolver::from_config(&sinks).unwrap();
+
+        let snap1 = resolver1.resolve_sink_snapshot("sink-a").unwrap();
+        let snap2 = resolver2.resolve_sink_snapshot("sink-a").unwrap();
+
+        assert_eq!(snap1.snapshot_digest, snap2.snapshot_digest);
+        assert_eq!(snap1.sink_identities, snap2.sink_identities);
     }
 }

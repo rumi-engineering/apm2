@@ -310,6 +310,7 @@ pub struct AdapterRotationProfileConfig {
 /// Disabled by default; enable by setting `enabled = true` and providing
 /// GitHub API credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionConfig {
     /// Whether projection is enabled.
     #[serde(default)]
@@ -379,8 +380,10 @@ pub const MAX_PROJECTION_SINKS: usize = 64;
 /// bound).
 pub const MAX_TRUSTED_SIGNERS_PER_SINK: usize = 32;
 
-/// Maximum length of a sink identifier string.
-pub const MAX_SINK_ID_CONFIG_LENGTH: usize = 256;
+/// Maximum length of a sink identifier string (references economics
+/// domain constant for consistency).
+pub const MAX_SINK_ID_CONFIG_LENGTH: usize =
+    crate::economics::projection_continuity::MAX_SINK_ID_LENGTH;
 
 /// Per-sink continuity profile configuration (TCK-00507).
 ///
