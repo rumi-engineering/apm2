@@ -7609,8 +7609,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // granted. Without it, broker dispatch MUST NOT proceed for
         // fail-closed tiers.
         // ================================================================
-        let _admission_result = if self.pcac_lifecycle_gate.is_none()
-            && self.is_authoritative_mode()
+        let admission_result = if self.pcac_lifecycle_gate.is_none() && self.is_authoritative_mode()
         {
             if let Some(ref kernel) = self.admission_kernel {
                 // Resolve the PCAC risk tier for this tool class.
@@ -7829,6 +7828,114 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         } else {
             None
         };
+
+        // ================================================================
+        // TCK-00494 SECURITY MAJOR 1 FIX: Persist AdmissionBundleV1
+        // evidence to the ledger BEFORE broker dispatch.
+        //
+        // The admission result from the kernel contains a sealed
+        // AdmissionBundleV1 and its content-hash digest. This evidence
+        // MUST be persisted as a ToolActuation ledger event before any
+        // effect execution to maintain the audit trail and
+        // non-repudiation guarantees (RFC-0019 §8, Evidence
+        // Sufficiency law 7).
+        //
+        // Fail-closed: if serialization or persistence fails, deny the
+        // request — the authority chain evidence MUST be durable before
+        // any side effect.
+        // ================================================================
+        if let Some(ref result) = admission_result {
+            // Get an HTF timestamp for the ledger event.
+            let evidence_timestamp = self.get_htf_timestamp()?;
+            let evidence_ts_ns = evidence_timestamp.wall_ns;
+
+            let tool_actuation_payload = serde_json::json!({
+                "event_kind": "ToolActuation",
+                "source": "admission_kernel",
+                "bundle_digest": hex::encode(result.bundle_digest),
+                "ajc_id": hex::encode(result.bundle.ajc_id),
+                "tool_class": tool_class.to_string(),
+                "session_id": result.bundle.session_id,
+                "intent_digest": hex::encode(result.bundle.intent_digest),
+                "consume_time_intent_digest": hex::encode(result.bundle.consume_time_intent_digest),
+                "enforcement_tier": format!("{}", result.boundary_span.enforcement_tier),
+                "risk_tier": format!("{:?}", result.bundle.risk_tier),
+                "consume_selector_digest": hex::encode(result.bundle.consume_selector_digest),
+                "authority_join_hash": hex::encode(result.bundle.authority_join_hash),
+                "time_envelope_ref": hex::encode(result.bundle.time_envelope_ref),
+                "freshness_witness_tick": result.bundle.freshness_witness_tick,
+                "revocation_head_hash": hex::encode(result.bundle.revocation_head_hash),
+                "spine_ext_hash": hex::encode(result.bundle.spine_ext_hash),
+                "policy_root_digest": hex::encode(result.bundle.policy_root_digest),
+                "policy_root_epoch": result.bundle.policy_root_epoch,
+            });
+            let payload_bytes = match serde_json::to_vec(&tool_actuation_payload) {
+                Ok(bytes) => bytes,
+                Err(serialization_error) => {
+                    error!(
+                        session_id = %token.session_id,
+                        request_id = %request_id,
+                        error = %serialization_error,
+                        "AdmissionKernel ToolActuation payload serialization failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!(
+                            "admission kernel authority denied before effect: \
+                             ToolActuation payload serialization failed: {serialization_error}"
+                        ),
+                    ));
+                },
+            };
+
+            if let Some(ref ledger) = self.ledger {
+                if let Err(e) = ledger.emit_session_event(
+                    &token.session_id,
+                    "kernel_tool_actuation",
+                    &payload_bytes,
+                    "admission_kernel:lifecycle",
+                    evidence_ts_ns,
+                ) {
+                    // Fail-closed: if the ToolActuation event cannot be
+                    // persisted, deny the effect. The authority chain
+                    // evidence MUST be durable before any side effect.
+                    warn!(
+                        session_id = %token.session_id,
+                        request_id = %request_id,
+                        error = %e,
+                        "AdmissionKernel ToolActuation ledger event persistence failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("admission kernel tool actuation evidence persistence failed: {e}"),
+                    ));
+                }
+
+                info!(
+                    session_id = %token.session_id,
+                    request_id = %request_id,
+                    bundle_digest = %hex::encode(result.bundle_digest),
+                    ajc_id = %hex::encode(result.bundle.ajc_id),
+                    "AdmissionKernel ToolActuation event persisted before broker dispatch"
+                );
+            } else if result.boundary_span.enforcement_tier
+                == crate::admission_kernel::types::EnforcementTier::FailClosed
+            {
+                // Fail-closed tier without ledger: cannot persist evidence.
+                warn!(
+                    session_id = %token.session_id,
+                    request_id = %request_id,
+                    "AdmissionKernel ToolActuation denied: ledger unavailable for fail-closed tier"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    "admission kernel tool actuation evidence persistence failed: \
+                     ledger unavailable for fail-closed tier",
+                ));
+            }
+            // Monitor tier without ledger: log warning but proceed (defense
+            // in depth, not gating).
+        }
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
@@ -22193,6 +22300,354 @@ mod tests {
                 },
                 other => panic!("Unexpected response for fail-closed tier with kernel: {other:?}"),
             }
+        }
+
+        /// **Admission bundle evidence persistence test (SECURITY MAJOR 1
+        /// fix)**:
+        ///
+        /// When the `AdmissionKernel` plan+execute succeeds, the handler MUST
+        /// emit a `kernel_tool_actuation` event to the ledger BEFORE broker
+        /// dispatch. This event binds the `AdmissionBundleV1` digest and AJC
+        /// ID to the session event stream, ensuring non-repudiation and
+        /// auditability for the kernel admission path.
+        ///
+        /// The test wires a fully-passing kernel (all prerequisites satisfied)
+        /// so plan+execute succeeds. The broker is NOT wired, so the request
+        /// ultimately fails at broker dispatch — but the ledger event MUST
+        /// already be persisted at that point.
+        #[test]
+        fn admission_bundle_evidence_emitted_to_ledger_on_kernel_success() {
+            use apm2_core::pcac::{
+                AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
+                AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+                BoundaryIntentClass, IdentityEvidenceLevel as CoreIdentityEvidenceLevel,
+                PcacPolicyKnobs,
+            };
+
+            use crate::admission_kernel::QuarantineGuard;
+            use crate::admission_kernel::prerequisites::{
+                AntiRollbackAnchor, ExternalAnchorStateV1, LedgerAnchorV1, LedgerTrustVerifier,
+                PolicyError, PolicyRootResolver, PolicyRootStateV1, TrustError,
+                ValidatedLedgerStateV1,
+            };
+            use crate::protocol::dispatch::LedgerEventEmitter;
+
+            fn test_hash(byte: u8) -> apm2_core::crypto::Hash {
+                let mut h = [0u8; 32];
+                h[0] = byte;
+                h[31] = byte;
+                h
+            }
+
+            // -- Mock PCAC kernel that always passes --
+            struct PassingPcacKernel;
+            impl AuthorityJoinKernel for PassingPcacKernel {
+                fn join(
+                    &self,
+                    _input: &AuthorityJoinInputV1,
+                    _policy: &PcacPolicyKnobs,
+                ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                    Ok(AuthorityJoinCertificateV1 {
+                        ajc_id: test_hash(50),
+                        authority_join_hash: test_hash(51),
+                        intent_digest: test_hash(3),
+                        boundary_intent_class: BoundaryIntentClass::Actuate,
+                        risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                        issued_time_envelope_ref: test_hash(52),
+                        issued_at_tick: 40,
+                        as_of_ledger_anchor: test_hash(53),
+                        expires_at_tick: 1000,
+                        revocation_head_hash: test_hash(54),
+                        identity_evidence_level: CoreIdentityEvidenceLevel::Verified,
+                        admission_capacity_token: None,
+                    })
+                }
+                fn revalidate(
+                    &self,
+                    _cert: &AuthorityJoinCertificateV1,
+                    _time: apm2_core::crypto::Hash,
+                    _ledger: apm2_core::crypto::Hash,
+                    _revocation: apm2_core::crypto::Hash,
+                    _policy: &PcacPolicyKnobs,
+                ) -> Result<(), Box<AuthorityDenyV1>> {
+                    Ok(())
+                }
+                fn consume(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    _intent: apm2_core::crypto::Hash,
+                    _class: BoundaryIntentClass,
+                    _requires_auth: bool,
+                    _time: apm2_core::crypto::Hash,
+                    _revocation: apm2_core::crypto::Hash,
+                    _policy: &PcacPolicyKnobs,
+                ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+                {
+                    Ok((
+                        AuthorityConsumedV1 {
+                            ajc_id: cert.ajc_id,
+                            intent_digest: test_hash(3),
+                            consumed_time_envelope_ref: test_hash(61),
+                            consumed_at_tick: 45,
+                        },
+                        AuthorityConsumeRecordV1 {
+                            ajc_id: cert.ajc_id,
+                            consumed_time_envelope_ref: test_hash(61),
+                            consumed_at_tick: 45,
+                            effect_selector_digest: test_hash(60),
+                        },
+                    ))
+                }
+            }
+
+            // -- Mock prerequisite stubs --
+            struct PassingLedgerVerifier;
+            impl LedgerTrustVerifier for PassingLedgerVerifier {
+                fn validated_state(&self) -> Result<ValidatedLedgerStateV1, TrustError> {
+                    Ok(ValidatedLedgerStateV1 {
+                        validated_anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(20),
+                            event_hash: test_hash(21),
+                            height: 100,
+                            he_time: 1000,
+                        },
+                        tip_anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(20),
+                            event_hash: test_hash(22),
+                            height: 105,
+                            he_time: 1050,
+                        },
+                        ledger_keyset_digest: test_hash(23),
+                        root_trust_bundle_digest: test_hash(24),
+                    })
+                }
+            }
+
+            struct PassingPolicyResolver;
+            impl PolicyRootResolver for PassingPolicyResolver {
+                fn resolve(
+                    &self,
+                    _as_of: &LedgerAnchorV1,
+                ) -> Result<PolicyRootStateV1, PolicyError> {
+                    Ok(PolicyRootStateV1 {
+                        policy_root_digest: test_hash(30),
+                        policy_root_epoch: 5,
+                        anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(20),
+                            event_hash: test_hash(21),
+                            height: 100,
+                            he_time: 1000,
+                        },
+                        provenance:
+                            crate::admission_kernel::prerequisites::GovernanceProvenanceV1 {
+                                signer_key_id: test_hash(31),
+                                algorithm_id: "ed25519".to_string(),
+                            },
+                    })
+                }
+            }
+
+            struct PassingAntiRollback;
+            impl AntiRollbackAnchor for PassingAntiRollback {
+                fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+                    Ok(ExternalAnchorStateV1 {
+                        anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(20),
+                            event_hash: test_hash(21),
+                            height: 100,
+                            he_time: 1000,
+                        },
+                        mechanism_id: "test".to_string(),
+                        proof_hash: test_hash(40),
+                    })
+                }
+                fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                    Ok(())
+                }
+            }
+
+            struct PassingQuarantineGuard;
+            impl QuarantineGuard for PassingQuarantineGuard {
+                fn reserve(
+                    &self,
+                    _request_id: &apm2_core::crypto::Hash,
+                    _ajc_id: &apm2_core::crypto::Hash,
+                ) -> Result<apm2_core::crypto::Hash, String> {
+                    Ok(test_hash(70))
+                }
+            }
+
+            // -- Build a kernel with all prerequisites passing --
+            let pcac_kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(PassingPcacKernel);
+            let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
+                provider_id: "test-provider/evidence-emission".to_string(),
+                provider_build_digest: *blake3::hash(b"test-build-digest-evidence").as_bytes(),
+            };
+            let kernel = Arc::new(
+                crate::admission_kernel::AdmissionKernelV1::new(pcac_kernel, witness_cfg)
+                    .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
+                    .with_policy_resolver(Arc::new(PassingPolicyResolver))
+                    .with_anti_rollback(Arc::new(PassingAntiRollback))
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard)),
+            );
+
+            let minter = test_minter();
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest = make_tier3_manifest(ToolClass::Execute);
+            manifest_store.register("session-001", manifest);
+
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            let ledger_dyn: Arc<dyn LedgerEventEmitter> = Arc::clone(&ledger) as _;
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let clock = Arc::new(
+                crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                    .expect("default clock config should build"),
+            );
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_ledger(ledger_dyn)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+            // NOTE: No broker wired — request will fail at broker dispatch.
+            // The ToolActuation event should already be persisted by then.
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "execute".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "command": "echo evidence-test"
+                }))
+                .unwrap(),
+                dedupe_key: "evidence-emission-test-001".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // The response should be an error (broker unavailable), but the
+            // ToolActuation event should have been persisted to the ledger
+            // BEFORE the broker check.
+            match response {
+                SessionResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("tool broker unavailable"),
+                        "Expected broker unavailable error (kernel succeeded, \
+                         evidence emitted, then broker missing). Got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected error response (broker unavailable after kernel success). \
+                     Got: {other:?}"
+                ),
+            }
+
+            // CRITICAL ASSERTION: Verify the ToolActuation event was
+            // emitted to the ledger with the admission bundle evidence.
+            let events = ledger.get_events_by_work_id("session-001");
+            let tool_actuation_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "kernel_tool_actuation")
+                .collect();
+
+            assert_eq!(
+                tool_actuation_events.len(),
+                1,
+                "Exactly 1 kernel_tool_actuation event must be emitted. \
+                 Found {} events. All events: {:?}",
+                tool_actuation_events.len(),
+                events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            );
+
+            // Parse the event payload and verify it contains the bundle
+            // evidence fields required for non-repudiation.
+            let actuation_event = tool_actuation_events[0];
+            let payload: serde_json::Value =
+                serde_json::from_slice(&actuation_event.payload).expect("valid JSON payload");
+
+            // The inner payload is hex-encoded in the signed event
+            // wrapper. Extract and decode it.
+            let inner_payload_hex = payload
+                .get("payload")
+                .and_then(|v| v.as_str())
+                .expect("payload field must exist");
+            let inner_bytes =
+                hex::decode(inner_payload_hex).expect("inner payload must be valid hex");
+            let inner: serde_json::Value =
+                serde_json::from_slice(&inner_bytes).expect("inner payload must be valid JSON");
+
+            // Verify required evidence fields are present and non-empty.
+            assert_eq!(
+                inner.get("event_kind").and_then(|v| v.as_str()),
+                Some("ToolActuation"),
+                "event_kind must be ToolActuation"
+            );
+            assert_eq!(
+                inner.get("source").and_then(|v| v.as_str()),
+                Some("admission_kernel"),
+                "source must be admission_kernel"
+            );
+
+            let bundle_digest_hex = inner
+                .get("bundle_digest")
+                .and_then(|v| v.as_str())
+                .expect("bundle_digest must be present");
+            assert!(
+                !bundle_digest_hex.is_empty() && bundle_digest_hex != "00".repeat(32),
+                "bundle_digest must be non-empty and non-zero. Got: {bundle_digest_hex}"
+            );
+
+            let ajc_id_hex = inner
+                .get("ajc_id")
+                .and_then(|v| v.as_str())
+                .expect("ajc_id must be present");
+            assert!(
+                !ajc_id_hex.is_empty() && ajc_id_hex != "00".repeat(32),
+                "ajc_id must be non-empty and non-zero. Got: {ajc_id_hex}"
+            );
+
+            assert!(
+                inner
+                    .get("intent_digest")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "intent_digest must be present"
+            );
+            assert!(
+                inner
+                    .get("enforcement_tier")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "enforcement_tier must be present"
+            );
+            assert!(
+                inner
+                    .get("authority_join_hash")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "authority_join_hash must be present"
+            );
+            assert!(
+                inner
+                    .get("consume_selector_digest")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "consume_selector_digest must be present"
+            );
+            assert!(
+                inner
+                    .get("policy_root_digest")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "policy_root_digest must be present"
+            );
         }
     }
 }

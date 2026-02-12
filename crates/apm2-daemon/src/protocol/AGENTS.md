@@ -97,7 +97,7 @@ Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after v
 - [CTR-PR06] Token is validated BEFORE any handler logic executes.
 - [CTR-PR07] Messages use bounded decoding (CTR-1603).
 - [CTR-PR08] Authority lifecycle guard fires after decode/validate/transport checks but BEFORE PCAC lifecycle and broker dispatch (TCK-00494). Requires at least one authority gate (`AdmissionKernel` or `LifecycleGate`) for fail-closed tier tool requests in authoritative mode.
-- [CTR-PR09] When `AdmissionKernel` is wired without `LifecycleGate`, `handle_request_tool` invokes `kernel.plan()` then `kernel.execute()` with fresh clock/session state, denying on any error with `SessionErrorToolNotAllowed`. The kernel result (`AdmissionResultV1`) is captured before broker dispatch (TCK-00494).
+- [CTR-PR09] When `AdmissionKernel` is wired without `LifecycleGate`, `handle_request_tool` invokes `kernel.plan()` then `kernel.execute()` with fresh clock/session state, denying on any error with `SessionErrorToolNotAllowed`. The kernel result (`AdmissionResultV1`) is persisted to the ledger as a `kernel_tool_actuation` event BEFORE broker dispatch — fail-closed if persistence fails (TCK-00494, SECURITY MAJOR 1 fix).
 
 ### `SessionToken`
 
