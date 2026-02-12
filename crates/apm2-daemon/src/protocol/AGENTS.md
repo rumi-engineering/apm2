@@ -89,11 +89,15 @@ Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after v
 - [INV-PR04] Session endpoints require valid `session_token`.
 - [INV-PR05] Invalid/expired tokens return `SESSION_ERROR_INVALID`.
 - [INV-PR06] Token validation uses constant-time HMAC comparison.
+- [INV-PR11] In authoritative mode, fail-closed tiers (Tier2/3/4) MUST be denied if neither `AdmissionKernel` nor `LifecycleGate` is wired (TCK-00494 no-bypass invariant). No silent fallback to ungated effect-capable path.
+- [INV-PR12] When `AdmissionKernel` is wired and `LifecycleGate` is absent, the `RequestTool` handler MUST invoke `kernel.plan()` and `kernel.execute()` for fail-closed tier requests in authoritative mode. The kernel MUST succeed before broker dispatch proceeds (TCK-00494 kernel invocation invariant).
 
 **Contracts:**
 
 - [CTR-PR06] Token is validated BEFORE any handler logic executes.
 - [CTR-PR07] Messages use bounded decoding (CTR-1603).
+- [CTR-PR08] Authority lifecycle guard fires after decode/validate/transport checks but BEFORE PCAC lifecycle and broker dispatch (TCK-00494). Requires at least one authority gate (`AdmissionKernel` or `LifecycleGate`) for fail-closed tier tool requests in authoritative mode.
+- [CTR-PR09] When `AdmissionKernel` is wired without `LifecycleGate`, `handle_request_tool` invokes `kernel.plan()` then `kernel.execute()` with fresh clock/session state, denying on any error with `SessionErrorToolNotAllowed`. The kernel result (`AdmissionResultV1`) is persisted to the ledger as a `kernel_tool_actuation` event BEFORE broker dispatch — fail-closed if persistence fails (TCK-00494, SECURITY MAJOR 1 fix).
 
 ### `SessionToken`
 

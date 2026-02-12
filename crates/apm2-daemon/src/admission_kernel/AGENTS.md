@@ -140,12 +140,24 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
 - `PolicyRootStateV1`, `GovernanceProvenanceV1`
 - `TrustError`, `PolicyError`
 
+## Handler Integration (TCK-00494)
+
+The `AdmissionKernel` is wired into `SessionDispatcher` via `with_admission_kernel()`. In authoritative mode (ledger or CAS configured), the `RequestTool` handler enforces a kernel guard and invokes the kernel lifecycle:
+
+- **Fail-closed tiers** (Tier2/3/4 -> `FailClosed` enforcement): requests are denied with `SessionErrorToolNotAllowed` if neither the kernel nor the PCAC `LifecycleGate` is wired. No silent fallback to ungated effect-capable path.
+- **Kernel invocation path** (kernel wired, no `LifecycleGate`): `handle_request_tool` invokes `kernel.plan()` with a `KernelRequestV1` built from session state, then `kernel.execute()` with fresh clock/revalidation inputs. Both must succeed; any error produces an immediate deny before broker dispatch.
+- **Monitor tiers** (Tier0/1): requests pass the kernel guard without kernel wiring.
+- **Non-authoritative mode**: the kernel guard does not fire regardless of tier.
+
+The kernel is wired in production via `DispatcherState::with_persistence_and_adapter_rotation()` and `DispatcherState::with_persistence_and_cas_and_key()`, each creating a dedicated `DurableKernel` with its own `FileBackedConsumeIndex`.
+
 ## Related Modules
 
 - [`apm2_daemon::pcac`](../pcac/AGENTS.md) -- PCAC lifecycle gate (`InProcessKernel`, `LifecycleGate`)
 - [`apm2_core::pcac`](../../../apm2-core/src/pcac/AGENTS.md) -- Core PCAC types (`AuthorityJoinKernel`, `RiskTier`, etc.)
 - [`apm2_daemon::htf`](../htf/AGENTS.md) -- `HolonicClock` provides tick source
 - [`apm2_daemon::protocol`](../protocol/AGENTS.md) -- Session dispatch integration point
+- [`apm2_daemon::state`](../state.rs) -- Production wiring (`DispatcherState` constructors)
 
 ## References
 
@@ -158,8 +170,10 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
 - RFC-0019 section 7: Quarantine reservation
 - RFC-0019 Appendix A: Prerequisite trait interfaces
 - REQ-0023: AdmissionKernel plan/execute + capability-gated effect surfaces
+- REQ-0025: Handler refactoring for kernel-gated admission
 - REQ-0002: Fail-closed enforcement tiers
 - REQ-0004: Lifecycle ordering
 - REQ-0024: AdmissionBundleV1 deterministic CAS bundle
 - TCK-00492: Implementation ticket (kernel plan/execute API)
 - TCK-00493: Implementation ticket (bundle + outcome index)
+- TCK-00494: Implementation ticket (handler refactoring + kernel wiring)
