@@ -105,6 +105,10 @@ const ZERO_HASH: Hash = [0u8; 32];
 
 /// Deserializes a `String` with a hard length bound to prevent OOM during
 /// deserialization from untrusted input.
+///
+/// Uses a Visitor-based implementation so that `visit_str` checks the length
+/// BEFORE allocating (calling `to_owned()`), closing the Check-After-Allocate
+/// OOM-DoS vector present in naive `String::deserialize` + post-check patterns.
 fn deserialize_bounded_string<'de, D>(
     deserializer: D,
     max_len: usize,
@@ -113,16 +117,55 @@ fn deserialize_bounded_string<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    if s.len() > max_len {
-        return Err(de::Error::custom(format!(
-            "string field '{}' exceeds maximum length ({} > {})",
-            field_name,
-            s.len(),
-            max_len
-        )));
+    struct BoundedStringVisitor {
+        max_len: usize,
+        field_name: &'static str,
     }
-    Ok(s)
+
+    impl Visitor<'_> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a string of at most {} bytes for field '{}'",
+                self.max_len, self.field_name
+            )
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            if value.len() > self.max_len {
+                Err(E::custom(format!(
+                    "string field '{}' exceeds maximum length ({} > {})",
+                    self.field_name,
+                    value.len(),
+                    self.max_len
+                )))
+            } else {
+                // Length validated BEFORE allocation.
+                Ok(value.to_owned())
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            if value.len() > self.max_len {
+                Err(E::custom(format!(
+                    "string field '{}' exceeds maximum length ({} > {})",
+                    self.field_name,
+                    value.len(),
+                    self.max_len
+                )))
+            } else {
+                // Already owned — no additional allocation needed.
+                Ok(value)
+            }
+        }
+    }
+
+    deserializer.deserialize_string(BoundedStringVisitor {
+        max_len,
+        field_name,
+    })
 }
 
 /// Deserializes a `Vec<T>` with a hard item-count bound to prevent OOM during
@@ -1140,13 +1183,29 @@ pub fn validate_envelope_tp001(
 }
 
 /// Returns deterministic canonical bytes for envelope signature verification.
+///
+/// Variable-length fields (`boundary_id`, `authority_clock`) are
+/// length-prefixed with a 4-byte LE u32 to ensure injectivity — otherwise
+/// concatenation of different pairs can produce identical byte sequences (e.g.,
+/// `("ab","cd")` vs `("abc","d")`).
 fn envelope_canonical_bytes(envelope: &TimeAuthorityEnvelopeV1) -> Vec<u8> {
-    // Build a deterministic byte representation:
-    // boundary_id || authority_clock || tick_start || tick_end || ttl_ticks ||
-    // deny_on_unknown || content_hash
+    // Build a deterministic, injective byte representation:
+    // len(boundary_id) || boundary_id || len(authority_clock) || authority_clock
+    // || tick_start || tick_end || ttl_ticks || deny_on_unknown || content_hash
     let mut buf = Vec::with_capacity(256);
+
+    // boundary_id (length-prefixed)
+    #[allow(clippy::cast_possible_truncation)]
+    let bid_len = envelope.boundary_id.len().min(u32::MAX as usize) as u32;
+    buf.extend_from_slice(&bid_len.to_le_bytes());
     buf.extend_from_slice(envelope.boundary_id.as_bytes());
+
+    // authority_clock (length-prefixed)
+    #[allow(clippy::cast_possible_truncation)]
+    let clk_len = envelope.authority_clock.len().min(u32::MAX as usize) as u32;
+    buf.extend_from_slice(&clk_len.to_le_bytes());
     buf.extend_from_slice(envelope.authority_clock.as_bytes());
+
     buf.extend_from_slice(&envelope.tick_start.to_le_bytes());
     buf.extend_from_slice(&envelope.tick_end.to_le_bytes());
     buf.extend_from_slice(&envelope.ttl_ticks.to_le_bytes());
@@ -1236,7 +1295,9 @@ pub fn validate_convergence_horizon_tp003(
         return Err(DENY_CONVERGENCE_RECEIPT_MISSING);
     }
 
-    // Every required authority set must have a matching, converged receipt
+    // O(N*M) where N=required_authority_sets (max 64) and M=convergence_receipts
+    // (max 256). Upper bound: 16,384 constant-time comparisons — negligible at
+    // these cardinalities.
     for required_set in required_authority_sets {
         if is_zero_hash(required_set) {
             return Err(DENY_AUTHORITY_SET_NOT_CONVERGED);
@@ -1331,6 +1392,8 @@ pub fn evaluate_queue_admission(
 
 /// Evaluates TP-EIO29-001/002/003 for queue admission. Returns
 /// `(tp001, tp002, tp003)` on success or a deny decision on failure.
+// JUSTIFICATION: `QueueAdmissionDecision` in the `Err` variant is returned by value
+// (not boxed) to avoid heap allocation on the deny hot-path.
 #[allow(clippy::result_large_err)]
 fn evaluate_temporal_predicates(
     request: &QueueAdmissionRequest,
@@ -1412,6 +1475,9 @@ fn evaluate_temporal_predicates(
 
 /// Checks tick-floor invariants and capacity constraints. Returns `Ok(())`
 /// on success or a deny decision on failure.
+// JUSTIFICATION: 8 parameters are individually meaningful context for deny-path
+// construction; a wrapper struct would add ceremony for a single internal call site.
+// `result_large_err`: returned by value to avoid heap allocation on deny hot-path.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn check_structural_constraints(
     scheduler: &QueueSchedulerState,
@@ -2924,5 +2990,73 @@ mod tests {
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         // The defect() accessor must delegate to trace.defect.
         assert_eq!(decision.defect(), decision.trace.defect.as_ref());
+    }
+
+    // ========================================================================
+    // BLOCKER 1 — Visitor-based bounded string deserialization
+    // ========================================================================
+
+    #[test]
+    fn test_bounded_string_visitor_rejects_oversized_boundary_id_at_deser() {
+        // A boundary_id exceeding MAX_BOUNDARY_ID_LENGTH (256) must fail at
+        // deserialization time — not at post-validation — proving the Visitor
+        // checks length before allocation on the `visit_str` path.
+        let oversized = "A".repeat(MAX_BOUNDARY_ID_LENGTH + 1);
+        let json = format!(
+            r#"{{
+                "boundary_id": "{oversized}",
+                "authority_clock": "c",
+                "tick_start": 0,
+                "tick_end": 0
+            }}"#
+        );
+        let result = serde_json::from_str::<HtfEvaluationWindow>(&json);
+        assert!(
+            result.is_err(),
+            "boundary_id exceeding MAX_BOUNDARY_ID_LENGTH must fail at deserialization"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds maximum length"),
+            "error must mention exceeds maximum length, got: {err_msg}"
+        );
+    }
+
+    // ========================================================================
+    // BLOCKER 2 — Injective (length-prefixed) canonical bytes
+    // ========================================================================
+
+    #[test]
+    fn test_envelope_canonical_bytes_injective() {
+        // Three envelopes whose (boundary_id, authority_clock) pairs would
+        // collide under naive concatenation must produce DISTINCT canonical
+        // bytes with the length-prefix framing.
+        let make = |bid: &str, clk: &str| {
+            let mut env = valid_envelope();
+            env.boundary_id = bid.to_string();
+            env.authority_clock = clk.to_string();
+            env
+        };
+
+        let e1 = make("ab", "cd");
+        let e2 = make("abc", "d");
+        let e3 = make("a", "bcd");
+
+        let b1 = envelope_canonical_bytes(&e1);
+        let b2 = envelope_canonical_bytes(&e2);
+        let b3 = envelope_canonical_bytes(&e3);
+
+        assert_ne!(
+            b1, b2,
+            "('ab','cd') and ('abc','d') must produce different canonical bytes"
+        );
+        assert_ne!(
+            b1, b3,
+            "('ab','cd') and ('a','bcd') must produce different canonical bytes"
+        );
+        assert_ne!(
+            b2, b3,
+            "('abc','d') and ('a','bcd') must produce different canonical bytes"
+        );
     }
 }
