@@ -8,6 +8,7 @@
 //! - replay recovery from durable, signature-verified receipts
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use super::domain_separator::{
@@ -613,7 +614,10 @@ impl ProjectionReplayReceiptV1 {
         )?;
         let actor_keyset =
             trusted_keyset_for_actor(&self.signer_actor_id, trusted_authority_bindings)?;
-        if !actor_keyset.contains(&self.signer_key) {
+        if !actor_keyset
+            .iter()
+            .any(|trusted_key| bool::from(trusted_key.ct_eq(&self.signer_key)))
+        {
             return Err(ProjectionCompromiseError::UntrustedSignerKey {
                 actor_id: self.signer_actor_id.clone(),
             });
@@ -683,7 +687,7 @@ pub fn detect_projection_divergence(
     validate_non_zero_hash("ledger_state_digest", &ledger_state_digest)?;
     validate_non_zero_hash("observed_digest", &observed_digest)?;
 
-    if channel.expected_state_digest == observed_digest {
+    if bool::from(channel.expected_state_digest.ct_eq(&observed_digest)) {
         return Ok(None);
     }
 
@@ -744,27 +748,41 @@ pub fn quarantine_channel(
             actual: sink_snapshot.channel_id.clone(),
         });
     }
-    if source_snapshot.expected_projection_digest != divergence.expected_digest {
+    if !bool::from(
+        source_snapshot
+            .expected_projection_digest
+            .ct_eq(&divergence.expected_digest),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: "source snapshot expected digest does not match divergence expected digest"
                 .to_string(),
         });
     }
-    if sink_snapshot.observed_projection_digest != divergence.observed_digest {
+    if !bool::from(
+        sink_snapshot
+            .observed_projection_digest
+            .ct_eq(&divergence.observed_digest),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: "sink snapshot observed digest does not match divergence observed digest"
                 .to_string(),
         });
     }
-    if source_snapshot.time_authority_ref != divergence.time_authority_ref
-        || sink_snapshot.time_authority_ref != divergence.time_authority_ref
-    {
+    if !bool::from(
+        source_snapshot
+            .time_authority_ref
+            .ct_eq(&divergence.time_authority_ref),
+    ) || !bool::from(
+        sink_snapshot
+            .time_authority_ref
+            .ct_eq(&divergence.time_authority_ref),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: "time_authority_ref mismatch between divergence and snapshots".to_string(),
         });
     }
-    if source_snapshot.window_ref != divergence.window_ref
-        || sink_snapshot.window_ref != divergence.window_ref
+    if !bool::from(source_snapshot.window_ref.ct_eq(&divergence.window_ref))
+        || !bool::from(sink_snapshot.window_ref.ct_eq(&divergence.window_ref))
     {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: "window_ref mismatch between divergence and snapshots".to_string(),
@@ -893,7 +911,7 @@ pub fn reconstruct_projection_state(
 
     validate_replay_receipt_count(&sorted, sequence_bounds, sorted_len_u64, expected_count)?;
 
-    if final_digest != source_snapshot.expected_projection_digest {
+    if !bool::from(final_digest.ct_eq(&source_snapshot.expected_projection_digest)) {
         return Err(ProjectionCompromiseError::ReplayDigestMismatch {
             expected: hex::encode(source_snapshot.expected_projection_digest),
             actual: hex::encode(final_digest),
@@ -989,12 +1007,16 @@ fn validate_reconstruction_inputs(
             actual: sink_snapshot.channel_id.clone(),
         });
     }
-    if source_snapshot.time_authority_ref != sink_snapshot.time_authority_ref {
+    if !bool::from(
+        source_snapshot
+            .time_authority_ref
+            .ct_eq(&sink_snapshot.time_authority_ref),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: "source/sink time_authority_ref mismatch".to_string(),
         });
     }
-    if source_snapshot.window_ref != sink_snapshot.window_ref {
+    if !bool::from(source_snapshot.window_ref.ct_eq(&sink_snapshot.window_ref)) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: "source/sink window_ref mismatch".to_string(),
         });
@@ -1053,17 +1075,25 @@ fn validate_replay_receipt(
     validate_non_zero_hash("receipt.time_authority_ref", &receipt.time_authority_ref)?;
     validate_non_zero_hash("receipt.window_ref", &receipt.window_ref)?;
 
-    if receipt.time_authority_ref != source_snapshot.time_authority_ref {
+    if !bool::from(
+        receipt
+            .time_authority_ref
+            .ct_eq(&source_snapshot.time_authority_ref),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: format!("receipt {} time_authority_ref mismatch", receipt.receipt_id),
         });
     }
-    if receipt.window_ref != source_snapshot.window_ref {
+    if !bool::from(receipt.window_ref.ct_eq(&source_snapshot.window_ref)) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: format!("receipt {} window_ref mismatch", receipt.receipt_id),
         });
     }
-    if receipt.source_trust_snapshot_digest != expected_source_digest {
+    if !bool::from(
+        receipt
+            .source_trust_snapshot_digest
+            .ct_eq(&expected_source_digest),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: format!(
                 "receipt {} source snapshot digest mismatch",
@@ -1071,7 +1101,11 @@ fn validate_replay_receipt(
             ),
         });
     }
-    if receipt.sink_identity_snapshot_digest != expected_sink_digest {
+    if !bool::from(
+        receipt
+            .sink_identity_snapshot_digest
+            .ct_eq(&expected_sink_digest),
+    ) {
         return Err(ProjectionCompromiseError::SnapshotMismatch {
             detail: format!(
                 "receipt {} sink snapshot digest mismatch",

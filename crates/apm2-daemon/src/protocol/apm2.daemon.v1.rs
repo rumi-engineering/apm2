@@ -1769,6 +1769,9 @@ pub struct RegisterRecoveryEvidenceRequest {
     /// Serialized replay receipts (JSON array of ProjectionReplayReceiptV1).
     #[prost(bytes = "vec", tag = "5")]
     pub receipts_json: ::prost::alloc::vec::Vec<u8>,
+    /// Lease ID for PCAC lifecycle enforcement. Required for authority binding.
+    #[prost(string, tag = "6")]
+    pub lease_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RegisterRecoveryEvidenceResponse {
@@ -1796,6 +1799,9 @@ pub struct RequestUnfreezeRequest {
     /// Adjudication ID (required when resolution_type is ADJUDICATION).
     #[prost(string, tag = "3")]
     pub adjudication_id: ::prost::alloc::string::String,
+    /// Lease ID for PCAC lifecycle enforcement. Required for authority binding.
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RequestUnfreezeResponse {

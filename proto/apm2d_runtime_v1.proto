@@ -1816,6 +1816,8 @@ message RegisterRecoveryEvidenceRequest {
   uint64 required_end_sequence = 4;
   // Serialized replay receipts (JSON array of ProjectionReplayReceiptV1).
   bytes receipts_json = 5;
+  // Lease ID for PCAC lifecycle enforcement. Required for authority binding.
+  string lease_id = 6;
 }
 
 message RegisterRecoveryEvidenceResponse {
@@ -1837,6 +1839,8 @@ message RequestUnfreezeRequest {
   string resolution_type = 2;
   // Adjudication ID (required when resolution_type is ADJUDICATION).
   string adjudication_id = 3;
+  // Lease ID for PCAC lifecycle enforcement. Required for authority binding.
+  string lease_id = 4;
 }
 
 message RequestUnfreezeResponse {

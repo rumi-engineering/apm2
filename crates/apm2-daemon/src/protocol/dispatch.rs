@@ -7365,6 +7365,8 @@ pub struct PrivilegedPcacPolicy {}
 pub(crate) enum PrivilegedHandlerClass {
     DelegateSublease,
     IngestReviewReceipt,
+    RegisterRecoveryEvidence,
+    RequestUnfreeze,
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -7373,6 +7375,8 @@ impl PrivilegedHandlerClass {
         match self {
             Self::DelegateSublease => "pcac-privileged-delegate-sublease",
             Self::IngestReviewReceipt => "pcac-privileged-ingest-review",
+            Self::RegisterRecoveryEvidence => "pcac-privileged-register-recovery-evidence",
+            Self::RequestUnfreeze => "pcac-privileged-request-unfreeze",
         }
     }
 
@@ -7380,6 +7384,8 @@ impl PrivilegedHandlerClass {
         match self {
             Self::DelegateSublease => "DelegateSublease",
             Self::IngestReviewReceipt => "IngestReviewReceipt",
+            Self::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
+            Self::RequestUnfreeze => "RequestUnfreeze",
         }
     }
 }
@@ -8760,11 +8766,27 @@ impl PrivilegedDispatcher {
     fn handle_register_recovery_evidence(
         &self,
         payload: &[u8],
+        ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
+        // Maximum size for receipts_json payload (256 KiB) to bound
+        // deserialization memory and prevent memory exhaustion via oversized payloads.
+        const MAX_RECEIPTS_JSON_SIZE: usize = 256 * 1024;
+        // Maximum number of replay receipts per request to prevent CPU exhaustion.
+        const MAX_RECEIPTS_PER_REQUEST: usize = 4096;
+
         let request = RegisterRecoveryEvidenceRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
                 reason: format!("invalid RegisterRecoveryEvidenceRequest: {e}"),
             })?;
+
+        // ---- Phase -1: Bind caller identity to authenticated peer ----
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "peer credentials required for recovery evidence registration",
+            ));
+        };
+        let _authenticated_caller_id = derive_actor_id(peer_creds);
 
         let watchdog =
             self.divergence_watchdog
@@ -8780,10 +8802,33 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "lease_id is required for PCAC lifecycle enforcement",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
         if request.durable_evidence_digest.len() != 32 {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::InvalidArgument,
                 "durable_evidence_digest must be exactly 32 bytes",
+            ));
+        }
+
+        if request.receipts_json.len() > MAX_RECEIPTS_JSON_SIZE {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "receipts_json exceeds maximum size: {} > {MAX_RECEIPTS_JSON_SIZE}",
+                    request.receipts_json.len()
+                ),
             ));
         }
 
@@ -8797,11 +8842,144 @@ impl PrivilegedDispatcher {
                 }
             })?;
 
+        if receipts.len() > MAX_RECEIPTS_PER_REQUEST {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "receipts count exceeds maximum: {} > {MAX_RECEIPTS_PER_REQUEST}",
+                    receipts.len(),
+                ),
+            ));
+        }
+
         let sequence_bounds = apm2_core::fac::projection_compromise::ReplaySequenceBoundsV1 {
             required_start_sequence: request.required_start_sequence,
             required_end_sequence: request.required_end_sequence,
         };
 
+        // ---- PCAC lifecycle enforcement (admission BEFORE mutation) ----
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for RegisterRecoveryEvidence (fail-closed)",
+            ));
+        };
+
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+                Ok(values) => values,
+                Err(error) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "PCAC authority denied for RegisterRecoveryEvidence: \
+                             authoritative revalidation unavailable: {error}"
+                        ),
+                    ));
+                },
+            };
+
+        let (risk_tier, _resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, digest);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+
+        let pcac_builder =
+            PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::RegisterRecoveryEvidence)
+                .session_id(request.freeze_id.clone())
+                .lease_id(request.lease_id.clone())
+                .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+                .identity_proof_hash(digest)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+                .risk_tier(pcac_risk_tier);
+
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                request.freeze_id.as_bytes(),
+                &digest,
+            ],
+        );
+
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[
+                request.freeze_id.as_bytes(),
+                &digest,
+                &request.required_start_sequence.to_le_bytes(),
+                &request.required_end_sequence.to_le_bytes(),
+            ],
+        );
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[request.lease_id.as_bytes(), request.freeze_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                request.freeze_id.as_bytes(),
+            ],
+        );
+
+        let effect_intent_digest = domain_tagged_hash(
+            PrivilegedHandlerClass::RegisterRecoveryEvidence,
+            "intent",
+            &[
+                request.lease_id.as_bytes(),
+                request.freeze_id.as_bytes(),
+                &digest,
+                &request.required_start_sequence.to_le_bytes(),
+                &request.required_end_sequence.to_le_bytes(),
+            ],
+        );
+
+        let pcac_builder = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest);
+
+        let pcac_input = pcac_builder.build(
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+        );
+
+        let _pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::RegisterRecoveryEvidence.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "RegisterRecoveryEvidence requires PCAC lifecycle evidence \
+                         (mandatory cutover); lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
+
+        // ---- Mutation: only after PCAC lifecycle succeeds ----
         match watchdog.register_durable_recovery_evidence(
             &request.freeze_id,
             receipts,
@@ -8836,11 +9014,24 @@ impl PrivilegedDispatcher {
     /// - Validates the watchdog is configured (fail-closed if missing)
     /// - Delegates admission and signature checks to `DivergenceWatchdog`
     /// - Follows create -> apply pattern per watchdog contract
-    fn handle_request_unfreeze(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+    fn handle_request_unfreeze(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
         let request = RequestUnfreezeRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
                 reason: format!("invalid RequestUnfreezeRequest: {e}"),
             })?;
+
+        // ---- Phase -1: Bind caller identity to authenticated peer ----
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "peer credentials required for unfreeze request",
+            ));
+        };
+        let _authenticated_caller_id = derive_actor_id(peer_creds);
 
         let watchdog =
             self.divergence_watchdog
@@ -8853,6 +9044,19 @@ impl PrivilegedDispatcher {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::InvalidArgument,
                 "freeze_id must not be empty",
+            ));
+        }
+
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "lease_id is required for PCAC lifecycle enforcement",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
             ));
         }
 
@@ -8884,6 +9088,128 @@ impl PrivilegedDispatcher {
         } else {
             Some(request.adjudication_id.as_str())
         };
+
+        // ---- PCAC lifecycle enforcement (admission BEFORE mutation) ----
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for RequestUnfreeze (fail-closed)",
+            ));
+        };
+
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+                Ok(values) => values,
+                Err(error) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "PCAC authority denied for RequestUnfreeze: \
+                             authoritative revalidation unavailable: {error}"
+                        ),
+                    ));
+                },
+            };
+
+        let freeze_id_hash = *blake3::hash(request.freeze_id.as_bytes()).as_bytes();
+        let (risk_tier, _resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, freeze_id_hash);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+
+        let pcac_builder = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::RequestUnfreeze)
+            .session_id(request.freeze_id.clone())
+            .lease_id(request.lease_id.clone())
+            .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+            .identity_proof_hash(freeze_id_hash)
+            .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+            .risk_tier(pcac_risk_tier);
+
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                request.freeze_id.as_bytes(),
+                request.resolution_type.as_bytes(),
+            ],
+        );
+
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[
+                request.freeze_id.as_bytes(),
+                request.resolution_type.as_bytes(),
+                request.adjudication_id.as_bytes(),
+            ],
+        );
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[request.lease_id.as_bytes(), request.freeze_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                request.freeze_id.as_bytes(),
+            ],
+        );
+
+        let effect_intent_digest = domain_tagged_hash(
+            PrivilegedHandlerClass::RequestUnfreeze,
+            "intent",
+            &[
+                request.lease_id.as_bytes(),
+                request.freeze_id.as_bytes(),
+                request.resolution_type.as_bytes(),
+                request.adjudication_id.as_bytes(),
+            ],
+        );
+
+        let pcac_builder = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest);
+
+        let pcac_input = pcac_builder.build(
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+        );
+
+        let _pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::RequestUnfreeze.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "RequestUnfreeze requires PCAC lifecycle evidence \
+                         (mandatory cutover); lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
+
+        // ---- Mutation: only after PCAC lifecycle succeeds ----
 
         // Step 1: Create the unfreeze event (validates durable provenance)
         let unfreeze =
@@ -9610,9 +9936,9 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::VerifyLedgerChain => self.handle_verify_ledger_chain(payload),
             // TCK-00469: Projection recovery handlers
             PrivilegedMessageType::RegisterRecoveryEvidence => {
-                self.handle_register_recovery_evidence(payload)
+                self.handle_register_recovery_evidence(payload, ctx)
             },
-            PrivilegedMessageType::RequestUnfreeze => self.handle_request_unfreeze(payload),
+            PrivilegedMessageType::RequestUnfreeze => self.handle_request_unfreeze(payload, ctx),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -29237,6 +29563,7 @@ mod tests {
                 required_start_sequence: 0,
                 required_end_sequence: 10,
                 receipts_json: b"[]".to_vec(),
+                lease_id: "test-lease-001".to_string(),
             };
             let mut frame = vec![PrivilegedMessageType::RegisterRecoveryEvidence.tag()];
             request.encode(&mut frame).expect("encode");
@@ -29259,6 +29586,7 @@ mod tests {
                 freeze_id: "freeze-001".to_string(),
                 resolution_type: "MANUAL".to_string(),
                 adjudication_id: String::new(),
+                lease_id: "test-lease-001".to_string(),
             };
             let mut frame = vec![PrivilegedMessageType::RequestUnfreeze.tag()];
             request.encode(&mut frame).expect("encode");
@@ -29295,6 +29623,7 @@ mod tests {
                 required_start_sequence: 0,
                 required_end_sequence: 10,
                 receipts_json: b"[]".to_vec(),
+                lease_id: "test-lease-001".to_string(),
             };
             let mut frame = vec![PrivilegedMessageType::RegisterRecoveryEvidence.tag()];
             request.encode(&mut frame).expect("encode");
@@ -29335,6 +29664,7 @@ mod tests {
                 freeze_id: "freeze-001".to_string(),
                 resolution_type: "INVALID_TYPE".to_string(),
                 adjudication_id: String::new(),
+                lease_id: "test-lease-001".to_string(),
             };
             let mut frame = vec![PrivilegedMessageType::RequestUnfreeze.tag()];
             request.encode(&mut frame).expect("encode");

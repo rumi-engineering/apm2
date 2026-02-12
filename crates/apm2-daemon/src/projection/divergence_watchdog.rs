@@ -77,6 +77,7 @@ use apm2_core::fac::{
 };
 use apm2_holon::defect::{DefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 // =============================================================================
@@ -532,7 +533,7 @@ impl TimeAuthorityEnvelopeV1 {
         }
         if !actor_bindings
             .iter()
-            .any(|binding| binding.verifying_key == self.signer_key)
+            .any(|binding| bool::from(binding.verifying_key.ct_eq(&self.signer_key)))
         {
             return Err(DivergenceError::InvalidTemporalAuthority(format!(
                 "untrusted key for time authority actor {}",
@@ -2647,9 +2648,24 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         *hasher.finalize().as_bytes()
     }
 
+    /// Constructs sink-side endpoint evidence for projection-compromise
+    /// detection.
+    ///
+    /// # Trust Boundary
+    ///
+    /// When `remote_fingerprint` is `None`, the returned evidence uses a
+    /// fingerprint derived from the **local** daemon signer key. This is a
+    /// self-attested identity claim and MUST NOT be trusted for remote
+    /// endpoint verification. The `endpoint_identity_verified` field will be
+    /// `false` and a warning is emitted to the `tracing` subsystem.
     fn sink_endpoint_evidence(&self, remote_fingerprint: Option<&str>) -> SinkEndpointEvidenceV1 {
         remote_fingerprint.map_or_else(
             || {
+                tracing::warn!(
+                    repo_id = %self.config.repo_id,
+                    "sink_endpoint_evidence: using local-signer fallback fingerprint \
+                     (unverified mode) — endpoint identity is self-attested"
+                );
                 let mut hasher = blake3::Hasher::new();
                 hasher
                     .update(b"apm2.projection_compromise.endpoint_key_fingerprint.local_signer.v1");
@@ -2761,7 +2777,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         external_trunk_head: [u8; 32],
     ) -> Result<Option<DivergenceResult>, DivergenceError> {
         // No divergence if heads match
-        if merge_receipt_head == external_trunk_head {
+        if bool::from(merge_receipt_head.ct_eq(&external_trunk_head)) {
             return Ok(None);
         }
 
@@ -3050,18 +3066,30 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             &trusted_authority_bindings,
             now_ns,
         )?;
-        if verified_temporal_authority.time_authority_ref
-            != state.source_snapshot.time_authority_ref
-            || verified_temporal_authority.time_authority_ref
-                != state.sink_snapshot.time_authority_ref
-        {
+        if !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.source_snapshot.time_authority_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.sink_snapshot.time_authority_ref),
+        ) {
             return Err(DivergenceError::ProjectionRecoveryFailed(
                 "temporal authority reference mismatch in recovery state".to_string(),
             ));
         }
-        if verified_temporal_authority.envelope.window_ref != state.source_snapshot.window_ref
-            || verified_temporal_authority.envelope.window_ref != state.sink_snapshot.window_ref
-        {
+        if !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.source_snapshot.window_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.sink_snapshot.window_ref),
+        ) {
             return Err(DivergenceError::ProjectionRecoveryFailed(
                 "temporal window reference mismatch in recovery state".to_string(),
             ));
@@ -3127,18 +3155,30 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             &trusted_authority_bindings,
             now_ns,
         )?;
-        if verified_temporal_authority.time_authority_ref
-            != state.source_snapshot.time_authority_ref
-            || verified_temporal_authority.time_authority_ref
-                != state.sink_snapshot.time_authority_ref
-        {
+        if !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.source_snapshot.time_authority_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .time_authority_ref
+                .ct_eq(&state.sink_snapshot.time_authority_ref),
+        ) {
             return Err(DivergenceError::ProjectionRecoveryFailed(
                 "temporal authority reference mismatch in recovery state".to_string(),
             ));
         }
-        if verified_temporal_authority.envelope.window_ref != state.source_snapshot.window_ref
-            || verified_temporal_authority.envelope.window_ref != state.sink_snapshot.window_ref
-        {
+        if !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.source_snapshot.window_ref),
+        ) || !bool::from(
+            verified_temporal_authority
+                .envelope
+                .window_ref
+                .ct_eq(&state.sink_snapshot.window_ref),
+        ) {
             return Err(DivergenceError::ProjectionRecoveryFailed(
                 "temporal window reference mismatch in recovery state".to_string(),
             ));

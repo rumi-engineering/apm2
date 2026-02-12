@@ -1496,12 +1496,13 @@ async fn async_main(args: Args) -> Result<()> {
                 .as_deref()
                 .unwrap_or("GITHUB_TOKEN");
             let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
-            let github_token = std::env::var(token_env).map_err(|_| {
-                anyhow::anyhow!(
-                    "divergence_watchdog.enabled=true but GitHub token env var \
-                     ({token_env}) is not set"
-                )
-            })?;
+            let github_token =
+                secrecy::SecretString::from(std::env::var(token_env).map_err(|_| {
+                    anyhow::anyhow!(
+                        "divergence_watchdog.enabled=true but GitHub token env var \
+                         ({token_env}) is not set"
+                    )
+                })?);
 
             // Build watchdog configuration
             let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);
@@ -1989,7 +1990,7 @@ async fn fetch_external_trunk_head(
     owner: &str,
     repo: &str,
     branch: &str,
-    token: &str,
+    token: &secrecy::SecretString,
 ) -> Result<[u8; 32]> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -2018,7 +2019,10 @@ async fn fetch_external_trunk_head(
     let request = http::Request::builder()
         .method("GET")
         .uri(&url)
-        .header("Authorization", format!("Bearer {token}"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", secrecy::ExposeSecret::expose_secret(token)),
+        )
         .header("Accept", "application/vnd.github.v3+json")
         .header("User-Agent", "apm2-daemon/divergence-watchdog")
         .body(Full::new(Bytes::new()))

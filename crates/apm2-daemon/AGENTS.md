@@ -261,6 +261,47 @@ Socket paths are configured via `[daemon].operator_socket` and
 `[daemon].session_socket` in `ecosystem.toml`. Single-socket CLI flags/keys are
 forbidden by DD-009.
 
+## Projection Recovery Handlers (TCK-00469)
+
+### `PrivilegedDispatcher::handle_register_recovery_evidence` (IPC-PRIV-074)
+
+Registers durable recovery evidence for frozen projections. Requires full
+PCAC lifecycle enforcement (join, revalidate, consume, effect) before any
+mutation.
+
+**Security Invariants:**
+- [INV-PRV-001] Caller identity is bound to authenticated peer credentials
+  via `derive_actor_id(peer_creds)` before processing.
+- [INV-PRV-002] `lease_id` is required and validated (non-empty, bounded
+  length) for PCAC lifecycle authority binding.
+- [INV-PRV-003] `receipts_json` payload is bounded by `MAX_RECEIPTS_JSON_SIZE`
+  (256 KiB) before deserialization, and receipt count by
+  `MAX_RECEIPTS_PER_REQUEST` (4096) after, to prevent memory/CPU exhaustion.
+- [INV-PRV-004] PCAC lifecycle gate must be wired; missing gate returns
+  fail-closed `CapabilityRequestRejected`.
+
+### `PrivilegedDispatcher::handle_request_unfreeze` (IPC-PRIV-075)
+
+Creates and applies an unfreeze event for frozen projections. Requires full
+PCAC lifecycle enforcement before mutation.
+
+**Security Invariants:**
+- [INV-PRV-005] Same caller identity binding as IPC-PRIV-074.
+- [INV-PRV-006] Same `lease_id` validation as IPC-PRIV-074.
+- [INV-PRV-007] PCAC lifecycle gate enforced before create+apply mutation
+  sequence.
+
+### Divergence Watchdog
+
+**Security Invariants (TCK-00469):**
+- [INV-DW-001] All cryptographic digest comparisons (merge receipt HEAD vs.
+  external trunk HEAD, temporal authority refs, window refs) use
+  `subtle::ConstantTimeEq::ct_eq()` to prevent timing side-channels.
+- [INV-DW-002] `sink_endpoint_evidence()` emits `tracing::warn!` when using
+  local-signer fallback (self-attested endpoint identity).
+- [INV-DW-003] GitHub API tokens are stored as `secrecy::SecretString` and
+  exposed only at the HTTP header construction boundary via `ExposeSecret`.
+
 ## Related Modules
 
 - [`apm2_core::process`](../apm2-core/src/process/AGENTS.md) - `ProcessSpec`, `ProcessState`, `ProcessRunner`

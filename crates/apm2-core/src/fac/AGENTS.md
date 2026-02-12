@@ -44,3 +44,11 @@ projection surfaces.
 - Require signed temporal authority references for compromise decisions.
 - Reconstruct projection state from trusted, ordered, signature-verified
   receipts.
+
+### Security Invariants (TCK-00469)
+
+- [INV-PC-001] All cryptographic digest comparisons (expected vs. observed,
+  temporal authority refs, window refs, source/sink snapshot digests) use
+  `subtle::ConstantTimeEq::ct_eq()` to prevent timing side-channel leakage.
+  Variable-time `==`/`!=` on `[u8; 32]` hash values is prohibited in this
+  module.
