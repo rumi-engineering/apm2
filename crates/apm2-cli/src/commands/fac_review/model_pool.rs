@@ -32,7 +32,36 @@ pub const MODEL_POOL: [ModelPoolEntry; 3] = [
     },
 ];
 
+pub const GEMINI_ALLOWED_MODELS: [&str; 2] = ["gemini-3-flash-preview", "gemini-3-pro-preview"];
+
 // ── Selection ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[must_use]
+pub fn is_allowed_gemini_model(model: &str) -> bool {
+    GEMINI_ALLOWED_MODELS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(model.trim()))
+}
+
+#[must_use]
+pub fn normalize_gemini_model(model: &str) -> &'static str {
+    GEMINI_ALLOWED_MODELS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.eq_ignore_ascii_case(model.trim()))
+        .unwrap_or("gemini-3-flash-preview")
+}
+
+fn normalize_review_model_selection(selection: ReviewModelSelection) -> ReviewModelSelection {
+    match selection.backend {
+        ReviewBackend::Gemini => ReviewModelSelection {
+            model: normalize_gemini_model(&selection.model).to_string(),
+            backend: ReviewBackend::Gemini,
+        },
+        ReviewBackend::Codex => selection,
+    }
+}
 
 pub fn select_review_model_random() -> ReviewModelSelection {
     let mut rng = rand::thread_rng();
@@ -79,14 +108,17 @@ pub fn select_cross_family_fallback(failed: &str) -> Option<ReviewModelSelection
 pub fn ensure_model_backend_available(
     selection: ReviewModelSelection,
 ) -> Result<ReviewModelSelection, String> {
+    let selection = normalize_review_model_selection(selection);
     if backend_tool_available(selection.backend) {
         return Ok(selection);
     }
 
     let mut candidate = selection;
     for _ in 0..MODEL_POOL.len() {
-        let fallback = select_fallback_model(&candidate.model)
-            .ok_or_else(|| "could not select fallback model".to_string())?;
+        let fallback = normalize_review_model_selection(
+            select_fallback_model(&candidate.model)
+                .ok_or_else(|| "could not select fallback model".to_string())?,
+        );
         if backend_tool_available(fallback.backend) {
             return Ok(fallback);
         }
@@ -182,5 +214,33 @@ pub fn acquire_provider_slot(backend: ReviewBackend) -> Result<ProviderSlotLease
 
         let jitter_millis = rand::thread_rng().gen_range(0..=PROVIDER_SLOT_WAIT_JITTER_MS);
         thread::sleep(PROVIDER_SLOT_POLL_INTERVAL + Duration::from_millis(jitter_millis));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_allowed_gemini_model, normalize_gemini_model};
+
+    #[test]
+    fn normalize_gemini_model_accepts_allowed_values() {
+        assert_eq!(
+            normalize_gemini_model("gemini-3-flash-preview"),
+            "gemini-3-flash-preview"
+        );
+        assert_eq!(
+            normalize_gemini_model("GEMINI-3-PRO-PREVIEW"),
+            "gemini-3-pro-preview"
+        );
+    }
+
+    #[test]
+    fn normalize_gemini_model_rejects_unknown_values() {
+        assert_eq!(
+            normalize_gemini_model("gemini-2.5-pro"),
+            "gemini-3-flash-preview"
+        );
+        assert!(!is_allowed_gemini_model("gemini-2.5-pro"));
+        assert!(is_allowed_gemini_model("gemini-3-flash-preview"));
+        assert!(is_allowed_gemini_model("gemini-3-pro-preview"));
     }
 }

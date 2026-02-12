@@ -19,16 +19,13 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
-//! - `apm2 fac barrier --repo <OWNER/REPO> --event <EVENT_JSON>` - Validate
-//!   trigger trust boundary before any FAC execution
-//! - `apm2 fac kickoff --repo <OWNER/REPO> --event <EVENT_JSON>` - Dispatch and
-//!   observe FAC review lifecycle for GitHub projection
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
 //! - `apm2 fac review dispatch <PR_URL>` - Dispatch detached FAC review runs
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
 //!   structured FAC-native format
+//! - `apm2 fac review comment` - Publish one SHA-bound finding comment
 //! - `apm2 fac review decision` - Show/set SHA-bound approve/deny decisions per
 //!   review dimension
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
@@ -161,17 +158,6 @@ pub enum FacSubcommand {
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
 
-    /// Validate FAC trigger trust boundary for GitHub projection execution.
-    ///
-    /// Fails closed unless the trigger context is authorized.
-    Barrier(BarrierArgs),
-
-    /// Dispatch and observe FAC review lifecycle for GitHub projection.
-    ///
-    /// Runs idempotent detached review dispatch and emits 1Hz health/status
-    /// lines until a terminal outcome is reached.
-    Kickoff(KickoffArgs),
-
     /// Push code and create/update PR (lean push).
     ///
     /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
@@ -224,7 +210,10 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub quick: bool,
 
-    /// Wall timeout for bounded test execution (seconds).
+    /// Steady-state wall timeout for bounded test execution (seconds).
+    ///
+    /// FAC may temporarily widen this window for cold-cache warm-up runs when
+    /// the default value is used.
     #[arg(long, default_value_t = 240)]
     pub timeout_seconds: u64,
 
@@ -366,51 +355,6 @@ pub struct ResumeArgs {
     pub limit: u64,
 }
 
-/// Arguments for `apm2 fac barrier`.
-#[derive(Debug, Args)]
-pub struct BarrierArgs {
-    /// Repository in owner/repo format.
-    #[arg(long)]
-    pub repo: String,
-
-    /// Path to GitHub event payload JSON.
-    #[arg(long)]
-    pub event: PathBuf,
-
-    /// Event name (`pull_request_target` or `workflow_dispatch`).
-    #[arg(long)]
-    pub event_name: String,
-}
-
-/// Arguments for `apm2 fac kickoff`.
-#[derive(Debug, Args)]
-pub struct KickoffArgs {
-    /// Repository in owner/repo format.
-    #[arg(long)]
-    pub repo: String,
-
-    /// Path to GitHub event payload JSON.
-    #[arg(long)]
-    pub event: PathBuf,
-
-    /// Event name (`pull_request_target` or `workflow_dispatch`).
-    #[arg(long)]
-    pub event_name: String,
-
-    /// Maximum seconds to wait for FAC terminal state.
-    #[arg(long, default_value_t = 3600)]
-    pub max_wait_seconds: u64,
-
-    /// SECURITY-CRITICAL: limit stdout to one projection health line per
-    /// second.
-    ///
-    /// Use this mode for public log surfaces (for example GitHub Actions logs).
-    /// Any rich diagnostics must stay on private runner-local storage.
-    /// Non-health diagnostics are emitted to stderr for private runner logs.
-    #[arg(long, default_value_t = false)]
-    pub public_projection_only: bool,
-}
-
 /// Arguments for `apm2 fac push`.
 #[derive(Debug, Args)]
 pub struct PushArgs {
@@ -470,6 +414,10 @@ pub struct LogsArgs {
     /// Selector token to resolve (typed by `--selector-type`).
     #[arg(long)]
     pub selector: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac pipeline` (hidden, internal).
@@ -514,6 +462,8 @@ pub enum ReviewSubcommand {
     Publish(ReviewPublishArgs),
     /// Retrieve structured review findings for a PR head SHA.
     Findings(ReviewFindingsArgs),
+    /// Publish one SHA-bound finding comment with machine-readable metadata.
+    Comment(ReviewCommentArgs),
     /// Show or set explicit decision state per review dimension.
     Decision(ReviewDecisionArgs),
     /// Render one condensed projection line for GitHub log surfaces.
@@ -577,6 +527,22 @@ pub struct ReviewDispatchArgs {
     pub force: bool,
 }
 
+/// Review lane filter for `apm2 fac review status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReviewStatusTypeArg {
+    Security,
+    Quality,
+}
+
+impl ReviewStatusTypeArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Security => "security",
+            Self::Quality => "quality",
+        }
+    }
+}
+
 /// Arguments for `apm2 fac review status`.
 #[derive(Debug, Args)]
 pub struct ReviewStatusArgs {
@@ -587,6 +553,14 @@ pub struct ReviewStatusArgs {
     /// Optional pull request URL filter.
     #[arg(long)]
     pub pr_url: Option<String>,
+
+    /// Optional reviewer lane filter (`security` or `quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: Option<ReviewStatusTypeArg>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review findings`.
@@ -607,6 +581,10 @@ pub struct ReviewFindingsArgs {
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
     pub sha: Option<String>,
+
+    /// Ignore local cached comments and re-fetch from GitHub projection.
+    #[arg(long, default_value_t = false)]
+    pub refresh: bool,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -663,6 +641,42 @@ pub struct ReviewPublishArgs {
     /// Path to markdown findings body.
     #[arg(long)]
     pub body_file: PathBuf,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac review comment`.
+#[derive(Debug, Args)]
+pub struct ReviewCommentArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to `git rev-parse HEAD`).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Finding severity (`blocker`, `major`, `minor`, or `nit`).
+    #[arg(long, value_enum)]
+    pub severity: fac_review::ReviewCommentSeverityArg,
+
+    /// Finding type (`security` or `code-quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: fac_review::ReviewCommentTypeArg,
+
+    /// Finding body text. If omitted, body is read from stdin.
+    #[arg(long)]
+    pub body: Option<String>,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -996,17 +1010,6 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
-        FacSubcommand::Barrier(args) => {
-            fac_review::run_barrier(&args.repo, &args.event, &args.event_name, json_output)
-        },
-        FacSubcommand::Kickoff(args) => fac_review::run_kickoff(
-            &args.repo,
-            &args.event,
-            &args.event_name,
-            args.max_wait_seconds,
-            args.public_projection_only,
-            json_output,
-        ),
         FacSubcommand::Push(args) => fac_review::run_push(
             &args.repo,
             &args.remote,
@@ -1025,7 +1028,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             &args.repo,
             args.selector_type.as_deref(),
             args.selector.as_deref(),
-            json_output,
+            json_output || args.json,
         ),
         FacSubcommand::Pipeline(args) => {
             fac_review::run_pipeline(&args.repo, &args.pr_url, args.pr, &args.sha)
@@ -1045,9 +1048,12 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 dispatch_args.force,
                 json_output,
             ),
-            ReviewSubcommand::Status(status_args) => {
-                fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
-            },
+            ReviewSubcommand::Status(status_args) => fac_review::run_status(
+                status_args.pr,
+                status_args.pr_url.as_deref(),
+                status_args.review_type.map(ReviewStatusTypeArg::as_str),
+                json_output || status_args.json,
+            ),
             ReviewSubcommand::Prepare(prepare_args) => fac_review::run_prepare(
                 &prepare_args.repo,
                 prepare_args.pr,
@@ -1069,7 +1075,18 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 findings_args.pr,
                 findings_args.pr_url.as_deref(),
                 findings_args.sha.as_deref(),
+                findings_args.refresh,
                 json_output || findings_args.json,
+            ),
+            ReviewSubcommand::Comment(comment_args) => fac_review::run_comment(
+                &comment_args.repo,
+                comment_args.pr,
+                comment_args.pr_url.as_deref(),
+                comment_args.sha.as_deref(),
+                comment_args.severity,
+                comment_args.review_type,
+                comment_args.body.as_deref(),
+                json_output || comment_args.json,
             ),
             ReviewSubcommand::Decision(decision_args) => match &decision_args.subcommand {
                 ReviewDecisionSubcommand::Show(show_args) => fac_review::run_decision_show(
@@ -2351,7 +2368,18 @@ fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
+
+    #[derive(Parser, Debug)]
+    struct FacLogsCliHarness {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+
+        #[command(subcommand)]
+        subcommand: FacSubcommand,
+    }
 
     #[test]
     fn test_work_status_response_serialization() {
@@ -2696,5 +2724,35 @@ mod tests {
             "schema": "apm2.projection.v1"
         });
         assert_eq!(detect_receipt_type(&json), "projection_receipt");
+    }
+
+    #[test]
+    fn test_logs_subcommand_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "logs", "--pr", "615", "--json"])
+            .expect("logs parser should accept subcommand json flag");
+
+        assert!(!parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Logs(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(args.json);
+            },
+            other => panic!("expected logs subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_global_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "logs", "--pr", "615"])
+            .expect("logs parser should accept global json flag");
+
+        assert!(parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Logs(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(!args.json);
+            },
+            other => panic!("expected logs subcommand, got {other:?}"),
+        }
     }
 }

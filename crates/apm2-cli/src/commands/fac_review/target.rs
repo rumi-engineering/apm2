@@ -2,7 +2,8 @@
 
 use std::process::Command;
 
-use super::types::parse_pr_url;
+use super::types::{parse_pr_url, validate_expected_head_sha};
+use super::{github_projection, projection_store};
 
 pub fn resolve_pr_target(
     repo: &str,
@@ -10,25 +11,42 @@ pub fn resolve_pr_target(
     pr_url: Option<&str>,
 ) -> Result<(String, u32), String> {
     let from_url = pr_url.map(parse_pr_url).transpose()?;
-    match (pr_number, from_url) {
+    let resolved = match (pr_number, from_url) {
         (Some(number), Some((owner_repo, url_number))) => {
             if number != url_number {
                 return Err(format!(
                     "review target mismatch: --pr={number} but --pr-url resolves to #{url_number}"
                 ));
             }
-            Ok((owner_repo, number))
+            (owner_repo, number)
         },
-        (Some(number), None) => Ok((repo.to_string(), number)),
-        (None, Some((owner_repo, number))) => Ok((owner_repo, number)),
+        (Some(number), None) => (repo.to_string(), number),
+        (None, Some((owner_repo, number))) => (owner_repo, number),
         (None, None) => {
             let branch = current_branch()?;
+
+            if let Some(identity) = projection_store::load_branch_identity(repo, &branch)? {
+                return Ok((identity.owner_repo, identity.pr_number));
+            }
+
+            if !projection_store::gh_read_fallback_enabled() {
+                return Err(format!(
+                    "no local PR mapping found for branch `{branch}` in repo `{repo}`. {}. pass --pr <N> or --pr-url <URL> to override auto-detection",
+                    projection_store::gh_read_fallback_disabled_error("resolve_pr_target")
+                ));
+            }
+
             let number = find_pr_for_branch(repo, &branch).map_err(|err| {
                 format!("{err}. pass --pr <N> or --pr-url <URL> to override auto-detection")
             })?;
-            Ok((repo.to_string(), number))
+            let _ =
+                projection_store::record_fallback_read(repo, number, "target.find_pr_for_branch");
+            (repo.to_string(), number)
         },
-    }
+    };
+
+    let _ = persist_identity_hint(&resolved.0, resolved.1);
+    Ok(resolved)
 }
 
 pub fn current_branch() -> Result<String, String> {
@@ -47,31 +65,30 @@ pub fn current_branch() -> Result<String, String> {
 }
 
 pub fn find_pr_for_branch(repo: &str, branch: &str) -> Result<u32, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            branch,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ])
+    github_projection::find_pr_for_branch(repo, branch)?.map_or_else(
+        || Err(format!("no open PR found for branch {branch} in {repo}")),
+        Ok,
+    )
+}
+
+fn current_head_sha() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
         .output()
-        .map_err(|e| format!("failed to find PR for branch {branch}: {e}"))?;
+        .map_err(|e| format!("failed to resolve HEAD sha: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "gh pr list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err("git rev-parse HEAD failed".to_string());
     }
-    let num_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    num_str
-        .parse::<u32>()
-        .map_err(|_| format!("no open PR found for branch {branch} in {repo}"))
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    validate_expected_head_sha(&sha)?;
+    Ok(sha)
+}
+
+fn persist_identity_hint(owner_repo: &str, pr_number: u32) -> Result<(), String> {
+    let head_sha = current_head_sha()?;
+    projection_store::save_identity_with_context(owner_repo, pr_number, &head_sha, "target")
 }
 
 #[cfg(test)]

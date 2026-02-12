@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
+use super::projection_store;
 use super::selector::render_finding_selector;
+use super::state::{ReviewRunStateLoad, load_review_run_state, read_pulse_file};
 use super::target::resolve_pr_target;
 use super::types::{COMMENT_CONFIRM_MAX_PAGES, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
@@ -18,6 +20,13 @@ const CODE_QUALITY_DIMENSION: &str = "code-quality";
 
 const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
 const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
+const FINDING_MARKER_PREFIX: &str = "<!-- apm2-finding:v1:";
+
+#[derive(Debug, Clone)]
+struct IssueCommentsFetch {
+    comments: Vec<IssueComment>,
+    from_cache: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct FindingsReport {
@@ -66,6 +75,16 @@ struct ReviewMetadata {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct FindingMetadata {
+    schema: String,
+    review_type: String,
+    severity: String,
+    head_sha: String,
+    pr_number: u32,
+    reviewer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IssueComment {
     id: u64,
     body: String,
@@ -75,7 +94,7 @@ struct IssueComment {
     user: Option<IssueUser>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IssueUser {
     login: String,
 }
@@ -84,6 +103,13 @@ struct IssueUser {
 struct ParsedReviewComment {
     comment: IssueComment,
     metadata: ReviewMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFindingComment {
+    comment: IssueComment,
+    metadata: FindingMetadata,
+    summary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,23 +153,35 @@ pub fn run_findings(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
     sha: Option<&str>,
+    refresh: bool,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-    let expected_author_login = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
-            .to_string()
-    })?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
     let resolved_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
-    let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
-    let report = build_findings_report(
+    let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
+    let initial_comments = fetch_issue_comments(&owner_repo, resolved_pr, refresh)?;
+    let mut report = build_findings_report(
         &owner_repo,
         resolved_pr,
         &resolved_sha,
-        &comments,
+        &initial_comments.comments,
         &expected_author_login,
     );
+    if !refresh
+        && initial_comments.from_cache
+        && report.fail_closed
+        && projection_store::gh_read_fallback_enabled()
+    {
+        if let Ok(refreshed) = fetch_issue_comments(&owner_repo, resolved_pr, true) {
+            report = build_findings_report(
+                &owner_repo,
+                resolved_pr,
+                &resolved_sha,
+                &refreshed.comments,
+                &expected_author_login,
+            );
+        }
+    }
     emit_report(&report, json_output)?;
 
     if report.fail_closed {
@@ -158,12 +196,86 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         validate_expected_head_sha(value)?;
         return Ok(value.to_ascii_lowercase());
     }
+
+    if let Some(value) = resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
+    }
+
+    if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "findings.resolve_head_sha",
+        ));
+    }
+
+    ensure_gh_cli_ready()?;
     let value = fetch_pr_head_sha(owner_repo, pr_number)?;
     validate_expected_head_sha(&value)?;
-    Ok(value.to_ascii_lowercase())
+    let value = value.to_ascii_lowercase();
+    let _ =
+        projection_store::record_fallback_read(owner_repo, pr_number, "findings.resolve_head_sha");
+    let _ = projection_store::save_identity_with_context(
+        owner_repo,
+        pr_number,
+        &value,
+        "gh-fallback:findings.resolve_head_sha",
+    );
+    Ok(value)
 }
 
-fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueComment>, String> {
+fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
+    for review_type in ["security", "quality"] {
+        let Ok(state) = load_review_run_state(pr_number, review_type) else {
+            continue;
+        };
+        if let ReviewRunStateLoad::Present(entry) = state {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    for review_type in ["security", "quality"] {
+        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
+            continue;
+        };
+        if let Some(entry) = pulse {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    None
+}
+
+fn fetch_issue_comments(
+    owner_repo: &str,
+    pr_number: u32,
+    refresh: bool,
+) -> Result<IssueCommentsFetch, String> {
+    if !refresh {
+        if let Some(cached) =
+            projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
+        {
+            return Ok(IssueCommentsFetch {
+                comments: cached,
+                from_cache: true,
+            });
+        }
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "findings.fetch_issue_comments",
+        ));
+    }
+
+    ensure_gh_cli_ready()?;
     let mut collected = Vec::new();
     for page in 1..=COMMENT_CONFIRM_MAX_PAGES {
         let endpoint =
@@ -185,7 +297,41 @@ fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueCom
         }
         collected.extend(page_comments);
     }
-    Ok(collected)
+    let _ = projection_store::record_fallback_read(
+        owner_repo,
+        pr_number,
+        "findings.fetch_issue_comments",
+    );
+    let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &collected);
+    Ok(IssueCommentsFetch {
+        comments: collected,
+        from_cache: false,
+    })
+}
+
+fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    if let Some(cached) = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)? {
+        return Ok(cached);
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "findings.resolve_expected_author_login",
+        ));
+    }
+
+    ensure_gh_cli_ready()?;
+    let login = resolve_authenticated_gh_login().ok_or_else(|| {
+        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
+            .to_string()
+    })?;
+    let _ = projection_store::record_fallback_read(
+        owner_repo,
+        pr_number,
+        "findings.resolve_expected_author_login",
+    );
+    let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
+    Ok(login)
 }
 
 fn build_findings_report(
@@ -248,6 +394,15 @@ fn evaluate_dimension(
     comments: &[IssueComment],
     expected_author_login: &str,
 ) -> DimensionFindings {
+    let (individual_findings, individual_errors) = collect_individual_findings(
+        spec,
+        owner_repo,
+        pr_number,
+        head_sha,
+        comments,
+        expected_author_login,
+    );
+
     let marker_count = comments
         .iter()
         .filter(|comment| comment.body.contains(spec.marker))
@@ -262,8 +417,8 @@ fn evaluate_dimension(
         .cloned()
         .collect::<Vec<_>>();
 
-    if marker_comments.is_empty() {
-        return DimensionFindings {
+    let mut dimension = if marker_comments.is_empty() {
+        DimensionFindings {
             dimension: spec.dimension.to_string(),
             status: "MISSING".to_string(),
             source_comment_id: None,
@@ -277,116 +432,331 @@ fn evaluate_dimension(
                     "marker comments exist but none were authored by trusted login `{expected_author_login}`"
                 )
             }),
-        };
-    }
+        }
+    } else {
+        let mut parse_errors = Vec::new();
+        let mut parsed = Vec::new();
+        for comment in marker_comments {
+            match parse_review_comment(spec, pr_number, &comment) {
+                Ok(value) => parsed.push(value),
+                Err(err) => parse_errors.push(format!("comment {}: {err}", comment.id)),
+            }
+        }
 
-    let mut parse_errors = Vec::new();
-    let mut parsed = Vec::new();
-    for comment in marker_comments {
-        match parse_review_comment(spec, pr_number, &comment) {
-            Ok(value) => parsed.push(value),
-            Err(err) => parse_errors.push(format!("comment {}: {err}", comment.id)),
+        if parsed.is_empty() {
+            DimensionFindings {
+                dimension: spec.dimension.to_string(),
+                status: "ERROR".to_string(),
+                source_comment_id: None,
+                source_comment_url: None,
+                verdict: None,
+                findings: Vec::new(),
+                error: Some(format!(
+                    "all marker comments were invalid ({})",
+                    parse_errors.join("; ")
+                )),
+            }
+        } else {
+            let mut matching_sha = parsed
+                .iter()
+                .filter(|entry| entry.metadata.head_sha.eq_ignore_ascii_case(head_sha))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching_sha.is_empty() {
+                DimensionFindings {
+                    dimension: spec.dimension.to_string(),
+                    status: "STALE".to_string(),
+                    source_comment_id: None,
+                    source_comment_url: None,
+                    verdict: None,
+                    findings: Vec::new(),
+                    error: Some(format!("no marker comment for head sha {head_sha}")),
+                }
+            } else {
+                matching_sha.sort_by(|a, b| {
+                    (&a.comment.created_at, a.comment.id)
+                        .cmp(&(&b.comment.created_at, b.comment.id))
+                });
+
+                let has_conflicting_verdicts = matching_sha
+                    .iter()
+                    .map(|entry| entry.metadata.verdict.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    > 1;
+                if has_conflicting_verdicts {
+                    DimensionFindings {
+                        dimension: spec.dimension.to_string(),
+                        status: "AMBIGUOUS".to_string(),
+                        source_comment_id: None,
+                        source_comment_url: None,
+                        verdict: None,
+                        findings: Vec::new(),
+                        error: Some("multiple matching comments disagree on verdict".to_string()),
+                    }
+                } else {
+                    let Some(selected) = matching_sha.pop() else {
+                        return append_individual_findings(
+                            DimensionFindings {
+                                dimension: spec.dimension.to_string(),
+                                status: "ERROR".to_string(),
+                                source_comment_id: None,
+                                source_comment_url: None,
+                                verdict: None,
+                                findings: Vec::new(),
+                                error: Some("internal selection error".to_string()),
+                            },
+                            individual_findings,
+                            &individual_errors,
+                        );
+                    };
+
+                    match parse_findings_from_comment(
+                        &selected.comment.body,
+                        owner_repo,
+                        pr_number,
+                        selected.comment.id,
+                        head_sha,
+                        spec.dimension,
+                        &selected.comment.html_url,
+                    ) {
+                        Ok(items) => DimensionFindings {
+                            dimension: spec.dimension.to_string(),
+                            status: selected.metadata.verdict.clone(),
+                            source_comment_id: Some(selected.comment.id),
+                            source_comment_url: Some(selected.comment.html_url),
+                            verdict: Some(selected.metadata.verdict),
+                            findings: items,
+                            error: None,
+                        },
+                        Err(err) => DimensionFindings {
+                            dimension: spec.dimension.to_string(),
+                            status: "ERROR".to_string(),
+                            source_comment_id: Some(selected.comment.id),
+                            source_comment_url: Some(selected.comment.html_url),
+                            verdict: Some(selected.metadata.verdict),
+                            findings: Vec::new(),
+                            error: Some(err),
+                        },
+                    }
+                }
+            }
+        }
+    };
+
+    dimension = append_individual_findings(dimension, individual_findings, &individual_errors);
+    dimension
+}
+
+fn append_individual_findings(
+    mut dimension: DimensionFindings,
+    individual_findings: Vec<FindingRecord>,
+    individual_errors: &[String],
+) -> DimensionFindings {
+    if !individual_findings.is_empty() {
+        dimension.findings.extend(individual_findings);
+    }
+    if !individual_errors.is_empty() {
+        let detail = format!(
+            "individual finding comments had parsing errors ({})",
+            individual_errors.join("; ")
+        );
+        dimension.error = Some(match dimension.error {
+            Some(existing) => format!("{existing}; {detail}"),
+            None => detail,
+        });
+    }
+    dimension
+}
+
+fn collect_individual_findings(
+    spec: DimensionSpec,
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    comments: &[IssueComment],
+    expected_author_login: &str,
+) -> (Vec<FindingRecord>, Vec<String>) {
+    let mut findings = Vec::new();
+    let mut errors = Vec::new();
+
+    for comment in comments {
+        if !comment_user_login(comment)
+            .is_some_and(|author| author.eq_ignore_ascii_case(expected_author_login))
+        {
+            continue;
+        }
+
+        let Some(marker) = parse_finding_marker(&comment.body) else {
+            continue;
+        };
+        if marker.review_type != spec.dimension {
+            continue;
+        }
+
+        match parse_finding_comment(pr_number, comment, &marker) {
+            Ok(parsed) => {
+                if !parsed.metadata.head_sha.eq_ignore_ascii_case(head_sha) {
+                    continue;
+                }
+                findings.push(FindingRecord {
+                    severity: parsed.metadata.severity.to_ascii_uppercase(),
+                    reviewer_type: spec.dimension.to_string(),
+                    sha: head_sha.to_string(),
+                    summary: parsed.summary,
+                    evidence_selector: render_finding_selector(
+                        owner_repo,
+                        pr_number,
+                        head_sha,
+                        spec.dimension,
+                        parsed.comment.id,
+                        1,
+                    ),
+                    evidence_digest: sha256_hex(parsed.comment.body.as_bytes()),
+                    raw_evidence_pointer: parsed.comment.html_url,
+                });
+            },
+            Err(err) => errors.push(format!("comment {}: {err}", comment.id)),
         }
     }
 
-    if parsed.is_empty() {
-        return DimensionFindings {
-            dimension: spec.dimension.to_string(),
-            status: "ERROR".to_string(),
-            source_comment_id: None,
-            source_comment_url: None,
-            verdict: None,
-            findings: Vec::new(),
-            error: Some(format!(
-                "all marker comments were invalid ({})",
-                parse_errors.join("; ")
-            )),
-        };
+    (findings, errors)
+}
+
+fn parse_finding_comment(
+    pr_number: u32,
+    comment: &IssueComment,
+    marker: &FindingMarker,
+) -> Result<ParsedFindingComment, String> {
+    let mut metadata = parse_finding_metadata_from_comment(&comment.body, &marker.raw_marker)?;
+    if metadata.schema != "apm2.finding.v1" {
+        return Err(format!(
+            "invalid finding metadata schema `{}`",
+            metadata.schema
+        ));
+    }
+    validate_expected_head_sha(&metadata.head_sha)?;
+    metadata.head_sha = metadata.head_sha.to_ascii_lowercase();
+    if metadata.pr_number != pr_number {
+        return Err(format!(
+            "finding metadata pr_number={} does not match target pr_number={pr_number}",
+            metadata.pr_number
+        ));
+    }
+    if metadata.reviewer_id.trim().is_empty() {
+        return Err("finding metadata reviewer_id is empty".to_string());
     }
 
-    let mut matching_sha = parsed
-        .iter()
-        .filter(|entry| entry.metadata.head_sha.eq_ignore_ascii_case(head_sha))
-        .cloned()
-        .collect::<Vec<_>>();
-    if matching_sha.is_empty() {
-        return DimensionFindings {
-            dimension: spec.dimension.to_string(),
-            status: "STALE".to_string(),
-            source_comment_id: None,
-            source_comment_url: None,
-            verdict: None,
-            findings: Vec::new(),
-            error: Some(format!("no marker comment for head sha {head_sha}")),
-        };
+    let metadata_type = normalize_review_type(&metadata.review_type);
+    if metadata_type != marker.review_type {
+        return Err(format!(
+            "finding metadata review_type `{}` does not match marker `{}`",
+            metadata.review_type, marker.review_type
+        ));
     }
 
-    matching_sha.sort_by(|a, b| {
-        (&a.comment.created_at, a.comment.id).cmp(&(&b.comment.created_at, b.comment.id))
-    });
-
-    let has_conflicting_verdicts = matching_sha
-        .iter()
-        .map(|entry| entry.metadata.verdict.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        > 1;
-    if has_conflicting_verdicts {
-        return DimensionFindings {
-            dimension: spec.dimension.to_string(),
-            status: "AMBIGUOUS".to_string(),
-            source_comment_id: None,
-            source_comment_url: None,
-            verdict: None,
-            findings: Vec::new(),
-            error: Some("multiple matching comments disagree on verdict".to_string()),
-        };
-    }
-
-    let Some(selected) = matching_sha.pop() else {
-        return DimensionFindings {
-            dimension: spec.dimension.to_string(),
-            status: "ERROR".to_string(),
-            source_comment_id: None,
-            source_comment_url: None,
-            verdict: None,
-            findings: Vec::new(),
-            error: Some("internal selection error".to_string()),
-        };
-    };
-
-    let findings = match parse_findings_from_comment(
-        &selected.comment.body,
-        owner_repo,
-        pr_number,
-        selected.comment.id,
-        head_sha,
-        spec.dimension,
-        &selected.comment.html_url,
+    let metadata_severity = metadata.severity.trim().to_ascii_lowercase();
+    if !matches!(
+        metadata_severity.as_str(),
+        "blocker" | "major" | "minor" | "nit"
     ) {
-        Ok(items) => items,
-        Err(err) => {
-            return DimensionFindings {
-                dimension: spec.dimension.to_string(),
-                status: "ERROR".to_string(),
-                source_comment_id: Some(selected.comment.id),
-                source_comment_url: Some(selected.comment.html_url),
-                verdict: Some(selected.metadata.verdict),
-                findings: Vec::new(),
-                error: Some(err),
-            };
-        },
-    };
-
-    DimensionFindings {
-        dimension: spec.dimension.to_string(),
-        status: selected.metadata.verdict.clone(),
-        source_comment_id: Some(selected.comment.id),
-        source_comment_url: Some(selected.comment.html_url),
-        verdict: Some(selected.metadata.verdict),
-        findings,
-        error: None,
+        return Err(format!(
+            "invalid finding metadata severity `{}`",
+            metadata.severity
+        ));
     }
+    if metadata_severity != marker.severity {
+        return Err(format!(
+            "finding metadata severity `{}` does not match marker severity `{}`",
+            metadata.severity, marker.severity
+        ));
+    }
+    metadata.severity = metadata_severity;
+
+    let summary = extract_finding_summary_from_comment(&comment.body, &marker.raw_marker);
+    Ok(ParsedFindingComment {
+        comment: comment.clone(),
+        metadata,
+        summary,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct FindingMarker {
+    raw_marker: String,
+    review_type: String,
+    severity: String,
+}
+
+fn parse_finding_marker(body: &str) -> Option<FindingMarker> {
+    let marker_line = body
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(FINDING_MARKER_PREFIX) && line.ends_with("-->"))?;
+    let payload = marker_line
+        .strip_prefix(FINDING_MARKER_PREFIX)?
+        .strip_suffix("-->")?
+        .trim();
+    let mut parts = payload.split(':');
+    let raw_type = parts.next()?.trim();
+    let raw_sha_short = parts.next()?.trim();
+    let raw_severity = parts.next()?.trim().to_ascii_lowercase();
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if raw_sha_short.len() != 8 || !raw_sha_short.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !matches!(raw_severity.as_str(), "blocker" | "major" | "minor" | "nit") {
+        return None;
+    }
+
+    let review_type = normalize_review_type(raw_type);
+    if !matches!(
+        review_type.as_str(),
+        SECURITY_DIMENSION | CODE_QUALITY_DIMENSION
+    ) {
+        return None;
+    }
+
+    Some(FindingMarker {
+        raw_marker: marker_line.to_string(),
+        review_type,
+        severity: raw_severity,
+    })
+}
+
+fn parse_finding_metadata_from_comment(
+    body: &str,
+    marker: &str,
+) -> Result<FindingMetadata, String> {
+    let marker_idx = body
+        .find(marker)
+        .ok_or_else(|| "finding marker not found in comment body".to_string())?;
+    let after_marker = &body[marker_idx + marker.len()..];
+    let json_payload = extract_fenced_block(after_marker, "json")
+        .ok_or_else(|| "missing fenced json finding metadata block after marker".to_string())?;
+    serde_json::from_str::<FindingMetadata>(json_payload)
+        .map_err(|err| format!("failed to parse finding metadata JSON: {err}"))
+}
+
+fn extract_finding_summary_from_comment(body: &str, marker: &str) -> String {
+    let before_marker = body
+        .split_once(marker)
+        .map_or(body, |(before, _)| before)
+        .trim();
+    if before_marker.is_empty() {
+        return "finding comment".to_string();
+    }
+
+    let first_non_empty = before_marker
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map_or(before_marker, str::trim);
+    parse_finding_summary(first_non_empty)
+        .unwrap_or(first_non_empty)
+        .to_string()
 }
 
 fn comment_user_login(comment: &IssueComment) -> Option<&str> {
@@ -746,6 +1116,154 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|err| err.contains("trusted login `fac-bot`"))
+        );
+    }
+
+    #[test]
+    fn test_evaluate_dimension_merges_monolithic_and_individual_findings() {
+        let monolithic = r#"
+## Security Review: PASS
+
+### **MAJOR FINDINGS**
+1. Missing authorization check before privileged mutation.
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{
+  "schema": "apm2.review.metadata.v1",
+  "review_type": "security",
+  "pr_number": 441,
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "verdict": "PASS"
+}
+```
+"#;
+        let individual = r#"
+Potential command injection through unchecked shell input.
+
+<!-- apm2-finding:v1:security:01234567:blocker -->
+```json
+{
+  "schema": "apm2.finding.v1",
+  "review_type": "security",
+  "severity": "blocker",
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "pr_number": 441,
+  "reviewer_id": "fac-bot"
+}
+```
+"#;
+        let comments = vec![
+            IssueComment {
+                id: 10,
+                body: monolithic.to_string(),
+                html_url: "https://example.invalid/comment/10".to_string(),
+                created_at: "2026-02-11T00:00:00Z".to_string(),
+                user: Some(IssueUser {
+                    login: "fac-bot".to_string(),
+                }),
+            },
+            IssueComment {
+                id: 11,
+                body: individual.to_string(),
+                html_url: "https://example.invalid/comment/11".to_string(),
+                created_at: "2026-02-11T00:00:01Z".to_string(),
+                user: Some(IssueUser {
+                    login: "fac-bot".to_string(),
+                }),
+            },
+        ];
+
+        let dimension = evaluate_dimension(
+            DimensionSpec {
+                dimension: SECURITY_DIMENSION,
+                marker: SECURITY_MARKER,
+            },
+            "guardian-intelligence/apm2",
+            441,
+            "0123456789abcdef0123456789abcdef01234567",
+            &comments,
+            "fac-bot",
+        );
+
+        assert_eq!(dimension.status, "PASS");
+        assert_eq!(dimension.findings.len(), 2);
+        assert!(dimension.findings.iter().any(|f| f.severity == "MAJOR"));
+        assert!(dimension.findings.iter().any(|f| f.severity == "BLOCKER"));
+    }
+
+    #[test]
+    fn test_evaluate_dimension_records_individual_finding_parse_errors() {
+        let monolithic = r#"
+## Security Review: PASS
+
+### **MINOR FINDINGS**
+1. Add input validation for optional query parameter.
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{
+  "schema": "apm2.review.metadata.v1",
+  "review_type": "security",
+  "pr_number": 441,
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "verdict": "PASS"
+}
+```
+"#;
+        let malformed_individual = r#"
+Malformed finding metadata.
+
+<!-- apm2-finding:v1:security:01234567:blocker -->
+```json
+{
+  "schema": "apm2.finding.v1",
+  "review_type": "security",
+  "severity": "major",
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "pr_number": 441,
+  "reviewer_id": "fac-bot"
+}
+```
+"#;
+        let comments = vec![
+            IssueComment {
+                id: 20,
+                body: monolithic.to_string(),
+                html_url: "https://example.invalid/comment/20".to_string(),
+                created_at: "2026-02-11T00:00:00Z".to_string(),
+                user: Some(IssueUser {
+                    login: "fac-bot".to_string(),
+                }),
+            },
+            IssueComment {
+                id: 21,
+                body: malformed_individual.to_string(),
+                html_url: "https://example.invalid/comment/21".to_string(),
+                created_at: "2026-02-11T00:00:01Z".to_string(),
+                user: Some(IssueUser {
+                    login: "fac-bot".to_string(),
+                }),
+            },
+        ];
+
+        let dimension = evaluate_dimension(
+            DimensionSpec {
+                dimension: SECURITY_DIMENSION,
+                marker: SECURITY_MARKER,
+            },
+            "guardian-intelligence/apm2",
+            441,
+            "0123456789abcdef0123456789abcdef01234567",
+            &comments,
+            "fac-bot",
+        );
+
+        assert_eq!(dimension.status, "PASS");
+        assert!(
+            dimension.error.as_deref().is_some_and(
+                |error| error.contains("individual finding comments had parsing errors")
+            )
         );
     }
 }

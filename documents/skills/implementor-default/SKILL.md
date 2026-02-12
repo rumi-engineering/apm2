@@ -71,7 +71,6 @@ decision_tree:
             (3) `apm2 fac logs --help`
             (4) `apm2 fac push --help`
             (5) `apm2 fac review --help`
-            (6) `apm2 fac review project --help`
             (7) `apm2 fac review status --help`
             (8) `apm2 fac restart --help`
             Help output is authoritative for names/flags.

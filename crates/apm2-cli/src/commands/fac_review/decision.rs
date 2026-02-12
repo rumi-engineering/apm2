@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::target::resolve_pr_target;
 use super::types::{COMMENT_CONFIRM_MAX_PAGES, now_iso8601, validate_expected_head_sha};
+use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-decision:v1";
@@ -56,7 +57,7 @@ struct DecisionEntry {
     set_at: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IssueComment {
     id: u64,
     body: String,
@@ -66,7 +67,7 @@ struct IssueComment {
     user: Option<IssueUser>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IssueUser {
     login: String,
 }
@@ -110,12 +111,8 @@ pub fn run_decision_show(
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-    let expected_author_login = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
-            .to_string()
-    })?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
     let report = build_show_report(resolved_pr, &head_sha, &comments, &expected_author_login);
@@ -140,14 +137,20 @@ pub fn run_decision_set(
     json_output: bool,
 ) -> Result<u8, String> {
     ensure_gh_cli_ready()?;
-    let expected_author_login = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
-            .to_string()
-    })?;
     let normalized_dimension = normalize_dimension(dimension)?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
-    let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
+    let comments = match fetch_issue_comments(&owner_repo, resolved_pr) {
+        Ok(value) => value,
+        Err(err)
+            if err.contains("requires local projection data")
+                || err.contains("GitHub read fallback is disabled") =>
+        {
+            Vec::new()
+        },
+        Err(err) => return Err(err),
+    };
     let parsed = parse_decision_comments_for_author(&comments, Some(&expected_author_login));
     let latest_any = latest_decision_comment(&parsed);
     let base_for_sha = latest_for_sha(&parsed, &head_sha);
@@ -168,7 +171,7 @@ pub fn run_decision_set(
     payload.sha.clone_from(&head_sha);
     payload.updated_at = now_iso8601();
 
-    let actor = expected_author_login;
+    let actor = expected_author_login.clone();
     payload.dimensions.insert(
         normalized_dimension.to_string(),
         DecisionEntry {
@@ -179,20 +182,41 @@ pub fn run_decision_set(
         },
     );
 
-    if let Some(existing) = latest_any {
+    let active_comment_id = if let Some(existing) = latest_any {
         update_decision_comment(&owner_repo, existing.comment.id, &payload)?;
+        existing.comment.id
     } else {
-        create_decision_comment(&owner_repo, resolved_pr, &payload)?;
-    }
+        create_decision_comment(&owner_repo, resolved_pr, &payload)?
+    };
 
     let report = build_report_from_payload(
         resolved_pr,
         &head_sha,
         &payload,
-        latest_any.map(|entry| entry.comment.id),
-        latest_any.map(|entry| entry.comment.html_url.clone()),
+        Some(active_comment_id),
+        Some(format!(
+            "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{active_comment_id}"
+        )),
         false,
         Vec::new(),
+    );
+    let _ = cache_written_decision_comment(
+        &owner_repo,
+        resolved_pr,
+        active_comment_id,
+        &payload,
+        &expected_author_login,
+    );
+    let _ = projection_store::save_identity_with_context(
+        &owner_repo,
+        resolved_pr,
+        &head_sha,
+        "decision.set",
+    );
+    let _ = projection_store::save_trusted_reviewer_id(
+        &owner_repo,
+        resolved_pr,
+        &expected_author_login,
     );
     emit_show_report(&report, json_output)?;
     if !keep_prepared_inputs {
@@ -210,9 +234,31 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         validate_expected_head_sha(value)?;
         return Ok(value.to_ascii_lowercase());
     }
+
+    if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "decision.resolve_head_sha",
+        ));
+    }
+
+    ensure_gh_cli_ready()?;
     let value = fetch_pr_head_sha(owner_repo, pr_number)?;
     validate_expected_head_sha(&value)?;
-    Ok(value.to_ascii_lowercase())
+    let value = value.to_ascii_lowercase();
+    let _ =
+        projection_store::record_fallback_read(owner_repo, pr_number, "decision.resolve_head_sha");
+    let _ = projection_store::save_identity_with_context(
+        owner_repo,
+        pr_number,
+        &value,
+        "gh-fallback:decision.resolve_head_sha",
+    );
+    Ok(value)
 }
 
 fn normalize_dimension(input: &str) -> Result<&'static str, String> {
@@ -227,6 +273,19 @@ fn normalize_dimension(input: &str) -> Result<&'static str, String> {
 }
 
 fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueComment>, String> {
+    if let Some(cached) =
+        projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
+    {
+        return Ok(cached);
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "decision.fetch_issue_comments",
+        ));
+    }
+
+    ensure_gh_cli_ready()?;
     let mut collected = Vec::new();
     for page in 1..=COMMENT_CONFIRM_MAX_PAGES {
         let endpoint =
@@ -248,7 +307,38 @@ fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueCom
         }
         collected.extend(page_comments);
     }
+    let _ = projection_store::record_fallback_read(
+        owner_repo,
+        pr_number,
+        "decision.fetch_issue_comments",
+    );
+    let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &collected);
     Ok(collected)
+}
+
+fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    if let Some(cached) = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)? {
+        return Ok(cached);
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "decision.resolve_expected_author_login",
+        ));
+    }
+
+    ensure_gh_cli_ready()?;
+    let login = resolve_authenticated_gh_login().ok_or_else(|| {
+        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
+            .to_string()
+    })?;
+    let _ = projection_store::record_fallback_read(
+        owner_repo,
+        pr_number,
+        "decision.resolve_expected_author_login",
+    );
+    let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
+    Ok(login)
 }
 
 fn parse_decision_comments_for_author(
@@ -540,30 +630,7 @@ fn create_decision_comment(
     payload: &DecisionComment,
 ) -> Result<u64, String> {
     let body = render_decision_comment_body(payload)?;
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
-    let output = Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "POST",
-            &endpoint,
-            "-f",
-            &format!("body={body}"),
-        ])
-        .output()
-        .map_err(|err| format!("failed to POST decision comment: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "decision comment POST failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse decision comment POST response: {err}"))?;
-    value
-        .get("id")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "decision comment POST response missing id".to_string())
+    github_projection::create_issue_comment(owner_repo, pr_number, &body).map(|value| value.id)
 }
 
 fn update_decision_comment(
@@ -572,25 +639,41 @@ fn update_decision_comment(
     payload: &DecisionComment,
 ) -> Result<(), String> {
     let body = render_decision_comment_body(payload)?;
-    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
-    let output = Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "PATCH",
-            &endpoint,
-            "-f",
-            &format!("body={body}"),
-        ])
-        .output()
-        .map_err(|err| format!("failed to PATCH decision comment: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "decision comment PATCH failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    github_projection::update_issue_comment(owner_repo, comment_id, &body)
+}
+
+fn cache_written_decision_comment(
+    owner_repo: &str,
+    pr_number: u32,
+    comment_id: u64,
+    payload: &DecisionComment,
+    trusted_login: &str,
+) -> Result<(), String> {
+    let body = render_decision_comment_body(payload)?;
+    let mut comments =
+        projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
+            .unwrap_or_default();
+
+    if let Some(existing) = comments.iter_mut().find(|comment| comment.id == comment_id) {
+        existing.body = body;
+        existing.user = Some(IssueUser {
+            login: trusted_login.to_string(),
+        });
+    } else {
+        comments.push(IssueComment {
+            id: comment_id,
+            body,
+            html_url: format!(
+                "https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"
+            ),
+            created_at: now_iso8601(),
+            user: Some(IssueUser {
+                login: trusted_login.to_string(),
+            }),
+        });
     }
-    Ok(())
+
+    projection_store::save_issue_comments_cache(owner_repo, pr_number, &comments)
 }
 
 fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<(), String> {

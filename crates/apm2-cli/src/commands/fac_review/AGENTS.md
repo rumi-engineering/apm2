@@ -4,7 +4,7 @@
 
 ## Overview
 
-The `fac_review` module implements the `apm2 fac review *` command family, which orchestrates automated code reviews (security and quality) against GitHub pull requests. It is the most complex command sub-module in the CLI, comprising 30 internal sub-modules.
+The `fac_review` module implements the `apm2 fac review *` command family, which orchestrates automated code reviews (security and quality) against GitHub pull requests. It is the most complex command sub-module in the CLI, comprising 33 internal sub-modules.
 
 ### Architecture
 
@@ -20,11 +20,13 @@ apm2 fac review run --pr-url <URL> --type all
        |      +-- selector.rs     (review model selection logic)
        |      +-- restart.rs      (CI-state-aware pipeline restart)
        |      +-- merge_conflicts.rs (merge conflict detection)
+       |      +-- worktree.rs     (SHA-to-worktree resolution for detached dispatch)
+       |      +-- timeout_policy.rs (cold-cache-aware bounded test timeout policy)
        |
        +-- state.rs          (ReviewStateFile persistence, pulse files, locking)
        +-- types.rs          (shared types, constants, utility functions)
        +-- events.rs         (NDJSON lifecycle telemetry)
-       +-- barrier.rs        (GitHub event barrier: author/actor authorization)
+       +-- barrier.rs        (GitHub helper primitives: auth/head/metadata rendering)
        +-- ci_status.rs      (CI check-suite status querying)
        +-- decision.rs       (review decision set/show)
        +-- detection.rs      (review detection from PR comments)
@@ -37,7 +39,11 @@ apm2 fac review run --pr-url <URL> --type all
        +-- pipeline.rs       (end-to-end pipeline: dispatch + project)
        +-- prepare.rs        (review input preparation)
        +-- projection.rs     (projection snapshot for GitHub surfaces)
+       +-- projection_store.rs (local canonical projection cache under ~/.apm2/fac_projection)
+       +-- github_projection.rs (dedicated GitHub projection writer/read-fallback boundary)
        +-- publish.rs        (review comment publishing to GitHub)
+       +-- comment.rs        (single SHA-bound finding comment publishing)
+       +-- pr_body.rs        (PR body gate-status marker sync + history retention)
        +-- push.rs           (branch push with commit signing)
        +-- target.rs         (review target resolution)
 ```
@@ -49,8 +55,12 @@ apm2 fac review run --pr-url <URL> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
+- **Adaptive bounded tests**: Test gate keeps a 240s steady-state SLA but can temporarily widen timeout on detected cold build caches.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
+- **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.
+- **Per-SHA finding comments**: `apm2 fac review comment` writes one finding per comment using an `apm2-finding:v1` marker and `apm2.finding.v1` metadata block.
+- **PR body gate status sync**: `apm2 fac push` writes a marker-bounded gate-status section in the PR body with expanded latest SHA and collapsed previous SHA snapshots.
 
 ## Key Types
 
@@ -241,15 +251,14 @@ pub use types::ReviewRunType;
 |----------|-------------|
 | `run_review(pr_url, type, sha, force, json)` | Run security/quality reviews synchronously |
 | `run_dispatch(pr_url, type, sha, force, json)` | Dispatch reviews as detached processes |
-| `run_status(pr_number, pr_url, json)` | Show review run status |
-| `run_findings(repo, pr, url, sha, json)` | Aggregate review findings |
+| `run_status(pr_number, pr_url, type_filter, json)` | Show review run status (optionally one reviewer lane) |
+| `run_findings(repo, pr, url, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
+| `run_comment(repo, pr, url, sha, severity, type, body, json)` | Publish a single SHA-bound finding comment |
 | `run_prepare(repo, pr, url, sha, json)` | Prepare review inputs |
 | `run_publish(repo, pr, url, sha, type, body, json)` | Publish review comment to GitHub |
 | `run_decision_set(repo, pr, url, sha, dim, dec, reason, keep, json)` | Set review decision |
 | `run_decision_show(repo, pr, url, sha, json)` | Show review decisions |
-| `run_barrier(repo, event_path, event_name, json)` | Enforce GitHub event authorization barrier |
-| `run_kickoff(repo, event_path, event_name, max_wait, public_only, json)` | Full kickoff: barrier + dispatch + projection loop |
-| `run_project(pr, sha, since, after_seq, errors, fail_term, json)` | Project review state from NDJSON events |
+| `run_project(pr, sha, since, after_seq, errors, fail_term, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
 | `run_tail(lines, follow)` | Tail review event log |
 | `run_push(repo, remote, branch, ticket)` | Push review branch with commit signing |
 | `run_restart(repo, pr, url, force, json)` | CI-aware pipeline restart |

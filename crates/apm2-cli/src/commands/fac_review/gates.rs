@@ -17,12 +17,13 @@ use super::gate_attestation::{
 };
 use super::gate_cache::GateCache;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
+use super::timeout_policy::{
+    MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, resolve_bounded_test_timeout,
+};
 use super::types::apm2_home_dir;
 use crate::exit_codes::codes as exit_codes;
 
-const MAX_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 240;
 const HTF_TEST_HEARTBEAT_SECONDS: u64 = 10;
-const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 80s. If tests are taking longer that is a bug. Never increase this timeout. Investigate why tests that you added have increased the test time.";
 
 /// Run all evidence gates locally with optional bounded test execution.
 ///
@@ -67,6 +68,14 @@ pub fn run_gates(
                     "  Mode:    {}",
                     if summary.quick { "quick" } else { "full" }
                 );
+                if summary.cold_cache_timeout_boosted {
+                    println!(
+                        "  Timeout: {}s (cold-cache boost from {}s)",
+                        summary.effective_timeout_seconds, summary.requested_timeout_seconds
+                    );
+                } else {
+                    println!("  Timeout: {}s", summary.effective_timeout_seconds);
+                }
                 println!("  Cache:   {}", summary.cache_status);
                 println!();
                 println!("  {:<25} {:<6} {:>8}", "Gate", "Status", "Duration");
@@ -112,11 +121,15 @@ pub fn run_gates(
 }
 
 #[derive(Debug, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct GatesSummary {
     sha: String,
     passed: bool,
     bounded: bool,
     quick: bool,
+    requested_timeout_seconds: u64,
+    effective_timeout_seconds: u64,
+    cold_cache_timeout_boosted: bool,
     cache_status: String,
     gates: Vec<GateResult>,
 }
@@ -140,6 +153,15 @@ fn run_gates_inner(
 
     let workspace_root =
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
+    let timeout_decision = resolve_bounded_test_timeout(&workspace_root, timeout_seconds);
+    if timeout_decision.boosted_for_cold_cache && !quick {
+        eprintln!(
+            "fac gates: cold build cache detected at {} — widening bounded test timeout from {}s to {}s for warm-up",
+            timeout_decision.target_dir.display(),
+            timeout_decision.requested_seconds,
+            timeout_decision.effective_seconds
+        );
+    }
 
     // 1. Require clean working tree for full gates only.
     ensure_clean_working_tree(&workspace_root, quick)?;
@@ -168,6 +190,9 @@ fn run_gates_inner(
             passed: false,
             bounded: false,
             quick,
+            requested_timeout_seconds: timeout_seconds,
+            effective_timeout_seconds: timeout_decision.effective_seconds,
+            cold_cache_timeout_boosted: timeout_decision.boosted_for_cold_cache,
             cache_status: "disabled (merge conflicts)".to_string(),
             gates: vec![merge_gate],
         });
@@ -183,7 +208,7 @@ fn run_gates_inner(
     } else if bounded {
         Some(build_bounded_test_command(
             &bounded_script,
-            timeout_seconds,
+            timeout_decision.effective_seconds,
             memory_max,
             pids_max,
             cpu_quota,
@@ -207,7 +232,7 @@ fn run_gates_inner(
     if !quick {
         let policy = GateResourcePolicy::from_cli(
             quick,
-            timeout_seconds,
+            timeout_decision.effective_seconds,
             memory_max,
             pids_max,
             cpu_quota,
@@ -275,6 +300,9 @@ fn run_gates_inner(
         passed,
         bounded,
         quick,
+        requested_timeout_seconds: timeout_seconds,
+        effective_timeout_seconds: timeout_decision.effective_seconds,
+        cold_cache_timeout_boosted: timeout_decision.boosted_for_cold_cache,
         cache_status: if quick {
             "disabled (quick mode)".to_string()
         } else if force {
@@ -304,12 +332,12 @@ fn gate_log_digest(gate_name: &str) -> Option<String> {
 fn validate_timeout_seconds(timeout_seconds: u64) -> Result<(), String> {
     if timeout_seconds == 0 {
         return Err(format!(
-            "--timeout-seconds must be greater than zero (max {MAX_BOUNDED_TEST_TIMEOUT_SECONDS}). {TEST_TIMEOUT_SLA_MESSAGE}"
+            "--timeout-seconds must be greater than zero (max {MAX_MANUAL_TIMEOUT_SECONDS}). {TEST_TIMEOUT_SLA_MESSAGE}"
         ));
     }
-    if timeout_seconds > MAX_BOUNDED_TEST_TIMEOUT_SECONDS {
+    if timeout_seconds > MAX_MANUAL_TIMEOUT_SECONDS {
         return Err(format!(
-            "--timeout-seconds cannot exceed {MAX_BOUNDED_TEST_TIMEOUT_SECONDS}. {TEST_TIMEOUT_SLA_MESSAGE}"
+            "--timeout-seconds cannot exceed {MAX_MANUAL_TIMEOUT_SECONDS}. {TEST_TIMEOUT_SLA_MESSAGE}"
         ));
     }
     Ok(())

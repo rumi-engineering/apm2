@@ -23,6 +23,7 @@ use super::types::{
     TERMINAL_SHA_DRIFT_SUPERSEDED, TERMINAL_STALE_HEAD_AMBIGUITY, TERMINATE_TIMEOUT, apm2_home_dir,
     ensure_parent_dir, now_iso8601,
 };
+use super::worktree::resolve_worktree_for_sha;
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -327,6 +328,51 @@ fn command_available(command: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn strip_deleted_executable_suffix(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_str()?;
+    let stripped = file_name.strip_suffix(" (deleted)")?;
+    let mut sanitized = path.to_path_buf();
+    sanitized.set_file_name(stripped);
+    Some(sanitized)
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn first_existing_dispatch_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|candidate| is_regular_file(candidate))
+        .cloned()
+}
+
+fn resolve_dispatch_executable_path(workspace_root: &Path) -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let mut candidates = Vec::new();
+    if let Some(sanitized) = strip_deleted_executable_suffix(&current_exe) {
+        candidates.push(sanitized);
+    }
+    candidates.push(current_exe.clone());
+    candidates.push(workspace_root.join("target").join("debug").join("apm2"));
+    candidates.push(workspace_root.join("target").join("release").join("apm2"));
+
+    if let Some(executable) = first_existing_dispatch_executable(&candidates) {
+        return Ok(executable);
+    }
+
+    let rendered = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(format!(
+        "failed to resolve dispatch executable (current_exe={}, candidates={rendered})",
+        current_exe.display()
+    ))
+}
+
 // ── Run-state contract helpers ──────────────────────────────────────────────
 
 fn attach_run_state_contract_for_home(
@@ -462,8 +508,10 @@ fn drift_lineage_from_state(state: &ReviewRunState, key: &DispatchIdempotencyKey
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resume_dispatch_after_head_drift_for_home<F>(
     home: &Path,
+    workspace_root: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
@@ -472,7 +520,7 @@ fn resume_dispatch_after_head_drift_for_home<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let mut superseded = state.clone();
     superseded.status = ReviewRunStatus::Failed;
@@ -485,6 +533,7 @@ where
     let mut seeded =
         seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, Some(&lineage))?;
     let started = match spawn_review(
+        workspace_root,
         pr_url,
         key.pr_number,
         review_kind,
@@ -561,8 +610,10 @@ fn next_sequence_hint_from_state(load: &ReviewRunStateLoad) -> Option<u32> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_single_review_locked_for_home<F>(
     home: &Path,
+    workspace_root: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
@@ -571,7 +622,7 @@ fn dispatch_single_review_locked_for_home<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let run_state_load = load_review_run_state_for_home(home, key.pr_number, &key.review_type)?;
     let sequence_hint = next_sequence_hint_from_state(&run_state_load);
@@ -696,6 +747,7 @@ where
                         }
                         return resume_dispatch_after_head_drift_for_home(
                             home,
+                            workspace_root,
                             pr_url,
                             key,
                             review_kind,
@@ -742,6 +794,7 @@ where
                             }
                             return resume_dispatch_after_head_drift_for_home(
                                 home,
+                                workspace_root,
                                 pr_url,
                                 key,
                                 review_kind,
@@ -795,6 +848,7 @@ where
 
     let mut seeded = seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, None)?;
     let started = match spawn_review(
+        workspace_root,
         pr_url,
         key.pr_number,
         review_kind,
@@ -813,31 +867,10 @@ where
     attach_run_state_contract_for_home(home, key, started)
 }
 
-#[cfg(test)]
-fn dispatch_single_review_for_home_with_spawn<F>(
+#[allow(clippy::too_many_arguments)]
+fn dispatch_single_review_for_home_with_spawn_force_workspace<F>(
     home: &Path,
-    pr_url: &str,
-    key: &DispatchIdempotencyKey,
-    review_kind: ReviewKind,
-    dispatch_epoch: u64,
-    spawn_review: &F,
-) -> Result<DispatchReviewResult, String>
-where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
-{
-    dispatch_single_review_for_home_with_spawn_force(
-        home,
-        pr_url,
-        key,
-        review_kind,
-        dispatch_epoch,
-        false,
-        spawn_review,
-    )
-}
-
-fn dispatch_single_review_for_home_with_spawn_force<F>(
-    home: &Path,
+    workspace_root: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
@@ -846,7 +879,7 @@ fn dispatch_single_review_for_home_with_spawn_force<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     key.validate()?;
     if !key.review_type.eq_ignore_ascii_case(review_kind.as_str()) {
@@ -887,6 +920,7 @@ where
 
     dispatch_single_review_locked_for_home(
         home,
+        workspace_root,
         pr_url,
         key,
         review_kind,
@@ -896,16 +930,85 @@ where
     )
 }
 
-fn dispatch_single_review_for_home(
+#[cfg(test)]
+fn dispatch_single_review_for_home_with_spawn<F>(
+    home: &Path,
+    pr_url: &str,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    spawn_review: &F,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    let adapter = |_: &Path,
+                   url: &str,
+                   pr_number: u32,
+                   kind: ReviewKind,
+                   expected_head_sha: &str,
+                   epoch: u64|
+     -> Result<DispatchReviewResult, String> {
+        spawn_review(url, pr_number, kind, expected_head_sha, epoch)
+    };
+    dispatch_single_review_for_home_with_spawn_force_workspace(
+        home,
+        Path::new("."),
+        pr_url,
+        key,
+        review_kind,
+        dispatch_epoch,
+        false,
+        &adapter,
+    )
+}
+
+#[cfg(test)]
+fn dispatch_single_review_for_home_with_spawn_force<F>(
     home: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
     force_same_sha_retry: bool,
-) -> Result<DispatchReviewResult, String> {
-    dispatch_single_review_for_home_with_spawn_force(
+    spawn_review: &F,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    let adapter = |_: &Path,
+                   url: &str,
+                   pr_number: u32,
+                   kind: ReviewKind,
+                   expected_head_sha: &str,
+                   epoch: u64|
+     -> Result<DispatchReviewResult, String> {
+        spawn_review(url, pr_number, kind, expected_head_sha, epoch)
+    };
+    dispatch_single_review_for_home_with_spawn_force_workspace(
         home,
+        Path::new("."),
+        pr_url,
+        key,
+        review_kind,
+        dispatch_epoch,
+        force_same_sha_retry,
+        &adapter,
+    )
+}
+
+fn dispatch_single_review_for_home(
+    home: &Path,
+    workspace_root: &Path,
+    pr_url: &str,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    force_same_sha_retry: bool,
+) -> Result<DispatchReviewResult, String> {
+    dispatch_single_review_for_home_with_spawn_force_workspace(
+        home,
+        workspace_root,
         pr_url,
         key,
         review_kind,
@@ -947,8 +1050,7 @@ pub fn dispatch_single_review_with_force(
 ) -> Result<DispatchReviewResult, String> {
     let key = DispatchIdempotencyKey::new(owner_repo, pr_number, review_kind.as_str(), head_sha);
     key.validate()?;
-    let workspace_root =
-        std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
+    let workspace_root = resolve_worktree_for_sha(head_sha)?;
     let merge_report = check_merge_conflicts_against_main(&workspace_root, head_sha)?;
     if merge_report.has_conflicts() {
         return Err(format!(
@@ -959,6 +1061,7 @@ pub fn dispatch_single_review_with_force(
     let home = apm2_home_dir()?;
     dispatch_single_review_for_home(
         &home,
+        &workspace_root,
         pr_url,
         &key,
         review_kind,
@@ -968,15 +1071,14 @@ pub fn dispatch_single_review_with_force(
 }
 
 fn spawn_detached_review(
+    workspace_root: &Path,
     pr_url: &str,
     pr_number: u32,
     review_kind: ReviewKind,
     expected_head_sha: &str,
     dispatch_epoch: u64,
 ) -> Result<DispatchReviewResult, String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
-    let cwd = std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
+    let exe_path = resolve_dispatch_executable_path(workspace_root)?;
     let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
 
@@ -994,7 +1096,7 @@ fn spawn_detached_review(
             .arg("--unit")
             .arg(&unit)
             .arg("--property")
-            .arg(format!("WorkingDirectory={}", cwd.display()));
+            .arg(format!("WorkingDirectory={}", workspace_root.display()));
 
         for key in ["PATH", "HOME", "CARGO_HOME"] {
             if let Ok(value) = std::env::var(key) {
@@ -1062,7 +1164,7 @@ fn spawn_detached_review(
         .arg(review_kind.as_str())
         .arg("--expected-head-sha")
         .arg(expected_head_sha)
-        .current_dir(cwd)
+        .current_dir(workspace_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr))
@@ -1092,8 +1194,9 @@ mod tests {
     use super::{
         DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
         dispatch_single_review_for_home_with_spawn,
-        dispatch_single_review_for_home_with_spawn_force, review_dispatch_scope_lock_path_for_home,
-        run_state_has_live_process, write_pending_dispatch_for_home,
+        dispatch_single_review_for_home_with_spawn_force, first_existing_dispatch_executable,
+        review_dispatch_scope_lock_path_for_home, run_state_has_live_process,
+        strip_deleted_executable_suffix, write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
         get_process_start_time, load_review_run_state_for_home, review_run_state_path_for_home,
@@ -1135,6 +1238,36 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn strip_deleted_executable_suffix_strips_deleted_marker() {
+        let path = std::path::Path::new("/tmp/apm2 (deleted)");
+        let sanitized = strip_deleted_executable_suffix(path).expect("sanitized path");
+        assert_eq!(sanitized, std::path::PathBuf::from("/tmp/apm2"));
+    }
+
+    #[test]
+    fn strip_deleted_executable_suffix_leaves_clean_path_unmodified() {
+        let path = std::path::Path::new("/tmp/apm2");
+        assert!(
+            strip_deleted_executable_suffix(path).is_none(),
+            "clean path should not change"
+        );
+    }
+
+    #[test]
+    fn first_existing_dispatch_executable_selects_first_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("apm2-first");
+        let second = temp.path().join("apm2-second");
+        fs::write(&first, b"first").expect("write first executable stub");
+        fs::write(&second, b"second").expect("write second executable stub");
+        let missing = temp.path().join("missing");
+
+        let selected = first_existing_dispatch_executable(&[missing, first.clone(), second])
+            .expect("select executable");
+        assert_eq!(selected, first);
     }
 
     fn spawn_long_lived_pid() -> u32 {

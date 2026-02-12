@@ -5,7 +5,9 @@ use std::process::Command;
 
 use super::dispatch::dispatch_single_review;
 use super::evidence::{EvidenceGateResult, run_evidence_gates};
+use super::pr_body::{GateResult, sync_gate_status_to_pr};
 use super::types::{DispatchReviewResult, ReviewKind};
+use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
@@ -303,98 +305,38 @@ fn resolve_pr_metadata(
 
 /// Look up an existing PR number for the given branch, or return 0 if none.
 fn find_existing_pr(repo: &str, branch: &str) -> u32 {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            branch,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let num_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            num_str.parse::<u32>().unwrap_or(0)
-        },
+    match github_projection::find_pr_for_branch(repo, branch) {
+        Ok(Some(number)) => number,
         _ => 0,
     }
 }
 
 /// Create a new PR and return the PR number on success.
 fn create_pr(repo: &str, title: &str, body: &str) -> Result<u32, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr", "create", "--repo", repo, "--title", title, "--body", body, "--base", "main",
-        ])
-        .output()
-        .map_err(|e| format!("failed to execute gh pr create: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr create failed: {stderr}"));
-    }
-
-    // gh pr create prints the PR URL on stdout; extract the number.
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let pr_number = url
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-        .ok_or_else(|| format!("could not parse PR number from gh output: {url}"))?;
-
-    Ok(pr_number)
+    github_projection::create_pr(repo, title, body)
 }
 
 /// Update an existing PR's title and body.
 fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), String> {
-    let pr_ref = pr_number.to_string();
-    let output = Command::new("gh")
-        .args([
-            "pr", "edit", &pr_ref, "--repo", repo, "--title", title, "--body", body,
-        ])
-        .output()
-        .map_err(|e| format!("failed to execute gh pr edit: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr edit failed: {stderr}"));
-    }
-    Ok(())
+    github_projection::update_pr(repo, pr_number, title, body)
 }
 
 /// Enable auto-merge (squash) on a PR.
 fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
-    let pr_ref = pr_number.to_string();
-    let output = Command::new("gh")
-        .args(["pr", "merge", &pr_ref, "--repo", repo, "--auto", "--squash"])
-        .output()
-        .map_err(|e| format!("failed to execute gh pr merge --auto: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Auto-merge may already be enabled — treat as non-fatal warning.
-        eprintln!("WARNING: gh pr merge --auto: {stderr}");
-    }
-    Ok(())
+    github_projection::enable_auto_merge(repo, pr_number)
 }
 
 fn ensure_evidence_gates_pass_with<F>(
     workspace_root: &Path,
     sha: &str,
     mut run_gates_fn: F,
-) -> Result<(), String>
+) -> Result<Vec<EvidenceGateResult>, String>
 where
     F: FnMut(&Path, &str) -> Result<(bool, Vec<EvidenceGateResult>), String>,
 {
     let (passed, results) = run_gates_fn(workspace_root, sha)?;
     if passed {
-        return Ok(());
+        return Ok(results);
     }
 
     let failed_gates = results
@@ -412,7 +354,10 @@ where
     ))
 }
 
-fn run_blocking_evidence_gates(workspace_root: &Path, sha: &str) -> Result<(), String> {
+fn run_blocking_evidence_gates(
+    workspace_root: &Path,
+    sha: &str,
+) -> Result<Vec<EvidenceGateResult>, String> {
     ensure_evidence_gates_pass_with(workspace_root, sha, |root, head_sha| {
         run_evidence_gates(root, head_sha, None, None)
     })
@@ -538,10 +483,13 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
 
     // Step 2: run evidence gates synchronously.
     eprintln!("fac push: running evidence gates (blocking)");
-    if let Err(err) = run_blocking_evidence_gates(&worktree_dir, &sha) {
-        eprintln!("ERROR: {err}");
-        return exit_codes::GENERIC_ERROR;
-    }
+    let gate_results = match run_blocking_evidence_gates(&worktree_dir, &sha) {
+        Ok(results) => results,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
     eprintln!("fac push: evidence gates PASSED");
 
     // Step 3: create or update PR.
@@ -565,6 +513,29 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         eprintln!("fac push: updated PR #{pr_number}");
         pr_number
     };
+    if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {
+        eprintln!("WARNING: failed to persist local projection identity: {err}");
+    }
+    if let Err(err) =
+        projection_store::save_pr_body_snapshot(repo, pr_number, &metadata.body, "push")
+    {
+        eprintln!("WARNING: failed to persist local PR body snapshot: {err}");
+    }
+
+    // Step 3.5: sync gate status section to PR body (best-effort).
+    let gate_status_rows = gate_results
+        .iter()
+        .map(|result| GateResult {
+            name: result.gate_name.clone(),
+            passed: result.passed,
+            duration_secs: result.duration_secs,
+        })
+        .collect::<Vec<_>>();
+    if let Err(err) = sync_gate_status_to_pr(repo, pr_number, gate_status_rows, &sha) {
+        eprintln!("WARNING: failed to sync gate status section in PR body: {err}");
+    } else {
+        eprintln!("fac push: synced gate status section in PR body for PR #{pr_number}");
+    }
 
     // Step 4: enable auto-merge.
     if let Err(e) = enable_auto_merge(repo, pr_number) {

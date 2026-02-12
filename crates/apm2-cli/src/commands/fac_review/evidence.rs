@@ -18,6 +18,9 @@ use super::gate_cache::{GateCache, ReuseDecision};
 use super::merge_conflicts::{
     check_merge_conflicts_against_main, render_merge_conflict_log, render_merge_conflict_summary,
 };
+use super::timeout_policy::{
+    DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, resolve_bounded_test_timeout,
+};
 use super::types::{apm2_home_dir, now_iso8601};
 
 /// Options for customizing evidence gate execution.
@@ -43,9 +46,7 @@ const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
 // Observability-only monotonic pulse cadence (not HTF authority time).
 const MONOTONIC_HEARTBEAT_TICK_SECS: u64 = 10;
 const GATE_WAIT_POLL_MILLIS: u64 = 250;
-const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 80s. If tests are taking longer that is a bug. Never increase this timeout. Investigate why tests that you added have increased the test time.";
 const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
-const DEFAULT_TEST_TIMEOUT_SECONDS: u64 = 240;
 const DEFAULT_TEST_MEMORY_MAX: &str = "24G";
 const DEFAULT_TEST_PIDS_MAX: u64 = 1536;
 const DEFAULT_TEST_CPU_QUOTA: &str = "200%";
@@ -379,15 +380,25 @@ fn verify_workspace_integrity_gate(
     (passed, line)
 }
 
-fn build_pipeline_test_command(workspace_root: &Path) -> (Vec<String>, bool) {
+struct PipelineTestCommand {
+    command: Vec<String>,
+    bounded_runner: bool,
+    effective_timeout_seconds: u64,
+    cold_cache_timeout_boosted: bool,
+    timeout_target_dir: Option<PathBuf>,
+}
+
+fn build_pipeline_test_command(workspace_root: &Path) -> PipelineTestCommand {
     let bounded_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
     let bounded_runner = bounded_script.is_file() && is_cgroup_v2_available();
     if bounded_runner {
-        return (
-            vec![
+        let timeout_decision =
+            resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
+        return PipelineTestCommand {
+            command: vec![
                 bounded_script.display().to_string(),
                 "--timeout-seconds".to_string(),
-                DEFAULT_TEST_TIMEOUT_SECONDS.to_string(),
+                timeout_decision.effective_seconds.to_string(),
                 "--kill-after-seconds".to_string(),
                 DEFAULT_TEST_KILL_AFTER_SECONDS.to_string(),
                 "--heartbeat-seconds".to_string(),
@@ -409,18 +420,24 @@ fn build_pipeline_test_command(workspace_root: &Path) -> (Vec<String>, bool) {
                 "--profile".to_string(),
                 "ci".to_string(),
             ],
-            true,
-        );
+            bounded_runner: true,
+            effective_timeout_seconds: timeout_decision.effective_seconds,
+            cold_cache_timeout_boosted: timeout_decision.boosted_for_cold_cache,
+            timeout_target_dir: Some(timeout_decision.target_dir),
+        };
     }
 
-    (
-        vec![
+    PipelineTestCommand {
+        command: vec![
             "cargo".to_string(),
             "test".to_string(),
             "--workspace".to_string(),
         ],
-        false,
-    )
+        bounded_runner: false,
+        effective_timeout_seconds: DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS,
+        cold_cache_timeout_boosted: false,
+        timeout_target_dir: None,
+    }
 }
 
 /// Run evidence gates (cargo fmt check, clippy, doc, test, CI scripts).
@@ -692,14 +709,27 @@ pub fn run_evidence_gates_with_status(
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
-    let (pipeline_test_command, bounded_runner) = build_pipeline_test_command(workspace_root);
+    let pipeline_test_command = build_pipeline_test_command(workspace_root);
+    if pipeline_test_command.cold_cache_timeout_boosted {
+        eprintln!(
+            "pipeline: cold build cache detected at {} — widening bounded test timeout to {}s for warm-up",
+            pipeline_test_command
+                .timeout_target_dir
+                .as_ref()
+                .map_or_else(
+                    || "<unknown>".to_string(),
+                    |path| path.display().to_string()
+                ),
+            pipeline_test_command.effective_timeout_seconds,
+        );
+    }
     let policy = GateResourcePolicy::from_cli(
         false,
-        DEFAULT_TEST_TIMEOUT_SECONDS,
+        pipeline_test_command.effective_timeout_seconds,
         DEFAULT_TEST_MEMORY_MAX,
         DEFAULT_TEST_PIDS_MAX,
         DEFAULT_TEST_CPU_QUOTA,
-        bounded_runner,
+        pipeline_test_command.bounded_runner,
     );
 
     let gates: &[(&str, &[&str])] = &[
@@ -963,7 +993,7 @@ pub fn run_evidence_gates_with_status(
             workspace_root,
             sha,
             gate_name,
-            Some(pipeline_test_command.as_slice()),
+            Some(pipeline_test_command.command.as_slice()),
             &policy,
         );
         let reuse =
@@ -1015,6 +1045,7 @@ pub fn run_evidence_gates_with_status(
             let log_path = evidence_dir.join("test.log");
             let started = Instant::now();
             let (test_cmd, test_args) = pipeline_test_command
+                .command
                 .split_first()
                 .ok_or_else(|| "pipeline test command is empty".to_string())?;
             let passed = run_single_evidence_gate(

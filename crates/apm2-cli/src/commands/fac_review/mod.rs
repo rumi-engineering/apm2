@@ -12,6 +12,7 @@
 mod backend;
 mod barrier;
 mod ci_status;
+mod comment;
 mod decision;
 mod detection;
 mod dispatch;
@@ -21,21 +22,26 @@ mod findings;
 mod gate_attestation;
 mod gate_cache;
 mod gates;
+mod github_projection;
 mod liveness;
 mod logs;
 mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
+mod pr_body;
 mod prepare;
 mod projection;
+mod projection_store;
 mod publish;
 mod push;
 mod restart;
 mod selector;
 mod state;
 mod target;
+mod timeout_policy;
 mod types;
+mod worktree;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -44,23 +50,19 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apm2_daemon::telemetry::reviewer::{ProjectionSummary, ProjectionSummaryEmitter};
-use barrier::{
-    emit_barrier_decision_event, enforce_barrier, ensure_gh_cli_ready, resolve_fac_event_context,
-};
 // Re-export public API for use by `fac.rs`
+pub use comment::{ReviewCommentSeverityArg, ReviewCommentTypeArg};
 pub use decision::DecisionValueArg;
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
-use projection::{projection_state_done, projection_state_failed, run_project_inner};
+use projection::run_project_inner;
 pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
 pub use types::ReviewRunType;
 use types::{
-    BarrierSummary, DispatchSummary, KickoffSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
-    validate_expected_head_sha,
+    DispatchSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url, validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -328,8 +330,13 @@ pub fn run_dispatch(
     }
 }
 
-pub fn run_status(pr_number: Option<u32>, pr_url: Option<&str>, json_output: bool) -> u8 {
-    match run_status_inner(pr_number, pr_url, json_output) {
+pub fn run_status(
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type_filter: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match run_status_inner(pr_number, pr_url, review_type_filter, json_output) {
         Ok(fail_closed) => {
             if fail_closed {
                 exit_codes::GENERIC_ERROR
@@ -361,9 +368,10 @@ pub fn run_findings(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
     sha: Option<&str>,
+    refresh: bool,
     json_output: bool,
 ) -> u8 {
-    match findings::run_findings(repo, pr_number, pr_url, sha, json_output) {
+    match findings::run_findings(repo, pr_number, pr_url, sha, refresh, json_output) {
         Ok(code) => code,
         Err(err) => {
             if json_output {
@@ -451,6 +459,47 @@ pub fn run_publish(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn run_comment(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    severity: ReviewCommentSeverityArg,
+    review_type: ReviewCommentTypeArg,
+    body: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match comment::run_comment(
+        repo,
+        pr_number,
+        pr_url,
+        sha,
+        severity,
+        review_type,
+        body,
+        json_output,
+    ) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_comment_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_decision_set(
     repo: &str,
     pr_number: Option<u32>,
@@ -521,163 +570,6 @@ pub fn run_decision_show(
     }
 }
 
-pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output: bool) -> u8 {
-    match resolve_fac_event_context(repo, event_path, event_name) {
-        Ok(ctx) => {
-            if let Err(err) = enforce_barrier(&ctx) {
-                let _ = emit_barrier_decision_event(
-                    "barrier",
-                    repo,
-                    event_name,
-                    Some(&ctx),
-                    false,
-                    Some(&err),
-                );
-                if json_output {
-                    let payload = serde_json::json!({
-                        "error": "fac_barrier_failed",
-                        "message": err,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    eprintln!("ERROR: {err}");
-                }
-                return exit_codes::GENERIC_ERROR;
-            }
-            let _ =
-                emit_barrier_decision_event("barrier", repo, event_name, Some(&ctx), true, None);
-
-            let summary = BarrierSummary {
-                repo: ctx.repo,
-                event_name: ctx.event_name,
-                pr_number: ctx.pr_number,
-                pr_url: ctx.pr_url,
-                head_sha: ctx.head_sha,
-                base_ref: ctx.base_ref,
-                default_branch: ctx.default_branch,
-                author_login: ctx.author_login,
-                author_association: ctx.author_association,
-                actor_login: ctx.actor_login,
-                actor_permission: ctx.actor_permission,
-            };
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Barrier");
-                println!("  Repo:              {}", summary.repo);
-                println!("  Event:             {}", summary.event_name);
-                println!("  PR Number:         {}", summary.pr_number);
-                println!("  Head SHA:          {}", summary.head_sha);
-                println!("  Base Ref:          {}", summary.base_ref);
-                println!(
-                    "  Author:            {} ({})",
-                    summary.author_login, summary.author_association
-                );
-                if let Some(permission) = &summary.actor_permission {
-                    println!(
-                        "  Actor:             {} ({permission})",
-                        summary.actor_login
-                    );
-                } else {
-                    println!("  Actor:             {}", summary.actor_login);
-                }
-                println!("  Barrier:           PASS");
-            }
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            let _ =
-                emit_barrier_decision_event("barrier", repo, event_name, None, false, Some(&err));
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_barrier_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_kickoff(
-    repo: &str,
-    event_path: &Path,
-    event_name: &str,
-    max_wait_seconds: u64,
-    public_projection_only: bool,
-    json_output: bool,
-) -> u8 {
-    // SECURITY BOUNDARY: GitHub Action logs are publicly visible.
-    // `public_projection_only` is intentionally fail-closed and must never emit
-    // sensitive diagnostics on stdout/stderr. Rich details stay on runner-local
-    // files under ~/.apm2.
-    if public_projection_only && json_output {
-        return exit_codes::GENERIC_ERROR;
-    }
-    if !json_output && !public_projection_only {
-        println!(
-            "details=~/.apm2/review_events.ndjson state=~/.apm2/reviews/ dispatch_logs=~/.apm2/review_dispatch/"
-        );
-    }
-    match run_kickoff_inner(
-        repo,
-        event_path,
-        event_name,
-        max_wait_seconds,
-        public_projection_only,
-    ) {
-        Ok(summary) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else if !public_projection_only {
-                println!("FAC Kickoff");
-                println!("  Repo:              {}", summary.repo);
-                println!("  Event:             {}", summary.event_name);
-                println!("  PR Number:         {}", summary.pr_number);
-                println!("  Head SHA:          {}", summary.head_sha);
-                println!("  Dispatch Epoch:    {}", summary.dispatch_epoch);
-                println!("  Total Seconds:     {}", summary.total_secs);
-                println!("  Terminal State:    {}", summary.terminal_state);
-            }
-            if summary.terminal_state == "success" {
-                exit_codes::SUCCESS
-            } else {
-                exit_codes::GENERIC_ERROR
-            }
-        },
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_kickoff_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else if !public_projection_only {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn run_project(
     pr_number: u32,
@@ -690,13 +582,6 @@ pub fn run_project(
 ) -> u8 {
     match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
         Ok(status) => {
-            let fail_closed_state = matches!(
-                status.security.as_str(),
-                "no-run-state" | "corrupt-state" | "ambiguous-state"
-            ) || matches!(
-                status.quality.as_str(),
-                "no-run-state" | "corrupt-state" | "ambiguous-state"
-            );
             if json_output {
                 println!(
                     "{}",
@@ -714,7 +599,7 @@ pub fn run_project(
                 }
             }
 
-            if fail_closed_state || (fail_on_terminal && status.terminal_failure) {
+            if fail_on_terminal && status.terminal_failure {
                 exit_codes::GENERIC_ERROR
             } else {
                 exit_codes::SUCCESS
@@ -723,6 +608,8 @@ pub fn run_project(
         Err(err) => {
             if json_output {
                 let payload = serde_json::json!({
+                    "schema": "apm2.fac.review.project.v1",
+                    "status": "unavailable",
                     "error": "fac_review_project_failed",
                     "message": err,
                 });
@@ -732,9 +619,10 @@ pub fn run_project(
                         .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
                 );
             } else {
-                eprintln!("ERROR: {err}");
+                eprintln!("WARN: fac review project unavailable: {err}");
             }
-            exit_codes::GENERIC_ERROR
+            // Projection is a debug/observability surface; do not fail callers by default.
+            exit_codes::SUCCESS
         },
     }
 }
@@ -806,7 +694,31 @@ fn run_dispatch_inner(
     force: bool,
 ) -> Result<DispatchSummary, String> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    let current_head_sha = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
+    let current_head_sha =
+        if let Some(identity) = projection_store::load_pr_identity(&owner_repo, pr_number)? {
+            validate_expected_head_sha(&identity.head_sha)?;
+            identity.head_sha.to_ascii_lowercase()
+        } else if projection_store::gh_read_fallback_enabled() {
+            let value = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
+            validate_expected_head_sha(&value)?;
+            let value = value.to_ascii_lowercase();
+            let _ = projection_store::record_fallback_read(
+                &owner_repo,
+                pr_number,
+                "dispatch.resolve_head_sha",
+            );
+            let _ = projection_store::save_identity_with_context(
+                &owner_repo,
+                pr_number,
+                &value,
+                "gh-fallback:dispatch.resolve_head_sha",
+            );
+            value
+        } else {
+            return Err(projection_store::gh_read_fallback_disabled_error(
+                "dispatch.resolve_head_sha",
+            ));
+        };
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
         if !expected.eq_ignore_ascii_case(&current_head_sha) {
@@ -849,116 +761,23 @@ fn run_dispatch_inner(
     })
 }
 
-// ── Kickoff ─────────────────────────────────────────────────────────────────
-
-fn run_kickoff_inner(
-    repo: &str,
-    event_path: &Path,
-    event_name: &str,
-    max_wait_seconds: u64,
-    public_projection_only: bool,
-) -> Result<KickoffSummary, String> {
-    if max_wait_seconds == 0 {
-        return Err("max_wait_seconds must be greater than zero".to_string());
-    }
-
-    let ctx = match resolve_fac_event_context(repo, event_path, event_name) {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            let _ =
-                emit_barrier_decision_event("kickoff", repo, event_name, None, false, Some(&err));
-            return Err(err);
-        },
-    };
-    if let Err(err) = enforce_barrier(&ctx) {
-        let _ =
-            emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), false, Some(&err));
-        return Err(err);
-    }
-    let _ = emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), true, None);
-    ensure_gh_cli_ready()?;
-
-    let started = Instant::now();
-    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha), false)?;
-    let mut after_seq = 0_u64;
-    let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
-    let mut terminal_state = "failure:timeout".to_string();
-    let mut summary_emitter = ProjectionSummaryEmitter::default();
-
-    loop {
-        let projection = run_project_inner(
-            ctx.pr_number,
-            Some(&ctx.head_sha),
-            Some(dispatch.dispatch_epoch),
-            after_seq,
-        )?;
-        let summary = ProjectionSummary::from_projection(
-            projection.sha.clone(),
-            projection.current_head_sha.clone(),
-            projection.security.clone(),
-            projection.quality.clone(),
-            projection.recent_events.clone(),
-        );
-        if let Some(line) = summary_emitter.emit_if_due(Instant::now(), &summary) {
-            println!("{line}");
-        }
-        for error in &projection.errors {
-            if public_projection_only {
-                eprintln!(
-                    "ERROR ts={} event={} review={} seq={} detail={}",
-                    error.ts, error.event, error.review_type, error.seq, error.detail
-                );
-            } else {
-                println!(
-                    "ERROR ts={} event={} review={} seq={} detail={}",
-                    error.ts, error.event, error.review_type, error.seq, error.detail
-                );
-            }
-        }
-        after_seq = projection.last_seq;
-
-        if projection.terminal_failure {
-            terminal_state = "failure:terminal_failure".to_string();
-            break;
-        }
-        if projection_state_failed(&projection.security) {
-            terminal_state = "failure:security".to_string();
-            break;
-        }
-        if projection_state_failed(&projection.quality) {
-            terminal_state = "failure:quality".to_string();
-            break;
-        }
-        if projection_state_done(&projection.security) && projection_state_done(&projection.quality)
-        {
-            terminal_state = "success".to_string();
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    Ok(KickoffSummary {
-        repo: ctx.repo,
-        event_name: ctx.event_name,
-        pr_number: ctx.pr_number,
-        pr_url: ctx.pr_url,
-        head_sha: ctx.head_sha,
-        dispatch_epoch: dispatch.dispatch_epoch,
-        total_secs: started.elapsed().as_secs(),
-        terminal_state,
-    })
-}
-
 // ── Status / Tail ───────────────────────────────────────────────────────────
 
 fn run_status_inner(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
+    review_type_filter: Option<&str>,
     json_output: bool,
 ) -> Result<bool, String> {
+    let normalized_review_type = review_type_filter.map(|value| value.trim().to_ascii_lowercase());
+    if let Some(value) = normalized_review_type.as_deref() {
+        if !matches!(value, "security" | "quality") {
+            return Err(format!(
+                "invalid review type filter `{value}` (expected security|quality)"
+            ));
+        }
+    }
+
     let derived_pr = if let Some(url) = pr_url {
         let (_, number) = parse_pr_url(url)?;
         Some(number)
@@ -981,11 +800,14 @@ fn run_status_inner(
     } else {
         list_review_pr_numbers()?
     };
+    let review_types = normalized_review_type
+        .as_deref()
+        .map_or_else(|| vec!["security", "quality"], |value| vec![value]);
 
     let mut entries = Vec::new();
     let mut fail_closed = false;
     for pr in &target_prs {
-        for review_type in ["security", "quality"] {
+        for review_type in &review_types {
             let state_path = review_run_state_path(*pr, review_type)?;
             match load_review_run_state(*pr, review_type)? {
                 state::ReviewRunStateLoad::Present(state) => {
@@ -1051,18 +873,41 @@ fn run_status_inner(
                     .get("pr_number")
                     .and_then(serde_json::Value::as_u64)
                     .is_some_and(|value| value == u64::from(number))
+            }) && normalized_review_type.as_deref().is_none_or(|wanted| {
+                event
+                    .get("review_type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| {
+                        value.eq_ignore_ascii_case(wanted) || value.eq_ignore_ascii_case("all")
+                    })
             })
         })
         .collect::<Vec<_>>();
 
-    let pulse_security = filter_pr
-        .map(|number| read_pulse_file(number, "security"))
-        .transpose()?
-        .flatten();
-    let pulse_quality = filter_pr
-        .map(|number| read_pulse_file(number, "quality"))
-        .transpose()?
-        .flatten();
+    let pulse_security = if let Some(number) = filter_pr {
+        if normalized_review_type
+            .as_deref()
+            .is_some_and(|value| value != "security")
+        {
+            None
+        } else {
+            read_pulse_file(number, "security")?
+        }
+    } else {
+        None
+    };
+    let pulse_quality = if let Some(number) = filter_pr {
+        if normalized_review_type
+            .as_deref()
+            .is_some_and(|value| value != "quality")
+        {
+            None
+        } else {
+            read_pulse_file(number, "quality")?
+        }
+    } else {
+        None
+    };
 
     let current_head_sha = filter_pr.and_then(|number| {
         entries
@@ -1088,6 +933,7 @@ fn run_status_inner(
         let payload = serde_json::json!({
             "schema": "apm2.fac.review.status.v1",
             "filter_pr": filter_pr,
+            "filter_review_type": normalized_review_type,
             "fail_closed": fail_closed,
             "entries": entries,
             "recent_events": filtered_events,
@@ -1106,6 +952,9 @@ fn run_status_inner(
     println!("FAC Review Status");
     if let Some(number) = filter_pr {
         println!("  Filter PR: #{number}");
+        if let Some(review_type) = normalized_review_type.as_deref() {
+            println!("  Filter Type: {review_type}");
+        }
         println!(
             "  Current Head SHA: {}",
             current_head_sha.as_deref().unwrap_or("-")
@@ -1148,6 +997,17 @@ fn run_status_inner(
     println!("  Pulse Files:");
     if filter_pr.is_none() {
         println!("    (set --pr or --pr-url to inspect PR-scoped pulse files)");
+    } else if let Some(review_type) = normalized_review_type.as_deref() {
+        let value = if review_type == "security" {
+            pulse_security
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
+        } else {
+            pulse_quality
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
+        };
+        println!("    {review_type}: {value}");
     } else {
         println!(
             "    security: {}",

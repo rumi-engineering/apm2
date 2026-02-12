@@ -20,6 +20,7 @@ pub const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
 pub const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
 pub const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 pub const DISPATCH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+#[allow(dead_code)]
 pub const MAX_EVENT_PAYLOAD_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_PROVIDER_SLOT_COUNT: usize = 10;
 pub const PROVIDER_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -357,6 +358,7 @@ pub struct DispatchSummary {
     pub results: Vec<DispatchReviewResult>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct BarrierSummary {
     pub repo: String,
@@ -372,6 +374,7 @@ pub struct BarrierSummary {
     pub actor_permission: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct KickoffSummary {
     pub repo: String,
@@ -412,6 +415,7 @@ pub struct ExecutionContext {
     pub seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FacEventContext {
     pub repo: String,

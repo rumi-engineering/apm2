@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use super::model_pool::normalize_gemini_model;
 use super::types::{ReviewBackend, sh_quote};
 
 fn build_script_wrapper_command(log_path: &Path, inner_command: &str, append: bool) -> String {
@@ -14,7 +15,7 @@ fn build_script_wrapper_command(log_path: &Path, inner_command: &str, append: bo
 
 pub fn build_gemini_script_command(prompt_path: &Path, log_path: &Path, model: &str) -> String {
     let prompt_q = sh_quote(&prompt_path.display().to_string());
-    let model_q = sh_quote(model);
+    let model_q = sh_quote(normalize_gemini_model(model));
     let inner = format!("gemini -m {model_q} -y -o stream-json -p \"$(cat {prompt_q})\"");
     build_script_wrapper_command(log_path, &inner, false)
 }
@@ -54,7 +55,7 @@ pub fn build_resume_command_for_backend(
             "codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}"
         ),
         ReviewBackend::Gemini => {
-            let model_q = sh_quote(model);
+            let model_q = sh_quote(normalize_gemini_model(model));
             format!("gemini -m {model_q} -y --resume latest -p {msg_q}")
         },
     }

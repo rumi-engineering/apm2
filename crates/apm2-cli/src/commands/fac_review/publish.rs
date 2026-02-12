@@ -1,16 +1,16 @@
 //! `apm2 fac review publish` — publish review comments with generated metadata.
 
-use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::barrier::{
     ensure_gh_cli_ready, fetch_pr_head_sha, render_comment_with_generated_metadata,
     resolve_authenticated_gh_login,
 };
+use super::github_projection::{self, IssueCommentResponse};
+use super::projection_store;
 use super::target::resolve_pr_target;
 use super::types::{QUALITY_MARKER, SECURITY_MARKER, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
@@ -46,12 +46,6 @@ struct PublishSummary {
     comment_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct IssueCommentResponse {
-    id: u64,
-    html_url: String,
-}
-
 pub fn run_publish(
     repo: &str,
     pr_number: Option<u32>,
@@ -62,10 +56,9 @@ pub fn run_publish(
     json_output: bool,
 ) -> Result<u8, String> {
     ensure_gh_cli_ready()?;
-    let reviewer_id = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for metadata reviewer_id".to_string()
-    })?;
+
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let reviewer_id = resolve_reviewer_id(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
 
     let raw_body = std::fs::read_to_string(body_file)
@@ -79,7 +72,8 @@ pub fn run_publish(
         &head_sha,
         &reviewer_id,
     )?;
-    let response = create_issue_comment(&owner_repo, resolved_pr, &enriched_body)?;
+    let response =
+        github_projection::create_issue_comment(&owner_repo, resolved_pr, &enriched_body)?;
 
     let summary = PublishSummary {
         schema: PUBLISH_SCHEMA.to_string(),
@@ -92,6 +86,22 @@ pub fn run_publish(
         comment_id: response.id,
         comment_url: response.html_url,
     };
+
+    let _ = projection_store::save_trusted_reviewer_id(&owner_repo, resolved_pr, &reviewer_id);
+    let _ = projection_store::save_identity_with_context(
+        &owner_repo,
+        resolved_pr,
+        &summary.head_sha,
+        "publish",
+    );
+    let _ = projection_store::upsert_issue_comment_cache_entry(
+        &owner_repo,
+        resolved_pr,
+        summary.comment_id,
+        &summary.comment_url,
+        &enriched_body,
+        &reviewer_id,
+    );
 
     if json_output {
         println!(
@@ -118,49 +128,61 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         validate_expected_head_sha(value)?;
         return Ok(value.to_ascii_lowercase());
     }
+
+    if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "publish.resolve_head_sha",
+        ));
+    }
+
     let value = fetch_pr_head_sha(owner_repo, pr_number)?;
     validate_expected_head_sha(&value)?;
-    Ok(value.to_ascii_lowercase())
+    let value = value.to_ascii_lowercase();
+    let _ =
+        projection_store::record_fallback_read(owner_repo, pr_number, "publish.resolve_head_sha");
+    let _ = projection_store::save_identity_with_context(
+        owner_repo,
+        pr_number,
+        &value,
+        "gh-fallback:publish.resolve_head_sha",
+    );
+    Ok(value)
 }
 
-fn create_issue_comment(
+fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    if let Some(cached) = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)? {
+        return Ok(cached);
+    }
+
+    if !projection_store::gh_read_fallback_enabled() {
+        return Err(projection_store::gh_read_fallback_disabled_error(
+            "publish.resolve_reviewer_id",
+        ));
+    }
+
+    let reviewer_id = resolve_authenticated_gh_login().ok_or_else(|| {
+        "failed to resolve authenticated GitHub login for metadata reviewer_id".to_string()
+    })?;
+    let _ = projection_store::record_fallback_read(
+        owner_repo,
+        pr_number,
+        "publish.resolve_reviewer_id",
+    );
+    let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &reviewer_id);
+    Ok(reviewer_id)
+}
+
+pub(super) fn create_issue_comment(
     owner_repo: &str,
     pr_number: u32,
     body: &str,
 ) -> Result<IssueCommentResponse, String> {
-    let mut payload_file = tempfile::NamedTempFile::new()
-        .map_err(|err| format!("failed to create temp payload for publish comment: {err}"))?;
-    let payload = serde_json::json!({ "body": body });
-    let payload_text = serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize comment payload: {err}"))?;
-    payload_file
-        .write_all(payload_text.as_bytes())
-        .map_err(|err| format!("failed to write comment payload: {err}"))?;
-    payload_file
-        .flush()
-        .map_err(|err| format!("failed to flush comment payload: {err}"))?;
-
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &endpoint,
-            "--method",
-            "POST",
-            "--input",
-            &payload_file.path().display().to_string(),
-        ])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for review publish comment: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh api failed creating review comment: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    serde_json::from_slice::<IssueCommentResponse>(&output.stdout)
-        .map_err(|err| format!("failed to parse issue comment response: {err}"))
+    github_projection::create_issue_comment(owner_repo, pr_number, body)
 }
 
 #[cfg(test)]

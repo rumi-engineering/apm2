@@ -22,12 +22,11 @@ variables:
   PR_SCOPE_OPTIONAL: "$1"
 
 notes:
-  - "Discovery-first policy: run the START-node help checklist (`fac`, `pr`, `pr auth-check`, `review`, `review status`, `review project`, `review tail`, `logs`, `gates`, `push`, `restart`) before execution."
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, enables auto-merge, and starts an async FAC pipeline."
   - "Use `apm2 fac gates --quick` for implementor short-loop checks and `apm2 fac gates` for full pre-push verification. Full results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
-  - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
-  - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
-  - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
+  - "Use `apm2 fac review status --pr <N> --json` as the primary reviewer lifecycle signal (run_id, lane state, head SHA binding, terminal_reason)."
+  - "Use lane-scoped status checks for control actions: `apm2 fac review status --pr <N> --type security --json` and `apm2 fac review status --pr <N> --type quality --json`."
+  - "Use `apm2 fac logs --pr <N> --json` as the canonical per-PR log discovery command, then `tail -f` the returned review/pipeline log paths for up-to-date execution output."
   - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces, including findings retrieval via `apm2 fac review findings --pr <N> --json`."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
 
@@ -72,10 +71,11 @@ runtime_review_protocol:
   manual_restart: "apm2 fac restart --pr <PR_NUMBER> (use ONLY when auto-dispatch has failed or for recovery)"
   recovery_entrypoint: "apm2 fac restart --pr <PR_NUMBER>"
   monitoring:
-    primary: "apm2 fac review project --pr <PR_NUMBER> --emit-errors (1Hz projection of review + CI gate states)"
-    secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state and run_id/SHA binding)"
-    log_discovery: "apm2 fac logs --pr <PR_NUMBER> (lists all local log files for evidence gates, pipeline runs, review dispatch, and events)"
-    liveness_check: "If no review progress appears for ~120s after push, run `apm2 fac review project --pr <PR_NUMBER> --emit-errors`, then `apm2 fac review status --pr <PR_NUMBER>`, then `apm2 fac logs --pr <PR_NUMBER>`."
+    primary: "apm2 fac review status --pr <PR_NUMBER> --json (authoritative reviewer lifecycle snapshot: security/quality state, run_id, sequence, terminal_reason, SHA binding)"
+    lane_health: "apm2 fac review status --pr <PR_NUMBER> --type <security|quality> --json (best lane-level signal for kill/revive decisions)"
+    log_discovery: "apm2 fac logs --pr <PR_NUMBER> --json (canonical per-PR log path inventory for evidence gates, pipeline, and review runs)"
+    live_logs: "Use `tail -f` on paths returned by `apm2 fac logs --pr <PR_NUMBER> --json` to monitor live reviewer output."
+    liveness_check: "If no review progress appears for ~120s after push, run lane-scoped status for both lanes, then refresh log paths with `apm2 fac logs --pr <PR_NUMBER> --json` and tail the active run logs."
     liveness_recovery: "If processes are stalled/dead or review state is ambiguous, run `apm2 fac restart --pr <PR_NUMBER>`."
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
     findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
@@ -89,8 +89,7 @@ runtime_review_protocol:
   required_semantics:
     - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
-    - "Projection snapshots are emitted via `apm2 fac review project` for 1Hz GitHub-style status rendering."
-    - "Treat FAC projection output as reviewer-lifecycle source of truth; GitHub remains a projection surface."
+    - "Treat `apm2 fac review status` + per-PR logs from `apm2 fac logs --pr <PR_NUMBER>` as the reviewer-lifecycle source of truth; GitHub remains a projection surface."
     - "Mid-review SHA movement uses kill+resume flow with backend-native session resume."
     - "Stalls and crashes emit structured events and trigger bounded model fallback."
 
@@ -117,7 +116,7 @@ decision_tree:
             (3) `apm2 fac pr auth-check --help`
             (4) `apm2 fac review --help`
             (5) `apm2 fac review status --help`
-            (6) `apm2 fac review project --help`
+            (6) `apm2 fac review findings --help`
             (7) `apm2 fac review tail --help`
             (8) `apm2 fac logs --help`
             (9) `apm2 fac gates --help`
@@ -136,7 +135,7 @@ decision_tree:
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
       steps[5]:
         - id: SNAPSHOT
-          action: "Capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use fac_logs and fac_review_tail for diagnosis context."
+          action: "Capture per-PR fac_review_status (including lane-scoped status) as the primary lifecycle signal; use fac_logs and fac_review_tail for diagnosis context."
         - id: COLLECT_FINDINGS_FROM_FAC
           action: |
             For each PR, fetch structured findings via FAC:
@@ -169,7 +168,9 @@ decision_tree:
         - id: REVIEW_MONITOR_ACTION
           action: |
             For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
-            Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac review project --pr <N> --emit-errors`.
+            Do NOT manually dispatch reviews. Instead, monitor with lane-scoped
+            `apm2 fac review status --pr <N> --type <security|quality> --json`
+            and per-PR logs from `apm2 fac logs --pr <N> --json`.
             If reviews have not started within 2 minutes of the push, use `apm2 fac restart --pr <PR_NUMBER>` as recovery.
         - id: FIX_AGENT_ACTION
           action: |
@@ -178,7 +179,7 @@ decision_tree:
             Inject @documents/skills/implementor-default/SKILL.md in its context.
             Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
         - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run fac_review_status + fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
+          action: "For PRs with active reviews, run fac_review_status (both lane-scoped and aggregate) and refresh/tail per-PR logs from fac_logs; the Forge Admission Cycle workflow remains the GitHub projection path."
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE
@@ -272,9 +273,9 @@ decision_tree:
         - id: GATE_RULE
           action: |
             READY_TO_MERGE iff all are true on current HEAD SHA:
-            (1) `apm2 fac review project --pr <PR_NUMBER> --emit-errors` reports terminal pass state,
-            (2) no FAC projection error lines indicate CI/review failure,
-            (3) PR is still observed in FAC lifecycle projections.
+            (1) `apm2 fac review status --pr <PR_NUMBER> --type security --json` reports terminal non-failed state bound to current head SHA,
+            (2) `apm2 fac review status --pr <PR_NUMBER> --type quality --json` reports terminal non-failed state bound to current head SHA,
+            (3) `apm2 fac review findings --pr <PR_NUMBER> --json` reports non-fail-closed, non-ERROR findings for current head SHA.
       next: HEARTBEAT_LOOP
 
     - id: STOP
