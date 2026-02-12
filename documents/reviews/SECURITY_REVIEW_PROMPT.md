@@ -18,7 +18,8 @@ metadata_contract:
     - '"pr_number" MUST match the prepared PR number exactly.'
     - "Set reviewed_sha = headRefOid."
 
-references[19]:
+references[27]:
+  # Core security and policy
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "Truth/projection model, containment, and verification laws."
   - path: "@AGENTS.md"
@@ -33,6 +34,8 @@ references[19]:
     purpose: "Network and interface threat matrix."
   - path: "@documents/skills/rust-standards/SKILL.md"
     purpose: "Rust correctness and safety standards."
+
+  # Original rust-standards references (6)
   - path: "@documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md"
     purpose: "Unsafe/soundness obligations."
   - path: "@documents/skills/rust-standards/references/19_unsafe_rust_obligations.md"
@@ -54,13 +57,54 @@ references[19]:
   - path: "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md"
     purpose: "PCAC/AJC lifecycle integration checks for authority-bearing handlers."
 
+  # NEW CRITICAL ADDITIONS: Foundational and Boundary Security (17)
+  - path: "@documents/skills/rust-standards/references/01_contract_and_truth.md"
+    purpose: "Primitive soundness invariants: type validity, initialization, pointer provenance, aliasing."
+  - path: "@documents/skills/rust-standards/references/03_compilation_pipeline.md"
+    purpose: "Macro expansion security, hidden unsafe, cfg-dependent code drift, dark code testing."
+  - path: "@documents/skills/rust-standards/references/05_toolchain_cargo_build.md"
+    purpose: "Build-time code execution, supply chain injection, feature safety, reproducibility."
+  - path: "@documents/skills/rust-standards/references/09_ownership_borrowing_model.md"
+    purpose: "Ownership authority, interior mutability protocols, reference invalidation, synchronization."
+  - path: "@documents/skills/rust-standards/references/11_lifetimes_variance_hrtb.md"
+    purpose: "Type variance, PhantomData correctness, auto-trait safety, dropck integrity."
+  - path: "@documents/skills/rust-standards/references/13_traits_generics_coherence.md"
+    purpose: "Trait coherence, blanket impl safety, auto-trait observability, downstream breakage."
+  - path: "@documents/skills/rust-standards/references/14_allocator_arena_pool_review.md"
+    purpose: "Allocator invariants: use-after-free, double-free, alignment, drop discipline, overflow."
+  - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
+    purpose: "Panic-as-DoS, panic safety for unsafe, unwind boundaries, cascading failures."
+  - path: "@documents/skills/rust-standards/references/17_layout_repr_drop.md"
+    purpose: "Layout contracts, repr safety, drop ordering, partial initialization, resource guards."
+  - path: "@documents/skills/rust-standards/references/25_api_design_stdlib_quality.md"
+    purpose: "API safety and misuse resistance, invariant clarity, hidden DoS vectors, allocation contracts."
+  - path: "@documents/skills/rust-standards/references/27_collections_allocation_models.md"
+    purpose: "Memory DoS prevention, use-after-realloc, size math overflow, bounded stores, iteration."
+  - path: "@documents/skills/rust-standards/references/29_unicode_text_graphemes.md"
+    purpose: "Text security: UTF-8 validity, confusable normalization, identifier confusion attacks."
+  - path: "@documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md"
+    purpose: "Verification methodology and tool gates: Miri, Loom, Proptest, Kani for risk anchors."
+  - path: "@documents/skills/rust-standards/references/35_cfg_features_build_matrix.md"
+    purpose: "Dark code coverage, build matrix enforcement, feature-gated security gaps, fail-closed flags."
+  - path: "@documents/skills/rust-standards/references/38_ffi_and_abi.md"
+    purpose: "FFI safety, ABI unwinding boundaries, ownership transfer, pointer validity, safe wrappers."
+  - path: "@documents/skills/rust-standards/references/40_time_monotonicity_determinism.md"
+    purpose: "Monotonic clocks, ordering invariants, consensus safety, distributed timeout protocols."
+  - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
+    purpose: "APM2 security contracts: typed IDs, secret redaction, state machines, atomic writes, identity boundaries, fail-closed defaults."
+  - path: "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md"
+    purpose: "PCAC/AJC authority lifecycle for privileged handlers: 4-step lifecycle, 7 semantic laws, security reviewer checklist for replay/revocation prevention."
+
 decision_tree:
   entrypoint: STEP_1_DISCOVERY
   nodes[8]:
     - id: STEP_1_DISCOVERY
-      purpose: "Discover FAC command surface before execution."
-      steps[7]:
-        - action: "Read all files listed in references before proceeding."
+      purpose: "Discover FAC command surface and internalize all reference material before execution."
+      steps[8]:
+        - action: read_all_references
+          rule: "Read every file listed in the references[] section IN FULL. Do not summarize, skip, or skim — details matter. Each reference contains threat vectors, invariants, checklists, and anti-patterns that are load-bearing for security review accuracy. Incomplete internalization produces false negatives."
+        - action: read_module_agents
+          rule: "For each crate/module touched by the PR diff, read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] whose violation constitutes a security finding."
         - action: command
           run: "apm2 fac review --help"
         - action: command

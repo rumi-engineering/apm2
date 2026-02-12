@@ -1,0 +1,44 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0027"
+  title: "Spine conformance suite: no-bypass, replay safety, tamper detection, fail-closed prerequisites, anti-rollback, downgrade resistance, bounded-work"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    A conformance test suite MUST exist that fails CI if any of the following
+    invariants from the Admission Spine v1.1 composition contract are violated:
+
+    - Any authoritative endpoint bypasses AdmissionKernel (no-bypass).
+    - Lifecycle ordering is violated.
+    - Consume can occur without durable persistence.
+    - Replay is possible across restart (PCAC-gated effects and declassification receipts).
+    - Enforcement tiers accept missing authoritative policy-root or missing witness commitments.
+    - Quarantine-mandated actions can be dropped or reservation is bypassed.
+    - Admission hot paths scan unbounded ledger history.
+    - Fail-closed tier flows release effect output (including streaming partials) before
+      post-effect boundary checks complete.
+    - Witness seed commitments can be supplied by client or altered post-join.
+    - AdmissionBundle digest cycles are introduced.
+    - Capability-gated effect surfaces can be invoked from outside AdmissionKernel.
+    - Fail-closed tiers run without a verified anti-rollback anchor.
+    - Enforcement tier or mode can be downgraded by client-controlled inputs.
+    - Cross-tenant/session identity confusion is possible.
+    - Rollback-to-earlier-seal passes when external anchor enforcement is active.
+    - Startup validation regresses to O(N) behavior.
+
+    Primary delivery ticket: TCK-00499.
+  rationale: |
+    Without enforced CI-blocking tests, the composition contract degrades to reviewer
+    convention. This suite replaces reviewer heroics with mechanical invariants.
+  acceptance_criteria:
+    - "CI fails on kernel bypass attempts."
+    - "CI fails on replay across restart."
+    - "CI fails if fail-closed tiers accept missing prerequisites."
+    - "CI fails if startup validation regresses to O(N) behavior."
+    - "CI fails if rollback is not denied when external anchor is enforced."
+    - "CI fails if downgrade-by-client is possible for effect-capable endpoints."
+  evidence_ids:
+    - "EVID-0022"
+  source_refs:
+    - "documents/rfcs/RFC-0019/19_admission_spine_v1_1_pcac_boundaries.md"

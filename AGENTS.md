@@ -43,67 +43,155 @@
       "purpose": "Index of all AGENTS.md files in the repository. Use this to locate domain-specific context for any area of the codebase.",
       "entries": [
         { "path": "AGENTS.md", "scope": "repo root — intent-based context router" },
-        { "path": "documents/AGENTS.md", "scope": "documents directory — naming conventions, directory structure" },
-        { "path": "documents/theory/AGENTS.md", "scope": "theory documents — unified-theory-v2" },
         { "path": "crates/apm2-cli/AGENTS.md", "scope": "apm2-cli crate" },
-        { "path": "crates/apm2-daemon/AGENTS.md", "scope": "apm2-daemon crate" },
-        { "path": "crates/apm2-holon/AGENTS.md", "scope": "apm2-holon crate — holon framework" },
+        { "path": "crates/apm2-cli/src/client/AGENTS.md", "scope": "cli client module — daemon communication via Unix domain sockets" },
+        { "path": "crates/apm2-cli/src/commands/AGENTS.md", "scope": "cli commands module — CLI subcommand implementations" },
+        { "path": "crates/apm2-cli/src/commands/fac_pr/AGENTS.md", "scope": "fac_pr module — GitHub App credential management and PR operations" },
+        { "path": "crates/apm2-cli/src/commands/fac_review/AGENTS.md", "scope": "fac_review module — FAC-first review orchestration with multi-model dispatch" },
+        { "path": "crates/apm2-cli/src/commands/factory/AGENTS.md", "scope": "factory module — AI-assisted code generation pipeline from PRD to tickets" },
+        { "path": "crates/apm2-core/AGENTS.md", "scope": "apm2-core crate — foundational types, event-sourced state, crypto, authority lifecycle" },
         { "path": "crates/apm2-core/src/adapter/AGENTS.md", "scope": "adapter module" },
+        { "path": "crates/apm2-core/src/adapter/seccomp/AGENTS.md", "scope": "seccomp module — syscall-level sandboxing via seccomp-BPF" },
         { "path": "crates/apm2-core/src/agent/AGENTS.md", "scope": "agent module" },
         { "path": "crates/apm2-core/src/bootstrap/AGENTS.md", "scope": "bootstrap module" },
         { "path": "crates/apm2-core/src/budget/AGENTS.md", "scope": "budget module" },
         { "path": "crates/apm2-core/src/cac/AGENTS.md", "scope": "cac module" },
+        { "path": "crates/apm2-core/src/capsule/AGENTS.md", "scope": "capsule module — agent process containment boundary (RFC-0020)" },
+        { "path": "crates/apm2-core/src/ccp/AGENTS.md", "scope": "ccp module — Canonical Context Pipeline" },
+        { "path": "crates/apm2-core/src/channel/AGENTS.md", "scope": "channel module — typed boundary channels" },
         { "path": "crates/apm2-core/src/config/AGENTS.md", "scope": "config module" },
         { "path": "crates/apm2-core/src/consensus/AGENTS.md", "scope": "consensus module" },
+        { "path": "crates/apm2-core/src/context/AGENTS.md", "scope": "context module — context resolution and firewall" },
+        { "path": "crates/apm2-core/src/coordination/AGENTS.md", "scope": "coordination module — agent coordination layer" },
         { "path": "crates/apm2-core/src/credentials/AGENTS.md", "scope": "credentials module" },
         { "path": "crates/apm2-core/src/crypto/AGENTS.md", "scope": "crypto module" },
         { "path": "crates/apm2-core/src/determinism/AGENTS.md", "scope": "determinism module" },
+        { "path": "crates/apm2-core/src/economics/AGENTS.md", "scope": "economics module — canonical economics profiles and budget admission (RFC-0029)" },
         { "path": "crates/apm2-core/src/events/AGENTS.md", "scope": "events module" },
         { "path": "crates/apm2-core/src/evidence/AGENTS.md", "scope": "evidence module" },
+        { "path": "crates/apm2-core/src/fac/AGENTS.md", "scope": "fac module — Forge Admission Cycle (RFC-0015, RFC-0019)" },
         { "path": "crates/apm2-core/src/github/AGENTS.md", "scope": "github module" },
         { "path": "crates/apm2-core/src/health/AGENTS.md", "scope": "health module" },
+        { "path": "crates/apm2-core/src/htf/AGENTS.md", "scope": "htf module — Holonic Time Fabric" },
         { "path": "crates/apm2-core/src/impact_map/AGENTS.md", "scope": "impact_map module" },
         { "path": "crates/apm2-core/src/lease/AGENTS.md", "scope": "lease module" },
         { "path": "crates/apm2-core/src/ledger/AGENTS.md", "scope": "ledger module" },
+        { "path": "crates/apm2-core/src/liveness/AGENTS.md", "scope": "liveness module — heartbeat receipts and restart policy (RFC-0020)" },
         { "path": "crates/apm2-core/src/log/AGENTS.md", "scope": "log module" },
+        { "path": "crates/apm2-core/src/model_router/AGENTS.md", "scope": "model_router module — multi-model routing with YAML profiles and canary mode" },
+        { "path": "crates/apm2-core/src/pcac/AGENTS.md", "scope": "pcac module — Proof-Carrying Authority Continuity (RFC-0027)" },
+        { "path": "crates/apm2-core/src/policy/AGENTS.md", "scope": "policy module — policy evaluation engine (RFC-0001)" },
         { "path": "crates/apm2-core/src/process/AGENTS.md", "scope": "process module" },
         { "path": "crates/apm2-core/src/reducer/AGENTS.md", "scope": "reducer module" },
+        { "path": "crates/apm2-core/src/refactor_radar/AGENTS.md", "scope": "refactor_radar module — codebase signal aggregation and maintenance recommendations" },
         { "path": "crates/apm2-core/src/restart/AGENTS.md", "scope": "restart module" },
+        { "path": "crates/apm2-core/src/rfc_framer/AGENTS.md", "scope": "rfc_framer module — RFC directory generation grounded in CCP artifacts" },
+        { "path": "crates/apm2-core/src/run_manifest/AGENTS.md", "scope": "run_manifest module — signed execution manifests for reproducibility auditing" },
         { "path": "crates/apm2-core/src/schema_registry/AGENTS.md", "scope": "schema_registry module" },
         { "path": "crates/apm2-core/src/session/AGENTS.md", "scope": "session module" },
         { "path": "crates/apm2-core/src/shutdown/AGENTS.md", "scope": "shutdown module" },
         { "path": "crates/apm2-core/src/state/AGENTS.md", "scope": "state module" },
         { "path": "crates/apm2-core/src/supervisor/AGENTS.md", "scope": "supervisor module" },
+        { "path": "crates/apm2-core/src/syscall/AGENTS.md", "scope": "syscall module — kernel syscall mediation (RFC-0001)" },
+        { "path": "crates/apm2-core/src/ticket_emitter/AGENTS.md", "scope": "ticket_emitter module — RFC decomposition into atomic ticket YAML files" },
         { "path": "crates/apm2-core/src/tool/AGENTS.md", "scope": "tool module" },
         { "path": "crates/apm2-core/src/webhook/AGENTS.md", "scope": "webhook module" },
-        { "path": "crates/apm2-core/src/work/AGENTS.md", "scope": "work module" }
+        { "path": "crates/apm2-core/src/work/AGENTS.md", "scope": "work module" },
+        { "path": "crates/apm2-daemon/AGENTS.md", "scope": "apm2-daemon crate" },
+        { "path": "crates/apm2-daemon/src/cas/AGENTS.md", "scope": "daemon cas module — filesystem-based content-addressed storage" },
+        { "path": "crates/apm2-daemon/src/episode/AGENTS.md", "scope": "daemon episode module — bounded execution episode runtime" },
+        { "path": "crates/apm2-daemon/src/evidence/AGENTS.md", "scope": "daemon evidence module — tool receipt generation and evidence binding" },
+        { "path": "crates/apm2-daemon/src/gate/AGENTS.md", "scope": "daemon gate module — gate execution orchestrator and merge executor" },
+        { "path": "crates/apm2-daemon/src/hmp/AGENTS.md", "scope": "daemon hmp module — Holonic Message Protocol digest-first channels" },
+        { "path": "crates/apm2-daemon/src/hsi_contract/AGENTS.md", "scope": "daemon hsi_contract module — HSI dispatch route inventory with deterministic hashing" },
+        { "path": "crates/apm2-daemon/src/htf/AGENTS.md", "scope": "daemon htf module — clock service for time envelope stamping" },
+        { "path": "crates/apm2-daemon/src/identity/AGENTS.md", "scope": "daemon identity module — canonical identity identifiers (RFC-0020)" },
+        { "path": "crates/apm2-daemon/src/pcac/AGENTS.md", "scope": "daemon pcac module — PCAC lifecycle gate for RequestTool authority" },
+        { "path": "crates/apm2-daemon/src/projection/AGENTS.md", "scope": "daemon projection module — write-only projection adapters for external systems" },
+        { "path": "crates/apm2-daemon/src/protocol/AGENTS.md", "scope": "daemon protocol module — Unix domain socket protocol stack" },
+        { "path": "crates/apm2-daemon/src/session/AGENTS.md", "scope": "daemon session module — episode session management with IPC auth" },
+        { "path": "crates/apm2-daemon/src/telemetry/AGENTS.md", "scope": "daemon telemetry module — cgroup-based resource telemetry collection" },
+        { "path": "crates/apm2-daemon/src/work/AGENTS.md", "scope": "daemon work module — work lifecycle authority with projection-backed status" },
+        { "path": "crates/apm2-holon/AGENTS.md", "scope": "apm2-holon crate — holon framework" },
+        { "path": "crates/apm2-holon/src/episode/AGENTS.md", "scope": "holon episode module — bounded episode execution controller" },
+        { "path": "crates/apm2-holon/src/ledger/AGENTS.md", "scope": "holon ledger module — append-only hash-chained event log" },
+        { "path": "crates/apm2-holon/src/orchestration/AGENTS.md", "scope": "holon orchestration module — FAC revision loop state machine" },
+        { "path": "crates/apm2-holon/src/resource/AGENTS.md", "scope": "holon resource module — multi-dimensional budget tracking and lease authorization" },
+        { "path": "documents/AGENTS.md", "scope": "documents directory — naming conventions, directory structure" },
+        { "path": "documents/theory/AGENTS.md", "scope": "theory documents — unified-theory-v2" },
+        { "path": "documents/work/tickets/AGENTS.md", "scope": "work tickets directory — RFC implementation decomposition tickets" }
       ]
     },
-    "major_rfc_context": {
-      "purpose": "High-signal index of major, recent system work so agents can pick the right RFC context quickly.",
-      "selection_policy": {
-        "implemented_definition": "RFC status == APPROVED in documents/rfcs/RFC-*/00_meta.yaml",
-        "recent_window_start": "2026-01-24",
-        "last_refreshed_date": "2026-02-06",
-        "fail_closed_rule": "If RFC status is missing or ambiguous, exclude it from recent_implemented."
+    "core_concepts": {
+      "context_as_code": {
+        "summary": "Compile what you can, discover only what you must.",
+        "definition": "Context-as-Code (CAC) is the principle that agent execution contexts are machine-checkable, deterministically reproducible artifacts (not prose or opaque state). Every context is content-addressed, versioned, and bound to specific execution episodes. Agents receive ContextPacks: sealed bundles of (CCP + Budget + Capabilities + Stop-Conditions) that determine exactly what an agent can see and do. This achieves the Zero-Tool Ideal: agents run with zero discovery phase, using only pre-compiled context.",
+        "key_principles": [
+          "Contexts are artifacts, not environment variables—reproducible and auditable",
+          "ContextPacks are content-addressed bundles: one execution = one deterministic context hash",
+          "Budget is part of context (tokens, tool-calls, wall-clock)—not a side constraint",
+          "Capabilities are explicitly granted; default-deny posture applies",
+          "Stop-conditions (goal reached, budget exhausted, blocked, escalated, error) are verifiable facts, not heuristics"
+        ],
+        "reference_rfc": "RFC-0011"
       },
-      "schema": "[Major_System, RFC_ids]",
-      "recent_implemented": [
-        ["Automated Forge Admission Cycle (FAC)", ["RFC-0019"]],
-        ["Holonic Event Fabric (HEF) Pulse Plane", ["RFC-0018"]],
-        ["Holonic Time Fabric (HTF)", ["RFC-0016"]],
-        ["Daemon Control Plane", ["RFC-0017"]],
-        ["Context-as-Code (CAC) Pipeline", ["RFC-0011"]],
-        ["Distributed Consensus + Replication Substrate", ["RFC-0014"]],
-        ["Agent Coordination Layer", ["RFC-0012"]],
-        ["Agent Acceptance Testing (AAT)", ["RFC-0004"]]
-      ],
-      "major_in_flight": [
-        ["Forge Admission Cycle (FAC) Gate Hardening Basis", ["RFC-0015"]],
-        ["Holonic Substrate Interface (HSI)", ["RFC-0020"]],
-        ["Venture Proving Holon Interface (VPHI)", ["RFC-0021"]]
-      ],
-      "read_hint": "If your task intersects a listed system, read its RFC folder before editing runtime, policy, security, or governance surfaces."
+      "holonic_hierarchy": {
+        "summary": "Recursion that scales from one box to 100B agent holarchies.",
+        "definition": "Holons are simultaneously wholes (autonomous agents) and parts (components in larger systems). This recursive composition means the same semantics—budgets, capabilities, boundaries, receipts—apply at every scale. A holon has internal structure (sub-holons), a boundary (typed channels), and invariants that compose through recursion depths.",
+        "key_principles": [
+          "One invariant architecture from single-agent to federated meshes",
+          "Boundaries are sealed: Markov blanket prevents data-plane leakage",
+          "Communication is typed and canonicalized before hashing/signing",
+          "Each recursion level has its own episode, lease, and budget"
+        ],
+        "reference_rfc": "RFC-0003"
+      },
+      "ledger_as_truth": {
+        "summary": "Truth is append-only; mutable state is derived.",
+        "definition": "The Ledger is the Topology of Truth: hash-chained, append-only, monotone. All authoritative facts (work decisions, policy, capability grants, evidence receipts) live in the ledger. Projections (views into the ledger) are disposable caches. Event-sourcing via deterministic reducers derives any mutable workspace state from ledger facts. Scale invariant: one box and global federation both use the same ledger append + reducer pipeline.",
+        "key_principles": [
+          "No retraction, no hidden state mutation—only appends",
+          "Projections are content-addressed and traceable to ledger facts",
+          "Reducers are deterministic; same events + reducer = same output",
+          "Consensus for control-plane (shared authority facts), convergence for data-plane (CRDTs)"
+        ],
+        "reference_rfcs": ["RFC-0014", "RFC-0016"]
+      },
+      "proof_admitted_gates": {
+        "summary": "Authority gated by machine-verifiable evidence receipts.",
+        "definition": "Every high-impact transition requires a receipt bundle signed by a gate. Gates are policy-indexed closures over evidence facts. Gates enforce the constraint hierarchy: Containment > Correctness > Liveness (S0 > S1 > S2). A fail at higher tiers is monotone—once failed, re-evaluation with more evidence cannot override the failure.",
+        "key_principles": [
+          "No transition without a gate receipt bound to evidence",
+          "Fail dominates verdict aggregation; missing evidence = fail or pending, never pass",
+          "High-risk gates (T2/T3) require uncertainty qualification and reverification paths",
+          "Tiered policy defines different gates for different risk levels and transition types"
+        ],
+        "reference_rfcs": ["RFC-0015", "RFC-0019"]
+      }
+    },
+    "major_rfc_context": {
+      "purpose": "Fundamental systems every agent must understand when working in this codebase.",
+      "last_refreshed_date": "2026-02-11",
+      "read_hint": "Before editing runtime, policy, security, or governance code, read the corresponding RFC folder (documents/rfcs/RFC-NNNN/).",
+      "rfcs": [
+        ["RFC-0001", "APM2 Kernel Architecture: Supervisor, Ledger, Policy, and Syscall Mediation"],
+        ["RFC-0003", "Holonic Coordination Framework"],
+        ["RFC-0004", "Agent Acceptance Testing (AAT) Implementation"],
+        ["RFC-0011", "Context-as-Code (CAC) v1: Canonical Context Pipeline for the APM2 Holonic Kernel"],
+        ["RFC-0012", "Agent Coordination Layer for Autonomous Work Loop Execution"],
+        ["RFC-0013", "APM2 Kernel Daemon and Holonic Runtime Protocol v1"],
+        ["RFC-0014", "Distributed Consensus and Replication Layer for APM2 Ledger+CAS Truth Substrate"],
+        ["RFC-0015", "Forge Admission Cycle (FAC) - Hardened Protocol with Cryptographic Gates and OCAP Containment"],
+        ["RFC-0016", "Holonic Time Fabric (HTF)"],
+        ["RFC-0017", "Daemon as Control Plane: xtask Demotion, Capability-Minted Episodes, Receipt-Backed Orchestration"],
+        ["RFC-0018", "Holonic Event Fabric (HEF) Phase 1 - Pulse Plane to Accelerate FAC"],
+        ["RFC-0019", "Automated FAC v0: End-to-end ingestion, review episode, durable receipt, GitHub projection"],
+        ["RFC-0020", "Holonic Substrate Interface (HSI)"],
+        ["RFC-0021", "Venture Proving Holon Interface (VPHI)"],
+        ["RFC-0027", "Proof-Carrying Authority Continuity (PCAC)"],
+        ["RFC-0028", "Holonic External I/O Security Profile over PCAC"],
+        ["RFC-0029", "Holonic External I/O Efficiency Profile over PCAC"]
+      ]
     },
     "routing_table": [
       {
@@ -138,7 +226,6 @@
         "precondition": "You know which crate(s) and module(s) you are working in.",
         "priority_reads": [
           "README.md",
-          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
         ],
         "supplementary_reads": [
           "DAEMON.md",
@@ -167,7 +254,6 @@
         "intent_name": "Testing and Quality Assurance",
         "precondition": "You know which crate or feature you are testing.",
         "priority_reads": [
-          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md",
           "documents/reviews/AAT_HYPOTHESIS_PROMPT.md",
           "crates/apm2-core/src/evidence/AGENTS.md"
         ],
@@ -212,7 +298,6 @@
         "precondition": "You have a PR URL or diff to review.",
         "priority_reads": [
           "documents/reviews/CODE_QUALITY_PROMPT.md",
-          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
         ],
         "supplementary_reads": [
           "documents/theory/unified-theory-v2.json",
@@ -304,7 +389,6 @@
         "intent_name": "CI/CD and Infrastructure",
         "precondition": "None.",
         "priority_reads": [
-          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md",
           ".github/workflows/ci.yml"
         ],
         "supplementary_reads": [
@@ -325,9 +409,7 @@
         "intent_id": "ticket_execution",
         "intent_name": "Working a Ticket",
         "precondition": "You have a ticket ID (e.g., TCK-00391).",
-        "priority_reads": [
-          "documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
-        ],
+        "priority_reads": [],
         "supplementary_reads": [
           "README.md",
           "documents/theory/unified-theory-v2.json"

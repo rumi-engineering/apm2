@@ -449,22 +449,6 @@ pub fn resolve_authenticated_gh_login() -> Option<String> {
     if login.is_empty() { None } else { Some(login) }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct MetadataSeverityCounts {
-    blocker: u64,
-    major: u64,
-    minor: u64,
-    nit: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeveritySection {
-    Blocker,
-    Major,
-    Minor,
-    Nit,
-}
-
 fn review_type_for_marker(marker: &str) -> Option<&'static str> {
     if marker == SECURITY_MARKER {
         Some("security")
@@ -486,83 +470,6 @@ fn comment_matches_review_dimension(body_lower: &str, review_type: &str) -> bool
     }
 }
 
-fn resolve_severity_heading(line: &str) -> Option<SeveritySection> {
-    let upper = line.to_ascii_uppercase();
-    if upper.contains("BLOCKER FINDINGS") {
-        return Some(SeveritySection::Blocker);
-    }
-    if upper.contains("MAJOR FINDINGS") {
-        return Some(SeveritySection::Major);
-    }
-    if upper.contains("MINOR FINDINGS") {
-        return Some(SeveritySection::Minor);
-    }
-    if upper.contains("NITS") || upper.contains("NIT FINDINGS") {
-        return Some(SeveritySection::Nit);
-    }
-    None
-}
-
-fn line_is_finding_item(line: &str) -> bool {
-    if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("Issue:") {
-        return true;
-    }
-
-    let mut chars = line.chars();
-    let mut digit_count = 0usize;
-    while let Some(ch) = chars.next() {
-        if ch.is_ascii_digit() {
-            digit_count += 1;
-            continue;
-        }
-        if ch == '.' && digit_count > 0 {
-            return !chars.as_str().trim().is_empty();
-        }
-        break;
-    }
-    false
-}
-
-fn count_findings_by_severity(body: &str) -> MetadataSeverityCounts {
-    let mut counts = MetadataSeverityCounts::default();
-    let mut current_section = None;
-
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("<!--") || trimmed.starts_with("```") {
-            continue;
-        }
-        if let Some(section) = resolve_severity_heading(trimmed) {
-            current_section = Some(section);
-            continue;
-        }
-        if !line_is_finding_item(trimmed) {
-            continue;
-        }
-
-        match current_section {
-            Some(SeveritySection::Blocker) => counts.blocker = counts.blocker.saturating_add(1),
-            Some(SeveritySection::Major) => counts.major = counts.major.saturating_add(1),
-            Some(SeveritySection::Minor) => counts.minor = counts.minor.saturating_add(1),
-            Some(SeveritySection::Nit) => counts.nit = counts.nit.saturating_add(1),
-            None => {},
-        }
-    }
-
-    counts
-}
-
-fn derive_verdict_from_body(body: &str, counts: MetadataSeverityCounts) -> String {
-    if let Some(value) = super::detection::extract_verdict_from_comment_body(body) {
-        return value;
-    }
-    if counts.blocker > 0 || counts.major > 0 {
-        "FAIL".to_string()
-    } else {
-        "PASS".to_string()
-    }
-}
-
 fn strip_existing_metadata_block(body: &str, marker: &str) -> String {
     let pattern = format!(r"(?s){}\s*```json.*?```", regex::escape(marker));
     let Ok(re) = regex::Regex::new(&pattern) else {
@@ -578,7 +485,6 @@ fn build_generated_metadata_block(
     head_sha: &str,
     reviewer_id: &str,
     verdict: &str,
-    counts: MetadataSeverityCounts,
 ) -> Result<String, String> {
     let payload = serde_json::json!({
         "schema": "apm2.review.metadata.v1",
@@ -586,12 +492,6 @@ fn build_generated_metadata_block(
         "pr_number": pr_number,
         "head_sha": head_sha,
         "verdict": verdict,
-        "severity_counts": {
-            "blocker": counts.blocker,
-            "major": counts.major,
-            "minor": counts.minor,
-            "nit": counts.nit,
-        },
         "reviewer_id": reviewer_id,
     });
     let json = serde_json::to_string_pretty(&payload)
@@ -608,8 +508,10 @@ pub(super) fn render_comment_with_generated_metadata(
     reviewer_id: &str,
 ) -> Result<String, String> {
     let stripped = strip_existing_metadata_block(body, marker);
-    let counts = count_findings_by_severity(&stripped);
-    let verdict = derive_verdict_from_body(&stripped, counts);
+    let verdict =
+        super::detection::extract_verdict_from_comment_body(&stripped).ok_or_else(|| {
+            "missing explicit review verdict (PASS|FAIL); set verdict before publishing".to_string()
+        })?;
     let metadata = build_generated_metadata_block(
         marker,
         review_type,
@@ -617,7 +519,6 @@ pub(super) fn render_comment_with_generated_metadata(
         head_sha,
         reviewer_id,
         &verdict,
-        counts,
     )?;
     let normalized = stripped.trim_end();
     if normalized.is_empty() {
@@ -788,10 +689,7 @@ pub fn confirm_review_posted_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MetadataSeverityCounts, count_findings_by_severity, derive_verdict_from_body,
-        render_comment_with_generated_metadata, review_type_for_marker,
-    };
+    use super::{render_comment_with_generated_metadata, review_type_for_marker};
     use crate::commands::fac_review::types::{QUALITY_MARKER, SECURITY_MARKER};
 
     #[test]
@@ -799,60 +697,6 @@ mod tests {
         assert_eq!(review_type_for_marker(SECURITY_MARKER), Some("security"));
         assert_eq!(review_type_for_marker(QUALITY_MARKER), Some("code-quality"));
         assert_eq!(review_type_for_marker("<!-- unknown -->"), None);
-    }
-
-    #[test]
-    fn count_findings_by_severity_extracts_expected_totals() {
-        let body = r"
-## Security Review: FAIL
-
-### **BLOCKER FINDINGS**
-1. Issue: one
-
-### **MAJOR FINDINGS**
-- two
-
-### **MINOR FINDINGS**
-* three
-
-### **NITS**
-1. four
-";
-        let counts = count_findings_by_severity(body);
-        assert_eq!(
-            counts,
-            MetadataSeverityCounts {
-                blocker: 1,
-                major: 1,
-                minor: 1,
-                nit: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn derive_verdict_falls_back_to_severity_counts() {
-        let pass = derive_verdict_from_body(
-            "no explicit verdict",
-            MetadataSeverityCounts {
-                blocker: 0,
-                major: 0,
-                minor: 2,
-                nit: 1,
-            },
-        );
-        assert_eq!(pass, "PASS");
-
-        let fail = derive_verdict_from_body(
-            "no explicit verdict",
-            MetadataSeverityCounts {
-                blocker: 0,
-                major: 1,
-                minor: 0,
-                nit: 0,
-            },
-        );
-        assert_eq!(fail, "FAIL");
     }
 
     #[test]
@@ -877,7 +721,26 @@ mod tests {
         assert!(rendered.contains("\"pr_number\": 587"));
         assert!(rendered.contains("\"head_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
         assert!(rendered.contains("\"reviewer_id\": \"fac-bot\""));
-        assert!(rendered.contains("\"minor\": 1"));
+        assert!(rendered.contains("\"verdict\": \"PASS\""));
+        assert!(!rendered.contains("\"severity_counts\""));
+    }
+
+    #[test]
+    fn render_comment_with_generated_metadata_requires_explicit_verdict() {
+        let body = r"
+### **MINOR FINDINGS**
+1. Improve this.
+";
+        let err = render_comment_with_generated_metadata(
+            body,
+            QUALITY_MARKER,
+            "code-quality",
+            587,
+            "0123456789abcdef0123456789abcdef01234567",
+            "fac-bot",
+        )
+        .expect_err("missing verdict should fail");
+        assert!(err.contains("missing explicit review verdict"));
     }
 
     #[test]
@@ -911,5 +774,37 @@ mod tests {
         assert!(rendered.contains("\"pr_number\": 441"));
         assert!(rendered.contains("\"reviewer_id\": \"new-reviewer\""));
         assert!(!rendered.contains("\"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+        assert!(!rendered.contains("\"severity_counts\""));
+    }
+
+    #[test]
+    fn render_comment_with_generated_metadata_uses_current_header_not_stale_metadata_verdict() {
+        let body = r#"
+## Security Review: PASS
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{
+  "schema": "apm2.review.metadata.v1",
+  "review_type": "security",
+  "pr_number": 1,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "verdict": "FAIL",
+  "reviewer_id": "old"
+}
+```
+"#;
+        let rendered = render_comment_with_generated_metadata(
+            body,
+            SECURITY_MARKER,
+            "security",
+            441,
+            "0123456789abcdef0123456789abcdef01234567",
+            "new-reviewer",
+        )
+        .expect("rendered");
+        assert!(rendered.contains("## Security Review: PASS"));
+        assert!(rendered.contains("\"verdict\": \"PASS\""));
+        assert!(!rendered.contains("\"verdict\": \"FAIL\""));
     }
 }

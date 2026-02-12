@@ -17,29 +17,41 @@ protocol:
 variables:
   IMPLEMENTATION_SCOPE_OPTIONAL: "$1"
 
-references[11]:
+references[16]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
-  - path: "@documents/reviews/FAC_LOCAL_GATE_RUNBOOK.md"
-    purpose: "Repository merge gate and verification expectations."
   - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
+
+  # Core standards
   - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
-    purpose: "RS-15: explicit error channels and no silent fallback."
+    purpose: "RS-15: explicit error channels and no silent fallback. CRITICAL DoS: RSK-0701 (panic-as-DoS)."
   - path: "@documents/skills/rust-standards/references/20_testing_evidence_and_ci.md"
     purpose: "RS-20: tests and evidence requirements for merge readiness."
+  - path: "@documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md"
+    purpose: "RS-21: atomic protocols, happens-before graphs, and RMW ordering. CRITICAL TOCTOU: CAS patterns, memory ordering."
   - path: "@documents/skills/rust-standards/references/31_io_protocol_boundaries.md"
-    purpose: "RS-31: protocol boundary contracts and trust handling."
+    purpose: "RS-31: protocol boundary contracts and trust handling. CRITICAL DoS: RSK-1601 (parsing DoS), CTR-1603 (bounded reads)."
   - path: "@documents/skills/rust-standards/references/34_security_adjacent_rust.md"
     purpose: "RS-34: crypto and security-adjacent correctness."
   - path: "@documents/skills/rust-standards/references/39_hazard_catalog_checklists.md"
-    purpose: "RS-39: hazard scan checklist for regressions."
+    purpose: "RS-39: hazard scan checklist for regressions. CRITICAL: RSK-2408/2409 (concurrency), RSK-2406 (panic surface)."
+  - path: "@documents/skills/rust-standards/references/40_time_monotonicity_determinism.md"
+    purpose: "RS-40: monotonic clocks, ordering hazards, staleness detection. CRITICAL DoS: INV-2501 (Instant not SystemTime), RSK-2504 (zero-interval guards). CRITICAL TOCTOU: tick/epoch staleness."
   - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
-    purpose: "RS-41: fail-closed, validated construction, and hash/canonicalization patterns."
+    purpose: "RS-41: fail-closed, validated construction, state machines. CRITICAL: CTR-2605 (state machines), CTR-2608 (retry backoff), RSK-2625 (unbounded channels)."
+
+  # Domain patterns and reference findings
+  - path: "@documents/skills/rust-standards/references/27_collections_allocation_models.md"
+    purpose: "RS-27: bounded collections and DoS prevention. CRITICAL: CTR-1303 (bounded stores), RSK-1302 (size math), CTR-1302 (query limits)."
+  - path: "@documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md"
+    purpose: "RS-32: verification tools for DoS-prone patterns (fuzzing, property tests). CRITICAL: RSK-1703 (parser fuzzing), CTR-1701 (verification plan)."
+  - path: "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md"
+    purpose: "RS-42: PCAC/AJC authority lifecycle (join→revalidate→consume→effect). MANDATORY for privileged handlers. CRITICAL: 7 semantic laws, reviewer checklist."
   - path: "@documents/skills/implementor-default/references/daemon-implementation-patterns.md"
-    purpose: "Daemon wiring and runtime invariants that commonly regress."
-  - path: "references/common-review-findings.md"
-    purpose: "Frequent BLOCKER/MAJOR patterns; inject into fix-agent context before coding."
+    purpose: "Daemon wiring and runtime invariants that commonly regress. CRITICAL: SQL patterns (no O(N) scans), atomicity protocols."
+  - path: "@documents/skills/implementor-default/references/common-review-findings.md"
+    purpose: "Frequent BLOCKER/MAJOR patterns from recent PRs. CRITICAL: § 3 (unbounded DoS), § 2 (stale TOCTOU), § 6 (containment)."
 
 decision_tree:
   entrypoint: START
@@ -48,12 +60,12 @@ decision_tree:
       purpose: "Initialize scope, collect authoritative context, and avoid ambient assumptions."
       steps[11]:
         - id: READ_REFERENCES
-          action: "read all files in references."
+          action: "read all files in references. Read them yourself and don't delegate summaries to a subagent. Details matter and it's not that much reading."
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables. Replace placeholders like <TICKET_ID>, <PR_NUMBER>, and <WORKTREE_PATH> before running commands."
         - id: DISCOVER_RELEVANT_FAC_HELP
           action: |
-            Discovery what the apm2 CLI can do for you. Run this help checklist:
+            Discovery what the apm2 CLI can do for you. Run these commands checklist:
             (1) `apm2 fac --help`
             (2) `apm2 fac gates --help`
             (3) `apm2 fac logs --help`
@@ -65,7 +77,7 @@ decision_tree:
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
-            Locate the ticket YAML at `documents/work/tickets/<TICKET_ID>.yaml` and read the full file. If a PR number was provided instead, extract the ticket ID from the branch name or PR description.
+            Locate the ticket YAML at `documents/work/tickets/$1.yaml` and read the full file. If a PR number was provided instead, extract the ticket ID from the branch name or PR description.
 
             Before proceeding, confirm: (1) ticket.status is OPEN, (2) all entries in dependencies.tickets are completed — read the reason field to understand each blocking relationship, (3) note custody.responsibility_domains — DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed review patterns.
 
@@ -107,8 +119,8 @@ decision_tree:
       next: PRE_EDIT_GATES
 
     - id: PRE_EDIT_GATES
-      purpose: "Apply 5-Whys-derived guardrails before modifying code."
-      steps[8]:
+      purpose: "Apply 5-Whys-derived guardrails before modifying code. Covers fail-closed defaults, DoS prevention, and TOCTOU atomicity."
+      steps[12]:
         - id: GATE_PRODUCTION_WIRING
           action: "If adding new builders, registries, or gates, verify all production constructor paths wire them; do not rely on test-only injection."
         - id: GATE_FAIL_CLOSED_DEFAULTS
@@ -117,27 +129,95 @@ decision_tree:
           action: "For signatures, digests, seals, or pointer receipts, validate authenticity and binding integrity, not just field shape."
         - id: GATE_MUTATION_ORDERING
           action: "Ensure admission checks execute before irreversible mutations unless an explicit two-phase protocol exists."
+        - id: GATE_TOCTOU_ATOMICITY
+          action: |
+            For any code pattern matching "check → decision → act on checked state", verify that checked state cannot become stale between check and act.
+            REJECT IF: permission checked then used without re-verification; quota checked then reserved non-atomically; state read outside lock then used as if valid; policy/capability read from store then applied without binding to read epoch.
+            REQUIRE: atomic operations (CAS loops, atomic types, database constraints, or explicit two-phase with idempotency).
+            Reference: RS-21 (atomics), RS-40 (staleness), RS-41 (state machines).
+        - id: GATE_SHARED_STATE_PROTOCOLS
+          action: |
+            Every shared mutable state (Mutex, RwLock, Atomic*, Cell, RefCell) MUST have explicit documented synchronization protocol.
+            Protocol must state: (1) what data is protected, (2) who can mutate and under what conditions, (3) lock/atomic ordering required, (4) happens-before edges, (5) async suspension invariants.
+            REJECT IF: interior mutability with no synchronization comment; lock/atomic use without clear ownership; panic-in-Drop of locked guard.
+            Reference: RS-21, RS-39.
+        - id: GATE_ASYNC_STATE_FRESHNESS
+          action: |
+            Async code depending on state machine transitions or monotonic values (tick/epoch/version) MUST NOT assume stale state is valid across `.await`.
+            REJECT IF: tick/epoch captured before `.await`, used after without re-validation; state machine state observed pre-await, decision made on stale assumption; leadership inferred pre-await, enforced post-await.
+            REQUIRE: critical gates re-fetch fresh state immediately before enforcement; staleness checks via HLC or explicit version binding; re-validation after suspension.
+            Reference: RS-40 (monotonicity), RS-21 (happens-before).
+        - id: GATE_DISTRIBUTED_STATE_CONSISTENCY
+          action: |
+            Multi-process or multi-thread code reading from persistent storage (ledger, files, DB) MUST ensure consistency between read epoch and enforcement epoch.
+            REJECT IF: ledger event read then enforced without provenance verification; file read then used without atomic/immutability proof; DB row read ignoring concurrent writers; policy cached without binding to resolver epoch; order assumptions without explicit causality.
+            REQUIRE: explicit consistency mechanism (immutability, atomic DB constraint, CAS loop); proof of who can write this state; reader holds lock/version for full decision scope.
+            Reference: RS-31, RS-40, RS-41.
         - id: GATE_NO_SYNTHETIC_CONSTANTS
           action: "Reject hardcoded runtime placeholders (ticks, attempts, verdicts, token counts) on production paths."
         - id: GATE_OPTIONAL_BYPASS
           action: "If gate dependencies are optional types, prove authoritative paths deny when dependency is missing and policy requires it."
         - id: GATE_HASH_PREIMAGE_FRAMING
           action: "For new commitments, include length/presence framing for variable fields and full normative-field coverage."
+        - id: GATE_RESOURCE_BOUNDS
+          action: |
+            Every in-memory collection (Vec, HashMap, HashSet, VecDeque, BTreeMap) tracking external events or input MUST have hard MAX_* constant and eviction strategy.
+            For EACH collection: (1) verify MAX_* constant exists at crate root, (2) verify overflow returns Err not truncation, (3) verify load/batch-insert enforce same cap, (4) verify concurrent writers cannot TOCTOU past cap.
+            AUTOMATIC REJECT IF UNCAPPED: query result collections, persisted state reload, cache stores, event ledgers, resource pools.
+            Reference: RS-27, common-review-findings.md § 3.
+        - id: GATE_PANIC_SURFACE_DOS
+          action: |
+            Verify no untrusted input can trigger panic via unwrap(), expect(), panic!(), indexing, or division.
+            For EACH unsafe/boundary path: (1) scan for panic sites, (2) confirm unreachable from untrusted input (proof required), (3) replace with fallible API (get(), checked math, Result).
+            AUTOMATIC REJECT: parse().unwrap() on external input; v[index] on untrusted index; str slicing by byte offset without UTF-8 check.
+            Reference: RS-15 (panic safety), RS-39 (hazards).
+        - id: GATE_UNBOUNDED_LOOPS_AND_TIMEOUTS
+          action: |
+            Verify loops, retries, and async operations have explicit termination guarantees.
+            For EACH loop/retry/spawn: (1) confirm max iteration count or break condition, (2) confirm timeout guards (Instant::elapsed < max_duration), (3) confirm exponential backoff with cap (e.g., max_delay=30s), (4) confirm circuit breaker if high failure rate.
+            AUTOMATIC REJECT: loops without MAX_ITERATIONS; retry loops without backoff; spawn loops without max concurrency; requests without timeout; recursive algorithms without depth limit.
+            Reference: RS-27, RS-40, RS-41.
+        - id: GATE_IO_BOUNDS_AND_PARSING
+          action: |
+            Verify I/O reads, allocations, and parsing cannot be exploited for memory exhaustion (memory DoS).
+            For EACH boundary read/parse: (1) never use .read_to_end(); use bounded loop, (2) confirm allocation size from length prefix WITH explicit cap checked BEFORE allocation, (3) confirm recursive parsing/JSON depth capped, (4) confirm string/bytes length validated before allocation.
+            AUTOMATIC REJECT: r.read_to_end() without size cap; vec.reserve(len) without len < MAX check; serde_json on untrusted bytes without size validation.
+            Reference: RS-31, RS-27.
         - id: GATE_E2E_COVERAGE
           action: "Require at least one test through production dispatch/runtime path for each high-risk change."
       next: IMPLEMENT
 
     - id: IMPLEMENT
-      purpose: "Execute the minimal change set while preserving boundary contracts."
-      steps[5]:
+      purpose: "Execute the minimal change set while preserving boundary contracts and preventing DoS/TOCTOU regressions."
+      steps[6]:
         - id: APPLY_PATCHES
           action: "Implement the smallest coherent patch satisfying requirement bindings and pre-edit gates."
         - id: ADD_REGRESSION_TESTS
-          action: "Add negative and positive tests for fixed defect classes (missing state, stale state, bypass attempts, replay/order hazards)."
+          action: |
+            Add negative and positive tests for fixed defect classes (missing state, stale state, bypass attempts, replay/order hazards, DoS, TOCTOU).
+
+            DoS test coverage (MANDATORY for resource-touching code):
+            - Collection bounds: MAX_SIZE + 1 bytes → Err not truncation; load() enforces same cap as insert()
+            - Panic surface: malformed/oversized input → Err not panic; no unwrap() on untrusted data
+            - Unbounded loops: loop exit after MAX_ITERATIONS; timeout after max_duration; exponential backoff with cap
+            - I/O bounds: oversized protocol frame → Err before allocation; .read_to_end() never on untrusted
+
+            TOCTOU/Race test coverage (MANDATORY for concurrent/async code):
+            - Check-then-act atomicity: concurrent quota requesters, verify only one succeeds, others denied
+            - State staleness: permission revoked between check and use → must deny second access
+            - Async state: tick/epoch changed during await → re-validation must deny stale assumption
+            - Distributed consistency: policy mutated during enforcement window → must use fresh policy not cached
         - id: VERIFY_ERROR_CHANNELS
           action: "Return structured errors for deny paths; avoid logging-and-continuing in authoritative control flow."
         - id: VERIFY_OBSERVABILITY
           action: "Ensure emitted receipts/events include enough fields to audit decisions (hashes, selectors, policy snapshot, reason codes)."
+        - id: VERIFY_DOS_SURFACE
+          action: |
+            Before finalizing, audit the change for DoS vectors:
+            - COLLECTIONS: grep Vec/HashMap/VecDeque; confirm MAX_* constant and eviction logic for each
+            - PANICS: grep unwrap/expect/panic/unreachable/v[; prove each unreachable from untrusted input or replace with Result
+            - LOOPS: confirm explicit MAX_ITERATIONS or break condition; timeout guards on long-running; exponential backoff with cap
+            - I/O: no .read_to_end() on untrusted; allocation size checked BEFORE reserve; protocol depth/recursion capped
       next: VERIFY_WITH_FAC
 
     - id: VERIFY_WITH_FAC
@@ -199,7 +279,7 @@ decision_tree:
         - id: DONE
           action: "output DONE and nothing else, your task is complete."
 
-invariants[9]:
+invariants[14]:
   - "Do not ship fail-open defaults for missing, stale, unknown, or unverifiable authority/security state."
   - "Do not rely on shape-only validation for trust decisions; validate authenticity and binding claims."
   - "Do not mutate durable or single-use state before all deny gates that can reject the operation."
@@ -209,3 +289,16 @@ invariants[9]:
   - "Do not claim hash/integrity guarantees without framed preimage and full-field coverage."
   - "Persist verifiable command and diff evidence in FAC artifacts; do not rely on narrative explanations."
   - "If a safety-critical requirement cannot be implemented safely in scope, stop and preserve blocker evidence in FAC artifacts."
+
+  # DoS Prevention Invariants
+  - "Every in-memory collection tracking unbounded external state MUST have hard MAX_* limits enforced on ALL write/load paths; overflow returns Err not truncation."
+  - "Untrusted input cannot cause panic (parse/index/unwrap/division); use Result types for all fallible operations at boundaries."
+  - "Loops, retries, and recursive algorithms MUST have explicit iteration/depth/time bounds; no indefinite spinning or exponential algorithms without cap."
+  - "I/O reads MUST be bounded by explicit size caps BEFORE allocation; never use unbounded .read_to_end() on untrusted streams."
+  - "Timeout logic uses monotonic Instant not wall-clock SystemTime; duration_since() uses checked_* variant; intervals guarded for zero before division."
+
+  # TOCTOU Prevention Invariants
+  - "If state machine state (tick, epoch, version, cursor) is read outside a lock, re-validate before enforcement; do not assume stale reads are truthful across await."
+  - "Cross-process reads from persistent storage (ledger, files, DB) require explicit provenance checks (signatures, version bindings, immutability proofs); do not assume read state is authoritative."
+  - "Non-atomic check-then-act sequences (quota reservation, resource allocation, permission enforcement) require atomic operations (CAS loops, atomic types, database constraints) or explicit idempotent two-phase."
+  - "Shared mutable state using interior mutability without an explicit documented synchronization protocol is a BLOCKER-level finding; every Mutex/RwLock/Atomic must have happens-before comment."

@@ -175,8 +175,7 @@ pub enum FacSubcommand {
     /// Push code and create/update PR (lean push).
     ///
     /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
-    /// enables auto-merge, spawns background evidence+review pipeline, and
-    /// exits immediately.
+    /// blocks on evidence gates, enables auto-merge, and dispatches reviews.
     Push(PushArgs),
 
     /// Restart the evidence/review pipeline from the optimal point.

@@ -1,0 +1,39 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0028"
+  title: "Ledger trust stack: RootTrustBundle, trusted seals, checkpoint-bounded startup, and governance-derived PolicyRootResolver"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Authoritative mode MUST treat the ledger as an HE-compatible append-only sequence with
+    canonical event digests and signature verification. The following MUST be implemented:
+
+    - RootTrustBundle loading with crypto-agile key dispatch (algorithm id + kid) for
+      ledger event signatures and governance/policy-root signatures.
+    - Trusted seal/checkpoint mechanism: seal event payload commits to LedgerAnchorV1
+      (ledger_id + hash + height + HT) and seal signature provenance chains to RootTrustBundle.
+    - Checkpoint-bounded startup validation from trusted seal to tip; max seal-to-tip
+      distance policy enforcement (fail closed or full-chain validation if exceeded).
+    - LedgerTrustVerifier interface returning ValidatedLedgerStateV1.
+    - PolicyRootResolver that derives PolicyRootStateV1 deterministically from governance-class
+      events up to a given LedgerAnchorV1, with caching bound to anchor + governance provenance.
+    - Fork/divergence detection: validated anchor must chain to tip.
+    - Key rotation/revocation semantics as-of anchor/epoch (no "always latest keyset" behavior).
+
+    If ledger integrity cannot be established, authoritative admission MUST deny.
+
+    Primary delivery ticket: TCK-00500.
+  rationale: |
+    PCAC's as_of_ledger_anchor is meaningful only if the ledger is tamper-evident and startup
+    validation is not bypassable. Without this, ledger trust is a paper promise.
+  acceptance_criteria:
+    - "Authoritative mode refuses startup or denies admission if ledger trust cannot be established."
+    - "PolicyRootResolver is governance-only and signature-verified."
+    - "Startup validation is checkpoint-bounded and fails closed when bounds are exceeded."
+    - "Tamper/fork tests exist and pass in CI."
+    - "Key rotation semantics are anchor/epoch correct and tested."
+  evidence_ids:
+    - "EVID-0023"
+  source_refs:
+    - "documents/rfcs/RFC-0019/19_admission_spine_v1_1_pcac_boundaries.md"

@@ -1,0 +1,20 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0019"
+  title: "Admission evidence closure: AdmissionBundleV1 sealing with no digest cycles"
+  category: "CODE_AND_TEST"
+  status: "STUB"
+  description: |
+    Evidence that AdmissionBundleV1 is sealed before receipt/event emission,
+    no digest cycles exist, and reverse-edge discovery is operational.
+  requirement_ids:
+    - "REQ-0024"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0024.yaml"
+  expected_contents:
+    - "AdmissionBundleV1 struct (bounded, deny_unknown_fields) with all normative fields."
+    - "CAS storage path for sealed bundles."
+    - "Sealing occurs before receipt/event emission in execute() flow."
+    - "Tests: digest cycle regression (bundle cannot reference receipt ids created after sealing)."
+    - "Tests: reverse-edge discovery (receipts carry bundle digest for O(1) correlation)."
+  artifacts: []

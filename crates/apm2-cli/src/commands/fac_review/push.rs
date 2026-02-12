@@ -1,8 +1,11 @@
-//! Lean `run_push` pipeline: git push → create/update PR → enable auto-merge.
+//! Lean `run_push` pipeline: git push → blocking gates → PR/update → dispatch.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::dispatch::dispatch_single_review;
+use super::evidence::{EvidenceGateResult, run_evidence_gates};
+use super::types::{DispatchReviewResult, ReviewKind};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
@@ -381,6 +384,71 @@ fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_evidence_gates_pass_with<F>(
+    workspace_root: &Path,
+    sha: &str,
+    mut run_gates_fn: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str) -> Result<(bool, Vec<EvidenceGateResult>), String>,
+{
+    let (passed, results) = run_gates_fn(workspace_root, sha)?;
+    if passed {
+        return Ok(());
+    }
+
+    let failed_gates = results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| result.gate_name.as_str())
+        .collect::<Vec<_>>();
+    let failed_summary = if failed_gates.is_empty() {
+        "unknown".to_string()
+    } else {
+        failed_gates.join(",")
+    };
+    Err(format!(
+        "evidence gates failed for sha={sha}; failing gates: {failed_summary}"
+    ))
+}
+
+fn run_blocking_evidence_gates(workspace_root: &Path, sha: &str) -> Result<(), String> {
+    ensure_evidence_gates_pass_with(workspace_root, sha, |root, head_sha| {
+        run_evidence_gates(root, head_sha, None, None)
+    })
+}
+
+fn dispatch_reviews_with<F>(
+    pr_url: &str,
+    repo: &str,
+    pr_number: u32,
+    sha: &str,
+    mut dispatch_fn: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    let dispatch_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    for kind in [ReviewKind::Security, ReviewKind::Quality] {
+        let result = dispatch_fn(pr_url, repo, pr_number, kind, sha, dispatch_epoch)
+            .map_err(|err| format!("failed to dispatch {} review: {err}", kind.as_str()))?;
+        eprintln!(
+            "fac push: dispatched {} review (mode={}{})",
+            result.review_type,
+            result.mode,
+            result
+                .pid
+                .map_or_else(String::new, |pid| format!(", pid={pid}")),
+        );
+    }
+
+    Ok(())
+}
+
 // ── run_push entry point ─────────────────────────────────────────────────────
 
 pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
@@ -468,7 +536,15 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         },
     }
 
-    // Step 2: create or update PR.
+    // Step 2: run evidence gates synchronously.
+    eprintln!("fac push: running evidence gates (blocking)");
+    if let Err(err) = run_blocking_evidence_gates(&worktree_dir, &sha) {
+        eprintln!("ERROR: {err}");
+        return exit_codes::GENERIC_ERROR;
+    }
+    eprintln!("fac push: evidence gates PASSED");
+
+    // Step 3: create or update PR.
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
         match create_pr(repo, &metadata.title, &metadata.body) {
@@ -490,127 +566,24 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         pr_number
     };
 
-    // Step 3: enable auto-merge.
+    // Step 4: enable auto-merge.
     if let Err(e) = enable_auto_merge(repo, pr_number) {
         eprintln!("WARNING: auto-merge enable failed: {e}");
     } else {
         eprintln!("fac push: auto-merge enabled on PR #{pr_number}");
     }
 
-    // Step 4: spawn background evidence+review pipeline.
+    // Step 5: dispatch reviews.
     let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
-    if let Err(e) = spawn_pipeline(repo, &pr_url, pr_number, &sha) {
-        eprintln!("WARNING: pipeline spawn failed: {e}");
+    if let Err(e) = dispatch_reviews_with(&pr_url, repo, pr_number, &sha, dispatch_single_review) {
+        eprintln!("ERROR: {e}");
         eprintln!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
+        return exit_codes::GENERIC_ERROR;
     }
 
-    let sha_short = &sha[..sha.len().min(8)];
     eprintln!("fac push: done (PR #{pr_number})");
-    eprintln!("  pipeline log: ~/.apm2/pipeline_logs/pr{pr_number}-{sha_short}.log");
-    eprintln!("  if pipeline fails: apm2 fac restart --pr {pr_number}");
+    eprintln!("  if review dispatch stalls: apm2 fac restart --pr {pr_number}");
     exit_codes::SUCCESS
-}
-
-// ── Background pipeline spawn ────────────────────────────────────────────────
-
-/// Spawn `apm2 fac pipeline` as a detached background process.
-fn spawn_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result<(), String> {
-    use std::fs::{self, OpenOptions};
-    use std::io::ErrorKind;
-
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("failed to resolve current executable: {e}"))?;
-    let cwd = std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
-
-    // Log to ~/.apm2/pipeline_logs/pr{N}-{sha_short}.log
-    let home = super::types::apm2_home_dir()?;
-    let log_dir = home.join("pipeline_logs");
-    fs::create_dir_all(&log_dir)
-        .map_err(|e| format!("failed to create pipeline log directory: {e}"))?;
-    let sha_short = &sha[..sha.len().min(8)];
-    let log_path = log_dir.join(format!("pr{pr_number}-{sha_short}.log"));
-
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("failed to open pipeline log {}: {e}", log_path.display()))?;
-    let stderr = stdout
-        .try_clone()
-        .map_err(|e| format!("failed to clone pipeline log handle: {e}"))?;
-
-    // Use `setsid` to detach from the caller's session so the pipeline
-    // survives shell teardown and can finish status/review projection updates.
-    let mut setsid_cmd = Command::new("setsid");
-    setsid_cmd
-        .arg(&exe_path)
-        .arg("fac")
-        .arg("pipeline")
-        .arg("--repo")
-        .arg(repo)
-        .arg("--pr-url")
-        .arg(pr_url)
-        .arg("--pr")
-        .arg(pr_number.to_string())
-        .arg("--sha")
-        .arg(sha)
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(stdout))
-        .stderr(std::process::Stdio::from(stderr));
-
-    let child = match setsid_cmd.spawn() {
-        Ok(child) => child,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            eprintln!(
-                "WARNING: `setsid` not available; falling back to non-detached pipeline spawn"
-            );
-
-            let stdout = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .map_err(|e| {
-                    format!("failed to reopen pipeline log {}: {e}", log_path.display())
-                })?;
-            let stderr = stdout
-                .try_clone()
-                .map_err(|e| format!("failed to clone pipeline log handle: {e}"))?;
-
-            Command::new(&exe_path)
-                .arg("fac")
-                .arg("pipeline")
-                .arg("--repo")
-                .arg(repo)
-                .arg("--pr-url")
-                .arg(pr_url)
-                .arg("--pr")
-                .arg(pr_number.to_string())
-                .arg("--sha")
-                .arg(sha)
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::from(stdout))
-                .stderr(std::process::Stdio::from(stderr))
-                .spawn()
-                .map_err(|e| format!("failed to spawn pipeline process: {e}"))?
-        },
-        Err(err) => {
-            return Err(format!(
-                "failed to spawn detached pipeline process with setsid: {err}"
-            ));
-        },
-    };
-
-    let pid = child.id();
-    // Drop child handle to detach — the process continues in background.
-    drop(child);
-
-    eprintln!(
-        "fac push: pipeline spawned (pid={pid}, log={})",
-        log_path.display()
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -871,5 +844,106 @@ mod tests {
         .expect_err("missing ticket should fail");
         assert!(err.contains("failed to read ticket body"));
         assert!(err.contains("TCK-00412.yaml"));
+    }
+
+    #[test]
+    fn ensure_evidence_gates_pass_with_accepts_pass_result() {
+        let result =
+            ensure_evidence_gates_pass_with(Path::new("/tmp"), "a".repeat(40).as_str(), |_, _| {
+                Ok((true, Vec::new()))
+            });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ensure_evidence_gates_pass_with_reports_failed_gate_names() {
+        let result =
+            ensure_evidence_gates_pass_with(Path::new("/tmp"), "b".repeat(40).as_str(), |_, _| {
+                Ok((
+                    false,
+                    vec![
+                        EvidenceGateResult {
+                            gate_name: "rustfmt".to_string(),
+                            passed: false,
+                            duration_secs: 1,
+                        },
+                        EvidenceGateResult {
+                            gate_name: "clippy".to_string(),
+                            passed: true,
+                            duration_secs: 2,
+                        },
+                        EvidenceGateResult {
+                            gate_name: "doc".to_string(),
+                            passed: false,
+                            duration_secs: 3,
+                        },
+                    ],
+                ))
+            })
+            .expect_err("expected failure");
+
+        assert!(result.contains("rustfmt"));
+        assert!(result.contains("doc"));
+        assert!(!result.contains("clippy"));
+    }
+
+    #[test]
+    fn dispatch_reviews_with_dispatches_security_then_quality() {
+        let mut dispatched = Vec::new();
+        let result = dispatch_reviews_with(
+            "https://github.com/guardian-intelligence/apm2/pull/42",
+            "guardian-intelligence/apm2",
+            42,
+            "a".repeat(40).as_str(),
+            |_, _, _, kind, _, _| {
+                dispatched.push(kind.as_str().to_string());
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode: "dispatched".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(dispatched, vec!["security", "quality"]);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_fails_closed_on_dispatch_error() {
+        let mut calls = 0usize;
+        let err = dispatch_reviews_with(
+            "https://github.com/guardian-intelligence/apm2/pull/42",
+            "guardian-intelligence/apm2",
+            42,
+            "b".repeat(40).as_str(),
+            |_, _, _, kind, _, _| {
+                calls += 1;
+                if kind == ReviewKind::Security {
+                    return Err("simulated failure".to_string());
+                }
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode: "dispatched".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+        )
+        .expect_err("expected dispatch failure");
+
+        assert!(err.contains("failed to dispatch security review"));
+        assert_eq!(calls, 1);
     }
 }

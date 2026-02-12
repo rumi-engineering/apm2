@@ -1,0 +1,35 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0025"
+  title: "RequestTool cutover: handler becomes thin wrapper over AdmissionKernel plan/execute"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    The RequestTool handler MUST be refactored to a thin wrapper over AdmissionKernel
+    plan/execute API with no direct broker/effect calls remaining.
+
+    The handler MUST only own: bounded decode, transport/session plumbing, observability
+    (metrics/logging), and translation between protocol structs and kernel request structs.
+
+    All authority-bearing side effects (tool/broker calls, mutations, outbound boundary
+    crossings, declassification emissions, quarantine insertions) MUST route through
+    AdmissionKernel.
+
+    For fail-closed tiers, no effect output (including streaming partials) MUST be released
+    before post-effect boundary checks complete.
+
+    Primary delivery ticket: TCK-00494.
+  rationale: |
+    RequestTool is the primary effect-capable endpoint. Until it routes through
+    AdmissionKernel, the no-bypass rule is incomplete and admission decisions are
+    scattered across handler code.
+  acceptance_criteria:
+    - "RequestTool handler contains no direct broker/effect invocations."
+    - "All authority consumption flows through AdmissionKernel plan/execute."
+    - "Fail-closed tiers buffer output until post-effect boundary checks complete."
+    - "Tests prove no-bypass for RequestTool endpoint."
+  evidence_ids:
+    - "EVID-0020"
+  source_refs:
+    - "documents/rfcs/RFC-0019/19_admission_spine_v1_1_pcac_boundaries.md"
