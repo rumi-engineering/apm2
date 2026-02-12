@@ -24,6 +24,7 @@ Production implementation of `QuarantineGuard`. Wraps an in-memory `QuarantineSt
 - [INV-QS02] Missing SQLite backend = deny all reservations.
 - [INV-QS03] Recovery loads persisted entries on construction.
 - [INV-QS04] All collections bounded by `MAX_*` constants.
+- [INV-QS05] `QuarantineGuard::reserve()` uses the caller-provided `session_id` for per-session quota isolation. No shared default session bucket exists.
 
 ### `QuarantineStore` (store.rs)
 
@@ -83,6 +84,8 @@ Four-level priority: `Low(0)`, `Normal(1)`, `High(2)`, `Critical(3)`.
 - BLAKE3 domain-separated reservation hashes (`apm2-quarantine-reservation-v1`).
 - HTF tick-based expiry (monotonic `Instant`, not wall clock `SystemTime`).
 - Bounded SQL queries prevent memory exhaustion from corrupted databases.
+- Quarantine DB files created with 0600 permissions (owner-only access).
+- Per-session quota isolation via caller-provided `session_id` (no shared default bucket).
 
 ## Related Modules
 

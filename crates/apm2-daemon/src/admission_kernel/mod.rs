@@ -77,12 +77,17 @@ use types::{
 pub trait QuarantineGuard: Send + Sync {
     /// Reserve quarantine capacity for the given request.
     ///
+    /// The `session_id` parameter identifies the requesting session for
+    /// per-session quota isolation. Without it, all requests share a
+    /// single quota bucket, enabling a single adversarial session to
+    /// exhaust global capacity (denial of service).
+    ///
     /// Returns a reservation hash proving capacity was reserved.
     ///
     /// # Errors
     ///
     /// Returns a reason string if capacity cannot be reserved.
-    fn reserve(&self, request_id: &Hash, ajc_id: &Hash) -> Result<Hash, String>;
+    fn reserve(&self, session_id: &str, request_id: &Hash, ajc_id: &Hash) -> Result<Hash, String>;
 }
 
 // =============================================================================
@@ -707,7 +712,11 @@ impl AdmissionKernelV1 {
         match &self.quarantine_guard {
             Some(guard) => {
                 let hash = guard
-                    .reserve(&plan.request.request_id, &plan.certificate.ajc_id)
+                    .reserve(
+                        &plan.request.session_id,
+                        &plan.request.request_id,
+                        &plan.certificate.ajc_id,
+                    )
                     .map_err(|reason| AdmitError::QuarantineReservationFailure { reason })?;
                 Ok(Some(hash))
             },

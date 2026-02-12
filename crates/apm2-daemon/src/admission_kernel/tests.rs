@@ -303,7 +303,12 @@ impl MockQuarantineGuard {
 }
 
 impl QuarantineGuard for MockQuarantineGuard {
-    fn reserve(&self, _request_id: &Hash, _ajc_id: &Hash) -> Result<Hash, String> {
+    fn reserve(
+        &self,
+        _session_id: &str,
+        _request_id: &Hash,
+        _ajc_id: &Hash,
+    ) -> Result<Hash, String> {
         self.result.clone()
     }
 }

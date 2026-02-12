@@ -22857,6 +22857,7 @@ mod tests {
             impl QuarantineGuard for PassingQuarantineGuard {
                 fn reserve(
                     &self,
+                    _session_id: &str,
                     _request_id: &apm2_core::crypto::Hash,
                     _ajc_id: &apm2_core::crypto::Hash,
                 ) -> Result<apm2_core::crypto::Hash, String> {

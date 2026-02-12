@@ -84,7 +84,7 @@ Trait interfaces for prerequisite resolution. Implementations provided by TCK-00
 
 ### `QuarantineGuard` (mod.rs)
 
-Trait for durable quarantine capacity reservation. Implemented by `DurableQuarantineGuard` in [`quarantine_store`](../quarantine_store/AGENTS.md) (TCK-00496).
+Trait for durable quarantine capacity reservation. Implemented by `DurableQuarantineGuard` in [`quarantine_store`](../quarantine_store/AGENTS.md) (TCK-00496). The `reserve()` method requires a `session_id` parameter for per-session quota isolation; the kernel passes `plan.request.session_id`.
 
 ### `EnforcementTier` (types.rs)
 

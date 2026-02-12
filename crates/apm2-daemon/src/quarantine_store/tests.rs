@@ -924,6 +924,24 @@ fn sqlite_load_bounded_by_max() {
     assert_eq!(loaded.len(), 10);
 }
 
+/// Regression test (SECURITY MINOR 1): quarantine database files must have
+/// 0600 permissions so other system users cannot read session metadata.
+#[cfg(unix)]
+#[test]
+fn sqlite_open_sets_restrictive_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = create_temp_db();
+    let _backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    let metadata = std::fs::metadata(tmp.path()).unwrap();
+    let mode = metadata.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "quarantine DB should have 0600 permissions, got {mode:o}"
+    );
+}
+
 // =============================================================================
 // Restart-Safe Persistence (DurableQuarantineGuard)
 // =============================================================================
@@ -1028,13 +1046,14 @@ fn guard_trait_reserve_succeeds() {
         .with_tick_provider(tick_provider)
         .with_default_ttl_ticks(1000);
 
-    let result = guard.reserve(&test_hash(1), &test_hash(2));
+    let result = guard.reserve("test-session", &test_hash(1), &test_hash(2));
     assert!(result.is_ok());
 
     let reservation_hash = result.unwrap();
     assert_ne!(reservation_hash, [0u8; 32]); // Non-zero reservation hash
 
     assert_eq!(guard.len(), 1);
+    assert_eq!(guard.session_count("test-session"), 1);
 
     let _ = tick;
 }
@@ -1058,13 +1077,77 @@ fn guard_trait_reserve_fails_when_saturated() {
         .with_default_priority(QuarantinePriority::Normal);
 
     // Fill to capacity
-    guard.reserve(&test_hash(1), &test_hash(11)).unwrap();
-    guard.reserve(&test_hash(2), &test_hash(12)).unwrap();
+    guard
+        .reserve("session-a", &test_hash(1), &test_hash(11))
+        .unwrap();
+    guard
+        .reserve("session-b", &test_hash(2), &test_hash(12))
+        .unwrap();
 
     // Third reservation should fail (all entries are same priority, unexpired)
-    let result = guard.reserve(&test_hash(3), &test_hash(13));
+    let result = guard.reserve("session-c", &test_hash(3), &test_hash(13));
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("saturated"));
+
+    let _ = tick;
+}
+
+/// Regression test: `session_id` through the trait interface isolates
+/// per-session quotas. Before the fix (SECURITY MAJOR 1), all trait-level calls
+/// used a hardcoded "kernel" `default_session_id`, so all sessions shared a
+/// single per-session quota of 64 instead of the global 4096.
+#[test]
+fn guard_trait_reserve_uses_provided_session_id_for_quota() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 16,
+        max_per_session_entries: 2,
+        max_tracked_sessions: 8,
+    };
+
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000)
+        .with_default_priority(QuarantinePriority::Normal);
+
+    // Session A fills its per-session quota of 2
+    guard
+        .reserve("session-a", &test_hash(1), &test_hash(11))
+        .unwrap();
+    guard
+        .reserve("session-a", &test_hash(2), &test_hash(12))
+        .unwrap();
+
+    // Session A cannot reserve more (quota = 2)
+    let result = guard.reserve("session-a", &test_hash(3), &test_hash(13));
+    assert!(result.is_err(), "session-a should be at quota");
+    assert!(
+        result.unwrap_err().contains("per-session quota"),
+        "error should mention per-session quota"
+    );
+
+    // Session B can still reserve (independent quota)
+    guard
+        .reserve("session-b", &test_hash(4), &test_hash(14))
+        .unwrap();
+    guard
+        .reserve("session-b", &test_hash(5), &test_hash(15))
+        .unwrap();
+
+    assert_eq!(guard.session_count("session-a"), 2);
+    assert_eq!(guard.session_count("session-b"), 2);
+    assert_eq!(guard.len(), 4);
+
+    // Session C can also reserve (proves quota isolation, not shared bucket)
+    guard
+        .reserve("session-c", &test_hash(6), &test_hash(16))
+        .unwrap();
+    assert_eq!(guard.session_count("session-c"), 1);
+    assert_eq!(guard.len(), 5);
 
     let _ = tick;
 }

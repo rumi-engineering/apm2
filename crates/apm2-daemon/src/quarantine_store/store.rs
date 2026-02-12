@@ -575,6 +575,24 @@ impl SqliteQuarantineBackend {
                 ),
             }
         })?;
+
+        // Restrict file permissions to owner-only (0600) for daemon state
+        // files. Default permissions (0644) would allow other users on the
+        // system to read quarantine state, which may leak session metadata.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "failed to set permissions on quarantine database at {}: {e}",
+                        path.display()
+                    ),
+                }
+            })?;
+        }
+
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| QuarantineStoreError::PersistenceError {
                 reason: format!("failed to set WAL mode: {e}"),
@@ -825,10 +843,6 @@ pub struct DurableQuarantineGuard {
     inner: Mutex<QuarantineStore>,
     /// `SQLite` persistence backend.
     backend: SqliteQuarantineBackend,
-    /// Default `session_id` used when the guard is invoked without session
-    /// context (the `QuarantineGuard` trait only provides `request_id` and
-    /// `ajc_id`).
-    default_session_id: String,
     /// Default priority for entries created via the trait interface.
     default_priority: QuarantinePriority,
     /// Default TTL in ticks for entry expiry.
@@ -841,7 +855,6 @@ pub struct DurableQuarantineGuard {
 impl std::fmt::Debug for DurableQuarantineGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DurableQuarantineGuard")
-            .field("default_session_id", &self.default_session_id)
             .field("default_priority", &self.default_priority)
             .field("default_ttl_ticks", &self.default_ttl_ticks)
             .finish_non_exhaustive()
@@ -882,18 +895,10 @@ impl DurableQuarantineGuard {
         Ok(Self {
             inner: Mutex::new(store),
             backend,
-            default_session_id: "kernel".to_string(),
             default_priority: QuarantinePriority::Normal,
             default_ttl_ticks: DEFAULT_TTL_TICKS,
             tick_provider: Box::new(default_tick_provider),
         })
-    }
-
-    /// Sets the default session ID for trait-level reservations.
-    #[must_use]
-    pub fn with_default_session_id(mut self, session_id: String) -> Self {
-        self.default_session_id = session_id;
-        self
     }
 
     /// Sets the default priority for trait-level reservations.
@@ -1064,7 +1069,7 @@ pub fn compute_reservation_hash(request_id: &Hash, bundle_digest: &Hash, tick: u
 // =============================================================================
 
 impl QuarantineGuard for DurableQuarantineGuard {
-    fn reserve(&self, request_id: &Hash, ajc_id: &Hash) -> Result<Hash, String> {
+    fn reserve(&self, session_id: &str, request_id: &Hash, ajc_id: &Hash) -> Result<Hash, String> {
         let current_tick = (self.tick_provider)();
         let expires_at_tick = current_tick.saturating_add(self.default_ttl_ticks);
         let reservation_hash = compute_reservation_hash(request_id, ajc_id, current_tick);
@@ -1076,7 +1081,7 @@ impl QuarantineGuard for DurableQuarantineGuard {
 
         let id = store
             .insert(
-                &self.default_session_id,
+                session_id,
                 self.default_priority,
                 *request_id,
                 *ajc_id,
