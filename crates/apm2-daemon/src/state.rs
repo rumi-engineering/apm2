@@ -1186,11 +1186,32 @@ impl DispatcherState {
                                 .as_bytes(),
                         };
 
-                        let admission_kernel =
-                            Arc::new(crate::admission_kernel::AdmissionKernelV1::new(
+                        // TCK-00502: Wire DurableAntiRollbackAnchor for fail-closed
+                        // external anchor verification. The anchor state file is
+                        // co-located alongside the PCAC consume index.
+                        let anti_rollback_state_path = {
+                            let parent = consume_log_path
+                                .parent()
+                                .unwrap_or(consume_log_path.as_path());
+                            parent.join("anti_rollback_anchor.json")
+                        };
+                        let anti_rollback_anchor = Arc::new(
+                            crate::admission_kernel::trust_stack::DurableAntiRollbackAnchor::new(
+                                anti_rollback_state_path,
+                                "file_anchor".to_string(),
+                            )
+                            .map_err(|e| {
+                                format!("failed to initialize anti-rollback anchor: {e}")
+                            })?,
+                        );
+
+                        let admission_kernel = Arc::new(
+                            crate::admission_kernel::AdmissionKernelV1::new(
                                 admission_pcac,
                                 witness_provider,
-                            ));
+                            )
+                            .with_anti_rollback(anti_rollback_anchor),
+                        );
                         session_dispatcher =
                             session_dispatcher.with_admission_kernel(admission_kernel);
                     }
@@ -1653,9 +1674,26 @@ impl DispatcherState {
                 })?,
             );
 
+            // TCK-00502: Wire DurableAntiRollbackAnchor for fail-closed
+            // external anchor verification. The anchor state file is
+            // co-located inside the CAS directory for per-instance isolation.
+            let anti_rollback_state_path = cas_path.as_ref().join("anti_rollback_anchor.json");
+            let anti_rollback_anchor = Arc::new(
+                crate::admission_kernel::trust_stack::DurableAntiRollbackAnchor::new(
+                    anti_rollback_state_path,
+                    "file_anchor".to_string(),
+                )
+                .map_err(|e| {
+                    crate::cas::DurableCasError::InitializationFailed {
+                        message: format!("failed to initialize anti-rollback anchor: {e}"),
+                    }
+                })?,
+            );
+
             let admission_kernel = Arc::new(
                 crate::admission_kernel::AdmissionKernelV1::new(admission_pcac, witness_provider)
-                    .with_quarantine_guard(quarantine_guard),
+                    .with_quarantine_guard(quarantine_guard)
+                    .with_anti_rollback(anti_rollback_anchor),
             );
             session_dispatcher = session_dispatcher.with_admission_kernel(admission_kernel);
         }

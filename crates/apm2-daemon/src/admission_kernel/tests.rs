@@ -4152,3 +4152,661 @@ fn test_tck_00497_monitor_waiver_json_round_trip() {
         "round-trip must preserve content hash"
     );
 }
+
+// =============================================================================
+// TCK-00502: Anti-rollback anchor provider tests
+// =============================================================================
+
+// ---- InMemoryAntiRollbackAnchor tests ----
+
+#[test]
+fn test_tck_00502_in_memory_anchor_latest_before_commit() {
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let result = anchor_provider.latest();
+    assert!(
+        result.is_err(),
+        "latest() before any commit must return error"
+    );
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorUnavailable { .. } => {},
+        other => panic!("expected ExternalAnchorUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_commit_and_latest() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    anchor_provider
+        .commit(&anchor)
+        .expect("commit must succeed");
+
+    let state = anchor_provider.latest().expect("latest must succeed");
+    assert_eq!(state.anchor, anchor);
+    assert_eq!(state.mechanism_id, "test_mechanism");
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_rollback_denied() {
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let anchor_high = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    anchor_provider
+        .commit(&anchor_high)
+        .expect("commit must succeed");
+
+    // Attempt rollback to lower height.
+    let anchor_low = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.commit(&anchor_low);
+    assert!(result.is_err(), "rollback commit must be denied");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(
+                reason.contains("regression"),
+                "error must mention regression: {reason}"
+            );
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_fork_denied() {
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let anchor_original = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    anchor_provider
+        .commit(&anchor_original)
+        .expect("commit must succeed");
+
+    // Attempt fork: same height, different hash.
+    let anchor_fork = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(99), // different hash
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.commit(&anchor_fork);
+    assert!(result.is_err(), "fork commit must be denied");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(reason.contains("fork"), "error must mention fork: {reason}");
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_rollback_detected() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed,
+    );
+
+    // Verify an anchor BEHIND the committed state -- rollback.
+    let anchor_behind = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.verify_committed(&anchor_behind);
+    assert!(
+        result.is_err(),
+        "verifying an anchor behind the committed state must fail"
+    );
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(
+                reason.contains("rollback"),
+                "error must mention rollback: {reason}"
+            );
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_fork_detected() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed,
+    );
+
+    // Verify an anchor at the same height but different hash -- fork.
+    let anchor_fork = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(99), // different hash
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.verify_committed(&anchor_fork);
+    assert!(result.is_err(), "verifying a forked anchor must fail");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(reason.contains("fork"), "error must mention fork: {reason}");
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_advance_accepted() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed,
+    );
+
+    // Verify an anchor AHEAD of the committed state -- accepted.
+    let anchor_ahead = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let result = anchor_provider.verify_committed(&anchor_ahead);
+    assert!(
+        result.is_ok(),
+        "verifying an anchor ahead of committed state must succeed"
+    );
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_same_height_same_hash() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed.clone(),
+    );
+
+    let result = anchor_provider.verify_committed(&anchor_committed);
+    assert!(
+        result.is_ok(),
+        "verifying the same anchor that was committed must succeed"
+    );
+}
+
+// ---- DurableAntiRollbackAnchor tests ----
+
+#[test]
+fn test_tck_00502_durable_anchor_new_file_not_exists() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor_provider =
+        super::trust_stack::DurableAntiRollbackAnchor::new(state_path, "file_anchor".to_string())
+            .expect("new must succeed when file does not exist");
+
+    // No committed state yet.
+    let result = anchor_provider.latest();
+    assert!(
+        result.is_err(),
+        "latest() before any commit must return error"
+    );
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_commit_and_reload() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    // Commit via first provider.
+    {
+        let provider = super::trust_stack::DurableAntiRollbackAnchor::new(
+            state_path.clone(),
+            "file_anchor".to_string(),
+        )
+        .expect("new must succeed");
+        provider.commit(&anchor).expect("commit must succeed");
+
+        let state = provider.latest().expect("latest must succeed");
+        assert_eq!(state.anchor, anchor);
+    }
+
+    // Reload via second provider (simulating daemon restart).
+    {
+        let provider = super::trust_stack::DurableAntiRollbackAnchor::new(
+            state_path,
+            "file_anchor".to_string(),
+        )
+        .expect("new must succeed with existing file");
+
+        let state = provider.latest().expect("latest must succeed after reload");
+        assert_eq!(state.anchor, anchor, "anchor must survive restart");
+        assert_eq!(state.mechanism_id, "file_anchor");
+    }
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_rollback_denied() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let provider =
+        super::trust_stack::DurableAntiRollbackAnchor::new(state_path, "file_anchor".to_string())
+            .expect("new must succeed");
+
+    let anchor_high = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+    provider
+        .commit(&anchor_high)
+        .expect("first commit must succeed");
+
+    // Attempt rollback.
+    let anchor_low = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = provider.commit(&anchor_low);
+    assert!(result.is_err(), "rollback must be denied");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(
+                reason.contains("regression"),
+                "error must mention regression: {reason}"
+            );
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_verify_committed_rollback() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let provider =
+        super::trust_stack::DurableAntiRollbackAnchor::new(state_path, "file_anchor".to_string())
+            .expect("new must succeed");
+    provider.commit(&anchor).expect("commit must succeed");
+
+    // Verify an anchor behind the committed state.
+    let anchor_behind = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = provider.verify_committed(&anchor_behind);
+    assert!(
+        result.is_err(),
+        "verifying a rollback anchor must be denied"
+    );
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_mechanism_id_mismatch() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    // Commit with mechanism "file_anchor".
+    {
+        let provider = super::trust_stack::DurableAntiRollbackAnchor::new(
+            state_path.clone(),
+            "file_anchor".to_string(),
+        )
+        .expect("new must succeed");
+        provider.commit(&anchor).expect("commit must succeed");
+    }
+
+    // Attempt reload with different mechanism ID.
+    let result = super::trust_stack::DurableAntiRollbackAnchor::new(
+        state_path,
+        "different_mechanism".to_string(),
+    );
+    assert!(
+        result.is_err(),
+        "reload with different mechanism_id must fail"
+    );
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_empty_mechanism_id_rejected() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let result = super::trust_stack::DurableAntiRollbackAnchor::new(state_path, String::new());
+    assert!(result.is_err(), "empty mechanism_id must be rejected");
+}
+
+// ---- Kernel integration tests for anti-rollback ----
+
+#[test]
+fn test_tck_00502_fail_closed_denies_without_anti_rollback_anchor() {
+    // Kernel without anti-rollback anchor wired.
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+    // Deliberately NOT setting anti-rollback.
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_err(),
+        "fail-closed tier must deny when anti-rollback anchor is missing"
+    );
+    match result.unwrap_err() {
+        AdmitError::MissingPrerequisite { prerequisite } => {
+            assert_eq!(
+                prerequisite, "AntiRollbackAnchor",
+                "must report AntiRollbackAnchor as missing"
+            );
+        },
+        other => panic!("expected MissingPrerequisite(AntiRollbackAnchor), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_monitor_tier_proceeds_without_anti_rollback() {
+    // Kernel without anti-rollback -- monitor tier should proceed.
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider());
+    // No prerequisites wired at all.
+
+    let request = valid_request(RiskTier::Tier0);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_ok(),
+        "monitor tier must proceed without anti-rollback anchor"
+    );
+}
+
+#[test]
+fn test_tck_00502_fail_closed_denies_on_anchor_mismatch() {
+    // Use a failing anti-rollback mock.
+    struct FailingAntiRollback;
+
+    impl AntiRollbackAnchor for FailingAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "test unavailable".into(),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorMismatch {
+                reason: "anchor mismatch (test)".into(),
+            })
+        }
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(FailingAntiRollback))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_err(),
+        "fail-closed tier must deny on anti-rollback mismatch"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("mismatch"),
+                "error must mention mismatch: {reason}"
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_fail_closed_denies_on_anchor_unavailable() {
+    // Anti-rollback anchor that is unavailable.
+    struct UnavailableAntiRollback;
+
+    impl AntiRollbackAnchor for UnavailableAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "external service down".into(),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "external service down".into(),
+            })
+        }
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(UnavailableAntiRollback))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_err(),
+        "fail-closed tier must deny when anti-rollback is unavailable"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("unavailable") || reason.contains("down"),
+                "error should describe unavailability: {reason}"
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_rollback_to_earlier_seal_denied_via_external_anchor() {
+    // This is the canonical REQ-0030 acceptance criterion test:
+    // A rollback that would pass purely local seal verification is denied
+    // by the external anchor.
+
+    let committed_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 500,
+        he_time: 5000,
+    };
+
+    let external_anchor = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        committed_anchor,
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(external_anchor))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    // The ledger verifier returns an anchor at height 100, which is BEHIND
+    // the externally committed anchor at height 500. This simulates a
+    // rollback attack where the adversary rewrites local state.
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    // The MockLedgerVerifier returns an anchor at height 100, and the
+    // InMemoryAntiRollbackAnchor has committed state at height 500.
+    // verify_committed(height=100) < committed(height=500) -> deny.
+    assert!(
+        result.is_err(),
+        "rollback to earlier seal must be denied by external anchor"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("rollback") || reason.contains("behind"),
+                "error must indicate rollback detection: {reason}"
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_fully_wired_kernel_with_matching_anchor_succeeds() {
+    // External anchor at the same height as the ledger verifier.
+    let matching_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let external_anchor = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        matching_anchor,
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(external_anchor))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_ok(),
+        "fully wired kernel with matching external anchor must succeed: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_forward_progress_accepted() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    // Test that advancing the anchor (higher height) succeeds.
+    let provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let height_values: [u64; 5] = [100, 200, 300, 400, 500];
+    for height in height_values {
+        #[allow(clippy::cast_possible_truncation)] // test-only: height/100 fits in u8
+        let hash_byte = (height / 100) as u8;
+        let anchor = LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(hash_byte),
+            height,
+            he_time: height * 10,
+        };
+        provider
+            .commit(&anchor)
+            .unwrap_or_else(|e| panic!("commit at height {height} must succeed: {e:?}"));
+    }
+
+    let latest = provider.latest().expect("latest must succeed");
+    assert_eq!(latest.anchor.height, 500, "latest must be at height 500");
+}

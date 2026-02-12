@@ -114,9 +114,9 @@ Capability tokens with `pub(super)` constructors. Non-cloneable, non-copyable, `
 
 Trait interfaces for prerequisite resolution. Concrete implementations provided by the `trust_stack` submodule (TCK-00500).
 
-### `trust_stack` submodule (trust_stack/mod.rs, TCK-00500)
+### `trust_stack` submodule (trust_stack/mod.rs, TCK-00500, TCK-00502)
 
-Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prerequisite traits, plus supporting infrastructure:
+Concrete implementations of `LedgerTrustVerifier`, `PolicyRootResolver`, and `AntiRollbackAnchor` prerequisite traits, plus supporting infrastructure:
 
 - **`RootTrustBundle`**: Bounded trust anchor with crypto-agile key entries (algorithm ID + key ID + public key bytes). `deny_unknown_fields` serde, domain-separated BLAKE3 content hash. Max 64 keys (`MAX_TRUST_BUNDLE_KEYS`). Supports key rotation/revocation with `active_from_epoch` (inclusive) and `revoked_at_epoch` (exclusive).
 - **`TrustBundleKeyEntry`**: Individual key entry with epoch-aware `is_active_at()` validity check.
@@ -146,6 +146,18 @@ Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prere
 - [INV-TS15] Governance event truncation is fail-closed: if `read_governance_events` returns `>= MAX_GOVERNANCE_EVENTS_PER_DERIVATION` events, `derive_policy_root` returns `DerivationFailed` (no silent partial derivation).
 - [INV-TS16] `content_hash()` and `active_keyset_digest()` sort keys by `key_id` before hashing to ensure deterministic output regardless of vector insertion order.
 - [INV-TS17] `RootTrustBundle::validate()` enforces `schema_version == ROOT_TRUST_BUNDLE_SCHEMA_VERSION` as the first check. Unknown/future schema versions are rejected.
+- [INV-TS18] `DurableAntiRollbackAnchor` persists anchor state via atomic file write (temp + rename). File reads bounded by `MAX_ANCHOR_STATE_FILE_SIZE` (8 KiB).
+- [INV-TS19] Anti-rollback regression checks enforce: (a) height never decreases, (b) at same height, event hash must match (constant-time comparison). Violations return `ExternalAnchorMismatch`.
+- [INV-TS20] `mechanism_id` bounded by `MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH` (128). Empty mechanism IDs rejected at construction.
+- [INV-TS21] `PersistedAnchorStateV1` uses `deny_unknown_fields` serde and `schema_version` validation for forward-compatible deserialization.
+- [INV-TS22] `DurableAntiRollbackAnchor` proof hash uses domain-separated BLAKE3 with length-prefixed framing for all variable fields.
+- [INV-TS23] `InMemoryAntiRollbackAnchor` provides identical semantics to `DurableAntiRollbackAnchor` without file I/O (for testing).
+
+#### Anti-Rollback Anchor Providers (TCK-00502)
+
+- **`DurableAntiRollbackAnchor`**: File-backed production `AntiRollbackAnchor` implementation. Atomic write (temp + rename) for crash safety. Bounded file read (`MAX_ANCHOR_STATE_FILE_SIZE`). Schema-versioned JSON with `deny_unknown_fields`. `RwLock<Option<PersistedAnchorStateV1>>` synchronization (writers: `commit()`, readers: `latest()`/`verify_committed()`).
+- **`InMemoryAntiRollbackAnchor`**: In-memory test `AntiRollbackAnchor` implementation. Same regression/fork checks as `DurableAntiRollbackAnchor` without file persistence.
+- **`PersistedAnchorStateV1`**: Serialized anchor state with `schema_version`, `anchor` (`LedgerAnchorV1`), `mechanism_id`, and `proof_hash` (BLAKE3).
 
 ### `QuarantineGuard` (mod.rs)
 
@@ -219,7 +231,7 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 
 ## Related Modules
 
-- [`admission_kernel::trust_stack`](trust_stack/mod.rs) -- `ConcreteLedgerTrustVerifier`, `GovernancePolicyRootResolver`, `RootTrustBundle` (TCK-00500)
+- [`admission_kernel::trust_stack`](trust_stack/mod.rs) -- `ConcreteLedgerTrustVerifier`, `GovernancePolicyRootResolver`, `RootTrustBundle` (TCK-00500), `DurableAntiRollbackAnchor`, `InMemoryAntiRollbackAnchor` (TCK-00502)
 - [`apm2_daemon::quarantine_store`](../quarantine_store/AGENTS.md) -- `DurableQuarantineGuard` (TCK-00496)
 - [`apm2_daemon::pcac`](../pcac/AGENTS.md) -- PCAC lifecycle gate (`InProcessKernel`, `LifecycleGate`)
 - [`apm2_core::pcac`](../../../apm2-core/src/pcac/AGENTS.md) -- Core PCAC types (`AuthorityJoinKernel`, `RiskTier`, etc.)
@@ -247,4 +259,6 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 - TCK-00494: Implementation ticket (handler refactoring + kernel wiring)
 - TCK-00497: Implementation ticket (witness closure -- post-effect evidence, monitor waivers, boundary output gating)
 - TCK-00500: Implementation ticket (ledger trust stack -- RootTrustBundle, trusted seals, checkpoint-bounded startup, governance-derived PolicyRootResolver)
+- TCK-00502: Implementation ticket (anti-rollback anchoring -- DurableAntiRollbackAnchor, InMemoryAntiRollbackAnchor, production wiring, fail-closed tier gating)
 - REQ-0028: Ledger trust stack requirements
+- REQ-0030: Anti-rollback anchoring requirements
