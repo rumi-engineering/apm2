@@ -7,11 +7,19 @@
 //! - [`ProjectionSinkContinuityProfileV1`] per-sink-set scenario evaluation.
 //! - [`SinkIdentitySnapshotV1`] sink identity binding.
 //! - TP-EIO29-005 (`projection_multi_sink_continuity_valid`) enforcement.
-//! - TP-EIO29-001/003/004 continuity predicates for sink outage/churn/partition
-//!   scenarios.
+//! - TP-EIO29-004 deferred replay boundedness validation (when active).
 //! - Authoritative progression independence from projection sink state.
 //! - Fail closed on missing/stale/invalid temporal authority in continuity
 //!   decisions.
+//!
+//! # Predicate Coverage
+//!
+//! This module validates **TP-EIO29-004** (deferred replay boundedness) and
+//! **TP-EIO29-005** (projection multi-sink continuity). TP-EIO29-001 (time
+//! authority envelope validity) and TP-EIO29-003 (anti-entropy convergence
+//! horizon) are validated upstream in the admission pipeline by the temporal
+//! arbitration layer ([`crate::pcac::temporal_arbitration`]) before continuity
+//! evaluation is reached.
 //!
 //! # Security Domain
 //!
@@ -248,6 +256,16 @@ pub const DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED: &str =
 /// Deny: sink snapshot digest mismatch between profile and snapshot.
 pub const DENY_SINK_SNAPSHOT_DIGEST_MISMATCH: &str =
     "projection_sink_identity_snapshot_digest_mismatch";
+/// Deny: duplicate sink IDs in sink identity snapshot.
+pub const DENY_SINK_SNAPSHOT_DUPLICATE_SINK_IDS: &str =
+    "projection_sink_identity_snapshot_duplicate_sink_ids";
+/// Deny: insufficient distinct sinks for REQ-0009 multi-sink continuity
+/// (minimum 2).
+pub const DENY_SINK_SNAPSHOT_INSUFFICIENT_SINKS: &str =
+    "projection_sink_identity_snapshot_insufficient_sinks";
+/// Deny: replay horizon tick is outside the declared replay window bounds.
+pub const DENY_REPLAY_HORIZON_OUT_OF_WINDOW: &str =
+    "projection_deferred_replay_horizon_out_of_window";
 
 // ============================================================================
 // Bounded serde helpers (OOM-safe deserialization)
@@ -1120,6 +1138,15 @@ impl SinkIdentitySnapshotV1 {
 
     /// Validates structural invariants.
     ///
+    /// Enforces:
+    /// - Non-empty snapshot (at least 1 sink).
+    /// - At most [`MAX_SINK_IDENTITIES`] entries.
+    /// - Non-zero `snapshot_digest`.
+    /// - Each `sink_id` is non-empty, within length bounds, and unique.
+    /// - Each `identity_digest` is non-zero.
+    /// - At least 2 distinct sink IDs (REQ-0009 multi-sink continuity requires
+    ///   multiple sinks for meaningful outage/churn/partition scenarios).
+    ///
     /// # Errors
     ///
     /// Returns a stable deny reason for any structural violation.
@@ -1133,6 +1160,9 @@ impl SinkIdentitySnapshotV1 {
         if is_zero_hash(&self.snapshot_digest) {
             return Err(DENY_SINK_SNAPSHOT_DIGEST_ZERO);
         }
+
+        // Enforce unique sink IDs and validate each entry.
+        let mut seen_ids = std::collections::HashSet::with_capacity(self.sink_identities.len());
         for entry in &self.sink_identities {
             if entry.sink_id.is_empty() || entry.sink_id.len() > MAX_SINK_ID_LENGTH {
                 return Err(DENY_SINK_ID_INVALID);
@@ -1140,7 +1170,16 @@ impl SinkIdentitySnapshotV1 {
             if is_zero_hash(&entry.identity_digest) {
                 return Err(DENY_SINK_IDENTITY_DIGEST_ZERO);
             }
+            if !seen_ids.insert(&entry.sink_id) {
+                return Err(DENY_SINK_SNAPSHOT_DUPLICATE_SINK_IDS);
+            }
         }
+
+        // REQ-0009 multi-sink continuity requires at least 2 distinct sinks.
+        if seen_ids.len() < 2 {
+            return Err(DENY_SINK_SNAPSHOT_INSUFFICIENT_SINKS);
+        }
+
         Ok(())
     }
 }
@@ -1513,6 +1552,14 @@ pub struct DeferredReplayInput {
     pub expected_backlog_digest: Hash,
     /// Maximum allowed backlog items (retention envelope).
     pub max_backlog_items: u64,
+    /// Start tick of the declared replay window (lower bound for
+    /// `replay_horizon_tick`). Receipts with `replay_horizon_tick` below
+    /// this value are denied.
+    pub replay_window_start: u64,
+    /// End tick of the declared replay window (upper bound for
+    /// `replay_horizon_tick`). Receipts with `replay_horizon_tick` above
+    /// this value are denied.
+    pub replay_window_end: u64,
 }
 
 /// Typed mode for deferred replay evaluation.
@@ -1537,7 +1584,9 @@ pub enum DeferredReplayMode {
 /// 5. Receipt context binds to expected boundary, time authority, window.
 /// 6. Receipt backlog digest matches expected context.
 /// 7. Receipt replay converged idempotently.
-/// 8. Replayed item count does not exceed retention envelope.
+/// 8. Receipt `replay_horizon_tick` falls within declared replay window bounds
+///    (`replay_window_start..=replay_window_end`).
+/// 9. Replayed item count does not exceed retention envelope.
 ///
 /// # Errors
 ///
@@ -1609,6 +1658,13 @@ pub fn validate_deferred_replay_boundedness(
         // Convergence check.
         if !receipt.converged {
             return Err(DENY_DEFERRED_REPLAY_NOT_CONVERGED);
+        }
+
+        // Replay horizon tick must fall within declared replay window bounds.
+        if receipt.replay_horizon_tick < input.replay_window_start
+            || receipt.replay_horizon_tick > input.replay_window_end
+        {
+            return Err(DENY_REPLAY_HORIZON_OUT_OF_WINDOW);
         }
 
         // Hard cap: replayed_item_count must not exceed MAX_BACKLOG_ITEMS
@@ -1691,8 +1747,12 @@ impl ContinuityDecision {
 
 /// Evaluates projection continuity admission.
 ///
-/// Combines TP-EIO29-005 (multi-sink continuity) with deferred replay
-/// boundedness checks via [`DeferredReplayMode`].
+/// Combines TP-EIO29-005 (multi-sink continuity) with optional TP-EIO29-004
+/// (deferred replay boundedness) checks via [`DeferredReplayMode`].
+///
+/// **Note**: TP-EIO29-001 (time authority envelope validity) and TP-EIO29-003
+/// (anti-entropy convergence horizon) are validated upstream in the temporal
+/// arbitration layer and are not re-evaluated here.
 ///
 /// # Arguments
 ///
@@ -2428,6 +2488,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2443,6 +2505,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2463,6 +2527,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2485,6 +2551,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "wrong-boundary");
@@ -2526,6 +2594,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2558,6 +2628,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 100, // below replayed count
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2578,6 +2650,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2600,6 +2674,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2622,6 +2698,8 @@ mod tests {
             expected_window_ref: test_hash(0x99), // mismatch
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2644,6 +2722,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0x99), // mismatch
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -2702,6 +2782,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         });
 
         let decision = evaluate_projection_continuity(
@@ -2770,6 +2852,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         });
 
         let decision = evaluate_projection_continuity(
@@ -3103,6 +3187,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: u64::MAX, // very large retention, but hard cap still applies
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -3135,6 +3221,8 @@ mod tests {
             expected_window_ref: expected_window_ref(),
             expected_backlog_digest: test_hash(0xFF),
             max_backlog_items: MAX_BACKLOG_ITEMS as u64,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
         };
 
         let result = validate_deferred_replay_boundedness(&input, "boundary-1");
@@ -3165,5 +3253,302 @@ mod tests {
             window.validate().unwrap_err(),
             DENY_CONTINUITY_WINDOW_BOUNDARY_ID_LENGTH_EXCEEDED
         );
+    }
+
+    // ========================================================================
+    // MAJOR 2: Sink snapshot duplicate sink IDs and minimum sink count
+    // ========================================================================
+
+    #[test]
+    fn sink_snapshot_duplicate_sink_ids_denied() {
+        let mut snapshot = SinkIdentitySnapshotV1 {
+            sink_identities: vec![
+                SinkIdentityEntry {
+                    sink_id: "sink-dup".to_string(),
+                    identity_digest: test_hash(0x01),
+                },
+                SinkIdentityEntry {
+                    sink_id: "sink-dup".to_string(), // duplicate
+                    identity_digest: test_hash(0x02),
+                },
+            ],
+            snapshot_digest: [0u8; 32],
+        };
+        snapshot.snapshot_digest = snapshot.compute_digest();
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            DENY_SINK_SNAPSHOT_DUPLICATE_SINK_IDS
+        );
+    }
+
+    #[test]
+    fn sink_snapshot_single_sink_insufficient_denied() {
+        let mut snapshot = SinkIdentitySnapshotV1 {
+            sink_identities: vec![SinkIdentityEntry {
+                sink_id: "only-one-sink".to_string(),
+                identity_digest: test_hash(0x01),
+            }],
+            snapshot_digest: [0u8; 32],
+        };
+        snapshot.snapshot_digest = snapshot.compute_digest();
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            DENY_SINK_SNAPSHOT_INSUFFICIENT_SINKS
+        );
+    }
+
+    #[test]
+    fn sink_snapshot_two_distinct_sinks_allowed() {
+        let snapshot = valid_sink_snapshot(); // has 2 distinct sinks
+        assert!(
+            snapshot.validate().is_ok(),
+            "2 distinct sinks should be allowed"
+        );
+    }
+
+    #[test]
+    fn sink_snapshot_three_distinct_sinks_allowed() {
+        let mut snapshot = SinkIdentitySnapshotV1 {
+            sink_identities: vec![
+                SinkIdentityEntry {
+                    sink_id: "sink-a".to_string(),
+                    identity_digest: test_hash(0x01),
+                },
+                SinkIdentityEntry {
+                    sink_id: "sink-b".to_string(),
+                    identity_digest: test_hash(0x02),
+                },
+                SinkIdentityEntry {
+                    sink_id: "sink-c".to_string(),
+                    identity_digest: test_hash(0x03),
+                },
+            ],
+            snapshot_digest: [0u8; 32],
+        };
+        snapshot.snapshot_digest = snapshot.compute_digest();
+        assert!(
+            snapshot.validate().is_ok(),
+            "3 distinct sinks should be allowed"
+        );
+    }
+
+    // ========================================================================
+    // MAJOR 3: Replay horizon tick window bounds validation
+    // ========================================================================
+
+    #[test]
+    fn deferred_replay_horizon_tick_below_window_start_denied() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create receipt with replay_horizon_tick below window start.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-below",
+            "boundary-1",
+            test_hash(0xFF),
+            42,
+            1000, // replay_horizon_tick below replay_window_start
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_OUT_OF_WINDOW);
+    }
+
+    #[test]
+    fn deferred_replay_horizon_tick_above_window_end_denied() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create receipt with replay_horizon_tick above window end.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-above",
+            "boundary-1",
+            test_hash(0xFF),
+            42,
+            6000, // replay_horizon_tick above replay_window_end
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_OUT_OF_WINDOW);
+    }
+
+    #[test]
+    fn deferred_replay_horizon_tick_at_window_start_allowed() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create receipt with replay_horizon_tick exactly at window start.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-at-start",
+            "boundary-1",
+            test_hash(0xFF),
+            42,
+            2001, // exactly at replay_window_start
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert!(
+            result.is_ok(),
+            "horizon tick at window start boundary should be allowed"
+        );
+    }
+
+    #[test]
+    fn deferred_replay_horizon_tick_at_window_end_allowed() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create receipt with replay_horizon_tick exactly at window end.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-at-end",
+            "boundary-1",
+            test_hash(0xFF),
+            42,
+            5000, // exactly at replay_window_end
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert!(
+            result.is_ok(),
+            "horizon tick at window end boundary should be allowed"
+        );
+    }
+
+    #[test]
+    fn deferred_replay_horizon_tick_one_below_window_start_denied() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create receipt with replay_horizon_tick one below window start.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-one-below",
+            "boundary-1",
+            test_hash(0xFF),
+            42,
+            2000, // one below replay_window_start (2001)
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_OUT_OF_WINDOW);
+    }
+
+    #[test]
+    fn deferred_replay_horizon_tick_one_above_window_end_denied() {
+        let signer = valid_signer();
+        let trusted = trusted_signers_for(&signer);
+        // Create receipt with replay_horizon_tick one above window end.
+        let receipt = DeferredReplayReceiptV1::create_signed(
+            "dr-one-above",
+            "boundary-1",
+            test_hash(0xFF),
+            42,
+            5001, // one above replay_window_end (5000)
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .expect("receipt created");
+
+        let input = DeferredReplayInput {
+            receipts: vec![receipt],
+            trusted_signers: trusted.to_vec(),
+            expected_time_authority_ref: expected_time_authority_ref(),
+            expected_window_ref: expected_window_ref(),
+            expected_backlog_digest: test_hash(0xFF),
+            max_backlog_items: 1000,
+            replay_window_start: 2001,
+            replay_window_end: 5000,
+        };
+
+        let result = validate_deferred_replay_boundedness(&input, "boundary-1");
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_OUT_OF_WINDOW);
     }
 }
