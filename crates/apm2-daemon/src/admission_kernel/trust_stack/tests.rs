@@ -36,6 +36,22 @@
 //! - (l) Per-event key epoch resolution:
 //!   - Post-seal key rotation accepted with per-event epoch
 //!   - Revoked key rejected at event epoch
+//! - (m) Height continuity enforcement:
+//!   - Non-contiguous heights (gaps) rejected
+//!   - Contiguous heights accepted
+//! - (n) Full-chain fallback seal anchor validation:
+//!   - Chain not matching seal anchor rejected
+//!   - Chain matching seal anchor accepted
+//! - (o) Governance event truncation fail-closed:
+//!   - Event count at limit rejected
+//!   - Event count below limit accepted
+//! - (p) Deterministic hashing (order-independent):
+//!   - `content_hash()` same for different key orders
+//!   - `active_keyset_digest()` same for different key orders
+//! - (q) Schema version enforcement:
+//!   - Wrong schema version rejected
+//!   - Empty schema version rejected
+//!   - Correct schema version accepted
 
 use std::sync::Arc;
 
@@ -1561,4 +1577,565 @@ fn verifier_revoked_key_rejected_at_event_epoch() {
             "reason should mention key not active: {reason}"
         );
     }
+}
+
+// =============================================================================
+// F4: Height continuity enforcement regression tests
+// =============================================================================
+
+#[test]
+fn verifier_non_contiguous_heights_rejected() {
+    use ed25519_dalek::Signer;
+
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Build a chain with heights [1, 2, 4, 5] -- gap at height 3.
+    // Each event has valid hash links to its predecessor.
+    let mut events = Vec::new();
+    let mut prev_hash = [0u8; 32];
+
+    for &height in &[1u64, 2, 4, 5] {
+        let he_time = 1000 + height * 10;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"test-event");
+        hasher.update(&prev_hash);
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&ledger_id);
+        let event_hash = *hasher.finalize().as_bytes();
+
+        let signature = signing_key.sign(&event_hash).to_bytes().to_vec();
+
+        events.push(LedgerEventView {
+            height,
+            event_hash,
+            prev_hash,
+            he_time,
+            event_type: "test.event".to_string(),
+            payload: Vec::new(),
+            signature,
+            signer_key_id: Some("test-key".to_string()),
+        });
+
+        prev_hash = event_hash;
+    }
+
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: events[0].event_hash,
+        height: 1,
+        he_time: events[0].he_time,
+    };
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        matches!(result, Err(TrustError::IntegrityFailure { .. })),
+        "non-contiguous heights should be rejected: {result:?}"
+    );
+    if let Err(TrustError::IntegrityFailure { reason }) = &result {
+        assert!(
+            reason.contains("height continuity"),
+            "reason should mention height continuity: {reason}"
+        );
+    }
+}
+
+#[test]
+fn verifier_contiguous_heights_accepted() {
+    // Ensure a properly contiguous chain still passes verification.
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+    let events = build_test_chain(ledger_id, 1, 10, &signing_key, "test-key");
+
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: events[0].event_hash,
+        height: 1,
+        he_time: events[0].he_time,
+    };
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        result.is_ok(),
+        "contiguous chain should be accepted: {result:?}"
+    );
+}
+
+// =============================================================================
+// F1: Full-chain fallback seal anchor validation regression tests
+// =============================================================================
+
+#[test]
+fn verifier_full_chain_fallback_rejects_chain_not_matching_seal_anchor() {
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Build a valid chain from genesis to tip (internally consistent).
+    let forked_events = build_forked_chain(ledger_id, 1, 20, &signing_key, "test-key", 0xAB);
+
+    // Create a seal whose anchor commits to a DIFFERENT event_hash at the
+    // seal height (e.g., from the canonical chain, not the forked chain).
+    let canonical_events = build_test_chain(ledger_id, 1, 5, &signing_key, "test-key");
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: canonical_events[0].event_hash, // Different from forked_events[0]
+        height: 1,
+        he_time: canonical_events[0].he_time,
+    };
+
+    // Confirm the hashes are actually different.
+    assert_ne!(
+        canonical_events[0].event_hash, forked_events[0].event_hash,
+        "test setup: seal anchor must differ from forked chain event"
+    );
+
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    let config = TrustVerifierConfig {
+        max_seal_to_tip_distance: 5, // Small limit to trigger fallback
+        allow_full_chain_fallback: true,
+    };
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(forked_events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        config,
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        matches!(result, Err(TrustError::IntegrityFailure { .. })),
+        "full-chain fallback should reject chain not matching seal anchor: {result:?}"
+    );
+    if let Err(TrustError::IntegrityFailure { reason }) = &result {
+        assert!(
+            reason.contains("seal anchor event_hash mismatch"),
+            "reason should mention seal anchor mismatch: {reason}"
+        );
+    }
+}
+
+#[test]
+fn verifier_full_chain_fallback_accepts_chain_matching_seal_anchor() {
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+    let events = build_test_chain(ledger_id, 1, 20, &signing_key, "test-key");
+
+    // Seal anchor at height 1 matches the chain's first event.
+    let seal_anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: events[0].event_hash,
+        height: 1,
+        he_time: events[0].he_time,
+    };
+    let seal = create_test_seal(&signing_key, &seal_anchor, "test-key", 0);
+
+    let config = TrustVerifierConfig {
+        max_seal_to_tip_distance: 5,
+        allow_full_chain_fallback: true,
+    };
+
+    let event_source = Arc::new(
+        MockEventSource::new(ledger_id)
+            .with_events(events)
+            .with_seal(seal),
+    );
+
+    let verifier = ConcreteLedgerTrustVerifier::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        config,
+    )
+    .unwrap();
+
+    let result = verifier.verify_startup();
+    assert!(
+        result.is_ok(),
+        "full-chain fallback with matching seal anchor should succeed: {result:?}"
+    );
+}
+
+// =============================================================================
+// F2: Governance event truncation fail-closed regression tests
+// =============================================================================
+
+/// Mock event source that overrides `read_governance_events` to return
+/// exactly `count` dummy events, simulating a ledger with many governance
+/// events that hit the truncation limit.
+struct TruncatingGovernanceSource {
+    inner: MockEventSource,
+    governance_count: usize,
+}
+
+impl LedgerEventSource for TruncatingGovernanceSource {
+    fn read_events(&self, start_height: u64, limit: usize) -> Result<Vec<LedgerEventView>, String> {
+        self.inner.read_events(start_height, limit)
+    }
+
+    fn tip_height(&self) -> Result<u64, String> {
+        self.inner.tip_height()
+    }
+
+    fn ledger_id(&self) -> Hash {
+        self.inner.ledger_id()
+    }
+
+    fn find_latest_seal(&self, max_height: u64) -> Result<Option<TrustedSealV1>, String> {
+        self.inner.find_latest_seal(max_height)
+    }
+
+    fn read_governance_events(
+        &self,
+        _start_height: u64,
+        _end_height: u64,
+        limit: usize,
+    ) -> Result<Vec<LedgerEventView>, String> {
+        // Return `min(governance_count, limit)` dummy governance events.
+        let count = self.governance_count.min(limit);
+        let mut events = Vec::with_capacity(count);
+        #[allow(clippy::cast_possible_truncation)] // i % 255 + 1 always fits in u8
+        for i in 0..count {
+            let height = (i + 1) as u64;
+            events.push(LedgerEventView {
+                height,
+                event_hash: test_hash((i % 255 + 1) as u8),
+                prev_hash: [0u8; 32],
+                he_time: height * 10,
+                event_type: "governance.policy_update".to_string(),
+                payload: Vec::new(),
+                signature: vec![0x42; 64], // Dummy (truncation check is before sig verification)
+                signer_key_id: Some("test-key".to_string()),
+            });
+        }
+        Ok(events)
+    }
+}
+
+#[test]
+fn policy_resolver_truncation_fails_closed() {
+    let (_, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    let inner_source = MockEventSource::new(ledger_id);
+
+    let event_source = Arc::new(TruncatingGovernanceSource {
+        inner: inner_source,
+        governance_count: MAX_GOVERNANCE_EVENTS_PER_DERIVATION, // Exactly at limit
+    });
+
+    let resolver = GovernancePolicyRootResolver::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+    )
+    .unwrap();
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: test_hash(1),
+        height: 10_000,
+        he_time: 100,
+    };
+
+    let result = resolver.resolve(&anchor);
+    assert!(
+        matches!(result, Err(PolicyError::DerivationFailed { .. })),
+        "truncation at limit should fail closed: {result:?}"
+    );
+    if let Err(PolicyError::DerivationFailed { reason }) = &result {
+        assert!(
+            reason.contains("governance event count"),
+            "reason should mention governance event count: {reason}"
+        );
+    }
+}
+
+#[test]
+fn policy_resolver_below_truncation_limit_succeeds() {
+    use ed25519_dalek::Signer;
+
+    let (signing_key, pk) = generate_test_keypair();
+    let ledger_id = test_hash(0xAA);
+
+    // Build a small number of signed governance events (well below limit).
+    let mut gov_events = Vec::new();
+    for i in 1..=3u64 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"gov-event");
+        hasher.update(&i.to_le_bytes());
+        let event_hash = *hasher.finalize().as_bytes();
+        let signature = signing_key.sign(&event_hash).to_bytes().to_vec();
+
+        gov_events.push(LedgerEventView {
+            height: i,
+            event_hash,
+            prev_hash: [0u8; 32],
+            he_time: i * 10,
+            event_type: "governance.policy_update".to_string(),
+            payload: Vec::new(),
+            signature,
+            signer_key_id: Some("test-key".to_string()),
+        });
+    }
+
+    let event_source = Arc::new(MockEventSource::new(ledger_id).with_governance_events(gov_events));
+
+    let resolver = GovernancePolicyRootResolver::new(
+        test_trust_bundle(&pk, "test-key"),
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+    )
+    .unwrap();
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id,
+        event_hash: test_hash(1),
+        height: 10,
+        he_time: 100,
+    };
+
+    let result = resolver.resolve(&anchor);
+    assert!(
+        result.is_ok(),
+        "governance events below truncation limit should succeed: {result:?}"
+    );
+}
+
+// =============================================================================
+// F3: Non-deterministic content hash regression tests
+// =============================================================================
+
+#[test]
+fn root_trust_bundle_content_hash_order_independent() {
+    let (_, pk1) = generate_test_keypair();
+    let (_, pk2) = generate_test_keypair();
+
+    // Bundle with keys in order [key-a, key-b].
+    let bundle_ab = RootTrustBundle {
+        schema_version: ROOT_TRUST_BUNDLE_SCHEMA_VERSION.to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-a".to_string(),
+                public_key_bytes: pk1.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-b".to_string(),
+                public_key_bytes: pk2.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+        ],
+    };
+
+    // Bundle with keys in REVERSED order [key-b, key-a].
+    let bundle_ba = RootTrustBundle {
+        schema_version: ROOT_TRUST_BUNDLE_SCHEMA_VERSION.to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-b".to_string(),
+                public_key_bytes: pk2.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-a".to_string(),
+                public_key_bytes: pk1.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+        ],
+    };
+
+    assert_eq!(
+        bundle_ab.content_hash(),
+        bundle_ba.content_hash(),
+        "content_hash must be order-independent (sorted by key_id)"
+    );
+}
+
+#[test]
+fn root_trust_bundle_active_keyset_digest_order_independent() {
+    let (_, pk1) = generate_test_keypair();
+    let (_, pk2) = generate_test_keypair();
+
+    // Bundle with keys in order [key-a, key-b].
+    let bundle_ab = RootTrustBundle {
+        schema_version: ROOT_TRUST_BUNDLE_SCHEMA_VERSION.to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-a".to_string(),
+                public_key_bytes: pk1.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-b".to_string(),
+                public_key_bytes: pk2.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+        ],
+    };
+
+    // Bundle with keys in REVERSED order [key-b, key-a].
+    let bundle_ba = RootTrustBundle {
+        schema_version: ROOT_TRUST_BUNDLE_SCHEMA_VERSION.to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-b".to_string(),
+                public_key_bytes: pk2.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+            TrustBundleKeyEntry {
+                algorithm_id: "ed25519".to_string(),
+                key_id: "key-a".to_string(),
+                public_key_bytes: pk1.to_vec(),
+                active_from_epoch: 0,
+                revoked_at_epoch: None,
+            },
+        ],
+    };
+
+    let epoch = 50;
+    assert_eq!(
+        bundle_ab.active_keyset_digest(epoch),
+        bundle_ba.active_keyset_digest(epoch),
+        "active_keyset_digest must be order-independent (sorted by key_id)"
+    );
+}
+
+// =============================================================================
+// F5: Schema version enforcement regression tests
+// =============================================================================
+
+#[test]
+fn root_trust_bundle_wrong_schema_version_rejected() {
+    let (_, pk) = generate_test_keypair();
+    let bundle = RootTrustBundle {
+        schema_version: "2.0.0".to_string(), // Wrong version!
+        bundle_id: test_hash(0xBB),
+        keys: vec![TrustBundleKeyEntry {
+            algorithm_id: "ed25519".to_string(),
+            key_id: "test-key".to_string(),
+            public_key_bytes: pk.to_vec(),
+            active_from_epoch: 0,
+            revoked_at_epoch: None,
+        }],
+    };
+    let result = bundle.validate();
+    assert!(result.is_err(), "wrong schema version should be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("schema_version"),
+        "error should mention schema_version: {err}"
+    );
+}
+
+#[test]
+fn root_trust_bundle_empty_schema_version_rejected() {
+    let (_, pk) = generate_test_keypair();
+    let bundle = RootTrustBundle {
+        schema_version: String::new(), // Empty!
+        bundle_id: test_hash(0xBB),
+        keys: vec![TrustBundleKeyEntry {
+            algorithm_id: "ed25519".to_string(),
+            key_id: "test-key".to_string(),
+            public_key_bytes: pk.to_vec(),
+            active_from_epoch: 0,
+            revoked_at_epoch: None,
+        }],
+    };
+    let result = bundle.validate();
+    assert!(result.is_err(), "empty schema version should be rejected");
+}
+
+#[test]
+fn root_trust_bundle_correct_schema_version_accepted() {
+    let (_, pk) = generate_test_keypair();
+    let bundle = test_trust_bundle(&pk, "test-key");
+    assert!(
+        bundle.validate().is_ok(),
+        "correct schema version should be accepted"
+    );
+}
+
+#[test]
+fn verifier_constructor_rejects_wrong_schema_version() {
+    let (_, pk) = generate_test_keypair();
+    let bundle = RootTrustBundle {
+        schema_version: "99.0.0".to_string(),
+        bundle_id: test_hash(0xBB),
+        keys: vec![TrustBundleKeyEntry {
+            algorithm_id: "ed25519".to_string(),
+            key_id: "test-key".to_string(),
+            public_key_bytes: pk.to_vec(),
+            active_from_epoch: 0,
+            revoked_at_epoch: None,
+        }],
+    };
+    let event_source = Arc::new(MockEventSource::new(test_hash(0xAA)));
+    let result = ConcreteLedgerTrustVerifier::new(
+        bundle,
+        event_source,
+        Arc::new(Ed25519SignatureVerifier),
+        TrustVerifierConfig::default(),
+    );
+    assert!(
+        result.is_err(),
+        "constructor should reject wrong schema version"
+    );
 }

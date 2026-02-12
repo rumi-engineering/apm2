@@ -141,6 +141,11 @@ Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prere
 - [INV-TS10] All `usize` to `u32` casts in hash functions are safe because input lengths are bounded by MAX_* constants.
 - [INV-TS11] Chain segment verification binds the first event's `event_hash` to the seal's committed anchor hash (constant-time comparison). Prevents fork substitution.
 - [INV-TS12] Incomplete chain reads (event source returns empty before `end_height`) fail closed with `IntegrityFailure`. No silent acceptance of truncated chains.
+- [INV-TS13] Chain segment verification enforces strict height continuity: each event's height must equal the expected next height (no gaps, no duplicates, no backward jumps).
+- [INV-TS14] Full-chain fallback path validates the seal's anchor `event_hash` at `seal_height` AFTER completing `verify_chain_segment`. An internally valid but unrelated chain is rejected.
+- [INV-TS15] Governance event truncation is fail-closed: if `read_governance_events` returns `>= MAX_GOVERNANCE_EVENTS_PER_DERIVATION` events, `derive_policy_root` returns `DerivationFailed` (no silent partial derivation).
+- [INV-TS16] `content_hash()` and `active_keyset_digest()` sort keys by `key_id` before hashing to ensure deterministic output regardless of vector insertion order.
+- [INV-TS17] `RootTrustBundle::validate()` enforces `schema_version == ROOT_TRUST_BUNDLE_SCHEMA_VERSION` as the first check. Unknown/future schema versions are rejected.
 
 ### `QuarantineGuard` (mod.rs)
 

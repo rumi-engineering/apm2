@@ -210,6 +210,12 @@ impl RootTrustBundle {
     ///
     /// Returns a description of the first violated constraint.
     pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != ROOT_TRUST_BUNDLE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported schema_version '{}'; expected '{ROOT_TRUST_BUNDLE_SCHEMA_VERSION}'",
+                self.schema_version
+            ));
+        }
         if self.keys.is_empty() {
             return Err("trust bundle must contain at least one key".into());
         }
@@ -240,7 +246,11 @@ impl RootTrustBundle {
         hasher.update(b"apm2-root-trust-bundle-v1");
         hasher.update(&self.bundle_id);
         hasher.update(&(self.keys.len() as u32).to_le_bytes());
-        for entry in &self.keys {
+        // Sort keys by key_id to ensure deterministic hashing regardless of
+        // vector insertion order.
+        let mut sorted_keys: Vec<&TrustBundleKeyEntry> = self.keys.iter().collect();
+        sorted_keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        for entry in sorted_keys {
             hasher.update(entry.algorithm_id.as_bytes());
             hasher.update(&(entry.algorithm_id.len() as u32).to_le_bytes());
             hasher.update(entry.key_id.as_bytes());
@@ -292,15 +302,18 @@ impl RootTrustBundle {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2-keyset-digest-v1");
         hasher.update(&epoch.to_le_bytes());
+        // Sort active keys by key_id to ensure deterministic hashing
+        // regardless of vector insertion order.
+        let mut active_keys: Vec<&TrustBundleKeyEntry> =
+            self.keys.iter().filter(|k| k.is_active_at(epoch)).collect();
+        active_keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
         let mut active_count: u32 = 0;
-        for entry in &self.keys {
-            if entry.is_active_at(epoch) {
-                hasher.update(entry.key_id.as_bytes());
-                hasher.update(&(entry.key_id.len() as u32).to_le_bytes());
-                hasher.update(&entry.public_key_bytes);
-                hasher.update(&(entry.public_key_bytes.len() as u32).to_le_bytes());
-                active_count += 1;
-            }
+        for entry in active_keys {
+            hasher.update(entry.key_id.as_bytes());
+            hasher.update(&(entry.key_id.len() as u32).to_le_bytes());
+            hasher.update(&entry.public_key_bytes);
+            hasher.update(&(entry.public_key_bytes.len() as u32).to_le_bytes());
+            active_count += 1;
         }
         hasher.update(&active_count.to_le_bytes());
         *hasher.finalize().as_bytes()
@@ -719,8 +732,38 @@ impl ConcreteLedgerTrustVerifier {
             }
             // Full-chain fallback: verify from height 1 to tip.
             // This is expensive but allows recovery when the seal is stale.
-            // No anchor binding for genesis-start (no seal anchor to bind to).
+            // No anchor binding for genesis-start (genesis has no predecessor
+            // hash to bind to), so pass `expected_start_hash: None`.
             self.verify_chain_segment(1, tip_height, &ledger_id, seal.seal_epoch, None)?;
+
+            // Post-verification: the seal's anchor event_hash MUST exist in
+            // the verified chain at seal_height. Without this check, a fully
+            // valid but unrelated chain could pass the fallback path.
+            let anchor_events = self.event_source.read_events(seal_height, 1).map_err(|e| {
+                TrustError::IntegrityFailure {
+                    reason: truncate_reason(&format!(
+                        "failed to read seal anchor event at height {seal_height}: {e}"
+                    )),
+                }
+            })?;
+            let anchor_event =
+                anchor_events
+                    .first()
+                    .ok_or_else(|| TrustError::IntegrityFailure {
+                        reason: truncate_reason(&format!(
+                            "no event found at seal anchor height {seal_height} after full-chain verification"
+                        )),
+                    })?;
+            if !bool::from(anchor_event.event_hash.ct_eq(&seal.anchor.event_hash)) {
+                return Err(TrustError::IntegrityFailure {
+                    reason: truncate_reason(&format!(
+                        "full-chain fallback: seal anchor event_hash mismatch at height {seal_height}: \
+                         expected {}, got {}",
+                        hex::encode(seal.anchor.event_hash),
+                        hex::encode(anchor_event.event_hash)
+                    )),
+                });
+            }
         } else {
             // Normal path: verify from seal to tip.
             // Bind the first event to the seal's committed event_hash.
@@ -844,6 +887,7 @@ impl ConcreteLedgerTrustVerifier {
         let mut prev_hash: Option<Hash> = None;
         let mut prev_he_time: u64 = 0;
         let mut checked_anchor = false;
+        let mut expected_height = start_height;
 
         while current_height <= end_height {
             let events = self
@@ -870,6 +914,18 @@ impl ConcreteLedgerTrustVerifier {
                 if event.height > end_height {
                     break;
                 }
+
+                // Enforce strict height continuity: no gaps, no duplicates,
+                // no backward jumps.
+                if event.height != expected_height {
+                    return Err(TrustError::IntegrityFailure {
+                        reason: truncate_reason(&format!(
+                            "height continuity violation: expected height {expected_height}, got {}",
+                            event.height
+                        )),
+                    });
+                }
+                expected_height = event.height + 1;
 
                 // Anchor binding check: the first event MUST match the
                 // seal's committed event_hash (if provided).
@@ -943,7 +999,7 @@ impl ConcreteLedgerTrustVerifier {
 
                 prev_hash = Some(event.event_hash);
                 prev_he_time = event.he_time;
-                current_height = event.height.saturating_add(1);
+                current_height = expected_height;
             }
         }
 
@@ -1094,6 +1150,18 @@ impl GovernancePolicyRootResolver {
             .map_err(|e| PolicyError::DerivationFailed {
                 reason: truncate_reason(&format!("failed to read governance events: {e}")),
             })?;
+
+        // Fail-closed truncation check: if the event source returned exactly
+        // the limit, the true set may be larger and our derivation incomplete.
+        if events.len() >= MAX_GOVERNANCE_EVENTS_PER_DERIVATION {
+            return Err(PolicyError::DerivationFailed {
+                reason: truncate_reason(&format!(
+                    "governance event count ({}) reached limit {MAX_GOVERNANCE_EVENTS_PER_DERIVATION}; \
+                     derivation may be incomplete -- pagination required",
+                    events.len()
+                )),
+            });
+        }
 
         if events.is_empty() {
             return Err(PolicyError::NoGovernanceEvents);
