@@ -55,14 +55,15 @@ pub use comment::{ReviewCommentSeverityArg, ReviewCommentTypeArg};
 pub use decision::DecisionValueArg;
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
-use projection::run_project_inner;
+use projection::{projection_state_done, projection_state_failed, run_project_inner};
 pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
 pub use types::ReviewRunType;
 use types::{
-    DispatchSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url, validate_expected_head_sha,
+    DispatchSummary, ProjectionStatus, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
+    validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -363,6 +364,105 @@ pub fn run_status(
     }
 }
 
+pub fn run_wait(
+    pr_number: u32,
+    pr_url: Option<&str>,
+    review_type_filter: Option<&str>,
+    wait_for_sha: Option<&str>,
+    timeout_seconds: Option<u64>,
+    poll_interval_seconds: u64,
+    json_output: bool,
+) -> u8 {
+    let max_interval = poll_interval_seconds.max(1);
+    let poll_interval = Duration::from_secs(max_interval);
+    match run_wait_inner(
+        pr_number,
+        pr_url,
+        review_type_filter,
+        wait_for_sha,
+        timeout_seconds.map(Duration::from_secs),
+        poll_interval,
+    ) {
+        Ok((status, attempts, elapsed)) => {
+            let elapsed_seconds = elapsed.as_secs();
+            if json_output {
+                let has_failed = review_types_terminal_failed(&status, review_type_filter);
+                let payload = serde_json::json!({
+                    "schema": "apm2.fac.review.wait.v1",
+                    "status": "completed",
+                    "filter_pr": pr_number,
+                    "filter_review_type": review_type_filter,
+                    "wait_for_sha": wait_for_sha,
+                    "attempts": attempts,
+                    "elapsed_seconds": elapsed_seconds,
+                    "poll_interval_seconds": max_interval,
+                    "project": status,
+                    "fail_closed": has_failed,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                println!("FAC Review Wait");
+                println!("  Filter PR: #{pr_number}");
+                if let Some(review_type) = review_type_filter {
+                    println!("  Filter Type: {review_type}");
+                }
+                if let Some(wait_sha) = wait_for_sha {
+                    println!("  Wait SHA: {wait_sha}");
+                }
+                println!("  Poll Interval: {max_interval}s");
+                println!("  Attempts: {attempts}");
+                println!("  Elapsed: {elapsed_seconds}s");
+                println!("  Final: {}", status.line);
+                println!(
+                    "  Fail Closed: {}",
+                    if review_types_terminal_failed(&status, review_type_filter) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                );
+                if !status.errors.is_empty() {
+                    println!("  Errors:");
+                    for error in &status.errors {
+                        println!(
+                            "    ts={} event={} review={} seq={} detail={}",
+                            error.ts, error.event, error.review_type, error.seq, error.detail
+                        );
+                    }
+                }
+            }
+
+            if review_types_terminal_failed(&status, review_type_filter) {
+                exit_codes::GENERIC_ERROR
+            } else {
+                exit_codes::SUCCESS
+            }
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_wait_failed",
+                    "message": err,
+                    "filter_pr": pr_number,
+                    "filter_review_type": review_type_filter,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 pub fn run_findings(
     repo: &str,
     pr_number: Option<u32>,
@@ -570,7 +670,7 @@ pub fn run_decision_show(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn run_project(
     pr_number: u32,
     head_sha: Option<&str>,
@@ -578,11 +678,12 @@ pub fn run_project(
     after_seq: u64,
     emit_errors: bool,
     fail_on_terminal: bool,
+    format_json: bool,
     json_output: bool,
 ) -> u8 {
     match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
         Ok(status) => {
-            if json_output {
+            if json_output || format_json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".to_string())
@@ -625,6 +726,149 @@ pub fn run_project(
             exit_codes::SUCCESS
         },
     }
+}
+
+fn review_type_filter_vec(review_type_filter: Option<&str>) -> Result<Vec<String>, String> {
+    review_type_filter.map_or_else(
+        || Ok(vec!["security".to_string(), "quality".to_string()]),
+        |value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "security" | "quality") {
+                Ok(vec![normalized])
+            } else {
+                Err(format!(
+                    "invalid review type filter `{value}` (expected security|quality)"
+                ))
+            }
+        },
+    )
+}
+
+fn run_wait_inner(
+    pr_number: u32,
+    pr_url: Option<&str>,
+    review_type_filter: Option<&str>,
+    wait_for_sha: Option<&str>,
+    timeout: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<(ProjectionStatus, u64, Duration), String> {
+    if let Some(url) = pr_url {
+        let (_, url_pr_number) = parse_pr_url(url)?;
+        if url_pr_number != pr_number {
+            return Err(format!(
+                "wait filters disagree: --pr={pr_number} but --pr-url resolves to #{url_pr_number}"
+            ));
+        }
+    }
+
+    if let Some(expected_sha) = wait_for_sha {
+        validate_expected_head_sha(expected_sha)?;
+    }
+
+    let start = Instant::now();
+    let mut attempts = 0_u64;
+    let mut last_status = run_project_inner(pr_number, wait_for_sha, None, 0)?;
+    if let Some(expected_head) = wait_for_sha {
+        if !last_status
+            .current_head_sha
+            .eq_ignore_ascii_case(expected_head)
+        {
+            return Err(format!(
+                "stale projection for PR #{pr_number}: expected head {expected_head}, observed {}",
+                last_status.current_head_sha
+            ));
+        }
+    }
+    if review_types_all_terminal(&last_status, review_type_filter)? {
+        return Ok((last_status, attempts, start.elapsed()));
+    }
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        if let Some(timeout) = timeout {
+            if start.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out waiting for PR #{pr_number} review completion after {timeout:?}"
+                ));
+            }
+        }
+
+        thread::sleep(poll_interval);
+        last_status = run_project_inner(pr_number, wait_for_sha, None, 0)?;
+        if let Some(expected_head) = wait_for_sha {
+            if !last_status
+                .current_head_sha
+                .eq_ignore_ascii_case(expected_head)
+            {
+                return Err(format!(
+                    "stale projection for PR #{pr_number}: expected head {expected_head}, observed {}",
+                    last_status.current_head_sha
+                ));
+            }
+        }
+        if review_types_all_terminal(&last_status, review_type_filter)? {
+            return Ok((last_status, attempts, start.elapsed()));
+        }
+    }
+}
+
+fn review_type_state<'a>(
+    status: &'a ProjectionStatus,
+    review_type: &str,
+) -> Result<&'a str, String> {
+    match review_type {
+        "security" => Ok(status.security.as_str()),
+        "quality" => Ok(status.quality.as_str()),
+        other => Err(format!(
+            "invalid review type `{other}` (expected security|quality)"
+        )),
+    }
+}
+
+fn review_types_terminal_done(status: &ProjectionStatus, review_type_filter: Option<&str>) -> bool {
+    let Ok(review_types) = review_type_filter_vec(review_type_filter) else {
+        return false;
+    };
+    review_types
+        .iter()
+        .all(|value| review_type_state(status, value).is_ok_and(projection_state_done))
+}
+
+fn review_types_terminal_failed(
+    status: &ProjectionStatus,
+    review_type_filter: Option<&str>,
+) -> bool {
+    let Ok(review_types) = review_type_filter_vec(review_type_filter) else {
+        return false;
+    };
+    if !review_types_terminal_done(status, review_type_filter) {
+        return false;
+    }
+    for value in &review_types {
+        if let Ok(state) = review_type_state(status, value)
+            && projection_state_failed(state)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn review_types_all_terminal(
+    status: &ProjectionStatus,
+    review_type_filter: Option<&str>,
+) -> Result<bool, String> {
+    let review_types = review_type_filter_vec(review_type_filter)?;
+    if review_types.is_empty() {
+        return Ok(false);
+    }
+    for value in &review_types {
+        let state = review_type_state(status, value)?;
+        if !projection_state_done(state) && !projection_state_failed(state) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn run_tail(lines: usize, follow: bool) -> u8 {
@@ -1091,8 +1335,12 @@ mod tests {
     };
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
-        EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewRunStatus,
-        ReviewStateEntry, ReviewStateFile, default_model, default_review_type, now_iso8601_millis,
+        EVENT_ROTATE_BYTES, FacEventContext, ProjectionStatus, ReviewBackend, ReviewKind,
+        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, default_review_type,
+        now_iso8601_millis,
+    };
+    use super::{
+        review_types_all_terminal, review_types_terminal_done, review_types_terminal_failed,
     };
 
     fn dead_pid_for_test() -> u32 {
@@ -1160,6 +1408,39 @@ mod tests {
         assert!(is_allowed_author_association("COLLABORATOR"));
         assert!(!is_allowed_author_association("CONTRIBUTOR"));
         assert!(!is_allowed_author_association("NONE"));
+    }
+
+    #[test]
+    fn test_review_wait_terminal_predicates_cover_filters() {
+        let status_done = ProjectionStatus {
+            line: String::new(),
+            sha: "abcd".to_string(),
+            current_head_sha: "abcd".to_string(),
+            security: "done:model/backend:r0:abcd".to_string(),
+            quality: "failed:sequence_unknown".to_string(),
+            recent_events: String::new(),
+            terminal_failure: false,
+            last_seq: 0,
+            errors: Vec::new(),
+        };
+        assert!(review_types_terminal_done(&status_done, Some("security")));
+        assert!(!review_types_terminal_failed(
+            &status_done,
+            Some("security")
+        ));
+        assert!(!review_types_terminal_failed(&status_done, Some("quality")));
+        assert!(!review_types_terminal_done(&status_done, Some("quality")));
+
+        let status_running = ProjectionStatus {
+            security: "alive:model/backend:r0:abcd".to_string(),
+            ..status_done
+        };
+        assert!(!review_types_terminal_done(&status_running, None));
+        assert!(!review_types_terminal_failed(&status_running, None));
+
+        let invalid_filter = review_types_all_terminal(&status_running, Some("invalid"));
+        assert!(invalid_filter.is_err());
+        assert!(invalid_filter.unwrap_err().contains("invalid review type"));
     }
 
     #[test]
