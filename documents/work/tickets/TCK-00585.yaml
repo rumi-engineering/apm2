@@ -1,0 +1,37 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00585"
+    title: "Horizon/authority health monitoring: broker validates TP001/TP002/TP003 invariants and emits health receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker serves envelopes/horizons."
+  scope:
+    in_scope:
+      - "Broker periodically self-checks RFC-0029 invariants:"
+      - "  - TP001 envelope signature validity"
+      - "  - TP002 refs resolved/current with non-zero commitments"
+      - "  - TP003 refs resolved/converged with non-zero commitments"
+      - "Expose `apm2 fac broker health` (optional) and emit periodic HealthReceiptV1."
+      - "Worker refuses to admit jobs if broker health is degraded (policy-driven)."
+    out_of_scope:
+      - "Distributed horizon resolution."
+  plan:
+    steps:
+      - "Implement health checker and receipts."
+      - "Add worker gate on health status."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "If horizons/envelopes are misconfigured, the system fails closed with clear diagnostic receipts."

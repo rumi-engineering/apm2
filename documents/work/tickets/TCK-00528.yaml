@@ -1,0 +1,44 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00528"
+    title: "Systemd units + runbook: broker + worker as managed services (user+system modes)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker must exist before unit packaging."
+      - ticket_id: "TCK-00511"
+        reason: "Worker must exist before unit packaging."
+  scope:
+    in_scope:
+      - "Provide systemd unit templates for: FAC Broker and FAC Worker."
+      - "Support both user-mode units (with linger guidance) and system-mode units (preferred hardening)."
+      - "Define dedicated runtime directories under `$APM2_HOME/private/fac/**` with strict permissions."
+      - "Provide a minimal runbook: start/stop/status, logs, key rotation notes, failure modes."
+      - "Add `apm2 fac services status` command (optional) that reports unit health."
+    out_of_scope:
+      - "Multi-node orchestration."
+  plan:
+    steps:
+      - "Author unit files with explicit WorkingDirectory, EnvironmentFile (optional), Restart policies, and hardening knobs."
+      - "For system units: run as dedicated service user; define slices if needed."
+      - "Add docs: how to enable linger for user-mode; how to run system-mode safely."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "On a clean Ubuntu VPS, broker and worker can be started and stay running under systemd."
+      - "Worker can execute at least one queued job end-to-end under unit management."
+  notes:
+    security: |
+      Ensure units do not run with excessive privileges by default.
+      Default should avoid reliance on a user-bus for correctness.

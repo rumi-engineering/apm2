@@ -1,0 +1,38 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00513"
+    title: "Receipt hardening: require RFC-0028 boundary + RFC-0029 queue/budget decisions in FacJobReceiptV1"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00511"
+        reason: "Worker is responsible for generating authoritative receipts."
+  scope:
+    in_scope:
+      - "Extend `FacJobReceiptV1` to include `job_spec_digest`."
+      - "Add required fields: `rfc0028_channel_boundary`, `eio29_queue_admission`, `eio29_budget_admission` (as applicable)."
+      - "Standardize denial receipts (authorization denied, economics denied, malformed input, etc.)."
+      - "Persist receipts content-addressed under `$APM2_HOME/private/fac/receipts/<hex>.json`."
+      - "Ensure receipts are emitted for BOTH deny/quarantine outcomes and execution outcomes."
+    out_of_scope:
+      - "Receipt stream merge tooling (separate ticket)."
+  plan:
+    steps:
+      - "Define receipt schema extensions + serialization rules."
+      - "Update worker to always emit these artifacts."
+      - "Add minimal tests: receipt includes required fields in default mode."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No successful execution receipt exists without RFC-0028 boundary + RFC-0029 admission artifacts."
+      - "Denied jobs produce denial receipts with stable reason codes."

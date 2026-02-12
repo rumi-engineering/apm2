@@ -390,6 +390,16 @@ pub enum ChannelContextTokenError {
         /// Request identifier carried in the token payload.
         actual: String,
     },
+    /// Token was issued in the future relative to the decoder's current time.
+    #[error(
+        "channel context token issued in the future: issued_at_secs {issued_at_secs}, current_time_secs {current_time_secs}"
+    )]
+    TokenIssuedInFuture {
+        /// Token issuance time in seconds since Unix epoch.
+        issued_at_secs: u64,
+        /// Decoder current time.
+        current_time_secs: u64,
+    },
     /// Token expired before decode.
     #[error("channel context token expired")]
     ExpiredToken {
@@ -676,6 +686,13 @@ pub fn decode_channel_context_token(
         return Err(ChannelContextTokenError::RequestIdMismatch {
             expected: expected_request_id.to_string(),
             actual: payload.payload.request_id,
+        });
+    }
+
+    if payload.payload.issued_at_secs > current_time_secs {
+        return Err(ChannelContextTokenError::TokenIssuedInFuture {
+            issued_at_secs: payload.payload.issued_at_secs,
+            current_time_secs,
         });
     }
 
@@ -1916,6 +1933,30 @@ mod tests {
         assert!(
             matches!(result, Err(ChannelContextTokenError::ExpiredToken { .. })),
             "expired token must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_future_issued_token_rejected() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let token =
+            issue_channel_context_token(&check, "lease-1", "REQ-1", now_secs() + 10, &signer)
+                .expect("token should encode");
+
+        let result = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ChannelContextTokenError::TokenIssuedInFuture { .. })
+            ),
+            "future-issued token must be rejected, got: {result:?}"
         );
     }
 

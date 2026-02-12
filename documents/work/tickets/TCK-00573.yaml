@@ -1,0 +1,45 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00573"
+    title: "Job unit sandbox hardening: NoNewPrivileges, PrivateTmp, Protect*, Restrict*, safe defaults without breaking builds"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00530"
+        reason: "Need centralized unit builder."
+  scope:
+    in_scope:
+      - "Add systemd hardening directives to job units (prefer system-mode backend):"
+      - "  - NoNewPrivileges=yes"
+      - "  - PrivateTmp=yes"
+      - "  - ProtectControlGroups=yes"
+      - "  - ProtectKernelTunables=yes"
+      - "  - ProtectKernelLogs=yes"
+      - "  - RestrictSUIDSGID=yes"
+      - "  - LockPersonality=yes"
+      - "  - RestrictRealtime=yes"
+      - "  - RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 (policy controlled)"
+      - "  - SystemCallArchitectures=native"
+      - "Make hardening policy-driven (FacPolicyV1), with a known-good default profile."
+      - "Emit unit hardening settings into receipts for audit (hash or normalized list)."
+    out_of_scope:
+      - "Container sandboxing."
+  plan:
+    steps:
+      - "Define hardening profile knobs in policy."
+      - "Update unit builder."
+      - "Run gates suite and iteratively tighten without breaking."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Default hardening reduces attack surface measurably (documented directives) while preserving successful gates execution."

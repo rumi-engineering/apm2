@@ -1,0 +1,43 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00564"
+    title: "Receipt write pipeline: emit receipt + update index + link job state atomically (avoid torn states)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00513"
+        reason: "Receipts schema exists."
+      - ticket_id: "TCK-00560"
+        reason: "Receipt index exists."
+      - ticket_id: "TCK-00537"
+        reason: "Needs atomic safe I/O helpers."
+  scope:
+    in_scope:
+      - "Define and implement an atomic 'commit protocol' when finishing a job:"
+      - "  1) write receipt content-addressed file"
+      - "  2) update receipt index pointer(s)"
+      - "  3) move job file claimed→done (or claimed→denied/cancelled) with atomic rename"
+      - "Ensure crash safety: after crash, reconcile can complete or rollback without losing receipts."
+      - "Emit recovery receipts if torn state is detected and repaired."
+    out_of_scope:
+      - "Distributed commit/consensus."
+  plan:
+    steps:
+      - "Implement a small transaction-like helper for these three steps."
+      - "Update worker completion paths to use it."
+      - "Add crash simulation test (kill worker mid-commit) and ensure reconcile converges."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No scenario exists where a job is marked done without its receipt present."
+      - "Receipt index does not point to missing receipts after crashes (or triggers rebuild automatically)."

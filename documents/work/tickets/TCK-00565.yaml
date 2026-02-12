@@ -1,0 +1,47 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00565"
+    title: "RFC-0028 token binding contract: bind tokens to (job_spec_digest, FacPolicyHash, canonicalizer tuple, boundary_id) + expiry"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker issues tokens."
+      - ticket_id: "TCK-00521"
+        reason: "FacPolicyHash exists."
+      - ticket_id: "TCK-00563"
+        reason: "Canonicalizer tuple commitment exists."
+      - ticket_id: "TCK-00556"
+        reason: "Boundary id is stabilized."
+  scope:
+    in_scope:
+      - "Define and enforce a token binding schema for FAC actuation tokens:"
+      - "  - request_id MUST equal job_spec_digest"
+      - "  - token MUST bind FacPolicyHash"
+      - "  - token MUST bind canonicalizer tuple digest"
+      - "  - token MUST bind boundary_id"
+      - "  - token MUST include issued_at_tick + expiry_tick (short TTL)"
+      - "Worker validation MUST deny if any binding mismatches or token expired."
+      - "Receipt MUST record token bindings used (from decoded boundary check)."
+    out_of_scope:
+      - "PCAC/AJC redesign."
+  plan:
+    steps:
+      - "Extend broker token issuance to include binding fields."
+      - "Extend worker token validation to enforce bindings."
+      - "Add tests: policy rotation invalidates old tokens; canonicalizer drift invalidates; expired token invalidates."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A token cannot be replayed across policy or canonicalization changes."
+      - "Tokens expire and workers fail-closed on expiration."

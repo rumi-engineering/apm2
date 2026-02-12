@@ -1,0 +1,40 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00518"
+    title: "Default-mode gates: enqueue+wait; add `--direct` unsafe; integrate with worker + broker"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Need broker to issue actuation tokens."
+      - ticket_id: "TCK-00511"
+        reason: "Need worker to consume queue."
+      - ticket_id: "TCK-00512"
+        reason: "Need job spec digest + actuation schema."
+  scope:
+    in_scope:
+      - "`apm2 fac gates` creates job spec, obtains token, enqueues, and waits by default."
+      - "Implement `apm2 fac gates --direct` as explicit unsafe mode that disables cache read/write and marks receipt `unsafe_direct:true`."
+      - "Implement `apm2 fac enqueue` paths to request tokens from broker."
+      - "Implement wait-for-completion using receipt presence (not process state)."
+    out_of_scope:
+      - "Distributed queue transport."
+  plan:
+    steps:
+      - "Refactor gates entrypoint to produce job specs rather than running gates inline."
+      - "Add waiter that watches done/receipt stream with bounded polling/backoff."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Default `apm2 fac gates` path exercises broker token issuance, worker claim, RFC-0029 admission, lane lease execution, and receipt emission."
+      - "Direct mode produces receipts but never writes gate cache."

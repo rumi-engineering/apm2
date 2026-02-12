@@ -1,6 +1,7 @@
 # Forge Admission Cycle (fac) Module
 
-> Evidence gates, projection compromise detection, and admission policy enforcement.
+> Evidence gates, projection compromise detection, admission policy enforcement,
+> and local broker authority for actuation tokens and economics envelopes.
 
 ## Overview
 
@@ -11,6 +12,58 @@ authoritative outcomes pinned to CAS+ledger trust roots.
 
 This module includes RFC-0028 REQ-0009 controls for projection compromise
 detection, quarantine, and replay recovery.
+
+## broker Submodule (TCK-00510)
+
+The `broker` submodule implements the FAC Broker service: the sole local
+authority for issuing actuation tokens and economics/time authority envelopes in
+default mode.
+
+### Key Types
+
+- `FacBroker`: The broker authority service. Owns an Ed25519 signing key and
+  mutable broker state (tick counter, admitted digests, horizons). Not internally
+  synchronized; callers must hold appropriate locks for concurrent access.
+- `BrokerState`: Persisted broker state including schema metadata, monotonic tick
+  counter, admitted policy digest set, freshness/revocation/convergence hashes,
+  and convergence receipts. Serialized to canonical JSON.
+- `BrokerError`: Fail-closed error taxonomy covering input validation, capacity
+  limits, persistence, and deserialization failures.
+- `BrokerSignatureVerifier`: Implements `SignatureVerifier` trait from
+  `economics::queue_admission` using the broker's Ed25519 public key. Workers use
+  this instead of `NoOpVerifier` in default mode.
+
+### Core Capabilities
+
+- RFC-0028 `ChannelContextToken` issuance bound to `job_spec_digest` + `lease_id`
+  via `issue_channel_context_token()`.
+- RFC-0029 `TimeAuthorityEnvelopeV1` issuance for `boundary_id` + evaluation
+  window via `issue_time_authority_envelope()`.
+- TP-EIO29-002 freshness horizon refs (`freshness_horizon()`) and revocation
+  frontier snapshots (`revocation_frontier()`).
+- TP-EIO29-003 convergence horizon refs (`convergence_horizon()`) and convergence
+  receipts (`convergence_receipts()`, `add_convergence_receipt()`).
+- Policy digest admission tracking (`admit_policy_digest()`,
+  `is_policy_digest_admitted()`).
+- State serialization/deserialization for persistence (`serialize_state()`,
+  `deserialize_state()`).
+- Verifying key publication (`verifying_key()`) for real signature verification.
+
+### Security Invariants (TCK-00510)
+
+- [INV-BRK-001] The broker signing key is never exposed outside the broker
+  process boundary. Only the `VerifyingKey` is published.
+- [INV-BRK-002] All issued tokens and envelopes are cryptographically signed
+  with the broker's Ed25519 key.
+- [INV-BRK-003] Fail-closed: missing, stale, or ambiguous authority state
+  results in denial.
+- [INV-BRK-004] All in-memory collections are bounded by hard `MAX_*` caps
+  (`MAX_ADMITTED_POLICY_DIGESTS=256`, `MAX_CONVERGENCE_RECEIPTS=64`).
+- [INV-BRK-005] Broker state persistence uses atomic write (temp+rename).
+- [INV-BRK-006] Horizon hashes are replay-stable (non-zero) in local-only mode
+  via domain-separated BLAKE3 hashing.
+- All hash comparisons use `subtle::ConstantTimeEq::ct_eq()` consistent with
+  INV-PC-001.
 
 ## projection_compromise Submodule
 

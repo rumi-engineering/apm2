@@ -1174,7 +1174,7 @@ pub fn validate_envelope_tp001(
 
     // Cryptographic signature verification (fail-closed when no verifier).
     let sig_verifier = verifier.unwrap_or(&NoOpVerifier);
-    let canonical = envelope_canonical_bytes(envelope);
+    let canonical = envelope_signature_canonical_bytes(envelope);
     for sig in &envelope.signature_set {
         sig_verifier.verify(&sig.signer_id, &canonical, &sig.signature)?;
     }
@@ -1188,7 +1188,7 @@ pub fn validate_envelope_tp001(
 /// length-prefixed with a 4-byte LE u32 to ensure injectivity — otherwise
 /// concatenation of different pairs can produce identical byte sequences (e.g.,
 /// `("ab","cd")` vs `("abc","d")`).
-fn envelope_canonical_bytes(envelope: &TimeAuthorityEnvelopeV1) -> Vec<u8> {
+pub(crate) fn envelope_signature_canonical_bytes(envelope: &TimeAuthorityEnvelopeV1) -> Vec<u8> {
     // Build a deterministic, injective byte representation:
     // len(boundary_id) || boundary_id || len(authority_clock) || authority_clock
     // || tick_start || tick_end || ttl_ticks || deny_on_unknown || content_hash
@@ -3042,9 +3042,9 @@ mod tests {
         let e2 = make("abc", "d");
         let e3 = make("a", "bcd");
 
-        let b1 = envelope_canonical_bytes(&e1);
-        let b2 = envelope_canonical_bytes(&e2);
-        let b3 = envelope_canonical_bytes(&e3);
+        let b1 = envelope_signature_canonical_bytes(&e1);
+        let b2 = envelope_signature_canonical_bytes(&e2);
+        let b3 = envelope_signature_canonical_bytes(&e3);
 
         assert_ne!(
             b1, b2,

@@ -1,0 +1,38 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00519"
+    title: "Nextest mandate: remove cargo-test fallbacks across all call paths; enforce caps; propagate env into bounded runner"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00515"
+        reason: "Nextest thread/jobserver policy is lane-derived."
+  scope:
+    in_scope:
+      - "Remove ALL cargo-test fallbacks (pipeline + local) and require explicit `cargo nextest run ...`."
+      - "Fail closed if nextest missing in default mode."
+      - "Enforce test caps: timeout ≤240s and MemoryMax ≤24G unless explicit unsafe override."
+      - "Set `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` based on lane policy."
+      - "Update bounded runner env allowlist to pass: `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`."
+    out_of_scope:
+      - "Nextest config redesign."
+  plan:
+    steps:
+      - "Unify test command construction in one helper used by both pipeline and local gates."
+      - "Update run_bounded_tests.sh allowlist."
+      - "Add regression tests ensuring nextest is used everywhere."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No FAC path executes `cargo test`."
+      - "Bounded test runner receives and respects computed env knobs."
