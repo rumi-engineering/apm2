@@ -150,6 +150,6 @@ pub use projection_receipt::{
     ProjectionReceipt, ProjectionReceiptBuilder, ProjectionReceiptError,
 };
 pub use worker::{
-    LedgerTailer, PrMetadata, ProjectionWorker, ProjectionWorkerConfig, ProjectionWorkerError,
-    WorkIndex,
+    AdmissionTelemetry, LedgerTailer, PrMetadata, ProjectionWorker, ProjectionWorkerConfig,
+    ProjectionWorkerError, WorkIndex, lifecycle_deny,
 };
