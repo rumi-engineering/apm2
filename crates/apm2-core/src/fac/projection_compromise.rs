@@ -339,10 +339,14 @@ impl SourceTrustSnapshotV1 {
     }
 }
 
-/// Sink identity snapshot used to bind observed projection identity.
+/// Channel-level identity snapshot used to bind observed projection identity.
+///
+/// Distinct from [`crate::economics::MultiSinkIdentitySnapshotV1`] which
+/// captures multi-sink continuity snapshots for economics gate evaluation.
+/// This type captures per-channel identity binding for compromise detection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SinkIdentitySnapshotV1 {
+pub struct ChannelIdentitySnapshotV1 {
     /// Channel identifier.
     pub channel_id: String,
     /// Digest of sink identity material (e.g. endpoint key fingerprint).
@@ -362,7 +366,7 @@ pub struct SinkIdentitySnapshotV1 {
     pub window_ref: Hash,
 }
 
-impl SinkIdentitySnapshotV1 {
+impl ChannelIdentitySnapshotV1 {
     /// Returns digest binding all sink-identity fields.
     #[must_use]
     pub fn snapshot_digest(&self) -> Hash {
@@ -724,7 +728,7 @@ pub fn quarantine_channel(
     channel: &mut ProjectionChannel,
     divergence: &ProjectionDivergence,
     source_snapshot: &SourceTrustSnapshotV1,
-    sink_snapshot: &SinkIdentitySnapshotV1,
+    sink_snapshot: &ChannelIdentitySnapshotV1,
     signal_id: impl Into<String>,
     issuer_actor_id: impl Into<String>,
     signer: &Signer,
@@ -842,7 +846,7 @@ pub fn reconstruct_projection_state(
     channel_id: &str,
     receipts: &[ProjectionReplayReceiptV1],
     source_snapshot: &SourceTrustSnapshotV1,
-    sink_snapshot: &SinkIdentitySnapshotV1,
+    sink_snapshot: &ChannelIdentitySnapshotV1,
     trusted_authority_bindings: &[AuthorityKeyBindingV1],
     sequence_bounds: ReplaySequenceBoundsV1,
 ) -> Result<ReconstructedProjectionState, ProjectionCompromiseError> {
@@ -973,7 +977,7 @@ fn validate_replay_receipt_count(
 fn validate_reconstruction_inputs(
     channel_id: &str,
     source_snapshot: &SourceTrustSnapshotV1,
-    sink_snapshot: &SinkIdentitySnapshotV1,
+    sink_snapshot: &ChannelIdentitySnapshotV1,
     trusted_authority_bindings: &[AuthorityKeyBindingV1],
     sequence_bounds: ReplaySequenceBoundsV1,
 ) -> Result<(), ProjectionCompromiseError> {
@@ -1213,7 +1217,7 @@ mod tests {
         observed_digest: Hash,
         time_authority_ref: Hash,
         window_ref: Hash,
-    ) -> (SourceTrustSnapshotV1, SinkIdentitySnapshotV1) {
+    ) -> (SourceTrustSnapshotV1, ChannelIdentitySnapshotV1) {
         (
             SourceTrustSnapshotV1 {
                 channel_id: channel_id.to_string(),
@@ -1223,7 +1227,7 @@ mod tests {
                 time_authority_ref,
                 window_ref,
             },
-            SinkIdentitySnapshotV1 {
+            ChannelIdentitySnapshotV1 {
                 channel_id: channel_id.to_string(),
                 sink_identity_digest: hash(0xAA),
                 observed_projection_digest: observed_digest,

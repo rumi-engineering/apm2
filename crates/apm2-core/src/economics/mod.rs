@@ -83,9 +83,9 @@ pub use profile::{
 };
 pub use projection_continuity::{
     ContinuityDecision, ContinuityDenyDefect, ContinuityScenarioVerdict, ContinuityVerdict,
-    DeferredReplayInput, DeferredReplayMode, DeferredReplayReceiptV1, ProjectionContinuityError,
-    ProjectionContinuityWindowV1, ProjectionSinkContinuityProfileV1, SinkIdentityEntry,
-    SinkIdentitySnapshotV1, evaluate_projection_continuity, validate_deferred_replay_boundedness,
+    DeferredReplayInput, DeferredReplayMode, DeferredReplayReceiptV1, MultiSinkIdentitySnapshotV1,
+    ProjectionContinuityError, ProjectionContinuityWindowV1, ProjectionSinkContinuityProfileV1,
+    SinkIdentityEntry, evaluate_projection_continuity, validate_deferred_replay_boundedness,
     validate_projection_continuity_tp005,
 };
 pub use queue_admission::{

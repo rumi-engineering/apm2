@@ -16,6 +16,8 @@ The `projection` module implements write-only projection adapters that synchroni
 - **`DivergenceWatchdog`**: Monitors for ledger/trunk HEAD divergence (TCK-00213)
 - **`FreezeRegistry`**: Tracks active intervention freezes
 - **`IntentBuffer`**: SQLite-backed durable buffer for projection intents and deferred replay backlog (TCK-00504)
+- **`ConfigBackedResolver`**: Config-backed continuity profile resolver for economics gate input assembly (TCK-00507)
+- **`ContinuityProfileResolver`**: Trait for resolving continuity profiles, sink snapshots, and continuity windows
 
 ### Security Model
 
@@ -202,6 +204,42 @@ pub enum IntentVerdict { Pending, Admitted, Denied }
 
 Fail-closed: unknown verdict values parsed from the database are treated as `Denied`.
 
+### `ConfigBackedResolver` (TCK-00507)
+
+```rust
+pub struct ConfigBackedResolver { /* profiles, snapshots, windows */ }
+```
+
+Config-backed continuity profile resolver for economics gate input assembly. Loads per-sink continuity profiles from daemon TOML configuration at startup. Trusted signer keys are pre-decoded and validated before the resolver is made available.
+
+**Invariants:**
+
+- [INV-CR01] All stored `trusted_signer_keys` are valid 32-byte Ed25519 public keys (validated at construction time).
+- [INV-CR02] The resolver is immutable after construction -- no runtime mutations.
+- [INV-CR03] Missing sink returns `None` (caller enforces DENY).
+
+**Contracts:**
+
+- [CTR-CR01] Construction fails if any trusted signer hex is invalid, preventing daemon startup.
+- [CTR-CR02] `resolve_*` methods are `O(1)` hash map lookups.
+- [CTR-CR03] The resolver is `Send + Sync` for concurrent access.
+
+### `ContinuityProfileResolver` (trait, TCK-00507)
+
+```rust
+pub trait ContinuityProfileResolver: Send + Sync {
+    fn resolve_continuity_profile(&self, sink_id: &str) -> Option<ResolvedContinuityProfile>;
+    fn resolve_sink_snapshot(&self, sink_id: &str) -> Option<MultiSinkIdentitySnapshotV1>;
+    fn resolve_continuity_window(&self, boundary_id: &str) -> Option<ResolvedContinuityWindow>;
+}
+```
+
+Trait boundary for resolving continuity profiles, sink snapshots, and continuity windows. All methods return `Option` -- callers MUST treat `None` as DENY (fail-closed).
+
+### `ResolvedContinuityProfile` / `ResolvedContinuityWindow` (TCK-00507)
+
+Pre-validated value types that map directly to economics module input types (`ProjectionSinkContinuityProfileV1`, `ProjectionContinuityWindowV1`) without lossy conversion.
+
 ## Public API
 
 - `ProjectionWorker`, `ProjectionWorkerConfig`, `ProjectionWorkerError`
@@ -213,20 +251,25 @@ Fail-closed: unknown verdict values parsed from the database are treated as `Den
 - `TamperEvent`, `TamperResult`
 - `WorkIndex`, `PrMetadata`, `LedgerTailer`
 - `IntentBuffer`, `IntentBufferError`, `IntentVerdict`, `ProjectionIntent`, `DeferredReplayEntry`, `MAX_BACKLOG_ITEMS`
+- `ConfigBackedResolver`, `ConfigResolverError`, `ContinuityProfileResolver`, `ResolvedContinuityProfile`, `ResolvedContinuityWindow`, `MAX_RESOLVED_PROFILES`
 
 ## Related Modules
 
 - [`apm2_daemon::gate`](../gate/AGENTS.md) -- Gate results trigger projection
 - [`apm2_daemon::cas`](../cas/AGENTS.md) -- Projection receipts stored in CAS
 - [`apm2_daemon::protocol`](../protocol/AGENTS.md) -- Ledger event emission
+- [`apm2_core::config`] -- Daemon TOML configuration schema with `ProjectionSinkProfileConfig`
+- [`apm2_core::economics::projection_continuity`] -- Economics module types that resolver feeds into
 
 ## References
 
 - RFC-0015: Forge Admission Cycle (FAC) -- projection adapters
 - RFC-0019: Automated FAC v0 -- projection worker (Workstream F)
+- RFC-0029: External IO Efficiency -- economics gate input assembly
 - TCK-00212: GitHub projection adapter
 - TCK-00213: Divergence watchdog
 - TCK-00214: Tamper detection
 - TCK-00322: Projection worker implementation
 - TCK-00504: Projection intent schema and durable buffer for economics-gated admission
 - TCK-00506: Projection receipt format bridge for economics gate compatibility
+- TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly

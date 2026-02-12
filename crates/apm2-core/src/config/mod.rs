@@ -79,6 +79,14 @@ impl EcosystemConfig {
             .adapter_rotation
             .validate()
             .map_err(ConfigError::Validation)?;
+        // TCK-00507: Validate projection sink profiles at startup.
+        // Invalid trusted signer keys must prevent daemon start, not
+        // silently produce DENY at runtime.
+        config
+            .daemon
+            .projection
+            .validate_sink_profiles()
+            .map_err(ConfigError::Validation)?;
         Ok(config)
     }
 
@@ -349,6 +357,192 @@ pub struct ProjectionConfig {
     /// automatically with mode 0600 if it does not exist.
     #[serde(default)]
     pub signer_key_file: Option<PathBuf>,
+
+    /// Per-sink continuity profiles for economics gate input assembly
+    /// (TCK-00507).
+    ///
+    /// Maps sink identifiers to their continuity parameters. Each sink
+    /// profile declares outage/replay windows, churn/partition tolerance,
+    /// and trusted signer keys that feed into the economics gate evaluator.
+    ///
+    /// Trusted signer keys are validated at config parse time (startup).
+    /// Invalid hex encoding, wrong key length, or empty signer lists
+    /// cause a startup-fatal validation error to prevent fail-open
+    /// behavior at runtime.
+    #[serde(default)]
+    pub sinks: HashMap<String, ProjectionSinkProfileConfig>,
+}
+
+/// Maximum number of configured projection sinks (denial-of-service bound).
+pub const MAX_PROJECTION_SINKS: usize = 64;
+
+/// Maximum number of trusted signers per sink profile (denial-of-service
+/// bound).
+pub const MAX_TRUSTED_SIGNERS_PER_SINK: usize = 32;
+
+/// Maximum length of a sink identifier string (references economics
+/// domain constant for consistency).
+pub const MAX_SINK_ID_CONFIG_LENGTH: usize =
+    crate::economics::projection_continuity::MAX_SINK_ID_LENGTH;
+
+/// Per-sink continuity profile configuration (TCK-00507).
+///
+/// Defines the continuity parameters for a single projection sink.
+/// These values map directly to economics module input types
+/// ([`crate::economics::ProjectionContinuityWindowV1`] fields) without
+/// lossy conversion.
+///
+/// # TOML Example
+///
+/// ```toml
+/// [daemon.projection.sinks.github-primary]
+/// outage_window_ticks = 3600000000
+/// replay_window_ticks = 7200000000
+/// churn_tolerance = 3
+/// partition_tolerance = 2
+/// trusted_signers = [
+///     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+/// ]
+/// ```
+///
+/// # Security
+///
+/// `trusted_signers` entries are hex-encoded Ed25519 public keys (32 bytes
+/// = 64 hex chars). Validation is performed eagerly at config parse time:
+/// - Odd-length hex strings are rejected.
+/// - Non-hex characters are rejected.
+/// - Keys that are not exactly 32 bytes after decoding are rejected.
+/// - An empty `trusted_signers` list is rejected.
+///
+/// Invalid keys prevent daemon startup rather than silently producing
+/// DENY verdicts at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionSinkProfileConfig {
+    /// Outage window duration in HTF ticks.
+    ///
+    /// Maps to `ProjectionContinuityWindowV1` outage window span.
+    pub outage_window_ticks: u64,
+
+    /// Replay window duration in HTF ticks.
+    ///
+    /// Maps to `ProjectionContinuityWindowV1` replay window span.
+    pub replay_window_ticks: u64,
+
+    /// Maximum number of sink identity churn events tolerated within the
+    /// outage window before continuity is denied.
+    pub churn_tolerance: u32,
+
+    /// Maximum number of network partition events tolerated within the
+    /// outage window before continuity is denied.
+    pub partition_tolerance: u32,
+
+    /// Hex-encoded Ed25519 public keys of trusted signers for this sink.
+    ///
+    /// Each entry must be exactly 64 hex characters (32 bytes).
+    /// Validated at config parse time -- invalid entries prevent daemon
+    /// startup.
+    pub trusted_signers: Vec<String>,
+}
+
+impl ProjectionConfig {
+    /// Validates all configured sink profiles at startup (TCK-00507).
+    ///
+    /// Enforces:
+    /// - Sink count within [`MAX_PROJECTION_SINKS`].
+    /// - Sink ID is non-empty and within [`MAX_SINK_ID_CONFIG_LENGTH`].
+    /// - Each sink has at least one trusted signer.
+    /// - Trusted signer count within [`MAX_TRUSTED_SIGNERS_PER_SINK`].
+    /// - Each trusted signer is valid hex encoding of exactly 32 bytes.
+    /// - Outage/replay window ticks are non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the first validation failure.
+    /// Invalid keys prevent daemon startup (fail-closed).
+    pub fn validate_sink_profiles(&self) -> Result<(), String> {
+        let sink_count = self.sinks.len();
+        if sink_count > MAX_PROJECTION_SINKS {
+            return Err(format!(
+                "daemon.projection.sinks: too many sinks ({sink_count} > {MAX_PROJECTION_SINKS})",
+            ));
+        }
+        for (sink_id, profile) in &self.sinks {
+            if sink_id.is_empty() || sink_id.len() > MAX_SINK_ID_CONFIG_LENGTH {
+                return Err(format!(
+                    "daemon.projection.sinks: sink_id '{sink_id}' is empty or exceeds {MAX_SINK_ID_CONFIG_LENGTH} chars",
+                ));
+            }
+            if profile.outage_window_ticks == 0 {
+                return Err(format!(
+                    "daemon.projection.sinks.{sink_id}: outage_window_ticks must be > 0",
+                ));
+            }
+            if profile.replay_window_ticks == 0 {
+                return Err(format!(
+                    "daemon.projection.sinks.{sink_id}: replay_window_ticks must be > 0",
+                ));
+            }
+            if profile.trusted_signers.is_empty() {
+                return Err(format!(
+                    "daemon.projection.sinks.{sink_id}: trusted_signers must not be empty",
+                ));
+            }
+            let signer_count = profile.trusted_signers.len();
+            if signer_count > MAX_TRUSTED_SIGNERS_PER_SINK {
+                return Err(format!(
+                    "daemon.projection.sinks.{sink_id}: too many trusted_signers ({signer_count} > {MAX_TRUSTED_SIGNERS_PER_SINK})",
+                ));
+            }
+            for (i, hex_key) in profile.trusted_signers.iter().enumerate() {
+                validate_trusted_signer_hex(sink_id, i, hex_key)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates a single hex-encoded Ed25519 public key at config parse time.
+///
+/// # Errors
+///
+/// Returns descriptive error for:
+/// - Odd-length hex strings
+/// - Non-hex characters
+/// - Decoded key not exactly 32 bytes
+fn validate_trusted_signer_hex(sink_id: &str, index: usize, hex_key: &str) -> Result<(), String> {
+    // Check for odd length before attempting decode (specific error).
+    let hex_len = hex_key.len();
+    if hex_len % 2 != 0 {
+        return Err(format!(
+            "daemon.projection.sinks.{sink_id}: trusted_signers[{index}] \
+             has odd-length hex ({hex_len} chars)",
+        ));
+    }
+    let bytes = hex::decode(hex_key).map_err(|e| {
+        format!(
+            "daemon.projection.sinks.{sink_id}: trusted_signers[{index}] \
+             invalid hex: {e}",
+        )
+    })?;
+    let byte_len = bytes.len();
+    if byte_len != 32 {
+        return Err(format!(
+            "daemon.projection.sinks.{sink_id}: trusted_signers[{index}] \
+             decoded to {byte_len} bytes, expected 32",
+        ));
+    }
+    // Validate the key is a valid Ed25519 point (not just any 32 bytes).
+    // This catches keys that decode to valid-length bytes but are not
+    // valid curve points.
+    let key_bytes: [u8; 32] = bytes.try_into().expect("length checked above");
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
+        format!(
+            "daemon.projection.sinks.{sink_id}: trusted_signers[{index}] \
+             not a valid Ed25519 public key: {e}",
+        )
+    })?;
+    Ok(())
 }
 
 fn default_github_api_url() -> String {

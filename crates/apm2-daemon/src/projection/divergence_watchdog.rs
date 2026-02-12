@@ -69,10 +69,10 @@ use apm2_core::events::{
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
 };
 use apm2_core::fac::{
-    AuthorityKeyBindingV1, INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX,
-    ProjectionChannel, ProjectionCompromiseSignalV1, ProjectionReplayReceiptV1,
-    ProjectionSurfaceType, ReconstructedProjectionState, ReplaySequenceBoundsV1,
-    SinkIdentitySnapshotV1, SourceTrustSnapshotV1, detect_projection_divergence,
+    AuthorityKeyBindingV1, ChannelIdentitySnapshotV1, INTERVENTION_FREEZE_PREFIX,
+    INTERVENTION_UNFREEZE_PREFIX, ProjectionChannel, ProjectionCompromiseSignalV1,
+    ProjectionReplayReceiptV1, ProjectionSurfaceType, ReconstructedProjectionState,
+    ReplaySequenceBoundsV1, SourceTrustSnapshotV1, detect_projection_divergence,
     quarantine_channel, reconstruct_projection_state, sign_with_domain, verify_with_domain,
 };
 use apm2_holon::defect::{DefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType};
@@ -377,7 +377,7 @@ pub struct DivergenceResult {
     /// Source trust snapshot (CAS+ledger rooted expectation).
     pub source_trust_snapshot: SourceTrustSnapshotV1,
     /// Sink identity snapshot (observed projection identity).
-    pub sink_identity_snapshot: SinkIdentitySnapshotV1,
+    pub sink_identity_snapshot: ChannelIdentitySnapshotV1,
     /// Durable replay receipt for reconstruction checks.
     pub replay_receipt: ProjectionReplayReceiptV1,
 }
@@ -588,7 +588,7 @@ impl TimeAuthorityEnvelopeV1 {
 struct ProjectionRecoveryState {
     channel_id: String,
     source_snapshot: SourceTrustSnapshotV1,
-    sink_snapshot: SinkIdentitySnapshotV1,
+    sink_snapshot: ChannelIdentitySnapshotV1,
     receipts: Vec<ProjectionReplayReceiptV1>,
     replay_sequence_bounds: ReplaySequenceBoundsV1,
     time_authority_envelope: TimeAuthorityEnvelopeV1,
@@ -2871,7 +2871,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             time_authority_ref,
             window_ref,
         };
-        let sink_identity_snapshot = SinkIdentitySnapshotV1 {
+        let sink_identity_snapshot = ChannelIdentitySnapshotV1 {
             channel_id: self.config.repo_id.clone(),
             sink_identity_digest,
             observed_projection_digest: actual_head,
