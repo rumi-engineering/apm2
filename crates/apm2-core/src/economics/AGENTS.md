@@ -1,6 +1,6 @@
 # Economics Module
 
-> Canonical economics profiles, deterministic budget admission (REQ-0001), and HTF-bound queue admission with anti-entropy anti-starvation enforcement (REQ-0004) for RFC-0029.
+> Canonical economics profiles, deterministic budget admission (REQ-0001), HTF-bound queue admission with anti-entropy anti-starvation enforcement (REQ-0004), and projection multi-sink outage continuity with deferred replay boundedness (REQ-0009) for RFC-0029.
 
 ## Overview
 
@@ -478,13 +478,98 @@ The `optimization_gate` submodule implements security-interlocked optimization g
 - `validate_arbitration_outcome(outcome)` -- Arbitration binding gate
 - `evaluate_optimization_gate(proposal, countermetric_profile, evidence_quality, authority_surface_evidence, arbitration_outcome, current_tick, max_evidence_age_ticks)` -- Combined gate evaluation
 
+## Projection Continuity (REQ-0009)
+
+The `projection_continuity` submodule implements projection multi-sink outage continuity and deferred replay boundedness (RFC-0029 REQ-0009).
+
+### Overview
+
+Ensures FAC authoritative progression remains admissible during projection sink outage, churn, and partition scenarios. Projection intents are durably buffered and replayed idempotently after sink recovery within declared replay windows.
+
+### Receipt and Window Types
+
+- `ProjectionContinuityWindowV1` -- Signed declaration of outage and replay horizons with tick ranges, boundary binding, and Ed25519 domain-separated signature (`PROJECTION_CONTINUITY_WINDOW:` prefix).
+- `ProjectionSinkContinuityProfileV1` -- Signed per-sink-set scenario evaluation profile with individual scenario verdicts and content hash. Uses `PROJECTION_SINK_CONTINUITY_PROFILE:` domain prefix.
+- `DeferredReplayReceiptV1` -- Signed receipt proving deferred replay convergence within a declared replay window. Uses `DEFERRED_REPLAY_RECEIPT:` domain prefix.
+- `SinkIdentitySnapshotV1` -- Sink identity set snapshot with content digest for binding.
+- `SinkIdentityEntry` -- Individual sink identity entry with ID, role, and content hash.
+- `ContinuityScenarioVerdict` -- Per-scenario verdict tuple (scenario_id, scenario_digest, truth_plane_continued, backlog_bounded).
+
+### Temporal Predicates
+
+- **TP-EIO29-005** (`projection_multi_sink_continuity_valid`): Combined multi-sink continuity gate. Enforces:
+  - Window presence, structural validity, signature verification, trusted signer enforcement
+  - Profile presence, structural validity, signature verification, trusted signer enforcement
+  - Sink snapshot presence and structural validity
+  - Boundary binding, time authority reference binding, and window reference binding
+  - Per-scenario truth-plane progression and backlog boundedness
+  - Sink snapshot digest binding to profile
+
+### Deferred Replay Validation
+
+- `validate_deferred_replay_boundedness()` validates:
+  - Receipt structural validity and Ed25519 signature verification
+  - Trusted signer enforcement via constant-time comparison
+  - Boundary, time authority reference, and window reference binding
+  - Convergence status (not-converged denied fail-closed)
+  - Retention bounds (backlog_items <= MAX_BACKLOG_ITEMS)
+  - Duplicate receipt ID detection (prevents signature amplification)
+  - Backlog digest binding to evaluation context
+
+### Key Types
+
+- `DeferredReplayInput` -- Complete input for deferred replay evaluation
+- `DeferredReplayMode` -- Typed enum (`Inactive` / `Active(&DeferredReplayInput)`) preventing fail-open bypass via Option
+- `ContinuityDecision` -- Combined verdict with structured deny defect
+- `ContinuityVerdict` -- Allow / Deny enum
+- `ContinuityDenyDefect` -- Auditable deny defect with reason, predicate ID, boundary, tick, and hash bindings
+- `ProjectionContinuityError` -- Structured error type for all module operations
+
+### Invariants
+
+- [INV-PC01] All unknown, missing, stale, unsigned, or invalid continuity states deny fail-closed.
+- [INV-PC02] Domain-separated signatures prevent cross-receipt-type replay (three distinct prefixes).
+- [INV-PC03] TP-EIO29-005 verifies Ed25519 signatures on windows and profiles (not just structural form).
+- [INV-PC04] Trusted signer enforcement uses constant-time comparison (`subtle::ConstantTimeEq`).
+- [INV-PC05] Sink identity and scenario verdict collections are hard-capped (MAX_SINK_IDENTITIES=64, MAX_SCENARIO_VERDICTS=256).
+- [INV-PC06] Deferred replay receipts are hard-capped (MAX_DEFERRED_REPLAY_RECEIPTS=256).
+- [INV-PC07] All protocol-boundary `String` and `Vec` fields use bounded serde deserializers (Check-Before-Allocate pattern).
+- [INV-PC08] `DeferredReplayMode` forces callers to explicitly declare replay intent; `Option`-based bypass is eliminated.
+- [INV-PC09] `create_signed` methods validate string field lengths BEFORE allocation to prevent DoS via oversized input.
+- [INV-PC10] Context binding (boundary_id, time_authority_ref, window_ref, backlog_digest) uses constant-time comparison.
+- [INV-PC11] Duplicate receipt IDs in deferred replay evaluation are rejected to prevent signature amplification attacks.
+- [INV-PC12] Zero hash fields (content_hash, signer, outage_window_ref, replay_window_ref, time_authority_ref, window_ref) deny fail-closed.
+
+### Contracts
+
+- [CTR-PC01] `validate_projection_continuity_tp005()` enforces window/profile/snapshot presence, structural validity, signature verification, trusted signer enforcement, context binding, and per-scenario truth-plane/backlog checks.
+- [CTR-PC02] `validate_deferred_replay_boundedness()` enforces receipt presence, structural validity, Ed25519 signature verification, trusted signer enforcement, context binding, convergence status, retention bounds, and duplicate ID detection.
+- [CTR-PC03] `evaluate_projection_continuity()` combines TP-EIO29-005 and deferred replay (via `DeferredReplayMode`) into a single admission decision with structured deny defects.
+- [CTR-PC04] All deny decisions produce a `ContinuityDenyDefect` with stable reason code, predicate ID, boundary, tick, and hash bindings.
+- [CTR-PC05] `create_signed` methods validate string field lengths BEFORE allocating to prevent unbounded memory allocation.
+
+### Public API
+
+- `ProjectionContinuityWindowV1::create_signed(window_id, ...)` -- Create and sign a continuity window (validates before allocating)
+- `ProjectionContinuityWindowV1::verify_signature()` -- Verify window Ed25519 signature
+- `ProjectionContinuityWindowV1::validate()` -- Structural validation (no signature check)
+- `ProjectionSinkContinuityProfileV1::create_signed(profile_id, ...)` -- Create and sign a continuity profile (validates before allocating)
+- `ProjectionSinkContinuityProfileV1::verify_signature()` -- Verify profile Ed25519 signature
+- `ProjectionSinkContinuityProfileV1::validate()` -- Structural validation
+- `DeferredReplayReceiptV1::create_signed(receipt_id, ...)` -- Create and sign a deferred replay receipt (validates before allocating)
+- `DeferredReplayReceiptV1::verify_signature()` -- Verify receipt Ed25519 signature
+- `DeferredReplayReceiptV1::validate()` -- Structural validation
+- `validate_projection_continuity_tp005(window, profile, snapshot, ...)` -- TP-EIO29-005 validation (multi-sink continuity gate)
+- `validate_deferred_replay_boundedness(receipts, ...)` -- Deferred replay boundedness validation
+- `evaluate_projection_continuity(window, profile, snapshot, ..., deferred_replay: &DeferredReplayMode)` -- Combined TP-EIO29-005 + deferred replay evaluation
+
 ## Related Modules
 
 - [`apm2_core::evidence`](../evidence/AGENTS.md) -- CAS (`ContentAddressedStore`, `MemoryCas`) used for profile storage
 - [`apm2_core::crypto`](../crypto/AGENTS.md) -- BLAKE3 hashing for profile content addressing; Ed25519 signing for receipt signatures
 - [`apm2_core::determinism`](../determinism/AGENTS.md) -- `canonicalize_json` used for deterministic serialization
 - [`apm2_core::budget`](../budget/AGENTS.md) -- Budget tracking and enforcement at the session level
-- [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/004/007/008/009) used for predicate tracking in admission traces
+- [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/004/005/007/008/009) used for predicate tracking in admission traces
 - [`apm2_core::fac::domain_separator`](../fac/AGENTS.md) -- `sign_with_domain` / `verify_with_domain` for domain-separated receipt signatures
 
 ## References

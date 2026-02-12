@@ -18,10 +18,13 @@
 //!   evidence quality enforcement
 //! - REQ-0008: authority-surface monotonicity and direct-GitHub non-regression
 //!   enforcement for optimization candidates
+//! - REQ-0009: projection multi-sink outage continuity and deferred replay
+//!   boundedness with TP-EIO29-005 enforcement
 
 pub mod admission;
 pub mod optimization_gate;
 pub mod profile;
+pub mod projection_continuity;
 pub mod queue_admission;
 pub mod replay_recovery;
 
@@ -60,6 +63,13 @@ pub use optimization_gate::{
 pub use profile::{
     BudgetEntry, ECONOMICS_PROFILE_HASH_DOMAIN, EconomicsProfile, EconomicsProfileError,
     EconomicsProfileInputState, LifecycleCostVector,
+};
+pub use projection_continuity::{
+    ContinuityDecision, ContinuityDenyDefect, ContinuityScenarioVerdict, ContinuityVerdict,
+    DeferredReplayInput, DeferredReplayMode, DeferredReplayReceiptV1, ProjectionContinuityError,
+    ProjectionContinuityWindowV1, ProjectionSinkContinuityProfileV1, SinkIdentityEntry,
+    SinkIdentitySnapshotV1, evaluate_projection_continuity, validate_deferred_replay_boundedness,
+    validate_projection_continuity_tp005,
 };
 pub use queue_admission::{
     AntiEntropyAdmissionRequest, AntiEntropyBudget, AntiEntropyDirection, ConvergenceHorizonRef,
