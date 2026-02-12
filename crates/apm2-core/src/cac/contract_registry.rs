@@ -1970,6 +1970,13 @@ fn default_contract_registry_entries() -> Vec<ContractObjectRegistryEntry> {
             SIGNATURE_SET_REQUIRED_REF,
             WINDOW_OR_TTL_REQUIRED_REF,
         ),
+        default_registry_entry(
+            "OptimizationGateDecisionV1",
+            "optimization.gate.decision",
+            "apm2.optimization_gate_decision.v1",
+            SIGNATURE_SET_REQUIRED_REF,
+            WINDOW_OR_TTL_REQUIRED_REF,
+        ),
     ]
 }
 
@@ -2022,6 +2029,7 @@ const REQUIRED_CONTRACT_SCHEMA_IDS: &[&str] = &[
     "apm2.post_compromise_recovery_receipt.v1",
     "apm2.operator_safety_guard_profile.v1",
     "apm2.anti_entropy_convergence_receipt.v1",
+    "apm2.optimization_gate_decision.v1",
 ];
 
 fn expected_required_row_bindings() -> HashMap<String, ContractObjectRegistryEntry> {
