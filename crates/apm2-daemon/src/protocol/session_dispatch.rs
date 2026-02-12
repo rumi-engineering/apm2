@@ -8596,9 +8596,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             request_id: admission_res.bundle.request_id,
                             session_id: admission_res.bundle.session_id.clone(),
                             ht_end: post_effect_tick,
-                            measured_values: vec![
-                                *blake3::hash(b"apm2-witness-leakage-measurement-v1").as_bytes(),
-                            ],
+                            measured_values: vec![{
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"apm2-witness-leakage-measurement-v1");
+                                h.update(b"effect_duration_ticks");
+                                h.update(
+                                    &post_effect_tick
+                                        .saturating_sub(admission_res.bundle.freshness_witness_tick)
+                                        .to_le_bytes(),
+                                );
+                                h.update(b"tool_class");
+                                h.update(tool_class.to_string().as_bytes());
+                                *h.finalize().as_bytes()
+                            }],
                             provider_id: kernel.witness_provider.provider_id.clone(),
                             provider_build_digest: kernel.witness_provider.provider_build_digest,
                         };
@@ -8608,9 +8618,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             request_id: admission_res.bundle.request_id,
                             session_id: admission_res.bundle.session_id.clone(),
                             ht_end: post_effect_tick,
-                            measured_values: vec![
-                                *blake3::hash(b"apm2-witness-timing-measurement-v1").as_bytes(),
-                            ],
+                            measured_values: vec![{
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"apm2-witness-timing-measurement-v1");
+                                h.update(b"pre_effect_tick");
+                                h.update(
+                                    &admission_res.bundle.freshness_witness_tick.to_le_bytes(),
+                                );
+                                h.update(b"post_effect_tick");
+                                h.update(&post_effect_tick.to_le_bytes());
+                                *h.finalize().as_bytes()
+                            }],
                             provider_id: kernel.witness_provider.provider_id.clone(),
                             provider_build_digest: kernel.witness_provider.provider_build_digest,
                         };
@@ -8703,12 +8721,114 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                             format!("boundary output release denied: {e}"),
                                         ));
                                     } else {
-                                        info!(
-                                            session_id = %token.session_id,
-                                            tool_class = %tool_class,
-                                            evidence_count = evidence_hashes.len(),
-                                            "post-effect witness closure complete: boundary output released"
-                                        );
+                                        // ================================================
+                                        // MAJOR 1 FIX: Construct, validate, and persist
+                                        // AdmissionOutcomeIndexV1 after successful
+                                        // release_boundary_output. This durably binds the
+                                        // post-effect witness evidence hashes into an
+                                        // authoritative artifact (fail-closed).
+                                        // ================================================
+                                        let outcome_index =
+                                            crate::admission_kernel::types::AdmissionOutcomeIndexV1 {
+                                                schema_version:
+                                                    crate::admission_kernel::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+                                                bundle_digest: admission_res.bundle_digest,
+                                                request_id: admission_res.bundle.request_id,
+                                                ajc_id: admission_res.bundle.ajc_id,
+                                                post_effect_witness_evidence_hashes:
+                                                    evidence_hashes.clone(),
+                                                receipt_digests: vec![],
+                                            };
+
+                                        if let Err(e) = outcome_index.validate() {
+                                            warn!(
+                                                session_id = %token.session_id,
+                                                error = %e,
+                                                "AdmissionOutcomeIndexV1 validation failed (fail-closed)"
+                                            );
+                                            response = Ok(SessionResponse::error(
+                                                SessionErrorCode::SessionErrorInternal,
+                                                format!(
+                                                    "post-effect outcome index validation failed: {e}"
+                                                ),
+                                            ));
+                                        } else {
+                                            let outcome_bytes = match outcome_index
+                                                .to_canonical_bytes()
+                                            {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    warn!(
+                                                        session_id = %token.session_id,
+                                                        error = %e,
+                                                        "AdmissionOutcomeIndexV1 serialization failed (fail-closed)"
+                                                    );
+                                                    response = Ok(SessionResponse::error(
+                                                        SessionErrorCode::SessionErrorInternal,
+                                                        format!(
+                                                            "post-effect outcome index serialization failed: {e}"
+                                                        ),
+                                                    ));
+                                                    // Skip ledger emit on serialization failure.
+                                                    Vec::new()
+                                                },
+                                            };
+
+                                            if !outcome_bytes.is_empty() {
+                                                if let Some(ref ledger) = self.ledger {
+                                                    let outcome_ts_ns =
+                                                        self.get_htf_timestamp().map_or_else(
+                                                            |_| {
+                                                                post_effect_tick
+                                                                    .saturating_mul(1_000_000_000)
+                                                            },
+                                                            |ts| ts.wall_ns,
+                                                        );
+                                                    if let Err(e) = ledger.emit_session_event(
+                                                        &token.session_id,
+                                                        "post_effect_witness_outcome_index",
+                                                        &outcome_bytes,
+                                                        "admission_kernel:witness_closure",
+                                                        outcome_ts_ns,
+                                                    ) {
+                                                        warn!(
+                                                            session_id = %token.session_id,
+                                                            error = %e,
+                                                            "AdmissionOutcomeIndexV1 ledger persistence failed (fail-closed)"
+                                                        );
+                                                        response = Ok(SessionResponse::error(
+                                                            SessionErrorCode::SessionErrorInternal,
+                                                            format!(
+                                                                "post-effect outcome index persistence failed: {e}"
+                                                            ),
+                                                        ));
+                                                    } else {
+                                                        info!(
+                                                            session_id = %token.session_id,
+                                                            tool_class = %tool_class,
+                                                            evidence_count = evidence_hashes.len(),
+                                                            outcome_index_digest = %hex::encode(outcome_index.content_hash()),
+                                                            bundle_digest = %hex::encode(outcome_index.bundle_digest),
+                                                            "post-effect witness closure complete: \
+                                                             boundary output released, outcome index persisted"
+                                                        );
+                                                    }
+                                                } else {
+                                                    // Fail-closed tier without ledger: cannot
+                                                    // persist outcome index evidence.
+                                                    warn!(
+                                                        session_id = %token.session_id,
+                                                        "AdmissionOutcomeIndexV1 denied: \
+                                                         ledger unavailable for fail-closed tier"
+                                                    );
+                                                    response = Ok(SessionResponse::error(
+                                                        SessionErrorCode::SessionErrorInternal,
+                                                        "post-effect outcome index persistence \
+                                                         failed: ledger unavailable for fail-closed tier",
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                 },
                                 Some(Err(ref e)) => {
