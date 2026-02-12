@@ -34,7 +34,9 @@ pub use queue_admission::{
 };
 pub use replay_recovery::{
     AdjacentWindowPair, BacklogState, IdempotencyCheckInput, IdempotencyMode,
-    RecoveryAdmissibilityReceiptV1, ReplayConvergenceHorizonRef, ReplayConvergenceReceiptV1,
-    ReplayRecoveryDecision, ReplayRecoveryDenyDefect, ReplayRecoveryError, ReplayRecoveryVerdict,
-    evaluate_replay_recovery, validate_replay_convergence_tp004, validate_replay_idempotency_tp007,
+    RecoveryAdmissibilityReceiptV1, RecoveryCheckInput, RecoveryMode, ReplayConvergenceHorizonRef,
+    ReplayConvergenceReceiptV1, ReplayRecoveryDecision, ReplayRecoveryDenyDefect,
+    ReplayRecoveryError, ReplayRecoveryVerdict, evaluate_replay_recovery,
+    validate_recovery_admissibility, validate_replay_convergence_tp004,
+    validate_replay_idempotency_tp007,
 };
