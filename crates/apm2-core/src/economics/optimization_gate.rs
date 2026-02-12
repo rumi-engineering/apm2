@@ -1,7 +1,9 @@
 // AGENT-AUTHORED
-//! Security-interlocked optimization gates, quantitative evidence quality
-//! enforcement (RFC-0029 REQ-0006), and authority-surface monotonicity
-//! enforcement (RFC-0029 REQ-0008).
+//! Security-interlocked optimization gates.
+//!
+//! Quantitative evidence quality enforcement (RFC-0029 REQ-0006),
+//! authority-surface monotonicity enforcement (RFC-0029 REQ-0008),
+//! and disclosure-control interlock non-regression (RFC-0029 REQ-0007).
 //!
 //! This module enforces the following interlock contracts:
 //!
@@ -35,6 +37,13 @@
 //! 7. **Authority-surface evidence requirement** (REQ-0008): every optimization
 //!    must carry authoritative capability-surface diff evidence. Missing,
 //!    stale, or ambiguous evidence fails closed to deny.
+//!
+//! 8. **Disclosure-control interlock** (REQ-0007): optimization decisions are
+//!    bound to signed disclosure-control policy snapshots. Phase-qualified
+//!    disclosure policy mode matching is enforced. Patent/provisional and
+//!    unapproved disclosure channels are denied in `TRADE_SECRET_ONLY` mode.
+//!    Unknown, stale, missing, or ambiguous disclosure-control state fails
+//!    closed to deny.
 //!
 //! # Security Model
 //!
@@ -110,6 +119,31 @@ pub const MAX_SURFACE_CAPABILITY_ID_LENGTH: usize = 256;
 
 /// Maximum age in ticks for authority-surface evidence freshness.
 pub const MAX_AUTHORITY_SURFACE_EVIDENCE_AGE_TICKS: u64 = 500;
+
+/// Maximum length for a phase ID in disclosure-control policy snapshots.
+pub const MAX_PHASE_ID_LENGTH: usize = 256;
+
+/// Maximum length for a disclosure channel class name.
+pub const MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH: usize = 256;
+
+/// Maximum number of approved disclosure channel classes in a policy snapshot.
+pub const MAX_APPROVED_DISCLOSURE_CHANNELS: usize = 64;
+
+/// Maximum age in ticks for disclosure-control policy epoch freshness.
+pub const MAX_DISCLOSURE_POLICY_AGE_TICKS: u64 = 500;
+
+/// Forbidden disclosure channel classes under `TRADE_SECRET_ONLY` mode.
+///
+/// Patent and provisional workflow channels are unconditionally denied
+/// when the current disclosure policy mode is `TradeSecretOnly`.
+pub const FORBIDDEN_TRADE_SECRET_CHANNEL_CLASSES: &[&str] = &[
+    "patent_filing",
+    "provisional_application",
+    "patent_prosecution",
+    "patent_licensing",
+    "patent_assignment",
+    "provisional_disclosure",
+];
 
 // ---------------------------------------------------------------------------
 // Deny reason constants
@@ -213,6 +247,52 @@ pub const DENY_AUTHORITY_SURFACE_ROLE_ID_EMPTY: &str =
 
 /// Deny: authority-surface diff content digest is zero.
 pub const DENY_AUTHORITY_SURFACE_DIGEST_ZERO: &str = "optimization_authority_surface_digest_zero";
+
+/// Deny: disclosure-control policy snapshot is missing.
+pub const DENY_DISCLOSURE_POLICY_MISSING: &str = "optimization_disclosure_policy_missing";
+
+/// Deny: disclosure-control policy snapshot is stale.
+pub const DENY_DISCLOSURE_POLICY_STALE: &str = "optimization_disclosure_policy_stale";
+
+/// Deny: disclosure-control policy snapshot is ambiguous.
+pub const DENY_DISCLOSURE_POLICY_AMBIGUOUS: &str = "optimization_disclosure_policy_ambiguous";
+
+/// Deny: disclosure-control policy state is unknown.
+pub const DENY_DISCLOSURE_POLICY_UNKNOWN: &str = "optimization_disclosure_policy_unknown";
+
+/// Deny: disclosure-control policy snapshot is unsigned.
+pub const DENY_DISCLOSURE_POLICY_UNSIGNED: &str = "optimization_disclosure_policy_unsigned";
+
+/// Deny: disclosure-control policy snapshot has zero signature.
+pub const DENY_DISCLOSURE_POLICY_SIGNATURE_ZERO: &str =
+    "optimization_disclosure_policy_signature_zero";
+
+/// Deny: disclosure-control policy snapshot has zero policy digest.
+pub const DENY_DISCLOSURE_POLICY_DIGEST_ZERO: &str = "optimization_disclosure_policy_digest_zero";
+
+/// Deny: disclosure-control policy snapshot has empty phase ID.
+pub const DENY_DISCLOSURE_POLICY_PHASE_ID_EMPTY: &str =
+    "optimization_disclosure_policy_phase_id_empty";
+
+/// Deny: disclosure-control policy epoch tick is ahead of current tick.
+pub const DENY_DISCLOSURE_POLICY_FUTURE_TICK: &str = "optimization_disclosure_policy_future_tick";
+
+/// Deny: disclosure-control policy mode mismatch between proposal and snapshot.
+pub const DENY_DISCLOSURE_MODE_MISMATCH: &str = "optimization_disclosure_mode_mismatch";
+
+/// Deny: patent/provisional channel attempted under `TRADE_SECRET_ONLY` mode.
+pub const DENY_TRADE_SECRET_PATENT_CHANNEL: &str =
+    "optimization_trade_secret_patent_channel_denied";
+
+/// Deny: unapproved disclosure channel class in optimization proposal.
+pub const DENY_UNAPPROVED_DISCLOSURE_CHANNEL: &str = "optimization_unapproved_disclosure_channel";
+
+/// Deny: approved disclosure channels list exceeds maximum size.
+pub const DENY_DISCLOSURE_CHANNELS_OVERFLOW: &str = "optimization_disclosure_channels_overflow";
+
+/// Deny: proposal disclosure channels list exceeds maximum size.
+pub const DENY_PROPOSAL_DISCLOSURE_CHANNELS_OVERFLOW: &str =
+    "optimization_proposal_disclosure_channels_overflow";
 
 // ---------------------------------------------------------------------------
 // Bounded serde deserializers
@@ -374,6 +454,134 @@ where
     Ok(value)
 }
 
+fn deserialize_bounded_phase_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX_PHASE_ID_LENGTH {
+        return Err(serde::de::Error::custom(format!(
+            "phase_id length {} exceeds maximum {}",
+            value.len(),
+            MAX_PHASE_ID_LENGTH,
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_bounded_disclosure_channels<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let channels = BTreeSet::<String>::deserialize(deserializer)?;
+    if channels.len() > MAX_APPROVED_DISCLOSURE_CHANNELS {
+        return Err(serde::de::Error::custom(format!(
+            "disclosure_channels length {} exceeds maximum {}",
+            channels.len(),
+            MAX_APPROVED_DISCLOSURE_CHANNELS,
+        )));
+    }
+    for ch in &channels {
+        if ch.len() > MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH {
+            return Err(serde::de::Error::custom(format!(
+                "disclosure_channel_class length {} exceeds maximum {}",
+                ch.len(),
+                MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH,
+            )));
+        }
+    }
+    Ok(channels)
+}
+
+// ---------------------------------------------------------------------------
+// Disclosure-control policy types (REQ-0007)
+// ---------------------------------------------------------------------------
+
+/// Disclosure policy mode for a phase.
+///
+/// Determines which disclosure channels are admissible for optimizations
+/// evaluated in this phase. Only the mode active for the current phase
+/// is valid; mismatches between proposal and snapshot are denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DisclosurePolicyMode {
+    /// Trade-secret-only mode. Patent and provisional workflow channels
+    /// are unconditionally denied. Only approved internal channels are
+    /// admissible.
+    TradeSecretOnly,
+
+    /// Open-source mode. Broad disclosure channels may be approved by
+    /// policy. Patent channels may still be denied if not explicitly
+    /// approved.
+    OpenSource,
+}
+
+/// Freshness state of a disclosure-control policy snapshot.
+///
+/// Only `Current` snapshots are admitted. All other states deny
+/// fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DisclosurePolicyState {
+    /// Policy snapshot is current and authoritative.
+    Current,
+    /// Policy snapshot is stale (exceeds freshness window).
+    Stale,
+    /// Policy snapshot is ambiguous (conflicting or incomplete).
+    Ambiguous,
+    /// Policy state is unknown.
+    Unknown,
+}
+
+/// Signed disclosure-control policy snapshot.
+///
+/// Binds optimization decisions to a specific disclosure posture for
+/// the evaluated phase. The snapshot includes a policy digest for
+/// CAS binding and an Ed25519 signature for integrity verification.
+///
+/// # Invariants
+///
+/// - [`DisclosurePolicyState::Current`] is the only admitted state.
+/// - Unsigned snapshots (zero signature) deny fail-closed.
+/// - Zero policy digest denies fail-closed.
+/// - Empty phase ID denies fail-closed.
+/// - Stale epochs (exceeding [`MAX_DISCLOSURE_POLICY_AGE_TICKS`]) deny
+///   fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisclosurePolicySnapshot {
+    /// Phase identifier this policy applies to.
+    #[serde(deserialize_with = "deserialize_bounded_phase_id")]
+    pub phase_id: String,
+
+    /// The disclosure policy mode active for this phase.
+    pub mode: DisclosurePolicyMode,
+
+    /// HTF tick at which this policy epoch was established.
+    pub epoch_tick: u64,
+
+    /// Freshness state of this policy snapshot.
+    pub state: DisclosurePolicyState,
+
+    /// Content digest of the full policy document (for CAS binding).
+    pub policy_digest: [u8; 32],
+
+    /// Ed25519 signature over the canonical policy payload (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub signature: [u8; 64],
+
+    /// Set of approved disclosure channel classes under this policy.
+    /// Only channels in this set are admissible for optimizations.
+    /// In `TradeSecretOnly` mode, patent/provisional channels are
+    /// denied even if they appear here.
+    #[serde(deserialize_with = "deserialize_bounded_disclosure_channels")]
+    pub approved_channels: BTreeSet<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Authority-surface evidence types (REQ-0008)
 // ---------------------------------------------------------------------------
@@ -471,6 +679,17 @@ pub struct OptimizationProposal {
 
     /// Content digest of the proposal (for integrity binding).
     pub proposal_digest: [u8; 32],
+
+    /// Disclosure policy mode the proposal assumes for its evaluation window.
+    /// Must match the mode in the active disclosure-control policy snapshot.
+    pub assumed_disclosure_mode: DisclosurePolicyMode,
+
+    /// Disclosure channel classes this optimization requires or uses.
+    /// All channels must be approved in the active policy snapshot.
+    /// In `TradeSecretOnly` mode, patent/provisional channels are always
+    /// denied.
+    #[serde(deserialize_with = "deserialize_bounded_disclosure_channels")]
+    pub disclosure_channels: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +788,19 @@ pub struct OptimizationGateTrace {
 
     /// Whether direct GitHub capability non-regression check passed (REQ-0008).
     pub no_direct_github_capabilities: bool,
+
+    /// Whether disclosure-control policy validation passed (REQ-0007).
+    pub disclosure_policy_valid: bool,
+
+    /// Whether disclosure-control mode matching passed (REQ-0007).
+    pub disclosure_mode_matched: bool,
+
+    /// Whether disclosure-channel classification check passed (REQ-0007).
+    pub disclosure_channels_approved: bool,
+
+    /// Policy snapshot digest bound to this decision (REQ-0007).
+    /// Zero when disclosure policy was not provided or not yet validated.
+    pub disclosure_policy_digest: [u8; 32],
 
     /// Proposal digest bound to this decision.
     pub proposal_digest: [u8; 32],
@@ -925,35 +1157,196 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Gate: Disclosure-control policy validity (REQ-0007)
+// ---------------------------------------------------------------------------
+
+/// Validates that a disclosure-control policy snapshot is present, current,
+/// signed, and structurally valid.
+///
+/// Checks:
+/// - Snapshot is not `None` (fail-closed: missing policy is denied).
+/// - Policy state is `Current` (stale, ambiguous, and unknown deny).
+/// - Signature is non-zero (unsigned snapshots deny fail-closed).
+/// - Policy digest is non-zero.
+/// - Phase ID is non-empty.
+/// - Epoch tick is not in the future.
+/// - Epoch is not stale (age <= `max_age_ticks`).
+/// - Approved channels set does not exceed
+///   [`MAX_APPROVED_DISCLOSURE_CHANNELS`].
+///
+/// # Errors
+///
+/// Returns a stable deny reason string if any check fails.
+pub fn validate_disclosure_policy(
+    snapshot: Option<&DisclosurePolicySnapshot>,
+    current_tick: u64,
+    max_age_ticks: u64,
+) -> Result<(), &'static str> {
+    let Some(snap) = snapshot else {
+        return Err(DENY_DISCLOSURE_POLICY_MISSING);
+    };
+
+    // State check (fail-closed for non-Current states).
+    match snap.state {
+        DisclosurePolicyState::Current => {},
+        DisclosurePolicyState::Stale => {
+            return Err(DENY_DISCLOSURE_POLICY_STALE);
+        },
+        DisclosurePolicyState::Ambiguous => {
+            return Err(DENY_DISCLOSURE_POLICY_AMBIGUOUS);
+        },
+        DisclosurePolicyState::Unknown => {
+            return Err(DENY_DISCLOSURE_POLICY_UNKNOWN);
+        },
+    }
+
+    // Signature check (unsigned is denied).
+    let zero_sig = [0u8; 64];
+    if snap.signature.ct_eq(&zero_sig).unwrap_u8() == 1 {
+        return Err(DENY_DISCLOSURE_POLICY_UNSIGNED);
+    }
+
+    // Policy digest zero check.
+    if is_zero_hash(&snap.policy_digest) {
+        return Err(DENY_DISCLOSURE_POLICY_DIGEST_ZERO);
+    }
+
+    // Phase ID non-empty check.
+    if snap.phase_id.is_empty() {
+        return Err(DENY_DISCLOSURE_POLICY_PHASE_ID_EMPTY);
+    }
+
+    // Epoch freshness checks.
+    if snap.epoch_tick > current_tick {
+        return Err(DENY_DISCLOSURE_POLICY_FUTURE_TICK);
+    }
+    let age = current_tick - snap.epoch_tick;
+    if age > max_age_ticks {
+        return Err(DENY_DISCLOSURE_POLICY_STALE);
+    }
+
+    // Approved channels bounds check.
+    if snap.approved_channels.len() > MAX_APPROVED_DISCLOSURE_CHANNELS {
+        return Err(DENY_DISCLOSURE_CHANNELS_OVERFLOW);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gate: Disclosure-control mode matching (REQ-0007)
+// ---------------------------------------------------------------------------
+
+/// Validates that the proposal's assumed disclosure mode matches the
+/// active policy snapshot's mode.
+///
+/// Optimization decisions that assume a disclosure mode not active for
+/// the current phase are non-admissible (REQ-0007).
+///
+/// # Errors
+///
+/// Returns a stable deny reason if the modes do not match.
+pub fn validate_disclosure_mode_match(
+    proposal: &OptimizationProposal,
+    snapshot: &DisclosurePolicySnapshot,
+) -> Result<(), &'static str> {
+    if proposal.assumed_disclosure_mode != snapshot.mode {
+        return Err(DENY_DISCLOSURE_MODE_MISMATCH);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gate: Disclosure-channel classification (REQ-0007)
+// ---------------------------------------------------------------------------
+
+/// Validates that all disclosure channels in the proposal are approved
+/// under the active policy snapshot.
+///
+/// In `TradeSecretOnly` mode, patent/provisional channels are
+/// unconditionally denied even if they appear in the approved set.
+///
+/// Unapproved channel classes are denied by default (deny-by-default
+/// for disclosure-channel classification).
+///
+/// # Errors
+///
+/// Returns a stable deny reason if any channel is forbidden or unapproved.
+pub fn validate_disclosure_channels(
+    proposal: &OptimizationProposal,
+    snapshot: &DisclosurePolicySnapshot,
+) -> Result<(), &'static str> {
+    if proposal.disclosure_channels.len() > MAX_APPROVED_DISCLOSURE_CHANNELS {
+        return Err(DENY_PROPOSAL_DISCLOSURE_CHANNELS_OVERFLOW);
+    }
+
+    for channel in &proposal.disclosure_channels {
+        // In TRADE_SECRET_ONLY mode, patent/provisional channels are always denied.
+        if snapshot.mode == DisclosurePolicyMode::TradeSecretOnly
+            && is_forbidden_trade_secret_channel(channel)
+        {
+            return Err(DENY_TRADE_SECRET_PATENT_CHANNEL);
+        }
+
+        // All channels must be in the approved set (deny-by-default).
+        if !snapshot.approved_channels.contains(channel) {
+            return Err(DENY_UNAPPROVED_DISCLOSURE_CHANNEL);
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks whether a disclosure channel class resolves to a forbidden
+/// patent/provisional channel under trade-secret-only mode.
+///
+/// Normalises the channel class by lowercasing and trimming whitespace.
+fn is_forbidden_trade_secret_channel(channel_class: &str) -> bool {
+    let normalized = channel_class.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    FORBIDDEN_TRADE_SECRET_CHANNEL_CLASSES
+        .iter()
+        .any(|forbidden| normalized == *forbidden)
+}
+
+// ---------------------------------------------------------------------------
 // Combined optimization gate evaluator
 // ---------------------------------------------------------------------------
 
 /// Evaluates all optimization gates for a proposal.
 ///
 /// Gate evaluation order:
-/// 1. Authority-surface evidence validity (REQ-0008)
-/// 2. Authority-surface monotonicity (REQ-0008)
-/// 3. Direct GitHub capability non-regression (REQ-0008)
-/// 4. KPI/countermetric completeness
-/// 5. Canonical evaluator binding
-/// 6. Arbitration outcome
-/// 7. Evidence quality thresholds
-/// 8. Evidence freshness
-/// 9. Throughput dominance
+/// 1. Disclosure-control policy validity (REQ-0007)
+/// 2. Disclosure-control mode matching (REQ-0007)
+/// 3. Disclosure-channel classification (REQ-0007)
+/// 4. Authority-surface evidence validity (REQ-0008)
+/// 5. Authority-surface monotonicity (REQ-0008)
+/// 6. Direct GitHub capability non-regression (REQ-0008)
+/// 7. KPI/countermetric completeness
+/// 8. Canonical evaluator binding
+/// 9. Arbitration outcome
+/// 10. Evidence quality thresholds
+/// 11. Evidence freshness
+/// 12. Throughput dominance
 ///
-/// Authority-surface gates (1-3) are evaluated first because they enforce
-/// containment-critical invariants that must not be bypassed even if
-/// downstream evidence gates would also fail.
+/// Disclosure-control gates (1-3) are evaluated first because they enforce
+/// containment-critical confidentiality invariants that must not be bypassed.
+/// Authority-surface gates (4-6) follow as containment-critical invariants.
 ///
 /// First failing gate determines the deny reason. All gates are fail-closed.
 ///
 /// Returns a decision with full trace for auditing.
 #[must_use]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn evaluate_optimization_gate(
     proposal: &OptimizationProposal,
     countermetric_profile: Option<&CountermetricProfile>,
     evidence_quality: Option<&EvidenceQualityReport>,
     authority_surface_evidence: Option<&AuthoritySurfaceEvidence>,
+    disclosure_policy: Option<&DisclosurePolicySnapshot>,
     arbitration_outcome: ArbitrationOutcome,
     current_tick: u64,
     max_evidence_age_ticks: u64,
@@ -969,10 +1362,45 @@ pub fn evaluate_optimization_gate(
         authority_surface_evidence_valid: false,
         authority_surface_monotonic: false,
         no_direct_github_capabilities: false,
+        disclosure_policy_valid: false,
+        disclosure_mode_matched: false,
+        disclosure_channels_approved: false,
+        disclosure_policy_digest: [0u8; 32],
         proposal_digest: proposal.proposal_digest,
     };
 
-    // Gate 1 (REQ-0008): Authority-surface evidence validity
+    // Gate 1 (REQ-0007): Disclosure-control policy validity
+    if let Err(reason) = validate_disclosure_policy(
+        disclosure_policy,
+        current_tick,
+        MAX_DISCLOSURE_POLICY_AGE_TICKS,
+    ) {
+        return deny_decision(reason, trace);
+    }
+    trace.disclosure_policy_valid = true;
+
+    // validate_disclosure_policy returned Ok, so snapshot is Some
+    // and structurally valid. Use let-else to avoid expect/panic.
+    let Some(policy_snap) = disclosure_policy else {
+        // Unreachable: validate_disclosure_policy returned Ok
+        // which requires Some. Fail-closed deny as defensive fallback.
+        return deny_decision(DENY_DISCLOSURE_POLICY_MISSING, trace);
+    };
+    trace.disclosure_policy_digest = policy_snap.policy_digest;
+
+    // Gate 2 (REQ-0007): Disclosure-control mode matching
+    if let Err(reason) = validate_disclosure_mode_match(proposal, policy_snap) {
+        return deny_decision(reason, trace);
+    }
+    trace.disclosure_mode_matched = true;
+
+    // Gate 3 (REQ-0007): Disclosure-channel classification
+    if let Err(reason) = validate_disclosure_channels(proposal, policy_snap) {
+        return deny_decision(reason, trace);
+    }
+    trace.disclosure_channels_approved = true;
+
+    // Gate 4 (REQ-0008): Authority-surface evidence validity
     if let Err(reason) = validate_authority_surface_evidence(
         authority_surface_evidence,
         current_tick,
@@ -990,19 +1418,19 @@ pub fn evaluate_optimization_gate(
         return deny_decision(DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING, trace);
     };
 
-    // Gate 2 (REQ-0008): Authority-surface monotonicity
+    // Gate 5 (REQ-0008): Authority-surface monotonicity
     if let Err(reason) = validate_authority_surface_monotonicity(&surface_evidence.diff) {
         return deny_decision(reason, trace);
     }
     trace.authority_surface_monotonic = true;
 
-    // Gate 3 (REQ-0008): Direct GitHub capability non-regression
+    // Gate 6 (REQ-0008): Direct GitHub capability non-regression
     if let Err(reason) = validate_no_direct_github_capabilities(&surface_evidence.diff) {
         return deny_decision(reason, trace);
     }
     trace.no_direct_github_capabilities = true;
 
-    // Gate 4: KPI/countermetric completeness
+    // Gate 7: KPI/countermetric completeness
     let Some(profile) = countermetric_profile else {
         return deny_decision(DENY_COUNTERMETRIC_PROFILE_MISSING, trace);
     };
@@ -1012,18 +1440,18 @@ pub fn evaluate_optimization_gate(
     }
     trace.kpi_countermetric_complete = true;
 
-    // Gate 5: Canonical evaluator binding
+    // Gate 8: Canonical evaluator binding
     if let Err(reason) = validate_canonical_evaluator_binding(proposal) {
         return deny_decision(reason, trace);
     }
     trace.canonical_evaluator_bound = true;
 
-    // Gate 6: Arbitration outcome
+    // Gate 9: Arbitration outcome
     if let Err(reason) = validate_arbitration_outcome(arbitration_outcome) {
         return deny_decision(reason, trace);
     }
 
-    // Gate 7: Evidence quality
+    // Gate 10: Evidence quality
     let Some(evidence) = evidence_quality else {
         return deny_decision(DENY_EVIDENCE_QUALITY_MISSING, trace);
     };
@@ -1033,7 +1461,7 @@ pub fn evaluate_optimization_gate(
     }
     trace.evidence_quality_passed = true;
 
-    // Gate 8: Evidence freshness
+    // Gate 11: Evidence freshness
     match validate_evidence_freshness(evidence.evidence_tick, current_tick, max_evidence_age_ticks)
     {
         Ok(()) => {
@@ -1051,7 +1479,7 @@ pub fn evaluate_optimization_gate(
         },
     }
 
-    // Gate 9: Throughput dominance
+    // Gate 12: Throughput dominance
     if let Err(reason) = validate_throughput_dominance(evidence.throughput_ratio) {
         return deny_decision(reason, trace);
     }
@@ -1223,6 +1651,20 @@ mod tests {
                 test_evaluator_tuple(TemporalPredicateId::TpEio29002),
             ],
             proposal_digest: hash(0xDD),
+            assumed_disclosure_mode: DisclosurePolicyMode::TradeSecretOnly,
+            disclosure_channels: BTreeSet::new(),
+        }
+    }
+
+    fn test_disclosure_policy_snapshot() -> DisclosurePolicySnapshot {
+        DisclosurePolicySnapshot {
+            phase_id: "phase_alpha".to_string(),
+            mode: DisclosurePolicyMode::TradeSecretOnly,
+            epoch_tick: 900,
+            state: DisclosurePolicyState::Current,
+            policy_digest: hash(0xBB),
+            signature: [0x55u8; 64],
+            approved_channels: BTreeSet::new(),
         }
     }
 
@@ -1729,12 +2171,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1750,6 +2194,10 @@ mod tests {
         assert!(decision.trace.evidence_quality_passed);
         assert!(decision.trace.evidence_freshness_passed);
         assert!(decision.trace.throughput_dominance_passed);
+        assert!(decision.trace.disclosure_policy_valid);
+        assert!(decision.trace.disclosure_mode_matched);
+        assert!(decision.trace.disclosure_channels_approved);
+        assert_eq!(decision.trace.disclosure_policy_digest, hash(0xBB));
     }
 
     #[test]
@@ -1757,12 +2205,14 @@ mod tests {
         let proposal = test_proposal();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             None,
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1780,12 +2230,14 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             None,
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1805,12 +2257,14 @@ mod tests {
         let mut evidence = test_evidence_quality();
         evidence.evidence_tick = 500;
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1827,12 +2281,14 @@ mod tests {
         let mut evidence = test_evidence_quality();
         evidence.throughput_ratio = 0.95;
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1852,12 +2308,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1878,12 +2336,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedDeny,
             1000,
             200,
@@ -1903,12 +2363,14 @@ mod tests {
         let mut evidence = test_evidence_quality();
         evidence.statistical_power = 0.5;
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1927,12 +2389,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let allow = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1944,6 +2408,7 @@ mod tests {
             None,
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1960,12 +2425,14 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             None,
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1984,6 +2451,7 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let policy = test_disclosure_policy_snapshot();
         let mut surface = test_authority_surface_evidence();
         surface.diff.after.insert("kernel.crypto.sign".to_string());
 
@@ -1992,6 +2460,7 @@ mod tests {
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2011,6 +2480,7 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let policy = test_disclosure_policy_snapshot();
         let mut surface = test_authority_surface_evidence();
         // Add github_api to both before and after (in before to satisfy
         // monotonicity, but still fails github non-regression)
@@ -2028,6 +2498,7 @@ mod tests {
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2048,6 +2519,7 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let policy = test_disclosure_policy_snapshot();
         let mut surface = test_authority_surface_evidence();
         surface.state = AuthoritySurfaceEvidenceState::Stale;
 
@@ -2056,6 +2528,7 @@ mod tests {
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2250,12 +2723,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2275,12 +2750,14 @@ mod tests {
         proposal.target_kpi_ids.push("kpi_unknown".to_string());
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             None, // missing authority surface evidence
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2299,6 +2776,7 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let mut surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
         // Add new capability (monotonicity violation) AND github capability
         surface
             .diff
@@ -2310,6 +2788,7 @@ mod tests {
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2331,12 +2810,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2357,12 +2838,14 @@ mod tests {
         let mut evidence = test_evidence_quality();
         evidence.statistical_power = 0.1;
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2383,12 +2866,14 @@ mod tests {
         evidence.evidence_tick = 100;
         evidence.throughput_ratio = 0.5;
         let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
             Some(&surface),
+            Some(&policy),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2396,5 +2881,458 @@ mod tests {
 
         assert_eq!(decision.verdict, OptimizationGateVerdict::Blocked);
         assert_eq!(decision.deny_reason.as_deref(), Some(DENY_EVIDENCE_STALE));
+    }
+
+    // =======================================================================
+    // Disclosure-control policy validity tests (REQ-0007)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_policy_current_allows() {
+        let snap = test_disclosure_policy_snapshot();
+        assert!(validate_disclosure_policy(Some(&snap), 1000, 500).is_ok());
+    }
+
+    #[test]
+    fn test_disclosure_policy_missing_denied() {
+        let err = validate_disclosure_policy(None, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_MISSING);
+    }
+
+    #[test]
+    fn test_disclosure_policy_stale_state_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.state = DisclosurePolicyState::Stale;
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_STALE);
+    }
+
+    #[test]
+    fn test_disclosure_policy_ambiguous_state_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.state = DisclosurePolicyState::Ambiguous;
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_AMBIGUOUS);
+    }
+
+    #[test]
+    fn test_disclosure_policy_unknown_state_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.state = DisclosurePolicyState::Unknown;
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_UNKNOWN);
+    }
+
+    #[test]
+    fn test_disclosure_policy_unsigned_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.signature = [0u8; 64];
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_UNSIGNED);
+    }
+
+    #[test]
+    fn test_disclosure_policy_zero_digest_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.policy_digest = [0u8; 32];
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_DIGEST_ZERO);
+    }
+
+    #[test]
+    fn test_disclosure_policy_empty_phase_id_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.phase_id = String::new();
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_PHASE_ID_EMPTY);
+    }
+
+    #[test]
+    fn test_disclosure_policy_future_tick_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.epoch_tick = 1001;
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_FUTURE_TICK);
+    }
+
+    #[test]
+    fn test_disclosure_policy_stale_epoch_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.epoch_tick = 100;
+        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_STALE);
+    }
+
+    #[test]
+    fn test_disclosure_policy_exact_age_allows() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.epoch_tick = 500;
+        assert!(validate_disclosure_policy(Some(&snap), 1000, 500).is_ok());
+    }
+
+    // =======================================================================
+    // Disclosure-control mode matching tests (REQ-0007)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_mode_match_allows() {
+        let proposal = test_proposal();
+        let snap = test_disclosure_policy_snapshot();
+        // Both are TradeSecretOnly
+        assert!(validate_disclosure_mode_match(&proposal, &snap).is_ok());
+    }
+
+    #[test]
+    fn test_disclosure_mode_mismatch_denied() {
+        let proposal = test_proposal();
+        // proposal is TradeSecretOnly, snapshot is OpenSource
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.mode = DisclosurePolicyMode::OpenSource;
+        let err = validate_disclosure_mode_match(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_MODE_MISMATCH);
+    }
+
+    #[test]
+    fn test_disclosure_mode_mismatch_reverse_denied() {
+        let mut proposal = test_proposal();
+        proposal.assumed_disclosure_mode = DisclosurePolicyMode::OpenSource;
+        let snap = test_disclosure_policy_snapshot();
+        // proposal is OpenSource, snapshot is TradeSecretOnly
+        let err = validate_disclosure_mode_match(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_MODE_MISMATCH);
+    }
+
+    // =======================================================================
+    // Disclosure-channel classification tests (REQ-0007)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_channels_empty_allows() {
+        let proposal = test_proposal(); // empty disclosure_channels
+        let snap = test_disclosure_policy_snapshot();
+        assert!(validate_disclosure_channels(&proposal, &snap).is_ok());
+    }
+
+    #[test]
+    fn test_disclosure_channels_approved_allows() {
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("internal_review".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.approved_channels.insert("internal_review".to_string());
+        assert!(validate_disclosure_channels(&proposal, &snap).is_ok());
+    }
+
+    #[test]
+    fn test_disclosure_channels_unapproved_denied() {
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("unknown_channel".to_string());
+        let snap = test_disclosure_policy_snapshot();
+        let err = validate_disclosure_channels(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_UNAPPROVED_DISCLOSURE_CHANNEL);
+    }
+
+    #[test]
+    fn test_trade_secret_patent_channel_denied() {
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("patent_filing".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        // Even if patent_filing is in approved_channels, deny in TRADE_SECRET_ONLY
+        snap.approved_channels.insert("patent_filing".to_string());
+        let err = validate_disclosure_channels(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_TRADE_SECRET_PATENT_CHANNEL);
+    }
+
+    #[test]
+    fn test_trade_secret_provisional_channel_denied() {
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("provisional_application".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.approved_channels
+            .insert("provisional_application".to_string());
+        let err = validate_disclosure_channels(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_TRADE_SECRET_PATENT_CHANNEL);
+    }
+
+    #[test]
+    fn test_trade_secret_all_forbidden_classes_denied() {
+        for class in FORBIDDEN_TRADE_SECRET_CHANNEL_CLASSES {
+            let mut proposal = test_proposal();
+            proposal.disclosure_channels.insert(class.to_string());
+            let mut snap = test_disclosure_policy_snapshot();
+            snap.approved_channels.insert(class.to_string());
+            let err = validate_disclosure_channels(&proposal, &snap).unwrap_err();
+            assert_eq!(
+                err, DENY_TRADE_SECRET_PATENT_CHANNEL,
+                "expected deny for forbidden class '{class}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_source_mode_allows_patent_when_approved() {
+        let mut proposal = test_proposal();
+        proposal.assumed_disclosure_mode = DisclosurePolicyMode::OpenSource;
+        proposal
+            .disclosure_channels
+            .insert("patent_filing".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.mode = DisclosurePolicyMode::OpenSource;
+        snap.approved_channels.insert("patent_filing".to_string());
+        assert!(validate_disclosure_channels(&proposal, &snap).is_ok());
+    }
+
+    #[test]
+    fn test_open_source_unapproved_channel_still_denied() {
+        let mut proposal = test_proposal();
+        proposal.assumed_disclosure_mode = DisclosurePolicyMode::OpenSource;
+        proposal
+            .disclosure_channels
+            .insert("not_approved".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.mode = DisclosurePolicyMode::OpenSource;
+        let err = validate_disclosure_channels(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_UNAPPROVED_DISCLOSURE_CHANNEL);
+    }
+
+    // =======================================================================
+    // Combined gate: disclosure-control gates in full evaluator (REQ-0007)
+    // =======================================================================
+
+    #[test]
+    fn test_missing_disclosure_policy_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            None, // missing disclosure policy
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DISCLOSURE_POLICY_MISSING),
+        );
+        assert!(!decision.trace.disclosure_policy_valid);
+    }
+
+    #[test]
+    fn test_disclosure_mode_mismatch_in_full_gate_denied() {
+        let proposal = test_proposal(); // TradeSecretOnly
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+        let mut policy = test_disclosure_policy_snapshot();
+        policy.mode = DisclosurePolicyMode::OpenSource; // mismatch
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            Some(&policy),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DISCLOSURE_MODE_MISMATCH),
+        );
+        assert!(decision.trace.disclosure_policy_valid);
+        assert!(!decision.trace.disclosure_mode_matched);
+    }
+
+    #[test]
+    fn test_patent_channel_in_trade_secret_full_gate_denied() {
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("patent_filing".to_string());
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+        let mut policy = test_disclosure_policy_snapshot();
+        policy.approved_channels.insert("patent_filing".to_string());
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            Some(&policy),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_TRADE_SECRET_PATENT_CHANNEL),
+        );
+        assert!(decision.trace.disclosure_policy_valid);
+        assert!(decision.trace.disclosure_mode_matched);
+        assert!(!decision.trace.disclosure_channels_approved);
+    }
+
+    #[test]
+    fn test_stale_disclosure_policy_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+        let mut policy = test_disclosure_policy_snapshot();
+        policy.state = DisclosurePolicyState::Stale;
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            Some(&policy),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DISCLOSURE_POLICY_STALE),
+        );
+        assert!(!decision.trace.disclosure_policy_valid);
+    }
+
+    #[test]
+    fn test_unsigned_disclosure_policy_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+        let mut policy = test_disclosure_policy_snapshot();
+        policy.signature = [0u8; 64];
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            Some(&policy),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DISCLOSURE_POLICY_UNSIGNED),
+        );
+    }
+
+    #[test]
+    fn test_gate_ordering_disclosure_before_authority_surface() {
+        // Both disclosure policy and authority surface fail — disclosure is first
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            None, // missing authority surface
+            None, // missing disclosure policy
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        // Disclosure policy is checked before authority surface
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DISCLOSURE_POLICY_MISSING),
+        );
+    }
+
+    // =======================================================================
+    // Disclosure policy snapshot serde tests (REQ-0007)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_policy_snapshot_serialization_roundtrip() {
+        let snap = test_disclosure_policy_snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let decoded: DisclosurePolicySnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, snap);
+    }
+
+    #[test]
+    fn test_disclosure_policy_snapshot_with_channels_roundtrip() {
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.approved_channels.insert("internal_review".to_string());
+        snap.approved_channels.insert("security_audit".to_string());
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let decoded: DisclosurePolicySnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, snap);
+        assert_eq!(decoded.approved_channels.len(), 2);
+    }
+
+    #[test]
+    fn test_is_forbidden_trade_secret_channel_case_insensitive() {
+        assert!(is_forbidden_trade_secret_channel("Patent_Filing"));
+        assert!(is_forbidden_trade_secret_channel("PATENT_FILING"));
+        assert!(is_forbidden_trade_secret_channel("patent_filing"));
+        assert!(is_forbidden_trade_secret_channel("  patent_filing  "));
+    }
+
+    #[test]
+    fn test_is_forbidden_trade_secret_channel_non_forbidden() {
+        assert!(!is_forbidden_trade_secret_channel("internal_review"));
+        assert!(!is_forbidden_trade_secret_channel("security_audit"));
+        assert!(!is_forbidden_trade_secret_channel(""));
+    }
+
+    #[test]
+    fn test_disclosure_policy_digest_bound_in_trace() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot();
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            Some(&policy),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Allow);
+        // Verify the policy digest is bound in the trace
+        assert_eq!(decision.trace.disclosure_policy_digest, hash(0xBB));
     }
 }
