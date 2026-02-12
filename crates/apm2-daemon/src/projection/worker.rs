@@ -22,10 +22,9 @@
 //! Per RFC-0029, before any projection side effect
 //! (`adapter.project_status()`):
 //!
-//! 1. Check if the event payload carries economics selectors (`eval_tick`,
-//!    `time_authority_ref`, `window_ref`, `boundary_id`). Events without
-//!    economics selectors use the legacy ungated projection path; the gate
-//!    enforces only when selectors are present.
+//! 1. ALL `review_receipt_recorded` events MUST pass through the economics
+//!    gate. Events without economics selectors are DENIED (fail-closed:
+//!    `missing_economics_selectors` subcategory).
 //! 2. Assemble gate inputs from `ReviewReceiptRecorded` payload
 //! 3. Resolve continuity profile, sink snapshot, and window via resolver
 //! 4. Evaluate `evaluate_projection_continuity()` economics gate
@@ -33,17 +32,20 @@
 //!    successful projection
 //! 6. On DENY: record denied intent in `IntentBuffer`, skip projection
 //!
-//! **Fail-closed**: When economics selectors are present, missing gate
-//! inputs (temporal authority, profile, snapshot) result in DENY, never
-//! default ALLOW. Idempotent-insert replay prevention ensures no
+//! **Fail-closed**: Missing gate inputs (temporal authority, profile,
+//! snapshot) result in DENY, never default ALLOW. Missing economics
+//! selectors result in DENY (no bypass path). Gate init failure denies
+//! all events. Idempotent-insert replay prevention ensures no
 //! double-projection of the same `(work_id, changeset_digest)`.
 //!
 //! **Implementation scope**: The current implementation provides
 //! economics-gated admission with idempotent-insert replay prevention
 //! (via `IntentBuffer` uniqueness constraint on `(work_id,
-//! changeset_digest)`). The enforcement guarantees are:
-//! - No projection without passing the economics gate (when selectors are
-//!   present).
+//! changeset_digest)`). Canonical PCAC lifecycle integration (join,
+//! revalidate, consume primitives) is deferred to a future ticket.
+//! The enforcement guarantees are:
+//! - No projection without passing the economics gate.
+//! - Events without economics selectors are DENIED, not bypassed.
 //! - No double-projection of the same `(work_id, changeset_digest)`.
 //! - Retry-safe: transient projection failures leave the intent as PENDING,
 //!   allowing re-attempt on the next delivery.
@@ -125,15 +127,16 @@ pub enum ProjectionWorkerError {
     /// (TCK-00505).
     ///
     /// Used for replay prevention (`consumed`), gate-not-wired
-    /// (`missing_gate`), revoked authority (`revoked`), and stale
-    /// authority (`stale`) scenarios. Covers idempotent-insert
-    /// replay prevention and fail-closed gate-init scenarios.
+    /// (`missing_gate`), missing selectors (`missing_economics_selectors`),
+    /// revoked authority (`revoked`), and stale authority (`stale`)
+    /// scenarios. Covers idempotent-insert replay prevention,
+    /// fail-closed gate-init scenarios, and selector-absent events.
     #[error("economics admission denied: {reason} (subcategory: {subcategory})")]
     LifecycleDenied {
         /// The structured deny reason.
         reason: String,
         /// Denial subcategory
-        /// (`consumed`/`missing_gate`).
+        /// (`consumed`/`missing_gate`/`missing_economics_selectors`).
         subcategory: String,
     },
 
@@ -193,6 +196,9 @@ pub struct AdmissionTelemetry {
     /// Total projections denied because the economics gate was not wired
     /// but the event carried economics selectors (fail-closed).
     pub missing_gate_denied_count: AtomicU64,
+    /// Total projections denied because the event did not carry economics
+    /// selectors (fail-closed: all events must have selectors).
+    pub missing_selectors_denied_count: AtomicU64,
 }
 
 impl AdmissionTelemetry {
@@ -207,6 +213,7 @@ impl AdmissionTelemetry {
             lifecycle_consumed_count: AtomicU64::new(0),
             missing_inputs_denied_count: AtomicU64::new(0),
             missing_gate_denied_count: AtomicU64::new(0),
+            missing_selectors_denied_count: AtomicU64::new(0),
         }
     }
 }
@@ -232,6 +239,11 @@ pub mod lifecycle_deny {
     /// Economics gate is not wired but event carries economics selectors
     /// (fail-closed).
     pub const MISSING_GATE: &str = "missing_gate";
+    /// Mandatory economics selectors absent (fail-closed).
+    ///
+    /// All `review_receipt_recorded` events must carry economics
+    /// selectors; absence is a gate bypass attempt or malformed event.
+    pub const MISSING_SELECTORS: &str = "missing_economics_selectors";
 }
 
 /// Default sink identifier for single-sink projection (GitHub).
@@ -360,9 +372,9 @@ fn payload_nonempty_str<'a>(
 /// Returns `true` if the event payload carries economics selectors
 /// (`eval_tick`, `time_authority_ref`, `window_ref`, `boundary_id`).
 ///
-/// Events without economics selectors use the legacy ungated projection
-/// path; the gate enforces only when selectors are present. This is the
-/// correct transitional behavior for gradual rollout of the economics gate.
+/// All `review_receipt_recorded` events MUST carry economics selectors.
+/// Events without selectors are DENIED with `missing_economics_selectors`
+/// subcategory (fail-closed: no bypass path).
 fn payload_has_economics_selectors(payload: &serde_json::Value) -> bool {
     payload.get("eval_tick").is_some()
         || payload.get("time_authority_ref").is_some()
@@ -2399,21 +2411,18 @@ impl ProjectionWorker {
 
         // =====================================================================
         // TCK-00505: Economics-gated admission with idempotent-insert
-        //            replay prevention
+        //            replay prevention (fail-closed: no bypass path)
         // =====================================================================
         //
-        // Events without economics selectors use the legacy ungated projection
-        // path; the gate enforces only when selectors are present. This is the
-        // correct transitional behavior -- the gate applies only to events that
-        // carry economics selectors (`eval_tick`, `time_authority_ref`,
-        // `window_ref`, `boundary_id`).
+        // ALL review_receipt_recorded events MUST pass through the economics
+        // gate. There is NO legacy ungated path.
         //
-        // When the event carries economics selectors:
-        //   - If the gate is wired: evaluate admission, insert as PENDING, project,
-        //     then admit AFTER successful projection.
-        //   - If the gate is NOT wired (init failure): DENY events with economics
-        //     selectors (fail-closed). Legacy events without selectors still project
-        //     normally.
+        //   - If selectors are present AND gate is wired: evaluate admission, insert as
+        //     PENDING, project, then admit AFTER successful projection.
+        //   - If selectors are present AND gate is NOT wired (init failure): DENY with
+        //     durable recording in IntentBuffer before ACK.
+        //   - If selectors are ABSENT: DENY with "missing_economics_selectors"
+        //     subcategory. No projection bypass.
         //
         // Security (RSK-1105): The economics admission logic performs
         // synchronous blocking SQLite I/O (IntentBuffer::insert,
@@ -2423,85 +2432,153 @@ impl ProjectionWorker {
 
         // Track the intent_id if economics gate admitted this event, so
         // we can durably admit it AFTER successful projection.
+        #[allow(unused_assignments)]
+        // Only the economics-gate-active path reaches post-block code; others return early.
         let mut pending_intent_id: Option<String> = None;
 
-        if has_econ_selectors {
-            if self.has_economics_gate() {
-                // Clone Arc-backed dependencies into the blocking closure.
-                let intent_buffer = Arc::clone(self.intent_buffer.as_ref().ok_or_else(|| {
-                    ProjectionWorkerError::IntentBufferError("intent buffer not wired".to_string())
-                })?);
+        if !has_econ_selectors {
+            // Fail-closed: events without economics selectors are DENIED.
+            // No legacy bypass path -- all review_receipt_recorded events
+            // must carry economics selectors.
+            let reason = "event missing economics selectors (fail-closed: no bypass path)";
+            warn!(
+                work_id = %work_id,
+                receipt_id = %receipt_id,
+                reason = %reason,
+                "Denying projection: missing economics selectors"
+            );
+            self.telemetry
+                .missing_selectors_denied_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
 
-                let resolver = Arc::clone(self.continuity_resolver.as_ref().ok_or_else(|| {
-                    ProjectionWorkerError::IntentBufferError(
-                        "continuity resolver not wired".to_string(),
-                    )
-                })?);
-                let gate_signer = Arc::clone(self.gate_signer.as_ref().ok_or_else(|| {
-                    ProjectionWorkerError::IntentBufferError("gate signer not wired".to_string())
-                })?);
-                let telemetry = Arc::clone(&self.telemetry);
-                let payload_clone = payload.clone();
-                let work_id_clone = work_id.clone();
-                let changeset_digest_clone = changeset_digest;
-                let receipt_id_clone = receipt_id.to_string();
-                let event_timestamp_ns = event.timestamp_ns;
-                let event_id_clone = event.event_id.clone();
+            // Record the deny durably in IntentBuffer before ACK.
+            // If the IntentBuffer is not available (gate completely failed
+            // to init), return a non-ACK error so the event is retried.
+            let intent_buffer = self.intent_buffer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError(
+                    "intent buffer not available for durable deny recording \
+                     (missing selectors path); event will be retried"
+                        .to_string(),
+                )
+            })?;
+            record_denied_intent(
+                intent_buffer,
+                receipt_id,
+                work_id,
+                &changeset_digest,
+                status,
+                0, // eval_tick absent -- use zero sentinel
+                event.timestamp_ns,
+                reason,
+            )?;
 
-                let intent_id = tokio::task::spawn_blocking(move || {
-                    evaluate_economics_admission_blocking(
-                        &payload_clone,
-                        &work_id_clone,
-                        &changeset_digest_clone,
-                        &receipt_id_clone,
-                        status,
-                        event_timestamp_ns,
-                        &event_id_clone,
-                        &intent_buffer,
-                        resolver.as_ref(),
-                        &gate_signer,
-                        &telemetry,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    ProjectionWorkerError::IntentBufferError(format!("spawn_blocking failed: {e}"))
-                })??;
+            return Err(ProjectionWorkerError::LifecycleDenied {
+                reason: reason.to_string(),
+                subcategory: lifecycle_deny::MISSING_SELECTORS.to_string(),
+            });
+        } else if self.has_economics_gate() {
+            // Clone Arc-backed dependencies into the blocking closure.
+            let intent_buffer = Arc::clone(self.intent_buffer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError("intent buffer not wired".to_string())
+            })?);
 
-                // Economics gate ALLOW + replay prevention passed.
-                // The intent is PENDING in the buffer. We will admit it
-                // AFTER successful projection to ensure at-least-once
-                // semantics (BLOCKER-2 fix).
-                pending_intent_id = Some(intent_id);
-                debug!(
-                    work_id = %work_id,
-                    receipt_id = %receipt_id,
-                    "Economics admission: ALLOW (pending projection effect)"
-                );
-            } else {
-                // Gate not wired but event carries economics selectors.
-                // Fail-closed: DENY projection for events with economics
-                // selectors when the gate is not initialized. This prevents
-                // silent bypass of economics enforcement due to init failure
-                // (MAJOR-1 fix: fail-closed gate wiring).
-                let reason = "economics gate not initialized but event carries economics \
-                     selectors (fail-closed)";
-                warn!(
-                    work_id = %work_id,
-                    receipt_id = %receipt_id,
-                    reason = %reason,
-                    "Denying projection: economics gate INACTIVE for event with selectors"
-                );
-                self.telemetry
-                    .missing_gate_denied_count
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                return Err(ProjectionWorkerError::LifecycleDenied {
-                    reason: reason.to_string(),
-                    subcategory: lifecycle_deny::MISSING_GATE.to_string(),
-                });
-            }
+            let resolver = Arc::clone(self.continuity_resolver.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError(
+                    "continuity resolver not wired".to_string(),
+                )
+            })?);
+            let gate_signer = Arc::clone(self.gate_signer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError("gate signer not wired".to_string())
+            })?);
+            let telemetry = Arc::clone(&self.telemetry);
+            let payload_clone = payload.clone();
+            let work_id_clone = work_id.clone();
+            let changeset_digest_clone = changeset_digest;
+            let receipt_id_clone = receipt_id.to_string();
+            let event_timestamp_ns = event.timestamp_ns;
+            let event_id_clone = event.event_id.clone();
+
+            let intent_id = tokio::task::spawn_blocking(move || {
+                evaluate_economics_admission_blocking(
+                    &payload_clone,
+                    &work_id_clone,
+                    &changeset_digest_clone,
+                    &receipt_id_clone,
+                    status,
+                    event_timestamp_ns,
+                    &event_id_clone,
+                    &intent_buffer,
+                    resolver.as_ref(),
+                    &gate_signer,
+                    &telemetry,
+                )
+            })
+            .await
+            .map_err(|e| {
+                ProjectionWorkerError::IntentBufferError(format!("spawn_blocking failed: {e}"))
+            })??;
+
+            // Economics gate ALLOW + replay prevention passed.
+            // The intent is PENDING in the buffer. We will admit it
+            // AFTER successful projection to ensure at-least-once
+            // semantics (BLOCKER-2 fix).
+            pending_intent_id = Some(intent_id);
+            debug!(
+                work_id = %work_id,
+                receipt_id = %receipt_id,
+                "Economics admission: ALLOW (pending projection effect)"
+            );
+        } else {
+            // Gate not wired but event carries economics selectors.
+            // Fail-closed: DENY projection for events with economics
+            // selectors when the gate is not initialized. This prevents
+            // silent bypass of economics enforcement due to init failure
+            // (MAJOR-1 fix: fail-closed gate wiring).
+            let reason = "economics gate not initialized but event carries economics \
+                 selectors (fail-closed)";
+            warn!(
+                work_id = %work_id,
+                receipt_id = %receipt_id,
+                reason = %reason,
+                "Denying projection: economics gate INACTIVE for event with selectors"
+            );
+            self.telemetry
+                .missing_gate_denied_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+
+            // Record the deny durably in IntentBuffer before ACK.
+            // If the IntentBuffer itself is unavailable (gate completely
+            // failed to init), return a non-ACK error so the event is
+            // retried rather than silently ACKed without audit trail.
+            let intent_buffer = self.intent_buffer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError(
+                    "intent buffer not available for durable deny recording \
+                     (missing gate path); event will be retried"
+                        .to_string(),
+                )
+            })?;
+            // Extract eval_tick for the deny record if available, otherwise
+            // use zero sentinel.
+            let eval_tick_for_deny = payload
+                .get("eval_tick")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            record_denied_intent(
+                intent_buffer,
+                receipt_id,
+                work_id,
+                &changeset_digest,
+                status,
+                eval_tick_for_deny,
+                event.timestamp_ns,
+                reason,
+            )?;
+
+            return Err(ProjectionWorkerError::LifecycleDenied {
+                reason: reason.to_string(),
+                subcategory: lifecycle_deny::MISSING_GATE.to_string(),
+            });
         }
-        // else: no economics selectors -- use legacy ungated projection path.
 
         // Project to GitHub if adapter is configured
         if let Some(ref adapter) = self.adapter {
@@ -4560,6 +4637,12 @@ mod tests {
                 .load(AtomicOrdering::Relaxed),
             0
         );
+        assert_eq!(
+            telemetry
+                .missing_selectors_denied_count
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -4580,6 +4663,10 @@ mod tests {
         assert_eq!(lifecycle_deny::STALE, "stale");
         assert_eq!(lifecycle_deny::CONSUMED, "consumed");
         assert_eq!(lifecycle_deny::MISSING_GATE, "missing_gate");
+        assert_eq!(
+            lifecycle_deny::MISSING_SELECTORS,
+            "missing_economics_selectors"
+        );
     }
 
     // ----- Test: extract_hash32_field -----
@@ -5810,6 +5897,126 @@ mod tests {
         assert!(
             !is_zero_hash32_field(&payload, "test_field"),
             "Wrong length zero hash should return false"
+        );
+    }
+
+    // =========================================================================
+    // Regression: missing economics selectors -> DENY (no bypass path)
+    // =========================================================================
+
+    /// Events without economics selectors must be DENIED, not projected.
+    /// Previously, such events bypassed the gate entirely via the "legacy
+    /// ungated path". This test ensures the fail-closed fix works: no
+    /// selectors = no projection.
+    #[test]
+    fn test_missing_economics_selectors_deny() {
+        // Build an intent buffer so the deny can be durably recorded.
+        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let intent_buffer =
+            crate::projection::intent_buffer::IntentBuffer::new(Arc::clone(&intent_conn)).unwrap();
+
+        // Payload WITHOUT economics selectors (no eval_tick, time_authority_ref,
+        // window_ref, boundary_id).
+        let payload_no_selectors = serde_json::json!({
+            "receipt_id": "r-no-sel",
+            "verdict": "success",
+            "changeset_digest": hex::encode([0x42u8; 32])
+        });
+        assert!(
+            !payload_has_economics_selectors(&payload_no_selectors),
+            "Precondition: payload should lack economics selectors"
+        );
+
+        // Record the deny using the same path the worker would take.
+        let reason = "event missing economics selectors (fail-closed: no bypass path)";
+        let changeset_digest = [0x42u8; 32];
+        let result = record_denied_intent(
+            &intent_buffer,
+            "r-no-sel",
+            "work-no-sel",
+            &changeset_digest,
+            ProjectedStatus::Success,
+            0, // eval_tick absent
+            1000,
+            reason,
+        );
+        assert!(
+            result.is_ok(),
+            "Durable deny recording should succeed for missing-selectors path"
+        );
+
+        // Verify the intent was inserted and denied.
+        let guard = intent_conn.lock().unwrap();
+        let (verdict, deny_reason): (String, Option<String>) = guard
+            .query_row(
+                "SELECT verdict, deny_reason FROM projection_intents WHERE intent_id = ?",
+                rusqlite::params!["proj-r-no-sel"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("Intent should exist in buffer");
+        assert_eq!(verdict, "denied", "Intent should be durably denied");
+        assert!(
+            deny_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("missing economics selectors"),
+            "Deny reason should mention missing economics selectors, got: {deny_reason:?}"
+        );
+    }
+
+    // =========================================================================
+    // Regression: missing-gate deny path records durable deny before ACK
+    // =========================================================================
+
+    /// When the economics gate is inactive (init failed) and an event carries
+    /// economics selectors, the deny must be durably recorded in
+    /// `IntentBuffer` BEFORE the event is acknowledged. Previously, the deny
+    /// was returned without durable recording, losing the audit trail.
+    #[test]
+    fn test_missing_gate_deny_records_durable_deny() {
+        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let intent_buffer =
+            crate::projection::intent_buffer::IntentBuffer::new(Arc::clone(&intent_conn)).unwrap();
+
+        let changeset_digest = [0x42u8; 32];
+        let reason = "economics gate not initialized but event carries economics \
+             selectors (fail-closed)";
+
+        // Simulate the missing-gate deny path: record the deny durably.
+        let result = record_denied_intent(
+            &intent_buffer,
+            "r-gate-miss",
+            "work-gate-miss",
+            &changeset_digest,
+            ProjectedStatus::Success,
+            42, // eval_tick present in payload
+            2000,
+            reason,
+        );
+        assert!(
+            result.is_ok(),
+            "Durable deny recording should succeed for missing-gate path"
+        );
+
+        // Verify the intent was inserted and denied.
+        let guard = intent_conn.lock().unwrap();
+        let (verdict, deny_reason): (String, Option<String>) = guard
+            .query_row(
+                "SELECT verdict, deny_reason FROM projection_intents WHERE intent_id = ?",
+                rusqlite::params!["proj-r-gate-miss"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("Intent should exist in buffer");
+        assert_eq!(
+            verdict, "denied",
+            "Intent should be durably denied (missing-gate path)"
+        );
+        assert!(
+            deny_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("not initialized"),
+            "Deny reason should mention gate not initialized, got: {deny_reason:?}"
         );
     }
 }

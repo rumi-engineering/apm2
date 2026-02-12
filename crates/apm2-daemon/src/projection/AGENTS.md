@@ -8,9 +8,9 @@ The `projection` module implements write-only projection adapters that synchroni
 
 ### Components
 
-- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Enforces economics-gated admission with idempotent-insert replay prevention for events carrying economics selectors (TCK-00505). Events without economics selectors use the legacy ungated path.
+- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Enforces economics-gated admission with idempotent-insert replay prevention (TCK-00505). ALL events must pass through the economics gate; events without economics selectors are DENIED (fail-closed: no bypass path).
 - **`AdmissionTelemetry`**: Thread-safe atomic counters for economics admit/deny decisions per subcategory (TCK-00505)
-- **`lifecycle_deny`**: Constants for denial subcategories (consumed, missing_gate) used in replay prevention and gate-inactive scenarios (TCK-00505)
+- **`lifecycle_deny`**: Constants for denial subcategories (consumed, missing_gate, missing_economics_selectors) used in replay prevention, gate-inactive, and selector-absent scenarios (TCK-00505)
 - **`GitHubProjectionAdapter`**: Write-only GitHub commit status projection with signed receipts
 - **`ProjectionReceipt`**: Signed proof of projection with idempotency keys (legacy, backwards-compatible)
 - **`ProjectionAdmissionReceipt`**: Temporal-bound projection receipt bridging daemon receipts to economics `DeferredReplayReceiptV1` (TCK-00506)
@@ -30,7 +30,7 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Idempotent**: Safe for retries with `(work_id, changeset_digest, ledger_head)` key
 - **Persistent cache**: Idempotency cache survives restarts
 - **Bounded deserialization**: String fields (`boundary_id`, `receipt_id`, `work_id`) reject oversized values before allocation
-- **Economics admission gate**: Events carrying economics selectors pass through `evaluate_projection_continuity()` before the side effect. Events without economics selectors use the legacy ungated path (TCK-00505)
+- **Economics admission gate**: ALL events pass through the economics gate before any side effect. Events without economics selectors are DENIED (fail-closed: no bypass path). Events with selectors pass through `evaluate_projection_continuity()` (TCK-00505)
 - **Idempotent-insert replay prevention**: Duplicate `(work_id, changeset_digest)` intents are denied, preventing double-projection (TCK-00505). Note: canonical PCAC lifecycle primitives are NOT used in this ticket; full PCAC integration is a future ticket.
 - **Fail-closed gate defaults**: Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, never default ALLOW. Gate init failure also denies events with economics selectors (TCK-00505)
 - **Post-projection admission**: Intent is inserted as PENDING before projection, then admitted only AFTER successful projection side effects, ensuring at-least-once semantics (TCK-00505)
@@ -49,16 +49,16 @@ Long-running worker that tails ledger and projects review results to GitHub.
 
 - [INV-PJ01] Watermark is NOT advanced for events that fail due to missing dependencies (NACK/Retry).
 - [INV-PJ02] Worker is idempotent: restarts do not duplicate comments.
-- [INV-PJ10] No projection of events with economics selectors occurs without passing the economics admission gate when the gate is wired. When the gate is NOT wired, events with economics selectors are DENIED (fail-closed) (TCK-00505).
+- [INV-PJ10] No projection occurs without passing the economics admission gate. When the gate is NOT wired, ALL events are DENIED (fail-closed) (TCK-00505).
 - [INV-PJ11] Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, not default ALLOW (TCK-00505).
-- [INV-PJ12] Events without economics selectors use the legacy ungated projection path; the gate enforces only when selectors are present (TCK-00505).
+- [INV-PJ12] Events without economics selectors are DENIED with `missing_economics_selectors` subcategory — no bypass path exists (TCK-00505).
 - [INV-PJ13] Already-projected intents (same `work_id + changeset_digest`) result in DENY via IntentBuffer uniqueness -- idempotent-insert replay prevention (TCK-00505).
 
 **Contracts:**
 
 - [CTR-PJ01] Reads ledger commits via `LedgerTailer`.
 - [CTR-PJ02] Stores projection receipts in CAS for idempotency.
-- [CTR-PJ10] `evaluate_economics_admission_blocking()` is called in `handle_review_receipt()` before `adapter.project_status()` for events carrying economics selectors. When the gate is not wired, such events are DENIED (TCK-00505).
+- [CTR-PJ10] `evaluate_economics_admission_blocking()` is called in `handle_review_receipt()` before `adapter.project_status()` for events carrying economics selectors. Events without selectors are DENIED before reaching the gate. When the gate is not wired, all events are DENIED with durable recording (TCK-00505).
 - [CTR-PJ11] Admitted intents are recorded in IntentBuffer: inserted as PENDING before projection, admitted AFTER successful projection side effects (TCK-00505).
 - [CTR-PJ12] Denied intents are recorded with structured deny reason in IntentBuffer. Deny recording failure prevents event ACK (durable deny guarantee) (TCK-00505).
 - [CTR-PJ13] `AdmissionTelemetry` counters increment atomically (Relaxed ordering -- observability only) for each verdict path (TCK-00505).
