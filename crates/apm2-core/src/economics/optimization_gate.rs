@@ -300,14 +300,18 @@ pub const DENY_PROPOSAL_DISCLOSURE_CHANNELS_OVERFLOW: &str =
 pub const DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID: &str =
     "optimization_disclosure_policy_signature_invalid";
 
-/// Deny: disclosure-control policy signature bytes are malformed (not a valid
-/// Ed25519 signature).
-pub const DENY_DISCLOSURE_POLICY_SIGNATURE_MALFORMED: &str =
-    "optimization_disclosure_policy_signature_malformed";
-
 /// Deny: trusted verification key bytes are invalid (not a valid Ed25519 public
 /// key).
 pub const DENY_DISCLOSURE_POLICY_KEY_INVALID: &str = "optimization_disclosure_policy_key_invalid";
+
+/// Deny: disclosure-control policy digest does not bind the semantic fields
+/// (mode, `phase_id`, `epoch_tick`, state, `approved_channels`).
+pub const DENY_DISCLOSURE_POLICY_DIGEST_MISMATCH: &str =
+    "optimization_disclosure_policy_digest_mismatch";
+
+/// Deny: disclosure-control policy phase ID does not match the expected phase.
+pub const DENY_DISCLOSURE_POLICY_PHASE_MISMATCH: &str =
+    "optimization_disclosure_policy_phase_mismatch";
 
 // ---------------------------------------------------------------------------
 // Bounded serde deserializers
@@ -473,15 +477,39 @@ fn deserialize_bounded_phase_id<'de, D>(deserializer: D) -> Result<String, D::Er
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
-    if value.len() > MAX_PHASE_ID_LENGTH {
-        return Err(serde::de::Error::custom(format!(
-            "phase_id length {} exceeds maximum {}",
-            value.len(),
-            MAX_PHASE_ID_LENGTH,
-        )));
+    struct BoundedStringVisitor;
+
+    impl serde::de::Visitor<'_> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a string of at most {MAX_PHASE_ID_LENGTH} bytes")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v.len() > MAX_PHASE_ID_LENGTH {
+                return Err(E::custom(format!(
+                    "phase_id length {} exceeds maximum {}",
+                    v.len(),
+                    MAX_PHASE_ID_LENGTH,
+                )));
+            }
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            if v.len() > MAX_PHASE_ID_LENGTH {
+                return Err(E::custom(format!(
+                    "phase_id length {} exceeds maximum {}",
+                    v.len(),
+                    MAX_PHASE_ID_LENGTH,
+                )));
+            }
+            Ok(v)
+        }
     }
-    Ok(value)
+
+    deserializer.deserialize_str(BoundedStringVisitor)
 }
 
 fn deserialize_bounded_disclosure_channels<'de, D>(
@@ -1196,8 +1224,53 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 // Gate: Disclosure-control policy validity (REQ-0007)
 // ---------------------------------------------------------------------------
 
+/// Computes a domain-separated canonical hash of all semantic fields in a
+/// disclosure-control policy snapshot.
+///
+/// The digest binds `phase_id`, `mode`, `epoch_tick`, `state`, and
+/// `approved_channels` using Blake3 with key derivation context
+/// `"apm2.disclosure_policy.v1"`.
+///
+/// This function is public so that snapshot producers can set `policy_digest`
+/// to the correct value before signing.
+#[must_use]
+pub fn compute_disclosure_policy_digest(snap: &DisclosurePolicySnapshot) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("apm2.disclosure_policy.v1");
+    // phase_id (length-prefixed)
+    hasher.update(&(snap.phase_id.len() as u64).to_le_bytes());
+    hasher.update(snap.phase_id.as_bytes());
+    // mode discriminant
+    #[allow(unreachable_patterns)]
+    hasher.update(&[match snap.mode {
+        DisclosurePolicyMode::TradeSecretOnly => 0u8,
+        DisclosurePolicyMode::OpenSource => 1u8,
+        // non_exhaustive: unknown variant fails closed with a unique discriminant
+        _ => 255u8,
+    }]);
+    // epoch_tick
+    hasher.update(&snap.epoch_tick.to_le_bytes());
+    // state discriminant
+    #[allow(unreachable_patterns)]
+    hasher.update(&[match snap.state {
+        DisclosurePolicyState::Current => 0u8,
+        DisclosurePolicyState::Stale => 1u8,
+        DisclosurePolicyState::Ambiguous => 2u8,
+        DisclosurePolicyState::Unknown => 3u8,
+        // non_exhaustive: unknown variant fails closed
+        _ => 255u8,
+    }]);
+    // approved_channels (BTreeSet is already sorted)
+    hasher.update(&(snap.approved_channels.len() as u64).to_le_bytes());
+    for ch in &snap.approved_channels {
+        hasher.update(&(ch.len() as u64).to_le_bytes());
+        hasher.update(ch.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Validates that a disclosure-control policy snapshot is present, current,
-/// signed, cryptographically verified, and structurally valid.
+/// signed, cryptographically verified, digest-bound, phase-matched, and
+/// structurally valid.
 ///
 /// Checks:
 /// - Snapshot is not `None` (fail-closed: missing policy is denied).
@@ -1205,12 +1278,16 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 /// - Signature is non-zero (unsigned snapshots deny fail-closed).
 /// - Policy digest is non-zero.
 /// - Phase ID is non-empty.
+/// - Phase ID matches the expected phase ID (cross-phase replay prevention).
 /// - Epoch tick is not in the future.
 /// - Epoch is not stale (age <= `max_age_ticks`).
 /// - Approved channels set does not exceed
 ///   [`MAX_APPROVED_DISCLOSURE_CHANNELS`].
 /// - Ed25519 signature cryptographically verifies against the trusted authority
 ///   key and the policy digest.
+/// - Policy digest canonically binds all semantic fields (mode, `phase_id`,
+///   `epoch_tick`, state, `approved_channels`) via
+///   [`compute_disclosure_policy_digest`].
 ///
 /// # Parameters
 ///
@@ -1218,6 +1295,8 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 ///   if the proposal has no policy binding.
 /// - `trusted_verifying_key`: 32-byte Ed25519 public key of the trusted
 ///   disclosure-control authority. Used to verify the snapshot signature.
+/// - `expected_phase_id`: The phase ID that the snapshot must match. Prevents
+///   cross-phase policy replay attacks.
 /// - `current_tick`: The current HTF tick for freshness evaluation.
 /// - `max_age_ticks`: Maximum allowed epoch age in ticks.
 ///
@@ -1227,6 +1306,7 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 pub fn validate_disclosure_policy(
     snapshot: Option<&DisclosurePolicySnapshot>,
     trusted_verifying_key: &[u8; 32],
+    expected_phase_id: &str,
     current_tick: u64,
     max_age_ticks: u64,
 ) -> Result<(), &'static str> {
@@ -1264,6 +1344,11 @@ pub fn validate_disclosure_policy(
         return Err(DENY_DISCLOSURE_POLICY_PHASE_ID_EMPTY);
     }
 
+    // Phase ID binding — prevents cross-phase policy replay.
+    if snap.phase_id != expected_phase_id {
+        return Err(DENY_DISCLOSURE_POLICY_PHASE_MISMATCH);
+    }
+
     // Epoch freshness checks.
     if snap.epoch_tick > current_tick {
         return Err(DENY_DISCLOSURE_POLICY_FUTURE_TICK);
@@ -1289,6 +1374,14 @@ pub fn validate_disclosure_policy(
     // Verify the signature against the policy digest.
     vk.verify_strict(&snap.policy_digest, &sig)
         .map_err(|_| DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID)?;
+
+    // Semantic field binding: verify that the policy digest canonically binds
+    // ALL semantic fields. This prevents an attacker from reusing a valid
+    // (policy_digest, signature) pair while mutating semantic fields.
+    let expected_digest = compute_disclosure_policy_digest(snap);
+    if snap.policy_digest.ct_eq(&expected_digest).unwrap_u8() != 1 {
+        return Err(DENY_DISCLOSURE_POLICY_DIGEST_MISMATCH);
+    }
 
     Ok(())
 }
@@ -1340,7 +1433,19 @@ pub fn validate_disclosure_channels(
         return Err(DENY_PROPOSAL_DISCLOSURE_CHANNELS_OVERFLOW);
     }
 
+    // Build a normalized (lowercase) set of approved channels for consistent
+    // case-insensitive comparison. This closes the gap where
+    // `is_forbidden_trade_secret_channel` uses lowercase but the approval
+    // check was raw.
+    let approved_lower: BTreeSet<String> = snapshot
+        .approved_channels
+        .iter()
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+
     for channel in &proposal.disclosure_channels {
+        let normalized = channel.to_ascii_lowercase();
+
         // In TRADE_SECRET_ONLY mode, patent/provisional channels are always denied.
         if snapshot.mode == DisclosurePolicyMode::TradeSecretOnly
             && is_forbidden_trade_secret_channel(channel)
@@ -1348,8 +1453,9 @@ pub fn validate_disclosure_channels(
             return Err(DENY_TRADE_SECRET_PATENT_CHANNEL);
         }
 
-        // All channels must be in the approved set (deny-by-default).
-        if !snapshot.approved_channels.contains(channel) {
+        // All channels must be in the approved set (deny-by-default),
+        // using normalized comparison.
+        if !approved_lower.contains(&normalized) {
             return Err(DENY_UNAPPROVED_DISCLOSURE_CHANNEL);
         }
     }
@@ -1408,6 +1514,7 @@ pub fn evaluate_optimization_gate(
     authority_surface_evidence: Option<&AuthoritySurfaceEvidence>,
     disclosure_policy: Option<&DisclosurePolicySnapshot>,
     trusted_disclosure_verifying_key: &[u8; 32],
+    expected_phase_id: &str,
     arbitration_outcome: ArbitrationOutcome,
     current_tick: u64,
     max_evidence_age_ticks: u64,
@@ -1434,6 +1541,7 @@ pub fn evaluate_optimization_gate(
     if let Err(reason) = validate_disclosure_policy(
         disclosure_policy,
         trusted_disclosure_verifying_key,
+        expected_phase_id,
         current_tick,
         MAX_DISCLOSURE_POLICY_AGE_TICKS,
     ) {
@@ -1733,21 +1841,47 @@ mod tests {
         }
     }
 
-    /// Creates a disclosure-policy snapshot with a valid Ed25519 signature
-    /// over the policy digest, signed by the deterministic test keypair.
+    /// The expected phase ID used by default test helpers.
+    const TEST_PHASE_ID: &str = "phase_alpha";
+
+    /// Creates a disclosure-policy snapshot with a real canonical digest
+    /// computed from its semantic fields and a valid Ed25519 signature
+    /// over that digest, signed by the deterministic test keypair.
     fn test_disclosure_policy_snapshot() -> DisclosurePolicySnapshot {
+        make_signed_snapshot(
+            TEST_PHASE_ID,
+            DisclosurePolicyMode::TradeSecretOnly,
+            900,
+            DisclosurePolicyState::Current,
+            BTreeSet::new(),
+        )
+    }
+
+    /// Build a [`DisclosurePolicySnapshot`] with the real canonical digest
+    /// and a valid Ed25519 signature from the deterministic test keypair.
+    fn make_signed_snapshot(
+        phase_id: &str,
+        mode: DisclosurePolicyMode,
+        epoch_tick: u64,
+        state: DisclosurePolicyState,
+        approved_channels: BTreeSet<String>,
+    ) -> DisclosurePolicySnapshot {
+        // Build a temporary snapshot to compute the digest.
+        let mut snap = DisclosurePolicySnapshot {
+            phase_id: phase_id.to_string(),
+            mode,
+            epoch_tick,
+            state,
+            policy_digest: [0u8; 32], // placeholder
+            signature: [0u8; 64],     // placeholder
+            approved_channels,
+        };
+        let digest = compute_disclosure_policy_digest(&snap);
+        snap.policy_digest = digest;
         let sk = test_signing_key();
-        let digest = hash(0xBB);
         let sig = sk.sign(&digest);
-        DisclosurePolicySnapshot {
-            phase_id: "phase_alpha".to_string(),
-            mode: DisclosurePolicyMode::TradeSecretOnly,
-            epoch_tick: 900,
-            state: DisclosurePolicyState::Current,
-            policy_digest: digest,
-            signature: sig.to_bytes(),
-            approved_channels: BTreeSet::new(),
-        }
+        snap.signature = sig.to_bytes();
+        snap
     }
 
     fn test_evidence_quality() -> EvidenceQualityReport {
@@ -2262,6 +2396,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2280,7 +2415,10 @@ mod tests {
         assert!(decision.trace.disclosure_policy_valid);
         assert!(decision.trace.disclosure_mode_matched);
         assert!(decision.trace.disclosure_channels_approved);
-        assert_eq!(decision.trace.disclosure_policy_digest, hash(0xBB));
+        assert_eq!(
+            decision.trace.disclosure_policy_digest,
+            policy.policy_digest
+        );
     }
 
     #[test]
@@ -2297,6 +2435,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2323,6 +2462,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2351,6 +2491,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2376,6 +2517,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2404,6 +2546,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2433,6 +2576,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedDeny,
             1000,
             200,
@@ -2461,6 +2605,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2488,6 +2633,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2501,6 +2647,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2526,6 +2673,7 @@ mod tests {
             None,
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2555,6 +2703,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2594,6 +2743,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2625,6 +2775,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2828,6 +2979,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2856,6 +3008,7 @@ mod tests {
             None, // missing authority surface evidence
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2888,6 +3041,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2918,6 +3072,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2947,6 +3102,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2976,6 +3132,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2993,14 +3150,22 @@ mod tests {
     fn test_disclosure_policy_current_allows() {
         let snap = test_disclosure_policy_snapshot();
         assert!(
-            validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500).is_ok()
+            validate_disclosure_policy(
+                Some(&snap),
+                &test_verifying_key_bytes(),
+                TEST_PHASE_ID,
+                1000,
+                500
+            )
+            .is_ok()
         );
     }
 
     #[test]
     fn test_disclosure_policy_missing_denied() {
         let err =
-            validate_disclosure_policy(None, &test_verifying_key_bytes(), 1000, 500).unwrap_err();
+            validate_disclosure_policy(None, &test_verifying_key_bytes(), TEST_PHASE_ID, 1000, 500)
+                .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_MISSING);
     }
 
@@ -3008,8 +3173,14 @@ mod tests {
     fn test_disclosure_policy_stale_state_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.state = DisclosurePolicyState::Stale;
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_STALE);
     }
 
@@ -3017,8 +3188,14 @@ mod tests {
     fn test_disclosure_policy_ambiguous_state_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.state = DisclosurePolicyState::Ambiguous;
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_AMBIGUOUS);
     }
 
@@ -3026,8 +3203,14 @@ mod tests {
     fn test_disclosure_policy_unknown_state_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.state = DisclosurePolicyState::Unknown;
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_UNKNOWN);
     }
 
@@ -3035,8 +3218,14 @@ mod tests {
     fn test_disclosure_policy_unsigned_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.signature = [0u8; 64];
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_UNSIGNED);
     }
 
@@ -3044,8 +3233,14 @@ mod tests {
     fn test_disclosure_policy_zero_digest_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.policy_digest = [0u8; 32];
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_DIGEST_ZERO);
     }
 
@@ -3053,8 +3248,14 @@ mod tests {
     fn test_disclosure_policy_empty_phase_id_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.phase_id = String::new();
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_PHASE_ID_EMPTY);
     }
 
@@ -3062,8 +3263,14 @@ mod tests {
     fn test_disclosure_policy_future_tick_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.epoch_tick = 1001;
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_FUTURE_TICK);
     }
 
@@ -3071,17 +3278,37 @@ mod tests {
     fn test_disclosure_policy_stale_epoch_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.epoch_tick = 100;
-        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
-            .unwrap_err();
+        let err = validate_disclosure_policy(
+            Some(&snap),
+            &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
+            1000,
+            500,
+        )
+        .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_STALE);
     }
 
     #[test]
     fn test_disclosure_policy_exact_age_allows() {
-        let mut snap = test_disclosure_policy_snapshot();
-        snap.epoch_tick = 500;
+        // Build a properly signed snapshot with epoch_tick = 500 so the
+        // canonical digest binds correctly.
+        let snap = make_signed_snapshot(
+            TEST_PHASE_ID,
+            DisclosurePolicyMode::TradeSecretOnly,
+            500,
+            DisclosurePolicyState::Current,
+            BTreeSet::new(),
+        );
         assert!(
-            validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500).is_ok()
+            validate_disclosure_policy(
+                Some(&snap),
+                &test_verifying_key_bytes(),
+                TEST_PHASE_ID,
+                1000,
+                500
+            )
+            .is_ok()
         );
     }
 
@@ -3235,6 +3462,7 @@ mod tests {
             Some(&surface),
             None, // missing disclosure policy
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3254,8 +3482,14 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
-        let mut policy = test_disclosure_policy_snapshot();
-        policy.mode = DisclosurePolicyMode::OpenSource; // mismatch
+        // Build a properly-signed OpenSource snapshot so digest is valid
+        let policy = make_signed_snapshot(
+            TEST_PHASE_ID,
+            DisclosurePolicyMode::OpenSource,
+            900,
+            DisclosurePolicyState::Current,
+            BTreeSet::new(),
+        );
 
         let decision = evaluate_optimization_gate(
             &proposal,
@@ -3264,6 +3498,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3287,8 +3522,15 @@ mod tests {
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
         let surface = test_authority_surface_evidence();
-        let mut policy = test_disclosure_policy_snapshot();
-        policy.approved_channels.insert("patent_filing".to_string());
+        let mut channels = BTreeSet::new();
+        channels.insert("patent_filing".to_string());
+        let policy = make_signed_snapshot(
+            TEST_PHASE_ID,
+            DisclosurePolicyMode::TradeSecretOnly,
+            900,
+            DisclosurePolicyState::Current,
+            channels,
+        );
 
         let decision = evaluate_optimization_gate(
             &proposal,
@@ -3297,6 +3539,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3328,6 +3571,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3357,6 +3601,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3383,6 +3628,7 @@ mod tests {
             None, // missing authority surface
             None, // missing disclosure policy
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3448,6 +3694,7 @@ mod tests {
             Some(&surface),
             Some(&policy),
             &test_verifying_key_bytes(),
+            TEST_PHASE_ID,
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3455,7 +3702,10 @@ mod tests {
 
         assert_eq!(decision.verdict, OptimizationGateVerdict::Allow);
         // Verify the policy digest is bound in the trace
-        assert_eq!(decision.trace.disclosure_policy_digest, hash(0xBB));
+        assert_eq!(
+            decision.trace.disclosure_policy_digest,
+            policy.policy_digest
+        );
     }
 
     // =======================================================================
@@ -3466,7 +3716,7 @@ mod tests {
     fn test_disclosure_policy_valid_signature_allows() {
         let snap = test_disclosure_policy_snapshot();
         let vk = test_verifying_key_bytes();
-        assert!(validate_disclosure_policy(Some(&snap), &vk, 1000, 500).is_ok());
+        assert!(validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).is_ok());
     }
 
     #[test]
@@ -3475,7 +3725,8 @@ mod tests {
         // Corrupt the signature (non-zero but invalid)
         snap.signature = [0xFFu8; 64];
         let vk = test_verifying_key_bytes();
-        let err = validate_disclosure_policy(Some(&snap), &vk, 1000, 500).unwrap_err();
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID);
     }
 
@@ -3486,7 +3737,9 @@ mod tests {
         let other_seed = [0x99u8; 32];
         let other_signing = SigningKey::from_bytes(&other_seed);
         let other_verifying = other_signing.verifying_key().to_bytes();
-        let err = validate_disclosure_policy(Some(&snap), &other_verifying, 1000, 500).unwrap_err();
+        let err =
+            validate_disclosure_policy(Some(&snap), &other_verifying, TEST_PHASE_ID, 1000, 500)
+                .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID);
     }
 
@@ -3502,7 +3755,8 @@ mod tests {
             candidate[31] &= 0x7F;
             if VerifyingKey::from_bytes(&candidate).is_err() {
                 let err =
-                    validate_disclosure_policy(Some(&snap), &candidate, 1000, 500).unwrap_err();
+                    validate_disclosure_policy(Some(&snap), &candidate, TEST_PHASE_ID, 1000, 500)
+                        .unwrap_err();
                 assert_eq!(err, DENY_DISCLOSURE_POLICY_KEY_INVALID);
                 found_invalid = true;
                 break;
@@ -3524,28 +3778,151 @@ mod tests {
         let mut snap = test_disclosure_policy_snapshot();
         snap.policy_digest = hash(0xCC); // different from 0xBB
         snap.signature = sig.to_bytes();
-        let err = validate_disclosure_policy(Some(&snap), &vk, 1000, 500).unwrap_err();
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID);
     }
 
     #[test]
     fn test_disclosure_policy_ed25519_end_to_end() {
-        // Generate keypair, sign a digest, build snapshot, verify passes
-        let sk = test_signing_key();
-        let vk_bytes = sk.verifying_key().to_bytes();
-        let digest = [0xAA; 32];
-        let sig = sk.sign(&digest);
+        // Generate keypair, compute canonical digest, sign it, verify passes
+        let vk_bytes = test_verifying_key_bytes();
+        let snap = make_signed_snapshot(
+            "phase_beta",
+            DisclosurePolicyMode::OpenSource,
+            800,
+            DisclosurePolicyState::Current,
+            BTreeSet::new(),
+        );
 
-        let snap = DisclosurePolicySnapshot {
-            phase_id: "phase_beta".to_string(),
-            mode: DisclosurePolicyMode::OpenSource,
-            epoch_tick: 800,
-            state: DisclosurePolicyState::Current,
-            policy_digest: digest,
-            signature: sig.to_bytes(),
-            approved_channels: BTreeSet::new(),
-        };
+        assert!(
+            validate_disclosure_policy(Some(&snap), &vk_bytes, "phase_beta", 1000, 500).is_ok()
+        );
+    }
 
-        assert!(validate_disclosure_policy(Some(&snap), &vk_bytes, 1000, 500).is_ok());
+    // =======================================================================
+    // Digest binding tests (BLOCKER remediation)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_policy_tampered_mode_denied() {
+        // Build a valid snapshot, then tamper with the mode field.
+        // The canonical digest will no longer match.
+        let mut snap = test_disclosure_policy_snapshot();
+        // Original mode is TradeSecretOnly; tamper to OpenSource
+        snap.mode = DisclosurePolicyMode::OpenSource;
+        let vk = test_verifying_key_bytes();
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).unwrap_err();
+        // Signature still verifies against old policy_digest, but the
+        // recomputed canonical digest no longer matches.
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_DIGEST_MISMATCH);
+    }
+
+    #[test]
+    fn test_disclosure_policy_tampered_channels_denied() {
+        // Build a valid snapshot, then tamper with approved_channels.
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.approved_channels
+            .insert("smuggled_channel".to_string());
+        let vk = test_verifying_key_bytes();
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_DIGEST_MISMATCH);
+    }
+
+    #[test]
+    fn test_disclosure_policy_tampered_epoch_tick_denied() {
+        // Tamper with epoch_tick — digest mismatch
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.epoch_tick = 999; // was 900
+        let vk = test_verifying_key_bytes();
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_DIGEST_MISMATCH);
+    }
+
+    #[test]
+    fn test_disclosure_policy_tampered_phase_id_denied() {
+        // Tamper with phase_id — hits phase mismatch first
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.phase_id = "phase_gamma".to_string();
+        let vk = test_verifying_key_bytes();
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, TEST_PHASE_ID, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_PHASE_MISMATCH);
+    }
+
+    // =======================================================================
+    // Cross-phase policy replay tests (MAJOR remediation)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_policy_phase_mismatch_denied() {
+        let snap = test_disclosure_policy_snapshot(); // phase_id = "phase_alpha"
+        let vk = test_verifying_key_bytes();
+        // Validate with a different expected phase
+        let err =
+            validate_disclosure_policy(Some(&snap), &vk, "phase_beta", 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_PHASE_MISMATCH);
+    }
+
+    #[test]
+    fn test_disclosure_policy_phase_mismatch_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+        let policy = test_disclosure_policy_snapshot(); // phase = "phase_alpha"
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            Some(&policy),
+            &test_verifying_key_bytes(),
+            "wrong_phase", // expected phase does not match snapshot
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DISCLOSURE_POLICY_PHASE_MISMATCH),
+        );
+    }
+
+    // =======================================================================
+    // Channel normalization tests (MAJOR remediation)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_channels_case_insensitive_approval() {
+        // approved_channels has "Internal_Review" but proposal has "internal_review"
+        // After normalization, should match
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("internal_review".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.approved_channels.insert("Internal_Review".to_string());
+        assert!(validate_disclosure_channels(&proposal, &snap).is_ok());
+    }
+
+    #[test]
+    fn test_disclosure_channels_mixed_case_forbidden_denied() {
+        // "Patent_Filing" with mixed case should still be caught by forbidden check
+        // AND should not be matched as approved
+        let mut proposal = test_proposal();
+        proposal
+            .disclosure_channels
+            .insert("Patent_Filing".to_string());
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.approved_channels.insert("Patent_Filing".to_string());
+        let err = validate_disclosure_channels(&proposal, &snap).unwrap_err();
+        assert_eq!(err, DENY_TRADE_SECRET_PATENT_CHANNEL);
     }
 }
