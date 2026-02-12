@@ -91,6 +91,8 @@ Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after v
 - [INV-PR06] Token validation uses constant-time HMAC comparison.
 - [INV-PR11] In authoritative mode, fail-closed tiers (Tier2/3/4) MUST be denied if neither `AdmissionKernel` nor `LifecycleGate` is wired (TCK-00494 no-bypass invariant). No silent fallback to ungated effect-capable path.
 - [INV-PR12] When `AdmissionKernel` is wired and `LifecycleGate` is absent, the `RequestTool` handler MUST invoke `kernel.plan()` and `kernel.execute()` for fail-closed tier requests in authoritative mode. The kernel MUST succeed before broker dispatch proceeds (TCK-00494 kernel invocation invariant).
+- [INV-PR13] In authoritative mode, `EmitEvent` and `PublishEvidence` handlers enforce the same kernel/PCAC lifecycle guard as `RequestTool` (TCK-00498). Session endpoints are classified as `Tier2Plus` (fail-closed) since they perform authoritative state mutations (ledger writes, CAS writes).
+- [INV-PR14] When `AdmissionKernel` is wired for `EmitEvent`/`PublishEvidence`, the kernel plan/execute lifecycle runs BEFORE the authoritative effect (ledger/CAS write). `AdmissionBundleV1` evidence is persisted before the effect; `AdmissionOutcomeIndexV1` is persisted after (TCK-00498).
 
 **Contracts:**
 
@@ -98,6 +100,7 @@ Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after v
 - [CTR-PR07] Messages use bounded decoding (CTR-1603).
 - [CTR-PR08] Authority lifecycle guard fires after decode/validate/transport checks but BEFORE PCAC lifecycle and broker dispatch (TCK-00494). Requires at least one authority gate (`AdmissionKernel` or `LifecycleGate`) for fail-closed tier tool requests in authoritative mode.
 - [CTR-PR09] When `AdmissionKernel` is wired without `LifecycleGate`, `handle_request_tool` invokes `kernel.plan()` then `kernel.execute()` with fresh clock/session state, denying on any error with `SessionErrorToolNotAllowed`. The kernel result (`AdmissionResultV1`) is persisted to the ledger as a `kernel_tool_actuation` event BEFORE broker dispatch — fail-closed if persistence fails (TCK-00494, SECURITY MAJOR 1 fix).
+- [CTR-PR10] `handle_emit_event` and `handle_publish_evidence` invoke the shared `enforce_session_endpoint_kernel_lifecycle` helper after decode/validate checks but BEFORE the authoritative effect (ledger write / CAS write). The helper uses `Tier2Plus` risk tier, domain-separated BLAKE3 intent/effect digests, and enforces governance policy-root prerequisites for fail-closed tiers (TCK-00498, REQ-0026).
 
 ### `SessionToken`
 
