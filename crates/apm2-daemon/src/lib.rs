@@ -64,6 +64,7 @@ pub mod metrics;
 pub mod pcac;
 pub mod projection;
 pub mod protocol;
+pub mod quarantine_store;
 pub mod session;
 pub mod state;
 pub mod telemetry;

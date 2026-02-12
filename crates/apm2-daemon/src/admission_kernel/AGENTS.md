@@ -84,7 +84,7 @@ Trait interfaces for prerequisite resolution. Implementations provided by TCK-00
 
 ### `QuarantineGuard` (mod.rs)
 
-Trait for durable quarantine capacity reservation. Implementations provided by TCK-00496.
+Trait for durable quarantine capacity reservation. Implemented by `DurableQuarantineGuard` in [`quarantine_store`](../quarantine_store/AGENTS.md) (TCK-00496).
 
 ### `EnforcementTier` (types.rs)
 
@@ -153,6 +153,7 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 
 ## Related Modules
 
+- [`apm2_daemon::quarantine_store`](../quarantine_store/AGENTS.md) -- `DurableQuarantineGuard` (TCK-00496)
 - [`apm2_daemon::pcac`](../pcac/AGENTS.md) -- PCAC lifecycle gate (`InProcessKernel`, `LifecycleGate`)
 - [`apm2_core::pcac`](../../../apm2-core/src/pcac/AGENTS.md) -- Core PCAC types (`AuthorityJoinKernel`, `RiskTier`, etc.)
 - [`apm2_daemon::htf`](../htf/AGENTS.md) -- `HolonicClock` provides tick source

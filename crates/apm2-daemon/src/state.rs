@@ -1629,10 +1629,34 @@ impl DispatcherState {
                 provider_build_digest: *blake3::hash(b"apm2-daemon-build-v1").as_bytes(),
             };
 
-            let admission_kernel = Arc::new(crate::admission_kernel::AdmissionKernelV1::new(
-                admission_pcac,
-                witness_provider,
-            ));
+            // TCK-00496: Wire DurableQuarantineGuard for fail-closed quarantine
+            // capacity reservation. The quarantine database is co-located inside
+            // the CAS directory for per-instance isolation.
+            let quarantine_db_path = cas_path.as_ref().join("quarantine_store.db");
+            let quarantine_backend =
+                crate::quarantine_store::SqliteQuarantineBackend::open(&quarantine_db_path)
+                    .map_err(|e| crate::cas::DurableCasError::InitializationFailed {
+                        message: format!(
+                            "failed to open quarantine store at {}: {e}",
+                            quarantine_db_path.display()
+                        ),
+                    })?;
+            let quarantine_guard = Arc::new(
+                crate::quarantine_store::DurableQuarantineGuard::new(
+                    quarantine_backend,
+                    crate::quarantine_store::QuarantineStoreConfig::default(),
+                )
+                .map_err(|e| {
+                    crate::cas::DurableCasError::InitializationFailed {
+                        message: format!("failed to initialize quarantine guard: {e}"),
+                    }
+                })?,
+            );
+
+            let admission_kernel = Arc::new(
+                crate::admission_kernel::AdmissionKernelV1::new(admission_pcac, witness_provider)
+                    .with_quarantine_guard(quarantine_guard),
+            );
             session_dispatcher = session_dispatcher.with_admission_kernel(admission_kernel);
         }
 
