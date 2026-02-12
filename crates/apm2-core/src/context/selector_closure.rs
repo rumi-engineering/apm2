@@ -120,6 +120,23 @@ pub enum CompletenessVerdict {
 /// Fail-closed: unknown/ambiguous state always produces `Incomplete`.
 #[must_use]
 pub fn verify_selector_completeness(input: &SelectorClosureInput) -> CompletenessVerdict {
+    verify_selector_completeness_impl(input, None)
+}
+
+/// Verifies selector closure completeness and validates loss-profile digest
+/// bindings against CAS for high-risk tiers.
+#[must_use]
+pub fn verify_selector_completeness_with_cas(
+    input: &SelectorClosureInput,
+    cas: &dyn ContentAddressedStore,
+) -> CompletenessVerdict {
+    verify_selector_completeness_impl(input, Some(cas))
+}
+
+fn verify_selector_completeness_impl(
+    input: &SelectorClosureInput,
+    cas: Option<&dyn ContentAddressedStore>,
+) -> CompletenessVerdict {
     let mut defects = Vec::new();
 
     if input.selector_digests.is_empty() {
@@ -170,8 +187,44 @@ pub fn verify_selector_completeness(input: &SelectorClosureInput) -> Completenes
                             selector_digest_hex: Some(hex::encode(digest)),
                         });
                     }
+
+                    if let Some(cas) = cas {
+                        match cas.exists(&lp.digest) {
+                            Ok(true) => {},
+                            Ok(false) | Err(CasError::NotFound { .. }) => {
+                                defects.push(SelectorClosureDefect {
+                                    code: SelectorClosureDefectCode::LossProfileDigestMismatch,
+                                    message: format!(
+                                        "loss profile digest for '{path}' does not match CAS content"
+                                    ),
+                                    selector_digest_hex: Some(hex::encode(digest)),
+                                });
+                            },
+                            Err(err) => {
+                                defects.push(SelectorClosureDefect {
+                                    code: SelectorClosureDefectCode::LossProfileDigestMismatch,
+                                    message: format!(
+                                        "unable to verify loss profile digest for '{path}' in CAS: {err}"
+                                    ),
+                                    selector_digest_hex: Some(hex::encode(digest)),
+                                });
+                            },
+                        }
+                    }
                 },
             }
+        }
+    }
+
+    // Reverse-set validation: orphan loss-profile keys are invalid at all risk
+    // tiers.
+    for lp_path in input.loss_profiles.keys() {
+        if !input.selector_digests.contains_key(lp_path) {
+            defects.push(SelectorClosureDefect {
+                code: SelectorClosureDefectCode::UnresolvedSelectorDigest,
+                message: format!("loss profile for '{lp_path}' does not match any selector digest"),
+                selector_digest_hex: None,
+            });
         }
     }
 
@@ -208,17 +261,51 @@ pub fn replay_zoom_in(
     cas: &dyn ContentAddressedStore,
     evidence_hash: &[u8; 32],
 ) -> Result<Vec<u8>, SelectorClosureError> {
-    let bytes = cas.retrieve(evidence_hash)?;
+    let evidence_hash_hex = hex::encode(evidence_hash);
 
+    let size = match cas.size(evidence_hash) {
+        Ok(size) => size,
+        Err(CasError::NotFound { .. }) => {
+            return Err(SelectorClosureError::Defect(SelectorClosureDefect {
+                code: SelectorClosureDefectCode::ReplayEvidenceMissing,
+                message: format!("replay evidence '{evidence_hash_hex}' not found in CAS"),
+                selector_digest_hex: Some(evidence_hash_hex),
+            }));
+        },
+        Err(err) => return Err(SelectorClosureError::Cas(err)),
+    };
+
+    if size > MAX_REPLAY_EVIDENCE_BYTES {
+        return Err(SelectorClosureError::Defect(SelectorClosureDefect {
+            code: SelectorClosureDefectCode::ReplayEvidenceTooLarge,
+            message: format!(
+                "replay evidence {size} bytes exceeds max {MAX_REPLAY_EVIDENCE_BYTES}"
+            ),
+            selector_digest_hex: Some(evidence_hash_hex),
+        }));
+    }
+
+    let bytes = match cas.retrieve(evidence_hash) {
+        Ok(bytes) => bytes,
+        Err(CasError::NotFound { .. }) => {
+            return Err(SelectorClosureError::Defect(SelectorClosureDefect {
+                code: SelectorClosureDefectCode::ReplayEvidenceMissing,
+                message: format!("replay evidence '{evidence_hash_hex}' not found in CAS"),
+                selector_digest_hex: Some(evidence_hash_hex),
+            }));
+        },
+        Err(err) => return Err(SelectorClosureError::Cas(err)),
+    };
+
+    // Re-check size after retrieval for TOCTOU defense across backends.
     if bytes.len() > MAX_REPLAY_EVIDENCE_BYTES {
         return Err(SelectorClosureError::Defect(SelectorClosureDefect {
             code: SelectorClosureDefectCode::ReplayEvidenceTooLarge,
             message: format!(
-                "replay evidence {} bytes exceeds max {}",
-                bytes.len(),
-                MAX_REPLAY_EVIDENCE_BYTES
+                "replay evidence {} bytes exceeds max {MAX_REPLAY_EVIDENCE_BYTES}",
+                bytes.len()
             ),
-            selector_digest_hex: Some(hex::encode(evidence_hash)),
+            selector_digest_hex: Some(evidence_hash_hex),
         }));
     }
 
@@ -228,7 +315,7 @@ pub fn replay_zoom_in(
         return Err(SelectorClosureError::Defect(SelectorClosureDefect {
             code: SelectorClosureDefectCode::ReplayEvidenceHashMismatch,
             message: "replay evidence content hash does not match requested hash".into(),
-            selector_digest_hex: Some(hex::encode(evidence_hash)),
+            selector_digest_hex: Some(evidence_hash_hex),
         }));
     }
 
@@ -372,7 +459,80 @@ mod tests {
         let cas = MemoryCas::new();
         let missing = [0xAB; 32];
         let err = replay_zoom_in(&cas, &missing).expect_err("should fail for missing evidence");
-        assert!(matches!(err, SelectorClosureError::Cas(_)));
+        assert!(matches!(
+            err,
+            SelectorClosureError::Defect(SelectorClosureDefect {
+                code: SelectorClosureDefectCode::ReplayEvidenceMissing,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn orphan_loss_profile_keys_emit_unresolved_defect() {
+        let mut input = make_input(RiskTier::Tier0, &["a.rs"], false);
+        input.loss_profiles.insert(
+            "orphan.rs".into(),
+            LossProfileDeclaration {
+                digest: [0x11; 32],
+                entry_count: 1,
+                risk_tier: RiskTier::Tier0,
+            },
+        );
+
+        let verdict = verify_selector_completeness(&input);
+        match verdict {
+            CompletenessVerdict::Incomplete { defects } => {
+                assert_eq!(defects.len(), 1);
+                assert_eq!(
+                    defects[0].code,
+                    SelectorClosureDefectCode::UnresolvedSelectorDigest
+                );
+            },
+            CompletenessVerdict::Complete { .. } => panic!("expected orphan profile defect"),
+        }
+    }
+
+    #[test]
+    fn replay_zoom_in_oversized_evidence_fails_before_retrieve() {
+        let cas = MemoryCas::new();
+        let oversized = vec![0xEE; MAX_REPLAY_EVIDENCE_BYTES + 1];
+        let stored = cas
+            .store(&oversized)
+            .expect("storing oversized replay artifact should succeed in CAS");
+
+        let err =
+            replay_zoom_in(&cas, &stored.hash).expect_err("oversized replay must fail closed");
+        assert!(matches!(
+            err,
+            SelectorClosureError::Defect(SelectorClosureDefect {
+                code: SelectorClosureDefectCode::ReplayEvidenceTooLarge,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn loss_profile_digest_mismatch_detected() {
+        let cas = MemoryCas::new();
+        let mut input = make_input(RiskTier::Tier2Plus, &["a.rs"], true);
+        input
+            .loss_profiles
+            .get_mut("a.rs")
+            .expect("path exists")
+            .digest = [0xFE; 32];
+
+        let verdict = verify_selector_completeness_with_cas(&input, &cas);
+        match verdict {
+            CompletenessVerdict::Incomplete { defects } => {
+                assert_eq!(defects.len(), 1);
+                assert_eq!(
+                    defects[0].code,
+                    SelectorClosureDefectCode::LossProfileDigestMismatch
+                );
+            },
+            CompletenessVerdict::Complete { .. } => panic!("expected digest mismatch defect"),
+        }
     }
 
     #[test]

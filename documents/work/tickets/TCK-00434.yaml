@@ -4,8 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00434"
     title: "Remove non-FAC GitHub CI workflows and CI-adjacent config"
-    status: "CANCELLED"
-    status_reason: "Superseded — non-FAC CI workflows were already removed organically during FAC rollout. PR #559 was closed without merge as the work was no longer needed."
+    status: "OPEN"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

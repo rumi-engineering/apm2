@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 
 use apm2_core::context::selector_closure::{
-    CompletenessVerdict, LossProfileDeclaration, SelectorClosureDefectCode, SelectorClosureInput,
-    replay_zoom_in, replay_zoom_in_batch, verify_selector_completeness,
+    CompletenessVerdict, LossProfileDeclaration, MAX_REPLAY_EVIDENCE_BYTES, SelectorClosureDefect,
+    SelectorClosureDefectCode, SelectorClosureError, SelectorClosureInput, replay_zoom_in,
+    replay_zoom_in_batch, verify_selector_completeness,
 };
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::pcac::RiskTier;
@@ -129,7 +130,14 @@ fn replay_zoom_in_missing_hash_fails_closed() {
     let cas = MemoryCas::new();
     let missing_hash = [0xFF; 32];
     let result = replay_zoom_in(&cas, &missing_hash);
-    assert!(result.is_err(), "missing evidence must fail closed");
+    let err = result.expect_err("missing evidence must fail closed");
+    assert!(matches!(
+        err,
+        SelectorClosureError::Defect(SelectorClosureDefect {
+            code: SelectorClosureDefectCode::ReplayEvidenceMissing,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -177,4 +185,47 @@ fn partial_loss_profiles_still_deny_missing_entries() {
         },
         CompletenessVerdict::Complete { .. } => panic!("expected Incomplete verdict"),
     }
+}
+
+#[test]
+fn orphan_loss_profile_detected_in_integration() {
+    let mut input = make_selector_input(RiskTier::Tier0, 1, false);
+    input.loss_profiles.insert(
+        "orphan_selector.rs".into(),
+        LossProfileDeclaration {
+            digest: [0xAA; 32],
+            entry_count: 1,
+            risk_tier: RiskTier::Tier0,
+        },
+    );
+
+    let verdict = verify_selector_completeness(&input);
+    match verdict {
+        CompletenessVerdict::Incomplete { defects } => {
+            assert_eq!(defects.len(), 1);
+            assert_eq!(
+                defects[0].code,
+                SelectorClosureDefectCode::UnresolvedSelectorDigest
+            );
+        },
+        CompletenessVerdict::Complete { .. } => panic!("expected unresolved selector defect"),
+    }
+}
+
+#[test]
+fn oversized_replay_evidence_rejected() {
+    let cas = MemoryCas::new();
+    let oversized = vec![0xCC; MAX_REPLAY_EVIDENCE_BYTES + 1];
+    let stored = cas
+        .store(&oversized)
+        .expect("CAS store for oversized replay evidence");
+
+    let err = replay_zoom_in(&cas, &stored.hash).expect_err("oversized replay should fail closed");
+    assert!(matches!(
+        err,
+        SelectorClosureError::Defect(SelectorClosureDefect {
+            code: SelectorClosureDefectCode::ReplayEvidenceTooLarge,
+            ..
+        })
+    ));
 }
