@@ -1,0 +1,82 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00508"
+    title: "Deferred replay worker for projection intent buffer drain after outage recovery"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0029"
+    requirements:
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml#requirement"
+      - requirement_id: "REQ-0005"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0005.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0009"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+      - evidence_id: "EVID-0005"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0005.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RELIABILITY"
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00504"
+        reason: "Deferred replay backlog table must exist before the replay worker can drain it."
+      - ticket_id: "TCK-00505"
+        reason: "Admission gate wiring populates the intent buffer that replay drains."
+      - ticket_id: "TCK-00506"
+        reason: "Receipt format bridge needed to emit DeferredReplayReceiptV1-compatible receipts on convergence."
+  scope:
+    in_scope:
+      - "Implement DeferredReplayWorker in crates/apm2-daemon/src/projection/ that periodically checks for buffered intents awaiting replay."
+      - "On sink recovery detection (successful health probe or first ALLOW after prior DENY), drain backlog in ledger-order."
+      - "For each replayed intent: re-evaluate economics gate, call adapter.project_status() on ALLOW, emit DeferredReplayReceiptV1 on convergence."
+      - "Enforce replay_window_ref bounds from ProjectionContinuityWindowV1: intents older than replay window are expired with deny receipt, not replayed."
+      - "Idempotent replay: skip intents whose (work_id, changeset_digest) already have a successful projection receipt."
+      - "Compute backlog_digest (Blake3 over ordered intent digests) and include in replay receipt."
+      - "Bounded replay batch size to prevent post-outage thundering herd (configurable, default 64 per cycle)."
+    out_of_scope:
+      - "Sink health probing mechanism (assume adapter.project_status() failure/success as the signal)."
+      - "Multi-sink replay coordination."
+      - "Replay priority ordering beyond ledger order."
+  plan:
+    steps:
+      - "Implement DeferredReplayWorker struct with reference to IntentBuffer, ProjectionAdapter, and ContinuityProfileResolver."
+      - "Add periodic drain loop: query buffered intents ordered by created_at, batch by configurable limit."
+      - "For each batch: re-evaluate economics gate, project on ALLOW, record result."
+      - "Compute running backlog_digest as Blake3 over replayed intent digests."
+      - "On batch completion with no remaining backlog: emit converged DeferredReplayReceiptV1 with replayed_item_count."
+      - "Expire intents outside replay_window_ref with DENY_REPLAY_HORIZON_OUT_OF_WINDOW."
+      - "Write unit tests: normal replay, idempotent skip, window expiration, batch limiting, convergence receipt generation."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0009"
+      - "EVID-0005"
+    criteria:
+      - "Buffered intents replay in ledger order after outage recovery."
+      - "Intents outside replay window are expired with deny receipt, not silently dropped."
+      - "Idempotent replay skips already-projected intents without error."
+      - "Convergence receipt includes correct replayed_item_count and backlog_digest."
+      - "Batch size limits prevent post-outage thundering herd."
+  notes:
+    security: |
+      Replay must re-evaluate the economics gate for each intent — do NOT assume a
+      previously-denied intent is now admissible just because the sink recovered.
+      Gate inputs may have changed (revoked keys, updated profiles). Each replay
+      is a fresh admission decision.
+    verification: |
+      Include outage simulation test: buffer N intents during simulated outage,
+      recover, verify replay in order with correct receipts. Include window
+      expiration test: buffer intent, advance tick past window, verify expiration.
+    general: |
+      This ticket delivers the "continuity during outage" promise from RFC-0029 REQ-0009.
+      Without it, denied projections during outages are permanently lost.

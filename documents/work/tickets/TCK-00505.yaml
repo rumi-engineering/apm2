@@ -1,0 +1,82 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00505"
+    title: "Wire economics admission gate into projection worker pre-projection path"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0029"
+    requirements:
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml#requirement"
+      - requirement_id: "REQ-0006"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0006.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0009"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+      - evidence_id: "EVID-0006"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RELIABILITY"
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00504"
+        reason: "Intent buffer schema must exist before the worker can record admit/deny decisions."
+      - ticket_id: "TCK-00506"
+        reason: "Receipt format bridge needed to produce economics-compatible projection receipts."
+      - ticket_id: "TCK-00507"
+        reason: "Continuity profile resolution needed to assemble gate inputs."
+  scope:
+    in_scope:
+      - "Insert a call to evaluate_projection_continuity() in ProjectionWorker::handle_review_receipt() before adapter.project_status()."
+      - "Assemble gate inputs from the ReviewReceiptRecorded event payload: extract eval_tick, time_authority_ref, window_ref, boundary_id."
+      - "On ALLOW verdict: proceed to adapter.project_status() and record admitted intent in IntentBuffer."
+      - "On DENY verdict: record denied intent in IntentBuffer with structured deny reason, skip projection, log verdict."
+      - "Fail closed if gate inputs cannot be assembled (missing temporal authority, missing profile, missing snapshot)."
+      - "Emit structured telemetry for admit/deny counts per sink."
+    out_of_scope:
+      - "Deferred replay logic for buffered intents after outage recovery (see TCK-00508)."
+      - "Multi-sink dispatch routing (single GitHub sink for now)."
+      - "Economics gate logic changes — this ticket only calls existing gates."
+  plan:
+    steps:
+      - "Add apm2-core economics dependency to apm2-daemon Cargo.toml if not already present."
+      - "In handle_review_receipt(), after PR metadata lookup and before adapter.project_status(), build ContinuityCheckInputs."
+      - "Load continuity profile and sink snapshot via profile resolver (TCK-00507 dependency)."
+      - "Call evaluate_projection_continuity() with assembled inputs."
+      - "Branch on verdict: ALLOW -> project + record admit; DENY -> record deny + skip."
+      - "Add structured log lines (tracing) for both paths with verdict details."
+      - "Write integration-style tests using mock adapter and mock profile resolver."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0009"
+      - "EVID-0006"
+    criteria:
+      - "No projection occurs without passing the economics admission gate."
+      - "Missing gate inputs (temporal authority, profile, snapshot) result in DENY, not default ALLOW."
+      - "Admitted projections produce a receipt recorded in the intent buffer."
+      - "Denied projections are logged with structured deny reason and recorded in intent buffer."
+      - "Existing projection behavior is preserved when gate returns ALLOW."
+  notes:
+    security: |
+      This is the critical wiring point. The gate MUST be fail-closed: if any input
+      assembly step fails (missing field, deserialization error, profile not found),
+      the default MUST be DENY. Never skip the gate — every projection path must
+      pass through it.
+    verification: |
+      Include tests for: (1) normal ALLOW path preserves existing behavior,
+      (2) DENY path skips projection, (3) missing temporal authority -> DENY,
+      (4) missing profile -> DENY, (5) gate error -> DENY.
+    general: |
+      This is the highest-value integration ticket — it turns the economics gates
+      from inert validation code into an active admission barrier on the production
+      projection path.

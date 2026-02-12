@@ -1,0 +1,66 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00504"
+    title: "Projection intent schema and durable buffer for economics-gated admission"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0029"
+    requirements:
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0009"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RELIABILITY"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00478"
+        reason: "Projection continuity economics gates (REQ-0009) must exist before the daemon can call them."
+  scope:
+    in_scope:
+      - "Define SQLite schema for `projection_intents` table: intent_id, work_id, changeset_digest, ledger_head, projected_status, eval_tick, verdict, deny_reason, created_at, admitted_at."
+      - "Define SQLite schema for `deferred_replay_backlog` table: intent_id, work_id, backlog_digest, replay_horizon_tick, replayed_at, converged."
+      - "Implement IntentBuffer struct in crates/apm2-daemon/src/projection/ with insert, admit, deny, evict, and query methods."
+      - "Enforce MAX_BACKLOG_ITEMS (65536) hard cap on deferred_replay_backlog with fail-closed eviction semantics."
+      - "Provide migration path for existing projection_receipts and comment_receipts tables (no breaking changes)."
+      - "Unit tests for all buffer operations including capacity exhaustion and idempotent insert."
+    out_of_scope:
+      - "Wiring the buffer into the projection worker run loop (see TCK-00505)."
+      - "Receipt format changes (see TCK-00506)."
+      - "Multi-sink routing or sink selection logic."
+  plan:
+    steps:
+      - "Add projection_intents and deferred_replay_backlog table creation to daemon schema migrations."
+      - "Implement IntentBuffer with rusqlite backing and bounded insert semantics."
+      - "Add eviction policy: oldest-first when backlog exceeds MAX_BACKLOG_ITEMS, with deny receipt emission."
+      - "Write unit tests for insert, admit, deny, evict, capacity exhaustion, and idempotent insert."
+      - "Verify migration is backwards-compatible with existing projection schema."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0009"
+    criteria:
+      - "IntentBuffer insert/admit/deny/evict round-trips correctly through SQLite."
+      - "Capacity exhaustion at MAX_BACKLOG_ITEMS triggers eviction, not silent drop."
+      - "Idempotent insert on duplicate (work_id, changeset_digest) does not create duplicates."
+      - "Migration does not alter existing projection_receipts or comment_receipts tables."
+  notes:
+    security: |
+      Intent buffer must never silently discard intents — capacity exhaustion must emit
+      a deny receipt so the audit trail is complete. Eviction is fail-closed: evicted
+      intents are recorded as denied, not dropped.
+    verification: |
+      Include capacity-at-boundary tests (65535 ok, 65536 ok, 65537 triggers eviction)
+      and concurrent-insert stress test.
+    general: |
+      This ticket provides the durable storage foundation that TCK-00505 (gate wiring),
+      TCK-00508 (deferred replay), and TCK-00509 (integration tests) depend on.
