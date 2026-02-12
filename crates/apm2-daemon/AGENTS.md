@@ -181,6 +181,31 @@ appropriate handler after validating the session token.
 - [CTR-SD-002] Messages use bounded decoding (CTR-1603).
 - [CTR-SD-003] Session ID from token is used for authorization, not user input.
 
+### Boundary Channel Quarantine (TCK-00489)
+
+```rust
+struct BoundaryChannelQuarantineState {
+    channels: HashMap<String, QuarantinedBoundaryChannel>,
+    insertion_order: VecDeque<String>,
+}
+```
+
+In-memory quarantine table for boundary channels that have violated leakage or
+timing budgets. Capped at `MAX_QUARANTINED_BOUNDARY_CHANNELS` (512) entries with
+priority-aware eviction, per-session quota isolation, and fail-closed insertion.
+
+**Invariants (BoundaryChannelQuarantine):**
+- [INV-BCQ-001] Active unexpired quarantines with severity >= incoming severity are never evicted.
+- [INV-BCQ-002] Per-session quota (`MAX / 8 = 64`) prevents a single session from exhausting the global quarantine budget.
+- [INV-BCQ-003] When quarantine insertion fails (saturation or quota exceeded), the request is denied (fail-closed). Proceeding without quarantine when quarantine is mandatory violates containment semantics.
+- [INV-BCQ-004] Severity is monotonically non-decreasing per channel key (update-in-place escalates, never downgrades).
+
+**Contracts (BoundaryChannelQuarantine):**
+- [CTR-BCQ-001] `quarantine()` returns `Result<bool, QuarantineInsertionError>`. `Ok(true)` = inserted/updated, `Err(Saturated)` = capacity full with no evictable entries, `Err(PerSessionQuotaExceeded)` = session-level limit reached.
+- [CTR-BCQ-002] Eviction priority: (1) expired entries (oldest first), (2) oldest unexpired entry with severity strictly less than incoming.
+- [CTR-BCQ-003] `ViolationSeverity` ordering: `Blocker > Major > Minor`. Derived from `ChannelViolationClass` (leakage/timing = Blocker, taint/classification/policy = Major, others = Minor).
+- [CTR-BCQ-004] Caller (boundary-flow admission) must handle both error variants by returning a deny response, not logging-and-continuing.
+
 ### Wire Protocol
 
 Uses length-prefixed binary framing with Hello/HelloAck handshake. JSON framing

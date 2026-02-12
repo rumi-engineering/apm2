@@ -766,6 +766,67 @@ const fn is_zero_hash(value: &Hash) -> bool {
     true
 }
 
+/// TCK-00489: Per-session quarantine quota.
+///
+/// Each session may use at most this fraction of the global quarantine
+/// capacity. This prevents a single adversarial session from exhausting the
+/// quarantine budget and starving other sessions.
+const PER_SESSION_QUARANTINE_QUOTA: usize = MAX_QUARANTINED_BOUNDARY_CHANNELS / 8;
+
+/// TCK-00489: Violation severity for priority-aware quarantine eviction.
+///
+/// Active unexpired quarantines with severity >= incoming entry's severity are
+/// never evicted. Only expired entries and lower-severity entries are
+/// candidates for eviction (expired entries first, then lowest-severity).
+///
+/// # Ordering
+///
+/// `BLOCKER > MAJOR > MINOR` -- higher ordinal = higher priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+enum ViolationSeverity {
+    /// Minor violation -- lowest priority, evicted first.
+    Minor   = 0,
+    /// Major violation -- medium priority.
+    Major   = 1,
+    /// Blocker violation -- highest priority, never evicted by lower severity.
+    Blocker = 2,
+}
+
+impl ViolationSeverity {
+    /// Derives severity from the set of channel boundary defects that triggered
+    /// this quarantine.
+    ///
+    /// - Leakage or timing budget exceeded => `Blocker`
+    /// - Taint/classification not admitted, policy mismatch => `Major`
+    /// - Everything else => `Minor`
+    fn from_violation_classes(
+        classes: impl IntoIterator<Item = apm2_core::channel::ChannelViolationClass>,
+    ) -> Self {
+        use apm2_core::channel::ChannelViolationClass;
+        let mut severity = Self::Minor;
+        for class in classes {
+            let class_severity = match class {
+                ChannelViolationClass::LeakageBudgetExceeded
+                | ChannelViolationClass::TimingChannelBudgetExceeded => Self::Blocker,
+                ChannelViolationClass::TaintNotAdmitted
+                | ChannelViolationClass::ClassificationNotAdmitted
+                | ChannelViolationClass::PolicyDigestBindingMismatch
+                | ChannelViolationClass::CanonicalizerTupleBindingMismatch
+                | ChannelViolationClass::DisclosurePolicyStateInvalid
+                | ChannelViolationClass::DisclosurePolicyModeMismatch
+                | ChannelViolationClass::DisclosurePolicyDigestBindingMismatch
+                | ChannelViolationClass::DisclosureChannelNotAdmitted => Self::Major,
+                _ => Self::Minor,
+            };
+            if class_severity > severity {
+                severity = class_severity;
+            }
+        }
+        severity
+    }
+}
+
 #[derive(Debug, Clone)]
 struct QuarantinedBoundaryChannel {
     session_id: String,
@@ -773,6 +834,8 @@ struct QuarantinedBoundaryChannel {
     reason: String,
     local_time_ref: Hash,
     local_window_ref: Hash,
+    /// TCK-00489: Violation severity for priority-aware eviction.
+    severity: ViolationSeverity,
 }
 
 impl QuarantinedBoundaryChannel {
@@ -784,6 +847,49 @@ impl QuarantinedBoundaryChannel {
         !is_zero_hash(&self.local_time_ref) && !is_zero_hash(&self.local_window_ref)
     }
 }
+
+/// TCK-00489: Error returned when quarantine insertion is not possible due to
+/// saturation with no evictable entries.
+///
+/// Callers MUST deny the request when this error is returned (fail-closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuarantineInsertionError {
+    /// Global quarantine capacity is full and no entry is evictable (all are
+    /// unexpired with severity >= incoming severity).
+    Saturated,
+    /// Per-session quota exceeded -- this session already has the maximum
+    /// number of quarantine entries.
+    PerSessionQuotaExceeded {
+        /// Session that exceeded its quota.
+        session_id: String,
+        /// Current number of entries for this session.
+        current_count: usize,
+        /// Maximum allowed per session.
+        quota: usize,
+    },
+}
+
+impl std::fmt::Display for QuarantineInsertionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Saturated => write!(
+                f,
+                "quarantine saturated: no evictable entries exist (fail-closed)"
+            ),
+            Self::PerSessionQuotaExceeded {
+                session_id,
+                current_count,
+                quota,
+            } => write!(
+                f,
+                "per-session quarantine quota exceeded for session {session_id}: \
+                 {current_count} >= {quota}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QuarantineInsertionError {}
 
 #[derive(Debug, Default)]
 struct BoundaryChannelQuarantineState {
@@ -827,6 +933,39 @@ impl BoundaryChannelQuarantineState {
         removed_keys.len()
     }
 
+    /// TCK-00489: Count of quarantine entries belonging to a specific session.
+    fn session_entry_count(&self, session_id: &str) -> usize {
+        self.channels
+            .values()
+            .filter(|entry| entry.session_id == session_id)
+            .count()
+    }
+
+    /// TCK-00489: Priority-aware quarantine insertion with saturation-safe
+    /// fail-closed semantics and per-session quota isolation.
+    ///
+    /// # Eviction Strategy
+    ///
+    /// When capacity is full:
+    /// 1. Evict expired entries first (oldest first via insertion order).
+    /// 2. If no expired entries, evict the oldest entry with severity strictly
+    ///    less than the incoming entry's severity.
+    /// 3. If no evictable entries exist, return `Err(Saturated)` -- the caller
+    ///    MUST deny the request.
+    ///
+    /// # Per-Session Quota
+    ///
+    /// Each session is limited to `PER_SESSION_QUARANTINE_QUOTA` entries. If
+    /// the session already holds that many entries and the incoming key is
+    /// new, return `Err(PerSessionQuotaExceeded)`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the entry was inserted (or an existing entry was
+    ///   updated).
+    /// - `Err(QuarantineInsertionError)` if insertion was not possible. The
+    ///   caller MUST deny the request.
+    #[allow(clippy::too_many_arguments)]
     fn quarantine(
         &mut self,
         channel_key: String,
@@ -835,30 +974,105 @@ impl BoundaryChannelQuarantineState {
         since_ns: u64,
         local_time_ref: Hash,
         local_window_ref: Hash,
-    ) -> bool {
+        severity: ViolationSeverity,
+    ) -> Result<bool, QuarantineInsertionError> {
+        // Update-in-place if the same channel key is already quarantined.
         if let Some(existing) = self.channels.get_mut(&channel_key) {
             existing.session_id = session_id;
             existing.reason = reason;
             existing.since_ns = since_ns;
             existing.local_time_ref = local_time_ref;
             existing.local_window_ref = local_window_ref;
-            return true;
+            // Escalate severity if the new severity is higher.
+            if severity > existing.severity {
+                existing.severity = severity;
+            }
+            return Ok(true);
         }
 
-        while self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
-            let Some(oldest_key) = self.insertion_order.front().cloned() else {
-                return false;
-            };
-            let Some(entry) = self.channels.get(&oldest_key) else {
-                self.insertion_order.pop_front();
-                continue;
-            };
-            if entry.is_expired(since_ns) {
-                self.channels.remove(&oldest_key);
-                self.insertion_order.pop_front();
-                continue;
+        // TCK-00489: Per-session quota isolation check.
+        let session_count = self.session_entry_count(&session_id);
+        if session_count >= PER_SESSION_QUARANTINE_QUOTA {
+            return Err(QuarantineInsertionError::PerSessionQuotaExceeded {
+                session_id,
+                current_count: session_count,
+                quota: PER_SESSION_QUARANTINE_QUOTA,
+            });
+        }
+
+        // TCK-00489: Priority-aware eviction when at capacity.
+        if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            // Phase 1: Evict expired entries (oldest first via insertion order).
+            let mut evicted_any_expired = false;
+            while self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
+                let Some(oldest_key) = self.insertion_order.front().cloned() else {
+                    break;
+                };
+                let Some(entry) = self.channels.get(&oldest_key) else {
+                    self.insertion_order.pop_front();
+                    continue;
+                };
+                if entry.is_expired(since_ns) {
+                    self.channels.remove(&oldest_key);
+                    self.insertion_order.pop_front();
+                    evicted_any_expired = true;
+                    continue;
+                }
+                break; // Front entry is not expired; stop scanning insertion order.
             }
-            return false;
+
+            // If we still need space and didn't find expired entries at the
+            // front, scan the full insertion order for any expired entries.
+            if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS && !evicted_any_expired {
+                let expired_keys: Vec<String> = self
+                    .insertion_order
+                    .iter()
+                    .filter(|key| {
+                        self.channels
+                            .get(*key)
+                            .is_some_and(|entry| entry.is_expired(since_ns))
+                    })
+                    .cloned()
+                    .collect();
+                for key in &expired_keys {
+                    self.channels.remove(key);
+                }
+                if !expired_keys.is_empty() {
+                    self.insertion_order
+                        .retain(|entry| !expired_keys.contains(entry));
+                }
+            }
+
+            // Phase 2: If still at capacity, evict the oldest entry with
+            // severity strictly less than the incoming severity. An entry
+            // of equal severity is NOT evictable -- active unexpired
+            // quarantines at the same or higher priority level are
+            // protected. This is the containment invariant from TCK-00489:
+            // "Active quarantines (unexpired, triggered by MAJOR+
+            // violations) are never evicted by lower-priority entries."
+            if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
+                // Find the best eviction candidate: oldest entry with severity
+                // strictly below incoming. Scan insertion_order for temporal
+                // ordering stability.
+                let mut eviction_candidate: Option<String> = None;
+                for key in &self.insertion_order {
+                    if let Some(entry) = self.channels.get(key) {
+                        if entry.severity < severity {
+                            eviction_candidate = Some(key.clone());
+                            break; // Oldest low-priority entry wins.
+                        }
+                    }
+                }
+
+                if let Some(victim_key) = eviction_candidate {
+                    self.channels.remove(&victim_key);
+                    self.insertion_order.retain(|entry| entry != &victim_key);
+                } else {
+                    // No evictable entry: all unexpired entries have severity
+                    // >= incoming. Fail-closed: MUST deny.
+                    return Err(QuarantineInsertionError::Saturated);
+                }
+            }
         }
 
         self.insertion_order.push_back(channel_key.clone());
@@ -870,9 +1084,10 @@ impl BoundaryChannelQuarantineState {
                 reason,
                 local_time_ref,
                 local_window_ref,
+                severity,
             },
         );
-        true
+        Ok(true)
     }
 }
 
@@ -2635,15 +2850,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .unwrap_or(0)
     }
 
+    /// TCK-00489: Insert a boundary-channel quarantine entry with
+    /// priority-aware eviction and per-session quota isolation.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the entry was inserted (or updated in place).
+    /// - `Err(QuarantineInsertionError)` if insertion was not possible due to
+    ///   saturation or per-session quota exhaustion. The caller MUST deny the
+    ///   request (fail-closed).
     fn quarantine_boundary_channel(
         &self,
         session_id: &str,
         channel_key: String,
         reason: String,
         since_ns: u64,
-    ) -> Result<bool, String> {
+        severity: ViolationSeverity,
+    ) -> Result<bool, QuarantineInsertionError> {
         let (local_time_ref, local_window_ref) =
-            Self::derive_boundary_quarantine_local_refs(session_id, &channel_key, since_ns)?;
+            Self::derive_boundary_quarantine_local_refs(session_id, &channel_key, since_ns)
+                .map_err(|_| QuarantineInsertionError::Saturated)?;
         let mut bounded_reason = reason;
         if bounded_reason.len() > MAX_BOUNDARY_QUARANTINE_REASON_LENGTH {
             bounded_reason.truncate(MAX_BOUNDARY_QUARANTINE_REASON_LENGTH);
@@ -2651,23 +2877,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let mut state = self
             .boundary_channel_quarantine
             .lock()
-            .map_err(|_| "boundary channel quarantine lock poisoned".to_string())?;
-        let inserted = state.quarantine(
+            .map_err(|_| QuarantineInsertionError::Saturated)?;
+        state.quarantine(
             channel_key,
             session_id.to_string(),
             bounded_reason,
             since_ns,
             local_time_ref,
             local_window_ref,
-        );
-        if !inserted {
-            warn!(
-                session_id = %session_id,
-                capacity = MAX_QUARANTINED_BOUNDARY_CHANNELS,
-                "boundary quarantine capacity reached; refusing new quarantine insertion"
-            );
-        }
-        Ok(inserted)
+            severity,
+        )
     }
 
     fn extract_boundary_flow_hints(
@@ -7749,31 +7968,66 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         .iter()
                         .any(|defect| defect.violation_class.requires_quarantine())
                     {
+                        // TCK-00489: Derive severity from the violation classes
+                        // present in the defect list.
+                        let severity = ViolationSeverity::from_violation_classes(
+                            defects.iter().map(|d| d.violation_class),
+                        );
+
                         match self.quarantine_boundary_channel(
                             &token.session_id,
                             boundary_channel_key,
                             defects_json.clone(),
                             timestamp_ns,
+                            severity,
                         ) {
-                            Ok(true) => {},
-                            Ok(false) => {
-                                warn!(
-                                    session_id = %token.session_id,
-                                    tool_class = %tool_class,
-                                    capacity = MAX_QUARANTINED_BOUNDARY_CHANNELS,
-                                    "boundary quarantine full with no expired entries; denying request"
-                                );
+                            Ok(true | false) => {
+                                // Ok(true) = newly inserted quarantine entry.
+                                // Ok(false) = entry already existed; severity
+                                // may have been escalated but the channel was
+                                // already quarantined.
                             },
-                            Err(error) => {
+                            Err(QuarantineInsertionError::Saturated) => {
+                                // TCK-00489: Fail-closed -- quarantine is
+                                // mandatory but no evictable entry exists.
+                                // The request MUST be denied.
                                 error!(
                                     session_id = %token.session_id,
                                     tool_class = %tool_class,
-                                    error = %error,
-                                    "failed to quarantine boundary channel"
+                                    capacity = MAX_QUARANTINED_BOUNDARY_CHANNELS,
+                                    "boundary quarantine saturated with no evictable entries; \
+                                     denying request (fail-closed)"
                                 );
                                 return Ok(SessionResponse::error(
                                     SessionErrorCode::SessionErrorInternal,
-                                    format!("boundary quarantine failed: {error}"),
+                                    "boundary quarantine saturated: mandatory quarantine \
+                                     cannot be fulfilled (fail-closed)"
+                                        .to_string(),
+                                ));
+                            },
+                            Err(QuarantineInsertionError::PerSessionQuotaExceeded {
+                                session_id: ref sid,
+                                current_count,
+                                quota,
+                            }) => {
+                                // TCK-00489: Per-session quota isolation --
+                                // this session is consuming too many
+                                // quarantine slots. Deny the request to
+                                // prevent cross-session exhaustion.
+                                warn!(
+                                    session_id = %sid,
+                                    tool_class = %tool_class,
+                                    current_count = current_count,
+                                    quota = quota,
+                                    "per-session quarantine quota exceeded; \
+                                     denying request to preserve isolation"
+                                );
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    format!(
+                                        "per-session quarantine quota exceeded: \
+                                         {current_count} >= {quota} (fail-closed)"
+                                    ),
                                 ));
                             },
                         }
@@ -14523,6 +14777,7 @@ mod tests {
                     channel_key.clone(),
                     "boundary quarantine test".to_string(),
                     quarantined_at_ns,
+                    ViolationSeverity::Major,
                 )
                 .expect("quarantine insertion should succeed"),
             "quarantine insertion should allocate a slot",
@@ -14570,6 +14825,7 @@ mod tests {
                     channel_key.clone(),
                     "boundary quarantine ttl".to_string(),
                     quarantined_at_ns,
+                    ViolationSeverity::Major,
                 )
                 .expect("quarantine insertion should succeed"),
             "quarantine insertion should allocate a slot",
@@ -14595,6 +14851,8 @@ mod tests {
         );
     }
 
+    /// TCK-00489: When all entries are unexpired and have the same severity as
+    /// the incoming entry, insertion must return `Err(Saturated)`.
     #[test]
     fn test_boundary_channel_quarantine_rejects_zero_timestamp() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
@@ -14608,10 +14866,11 @@ mod tests {
             channel_key,
             "boundary quarantine zero timestamp".to_string(),
             0,
+            ViolationSeverity::Major,
         );
         assert!(
-            matches!(result, Err(error) if error.contains("timestamp is zero")),
-            "zero timestamp must fail closed with temporal authority error",
+            matches!(result, Err(QuarantineInsertionError::Saturated)),
+            "zero timestamp must fail closed (mapped to Saturated)",
         );
     }
 
@@ -14633,6 +14892,7 @@ mod tests {
                         channel_key,
                         format!("seed quarantine {idx}"),
                         u64::try_from(idx).expect("index should fit in u64") + 1,
+                        ViolationSeverity::Major,
                     )
                     .expect("seed quarantine insertion should succeed"),
                 "quarantine insertion should succeed before capacity is reached",
@@ -14657,17 +14917,18 @@ mod tests {
             overflow_session_id,
             ToolClass::Inference,
         );
-        let inserted = dispatcher
-            .quarantine_boundary_channel(
-                overflow_session_id,
-                overflow_channel_key.clone(),
-                "overflow quarantine should be refused when no entries are expired".to_string(),
-                9_999,
-            )
-            .expect("overflow quarantine attempt should not fail");
+        // TCK-00489: Same severity as existing entries -- cannot evict.
+        let result = dispatcher.quarantine_boundary_channel(
+            overflow_session_id,
+            overflow_channel_key.clone(),
+            "overflow quarantine should be refused when no entries are expired".to_string(),
+            9_999,
+            ViolationSeverity::Major,
+        );
         assert!(
-            !inserted,
-            "overflow quarantine insertion must be refused when capacity is full and no entries are expired",
+            matches!(result, Err(QuarantineInsertionError::Saturated)),
+            "overflow quarantine insertion must return Saturated when capacity is full \
+             and no entries are evictable (same severity, unexpired), got: {result:?}",
         );
 
         let state = dispatcher
@@ -14710,6 +14971,7 @@ mod tests {
                         channel_key,
                         format!("seed quarantine {idx}"),
                         initial_timestamp_ns,
+                        ViolationSeverity::Major,
                     )
                     .expect("seed quarantine insertion should succeed"),
                 "quarantine insertion should succeed before capacity is reached",
@@ -14733,6 +14995,7 @@ mod tests {
                 overflow_channel_key.clone(),
                 "overflow quarantine should evict oldest expired entry".to_string(),
                 overflow_timestamp_ns,
+                ViolationSeverity::Major,
             )
             .expect("overflow quarantine insertion should not fail");
         assert!(
@@ -20519,5 +20782,449 @@ mod tests {
                 "tool_kind must carry the FileNotExists precondition"
             );
         }
+    }
+
+    // =====================================================================
+    // TCK-00489: Priority-aware quarantine lifecycle tests
+    // =====================================================================
+
+    /// TCK-00489 (a): Adversarial flood of low-severity entries cannot evict
+    /// unexpired high-severity quarantine. A higher-severity entry CAN evict a
+    /// lower-severity entry, but a same-severity entry cannot (fail-closed).
+    #[test]
+    fn tck_00489_adversarial_flood_cannot_evict_unexpired_high_severity_quarantine() {
+        let mut state = BoundaryChannelQuarantineState::default();
+        let now_ns = 1_000_000;
+
+        // Insert a high-severity (Blocker) quarantine for session-B.
+        let victim_key = "boundary:session-b-channel".to_string();
+        assert!(
+            state
+                .quarantine(
+                    victim_key.clone(),
+                    "session-b".to_string(),
+                    "leakage budget exceeded".to_string(),
+                    now_ns,
+                    [1u8; 32],
+                    [1u8; 32],
+                    ViolationSeverity::Blocker,
+                )
+                .is_ok(),
+            "blocker quarantine should insert successfully",
+        );
+
+        // Fill remaining capacity with low-severity (Minor) entries from
+        // adversarial sessions. Use unique session IDs to avoid
+        // per-session quota limits.
+        for idx in 1..MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            let key = format!("boundary:flood-{idx}");
+            let session_id = format!("session-flood-{idx}");
+            assert!(
+                state
+                    .quarantine(
+                        key,
+                        session_id,
+                        "minor violation flood".to_string(),
+                        now_ns,
+                        [1u8; 32],
+                        [1u8; 32],
+                        ViolationSeverity::Minor,
+                    )
+                    .is_ok(),
+                "flood entry {idx} should insert successfully",
+            );
+        }
+        assert_eq!(
+            state.channels.len(),
+            MAX_QUARANTINED_BOUNDARY_CHANNELS,
+            "quarantine must be at capacity",
+        );
+
+        // Try to insert another Minor entry -- should FAIL because
+        // same-severity entries are not evictable (containment protection).
+        let result = state.quarantine(
+            "boundary:new-minor".to_string(),
+            "session-attacker".to_string(),
+            "new minor violation".to_string(),
+            now_ns + 1,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Minor,
+        );
+        assert!(
+            matches!(result, Err(QuarantineInsertionError::Saturated)),
+            "same-severity (Minor) entry must NOT evict another Minor entry; \
+             should return Saturated (fail-closed), got: {result:?}",
+        );
+
+        // The Blocker entry must still be present.
+        assert!(
+            state.channels.contains_key(&victim_key),
+            "high-severity (Blocker) quarantine must NOT be evicted by lower-severity entries",
+        );
+
+        // A higher-severity (Major) entry CAN evict a Minor entry.
+        let major_result = state.quarantine(
+            "boundary:major-entry".to_string(),
+            "session-legitimate".to_string(),
+            "major boundary violation".to_string(),
+            now_ns + 2,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Major,
+        );
+        assert!(
+            major_result.is_ok(),
+            "Major-severity entry should evict a Minor entry when saturated",
+        );
+
+        // Blocker is still present after Major insertion.
+        assert!(
+            state.channels.contains_key(&victim_key),
+            "Blocker quarantine must survive Major-severity eviction",
+        );
+        assert_eq!(
+            state.channels.get(&victim_key).unwrap().severity,
+            ViolationSeverity::Blocker,
+            "blocker severity must be preserved",
+        );
+    }
+
+    /// TCK-00489 (b): Higher-severity entry can evict lower-severity entry
+    /// when capacity is full and no expired entries exist.
+    #[test]
+    fn tck_00489_higher_severity_evicts_lower_severity_when_saturated() {
+        let mut state = BoundaryChannelQuarantineState::default();
+        let now_ns = 1_000_000;
+
+        // Fill all capacity with Minor entries.
+        for idx in 0..MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            let key = format!("boundary:minor-{idx}");
+            let session_id = format!("session-minor-{idx}");
+            state
+                .quarantine(
+                    key,
+                    session_id,
+                    "minor violation".to_string(),
+                    now_ns,
+                    [1u8; 32],
+                    [1u8; 32],
+                    ViolationSeverity::Minor,
+                )
+                .expect("seeding should succeed");
+        }
+        assert_eq!(state.channels.len(), MAX_QUARANTINED_BOUNDARY_CHANNELS);
+
+        // Insert a Blocker entry -- should evict the oldest Minor entry.
+        let blocker_key = "boundary:blocker-new".to_string();
+        let result = state.quarantine(
+            blocker_key.clone(),
+            "session-critical".to_string(),
+            "leakage budget exceeded".to_string(),
+            now_ns + 1,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Blocker,
+        );
+        assert!(result.is_ok(), "blocker entry should evict a minor entry");
+        assert!(
+            state.channels.contains_key(&blocker_key),
+            "blocker entry must be inserted after eviction",
+        );
+        assert_eq!(
+            state.channels.len(),
+            MAX_QUARANTINED_BOUNDARY_CHANNELS,
+            "capacity must remain constant after priority eviction",
+        );
+    }
+
+    /// TCK-00489 (c): Expired entries are evicted before active entries of any
+    /// severity.
+    #[test]
+    fn tck_00489_expired_entries_evicted_before_active_entries() {
+        let mut state = BoundaryChannelQuarantineState::default();
+        let base_ns = 1;
+
+        // Insert entries: first one is old (will be expired), rest are recent.
+        state
+            .quarantine(
+                "boundary:old-blocker".to_string(),
+                "session-old".to_string(),
+                "old blocker".to_string(),
+                base_ns, // Will be expired when we insert at base_ns + TTL + 1
+                [1u8; 32],
+                [1u8; 32],
+                ViolationSeverity::Blocker,
+            )
+            .expect("old blocker should insert");
+
+        for idx in 1..MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            let key = format!("boundary:recent-{idx}");
+            let session_id = format!("session-recent-{idx}");
+            let recent_ns = base_ns + QUARANTINE_TTL_NS; // Recent enough to not expire
+            state
+                .quarantine(
+                    key,
+                    session_id,
+                    "recent minor".to_string(),
+                    recent_ns,
+                    [1u8; 32],
+                    [1u8; 32],
+                    ViolationSeverity::Minor,
+                )
+                .expect("recent entry should insert");
+        }
+        assert_eq!(state.channels.len(), MAX_QUARANTINED_BOUNDARY_CHANNELS);
+
+        // Insert at a time that makes the first entry expired.
+        let overflow_ns = base_ns + QUARANTINE_TTL_NS + 1;
+        let result = state.quarantine(
+            "boundary:new-minor".to_string(),
+            "session-new".to_string(),
+            "new minor".to_string(),
+            overflow_ns,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Minor,
+        );
+        assert!(
+            result.is_ok(),
+            "new entry should insert by evicting the expired entry",
+        );
+        assert!(
+            !state.channels.contains_key("boundary:old-blocker"),
+            "expired blocker entry must be evicted regardless of its severity",
+        );
+        assert!(
+            state.channels.contains_key("boundary:new-minor"),
+            "new entry must be present after eviction of expired entry",
+        );
+    }
+
+    /// TCK-00489 (d): Per-session quota isolation prevents cross-session
+    /// quarantine exhaustion.
+    #[test]
+    fn tck_00489_per_session_quota_prevents_cross_session_exhaustion() {
+        let mut state = BoundaryChannelQuarantineState::default();
+        let now_ns = 1_000_000;
+        let adversarial_session = "session-adversary";
+
+        // Fill up to the per-session quota for the adversarial session.
+        for idx in 0..PER_SESSION_QUARANTINE_QUOTA {
+            let key = format!("boundary:adversary-channel-{idx}");
+            state
+                .quarantine(
+                    key,
+                    adversarial_session.to_string(),
+                    format!("adversary quarantine {idx}"),
+                    now_ns,
+                    [1u8; 32],
+                    [1u8; 32],
+                    ViolationSeverity::Minor,
+                )
+                .expect("should succeed within per-session quota");
+        }
+
+        // Next insertion from the same session should be rejected.
+        let result = state.quarantine(
+            format!("boundary:adversary-channel-{PER_SESSION_QUARANTINE_QUOTA}"),
+            adversarial_session.to_string(),
+            "adversary overflow".to_string(),
+            now_ns,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Minor,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(QuarantineInsertionError::PerSessionQuotaExceeded { .. })
+            ),
+            "per-session quota must prevent further insertions from the same session, \
+             got: {result:?}",
+        );
+
+        // A different session (victim) should still be able to insert.
+        let victim_key = "boundary:victim-channel".to_string();
+        let result = state.quarantine(
+            victim_key.clone(),
+            "session-victim".to_string(),
+            "victim quarantine".to_string(),
+            now_ns,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Major,
+        );
+        assert!(
+            result.is_ok(),
+            "different session must not be affected by adversary's quota exhaustion",
+        );
+        assert!(
+            state.channels.contains_key(&victim_key),
+            "victim's quarantine entry must be present",
+        );
+    }
+
+    /// TCK-00489 (e): Normal-path quarantine lifecycle works: insert, query,
+    /// TTL expiry, clearance.
+    #[test]
+    fn tck_00489_normal_path_quarantine_lifecycle() {
+        let mut state = BoundaryChannelQuarantineState::default();
+        let quarantined_at_ns = 1_000_000;
+        let channel_key = "boundary:lifecycle-channel".to_string();
+
+        // Insert a quarantine entry.
+        let result = state.quarantine(
+            channel_key.clone(),
+            "session-lifecycle".to_string(),
+            "lifecycle test".to_string(),
+            quarantined_at_ns,
+            [1u8; 32],
+            [1u8; 32],
+            ViolationSeverity::Major,
+        );
+        assert!(result.is_ok(), "quarantine insertion should succeed");
+
+        // Query: entry should be present and not expired.
+        let entry = state.get(&channel_key).expect("entry should be present");
+        assert!(!entry.is_expired(quarantined_at_ns + 1));
+        assert_eq!(entry.severity, ViolationSeverity::Major);
+
+        // Still active just before TTL.
+        let entry = state.get(&channel_key).expect("entry should be present");
+        assert!(
+            !entry.is_expired(quarantined_at_ns + QUARANTINE_TTL_NS - 1),
+            "entry should still be active just before TTL expiry",
+        );
+
+        // Expired at TTL boundary.
+        let entry = state.get(&channel_key).expect("entry should be present");
+        assert!(
+            entry.is_expired(quarantined_at_ns + QUARANTINE_TTL_NS),
+            "entry should expire at TTL boundary",
+        );
+
+        // Clear by session.
+        let removed = state.clear_session("session-lifecycle");
+        assert_eq!(removed, 1, "exactly one entry should be cleared");
+        assert!(
+            state.get(&channel_key).is_none(),
+            "entry should be gone after session clear",
+        );
+    }
+
+    /// TCK-00489 (f): Severity escalation on update-in-place.
+    #[test]
+    fn tck_00489_severity_escalation_on_update() {
+        let mut state = BoundaryChannelQuarantineState::default();
+        let now_ns = 1_000_000;
+        let key = "boundary:escalation".to_string();
+
+        // Insert with Minor severity.
+        state
+            .quarantine(
+                key.clone(),
+                "session-escalate".to_string(),
+                "minor".to_string(),
+                now_ns,
+                [1u8; 32],
+                [1u8; 32],
+                ViolationSeverity::Minor,
+            )
+            .expect("initial insert should succeed");
+        assert_eq!(state.get(&key).unwrap().severity, ViolationSeverity::Minor,);
+
+        // Update with Blocker severity -- should escalate.
+        state
+            .quarantine(
+                key.clone(),
+                "session-escalate".to_string(),
+                "blocker now".to_string(),
+                now_ns + 1,
+                [1u8; 32],
+                [1u8; 32],
+                ViolationSeverity::Blocker,
+            )
+            .expect("update should succeed");
+        assert_eq!(
+            state.get(&key).unwrap().severity,
+            ViolationSeverity::Blocker,
+            "severity should escalate on update",
+        );
+
+        // Update with Minor severity -- should NOT downgrade.
+        state
+            .quarantine(
+                key.clone(),
+                "session-escalate".to_string(),
+                "minor again".to_string(),
+                now_ns + 2,
+                [1u8; 32],
+                [1u8; 32],
+                ViolationSeverity::Minor,
+            )
+            .expect("update should succeed");
+        assert_eq!(
+            state.get(&key).unwrap().severity,
+            ViolationSeverity::Blocker,
+            "severity must not downgrade on update",
+        );
+    }
+
+    /// TCK-00489: `ViolationSeverity::from_violation_classes` derives
+    /// correct severity from boundary defect classes.
+    #[test]
+    fn tck_00489_violation_severity_from_classes() {
+        use apm2_core::channel::ChannelViolationClass;
+
+        // Leakage budget exceeded => Blocker
+        assert_eq!(
+            ViolationSeverity::from_violation_classes(std::iter::once(
+                ChannelViolationClass::LeakageBudgetExceeded
+            )),
+            ViolationSeverity::Blocker,
+        );
+
+        // Timing channel budget exceeded => Blocker
+        assert_eq!(
+            ViolationSeverity::from_violation_classes(std::iter::once(
+                ChannelViolationClass::TimingChannelBudgetExceeded
+            )),
+            ViolationSeverity::Blocker,
+        );
+
+        // Taint not admitted => Major
+        assert_eq!(
+            ViolationSeverity::from_violation_classes(std::iter::once(
+                ChannelViolationClass::TaintNotAdmitted
+            )),
+            ViolationSeverity::Major,
+        );
+
+        // Unknown channel source => Minor
+        assert_eq!(
+            ViolationSeverity::from_violation_classes(std::iter::once(
+                ChannelViolationClass::UnknownChannelSource
+            )),
+            ViolationSeverity::Minor,
+        );
+
+        // Mix of Minor + Blocker => Blocker (highest wins)
+        assert_eq!(
+            ViolationSeverity::from_violation_classes(
+                [
+                    ChannelViolationClass::UnknownChannelSource,
+                    ChannelViolationClass::LeakageBudgetExceeded,
+                ]
+                .into_iter()
+            ),
+            ViolationSeverity::Blocker,
+        );
+
+        // Empty iterator => Minor (default)
+        assert_eq!(
+            ViolationSeverity::from_violation_classes(std::iter::empty()),
+            ViolationSeverity::Minor,
+        );
     }
 }
