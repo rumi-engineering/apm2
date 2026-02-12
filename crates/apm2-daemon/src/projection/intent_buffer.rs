@@ -543,6 +543,102 @@ impl IntentBuffer {
         Ok(rows > 0)
     }
 
+    /// Retrieves lifecycle artifacts persisted on a pending intent.
+    ///
+    /// This is used during retry: if a previous attempt completed the
+    /// lifecycle gate (`join -> revalidate -> consume`) and persisted
+    /// artifacts but then failed during projection, the caller can
+    /// retrieve the existing artifacts and skip the lifecycle gate on
+    /// retry (avoiding `AlreadyConsumed` denial).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(artifacts))` if the intent exists, is pending, and has all
+    ///   five lifecycle columns non-NULL.
+    /// - `Ok(None)` if the intent does not exist, is not pending, or has NULL
+    ///   lifecycle columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IntentBufferError::Database`] on SQL failure.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn get_lifecycle_artifacts(
+        &self,
+        intent_id: &str,
+    ) -> Result<Option<IntentLifecycleArtifacts>, IntentBufferError> {
+        validate_field("intent_id", intent_id)?;
+
+        let guard = self.lock()?;
+        let result = guard
+            .query_row(
+                "SELECT lifecycle_ajc_id,
+                        lifecycle_intent_digest,
+                        lifecycle_consume_selector_digest,
+                        lifecycle_consume_tick,
+                        lifecycle_time_envelope_ref
+                 FROM projection_intents
+                 WHERE intent_id = ?1
+                   AND verdict = 'pending'
+                   AND lifecycle_ajc_id IS NOT NULL
+                   AND lifecycle_intent_digest IS NOT NULL
+                   AND lifecycle_consume_selector_digest IS NOT NULL
+                   AND lifecycle_consume_tick IS NOT NULL
+                   AND lifecycle_time_envelope_ref IS NOT NULL",
+                params![intent_id],
+                |row| {
+                    let ajc_blob: Vec<u8> = row.get(0)?;
+                    let intent_blob: Vec<u8> = row.get(1)?;
+                    let selector_blob: Vec<u8> = row.get(2)?;
+                    let tick: i64 = row.get(3)?;
+                    let envelope_blob: Vec<u8> = row.get(4)?;
+                    Ok((ajc_blob, intent_blob, selector_blob, tick, envelope_blob))
+                },
+            )
+            .optional()
+            .map_err(|e| {
+                IntentBufferError::Database(format!("get_lifecycle_artifacts failed: {e}"))
+            })?;
+
+        let Some((ajc_blob, intent_blob, selector_blob, tick, envelope_blob)) = result else {
+            return Ok(None);
+        };
+
+        // Validate blob lengths — corrupt data must not produce zero-fills.
+        let ajc_id: [u8; 32] = ajc_blob.as_slice().try_into().map_err(|_| {
+            IntentBufferError::Database(format!(
+                "lifecycle_ajc_id: expected 32 bytes, got {}",
+                ajc_blob.len()
+            ))
+        })?;
+        let intent_digest: [u8; 32] = intent_blob.as_slice().try_into().map_err(|_| {
+            IntentBufferError::Database(format!(
+                "lifecycle_intent_digest: expected 32 bytes, got {}",
+                intent_blob.len()
+            ))
+        })?;
+        let consume_selector_digest: [u8; 32] =
+            selector_blob.as_slice().try_into().map_err(|_| {
+                IntentBufferError::Database(format!(
+                    "lifecycle_consume_selector_digest: expected 32 bytes, got {}",
+                    selector_blob.len()
+                ))
+            })?;
+        let time_envelope_ref: [u8; 32] = envelope_blob.as_slice().try_into().map_err(|_| {
+            IntentBufferError::Database(format!(
+                "lifecycle_time_envelope_ref: expected 32 bytes, got {}",
+                envelope_blob.len()
+            ))
+        })?;
+
+        Ok(Some(IntentLifecycleArtifacts {
+            ajc_id,
+            intent_digest,
+            consume_selector_digest,
+            consume_tick: tick as u64,
+            time_envelope_ref,
+        }))
+    }
+
     // =========================================================================
     // Deny
     // =========================================================================
@@ -2383,6 +2479,155 @@ mod tests {
                 "missing expected migrated column: {expected}"
             );
         }
+    }
+
+    // =========================================================================
+    // get_lifecycle_artifacts Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_lifecycle_artifacts_returns_none_without_artifacts() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-001",
+            "work-001",
+            &make_digest(0x42),
+            &make_digest(0xAB),
+            "pending",
+            100,
+            1_000_000,
+        )
+        .expect("insert");
+
+        // No artifacts attached yet.
+        let result = buf.get_lifecycle_artifacts("intent-001").expect("query");
+        assert!(result.is_none(), "no artifacts should mean None");
+    }
+
+    #[test]
+    fn test_get_lifecycle_artifacts_returns_some_after_attach() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-002",
+            "work-002",
+            &make_digest(0x43),
+            &make_digest(0xAB),
+            "pending",
+            200,
+            2_000_000,
+        )
+        .expect("insert");
+
+        let artifacts = IntentLifecycleArtifacts {
+            ajc_id: make_digest(0xC1),
+            intent_digest: make_digest(0xC2),
+            consume_selector_digest: make_digest(0xC3),
+            consume_tick: 9999,
+            time_envelope_ref: make_digest(0xC4),
+        };
+        buf.attach_lifecycle_artifacts("intent-002", &artifacts)
+            .expect("attach");
+
+        let retrieved = buf
+            .get_lifecycle_artifacts("intent-002")
+            .expect("query")
+            .expect("should be Some");
+        assert_eq!(retrieved.ajc_id, artifacts.ajc_id);
+        assert_eq!(retrieved.intent_digest, artifacts.intent_digest);
+        assert_eq!(
+            retrieved.consume_selector_digest,
+            artifacts.consume_selector_digest
+        );
+        assert_eq!(retrieved.consume_tick, 9999);
+        assert_eq!(retrieved.time_envelope_ref, artifacts.time_envelope_ref);
+    }
+
+    #[test]
+    fn test_get_lifecycle_artifacts_returns_none_for_denied_intent() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-003",
+            "work-003",
+            &make_digest(0x44),
+            &make_digest(0xAB),
+            "pending",
+            300,
+            3_000_000,
+        )
+        .expect("insert");
+
+        let artifacts = IntentLifecycleArtifacts {
+            ajc_id: make_digest(0xD1),
+            intent_digest: make_digest(0xD2),
+            consume_selector_digest: make_digest(0xD3),
+            consume_tick: 5555,
+            time_envelope_ref: make_digest(0xD4),
+        };
+        buf.attach_lifecycle_artifacts("intent-003", &artifacts)
+            .expect("attach");
+
+        // Deny the intent.
+        buf.deny("intent-003", "test deny reason").expect("deny");
+
+        // Lifecycle artifacts should not be returned for a denied intent
+        // (only pending intents are eligible for retry).
+        let result = buf.get_lifecycle_artifacts("intent-003").expect("query");
+        assert!(
+            result.is_none(),
+            "denied intent must not return lifecycle artifacts"
+        );
+    }
+
+    #[test]
+    fn test_get_lifecycle_artifacts_returns_none_for_admitted_intent() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-004",
+            "work-004",
+            &make_digest(0x45),
+            &make_digest(0xAB),
+            "pending",
+            400,
+            4_000_000,
+        )
+        .expect("insert");
+
+        let artifacts = IntentLifecycleArtifacts {
+            ajc_id: make_digest(0xE1),
+            intent_digest: make_digest(0xE2),
+            consume_selector_digest: make_digest(0xE3),
+            consume_tick: 7777,
+            time_envelope_ref: make_digest(0xE4),
+        };
+        buf.attach_lifecycle_artifacts("intent-004", &artifacts)
+            .expect("attach");
+
+        // Admit the intent.
+        buf.admit("intent-004", 5_000_000).expect("admit");
+
+        // Lifecycle artifacts should not be returned for admitted intents.
+        let result = buf.get_lifecycle_artifacts("intent-004").expect("query");
+        assert!(
+            result.is_none(),
+            "admitted intent must not return lifecycle artifacts"
+        );
+    }
+
+    #[test]
+    fn test_get_lifecycle_artifacts_nonexistent_returns_none() {
+        let buf = make_buffer();
+        let result = buf.get_lifecycle_artifacts("nonexistent").expect("query");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_lifecycle_artifacts_rejects_empty_id() {
+        let buf = make_buffer();
+        let result = buf.get_lifecycle_artifacts("");
+        assert!(matches!(
+            result,
+            Err(IntentBufferError::MissingField("intent_id"))
+        ));
     }
 
     // =========================================================================
