@@ -911,8 +911,9 @@ fn sqlite_load_bounded_by_max() {
     let tmp = create_temp_db();
     let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
 
-    // Insert more than MAX_GLOBAL_ENTRIES (but we'll check it doesn't load more)
-    for i in 0..10u8 {
+    // Insert more than MAX_GLOBAL_ENTRIES (but we'll check it doesn't load more).
+    // IDs start at 1 (load_all rejects id <= 0 as corrupted).
+    for i in 1..=10u8 {
         backend
             .persist_entry(&QuarantineEntry {
                 id: u64::from(i),
@@ -1897,4 +1898,618 @@ fn insert_result_reports_evicted_id() {
     assert!(result.evicted_id.is_some(), "eviction should be reported");
     // The evicted entry should be the oldest Low (id=1)
     assert_eq!(result.evicted_id.unwrap(), 1);
+}
+
+/// Verify that `InsertResult.evicted_entry` carries the full evicted entry
+/// data for rollback purposes.
+#[test]
+fn insert_result_carries_evicted_entry_for_rollback() {
+    let mut store = QuarantineStore::with_config(tiny_config()); // max_global=4
+
+    // Fill with Low priority entries
+    for i in 0..4u8 {
+        store
+            .insert(
+                &format!("s{i}"),
+                QuarantinePriority::Low,
+                test_hash(i),
+                test_hash(10 + i),
+                test_hash(20 + i),
+                100,
+                500,
+                "low",
+                100,
+            )
+            .unwrap();
+    }
+
+    // Insert with eviction (High priority evicts one Low)
+    let result = store
+        .insert(
+            "s-high",
+            QuarantinePriority::High,
+            test_hash(50),
+            test_hash(60),
+            test_hash(70),
+            100,
+            500,
+            "high-priority",
+            100,
+        )
+        .unwrap();
+
+    assert!(
+        result.evicted_entry.is_some(),
+        "evicted_entry must carry full entry data"
+    );
+    let evicted = result.evicted_entry.unwrap();
+    assert_eq!(evicted.id, 1, "oldest Low entry should be evicted");
+    assert_eq!(evicted.priority, QuarantinePriority::Low);
+    assert_eq!(evicted.session_id, "s0");
+}
+
+// =============================================================================
+// QUALITY MAJOR 1: Atomic Rollback on Eviction-Delete Failure
+// =============================================================================
+
+/// Regression test (QUALITY MAJOR 1): when `remove_entry(evicted_id)` fails
+/// after an eviction-triggering insert, the rollback must restore the evicted
+/// entry back into the in-memory store. Without this fix, the evicted entry
+/// exists in `SQLite` but not in memory, causing divergence.
+#[test]
+fn eviction_delete_failure_restores_evicted_entry_in_memory() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    // Fill to capacity with Low priority entries
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Low,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "entry-1-low",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "s2",
+            QuarantinePriority::Low,
+            test_hash(2),
+            test_hash(12),
+            500,
+            "entry-2-low",
+        )
+        .unwrap();
+
+    assert_eq!(guard.len(), 2);
+    assert_eq!(guard.session_count("s1"), 1);
+    assert_eq!(guard.session_count("s2"), 1);
+
+    // Now sabotage the database by dropping the quarantine_entries table.
+    // This will cause `remove_entry` to fail because the table no longer exists.
+    {
+        let sabotage_conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        sabotage_conn
+            .execute_batch("DROP TABLE quarantine_entries")
+            .unwrap();
+    }
+
+    // Try to insert a High priority entry -- this will trigger eviction of
+    // a Low entry in memory, then fail when trying to delete the evicted
+    // entry from SQLite. The rollback must:
+    // 1. Remove the newly inserted entry from memory
+    // 2. Restore the evicted entry back into memory
+    let result = guard.insert(
+        "s3",
+        QuarantinePriority::High,
+        test_hash(3),
+        test_hash(13),
+        500,
+        "entry-3-high-fails",
+    );
+
+    // Insert should fail due to persistence error
+    assert!(
+        result.is_err(),
+        "insert should fail when backend remove_entry fails"
+    );
+    assert!(matches!(
+        result,
+        Err(QuarantineStoreError::PersistenceError { .. })
+    ));
+
+    // CRITICAL: In-memory store should be unchanged -- both original entries
+    // should still be present. The evicted entry must have been restored.
+    assert_eq!(
+        guard.len(),
+        2,
+        "in-memory store should have 2 entries after rollback (evicted entry restored)"
+    );
+    assert_eq!(
+        guard.session_count("s1"),
+        1,
+        "session s1 count should be preserved after rollback"
+    );
+    assert_eq!(
+        guard.session_count("s2"),
+        1,
+        "session s2 count should be preserved after rollback"
+    );
+    // The new entry (s3) should NOT be in memory
+    assert_eq!(
+        guard.session_count("s3"),
+        0,
+        "failed insert session s3 should not be in memory"
+    );
+
+    let _ = tick;
+}
+
+/// Regression test: trait-level `reserve()` also restores evicted entries
+/// on eviction-delete failure (same fix as `insert()`).
+#[test]
+fn trait_reserve_eviction_delete_failure_restores_evicted_entry() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(50) // Short TTL
+        .with_default_priority(QuarantinePriority::Normal);
+
+    // Fill via trait interface — both expire at tick 150
+    guard
+        .reserve("session-a", &test_hash(1), &test_hash(11))
+        .unwrap();
+    guard
+        .reserve("session-b", &test_hash(2), &test_hash(12))
+        .unwrap();
+    assert_eq!(guard.len(), 2);
+
+    // Advance past expiry so next reserve will trigger eviction
+    tick.store(200, Ordering::Relaxed);
+
+    // Sabotage the database
+    {
+        let sabotage_conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        sabotage_conn
+            .execute_batch("DROP TABLE quarantine_entries")
+            .unwrap();
+    }
+
+    // Reserve should fail, but in-memory state should be restored
+    let result = guard.reserve("session-c", &test_hash(3), &test_hash(13));
+    assert!(result.is_err(), "reserve should fail with broken backend");
+
+    // In-memory store should still have the 2 original entries
+    assert_eq!(
+        guard.len(),
+        2,
+        "in-memory store should have 2 entries after trait-reserve rollback"
+    );
+    assert_eq!(guard.session_count("session-a"), 1);
+    assert_eq!(guard.session_count("session-b"), 1);
+    assert_eq!(guard.session_count("session-c"), 0);
+}
+
+// =============================================================================
+// QUALITY MAJOR 2: Fail-Closed Validation for Signed Integer Fields
+// =============================================================================
+
+/// Regression test (QUALITY MAJOR 2): `load_all` must reject rows with
+/// negative `id`, `created_at_tick`, or `expires_at_tick` values. Without
+/// validation, negative i64 values silently become huge u64 values via
+/// `as u64`, breaking expiry logic (e.g., -1 becomes `u64::MAX`, meaning never
+/// expires).
+#[test]
+fn load_all_rejects_negative_id() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    // Manually insert a row with negative id (simulating corruption/tampering)
+    {
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                -1i64,
+                "s1",
+                1u8,
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 32],
+                100i64,
+                500i64,
+                "negative-id",
+            ],
+        )
+        .unwrap();
+    }
+
+    let result = backend.load_all();
+    assert!(
+        result.is_err(),
+        "load_all should reject rows with negative id"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, QuarantineStoreError::PersistenceError { .. }),
+        "error should be PersistenceError, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must be positive"),
+        "error message should mention positive requirement: {msg}"
+    );
+}
+
+#[test]
+fn load_all_rejects_negative_created_at_tick() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                1i64,
+                "s1",
+                1u8,
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 32],
+                -100i64,
+                500i64,
+                "negative-created-at",
+            ],
+        )
+        .unwrap();
+    }
+
+    let result = backend.load_all();
+    assert!(
+        result.is_err(),
+        "load_all should reject rows with negative created_at_tick"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("must be non-negative"),
+        "error should mention non-negative: {msg}"
+    );
+}
+
+#[test]
+fn load_all_rejects_negative_expires_at_tick() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                1i64,
+                "s1",
+                1u8,
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 32],
+                100i64,
+                -50i64,
+                "negative-expires-at",
+            ],
+        )
+        .unwrap();
+    }
+
+    let result = backend.load_all();
+    assert!(
+        result.is_err(),
+        "load_all should reject rows with negative expires_at_tick"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("must be non-negative"),
+        "error should mention non-negative: {msg}"
+    );
+}
+
+#[test]
+fn load_all_rejects_expires_before_created() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                1i64,
+                "s1",
+                1u8,
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 32],
+                500i64,
+                100i64,
+                "expires-before-created",
+            ],
+        )
+        .unwrap();
+    }
+
+    let result = backend.load_all();
+    assert!(
+        result.is_err(),
+        "load_all should reject rows where expires_at_tick < created_at_tick"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("expires_at_tick"),
+        "error should mention expires_at_tick: {msg}"
+    );
+}
+
+#[test]
+fn load_all_rejects_zero_id() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                0i64,
+                "s1",
+                1u8,
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 32],
+                100i64,
+                500i64,
+                "zero-id",
+            ],
+        )
+        .unwrap();
+    }
+
+    let result = backend.load_all();
+    assert!(result.is_err(), "load_all should reject rows with id=0");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("must be positive"),
+        "error should mention positive: {msg}"
+    );
+}
+
+/// Positive test: valid rows with id > 0 and non-negative tick values load
+/// correctly after the validation changes.
+#[test]
+fn load_all_accepts_valid_positive_values() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    let entry = QuarantineEntry {
+        id: 42,
+        session_id: "valid-session".to_string(),
+        priority: QuarantinePriority::High,
+        request_id: test_hash(1),
+        bundle_digest: test_hash(2),
+        reservation_hash: test_hash(3),
+        created_at_tick: 0, // zero is valid (non-negative)
+        expires_at_tick: 100,
+        reason: "valid entry".to_string(),
+    };
+
+    backend.persist_entry(&entry).unwrap();
+
+    let loaded = backend.load_all().unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, 42);
+    assert_eq!(loaded[0].created_at_tick, 0);
+    assert_eq!(loaded[0].expires_at_tick, 100);
+}
+
+// =============================================================================
+// QUALITY MINOR 1: Persistence Failure Exercises Failure Path
+// =============================================================================
+
+/// Deterministic test that forces `persist_entry` to fail after successful
+/// in-memory insertion, then asserts that the in-memory state is rolled back
+/// to maintain memory/DB consistency (fail-closed).
+#[test]
+fn persist_entry_failure_rolls_back_in_memory_state() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 4,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    // Successful insert
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Normal,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "entry-1",
+        )
+        .unwrap();
+    assert_eq!(guard.len(), 1);
+
+    // Sabotage DB to make persist_entry fail
+    {
+        let sabotage_conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        sabotage_conn
+            .execute_batch("DROP TABLE quarantine_entries")
+            .unwrap();
+    }
+
+    // This insert should fail at persist_entry (no eviction involved)
+    let result = guard.insert(
+        "s2",
+        QuarantinePriority::Normal,
+        test_hash(2),
+        test_hash(12),
+        500,
+        "entry-2-fails",
+    );
+
+    assert!(
+        result.is_err(),
+        "insert should fail when persist_entry fails"
+    );
+    assert!(matches!(
+        result,
+        Err(QuarantineStoreError::PersistenceError { .. })
+    ));
+
+    // In-memory state should be rolled back to just the first entry
+    // (the new entry should have been removed from memory)
+    assert_eq!(
+        guard.len(),
+        1,
+        "in-memory store should have 1 entry after persist_entry rollback"
+    );
+    assert_eq!(
+        guard.session_count("s1"),
+        1,
+        "session s1 should still be present"
+    );
+    assert_eq!(
+        guard.session_count("s2"),
+        0,
+        "session s2 should not be present after rollback"
+    );
+
+    let _ = tick;
+}
+
+/// Deterministic test that forces `remove_entry` to fail during eviction,
+/// then asserts full memory/DB parity: the evicted entry is restored, the
+/// new entry is removed, and session counts are correct.
+#[test]
+fn remove_entry_failure_during_eviction_preserves_full_state_parity() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    // Fill to capacity
+    guard
+        .insert(
+            "session-alpha",
+            QuarantinePriority::Low,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "alpha",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "session-beta",
+            QuarantinePriority::Low,
+            test_hash(2),
+            test_hash(12),
+            500,
+            "beta",
+        )
+        .unwrap();
+
+    // Verify DB has 2 entries before sabotage
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        assert_eq!(verify_backend.load_all().unwrap().len(), 2);
+    }
+
+    // Sabotage: drop table so remove_entry will fail
+    {
+        let sabotage_conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        sabotage_conn
+            .execute_batch("DROP TABLE quarantine_entries")
+            .unwrap();
+    }
+
+    // Attempt insert that requires eviction — should fail
+    let result = guard.insert(
+        "session-gamma",
+        QuarantinePriority::High,
+        test_hash(3),
+        test_hash(13),
+        500,
+        "gamma-triggers-eviction",
+    );
+
+    assert!(result.is_err());
+
+    // State parity assertions:
+    // 1. In-memory store has exactly 2 entries (evicted restored, new removed)
+    assert_eq!(guard.len(), 2);
+    // 2. Original sessions preserved
+    assert_eq!(guard.session_count("session-alpha"), 1);
+    assert_eq!(guard.session_count("session-beta"), 1);
+    // 3. New session not present
+    assert_eq!(guard.session_count("session-gamma"), 0);
+
+    let _ = tick;
 }

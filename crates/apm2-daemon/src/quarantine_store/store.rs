@@ -232,7 +232,7 @@ pub struct QuarantineStore {
 }
 
 /// Result of a successful quarantine insertion, including any evicted
-/// entry ID for backend synchronization.
+/// entry for backend synchronization and rollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertResult {
     /// The ID assigned to the newly inserted entry.
@@ -243,6 +243,11 @@ pub struct InsertResult {
     /// evicted entries surviving in the DB cause permanent capacity loss
     /// on restart via `load_all`).
     pub evicted_id: Option<QuarantineEntryId>,
+    /// The full evicted entry data, preserved for atomic rollback.
+    /// If persistence of the eviction-delete fails, this entry MUST be
+    /// restored to the in-memory store to maintain memory/DB parity
+    /// (QUALITY MAJOR: eviction-delete failure divergence fix).
+    pub evicted_entry: Option<QuarantineEntry>,
 }
 
 impl QuarantineStore {
@@ -347,7 +352,7 @@ impl QuarantineStore {
         }
 
         // Global capacity check with priority-aware eviction
-        let evicted_id = if self.entries.len() >= self.config.max_global_entries {
+        let evicted_entry = if self.entries.len() >= self.config.max_global_entries {
             match self.try_evict_one(priority, current_tick) {
                 Some(evicted) => Some(evicted),
                 None => {
@@ -359,6 +364,8 @@ impl QuarantineStore {
         } else {
             None
         };
+
+        let evicted_id = evicted_entry.as_ref().map(|e| e.id);
 
         // Create and insert the entry
         let id = self.next_id;
@@ -385,6 +392,7 @@ impl QuarantineStore {
         Ok(InsertResult {
             entry_id: id,
             evicted_id,
+            evicted_entry,
         })
     }
 
@@ -487,14 +495,15 @@ impl QuarantineStore {
     /// 2. Non-expired entries with priority strictly below incoming — lowest
     ///    priority first, then oldest (lowest ID) as tiebreaker.
     ///
-    /// Returns `Some(evicted_id)` if an entry was evicted, `None` otherwise.
-    /// The caller MUST propagate the evicted ID to the persistence backend
-    /// to prevent ghost records in the database (SECURITY BLOCKER fix).
+    /// Returns `Some(evicted_entry)` if an entry was evicted, `None`
+    /// otherwise. The full entry is returned (not just the ID) so callers
+    /// can restore it on rollback if persistence of the eviction-delete
+    /// fails (QUALITY MAJOR: atomic rollback for eviction-delete failure).
     fn try_evict_one(
         &mut self,
         incoming_priority: QuarantinePriority,
         current_tick: u64,
-    ) -> Option<QuarantineEntryId> {
+    ) -> Option<QuarantineEntry> {
         // Phase 1: Try to evict an expired entry (any priority)
         let expired_id = self
             .entries
@@ -504,8 +513,7 @@ impl QuarantineStore {
             .map(|(id, _)| *id);
 
         if let Some(id) = expired_id {
-            self.remove(id);
-            return Some(id);
+            return self.remove_and_return(id);
         }
 
         // Phase 2: Try to evict the lowest-priority entry strictly below incoming
@@ -517,11 +525,28 @@ impl QuarantineStore {
             .map(|(id, _)| *id);
 
         if let Some(id) = evictable_id {
-            self.remove(id);
-            return Some(id);
+            return self.remove_and_return(id);
         }
 
         None
+    }
+
+    /// Removes an entry by ID and returns the full entry data.
+    ///
+    /// Used by `try_evict_one` to preserve evicted entries for atomic
+    /// rollback when persistence fails.
+    fn remove_and_return(&mut self, id: QuarantineEntryId) -> Option<QuarantineEntry> {
+        if let Some(entry) = self.entries.remove(&id) {
+            if let Some(count) = self.session_counts.get_mut(&entry.session_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.session_counts.remove(&entry.session_id);
+                }
+            }
+            Some(entry)
+        } else {
+            None
+        }
     }
 }
 
@@ -742,7 +767,7 @@ impl SqliteQuarantineBackend {
     ///
     /// Returns `QuarantineStoreError::PersistenceError` on SQL failure
     /// or data corruption.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)] // SQL integers are positive for our use cases; MAX_GLOBAL_ENTRIES fits in i64
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)] // SQL integers validated non-negative before cast; MAX_GLOBAL_ENTRIES fits in i64
     pub fn load_all(&self) -> Result<Vec<QuarantineEntry>, QuarantineStoreError> {
         let db = self
             .conn
@@ -803,6 +828,38 @@ impl SqliteQuarantineBackend {
             ) = row_result.map_err(|e| QuarantineStoreError::PersistenceError {
                 reason: format!("failed to read quarantine entry row: {e}"),
             })?;
+
+            // Fail-closed validation: reject corrupted/tampered negative values
+            // for fields stored as SQL INTEGER (i64) but used as u64.
+            // Without this check, negative i64 values silently become huge u64
+            // values (e.g., -1 → u64::MAX), breaking expiry logic and capacity
+            // accounting (QUALITY MAJOR: signed integer field validation).
+            if id <= 0 {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!("invalid entry id {id}: must be positive"),
+                });
+            }
+            if created_at_tick < 0 {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "invalid created_at_tick {created_at_tick} in entry {id}: must be non-negative"
+                    ),
+                });
+            }
+            if expires_at_tick < 0 {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "invalid expires_at_tick {expires_at_tick} in entry {id}: must be non-negative"
+                    ),
+                });
+            }
+            if expires_at_tick < created_at_tick {
+                return Err(QuarantineStoreError::PersistenceError {
+                    reason: format!(
+                        "invalid tick range in entry {id}: expires_at_tick ({expires_at_tick}) < created_at_tick ({created_at_tick})"
+                    ),
+                });
+            }
 
             let priority = QuarantinePriority::from_tag(priority_tag).ok_or_else(|| {
                 QuarantineStoreError::PersistenceError {
@@ -1013,8 +1070,16 @@ impl DurableQuarantineGuard {
         // occupying capacity slots).
         if let Some(evicted_id) = result.evicted_id {
             if let Err(e) = self.backend.remove_entry(evicted_id) {
-                // Roll back in-memory insertion to maintain consistency
+                // Roll back: remove the new entry AND restore the evicted
+                // entry back into memory to maintain memory/DB parity
+                // (QUALITY MAJOR: atomic rollback for eviction-delete failure).
                 store.remove(result.entry_id);
+                if let Some(evicted_entry) = result.evicted_entry {
+                    // restore_entry can only fail if at capacity, but we just
+                    // removed the new entry so there is room. Ignore the
+                    // (practically unreachable) error to avoid masking `e`.
+                    let _ = store.restore_entry(evicted_entry);
+                }
                 return Err(e);
             }
         }
@@ -1157,7 +1222,13 @@ impl QuarantineGuard for DurableQuarantineGuard {
         // Remove evicted entry from DB to prevent ghost records
         if let Some(evicted_id) = result.evicted_id {
             if let Err(e) = self.backend.remove_entry(evicted_id) {
+                // Roll back: remove the new entry AND restore the evicted
+                // entry back into memory to maintain memory/DB parity
+                // (QUALITY MAJOR: atomic rollback for eviction-delete failure).
                 store.remove(result.entry_id);
+                if let Some(evicted_entry) = result.evicted_entry {
+                    let _ = store.restore_entry(evicted_entry);
+                }
                 return Err(e.to_string());
             }
         }
