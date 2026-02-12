@@ -1,6 +1,7 @@
 // AGENT-AUTHORED
-//! Security-interlocked optimization gates and quantitative evidence quality
-//! enforcement (RFC-0029 REQ-0006).
+//! Security-interlocked optimization gates, quantitative evidence quality
+//! enforcement (RFC-0029 REQ-0006), and authority-surface monotonicity
+//! enforcement (RFC-0029 REQ-0008).
 //!
 //! This module enforces the following interlock contracts:
 //!
@@ -21,17 +22,32 @@
 //!    optimization promotions, and throughput-dominance violations block
 //!    promotion-critical evidence classes.
 //!
+//! 5. **Authority-surface monotonicity** (REQ-0008): for production FAC roles,
+//!    `AS(role, t+1) ⊆ AS(role, t)` — the authority surface must monotonically
+//!    decrease. Any optimization that increases the external authority surface
+//!    is denied fail-closed.
+//!
+//! 6. **Direct GitHub non-regression** (REQ-0008): `github_direct_surface(role,
+//!    t) == 0` — no direct GitHub API/gh\_cli capability classes may appear in
+//!    production agent runtimes. Any optimization that reintroduces these
+//!    classes is denied fail-closed.
+//!
+//! 7. **Authority-surface evidence requirement** (REQ-0008): every optimization
+//!    must carry authoritative capability-surface diff evidence. Missing,
+//!    stale, or ambiguous evidence fails closed to deny.
+//!
 //! # Security Model
 //!
 //! All gates enforce fail-closed semantics: missing, stale, unknown, or
 //! sub-threshold evidence produces a deterministic denial with a stable
 //! reason code. There is no "default pass" path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::fac::FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES;
 use crate::pcac::MAX_REASON_LENGTH;
 use crate::pcac::temporal_arbitration::{ArbitrationOutcome, EvaluatorTuple, TemporalPredicateId};
 
@@ -82,6 +98,18 @@ pub const MAX_EVIDENCE_FRESHNESS_TICKS: u64 = 1000;
 /// Evidence that shows throughput below this ratio of the baseline is
 /// rejected as a throughput-dominance violation.
 pub const THROUGHPUT_DOMINANCE_MIN_RATIO: f64 = 1.0;
+
+/// Maximum number of capability entries in an authority-surface diff.
+pub const MAX_CAPABILITY_SURFACE_ENTRIES: usize = 256;
+
+/// Maximum length for a role ID in authority-surface evidence.
+pub const MAX_SURFACE_ROLE_ID_LENGTH: usize = 256;
+
+/// Maximum length for a capability ID in authority-surface evidence.
+pub const MAX_SURFACE_CAPABILITY_ID_LENGTH: usize = 256;
+
+/// Maximum age in ticks for authority-surface evidence freshness.
+pub const MAX_AUTHORITY_SURFACE_EVIDENCE_AGE_TICKS: u64 = 500;
 
 // ---------------------------------------------------------------------------
 // Deny reason constants
@@ -147,6 +175,44 @@ pub const DENY_ALPHA_NAN: &str = "optimization_evidence_alpha_nan";
 
 /// Deny: evidence freshness tick is ahead of current tick.
 pub const DENY_EVIDENCE_FUTURE_TICK: &str = "optimization_evidence_future_tick";
+
+/// Deny: authority-surface evidence is missing.
+pub const DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING: &str =
+    "optimization_authority_surface_evidence_missing";
+
+/// Deny: authority-surface evidence is stale (exceeds freshness window).
+pub const DENY_AUTHORITY_SURFACE_EVIDENCE_STALE: &str =
+    "optimization_authority_surface_evidence_stale";
+
+/// Deny: authority-surface evidence is ambiguous.
+pub const DENY_AUTHORITY_SURFACE_EVIDENCE_AMBIGUOUS: &str =
+    "optimization_authority_surface_evidence_ambiguous";
+
+/// Deny: authority-surface evidence state is unknown.
+pub const DENY_AUTHORITY_SURFACE_EVIDENCE_UNKNOWN: &str =
+    "optimization_authority_surface_evidence_unknown";
+
+/// Deny: authority surface increased (monotonicity violation).
+pub const DENY_AUTHORITY_SURFACE_INCREASE: &str = "optimization_authority_surface_increase";
+
+/// Deny: direct GitHub capability class reintroduced in production runtime.
+pub const DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED: &str =
+    "optimization_direct_github_capability_reintroduced";
+
+/// Deny: authority-surface diff has too many capability entries.
+pub const DENY_CAPABILITY_SURFACE_ENTRIES_OVERFLOW: &str =
+    "optimization_capability_surface_entries_overflow";
+
+/// Deny: authority-surface evidence tick is ahead of current tick.
+pub const DENY_AUTHORITY_SURFACE_EVIDENCE_FUTURE_TICK: &str =
+    "optimization_authority_surface_evidence_future_tick";
+
+/// Deny: authority-surface diff role ID is empty.
+pub const DENY_AUTHORITY_SURFACE_ROLE_ID_EMPTY: &str =
+    "optimization_authority_surface_role_id_empty";
+
+/// Deny: authority-surface diff content digest is zero.
+pub const DENY_AUTHORITY_SURFACE_DIGEST_ZERO: &str = "optimization_authority_surface_digest_zero";
 
 // ---------------------------------------------------------------------------
 // Bounded serde deserializers
@@ -265,6 +331,112 @@ where
         }
     }
     Ok(ids)
+}
+
+fn deserialize_bounded_capability_surface<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let caps = BTreeSet::<String>::deserialize(deserializer)?;
+    if caps.len() > MAX_CAPABILITY_SURFACE_ENTRIES {
+        return Err(serde::de::Error::custom(format!(
+            "capability_surface length {} exceeds maximum {}",
+            caps.len(),
+            MAX_CAPABILITY_SURFACE_ENTRIES,
+        )));
+    }
+    for cap in &caps {
+        if cap.len() > MAX_SURFACE_CAPABILITY_ID_LENGTH {
+            return Err(serde::de::Error::custom(format!(
+                "capability_id length {} exceeds maximum {}",
+                cap.len(),
+                MAX_SURFACE_CAPABILITY_ID_LENGTH,
+            )));
+        }
+    }
+    Ok(caps)
+}
+
+fn deserialize_bounded_surface_role_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX_SURFACE_ROLE_ID_LENGTH {
+        return Err(serde::de::Error::custom(format!(
+            "role_id length {} exceeds maximum {}",
+            value.len(),
+            MAX_SURFACE_ROLE_ID_LENGTH,
+        )));
+    }
+    Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// Authority-surface evidence types (REQ-0008)
+// ---------------------------------------------------------------------------
+
+/// Freshness state of authority-surface evidence.
+///
+/// Only `Current` evidence is admitted. All other states deny fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuthoritySurfaceEvidenceState {
+    /// Evidence is current and authoritative.
+    Current,
+    /// Evidence is stale (exceeds freshness window).
+    Stale,
+    /// Evidence is ambiguous (conflicting or incomplete).
+    Ambiguous,
+    /// Evidence state is unknown.
+    Unknown,
+}
+
+/// Role-level capability-surface diff for an optimization candidate.
+///
+/// Captures the before and after capability surfaces for a production FAC
+/// role, enabling monotonicity verification and direct GitHub non-regression
+/// checks.
+///
+/// Both `before` and `after` sets are bounded to
+/// [`MAX_CAPABILITY_SURFACE_ENTRIES`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySurfaceDiff {
+    /// Role identifier for this diff.
+    #[serde(deserialize_with = "deserialize_bounded_surface_role_id")]
+    pub role_id: String,
+
+    /// Capability surface before the optimization (time t).
+    #[serde(deserialize_with = "deserialize_bounded_capability_surface")]
+    pub before: BTreeSet<String>,
+
+    /// Capability surface after the optimization (time t+1).
+    #[serde(deserialize_with = "deserialize_bounded_capability_surface")]
+    pub after: BTreeSet<String>,
+
+    /// Content digest of this diff (for integrity binding).
+    pub content_digest: [u8; 32],
+}
+
+/// Authority-surface evidence for an optimization proposal (REQ-0008).
+///
+/// Wraps a capability-surface diff with freshness and state metadata.
+/// Missing, stale, ambiguous, or unknown evidence states deny fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySurfaceEvidence {
+    /// The capability-surface diff for this optimization.
+    pub diff: AuthoritySurfaceDiff,
+
+    /// HTF tick at which this evidence was gathered.
+    pub evidence_tick: u64,
+
+    /// State of this evidence.
+    pub state: AuthoritySurfaceEvidenceState,
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +560,15 @@ pub struct OptimizationGateTrace {
 
     /// Whether throughput-dominance check passed.
     pub throughput_dominance_passed: bool,
+
+    /// Whether authority-surface evidence was provided and valid (REQ-0008).
+    pub authority_surface_evidence_valid: bool,
+
+    /// Whether authority-surface monotonicity check passed (REQ-0008).
+    pub authority_surface_monotonic: bool,
+
+    /// Whether direct GitHub capability non-regression check passed (REQ-0008).
+    pub no_direct_github_capabilities: bool,
 
     /// Proposal digest bound to this decision.
     pub proposal_digest: [u8; 32],
@@ -594,18 +775,175 @@ pub fn validate_arbitration_outcome(outcome: ArbitrationOutcome) -> Result<(), &
 }
 
 // ---------------------------------------------------------------------------
+// Gate: Authority-surface evidence validity (REQ-0008)
+// ---------------------------------------------------------------------------
+
+/// Validates that authority-surface evidence is present, current, and
+/// structurally valid.
+///
+/// Checks:
+/// - Evidence is not `None` (fail-closed: missing evidence is denied).
+/// - Evidence state is `Current` (stale, ambiguous, and unknown states are
+///   denied fail-closed).
+/// - Evidence tick is not in the future.
+/// - Evidence is not stale (age <= `max_age_ticks`).
+/// - Role ID is non-empty.
+/// - Content digest is non-zero.
+/// - Capability sets do not exceed `MAX_CAPABILITY_SURFACE_ENTRIES`.
+///
+/// # Errors
+///
+/// Returns a stable deny reason string if any check fails.
+pub fn validate_authority_surface_evidence(
+    evidence: Option<&AuthoritySurfaceEvidence>,
+    current_tick: u64,
+    max_age_ticks: u64,
+) -> Result<(), &'static str> {
+    let Some(evidence) = evidence else {
+        return Err(DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING);
+    };
+
+    // State check (fail-closed for non-Current states).
+    match evidence.state {
+        AuthoritySurfaceEvidenceState::Current => {},
+        AuthoritySurfaceEvidenceState::Stale => {
+            return Err(DENY_AUTHORITY_SURFACE_EVIDENCE_STALE);
+        },
+        AuthoritySurfaceEvidenceState::Ambiguous => {
+            return Err(DENY_AUTHORITY_SURFACE_EVIDENCE_AMBIGUOUS);
+        },
+        AuthoritySurfaceEvidenceState::Unknown => {
+            return Err(DENY_AUTHORITY_SURFACE_EVIDENCE_UNKNOWN);
+        },
+    }
+
+    // Freshness checks.
+    if evidence.evidence_tick > current_tick {
+        return Err(DENY_AUTHORITY_SURFACE_EVIDENCE_FUTURE_TICK);
+    }
+    let age = current_tick - evidence.evidence_tick;
+    if age > max_age_ticks {
+        return Err(DENY_AUTHORITY_SURFACE_EVIDENCE_STALE);
+    }
+
+    // Structural checks on the diff.
+    if evidence.diff.role_id.is_empty() {
+        return Err(DENY_AUTHORITY_SURFACE_ROLE_ID_EMPTY);
+    }
+
+    if is_zero_hash(&evidence.diff.content_digest) {
+        return Err(DENY_AUTHORITY_SURFACE_DIGEST_ZERO);
+    }
+
+    if evidence.diff.before.len() > MAX_CAPABILITY_SURFACE_ENTRIES {
+        return Err(DENY_CAPABILITY_SURFACE_ENTRIES_OVERFLOW);
+    }
+
+    if evidence.diff.after.len() > MAX_CAPABILITY_SURFACE_ENTRIES {
+        return Err(DENY_CAPABILITY_SURFACE_ENTRIES_OVERFLOW);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gate: Authority-surface monotonicity (REQ-0008)
+// ---------------------------------------------------------------------------
+
+/// Validates that the authority surface monotonically decreases:
+/// `AS(role, t+1) ⊆ AS(role, t)`.
+///
+/// Any capability present in `after` but absent from `before` represents
+/// an authority-surface increase, which is denied for production FAC roles.
+///
+/// # Errors
+///
+/// Returns a stable deny reason if the after set is not a subset of before.
+pub fn validate_authority_surface_monotonicity(
+    diff: &AuthoritySurfaceDiff,
+) -> Result<(), &'static str> {
+    // AS(role, t+1) must be a subset of AS(role, t).
+    // Any element in `after` not in `before` is an increase.
+    if !diff.after.is_subset(&diff.before) {
+        return Err(DENY_AUTHORITY_SURFACE_INCREASE);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gate: Direct GitHub capability non-regression (REQ-0008)
+// ---------------------------------------------------------------------------
+
+/// Validates that no direct GitHub capability classes appear in the
+/// `after` capability surface.
+///
+/// For production FAC roles: `github_direct_surface(role, t) == 0`.
+/// Any capability in the `after` set that resolves to a forbidden direct
+/// GitHub capability class is denied fail-closed.
+///
+/// Uses the canonical forbidden-class list from
+/// [`FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES`].
+///
+/// # Errors
+///
+/// Returns a stable deny reason if any forbidden class is found.
+pub fn validate_no_direct_github_capabilities(
+    diff: &AuthoritySurfaceDiff,
+) -> Result<(), &'static str> {
+    for cap_id in &diff.after {
+        if is_forbidden_github_capability(cap_id) {
+            return Err(DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+        }
+    }
+    Ok(())
+}
+
+/// Checks whether a capability ID resolves to a forbidden direct GitHub
+/// capability class.
+///
+/// Normalises the capability ID by lowercasing, stripping the `kernel.`
+/// prefix, and extracting the first path segment. Then checks against
+/// [`FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES`].
+fn is_forbidden_github_capability(capability_id: &str) -> bool {
+    let normalized = capability_id.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let stripped = normalized
+        .strip_prefix("kernel.")
+        .unwrap_or(&normalized)
+        .trim();
+
+    let class = stripped
+        .split(['.', ':', '/'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(stripped);
+
+    FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES.contains(&class)
+}
+
+// ---------------------------------------------------------------------------
 // Combined optimization gate evaluator
 // ---------------------------------------------------------------------------
 
 /// Evaluates all optimization gates for a proposal.
 ///
 /// Gate evaluation order:
-/// 1. KPI/countermetric completeness
-/// 2. Canonical evaluator binding
-/// 3. Arbitration outcome
-/// 4. Evidence quality thresholds
-/// 5. Evidence freshness
-/// 6. Throughput dominance
+/// 1. Authority-surface evidence validity (REQ-0008)
+/// 2. Authority-surface monotonicity (REQ-0008)
+/// 3. Direct GitHub capability non-regression (REQ-0008)
+/// 4. KPI/countermetric completeness
+/// 5. Canonical evaluator binding
+/// 6. Arbitration outcome
+/// 7. Evidence quality thresholds
+/// 8. Evidence freshness
+/// 9. Throughput dominance
+///
+/// Authority-surface gates (1-3) are evaluated first because they enforce
+/// containment-critical invariants that must not be bypassed even if
+/// downstream evidence gates would also fail.
 ///
 /// First failing gate determines the deny reason. All gates are fail-closed.
 ///
@@ -615,6 +953,7 @@ pub fn evaluate_optimization_gate(
     proposal: &OptimizationProposal,
     countermetric_profile: Option<&CountermetricProfile>,
     evidence_quality: Option<&EvidenceQualityReport>,
+    authority_surface_evidence: Option<&AuthoritySurfaceEvidence>,
     arbitration_outcome: ArbitrationOutcome,
     current_tick: u64,
     max_evidence_age_ticks: u64,
@@ -627,10 +966,43 @@ pub fn evaluate_optimization_gate(
         evidence_quality_passed: false,
         evidence_freshness_passed: false,
         throughput_dominance_passed: false,
+        authority_surface_evidence_valid: false,
+        authority_surface_monotonic: false,
+        no_direct_github_capabilities: false,
         proposal_digest: proposal.proposal_digest,
     };
 
-    // Gate 1: KPI/countermetric completeness
+    // Gate 1 (REQ-0008): Authority-surface evidence validity
+    if let Err(reason) = validate_authority_surface_evidence(
+        authority_surface_evidence,
+        current_tick,
+        MAX_AUTHORITY_SURFACE_EVIDENCE_AGE_TICKS,
+    ) {
+        return deny_decision(reason, trace);
+    }
+    trace.authority_surface_evidence_valid = true;
+
+    // validate_authority_surface_evidence returned Ok, so evidence is Some
+    // and structurally valid. Use let-else to avoid expect/panic.
+    let Some(surface_evidence) = authority_surface_evidence else {
+        // Unreachable: validate_authority_surface_evidence returned Ok
+        // which requires Some. Fail-closed deny as defensive fallback.
+        return deny_decision(DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING, trace);
+    };
+
+    // Gate 2 (REQ-0008): Authority-surface monotonicity
+    if let Err(reason) = validate_authority_surface_monotonicity(&surface_evidence.diff) {
+        return deny_decision(reason, trace);
+    }
+    trace.authority_surface_monotonic = true;
+
+    // Gate 3 (REQ-0008): Direct GitHub capability non-regression
+    if let Err(reason) = validate_no_direct_github_capabilities(&surface_evidence.diff) {
+        return deny_decision(reason, trace);
+    }
+    trace.no_direct_github_capabilities = true;
+
+    // Gate 4: KPI/countermetric completeness
     let Some(profile) = countermetric_profile else {
         return deny_decision(DENY_COUNTERMETRIC_PROFILE_MISSING, trace);
     };
@@ -640,18 +1012,18 @@ pub fn evaluate_optimization_gate(
     }
     trace.kpi_countermetric_complete = true;
 
-    // Gate 2: Canonical evaluator binding
+    // Gate 5: Canonical evaluator binding
     if let Err(reason) = validate_canonical_evaluator_binding(proposal) {
         return deny_decision(reason, trace);
     }
     trace.canonical_evaluator_bound = true;
 
-    // Gate 3: Arbitration outcome
+    // Gate 6: Arbitration outcome
     if let Err(reason) = validate_arbitration_outcome(arbitration_outcome) {
         return deny_decision(reason, trace);
     }
 
-    // Gate 4: Evidence quality
+    // Gate 7: Evidence quality
     let Some(evidence) = evidence_quality else {
         return deny_decision(DENY_EVIDENCE_QUALITY_MISSING, trace);
     };
@@ -661,7 +1033,7 @@ pub fn evaluate_optimization_gate(
     }
     trace.evidence_quality_passed = true;
 
-    // Gate 5: Evidence freshness
+    // Gate 8: Evidence freshness
     match validate_evidence_freshness(evidence.evidence_tick, current_tick, max_evidence_age_ticks)
     {
         Ok(()) => {
@@ -679,7 +1051,7 @@ pub fn evaluate_optimization_gate(
         },
     }
 
-    // Gate 6: Throughput dominance
+    // Gate 9: Throughput dominance
     if let Err(reason) = validate_throughput_dominance(evidence.throughput_ratio) {
         return deny_decision(reason, trace);
     }
@@ -867,6 +1239,37 @@ mod tests {
             evidence_tick: 900,
             throughput_ratio: 1.15,
             evidence_digest: hash(0xEE),
+        }
+    }
+
+    /// Creates a valid authority-surface diff where after is a strict subset
+    /// of before (monotonic decrease). No GitHub capability classes present.
+    fn test_authority_surface_diff() -> AuthoritySurfaceDiff {
+        let mut before = BTreeSet::new();
+        before.insert("kernel.fs.read".to_string());
+        before.insert("kernel.fs.write".to_string());
+        before.insert("kernel.shell.exec".to_string());
+        before.insert("kernel.net.http".to_string());
+
+        let mut after = BTreeSet::new();
+        after.insert("kernel.fs.read".to_string());
+        after.insert("kernel.fs.write".to_string());
+
+        AuthoritySurfaceDiff {
+            role_id: "implementer".to_string(),
+            before,
+            after,
+            content_digest: hash(0xAA),
+        }
+    }
+
+    /// Creates valid authority-surface evidence with Current state and
+    /// fresh tick.
+    fn test_authority_surface_evidence() -> AuthoritySurfaceEvidence {
+        AuthoritySurfaceEvidence {
+            diff: test_authority_surface_diff(),
+            evidence_tick: 900,
+            state: AuthoritySurfaceEvidenceState::Current,
         }
     }
 
@@ -1096,6 +1499,227 @@ mod tests {
     }
 
     // =======================================================================
+    // Authority-surface evidence validity tests (REQ-0008)
+    // =======================================================================
+
+    #[test]
+    fn test_authority_surface_evidence_current_allows() {
+        let evidence = test_authority_surface_evidence();
+        assert!(validate_authority_surface_evidence(Some(&evidence), 1000, 500).is_ok());
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_missing_denied() {
+        let err = validate_authority_surface_evidence(None, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_stale_state_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.state = AuthoritySurfaceEvidenceState::Stale;
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_EVIDENCE_STALE);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_ambiguous_state_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.state = AuthoritySurfaceEvidenceState::Ambiguous;
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_EVIDENCE_AMBIGUOUS);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_unknown_state_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.state = AuthoritySurfaceEvidenceState::Unknown;
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_EVIDENCE_UNKNOWN);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_future_tick_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.evidence_tick = 1001;
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_EVIDENCE_FUTURE_TICK);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_tick_stale_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.evidence_tick = 100;
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_EVIDENCE_STALE);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_exact_age_allows() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.evidence_tick = 500;
+        assert!(validate_authority_surface_evidence(Some(&evidence), 1000, 500).is_ok());
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_empty_role_id_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.diff.role_id = String::new();
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_ROLE_ID_EMPTY);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_zero_digest_denied() {
+        let mut evidence = test_authority_surface_evidence();
+        evidence.diff.content_digest = [0u8; 32];
+        let err = validate_authority_surface_evidence(Some(&evidence), 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_DIGEST_ZERO);
+    }
+
+    // =======================================================================
+    // Authority-surface monotonicity tests (REQ-0008)
+    // =======================================================================
+
+    #[test]
+    fn test_monotonicity_subset_allows() {
+        let diff = test_authority_surface_diff();
+        // after is subset of before (monotonic decrease)
+        assert!(validate_authority_surface_monotonicity(&diff).is_ok());
+    }
+
+    #[test]
+    fn test_monotonicity_equal_sets_allows() {
+        let mut diff = test_authority_surface_diff();
+        // after == before (no change is still monotonic)
+        diff.after = diff.before.clone();
+        assert!(validate_authority_surface_monotonicity(&diff).is_ok());
+    }
+
+    #[test]
+    fn test_monotonicity_empty_after_allows() {
+        let mut diff = test_authority_surface_diff();
+        diff.after.clear();
+        assert!(validate_authority_surface_monotonicity(&diff).is_ok());
+    }
+
+    #[test]
+    fn test_monotonicity_increase_denied() {
+        let mut diff = test_authority_surface_diff();
+        // Add a new capability to after that is not in before
+        diff.after.insert("kernel.crypto.sign".to_string());
+        let err = validate_authority_surface_monotonicity(&diff).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_INCREASE);
+    }
+
+    #[test]
+    fn test_monotonicity_both_empty_allows() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.clear();
+        diff.after.clear();
+        assert!(validate_authority_surface_monotonicity(&diff).is_ok());
+    }
+
+    #[test]
+    fn test_monotonicity_disjoint_sets_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.clear();
+        diff.before.insert("cap_a".to_string());
+        diff.after.clear();
+        diff.after.insert("cap_b".to_string());
+        let err = validate_authority_surface_monotonicity(&diff).unwrap_err();
+        assert_eq!(err, DENY_AUTHORITY_SURFACE_INCREASE);
+    }
+
+    // =======================================================================
+    // Direct GitHub capability non-regression tests (REQ-0008)
+    // =======================================================================
+
+    #[test]
+    fn test_no_github_capabilities_allows() {
+        let diff = test_authority_surface_diff();
+        assert!(validate_no_direct_github_capabilities(&diff).is_ok());
+    }
+
+    #[test]
+    fn test_github_api_in_after_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("github_api.issues.read".to_string());
+        diff.after.insert("github_api.issues.read".to_string());
+        let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+        assert_eq!(err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+    }
+
+    #[test]
+    fn test_gh_cli_in_after_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("gh_cli.pr.create".to_string());
+        diff.after.insert("gh_cli.pr.create".to_string());
+        let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+        assert_eq!(err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+    }
+
+    #[test]
+    fn test_forge_org_admin_in_after_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("forge_org_admin.settings".to_string());
+        diff.after.insert("forge_org_admin.settings".to_string());
+        let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+        assert_eq!(err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+    }
+
+    #[test]
+    fn test_forge_repo_admin_in_after_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("forge_repo_admin.hooks".to_string());
+        diff.after.insert("forge_repo_admin.hooks".to_string());
+        let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+        assert_eq!(err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+    }
+
+    #[test]
+    fn test_github_in_before_only_allows() {
+        // github_api in before but NOT in after is fine (removed = good)
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("github_api.issues.read".to_string());
+        // after does not contain github_api
+        assert!(validate_no_direct_github_capabilities(&diff).is_ok());
+    }
+
+    #[test]
+    fn test_kernel_prefixed_github_api_in_after_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("kernel.github_api.read".to_string());
+        diff.after.insert("kernel.github_api.read".to_string());
+        let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+        assert_eq!(err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+    }
+
+    #[test]
+    fn test_case_insensitive_github_api_denied() {
+        let mut diff = test_authority_surface_diff();
+        diff.before.insert("GitHub_API.issues".to_string());
+        diff.after.insert("GitHub_API.issues".to_string());
+        let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+        assert_eq!(err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED);
+    }
+
+    #[test]
+    fn test_all_forbidden_classes_detected() {
+        for class in FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES {
+            let mut diff = test_authority_surface_diff();
+            let cap = format!("{class}.some_action");
+            diff.before.insert(cap.clone());
+            diff.after.insert(cap);
+            let err = validate_no_direct_github_capabilities(&diff).unwrap_err();
+            assert_eq!(
+                err, DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED,
+                "expected deny for forbidden class '{class}'"
+            );
+        }
+    }
+
+    // =======================================================================
     // Combined gate evaluation tests
     // =======================================================================
 
@@ -1104,11 +1728,13 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1116,6 +1742,9 @@ mod tests {
 
         assert_eq!(decision.verdict, OptimizationGateVerdict::Allow);
         assert!(decision.deny_reason.is_none());
+        assert!(decision.trace.authority_surface_evidence_valid);
+        assert!(decision.trace.authority_surface_monotonic);
+        assert!(decision.trace.no_direct_github_capabilities);
         assert!(decision.trace.kpi_countermetric_complete);
         assert!(decision.trace.canonical_evaluator_bound);
         assert!(decision.trace.evidence_quality_passed);
@@ -1127,11 +1756,13 @@ mod tests {
     fn test_missing_countermetric_profile_denied() {
         let proposal = test_proposal();
         let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             None,
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1148,11 +1779,13 @@ mod tests {
     fn test_missing_evidence_quality_denied() {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             None,
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1171,18 +1804,20 @@ mod tests {
         let profile = test_countermetric_profile();
         let mut evidence = test_evidence_quality();
         evidence.evidence_tick = 500;
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
         );
 
         assert_eq!(decision.verdict, OptimizationGateVerdict::Blocked);
-        assert_eq!(decision.deny_reason.as_deref(), Some(DENY_EVIDENCE_STALE),);
+        assert_eq!(decision.deny_reason.as_deref(), Some(DENY_EVIDENCE_STALE));
     }
 
     #[test]
@@ -1191,11 +1826,13 @@ mod tests {
         let profile = test_countermetric_profile();
         let mut evidence = test_evidence_quality();
         evidence.throughput_ratio = 0.95;
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1214,11 +1851,13 @@ mod tests {
         proposal.evaluator_bindings[0].evaluator_id = "bad_evaluator".to_string();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1238,11 +1877,13 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedDeny,
             1000,
             200,
@@ -1261,11 +1902,13 @@ mod tests {
         let profile = test_countermetric_profile();
         let mut evidence = test_evidence_quality();
         evidence.statistical_power = 0.5;
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1283,11 +1926,13 @@ mod tests {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
 
         let allow = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1298,11 +1943,130 @@ mod tests {
             &proposal,
             None,
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
         );
         assert_eq!(deny.defect(), Some(DENY_COUNTERMETRIC_PROFILE_MISSING));
+    }
+
+    // =======================================================================
+    // Combined gate: authority-surface gates in full evaluator (REQ-0008)
+    // =======================================================================
+
+    #[test]
+    fn test_missing_authority_surface_evidence_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            None,
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING),
+        );
+        assert!(!decision.trace.authority_surface_evidence_valid);
+    }
+
+    #[test]
+    fn test_authority_surface_increase_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let mut surface = test_authority_surface_evidence();
+        surface.diff.after.insert("kernel.crypto.sign".to_string());
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_AUTHORITY_SURFACE_INCREASE),
+        );
+        assert!(decision.trace.authority_surface_evidence_valid);
+        assert!(!decision.trace.authority_surface_monotonic);
+    }
+
+    #[test]
+    fn test_github_capability_reintroduced_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let mut surface = test_authority_surface_evidence();
+        // Add github_api to both before and after (in before to satisfy
+        // monotonicity, but still fails github non-regression)
+        surface
+            .diff
+            .before
+            .insert("github_api.issues.read".to_string());
+        surface
+            .diff
+            .after
+            .insert("github_api.issues.read".to_string());
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_DIRECT_GITHUB_CAPABILITY_REINTRODUCED),
+        );
+        assert!(decision.trace.authority_surface_evidence_valid);
+        assert!(decision.trace.authority_surface_monotonic);
+        assert!(!decision.trace.no_direct_github_capabilities);
+    }
+
+    #[test]
+    fn test_stale_authority_surface_evidence_state_in_full_gate_denied() {
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let mut surface = test_authority_surface_evidence();
+        surface.state = AuthoritySurfaceEvidenceState::Stale;
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(decision.verdict, OptimizationGateVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_AUTHORITY_SURFACE_EVIDENCE_STALE),
+        );
+        assert!(!decision.trace.authority_surface_evidence_valid);
     }
 
     // =======================================================================
@@ -1435,15 +2199,63 @@ mod tests {
     }
 
     #[test]
+    fn test_authority_surface_diff_oversized_capability_set_rejected() {
+        let caps: Vec<String> = (0..=MAX_CAPABILITY_SURFACE_ENTRIES)
+            .map(|i| format!("cap_{i}"))
+            .collect();
+        let digest: Vec<u8> = vec![0xAA; 32];
+        let json = serde_json::json!({
+            "role_id": "test_role",
+            "before": caps,
+            "after": [],
+            "content_digest": digest,
+        });
+        let err = serde_json::from_value::<AuthoritySurfaceDiff>(json).unwrap_err();
+        assert!(err.to_string().contains("capability_surface length"));
+    }
+
+    #[test]
+    fn test_authority_surface_diff_oversized_role_id_rejected() {
+        let role_id = "x".repeat(MAX_SURFACE_ROLE_ID_LENGTH + 1);
+        let digest: Vec<u8> = vec![0xAA; 32];
+        let json = serde_json::json!({
+            "role_id": role_id,
+            "before": [],
+            "after": [],
+            "content_digest": digest,
+        });
+        let err = serde_json::from_value::<AuthoritySurfaceDiff>(json).unwrap_err();
+        assert!(err.to_string().contains("role_id length"));
+    }
+
+    #[test]
+    fn test_authority_surface_diff_serialization_roundtrip() {
+        let diff = test_authority_surface_diff();
+        let json = serde_json::to_string(&diff).expect("serialize");
+        let decoded: AuthoritySurfaceDiff = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, diff);
+    }
+
+    #[test]
+    fn test_authority_surface_evidence_serialization_roundtrip() {
+        let evidence = test_authority_surface_evidence();
+        let json = serde_json::to_string(&evidence).expect("serialize");
+        let decoded: AuthoritySurfaceEvidence = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evidence);
+    }
+
+    #[test]
     fn test_gate_trace_proposal_digest_preserved() {
         let proposal = test_proposal();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1457,11 +2269,10 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_gate_ordering_kpi_before_evaluator() {
-        // Both KPI and evaluator fail — KPI is checked first
+    fn test_gate_ordering_authority_surface_before_kpi() {
+        // Both authority surface and KPI fail — authority surface is first
         let mut proposal = test_proposal();
         proposal.target_kpi_ids.push("kpi_unknown".to_string());
-        proposal.evaluator_bindings[0].evaluator_id = "bad".to_string();
         let profile = test_countermetric_profile();
         let evidence = test_evidence_quality();
 
@@ -1469,6 +2280,63 @@ mod tests {
             &proposal,
             Some(&profile),
             Some(&evidence),
+            None, // missing authority surface evidence
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_AUTHORITY_SURFACE_EVIDENCE_MISSING),
+        );
+    }
+
+    #[test]
+    fn test_gate_ordering_monotonicity_before_github() {
+        // Both monotonicity and GitHub fail — monotonicity is first
+        let proposal = test_proposal();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let mut surface = test_authority_surface_evidence();
+        // Add new capability (monotonicity violation) AND github capability
+        surface
+            .diff
+            .after
+            .insert("github_api.issues.read".to_string());
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
+            ArbitrationOutcome::AgreedAllow,
+            1000,
+            200,
+        );
+
+        // monotonicity is checked before github regression
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_AUTHORITY_SURFACE_INCREASE),
+        );
+    }
+
+    #[test]
+    fn test_gate_ordering_kpi_before_evaluator() {
+        // Both KPI and evaluator fail — KPI is checked first (after authority surface)
+        let mut proposal = test_proposal();
+        proposal.target_kpi_ids.push("kpi_unknown".to_string());
+        proposal.evaluator_bindings[0].evaluator_id = "bad".to_string();
+        let profile = test_countermetric_profile();
+        let evidence = test_evidence_quality();
+        let surface = test_authority_surface_evidence();
+
+        let decision = evaluate_optimization_gate(
+            &proposal,
+            Some(&profile),
+            Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1488,11 +2356,13 @@ mod tests {
         let profile = test_countermetric_profile();
         let mut evidence = test_evidence_quality();
         evidence.statistical_power = 0.1;
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -1512,17 +2382,19 @@ mod tests {
         // Evidence is stale AND throughput is bad — stale is checked first
         evidence.evidence_tick = 100;
         evidence.throughput_ratio = 0.5;
+        let surface = test_authority_surface_evidence();
 
         let decision = evaluate_optimization_gate(
             &proposal,
             Some(&profile),
             Some(&evidence),
+            Some(&surface),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
         );
 
         assert_eq!(decision.verdict, OptimizationGateVerdict::Blocked);
-        assert_eq!(decision.deny_reason.as_deref(), Some(DENY_EVIDENCE_STALE),);
+        assert_eq!(decision.deny_reason.as_deref(), Some(DENY_EVIDENCE_STALE));
     }
 }

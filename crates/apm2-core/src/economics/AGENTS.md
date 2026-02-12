@@ -411,27 +411,33 @@ Both receipt types use domain-separated Ed25519 signatures (`REPLAY_CONVERGENCE_
 - `validate_recovery_admissibility(input, eval_boundary_id)` -- TP-EIO29-009 validation (recovery admissibility gate)
 - `evaluate_replay_recovery(..., trusted_signers, idempotency: IdempotencyMode, recovery: &RecoveryMode)` -- Combined TP-EIO29-004 + TP-EIO29-007 + TP-EIO29-009 evaluation
 
-## Optimization Gates (REQ-0006)
+## Optimization Gates (REQ-0006, REQ-0008)
 
-The `optimization_gate` submodule implements security-interlocked optimization gates and quantitative evidence quality enforcement (RFC-0029 REQ-0006).
+The `optimization_gate` submodule implements security-interlocked optimization gates, quantitative evidence quality enforcement (RFC-0029 REQ-0006), and authority-surface monotonicity enforcement (RFC-0029 REQ-0008).
 
 ### Gate Evaluation Order
 
-1. **KPI/countermetric completeness** -- every optimization KPI must have a required countermetric mapping.
-2. **Canonical evaluator binding** -- all TP-EIO29 predicates must use `TemporalPredicateEvaluatorV1` (ID: `temporal_predicate_evaluator_v1`).
-3. **Arbitration outcome** -- temporal arbitration must produce `AgreedAllow`.
-4. **Evidence quality thresholds** -- power >= 0.90, alpha <= 0.01, sample size > 0, >= 3 distinct runtime classes.
-5. **Evidence freshness** -- evidence must not exceed the maximum age window (produces BLOCKED, not DENY).
-6. **Throughput dominance** -- throughput ratio must be >= 1.0 (no regression below baseline).
+1. **Authority-surface evidence validity** (REQ-0008) -- evidence must be present, current, structurally valid, and fresh.
+2. **Authority-surface monotonicity** (REQ-0008) -- `AS(role, t+1) ⊆ AS(role, t)` for production FAC roles.
+3. **Direct GitHub capability non-regression** (REQ-0008) -- `github_direct_surface(role, t) == 0` for production runtimes.
+4. **KPI/countermetric completeness** -- every optimization KPI must have a required countermetric mapping.
+5. **Canonical evaluator binding** -- all TP-EIO29 predicates must use `TemporalPredicateEvaluatorV1` (ID: `temporal_predicate_evaluator_v1`).
+6. **Arbitration outcome** -- temporal arbitration must produce `AgreedAllow`.
+7. **Evidence quality thresholds** -- power >= 0.90, alpha <= 0.01, sample size > 0, >= 3 distinct runtime classes.
+8. **Evidence freshness** -- evidence must not exceed the maximum age window (produces BLOCKED, not DENY).
+9. **Throughput dominance** -- throughput ratio must be >= 1.0 (no regression below baseline).
 
 ### Key Types
 
 - `CountermetricProfile` -- KPI-to-countermetric mapping for optimization gate policy
 - `OptimizationProposal` -- Proposal declaring target KPIs and evaluator bindings
 - `EvidenceQualityReport` -- Quantitative evidence with power, alpha, sample size, reproducibility, freshness, and throughput
+- `AuthoritySurfaceDiff` -- Role-level capability-surface diff (before/after `BTreeSet<String>` with content digest)
+- `AuthoritySurfaceEvidence` -- Wraps `AuthoritySurfaceDiff` with HTF tick and `AuthoritySurfaceEvidenceState`
+- `AuthoritySurfaceEvidenceState` -- `Current` / `Stale` / `Ambiguous` / `Unknown` enum (only `Current` admitted)
 - `TemporalSloProfileV1` -- Temporal SLO tuple (baseline, target, window, owner locus, falsification predicate, countermetrics, boundary authority)
 - `OptimizationGateDecision` -- Verdict + trace for auditing; defect accessed via `decision.defect()`
-- `OptimizationGateTrace` -- Per-gate pass/fail status and proposal digest
+- `OptimizationGateTrace` -- Per-gate pass/fail status including authority-surface flags and proposal digest
 - `OptimizationGateVerdict` -- Allow / Deny / Blocked enum
 
 ### Invariants
@@ -439,9 +445,13 @@ The `optimization_gate` submodule implements security-interlocked optimization g
 - [INV-OG01] All unknown, missing, stale, sub-threshold, or incomplete evidence/countermetric states deny fail-closed.
 - [INV-OG02] Stale evidence produces BLOCKED (not DENY) to distinguish recoverable freshness from structural rejection.
 - [INV-OG03] NaN values in statistical fields (power, alpha, throughput) are denied fail-closed.
-- [INV-OG04] All `String` and `Vec` fields use bounded serde deserializers to prevent OOM from untrusted input.
+- [INV-OG04] All `String`, `Vec`, and `BTreeSet` fields use bounded serde deserializers to prevent OOM from untrusted input.
 - [INV-OG05] `TemporalSloProfileV1` requires non-empty countermetrics for every objective (KPI/countermetric pairing).
 - [INV-OG06] Hash field zero checks use constant-time comparison (`subtle::ConstantTimeEq`).
+- [INV-OG07] Authority surface must monotonically decrease for production FAC roles: `AS(role, t+1) ⊆ AS(role, t)`. Any increase is denied fail-closed.
+- [INV-OG08] No direct GitHub capability classes (`github_api`, `gh_cli`, `forge_org_admin`, `forge_repo_admin`) may appear in the `after` capability surface.
+- [INV-OG09] Missing, stale, ambiguous, or unknown authority-surface evidence states deny fail-closed. Only `Current` state is admitted.
+- [INV-OG10] Authority-surface evidence freshness enforces the same tick-based staleness model as evidence quality freshness.
 
 ### Contracts
 
@@ -450,17 +460,23 @@ The `optimization_gate` submodule implements security-interlocked optimization g
 - [CTR-OG03] `validate_evidence_quality()` enforces power, alpha, sample size, and reproducibility thresholds.
 - [CTR-OG04] `validate_evidence_freshness()` rejects stale or future-ticked evidence.
 - [CTR-OG05] `validate_throughput_dominance()` rejects throughput ratios below baseline.
-- [CTR-OG06] `evaluate_optimization_gate()` combines all gates in order, producing `OptimizationGateDecision` with full trace.
+- [CTR-OG06] `evaluate_optimization_gate()` combines all gates in order (authority-surface first), producing `OptimizationGateDecision` with full trace.
+- [CTR-OG07] `validate_authority_surface_evidence()` rejects missing, stale, ambiguous, unknown, future-ticked, empty-role-id, and zero-digest evidence.
+- [CTR-OG08] `validate_authority_surface_monotonicity()` rejects diffs where `after` is not a subset of `before`.
+- [CTR-OG09] `validate_no_direct_github_capabilities()` rejects diffs where `after` contains any forbidden GitHub capability class.
 
 ### Public API
 
+- `validate_authority_surface_evidence(evidence, current_tick, max_age_ticks)` -- Authority-surface evidence validity gate (REQ-0008)
+- `validate_authority_surface_monotonicity(diff)` -- Authority-surface monotonicity gate (REQ-0008)
+- `validate_no_direct_github_capabilities(diff)` -- Direct GitHub capability non-regression gate (REQ-0008)
 - `validate_kpi_countermetric_completeness(proposal, profile)` -- KPI/countermetric completeness gate
 - `validate_canonical_evaluator_binding(proposal)` -- Canonical evaluator binding gate
 - `validate_evidence_quality(report)` -- Evidence quality threshold gate
 - `validate_evidence_freshness(evidence_tick, current_tick, max_age_ticks)` -- Evidence freshness gate
 - `validate_throughput_dominance(throughput_ratio)` -- Throughput dominance gate
 - `validate_arbitration_outcome(outcome)` -- Arbitration binding gate
-- `evaluate_optimization_gate(proposal, countermetric_profile, evidence_quality, arbitration_outcome, current_tick, max_evidence_age_ticks)` -- Combined gate evaluation
+- `evaluate_optimization_gate(proposal, countermetric_profile, evidence_quality, authority_surface_evidence, arbitration_outcome, current_tick, max_evidence_age_ticks)` -- Combined gate evaluation
 
 ## Related Modules
 
