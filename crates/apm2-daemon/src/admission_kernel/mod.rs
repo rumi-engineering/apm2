@@ -553,7 +553,6 @@ impl AdmissionKernelV1 {
             consume_time_intent_digest: consumed_witness.intent_digest,
             leakage_witness_seed_hash: plan.leakage_witness_seed.content_hash(),
             timing_witness_seed_hash: plan.timing_witness_seed.content_hash(),
-            post_effect_witness_evidence_hashes: Vec::new(),
             effect_descriptor_digest: plan.request.effect_descriptor_digest,
             quarantine_actions,
             ledger_anchor: plan.as_of_ledger_anchor.clone(),

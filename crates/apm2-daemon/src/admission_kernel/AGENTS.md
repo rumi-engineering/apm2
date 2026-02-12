@@ -97,14 +97,16 @@ Deterministic, bounded, `deny_unknown_fields` CAS object that captures all norma
 **Invariants:**
 
 - [INV-AK20] Bundle is sealed before any receipt/event emission (no digest cycles).
-- [INV-AK21] Bundle digest equals `content_hash()` (deterministic BLAKE3 with domain separation).
+- [INV-AK21] Bundle digest equals `content_hash()` (deterministic BLAKE3 with domain separation). This is a logical binding hash, NOT the CAS storage key.
 - [INV-AK22] Bundle validated before sealing (`validate()` checks zero fields and collection bounds).
 - [INV-AK23] `deny_unknown_fields` rejects unknown JSON fields at deserialization boundary.
-- [INV-AK24] Collection fields bounded by `MAX_BUNDLE_QUARANTINE_ACTIONS` (16) and `MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES` (32).
+- [INV-AK24] Collection fields bounded by `MAX_BUNDLE_QUARANTINE_ACTIONS` (16). Deserialization enforces bounds via visitor-based counting (no oversized pre-allocation).
+- [INV-AK25] Post-effect data (witness evidence hashes) does NOT live in the bundle. The bundle represents the sealed decision to admit; post-effect data belongs in `AdmissionOutcomeIndexV1`.
+- [INV-AK26] All string fields use bounded visitor deserialization that checks length DURING parsing, not after allocation.
 
 ### `AdmissionOutcomeIndexV1` (types.rs)
 
-Forward index emitted AFTER receipts/events to bridge bundle -> receipt digests without creating digest cycles. Bounded by `MAX_OUTCOME_INDEX_RECEIPT_DIGESTS` (64).
+Forward index emitted AFTER receipts/events to bridge bundle -> receipt digests without creating digest cycles. Contains `post_effect_witness_evidence_hashes` (populated after effect execution) and `receipt_digests`. Bounded by `MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES` (32) and `MAX_OUTCOME_INDEX_RECEIPT_DIGESTS` (64). Deserialization enforces bounds via visitor-based counting.
 
 ### `QuarantineActionV1` (types.rs)
 

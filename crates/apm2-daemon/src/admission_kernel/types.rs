@@ -28,38 +28,127 @@ use super::prerequisites::LedgerAnchorV1;
 // Bounded deserialization helpers (SECURITY BLOCKER 2, TCK-00492)
 // =============================================================================
 
-/// Bounded string deserialization module.
+/// Bounded deserialization module (SECURITY: visitor-based bounds enforcement).
 ///
 /// Prevents denial-of-service via unbounded allocation when deserializing
-/// string fields from untrusted input. Each string is rejected if it exceeds
-/// the corresponding `MAX_*` limit.
+/// string and collection fields from untrusted input. Uses serde `Visitor`
+/// patterns that enforce length/count limits DURING parsing, before
+/// allocating the full payload.
+///
+/// # String Visitor
+///
+/// The `bounded_string_deser!` macro generates a `Visitor` that intercepts
+/// `visit_str` / `visit_string` and rejects strings exceeding `MAX_*`
+/// bytes BEFORE copying into a new `String`. This prevents an attacker
+/// from forcing allocation of a multi-gigabyte string that is only
+/// rejected post-allocation.
+///
+/// # Vec Visitor
+///
+/// The `bounded_vec_deser!` macro generates a `Visitor` that consumes a
+/// JSON array element-by-element via `SeqAccess`, counting entries and
+/// rejecting the payload as soon as the count exceeds `MAX_*`. This
+/// prevents pre-allocation of an oversized `Vec` from a malicious
+/// `serde_json` size hint.
 mod bounded_deser {
-    use serde::{self, Deserialize, Deserializer};
+    use serde::{self, Deserializer, de};
 
-    /// Macro to generate bounded deserializer functions with compile-time
-    /// maximum length constants.
+    /// Macro to generate bounded string deserializer functions with a
+    /// visitor that enforces the limit DURING parsing (before allocation).
     macro_rules! bounded_string_deser {
         ($fn_name:ident, $max:expr) => {
             pub fn $fn_name<'de, D>(deserializer: D) -> Result<String, D::Error>
             where
                 D: Deserializer<'de>,
             {
-                let s = String::deserialize(deserializer)?;
-                if s.len() > $max {
-                    return Err(serde::de::Error::custom(concat!(
-                        "string exceeds maximum length of ",
-                        stringify!($max),
-                        " bytes"
-                    )));
+                struct BoundedStringVisitor;
+
+                impl<'de> de::Visitor<'de> for BoundedStringVisitor {
+                    type Value = String;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "a string of at most {} bytes", $max)
+                    }
+
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                        if v.len() > $max {
+                            return Err(E::custom(concat!(
+                                "string exceeds maximum length of ",
+                                stringify!($max),
+                                " bytes"
+                            )));
+                        }
+                        Ok(v.to_owned())
+                    }
+
+                    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                        if v.len() > $max {
+                            return Err(E::custom(concat!(
+                                "string exceeds maximum length of ",
+                                stringify!($max),
+                                " bytes"
+                            )));
+                        }
+                        Ok(v)
+                    }
                 }
-                Ok(s)
+
+                deserializer.deserialize_str(BoundedStringVisitor)
             }
         };
     }
 
-    // Bounded deserializers for each field type.
-    // These enforce MAX_* limits at deserialization time, preventing
-    // attackers from forcing large allocations via malicious payloads.
+    /// Macro to generate bounded `Vec<T>` deserializer functions with a
+    /// visitor that enforces the count limit DURING parsing. The visitor
+    /// consumes elements one-by-one via `SeqAccess` and rejects as soon
+    /// as the count exceeds `$max`, preventing oversized pre-allocation.
+    macro_rules! bounded_vec_deser {
+        ($fn_name:ident, $elem_ty:ty, $max:expr) => {
+            pub fn $fn_name<'de, D>(deserializer: D) -> Result<Vec<$elem_ty>, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct BoundedVecVisitor;
+
+                impl<'de> de::Visitor<'de> for BoundedVecVisitor {
+                    type Value = Vec<$elem_ty>;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "a sequence of at most {} elements", $max)
+                    }
+
+                    fn visit_seq<A: de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        // Cap pre-allocation to MAX to prevent a malicious
+                        // size hint from causing a massive allocation.
+                        let cap = seq.size_hint().unwrap_or(0).min($max);
+                        let mut vec = Vec::with_capacity(cap);
+
+                        while let Some(elem) = seq.next_element::<$elem_ty>()? {
+                            if vec.len() >= $max {
+                                return Err(de::Error::custom(concat!(
+                                    "sequence exceeds maximum of ",
+                                    stringify!($max),
+                                    " elements"
+                                )));
+                            }
+                            vec.push(elem);
+                        }
+
+                        Ok(vec)
+                    }
+                }
+
+                deserializer.deserialize_seq(BoundedVecVisitor)
+            }
+        };
+    }
+
+    // Bounded string deserializers for each field type.
+    // These enforce MAX_* limits DURING deserialization via Visitor,
+    // preventing attackers from forcing large allocations.
     bounded_string_deser!(deser_kernel_string, super::MAX_KERNEL_STRING_LENGTH);
     bounded_string_deser!(deser_tool_class, super::MAX_TOOL_CLASS_LENGTH);
     bounded_string_deser!(deser_boundary_profile, super::MAX_BOUNDARY_PROFILE_LENGTH);
@@ -68,6 +157,25 @@ mod bounded_deser {
         super::MAX_WITNESS_PROVIDER_ID_LENGTH
     );
     bounded_string_deser!(deser_witness_class, super::MAX_KERNEL_STRING_LENGTH);
+
+    // Bounded Vec deserializers for collection fields.
+    // These enforce MAX_* limits DURING deserialization via SeqAccess Visitor,
+    // preventing oversized pre-allocation from malicious size hints.
+    bounded_vec_deser!(
+        deser_quarantine_actions,
+        super::QuarantineActionV1,
+        super::MAX_BUNDLE_QUARANTINE_ACTIONS
+    );
+    bounded_vec_deser!(
+        deser_receipt_digests,
+        apm2_core::crypto::Hash,
+        super::MAX_OUTCOME_INDEX_RECEIPT_DIGESTS
+    );
+    bounded_vec_deser!(
+        deser_post_effect_witness_evidence_hashes,
+        apm2_core::crypto::Hash,
+        super::MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES
+    );
 }
 
 // =============================================================================
@@ -665,19 +773,15 @@ pub struct AdmissionBundleV1 {
     /// Timing witness seed content hash.
     pub timing_witness_seed_hash: Hash,
 
-    // -- Post-effect witness evidence hashes/refs --
-    /// Post-effect witness evidence hashes (populated after effect, before
-    /// any receipts that reference this bundle are emitted). Bounded by
-    /// `MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES`.
-    pub post_effect_witness_evidence_hashes: Vec<Hash>,
-
     // -- Effect digest --
     /// Effect descriptor digest (tool identity + arguments hash).
     pub effect_descriptor_digest: Hash,
 
     // -- Quarantine actions --
     /// Quarantine actions committed at bundle seal time. Bounded by
-    /// `MAX_BUNDLE_QUARANTINE_ACTIONS`.
+    /// `MAX_BUNDLE_QUARANTINE_ACTIONS`. Deserialization enforces the
+    /// limit via visitor-based counting (no oversized pre-allocation).
+    #[serde(deserialize_with = "bounded_deser::deser_quarantine_actions")]
     pub quarantine_actions: Vec<QuarantineActionV1>,
 
     // -- HT/HE anchors for audit --
@@ -723,15 +827,6 @@ impl AdmissionBundleV1 {
         }
 
         // Bounded collection checks
-        if self.post_effect_witness_evidence_hashes.len() > MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES {
-            return Err(AdmitError::BundleSealFailure {
-                reason: format!(
-                    "post_effect_witness_evidence_hashes exceeds maximum of \
-                     {MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES}, got {}",
-                    self.post_effect_witness_evidence_hashes.len()
-                ),
-            });
-        }
         if self.quarantine_actions.len() > MAX_BUNDLE_QUARANTINE_ACTIONS {
             return Err(AdmitError::BundleSealFailure {
                 reason: format!(
@@ -771,9 +866,17 @@ impl AdmissionBundleV1 {
 
     /// Compute the deterministic content hash (digest) for this bundle.
     ///
-    /// This digest IS the v1.1 `AdmissionBindingHash`. It uses
-    /// domain-separated BLAKE3 hashing over all fields in canonical
-    /// order with length-prefixed variable-length fields.
+    /// This digest IS the v1.1 `AdmissionBindingHash` — a **logical
+    /// binding hash** for semantic equality of the admission decision.
+    /// It is NOT the CAS storage key. The CAS storage key is derived
+    /// from `to_canonical_bytes()` (`serde_json` serialization), while
+    /// this hash is a domain-separated BLAKE3 digest over normative
+    /// fields in canonical order. The two serve different purposes:
+    ///
+    /// - `content_hash()` / `bundle_digest`: logical identity for receipts,
+    ///   events, and cross-component binding references.
+    /// - `to_canonical_bytes()`: byte-level representation for
+    ///   content-addressed storage (CAS) keying.
     ///
     /// # Digest Stability
     ///
@@ -810,12 +913,6 @@ impl AdmissionBundleV1 {
         // Witness SEED hashes
         hasher.update(&self.leakage_witness_seed_hash);
         hasher.update(&self.timing_witness_seed_hash);
-
-        // Post-effect witness evidence hashes (length-prefixed array)
-        hasher.update(&(self.post_effect_witness_evidence_hashes.len() as u32).to_le_bytes());
-        for h in &self.post_effect_witness_evidence_hashes {
-            hasher.update(h);
-        }
 
         // Effect digest
         hasher.update(&self.effect_descriptor_digest);
@@ -876,6 +973,11 @@ impl AdmissionBundleV1 {
 /// and lists the receipt/event digests that were emitted for this
 /// admission. It is emitted post-bundle to avoid digest cycles.
 ///
+/// Post-effect witness evidence hashes live here (not in the bundle)
+/// because they are populated AFTER the effect executes, which is after
+/// bundle sealing. Placing them in the bundle would mutate the sealed
+/// content hash and orphan the original `AdmissionBindingHash`.
+///
 /// # Digest Cycle Avoidance
 ///
 /// The bundle is sealed BEFORE receipts/events. This index is created
@@ -892,8 +994,17 @@ pub struct AdmissionOutcomeIndexV1 {
     pub request_id: Hash,
     /// AJC ID for correlation.
     pub ajc_id: Hash,
+    /// Post-effect witness evidence hashes (populated after effect
+    /// execution). These live in the outcome index rather than the
+    /// bundle because the bundle is sealed BEFORE the effect executes.
+    /// Bounded by `MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES`.
+    /// Deserialization enforces the limit via visitor-based counting.
+    #[serde(deserialize_with = "bounded_deser::deser_post_effect_witness_evidence_hashes")]
+    pub post_effect_witness_evidence_hashes: Vec<Hash>,
     /// Receipt/event digests emitted for this admission. Bounded by
-    /// `MAX_OUTCOME_INDEX_RECEIPT_DIGESTS`.
+    /// `MAX_OUTCOME_INDEX_RECEIPT_DIGESTS`. Deserialization enforces
+    /// the limit via visitor-based counting (no oversized pre-allocation).
+    #[serde(deserialize_with = "bounded_deser::deser_receipt_digests")]
     pub receipt_digests: Vec<Hash>,
 }
 
@@ -915,6 +1026,16 @@ impl AdmissionOutcomeIndexV1 {
                     "unsupported outcome index schema_version: expected \
                      {ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION}, got {}",
                     self.schema_version
+                ),
+            });
+        }
+
+        if self.post_effect_witness_evidence_hashes.len() > MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES {
+            return Err(AdmitError::BundleSealFailure {
+                reason: format!(
+                    "post_effect_witness_evidence_hashes exceeds maximum of \
+                     {MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES}, got {}",
+                    self.post_effect_witness_evidence_hashes.len()
                 ),
             });
         }
@@ -945,8 +1066,12 @@ impl AdmissionOutcomeIndexV1 {
     }
 
     /// Compute the deterministic content hash for this outcome index.
+    ///
+    /// This is a **logical binding hash** (domain-separated BLAKE3),
+    /// not the CAS storage key. See [`AdmissionBundleV1::content_hash`]
+    /// for the distinction between logical hash and CAS key.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // receipt_digests bounded by MAX_OUTCOME_INDEX_RECEIPT_DIGESTS (64), safe for u32.
+    #[allow(clippy::cast_possible_truncation)] // Collections bounded by MAX_* constants (<=64), safe for u32.
     pub fn content_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2-admission-outcome-index-v1");
@@ -954,6 +1079,12 @@ impl AdmissionOutcomeIndexV1 {
         hasher.update(&self.bundle_digest);
         hasher.update(&self.request_id);
         hasher.update(&self.ajc_id);
+        // Post-effect witness evidence hashes (length-prefixed array)
+        hasher.update(&(self.post_effect_witness_evidence_hashes.len() as u32).to_le_bytes());
+        for h in &self.post_effect_witness_evidence_hashes {
+            hasher.update(h);
+        }
+        // Receipt digests (length-prefixed array)
         hasher.update(&(self.receipt_digests.len() as u32).to_le_bytes());
         for d in &self.receipt_digests {
             hasher.update(d);
