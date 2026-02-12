@@ -18,9 +18,11 @@
 //!
 //! Trusted signer keys are validated at config parse time (see
 //! [`apm2_core::config::ProjectionConfig::validate_sink_profiles`]).
-//! By the time a `ConfigBackedResolver` is constructed, all keys are
-//! guaranteed to be valid Ed25519 public keys. This module does NOT
-//! perform lazy key validation.
+//! As defense-in-depth, `ConfigBackedResolver::from_config` also
+//! enforces exact hex length (64 chars), hex decode, and Ed25519
+//! curve point validation via `ed25519_dalek::VerifyingKey::from_bytes`
+//! at construction time. This upholds INV-CR01 at the constructor
+//! boundary even if `validate_sink_profiles` was not called.
 //!
 //! # Future Extension
 //!
@@ -155,21 +157,36 @@ impl ConfigBackedResolver {
     /// Creates a new `ConfigBackedResolver` from validated sink profile
     /// configurations.
     ///
-    /// This constructor decodes hex-encoded trusted signer keys and
-    /// builds the internal lookup maps. It assumes that
-    /// [`apm2_core::config::ProjectionConfig::validate_sink_profiles`] has
-    /// already been called during config parsing (which happens at daemon
-    /// startup).
+    /// This constructor enforces exact hex length (64 chars), decodes
+    /// hex-encoded trusted signer keys, validates Ed25519 curve points
+    /// via `ed25519_dalek::VerifyingKey::from_bytes`, and builds the
+    /// internal lookup maps. It also enforces the
+    /// `MAX_RESOLVED_PROFILES` bound on the number of sinks.
+    ///
+    /// While [`apm2_core::config::ProjectionConfig::validate_sink_profiles`]
+    /// is expected to have already been called during config parsing,
+    /// this constructor provides defense-in-depth validation at the
+    /// resolver boundary.
     ///
     /// # Errors
     ///
-    /// Returns an error if hex decoding or key parsing fails. In
-    /// practice this should not happen if config validation passed,
-    /// but we maintain fail-closed semantics by propagating errors
-    /// rather than silently ignoring them.
+    /// Returns an error if:
+    /// - The number of sinks exceeds `MAX_RESOLVED_PROFILES`.
+    /// - Any hex key is not exactly 64 characters.
+    /// - Hex decoding fails.
+    /// - A decoded key is not 32 bytes.
+    /// - A 32-byte key is not a valid Ed25519 curve point.
     pub fn from_config(
         sinks: &HashMap<String, ProjectionSinkProfileConfig>,
     ) -> Result<Self, ConfigResolverError> {
+        // Enforce MAX_RESOLVED_PROFILES bound at construction time.
+        if sinks.len() > MAX_RESOLVED_PROFILES {
+            return Err(ConfigResolverError::TooManySinks {
+                count: sinks.len(),
+                max: MAX_RESOLVED_PROFILES,
+            });
+        }
+
         let mut profiles = HashMap::with_capacity(sinks.len());
         let mut windows = HashMap::with_capacity(sinks.len());
 
@@ -183,6 +200,18 @@ impl ConfigBackedResolver {
             // depth).
             let mut trusted_signer_keys = Vec::with_capacity(config.trusted_signers.len());
             for (i, hex_key) in config.trusted_signers.iter().enumerate() {
+                // Enforce exact hex length (64 chars = 32 bytes) before
+                // decode to prevent oversized input amplification.
+                if hex_key.len() != 64 {
+                    return Err(ConfigResolverError::InvalidSignerKey {
+                        sink_id: sink_id.clone(),
+                        index: i,
+                        reason: format!(
+                            "hex string length {} != 64 (expected exactly 32 bytes)",
+                            hex_key.len()
+                        ),
+                    });
+                }
                 let bytes =
                     hex::decode(hex_key).map_err(|e| ConfigResolverError::InvalidSignerKey {
                         sink_id: sink_id.clone(),
@@ -197,6 +226,18 @@ impl ConfigBackedResolver {
                             index: i,
                             reason: "decoded key is not 32 bytes".to_string(),
                         })?;
+
+                // Validate Ed25519 curve point (INV-CR01 defense-in-depth).
+                // This ensures the 32-byte key is actually a valid Ed25519
+                // public key on the curve, not just arbitrary bytes.
+                let _vk = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
+                    ConfigResolverError::InvalidSignerKey {
+                        sink_id: sink_id.clone(),
+                        index: i,
+                        reason: format!("Ed25519 curve point validation: {e}"),
+                    }
+                })?;
+
                 trusted_signer_keys.push(key_bytes);
             }
 
@@ -294,6 +335,15 @@ pub enum ConfigResolverError {
         index: usize,
         /// Descriptive reason for the failure.
         reason: String,
+    },
+
+    /// The number of configured sinks exceeds `MAX_RESOLVED_PROFILES`.
+    #[error("too many sinks: {count} exceeds maximum {max}")]
+    TooManySinks {
+        /// Actual number of sinks provided.
+        count: usize,
+        /// Maximum allowed (`MAX_RESOLVED_PROFILES`).
+        max: usize,
     },
 }
 

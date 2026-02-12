@@ -514,7 +514,7 @@ Ensures FAC authoritative progression remains admissible during projection sink 
 - `ProjectionContinuityWindowV1` -- Signed declaration of outage and replay horizons with tick ranges, boundary binding, and Ed25519 domain-separated signature (`PROJECTION_CONTINUITY_WINDOW:` prefix).
 - `ProjectionSinkContinuityProfileV1` -- Signed per-sink-set scenario evaluation profile with individual scenario verdicts and content hash. Uses `PROJECTION_SINK_CONTINUITY_PROFILE:` domain prefix.
 - `DeferredReplayReceiptV1` -- Signed receipt proving deferred replay convergence within a declared replay window. Uses `DEFERRED_REPLAY_RECEIPT:` domain prefix.
-- `SinkIdentitySnapshotV1` -- Sink identity set snapshot with content digest for binding.
+- `MultiSinkIdentitySnapshotV1` -- Multi-sink identity set snapshot with content digest for binding.
 - `SinkIdentityEntry` -- Individual sink identity entry with ID, role, and content hash.
 - `ContinuityScenarioVerdict` -- Per-scenario verdict tuple (scenario_id, scenario_digest, truth_plane_continued, backlog_bounded).
 
