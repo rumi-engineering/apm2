@@ -77,6 +77,7 @@
 
 pub mod firewall;
 mod manifest;
+pub mod proof_cache;
 mod recipe;
 pub mod selector_closure;
 
@@ -85,6 +86,11 @@ pub use manifest::{
     MAX_PATH_LENGTH, MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_TOOL_ALLOWLIST,
     MAX_TOOL_CLASS_NAME_LEN, MAX_WRITE_ALLOWLIST, ManifestEntry, ManifestEntryBuilder,
     ManifestError, ToolClass, ToolClassExt, normalize_path, shell_pattern_matches,
+};
+pub use proof_cache::{
+    CacheVerdict, CachedProofEntry, DEFAULT_MAX_TTL_TICKS, MAX_PROOF_CACHE_ENTRIES, ProofCache,
+    ProofCacheDefect, ProofCacheDefectCode, ProofCacheError, ProofCacheMetrics, ProofCachePolicy,
+    VerificationInput, VerificationResult,
 };
 pub use recipe::{
     CONTEXT_PACK_RECIPE_SCHEMA, CONTEXT_PACK_RECIPE_VERSION, CompiledContextPackRecipe,

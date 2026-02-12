@@ -294,6 +294,39 @@ let result = firewall.validate_read("/etc/passwd", None);
 assert!(result.is_err());
 ```
 
+### `ProofCache` (RFC-0029 REQ-0003)
+
+```rust
+pub struct ProofCache {
+    // entries: HashMap<[u8; 32], CachedProofEntry>  (bounded)
+    // policy: ProofCachePolicy
+    // metrics: ProofCacheMetrics
+}
+```
+
+Bounded, policy-gated proof cache for verification amortization. Maps proof keys (BLAKE3 hashes of admission inputs) to cached verification results with TTL-based freshness and generation-based revocation invalidation.
+
+**Invariants:**
+
+- [INV-CX20] Cache entries are bounded by `MAX_PROOF_CACHE_ENTRIES` (100,000); overflow returns `Err`, never evicts silently
+- [INV-CX21] Stale entries (TTL exceeded) produce deterministic deny with `StaleCacheEntry`
+- [INV-CX22] Revoked entries (older revocation generation) produce deterministic deny with `RevokedCacheEntry`
+- [INV-CX23] Cache reuse is policy-gated: `allow_reuse=false` disables cache hits entirely
+
+**Contracts:**
+
+- [CTR-CX20] `lookup(key, tick)` returns `Hit`/`Miss`/`Err(Defect)` — never silently serves stale data
+- [CTR-CX21] `insert(key, result, tick)` enforces capacity bounds atomically (check-then-insert with `&mut self`)
+- [CTR-CX22] `verify_batch(inputs, tick, verifier_fn)` deduplicates by proof key, serves cache hits, computes only misses, returns results in input order
+- [CTR-CX23] `invalidate_generation()` bumps revocation generation counter (saturating), invalidating all older entries on next lookup
+
+**Resource Limits:**
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `MAX_PROOF_CACHE_ENTRIES` | 100,000 | Hard cap on cache entries |
+| `DEFAULT_MAX_TTL_TICKS` | 1,000 | Default freshness TTL |
+
 ## Related Modules
 
 - [`apm2_core::evidence`](../evidence/AGENTS.md) - `ContentAddressedStore` used by recipe compilation
