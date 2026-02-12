@@ -8377,6 +8377,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             match receipt.predicate_id {
                                 TemporalPredicateId::TpEio29001 => has_tp_eio29_001 = true,
                                 TemporalPredicateId::TpEio29008 => has_tp_eio29_008 = true,
+                                // Other predicates (e.g., TpEio29002, TpEio29003) are
+                                // handled by separate admission paths; not tracked here.
+                                _ => {},
                             }
                         }
 

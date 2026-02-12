@@ -104,6 +104,12 @@ pub enum TemporalPredicateId {
     /// Time authority envelope is valid.
     #[serde(rename = "TP-EIO29-001")]
     TpEio29001,
+    /// Freshness horizon satisfied.
+    #[serde(rename = "TP-EIO29-002")]
+    TpEio29002,
+    /// Anti-entropy convergence horizon satisfied.
+    #[serde(rename = "TP-EIO29-003")]
+    TpEio29003,
     /// Promotion temporal ambiguity is false.
     #[serde(rename = "TP-EIO29-008")]
     TpEio29008,
@@ -113,6 +119,8 @@ impl std::fmt::Display for TemporalPredicateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TpEio29001 => write!(f, "TP-EIO29-001"),
+            Self::TpEio29002 => write!(f, "TP-EIO29-002"),
+            Self::TpEio29003 => write!(f, "TP-EIO29-003"),
             Self::TpEio29008 => write!(f, "TP-EIO29-008"),
         }
     }
@@ -638,6 +646,8 @@ fn encode_string(payload: &mut Vec<u8>, value: &str) {
 const fn predicate_tag(predicate: TemporalPredicateId) -> u8 {
     match predicate {
         TemporalPredicateId::TpEio29001 => 1,
+        TemporalPredicateId::TpEio29002 => 2,
+        TemporalPredicateId::TpEio29003 => 3,
         TemporalPredicateId::TpEio29008 => 8,
     }
 }
