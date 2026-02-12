@@ -151,3 +151,4 @@ Error from temporal arbitration receipt validation.
 - TCK-00423: Lifecycle gate implementation
 - TCK-00426: Durable consume index
 - TCK-00427: Sovereignty checker
+- TCK-00495: Normalized declassification receipt consumption as PCAC-gated effects with durable binding fields (`receipt_hash`, `admission_bundle_digest`)

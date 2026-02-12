@@ -321,6 +321,20 @@ pub struct RedundancyReceiptConsumption {
     /// `None` indicates a legacy consumption record emitted before channel-key
     /// binding was added; callers must treat it fail-closed.
     pub channel_key: Option<String>,
+    /// BLAKE3 hash of the declassification receipt fields, binding the
+    /// receipt identity to the specific receipt content at consumption time.
+    ///
+    /// `None` indicates a legacy consumption record emitted before receipt-hash
+    /// binding was added; callers must treat it fail-closed.
+    pub receipt_hash: Option<[u8; 32]>,
+    /// PCAC authority join certificate ID (`ajc_id`) that authorized this
+    /// consumption. Provides O(1) correlation between the consumption event
+    /// and the PCAC lifecycle admission that gated it.
+    ///
+    /// `None` indicates a legacy consumption record emitted before
+    /// admission-digest binding was added, or a consumption that occurred
+    /// outside PCAC lifecycle (must be treated fail-closed by auditors).
+    pub admission_bundle_digest: Option<[u8; 32]>,
 }
 
 /// Error type for ledger event emission.
@@ -734,6 +748,8 @@ pub trait LedgerEventEmitter: Send + Sync {
         channel_key: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        receipt_hash: &[u8; 32],
+        admission_bundle_digest: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         let payload = serde_json::json!({
             "receipt_id": receipt_id,
@@ -742,6 +758,8 @@ pub trait LedgerEventEmitter: Send + Sync {
             "intent_digest": hex::encode(intent_digest),
             "argument_content_digest": hex::encode(argument_content_digest),
             "channel_key": channel_key,
+            "receipt_hash": hex::encode(receipt_hash),
+            "admission_bundle_digest": hex::encode(admission_bundle_digest),
         });
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
@@ -789,6 +807,13 @@ pub trait LedgerEventEmitter: Send + Sync {
                     .get("channel_key")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                receipt_hash: parse_hex_hash32(
+                    obj.get("receipt_hash").and_then(serde_json::Value::as_str),
+                ),
+                admission_bundle_digest: parse_hex_hash32(
+                    obj.get("admission_bundle_digest")
+                        .and_then(serde_json::Value::as_str),
+                ),
             })
         }
 
