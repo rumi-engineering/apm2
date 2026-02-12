@@ -1567,17 +1567,27 @@ impl DurableAntiRollbackAnchor {
         Ok(state)
     }
 
-    /// Atomically write state to a file using temp + rename.
+    /// Atomically write state to a file using `tempfile::NamedTempFile`.
+    ///
+    /// # Security Properties
+    ///
+    /// - **Restrictive permissions**: `NamedTempFile` creates files with 0600
+    ///   permissions by default, preventing world-readable anchor state that a
+    ///   local attacker could modify to roll back height.
+    /// - **fsync before rename**: `sync_all()` is called before `persist()` to
+    ///   ensure data is durable on disk. Power loss cannot result in a
+    ///   zero-byte or partially-written file.
+    /// - **Atomic rename**: `persist()` performs an atomic rename on the same
+    ///   filesystem, ensuring readers always see either the old or new complete
+    ///   state.
     fn atomic_write_state(
         path: &std::path::Path,
         state: &PersistedAnchorStateV1,
     ) -> Result<(), TrustError> {
-        let bytes = serde_json::to_vec_pretty(state).map_err(|e| TrustError::IntegrityFailure {
-            reason: truncate_reason(&format!("failed to serialize anchor state: {e}")),
-        })?;
+        use std::io::Write;
 
         // Write to temp file in the same directory (ensures same filesystem
-        // for atomic rename).
+        // for atomic rename via persist()).
         let parent = path.parent().ok_or_else(|| TrustError::IntegrityFailure {
             reason: "anchor state path has no parent directory".into(),
         })?;
@@ -1592,26 +1602,43 @@ impl DurableAntiRollbackAnchor {
             })?;
         }
 
-        let temp_path = path.with_extension("tmp");
-        std::fs::write(&temp_path, &bytes).map_err(|e| TrustError::IntegrityFailure {
-            reason: truncate_reason(&format!(
-                "failed to write temp anchor state file at {}: {e}",
-                temp_path.display()
-            )),
-        })?;
-
-        // Atomic rename.
-        std::fs::rename(&temp_path, path).map_err(|e| {
-            // Clean up temp file on rename failure.
-            let _ = std::fs::remove_file(&temp_path);
-            TrustError::IntegrityFailure {
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| TrustError::IntegrityFailure {
                 reason: truncate_reason(&format!(
-                    "failed to atomically rename anchor state file from {} to {}: {e}",
-                    temp_path.display(),
-                    path.display()
+                    "failed to create temp file for anchor state in {}: {e}",
+                    parent.display()
                 )),
+            })?;
+
+        serde_json::to_writer_pretty(&mut tmp, state).map_err(|e| {
+            TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to serialize anchor state: {e}")),
             }
         })?;
+
+        // Flush the write buffer to the OS before fsync.
+        tmp.flush().map_err(|e| TrustError::IntegrityFailure {
+            reason: truncate_reason(&format!("failed to flush anchor state temp file: {e}")),
+        })?;
+
+        // fsync: ensure data is durable on disk before atomic rename.
+        // Without this, power loss after rename could leave a zero-byte
+        // or partially-written file.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to fsync anchor state temp file: {e}")),
+            })?;
+
+        // Atomic rename with restrictive permissions (0600 by default from
+        // NamedTempFile). This replaces the manual write+rename pattern.
+        tmp.persist(path)
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to atomically persist anchor state file to {}: {e}",
+                    path.display()
+                )),
+            })?;
 
         Ok(())
     }
@@ -1740,6 +1767,12 @@ impl super::prerequisites::AntiRollbackAnchor for DurableAntiRollbackAnchor {
         }
 
         Ok(())
+    }
+
+    fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        // Delegate to the inherent `commit()` method which handles
+        // validation, anti-rollback checks, and atomic file persistence.
+        Self::commit(self, anchor)
     }
 }
 
@@ -1878,6 +1911,12 @@ impl super::prerequisites::AntiRollbackAnchor for InMemoryAntiRollbackAnchor {
         }
 
         Ok(())
+    }
+
+    fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        // Delegate to the inherent `commit()` method which handles
+        // validation and anti-rollback checks in memory.
+        Self::commit(self, anchor)
     }
 }
 

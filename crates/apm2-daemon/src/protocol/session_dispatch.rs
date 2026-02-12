@@ -24554,6 +24554,9 @@ mod tests {
                 fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
                     Ok(())
                 }
+                fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                    Ok(())
+                }
             }
 
             struct PassingQuarantineGuard;

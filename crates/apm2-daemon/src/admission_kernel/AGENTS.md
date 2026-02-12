@@ -41,7 +41,7 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 **Contracts:**
 
 - [CTR-AK01] `plan()` validates request, resolves prerequisites, creates witness seeds, executes PCAC join + initial revalidate.
-- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, capability minting, and boundary span initialization.
+- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, **anti-rollback anchor commit (Phase P.1)**, capability minting, and boundary span initialization.
 - [CTR-AK03] Monitor tiers may proceed without optional prerequisites and without prerequisite re-checks in `execute()`.
 - [CTR-AK04] Enforcement tier is derived from `RiskTier`: `Tier2Plus` -> `FailClosed`, all others -> `Monitor`.
 - [CTR-AK05] `LedgerWriteCapability` is only minted for fail-closed tiers (CTR-2617). Monitor tiers receive `None`.
@@ -146,7 +146,7 @@ Concrete implementations of `LedgerTrustVerifier`, `PolicyRootResolver`, and `An
 - [INV-TS15] Governance event truncation is fail-closed: if `read_governance_events` returns `>= MAX_GOVERNANCE_EVENTS_PER_DERIVATION` events, `derive_policy_root` returns `DerivationFailed` (no silent partial derivation).
 - [INV-TS16] `content_hash()` and `active_keyset_digest()` sort keys by `key_id` before hashing to ensure deterministic output regardless of vector insertion order.
 - [INV-TS17] `RootTrustBundle::validate()` enforces `schema_version == ROOT_TRUST_BUNDLE_SCHEMA_VERSION` as the first check. Unknown/future schema versions are rejected.
-- [INV-TS18] `DurableAntiRollbackAnchor` persists anchor state via atomic file write (temp + rename). File reads bounded by `MAX_ANCHOR_STATE_FILE_SIZE` (8 KiB).
+- [INV-TS18] `DurableAntiRollbackAnchor` persists anchor state via `tempfile::NamedTempFile` + `flush()` + `sync_all()` + `persist()` for crash-safe atomic writes with restrictive permissions (0600). File reads bounded by `MAX_ANCHOR_STATE_FILE_SIZE` (8 KiB).
 - [INV-TS19] Anti-rollback regression checks enforce: (a) height never decreases, (b) at same height, event hash must match (constant-time comparison). Violations return `ExternalAnchorMismatch`.
 - [INV-TS20] `mechanism_id` bounded by `MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH` (128). Empty mechanism IDs rejected at construction.
 - [INV-TS21] `PersistedAnchorStateV1` uses `deny_unknown_fields` serde and `schema_version` validation for forward-compatible deserialization.
@@ -201,7 +201,8 @@ plan():    validate -> prerequisite resolution -> witness seed creation ->
            PCAC join -> PCAC revalidate
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
-           durable consume -> bundle seal (TCK-00493) ->
+           durable consume -> anti-rollback anchor commit [P.1] (fail-closed) ->
+           bundle seal (TCK-00493) ->
            capability mint (tier-gated) -> boundary span -> result
 ```
 

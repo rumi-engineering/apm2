@@ -524,6 +524,28 @@ impl AdmissionKernelV1 {
                 reason: format!("PCAC consume denied: {}", deny.deny_class),
             })?;
 
+        // Phase P.1: Advance anti-rollback anchor after successful consume.
+        //
+        // SECURITY BLOCKER-001 (TCK-00502): The anchor MUST be committed
+        // AFTER the PCAC consume succeeds — never before — so a failed
+        // admission cannot advance the watermark. For fail-closed tiers,
+        // this ensures the external anchor tracks the latest successfully
+        // admitted ledger head. On fresh install (anchor is `None`), this
+        // first commit establishes the initial anchor state, unblocking
+        // subsequent `verify_committed()` calls.
+        //
+        // For monitor tiers, the anchor is not committed because monitor
+        // tiers do not gate authoritative effects.
+        if plan.enforcement_tier == EnforcementTier::FailClosed {
+            if let Some(ref ar) = self.anti_rollback {
+                ar.commit(&plan.as_of_ledger_anchor).map_err(|e| {
+                    AdmitError::AntiRollbackFailure {
+                        reason: format!("failed to commit anti-rollback anchor: {e}"),
+                    }
+                })?;
+            }
+        }
+
         // Phase Q: Mint capability tokens.
         let ajc_id = plan.certificate.ajc_id;
         let request_id = plan.request.request_id;

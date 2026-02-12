@@ -1195,13 +1195,23 @@ impl DispatcherState {
                                 .unwrap_or(consume_log_path.as_path());
                             parent.join("anti_rollback_anchor.json")
                         };
+                        // QUALITY NIT-1: TrustError implements Display which
+                        // includes the variant name and reason. The String
+                        // error type here prevents preserving the full error
+                        // chain via .context(); Display formatting is the
+                        // best available chain preservation.
                         let anti_rollback_anchor = Arc::new(
                             crate::admission_kernel::trust_stack::DurableAntiRollbackAnchor::new(
                                 anti_rollback_state_path,
                                 "file_anchor".to_string(),
                             )
                             .map_err(|e| {
-                                format!("failed to initialize anti-rollback anchor: {e}")
+                                format!(
+                                    "failed to initialize anti-rollback anchor ({}): {e}",
+                                    std::any::type_name::<
+                                        crate::admission_kernel::trust_stack::DurableAntiRollbackAnchor,
+                                    >()
+                                )
                             })?,
                         );
 

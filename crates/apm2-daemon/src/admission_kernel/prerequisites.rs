@@ -324,6 +324,14 @@ pub trait PolicyRootResolver: Send + Sync {
 ///
 /// Fail-closed tiers MUST require verified anti-rollback anchoring.
 /// If the anchor is unavailable or does not match, admission MUST deny.
+///
+/// # Commit Contract
+///
+/// After successful admission (PCAC consume + effects complete), the caller
+/// MUST call `commit()` to advance the external anchor to the new ledger
+/// head. Failing to commit leaves the anchor stale, which causes subsequent
+/// `verify_committed()` calls for higher anchors to fail (`DoS` on fresh
+/// install where anchor is `None`).
 pub trait AntiRollbackAnchor: Send + Sync {
     /// Returns the most recently verified external anchor state.
     ///
@@ -339,4 +347,19 @@ pub trait AntiRollbackAnchor: Send + Sync {
     /// Returns [`TrustError`] if the anchor is not committed externally
     /// or the external state does not match.
     fn verify_committed(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError>;
+
+    /// Commit a new anchor to the external anchor state, advancing
+    /// the anti-rollback watermark.
+    ///
+    /// The new anchor MUST NOT regress relative to the current committed
+    /// state (anti-rollback invariant). Implementations validate this
+    /// before persisting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if:
+    /// - The new anchor regresses (lower height or fork at same height).
+    /// - The anchor fails structural validation.
+    /// - The persistence operation fails.
+    fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError>;
 }
