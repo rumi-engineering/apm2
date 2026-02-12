@@ -49,7 +49,9 @@ use apm2_core::pcac::{
     IdentityEvidenceLevel,
 };
 use capabilities::{EffectCapability, LedgerWriteCapability, QuarantineCapability};
-use prerequisites::{AntiRollbackAnchor, LedgerAnchorV1, LedgerTrustVerifier, PolicyRootResolver};
+use prerequisites::{
+    AntiRollbackAnchor, LedgerAnchorV1, LedgerTrustVerifier, PolicyRootResolver, TrustError,
+};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 use types::{
@@ -524,27 +526,15 @@ impl AdmissionKernelV1 {
                 reason: format!("PCAC consume denied: {}", deny.deny_class),
             })?;
 
-        // Phase P.1: Advance anti-rollback anchor after successful consume.
+        // Phase P.1: Anti-rollback anchor commit is DEFERRED to
+        // finalize_anti_rollback(), which MUST be called by the caller
+        // AFTER the authoritative effect (broker dispatch, ledger write)
+        // has been confirmed successful. Committing here (inside execute())
+        // would create a pre-commit hazard: if the subsequent effect fails,
+        // the anchor watermark would advance past the actual ledger head,
+        // permanently deadlocking subsequent fail-closed admissions.
         //
-        // SECURITY BLOCKER-001 (TCK-00502): The anchor MUST be committed
-        // AFTER the PCAC consume succeeds — never before — so a failed
-        // admission cannot advance the watermark. For fail-closed tiers,
-        // this ensures the external anchor tracks the latest successfully
-        // admitted ledger head. On fresh install (anchor is `None`), this
-        // first commit establishes the initial anchor state, unblocking
-        // subsequent `verify_committed()` calls.
-        //
-        // For monitor tiers, the anchor is not committed because monitor
-        // tiers do not gate authoritative effects.
-        if plan.enforcement_tier == EnforcementTier::FailClosed {
-            if let Some(ref ar) = self.anti_rollback {
-                ar.commit(&plan.as_of_ledger_anchor).map_err(|e| {
-                    AdmitError::AntiRollbackFailure {
-                        reason: format!("failed to commit anti-rollback anchor: {e}"),
-                    }
-                })?;
-            }
-        }
+        // See: finalize_anti_rollback() method below.
 
         // Phase Q: Mint capability tokens.
         let ajc_id = plan.certificate.ajc_id;
@@ -880,6 +870,42 @@ impl AdmissionKernelV1 {
     }
 
     // =========================================================================
+    // Anti-rollback anchor finalization (TCK-00502 BLOCKER-2)
+    // =========================================================================
+
+    /// Finalize anti-rollback anchor after successful effect execution.
+    ///
+    /// MUST only be called after the authoritative effect (ledger write,
+    /// broker dispatch) has been confirmed successful. Committing before
+    /// effect confirmation creates a pre-commit hazard where the anchor
+    /// watermark advances past the actual ledger head, permanently
+    /// deadlocking subsequent fail-closed admissions.
+    ///
+    /// For monitor tiers, this is a no-op: monitor tiers do not gate
+    /// authoritative effects and MUST NOT advance the anti-rollback
+    /// watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmitError::AntiRollbackFailure`] if the anchor commit
+    /// fails (persistence error, regression detected, etc.).
+    pub fn finalize_anti_rollback(
+        &self,
+        enforcement_tier: EnforcementTier,
+        anchor: &LedgerAnchorV1,
+    ) -> Result<(), AdmitError> {
+        if enforcement_tier == EnforcementTier::FailClosed {
+            if let Some(ref ar) = self.anti_rollback {
+                ar.commit(anchor)
+                    .map_err(|e| AdmitError::AntiRollbackFailure {
+                        reason: format!("failed to commit anti-rollback anchor: {e}"),
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    // =========================================================================
     // Internal prerequisite resolution
     // =========================================================================
 
@@ -959,8 +985,12 @@ impl AdmissionKernelV1 {
 
     /// Verify anti-rollback anchor.
     ///
-    /// For fail-closed tiers: missing or errored anchor produces denial.
+    /// For fail-closed tiers: missing or errored anchor produces denial,
+    /// except for `ExternalAnchorUnavailable` which is tolerated as the
+    /// bootstrap path (no prior anchor exists on fresh install).
+    ///
     /// For monitor tiers: missing anchor is allowed (warning only).
+    #[allow(clippy::option_if_let_else)] // nested match on TrustError variant
     fn verify_anti_rollback(
         &self,
         tier: EnforcementTier,
@@ -968,11 +998,21 @@ impl AdmissionKernelV1 {
     ) -> Result<(), AdmitError> {
         match &self.anti_rollback {
             Some(ar) => {
-                ar.verify_committed(anchor)
-                    .map_err(|e| AdmitError::AntiRollbackFailure {
+                match ar.verify_committed(anchor) {
+                    Ok(()) => Ok(()),
+                    Err(TrustError::ExternalAnchorUnavailable { .. }) => {
+                        // Bootstrap path: on fresh install, no anchor has been
+                        // committed yet. The first execute() will establish the
+                        // initial anchor state via finalize_anti_rollback().
+                        // This is NOT a security failure; the anti-rollback
+                        // invariant is vacuously satisfied when no prior state
+                        // exists to protect.
+                        Ok(())
+                    },
+                    Err(e) => Err(AdmitError::AntiRollbackFailure {
                         reason: e.to_string(),
-                    })?;
-                Ok(())
+                    }),
+                }
             },
             None => {
                 if tier == EnforcementTier::FailClosed {

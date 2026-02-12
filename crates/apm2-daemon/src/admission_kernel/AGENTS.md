@@ -41,7 +41,7 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 **Contracts:**
 
 - [CTR-AK01] `plan()` validates request, resolves prerequisites, creates witness seeds, executes PCAC join + initial revalidate.
-- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, **anti-rollback anchor commit (Phase P.1)**, capability minting, and boundary span initialization.
+- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, capability minting, and boundary span initialization. **Anti-rollback anchor commit is deferred to `finalize_anti_rollback()`** which MUST be called by the caller AFTER the authoritative effect succeeds (TCK-00502 BLOCKER-2: pre-commit hazard prevention).
 - [CTR-AK03] Monitor tiers may proceed without optional prerequisites and without prerequisite re-checks in `execute()`.
 - [CTR-AK04] Enforcement tier is derived from `RiskTier`: `Tier2Plus` -> `FailClosed`, all others -> `Monitor`.
 - [CTR-AK05] `LedgerWriteCapability` is only minted for fail-closed tiers (CTR-2617). Monitor tiers receive `None`.
@@ -54,6 +54,8 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK12] `release_boundary_output()` denies output release for fail-closed tiers when evidence hashes are empty. Marks `BoundarySpanV1` as released exactly once (TCK-00497). Integrated into `handle_request_tool` post-effect path.
 - [CTR-AK13] `MonitorWaiverV1::validate()` enforces `expires_at_tick` against current tick. Non-zero `expires_at_tick < current_tick` means expired waiver, which is denied (SECURITY MAJOR 2, TCK-00497).
 - [CTR-AK14] `WitnessEvidenceV1.measured_values` uses bounded visitor deserialization (`bounded_vec_deser!`) with max `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` to prevent unbounded allocation from untrusted input (QUALITY MAJOR 1 + SECURITY MAJOR 1, TCK-00497).
+- [CTR-AK18] `finalize_anti_rollback()` commits the anti-rollback anchor AFTER confirmed effect success. For fail-closed tiers, this advances the external anchor watermark. For monitor tiers, this is a no-op. MUST NOT be called before effect confirmation (pre-commit hazard). Called from `handle_request_tool` post-effect path after `DecisionType::Allow` (TCK-00502 BLOCKER-2).
+- [CTR-AK19] `verify_anti_rollback()` tolerates `ExternalAnchorUnavailable` from `verify_committed()` as the bootstrap path: on fresh install, no prior anchor exists to protect and the anti-rollback invariant is vacuously satisfied. Other `TrustError` variants still produce denial (TCK-00502 BLOCKER-1).
 
 ### `KernelRequestV1` (types.rs)
 

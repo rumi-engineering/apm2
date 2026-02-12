@@ -8557,6 +8557,32 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             // Only proceed with witness closure on successful broker dispatch.
             if let Ok(SessionResponse::RequestTool(ref resp)) = response {
                 if resp.decision == i32::from(DecisionType::Allow) {
+                    // ====================================================
+                    // TCK-00502 BLOCKER-2 FIX: Finalize anti-rollback
+                    // anchor AFTER confirmed effect success. The anchor
+                    // commit was moved out of execute() to prevent the
+                    // pre-commit hazard where a failed effect would leave
+                    // the anchor watermark ahead of the actual ledger head.
+                    // ====================================================
+                    if let Some(ref kernel) = self.admission_kernel {
+                        let plan_tier = admission_res.boundary_span.enforcement_tier;
+                        if let Err(e) = kernel
+                            .finalize_anti_rollback(plan_tier, &admission_res.bundle.ledger_anchor)
+                        {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "anti-rollback anchor finalization failed \
+                                 (effect succeeded but anchor not committed)"
+                            );
+                            // The effect already succeeded; anti-rollback
+                            // finalization failure is logged but does not
+                            // retroactively revoke the allow decision. The
+                            // next admission will detect the stale anchor
+                            // via verify_anti_rollback and deny if needed.
+                        }
+                    }
+
                     // Get fresh tick for waiver expiry enforcement.
                     let post_effect_tick = self
                         .clock

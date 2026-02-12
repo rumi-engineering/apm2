@@ -1679,15 +1679,18 @@ impl DurableAntiRollbackAnchor {
     }
 
     /// Compute a deterministic proof hash for an anchor commitment.
+    ///
+    /// Field ordering follows conventional length-prefixed framing:
+    /// `domain_tag || anchor_hash || mechanism_id_len || mechanism_id_bytes`.
     fn compute_proof_hash(anchor: &LedgerAnchorV1, mechanism_id: &str) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2-anti-rollback-proof-v1");
         hasher.update(&anchor.content_hash());
-        hasher.update(mechanism_id.as_bytes());
         #[allow(clippy::cast_possible_truncation)] // mechanism_id bounded by MAX constant
         {
             hasher.update(&(mechanism_id.len() as u32).to_le_bytes());
         }
+        hasher.update(mechanism_id.as_bytes());
         *hasher.finalize().as_bytes()
     }
 }
