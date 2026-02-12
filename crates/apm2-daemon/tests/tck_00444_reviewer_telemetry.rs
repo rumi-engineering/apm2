@@ -169,6 +169,122 @@ fn malformed_telemetry_is_detected_and_blocks_authoritative_progression() {
 }
 
 #[test]
+fn trailing_partial_telemetry_line_is_ignored() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let events_path = temp.path().join("review_events.ndjson");
+    let complete = serde_json::json!({
+        "ts": "2026-02-10T12:00:00Z",
+        "event": "run_start",
+        "review_type": "security",
+        "pr_number": 444,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "seq": 1,
+    });
+    let partial = serde_json::json!({
+        "ts": "2026-02-10T12:00:01Z",
+        "event": "run_complete",
+        "review_type": "security",
+        "pr_number": 444,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "seq": 2,
+        "verdict": "PASS",
+    })
+    .to_string();
+    let partial = &partial[..partial.len() / 2];
+
+    let mut content = String::new();
+    content.push_str(&serde_json::to_string(&complete).expect("complete event should serialize"));
+    content.push('\n');
+    content.push_str(partial);
+
+    fs::write(&events_path, content).expect("fixture write");
+
+    let filter = ReviewerProjectionFilter::new(444).with_max_events(8);
+    let parsed = read_reviewer_projection_events(&events_path, &filter)
+        .expect("partial trailing line should be ignored");
+    assert_eq!(
+        parsed.events.len(),
+        1,
+        "only complete lifecycle events should be parsed"
+    );
+    assert_eq!(parsed.latest_seq, 1);
+}
+
+#[test]
+fn trailing_partial_telemetry_line_with_newline_is_ignored() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let events_path = temp.path().join("review_events.ndjson");
+    let complete = serde_json::json!({
+        "ts": "2026-02-10T12:00:00Z",
+        "event": "run_start",
+        "review_type": "security",
+        "pr_number": 444,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "seq": 1,
+    });
+    let partial = serde_json::json!({
+        "ts": "2026-02-10T12:00:01Z",
+        "event": "run_complete",
+        "review_type": "security",
+        "pr_number": 444,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "seq": 2,
+        "verdict": "PASS",
+    })
+    .to_string();
+    let partial = &partial[..partial.len() / 2];
+
+    let mut content = String::new();
+    content.push_str(&serde_json::to_string(&complete).expect("complete event should serialize"));
+    content.push('\n');
+    content.push_str(partial);
+    content.push('\n');
+
+    fs::write(&events_path, content).expect("fixture write");
+
+    let filter = ReviewerProjectionFilter::new(444).with_max_events(8);
+    let parsed = read_reviewer_projection_events(&events_path, &filter)
+        .expect("partial trailing line should be ignored even with trailing newline");
+    assert_eq!(
+        parsed.events.len(),
+        1,
+        "only complete lifecycle events should be parsed"
+    );
+    assert_eq!(parsed.latest_seq, 1);
+}
+
+#[test]
+fn rotated_partial_telemetry_line_is_not_ignored() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let events_path = temp.path().join("review_events.ndjson");
+    let rotated = reviewer_events_rotated_path(&events_path);
+    let active = serde_json::json!({
+        "ts": "2026-02-10T12:00:00Z",
+        "event": "run_start",
+        "review_type": "security",
+        "pr_number": 444,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "seq": 1,
+    });
+    let partial = "{not-json";
+
+    fs::write(&rotated, partial).expect("rotated fixture write");
+    fs::write(
+        &events_path,
+        serde_json::to_string(&active).expect("serialize active event"),
+    )
+    .expect("active fixture write");
+
+    let filter = ReviewerProjectionFilter::new(444).with_max_events(8);
+    let err = read_reviewer_projection_events(&events_path, &filter)
+        .expect_err("malformed rotated line should not be ignored");
+    match err {
+        ReviewerTelemetryError::Malformed { .. } => {},
+        other => panic!("expected malformed telemetry error, got {other:?}"),
+    }
+}
+
+#[test]
 fn parser_accepts_legacy_sha_update_alias_and_normalizes_kind() {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let events_path = temp.path().join("review_events.ndjson");

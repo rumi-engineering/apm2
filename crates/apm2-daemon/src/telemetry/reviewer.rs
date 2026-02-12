@@ -557,25 +557,47 @@ pub fn read_reviewer_projection_events(
     let mut latest_seq = 0_u64;
 
     for source in sources {
+        let tolerate_partial_line = source == *events_path;
         let file = File::open(&source)
             .map_err(|err| ReviewerTelemetryError::io(source.clone(), err.to_string()))?;
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line_no = index + 1;
-            let line = line.map_err(|err| ReviewerTelemetryError::Malformed {
-                path: source.clone(),
-                line: line_no,
-                detail: err.to_string(),
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value = serde_json::from_str::<Value>(&line).map_err(|err| {
+        let mut reader = BufReader::new(file);
+        let mut line_no = 0_usize;
+        let mut raw_line = String::new();
+        loop {
+            raw_line.clear();
+            let bytes_read = reader.read_line(&mut raw_line).map_err(|err| {
                 ReviewerTelemetryError::Malformed {
                     path: source.clone(),
-                    line: line_no,
+                    line: line_no.saturating_add(1),
                     detail: err.to_string(),
                 }
             })?;
+            if bytes_read == 0 {
+                break;
+            }
+            line_no += 1;
+            let line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = match serde_json::from_str::<Value>(line) {
+                Ok(value) => value,
+                Err(err) => {
+                    let parse_error = err.to_string();
+                    let is_partial_json = parse_error.contains("EOF while parsing");
+                    if tolerate_partial_line
+                        && line.trim_start().starts_with('{')
+                        && is_partial_json
+                    {
+                        continue;
+                    }
+                    return Err(ReviewerTelemetryError::Malformed {
+                        path: source,
+                        line: line_no,
+                        detail: err.to_string(),
+                    });
+                },
+            };
 
             let maybe_lifecycle =
                 ReviewerLifecycleEvent::from_json_value(&value).map_err(|err| {

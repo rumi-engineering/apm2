@@ -1,0 +1,52 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00510"
+    title: "CLI UX enhancements for FAC review workflow"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RELIABILITY"
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Implement apm2 fac review wait --pr <N> to block until reviews complete."
+      - "Add --format json support to apm2 fac review project for machine-readable output."
+      - "Implement apm2 fac review findings --pr <N> to return structured findings."
+      - "Add --wait-for-sha <SHA> flag to ensure review status reflects the expected commit."
+      - "Fix telemetry_malformed error caused by corrupt review_events.ndjson."
+    out_of_scope:
+      - "Full orchestration primitive (e.g., apm2 fac orchestrate)."
+  plan:
+    steps:
+      - "Investigate and fix review_events.ndjson corruption (telemetry_malformed)."
+      - "Implement blocking logic for review wait command with polling."
+      - "Refactor review project output generation to support JSON formatting."
+      - "Implement review findings command to aggregate and output findings in JSON."
+      - "Implement SHA consistency check for --wait-for-sha."
+      - "Update CLI documentation and help text."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "apm2 fac review wait blocks and returns final status correctly."
+      - "apm2 fac review project --format json returns valid JSON."
+      - "apm2 fac review findings returns accurate, structured findings."
+      - "CLI does not report telemetry_malformed errors."
+      - "--wait-for-sha prevents reporting on stale SHAs."
+  notes:
+    general: |
+      This ticket addresses direct user feedback regarding the friction in the FAC review workflow.
+      The goal is to enable better automation and reduce manual polling/parsing.

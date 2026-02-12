@@ -454,6 +454,8 @@ pub enum ReviewSubcommand {
     Run(ReviewRunArgs),
     /// Dispatch FAC review orchestration in detached mode.
     Dispatch(ReviewDispatchArgs),
+    /// Block until active FAC review runs for a PR reach terminal state.
+    Wait(ReviewWaitArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
     /// Materialize local review inputs (diff + commit history) under /tmp.
@@ -470,6 +472,13 @@ pub enum ReviewSubcommand {
     Project(ReviewProjectArgs),
     /// Tail FAC review NDJSON event stream.
     Tail(ReviewTailArgs),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReviewFormatArg {
+    #[default]
+    Text,
+    Json,
 }
 
 /// Arguments for `apm2 fac review run`.
@@ -498,6 +507,38 @@ pub struct ReviewRunArgs {
     /// This does not bypass merge-conflict checks against `main`.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+}
+
+/// Arguments for `apm2 fac review wait`.
+#[derive(Debug, Args)]
+pub struct ReviewWaitArgs {
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Optional pull request URL filter (must match --pr when both set).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional reviewer lane filter (`security` or `quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: Option<ReviewStatusTypeArg>,
+
+    /// Maximum wait time in seconds. Omit to wait indefinitely.
+    #[arg(long)]
+    pub timeout_seconds: Option<u64>,
+
+    /// Poll cadence in seconds (min: 1, default: 5).
+    #[arg(long, default_value_t = 5)]
+    pub poll_interval_seconds: u64,
+
+    /// Required head SHA for stale projection protection.
+    #[arg(long = "wait-for-sha")]
+    pub wait_for_sha: Option<String>,
+
+    /// Output format (`text` or `json`).
+    #[arg(long, default_value = "text", value_enum)]
+    pub format: ReviewFormatArg,
 }
 
 /// Arguments for `apm2 fac review dispatch`.
@@ -789,6 +830,10 @@ pub struct ReviewProjectArgs {
     /// Return non-zero when terminal failure is detected.
     #[arg(long, default_value_t = false)]
     pub fail_on_terminal: bool,
+
+    /// Output format (`text` or `json`).
+    #[arg(long, default_value = "text", value_enum)]
+    pub format: ReviewFormatArg,
 }
 
 /// Arguments for `apm2 fac review tail`.
@@ -1041,6 +1086,15 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 run_args.force,
                 json_output,
             ),
+            ReviewSubcommand::Wait(wait_args) => fac_review::run_wait(
+                wait_args.pr,
+                wait_args.pr_url.as_deref(),
+                wait_args.review_type.map(ReviewStatusTypeArg::as_str),
+                wait_args.wait_for_sha.as_deref(),
+                wait_args.timeout_seconds,
+                wait_args.poll_interval_seconds,
+                matches!(wait_args.format, ReviewFormatArg::Json),
+            ),
             ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
                 &dispatch_args.pr_url,
                 dispatch_args.review_type,
@@ -1115,6 +1169,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 project_args.after_seq,
                 project_args.emit_errors,
                 project_args.fail_on_terminal,
+                matches!(project_args.format, ReviewFormatArg::Json),
                 json_output,
             ),
             ReviewSubcommand::Tail(tail_args) => {
