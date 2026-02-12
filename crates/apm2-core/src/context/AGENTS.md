@@ -186,12 +186,14 @@ Compiles `ContextPackSelectorInput` into `CompiledContextPackRecipe` with:
 - Symlink rejection
 - Workspace boundary enforcement
 - Drift fingerprint generation
+- Selector closure completeness gate (RFC-0029 REQ-0002): high-risk tiers (Tier1+) require complete loss-profile declarations for every selector digest
 
 **Contracts:**
 
 - [CTR-CX11] Rejects paths outside workspace boundaries
 - [CTR-CX12] Rejects symlink paths (prevents escape)
 - [CTR-CX13] Enforces `MAX_REQUIRED_READ_PATHS` (10,000), `MAX_AGGREGATE_COMPONENTS` (100,000)
+- [CTR-CX14] Selector closure completeness: Tier1+ selectors without complete loss profiles are denied with `SelectorClosureIncomplete` reason code
 
 ### `DriftFingerprint`
 
