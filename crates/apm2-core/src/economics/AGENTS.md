@@ -1,6 +1,6 @@
 # Economics Module
 
-> Canonical economics profiles, deterministic budget admission (REQ-0001), HTF-bound queue admission with anti-entropy anti-starvation enforcement (REQ-0004), and projection multi-sink outage continuity with deferred replay boundedness (REQ-0009) for RFC-0029.
+> Canonical economics profiles, deterministic budget admission (REQ-0001), HTF-bound queue admission with anti-entropy anti-starvation enforcement (REQ-0004), security-interlocked optimization gates with disclosure-control interlock (REQ-0006, REQ-0007, REQ-0008), and projection multi-sink outage continuity with deferred replay boundedness (REQ-0009) for RFC-0029.
 
 ## Overview
 
@@ -411,33 +411,39 @@ Both receipt types use domain-separated Ed25519 signatures (`REPLAY_CONVERGENCE_
 - `validate_recovery_admissibility(input, eval_boundary_id)` -- TP-EIO29-009 validation (recovery admissibility gate)
 - `evaluate_replay_recovery(..., trusted_signers, idempotency: IdempotencyMode, recovery: &RecoveryMode)` -- Combined TP-EIO29-004 + TP-EIO29-007 + TP-EIO29-009 evaluation
 
-## Optimization Gates (REQ-0006, REQ-0008)
+## Optimization Gates (REQ-0006, REQ-0007, REQ-0008)
 
-The `optimization_gate` submodule implements security-interlocked optimization gates, quantitative evidence quality enforcement (RFC-0029 REQ-0006), and authority-surface monotonicity enforcement (RFC-0029 REQ-0008).
+The `optimization_gate` submodule implements security-interlocked optimization gates, quantitative evidence quality enforcement (RFC-0029 REQ-0006), disclosure-control interlock non-regression (RFC-0029 REQ-0007), and authority-surface monotonicity enforcement (RFC-0029 REQ-0008).
 
 ### Gate Evaluation Order
 
-1. **Authority-surface evidence validity** (REQ-0008) -- evidence must be present, current, structurally valid, and fresh.
-2. **Authority-surface monotonicity** (REQ-0008) -- `AS(role, t+1) ⊆ AS(role, t)` for production FAC roles.
-3. **Direct GitHub capability non-regression** (REQ-0008) -- `github_direct_surface(role, t) == 0` for production runtimes.
-4. **KPI/countermetric completeness** -- every optimization KPI must have a required countermetric mapping.
-5. **Canonical evaluator binding** -- all TP-EIO29 predicates must use `TemporalPredicateEvaluatorV1` (ID: `temporal_predicate_evaluator_v1`).
-6. **Arbitration outcome** -- temporal arbitration must produce `AgreedAllow`.
-7. **Evidence quality thresholds** -- power >= 0.90, alpha <= 0.01, sample size > 0, >= 3 distinct runtime classes.
-8. **Evidence freshness** -- evidence must not exceed the maximum age window (produces BLOCKED, not DENY).
-9. **Throughput dominance** -- throughput ratio must be >= 1.0 (no regression below baseline).
+1. **Disclosure-control policy validity** (REQ-0007) -- policy must be present, current, signed, non-zero digest, non-empty phase, and fresh epoch.
+2. **Disclosure-control mode matching** (REQ-0007) -- proposal's assumed mode must match the policy's active mode.
+3. **Disclosure-control channel approval** (REQ-0007) -- all proposed channels must be approved; patent/provisional channels denied in TradeSecretOnly mode.
+4. **Authority-surface evidence validity** (REQ-0008) -- evidence must be present, current, structurally valid, and fresh.
+5. **Authority-surface monotonicity** (REQ-0008) -- `AS(role, t+1) ⊆ AS(role, t)` for production FAC roles.
+6. **Direct GitHub capability non-regression** (REQ-0008) -- `github_direct_surface(role, t) == 0` for production runtimes.
+7. **KPI/countermetric completeness** -- every optimization KPI must have a required countermetric mapping.
+8. **Canonical evaluator binding** -- all TP-EIO29 predicates must use `TemporalPredicateEvaluatorV1` (ID: `temporal_predicate_evaluator_v1`).
+9. **Arbitration outcome** -- temporal arbitration must produce `AgreedAllow`.
+10. **Evidence quality thresholds** -- power >= 0.90, alpha <= 0.01, sample size > 0, >= 3 distinct runtime classes.
+11. **Evidence freshness** -- evidence must not exceed the maximum age window (produces BLOCKED, not DENY).
+12. **Throughput dominance** -- throughput ratio must be >= 1.0 (no regression below baseline).
 
 ### Key Types
 
 - `CountermetricProfile` -- KPI-to-countermetric mapping for optimization gate policy
-- `OptimizationProposal` -- Proposal declaring target KPIs and evaluator bindings
+- `OptimizationProposal` -- Proposal declaring target KPIs, evaluator bindings, assumed disclosure mode, and proposed disclosure channels
 - `EvidenceQualityReport` -- Quantitative evidence with power, alpha, sample size, reproducibility, freshness, and throughput
 - `AuthoritySurfaceDiff` -- Role-level capability-surface diff (before/after `BTreeSet<String>` with content digest)
 - `AuthoritySurfaceEvidence` -- Wraps `AuthoritySurfaceDiff` with HTF tick and `AuthoritySurfaceEvidenceState`
 - `AuthoritySurfaceEvidenceState` -- `Current` / `Stale` / `Ambiguous` / `Unknown` enum (only `Current` admitted)
+- `DisclosurePolicyMode` -- `TradeSecretOnly` / `OpenSource` enum for disclosure policy mode
+- `DisclosurePolicyState` -- `Current` / `Stale` / `Ambiguous` / `Unknown` enum for policy freshness (only `Current` admitted)
+- `DisclosurePolicySnapshot` -- Signed policy snapshot with phase ID, mode, epoch tick, state, CAS digest, Ed25519 signature, and approved channels
 - `TemporalSloProfileV1` -- Temporal SLO tuple (baseline, target, window, owner locus, falsification predicate, countermetrics, boundary authority)
 - `OptimizationGateDecision` -- Verdict + trace for auditing; defect accessed via `decision.defect()`
-- `OptimizationGateTrace` -- Per-gate pass/fail status including authority-surface flags and proposal digest
+- `OptimizationGateTrace` -- Per-gate pass/fail status including disclosure-control, authority-surface, and proposal digest
 - `OptimizationGateVerdict` -- Allow / Deny / Blocked enum
 
 ### Invariants
@@ -452,6 +458,17 @@ The `optimization_gate` submodule implements security-interlocked optimization g
 - [INV-OG08] No direct GitHub capability classes (`github_api`, `gh_cli`, `forge_org_admin`, `forge_repo_admin`) may appear in the `after` capability surface.
 - [INV-OG09] Missing, stale, ambiguous, or unknown authority-surface evidence states deny fail-closed. Only `Current` state is admitted.
 - [INV-OG10] Authority-surface evidence freshness enforces the same tick-based staleness model as evidence quality freshness.
+- [INV-OG11] Missing, stale, ambiguous, or unknown disclosure-control policy states deny fail-closed. Only `Current` state is admitted.
+- [INV-OG12] Unsigned or zero-signature disclosure policies deny fail-closed (zero-signature check uses constant-time comparison).
+- [INV-OG13] Zero policy digest denies fail-closed (uses constant-time comparison).
+- [INV-OG14] Empty phase ID denies fail-closed.
+- [INV-OG15] Future-ticked or stale-epoch disclosure policies deny fail-closed (MAX_DISCLOSURE_POLICY_AGE_TICKS=500).
+- [INV-OG16] Proposal disclosure mode must match policy active mode; mismatches deny fail-closed.
+- [INV-OG17] In `TradeSecretOnly` mode, patent/provisional channel classes (`FORBIDDEN_TRADE_SECRET_CHANNEL_CLASSES`) are unconditionally denied, even if approved.
+- [INV-OG18] All proposed disclosure channels must appear in the policy's `approved_channels` set; unapproved channels deny fail-closed.
+- [INV-OG19] Disclosure-control gates execute BEFORE authority-surface gates to enforce containment-critical confidentiality invariants first.
+- [INV-OG20] `DisclosurePolicySnapshot.signature` uses `serde_bytes` for `[u8; 64]` serialization/deserialization.
+- [INV-OG21] Policy digest is bound to the `OptimizationGateTrace` on successful validation for audit traceability.
 
 ### Contracts
 
@@ -460,13 +477,19 @@ The `optimization_gate` submodule implements security-interlocked optimization g
 - [CTR-OG03] `validate_evidence_quality()` enforces power, alpha, sample size, and reproducibility thresholds.
 - [CTR-OG04] `validate_evidence_freshness()` rejects stale or future-ticked evidence.
 - [CTR-OG05] `validate_throughput_dominance()` rejects throughput ratios below baseline.
-- [CTR-OG06] `evaluate_optimization_gate()` combines all gates in order (authority-surface first), producing `OptimizationGateDecision` with full trace.
+- [CTR-OG06] `evaluate_optimization_gate()` combines all gates in order (disclosure-control first, then authority-surface), producing `OptimizationGateDecision` with full trace.
 - [CTR-OG07] `validate_authority_surface_evidence()` rejects missing, stale, ambiguous, unknown, future-ticked, empty-role-id, and zero-digest evidence.
 - [CTR-OG08] `validate_authority_surface_monotonicity()` rejects diffs where `after` is not a subset of `before`.
 - [CTR-OG09] `validate_no_direct_github_capabilities()` rejects diffs where `after` contains any forbidden GitHub capability class.
+- [CTR-OG10] `validate_disclosure_policy()` rejects missing, stale, ambiguous, unknown, unsigned, zero-signature, zero-digest, empty-phase, future-ticked, and stale-epoch policies.
+- [CTR-OG11] `validate_disclosure_mode_match()` rejects proposals whose assumed disclosure mode does not match the policy's active mode.
+- [CTR-OG12] `validate_disclosure_channels()` rejects unapproved channels and (in TradeSecretOnly mode) patent/provisional channel classes.
 
 ### Public API
 
+- `validate_disclosure_policy(snapshot, current_tick, max_age_ticks)` -- Disclosure-control policy validity gate (REQ-0007)
+- `validate_disclosure_mode_match(proposal, snapshot)` -- Disclosure mode matching gate (REQ-0007)
+- `validate_disclosure_channels(proposal, snapshot)` -- Disclosure channel approval gate (REQ-0007)
 - `validate_authority_surface_evidence(evidence, current_tick, max_age_ticks)` -- Authority-surface evidence validity gate (REQ-0008)
 - `validate_authority_surface_monotonicity(diff)` -- Authority-surface monotonicity gate (REQ-0008)
 - `validate_no_direct_github_capabilities(diff)` -- Direct GitHub capability non-regression gate (REQ-0008)
@@ -476,7 +499,7 @@ The `optimization_gate` submodule implements security-interlocked optimization g
 - `validate_evidence_freshness(evidence_tick, current_tick, max_age_ticks)` -- Evidence freshness gate
 - `validate_throughput_dominance(throughput_ratio)` -- Throughput dominance gate
 - `validate_arbitration_outcome(outcome)` -- Arbitration binding gate
-- `evaluate_optimization_gate(proposal, countermetric_profile, evidence_quality, authority_surface_evidence, arbitration_outcome, current_tick, max_evidence_age_ticks)` -- Combined gate evaluation
+- `evaluate_optimization_gate(proposal, countermetric_profile, evidence_quality, authority_surface_evidence, disclosure_policy, arbitration_outcome, current_tick, max_evidence_age_ticks)` -- Combined gate evaluation
 
 ## Projection Continuity (REQ-0009)
 
