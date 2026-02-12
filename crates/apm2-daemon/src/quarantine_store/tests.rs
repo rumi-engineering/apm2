@@ -2513,3 +2513,516 @@ fn remove_entry_failure_during_eviction_preserves_full_state_parity() {
 
     let _ = tick;
 }
+
+// =============================================================================
+// QUALITY MAJOR 1: Atomic Eviction Replacement (Single Transaction)
+// =============================================================================
+
+/// Verifies that `evict_and_insert` wraps DELETE + INSERT in a single `SQLite`
+/// transaction. After a successful eviction-insert, both the evicted entry
+/// removal and the new entry insertion must be visible in the database.
+#[test]
+fn evict_and_insert_is_atomic_success() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    // Pre-populate with an entry that will be evicted.
+    let evicted = QuarantineEntry {
+        id: 1,
+        session_id: "s1".to_string(),
+        priority: QuarantinePriority::Low,
+        request_id: test_hash(1),
+        bundle_digest: test_hash(11),
+        reservation_hash: test_hash(21),
+        created_at_tick: 100,
+        expires_at_tick: 500,
+        reason: "to-be-evicted".to_string(),
+    };
+    backend.persist_entry(&evicted).unwrap();
+
+    // New entry to insert.
+    let new_entry = QuarantineEntry {
+        id: 2,
+        session_id: "s2".to_string(),
+        priority: QuarantinePriority::High,
+        request_id: test_hash(2),
+        bundle_digest: test_hash(12),
+        reservation_hash: test_hash(22),
+        created_at_tick: 200,
+        expires_at_tick: 600,
+        reason: "new-entry".to_string(),
+    };
+
+    backend.evict_and_insert(1, &new_entry).unwrap();
+
+    let loaded = backend.load_all().unwrap();
+    assert_eq!(
+        loaded.len(),
+        1,
+        "should have exactly 1 entry after evict_and_insert"
+    );
+    assert_eq!(loaded[0].id, 2, "new entry should be present");
+    assert_eq!(loaded[0].reason, "new-entry");
+}
+
+/// Verifies that `evict_and_insert` rolls back both DELETE and INSERT on
+/// failure (e.g., table dropped). Neither the eviction nor the insertion
+/// should be visible in the DB.
+#[test]
+fn evict_and_insert_rolls_back_on_failure() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    // Pre-populate with an entry.
+    let evicted = QuarantineEntry {
+        id: 1,
+        session_id: "s1".to_string(),
+        priority: QuarantinePriority::Low,
+        request_id: test_hash(1),
+        bundle_digest: test_hash(11),
+        reservation_hash: test_hash(21),
+        created_at_tick: 100,
+        expires_at_tick: 500,
+        reason: "original".to_string(),
+    };
+    backend.persist_entry(&evicted).unwrap();
+
+    // Drop the table to force transaction failure.
+    {
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        conn.execute_batch("DROP TABLE quarantine_entries").unwrap();
+    }
+
+    let new_entry = QuarantineEntry {
+        id: 2,
+        session_id: "s2".to_string(),
+        priority: QuarantinePriority::High,
+        request_id: test_hash(2),
+        bundle_digest: test_hash(12),
+        reservation_hash: test_hash(22),
+        created_at_tick: 200,
+        expires_at_tick: 600,
+        reason: "new".to_string(),
+    };
+
+    let result = backend.evict_and_insert(1, &new_entry);
+    assert!(
+        result.is_err(),
+        "evict_and_insert should fail on dropped table"
+    );
+}
+
+/// Verifies that the full `DurableQuarantineGuard::insert` uses the atomic
+/// `evict_and_insert` path so that after an eviction-triggering insert, the
+/// `SQLite` database contains exactly the correct entries (no ghost records
+/// and no missing new entries).
+#[test]
+fn durable_insert_uses_atomic_evict_and_insert() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config.clone())
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    // Fill to capacity with Low priority entries.
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Low,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "low-1",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "s2",
+            QuarantinePriority::Low,
+            test_hash(2),
+            test_hash(12),
+            500,
+            "low-2",
+        )
+        .unwrap();
+
+    // Insert High priority — triggers eviction. The eviction + insert MUST
+    // be atomic (single transaction).
+    guard
+        .insert(
+            "s3",
+            QuarantinePriority::High,
+            test_hash(3),
+            test_hash(13),
+            500,
+            "high-1",
+        )
+        .unwrap();
+
+    // Verify DB state directly: exactly 2 entries, new entry present.
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(loaded.len(), 2, "DB should have exactly 2 entries");
+        assert!(
+            loaded.iter().any(|e| e.reason == "high-1"),
+            "new High entry should be in DB"
+        );
+    }
+
+    // Verify restart recovery also sees exactly 2 entries.
+    {
+        let (_, tick_provider2) = make_tick_provider(200);
+        let backend2 = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let guard2 = DurableQuarantineGuard::new(backend2, config)
+            .unwrap()
+            .with_tick_provider(tick_provider2);
+        assert_eq!(guard2.len(), 2);
+    }
+
+    let _ = tick;
+}
+
+// =============================================================================
+// QUALITY MAJOR 2: Persist-First-Then-Memory-Commit for remove/evict_expired
+// =============================================================================
+
+/// Regression test (QUALITY MAJOR 2): `DurableQuarantineGuard::remove()`
+/// must NOT mutate in-memory state if the database removal fails.
+/// Before the fix, memory was updated first, then DB was attempted, causing
+/// memory/DB drift on persistence failure.
+#[test]
+fn remove_preserves_memory_db_parity_on_persistence_failure() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 4,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    // Insert an entry successfully.
+    let (id, _hash) = guard
+        .insert(
+            "s1",
+            QuarantinePriority::Normal,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "entry-1",
+        )
+        .unwrap();
+    assert_eq!(guard.len(), 1);
+    assert_eq!(guard.session_count("s1"), 1);
+
+    // Sabotage DB so remove_entry fails.
+    {
+        let sabotage_conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        sabotage_conn
+            .execute_batch("DROP TABLE quarantine_entries")
+            .unwrap();
+    }
+
+    // Attempt to remove — should fail because DB is broken.
+    let result = guard.remove(id);
+    assert!(result.is_err(), "remove should fail with broken DB");
+    assert!(matches!(
+        result,
+        Err(QuarantineStoreError::PersistenceError { .. })
+    ));
+
+    // CRITICAL: In-memory state must be UNCHANGED (entry still present).
+    assert_eq!(
+        guard.len(),
+        1,
+        "in-memory store should still have 1 entry after failed remove"
+    );
+    assert_eq!(
+        guard.session_count("s1"),
+        1,
+        "session count should be preserved after failed remove"
+    );
+
+    let _ = tick;
+}
+
+/// Regression test (QUALITY MAJOR 2): `DurableQuarantineGuard::evict_expired()`
+/// must NOT mutate in-memory state if the database removal fails.
+/// Before the fix, expired entries were removed from memory first, then DB
+/// was attempted, causing memory/DB drift on persistence failure.
+#[test]
+fn evict_expired_preserves_memory_db_parity_on_persistence_failure() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 4,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(50); // Short TTL: entries expire at tick 150
+
+    // Insert entries that will expire.
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Normal,
+            test_hash(1),
+            test_hash(11),
+            50,
+            "will-expire-1",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "s2",
+            QuarantinePriority::Normal,
+            test_hash(2),
+            test_hash(12),
+            50,
+            "will-expire-2",
+        )
+        .unwrap();
+    assert_eq!(guard.len(), 2);
+
+    // Advance tick past expiry.
+    tick.store(200, Ordering::Relaxed);
+
+    // Sabotage DB so remove_entries fails.
+    {
+        let sabotage_conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        sabotage_conn
+            .execute_batch("DROP TABLE quarantine_entries")
+            .unwrap();
+    }
+
+    // Attempt to evict expired — should fail because DB is broken.
+    let result = guard.evict_expired();
+    assert!(result.is_err(), "evict_expired should fail with broken DB");
+    assert!(matches!(
+        result,
+        Err(QuarantineStoreError::PersistenceError { .. })
+    ));
+
+    // CRITICAL: In-memory state must be UNCHANGED (both entries still present).
+    assert_eq!(
+        guard.len(),
+        2,
+        "in-memory store should still have 2 entries after failed evict_expired"
+    );
+    assert_eq!(
+        guard.session_count("s1"),
+        1,
+        "session s1 count should be preserved"
+    );
+    assert_eq!(
+        guard.session_count("s2"),
+        1,
+        "session s2 count should be preserved"
+    );
+
+    let _ = tick;
+}
+
+/// Positive test: `remove()` succeeds when DB is healthy, removing from both
+/// in-memory store and database.
+#[test]
+fn remove_persist_first_succeeds_on_healthy_db() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 4,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    let (id, _hash) = guard
+        .insert(
+            "s1",
+            QuarantinePriority::Normal,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "entry-1",
+        )
+        .unwrap();
+    assert_eq!(guard.len(), 1);
+
+    // Remove should succeed on healthy DB.
+    let existed = guard.remove(id).unwrap();
+    assert!(existed, "entry should have existed");
+    assert_eq!(guard.len(), 0, "in-memory store should be empty");
+    assert_eq!(guard.session_count("s1"), 0);
+
+    // Verify DB is also empty.
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(loaded.len(), 0, "DB should be empty after remove");
+    }
+
+    // Double-remove returns false.
+    let existed2 = guard.remove(id).unwrap();
+    assert!(!existed2, "double-remove should return false");
+
+    let _ = tick;
+}
+
+/// Positive test: `evict_expired()` succeeds when DB is healthy, removing
+/// expired entries from both in-memory store and database.
+#[test]
+fn evict_expired_persist_first_succeeds_on_healthy_db() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 4,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(50); // Expires at tick 150
+
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Normal,
+            test_hash(1),
+            test_hash(11),
+            50,
+            "will-expire",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "s2",
+            QuarantinePriority::Normal,
+            test_hash(2),
+            test_hash(12),
+            5000,
+            "will-survive",
+        )
+        .unwrap();
+    assert_eq!(guard.len(), 2);
+
+    // Advance tick past first entry's expiry.
+    tick.store(200, Ordering::Relaxed);
+
+    let evicted = guard.evict_expired().unwrap();
+    assert_eq!(evicted, 1, "should evict 1 expired entry");
+    assert_eq!(guard.len(), 1, "should have 1 remaining entry");
+    assert_eq!(
+        guard.session_count("s1"),
+        0,
+        "expired session should be removed"
+    );
+    assert_eq!(
+        guard.session_count("s2"),
+        1,
+        "surviving session should remain"
+    );
+
+    // Verify DB also has exactly 1 entry.
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "DB should have 1 entry after evict_expired"
+        );
+        assert_eq!(loaded[0].reason, "will-survive");
+    }
+}
+
+/// Test that `SqliteQuarantineBackend::remove_entries` works correctly with
+/// multiple IDs in a single transaction.
+#[test]
+fn sqlite_remove_entries_batch() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    // Persist 4 entries.
+    for i in 1..=4u8 {
+        backend
+            .persist_entry(&QuarantineEntry {
+                id: u64::from(i),
+                session_id: format!("s{i}"),
+                priority: QuarantinePriority::Normal,
+                request_id: test_hash(i),
+                bundle_digest: test_hash(10 + i),
+                reservation_hash: test_hash(20 + i),
+                created_at_tick: 100,
+                expires_at_tick: 500,
+                reason: format!("entry-{i}"),
+            })
+            .unwrap();
+    }
+    assert_eq!(backend.load_all().unwrap().len(), 4);
+
+    // Remove entries 1 and 3 in a batch.
+    backend.remove_entries(&[1, 3]).unwrap();
+
+    let remaining = backend.load_all().unwrap();
+    assert_eq!(remaining.len(), 2, "should have 2 remaining entries");
+    assert_eq!(remaining[0].id, 2);
+    assert_eq!(remaining[1].id, 4);
+}
+
+/// Test that `SqliteQuarantineBackend::remove_entries` with empty list is a
+/// no-op.
+#[test]
+fn sqlite_remove_entries_empty_is_noop() {
+    let tmp = create_temp_db();
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+
+    backend
+        .persist_entry(&QuarantineEntry {
+            id: 1,
+            session_id: "s1".to_string(),
+            priority: QuarantinePriority::Normal,
+            request_id: test_hash(1),
+            bundle_digest: test_hash(11),
+            reservation_hash: test_hash(21),
+            created_at_tick: 100,
+            expires_at_tick: 500,
+            reason: "test".to_string(),
+        })
+        .unwrap();
+
+    // Empty batch should be a no-op.
+    backend.remove_entries(&[]).unwrap();
+    assert_eq!(backend.load_all().unwrap().len(), 1);
+}

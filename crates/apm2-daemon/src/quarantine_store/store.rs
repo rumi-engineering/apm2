@@ -735,6 +735,108 @@ impl SqliteQuarantineBackend {
         Ok(())
     }
 
+    /// Removes multiple quarantine entries from the database in a single
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    /// The transaction is rolled back on any failure so either all entries
+    /// are removed or none are.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn remove_entries(&self, ids: &[QuarantineEntryId]) -> Result<(), QuarantineStoreError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db
+            .transaction()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to begin transaction for batch remove: {e}"),
+            })?;
+        for &id in ids {
+            tx.execute(
+                "DELETE FROM quarantine_entries WHERE id = ?1",
+                rusqlite::params![id as i64],
+            )
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to remove quarantine entry {id} in batch: {e}"),
+            })?;
+        }
+        tx.commit()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to commit batch remove transaction: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Atomically removes an evicted entry and inserts a new entry in a single
+    /// `SQLite` transaction.
+    ///
+    /// This prevents partial state on crash: either both the eviction removal
+    /// and the new entry insertion succeed, or neither does (the transaction
+    /// is rolled back).
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuarantineStoreError::PersistenceError` on SQL failure.
+    /// On failure the transaction is rolled back so neither the eviction
+    /// removal nor the new entry insertion is persisted.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn evict_and_insert(
+        &self,
+        evicted_id: QuarantineEntryId,
+        new_entry: &QuarantineEntry,
+    ) -> Result<(), QuarantineStoreError> {
+        let mut db = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db
+            .transaction()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to begin evict_and_insert transaction: {e}"),
+            })?;
+        tx.execute(
+            "DELETE FROM quarantine_entries WHERE id = ?1",
+            rusqlite::params![evicted_id as i64],
+        )
+        .map_err(|e| QuarantineStoreError::PersistenceError {
+            reason: format!("failed to remove evicted entry {evicted_id}: {e}"),
+        })?;
+        tx.execute(
+            "INSERT OR REPLACE INTO quarantine_entries
+             (id, session_id, priority, request_id, bundle_digest,
+              reservation_hash, created_at_tick, expires_at_tick, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                new_entry.id as i64,
+                new_entry.session_id,
+                new_entry.priority.as_tag(),
+                new_entry.request_id.as_slice(),
+                new_entry.bundle_digest.as_slice(),
+                new_entry.reservation_hash.as_slice(),
+                new_entry.created_at_tick as i64,
+                new_entry.expires_at_tick as i64,
+                new_entry.reason,
+            ],
+        )
+        .map_err(|e| QuarantineStoreError::PersistenceError {
+            reason: format!(
+                "failed to insert new entry {} after eviction: {e}",
+                new_entry.id
+            ),
+        })?;
+        tx.commit()
+            .map_err(|e| QuarantineStoreError::PersistenceError {
+                reason: format!("failed to commit evict_and_insert transaction: {e}"),
+            })?;
+        Ok(())
+    }
+
     /// Removes all expired entries from the database.
     ///
     /// # Errors
@@ -1064,31 +1166,26 @@ impl DurableQuarantineGuard {
             current_tick,
         )?;
 
-        // Remove evicted entry from DB to prevent ghost records
-        // (SECURITY BLOCKER fix: evicted entries that remain in SQLite
-        // would be reloaded by `load_all` on restart, permanently
-        // occupying capacity slots).
-        if let Some(evicted_id) = result.evicted_id {
-            if let Err(e) = self.backend.remove_entry(evicted_id) {
-                // Roll back: remove the new entry AND restore the evicted
-                // entry back into memory to maintain memory/DB parity
-                // (QUALITY MAJOR: atomic rollback for eviction-delete failure).
-                store.remove(result.entry_id);
-                if let Some(evicted_entry) = result.evicted_entry {
-                    // restore_entry can only fail if at capacity, but we just
-                    // removed the new entry so there is room. Ignore the
-                    // (practically unreachable) error to avoid masking `e`.
-                    let _ = store.restore_entry(evicted_entry);
-                }
-                return Err(e);
-            }
-        }
-
-        // Persist new entry to SQLite (fail-closed: if persistence fails, roll back)
+        // Persist to SQLite atomically. If eviction occurred, the evicted
+        // entry DELETE and new entry INSERT are wrapped in a SINGLE SQLite
+        // transaction via `evict_and_insert()`. A crash between them cannot
+        // leave partial state (QUALITY MAJOR 1: non-atomic eviction fix).
         let entry = store.entries.get(&result.entry_id).expect("just inserted");
-        if let Err(e) = self.backend.persist_entry(entry) {
-            // Roll back in-memory insertion
+        let persist_result = result.evicted_id.map_or_else(
+            || self.backend.persist_entry(entry),
+            |evicted_id| self.backend.evict_and_insert(evicted_id, entry),
+        );
+
+        if let Err(e) = persist_result {
+            // Roll back in-memory state: remove the new entry and restore
+            // the evicted entry (if any) to maintain memory/DB parity.
             store.remove(result.entry_id);
+            if let Some(evicted_entry) = result.evicted_entry {
+                // restore_entry can only fail if at capacity, but we just
+                // removed the new entry so there is room. Ignore the
+                // (practically unreachable) error to avoid masking `e`.
+                let _ = store.restore_entry(evicted_entry);
+            }
             return Err(e);
         }
 
@@ -1097,37 +1194,77 @@ impl DurableQuarantineGuard {
 
     /// Removes an entry and updates persistence.
     ///
+    /// Uses persist-first-then-memory-commit pattern: the database removal
+    /// is attempted first; only on success is the in-memory state updated.
+    /// This prevents memory/DB drift when persistence fails (QUALITY MAJOR 2).
+    ///
     /// # Errors
     ///
     /// Returns `QuarantineStoreError::PersistenceError` if the database
-    /// removal fails. The in-memory removal still proceeds to avoid
-    /// inconsistency, but the error is reported.
+    /// removal fails. In-memory state is NOT modified on persistence failure
+    /// to maintain memory/DB parity.
     pub fn remove(&self, id: QuarantineEntryId) -> Result<bool, QuarantineStoreError> {
         let mut store = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let existed = store.remove(id);
-        if existed {
-            self.backend.remove_entry(id)?;
+
+        // Check existence in memory before attempting DB operation to avoid
+        // unnecessary DB round-trips for non-existent entries.
+        let exists_in_memory = store.entries.contains_key(&id);
+        if !exists_in_memory {
+            return Ok(false);
         }
-        Ok(existed)
+
+        // Persist first: remove from DB before touching in-memory state.
+        // If this fails, in-memory state remains unchanged (parity preserved).
+        self.backend.remove_entry(id)?;
+
+        // DB succeeded — now commit the in-memory removal.
+        store.remove(id);
+        Ok(true)
     }
 
     /// Evicts all expired entries from both in-memory store and database.
     ///
+    /// Uses persist-first-then-memory-commit pattern: expired entries are
+    /// identified in memory, removed from the database first, and only then
+    /// removed from in-memory state. This prevents memory/DB drift when
+    /// persistence fails (QUALITY MAJOR 2).
+    ///
     /// # Errors
     ///
     /// Returns `QuarantineStoreError::PersistenceError` on database failure.
+    /// In-memory state is NOT modified on persistence failure to maintain
+    /// memory/DB parity.
     pub fn evict_expired(&self) -> Result<usize, QuarantineStoreError> {
         let current_tick = (self.tick_provider)();
         let mut store = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = store.evict_expired(current_tick);
-        if count > 0 {
-            self.backend.remove_expired(current_tick)?;
+
+        // Identify expired entries in memory first.
+        let expired_ids: Vec<QuarantineEntryId> = store
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_expired_at(current_tick))
+            .map(|(&id, _)| id)
+            .collect();
+
+        if expired_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Persist first: remove expired entries from DB in a single
+        // transaction before touching in-memory state. If this fails,
+        // in-memory state remains unchanged (parity preserved).
+        self.backend.remove_entries(&expired_ids)?;
+
+        // DB succeeded — now commit the in-memory removals.
+        let count = expired_ids.len();
+        for id in expired_ids {
+            store.remove(id);
         }
         Ok(count)
     }
@@ -1219,24 +1356,22 @@ impl QuarantineGuard for DurableQuarantineGuard {
             )
             .map_err(|e| e.to_string())?;
 
-        // Remove evicted entry from DB to prevent ghost records
-        if let Some(evicted_id) = result.evicted_id {
-            if let Err(e) = self.backend.remove_entry(evicted_id) {
-                // Roll back: remove the new entry AND restore the evicted
-                // entry back into memory to maintain memory/DB parity
-                // (QUALITY MAJOR: atomic rollback for eviction-delete failure).
-                store.remove(result.entry_id);
-                if let Some(evicted_entry) = result.evicted_entry {
-                    let _ = store.restore_entry(evicted_entry);
-                }
-                return Err(e.to_string());
-            }
-        }
-
-        // Persist to SQLite (fail-closed)
+        // Persist to SQLite atomically. If eviction occurred, the evicted
+        // entry DELETE and new entry INSERT are wrapped in a SINGLE SQLite
+        // transaction via `evict_and_insert()` (QUALITY MAJOR 1 fix).
         let entry = store.entries.get(&result.entry_id).expect("just inserted");
-        if let Err(e) = self.backend.persist_entry(entry) {
+        let persist_result = result.evicted_id.map_or_else(
+            || self.backend.persist_entry(entry),
+            |evicted_id| self.backend.evict_and_insert(evicted_id, entry),
+        );
+
+        if let Err(e) = persist_result {
+            // Roll back in-memory state: remove the new entry and restore
+            // the evicted entry (if any) to maintain memory/DB parity.
             store.remove(result.entry_id);
+            if let Some(evicted_entry) = result.evicted_entry {
+                let _ = store.restore_entry(evicted_entry);
+            }
             return Err(e.to_string());
         }
 

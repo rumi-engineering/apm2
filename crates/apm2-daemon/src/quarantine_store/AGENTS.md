@@ -25,7 +25,8 @@ Production implementation of `QuarantineGuard`. Wraps an in-memory `QuarantineSt
 - [INV-QS03] Recovery loads persisted entries on construction.
 - [INV-QS04] All collections bounded by `MAX_*` constants.
 - [INV-QS05] `QuarantineGuard::reserve()` uses the caller-provided `session_id` for per-session quota isolation. No shared default session bucket exists.
-- [INV-QS06] Evicted entries are removed from both in-memory store AND SQLite backend. `insert()` returns `InsertResult` containing `evicted_id` and `evicted_entry` which callers MUST propagate to `backend.remove_entry()`. Failure to do so causes ghost records that permanently consume capacity on restart. If the eviction-delete fails, the evicted entry MUST be restored to the in-memory store to maintain memory/DB parity.
+- [INV-QS06] Eviction replacement is atomic: when an insert triggers eviction, the evicted entry DELETE and new entry INSERT are wrapped in a SINGLE SQLite transaction via `evict_and_insert()`. Crash between them cannot leave partial state. On transaction failure, the evicted entry is restored to the in-memory store to maintain memory/DB parity.
+- [INV-QS09] `remove()` and `evict_expired()` use persist-first-then-memory-commit pattern: the database mutation is attempted FIRST; in-memory state is only modified on persistence success. This prevents memory/DB drift when persistence fails.
 - [INV-QS08] `load_all()` validates that `id > 0`, `created_at_tick >= 0`, `expires_at_tick >= 0`, and `expires_at_tick >= created_at_tick` before casting i64 to u64. Corrupted/tampered negative values are rejected as `PersistenceError` (fail-closed).
 - [INV-QS07] `find_by_reservation_hash()` uses `subtle::ConstantTimeEq` with full linear scan (no short-circuit) to prevent timing side-channel leakage about reservation hash values (RSK-1909).
 
