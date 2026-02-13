@@ -282,3 +282,11 @@ pub use types::ReviewRunType;
 - `~/.apm2/review_locks/`: File-based dispatch locks
 - `documents/reviews/SECURITY_REVIEW_PROMPT.md`: Security review prompt
 - `documents/reviews/CODE_QUALITY_PROMPT.md`: Code quality review prompt
+
+## Ticket Notes
+
+- TCK-00523: Attestation fail-closed fixes.
+  - Added `.cargo/config.toml` to gate input digest paths for cargo-based gates.
+  - Added `rustfmt --version` to environment digest inputs.
+  - Optionally captured `sccache --version` (with fallback when unavailable).
+  - Extended command env allowlist with `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `RUSTC_WRAPPER`, and `SCCACHE_*`.

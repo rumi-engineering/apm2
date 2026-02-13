@@ -1176,6 +1176,12 @@ async fn async_main(args: Args) -> Result<()> {
     // Security BLOCKER 2 fix: Persist timeout and gate events to the ledger
     // with fail-closed error handling. Without persistence, timeout FAIL
     // verdicts exist only in memory and are lost on restart.
+    //
+    // MAJOR-1 fix (INV-BRK-HEALTH-GATE-001): The poller also continuously
+    // evaluates broker health and updates the PrivilegedDispatcher's
+    // admission health gate. The gate starts closed (fail-closed) and only
+    // opens when a health check returns Healthy. On degradation/failure,
+    // the gate is actively closed until the next successful check.
     {
         let orch = Arc::clone(&gate_orchestrator);
         let timeout_signing_key_bytes = lifecycle_signing_key_bytes;
@@ -1187,6 +1193,32 @@ async fn async_main(args: Args) -> Result<()> {
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&timeout_signing_key_bytes);
                 SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
             });
+
+        // MAJOR-1 fix: Create a daemon-level FacBroker and
+        // BrokerHealthChecker for periodic health evaluation. The broker
+        // uses the daemon lifecycle signing key so its self-issued envelopes
+        // and health receipts are cryptographically bound to this daemon
+        // instance. The checker maintains a monotonic health_seq to prevent
+        // replay of stale healthy receipts.
+        //
+        // Synchronization protocol (RS-21):
+        // - Protected data: daemon-level FacBroker state + BrokerHealthChecker
+        //   history/seq
+        // - Writers: only this poller task (single writer)
+        // - Readers: only this poller task (single reader)
+        // - No concurrent access: both are owned by the spawned task and accessed
+        //   sequentially within each poll iteration
+        // - The AtomicBool on the static PrivilegedDispatcher is the cross-task
+        //   communication channel (Release/Acquire ordering)
+        let health_signer = apm2_core::crypto::Signer::from_bytes(&timeout_signing_key_bytes)
+            .expect("lifecycle signing key validated at daemon startup");
+        let mut health_broker = apm2_core::fac::FacBroker::from_signer_and_state(
+            health_signer,
+            apm2_core::fac::BrokerState::default(),
+        )
+        .expect("default BrokerState is always valid");
+        let mut health_checker = apm2_core::fac::BrokerHealthChecker::new();
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -1248,6 +1280,87 @@ async fn async_main(args: Args) -> Result<()> {
                             }
                         }
                     }
+                }
+
+                // ---------------------------------------------------------------
+                // MAJOR-1 fix: Periodic broker health evaluation for the static
+                // PrivilegedDispatcher's admission health gate.
+                //
+                // The daemon-level FacBroker issues a self-signed time authority
+                // envelope and advances its freshness horizon on each poll cycle.
+                // The health check validates TP001/TP002/TP003 invariants against
+                // this broker's state. If the check returns Healthy, the gate
+                // opens; otherwise it closes (fail-closed).
+                //
+                // This replaces the sticky one-time startup gate open with a
+                // continuously re-evaluated, receipt-bound health signal on a
+                // bounded 10-second interval.
+                // ---------------------------------------------------------------
+                let broker_tick = health_broker.advance_tick();
+                let eval_window = apm2_core::economics::queue_admission::HtfEvaluationWindow {
+                    boundary_id: "daemon-health-poller".to_string(),
+                    authority_clock: "daemon-lifecycle".to_string(),
+                    tick_start: broker_tick.saturating_sub(1),
+                    tick_end: broker_tick,
+                };
+
+                // Issue a self-signed envelope covering the evaluation window.
+                // Fail-closed: if envelope issuance fails, close the gate.
+                let envelope_result = health_broker.issue_time_authority_envelope(
+                    "daemon-health-poller",
+                    "daemon-lifecycle",
+                    eval_window.tick_start,
+                    eval_window.tick_end,
+                    100, // TTL: 100 ticks, well within MAX_ENVELOPE_TTL_TICKS
+                );
+
+                let gate_healthy = match envelope_result {
+                    Ok(envelope) => {
+                        // Advance freshness horizon so TP002 has resolved state.
+                        health_broker.advance_freshness_horizon(broker_tick);
+
+                        // Run the health check through the broker's full
+                        // TP001/TP002/TP003 validation pipeline.
+                        match health_broker.check_health(
+                            Some(&envelope),
+                            &eval_window,
+                            &[], // No required authority sets for daemon-level check
+                            &mut health_checker,
+                        ) {
+                            Ok(receipt) => {
+                                receipt.status == apm2_core::fac::BrokerHealthStatus::Healthy
+                            },
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Daemon health check failed; closing admission gate \
+                                     (fail-closed, INV-BRK-HEALTH-GATE-001)"
+                                );
+                                false
+                            },
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Daemon health envelope issuance failed; closing admission gate \
+                             (fail-closed, INV-BRK-HEALTH-GATE-001)"
+                        );
+                        false
+                    },
+                };
+
+                // Update the static PrivilegedDispatcher's admission health gate.
+                // Release ordering ensures all health evaluation side-effects are
+                // visible to subsequent Acquire loads in the token issuance path.
+                apm2_daemon::protocol::session_dispatch::channel_boundary_dispatcher()
+                    .set_admission_health_gate(gate_healthy);
+
+                if !gate_healthy {
+                    warn!(
+                        "Admission health gate CLOSED by poller \
+                         (INV-BRK-HEALTH-GATE-001)"
+                    );
                 }
             }
         });
@@ -1940,6 +2053,17 @@ async fn async_main(args: Args) -> Result<()> {
     } else {
         dispatcher_state
     };
+
+    // INV-BRK-HEALTH-GATE-001: The admission health gate starts CLOSED
+    // (fail-closed). It is NOT opened here at startup. Instead, the background
+    // health poller (10s interval) continuously evaluates broker health and
+    // updates the gate. This prevents the "sticky open" vulnerability where
+    // the gate opens once at startup and never closes on health degradation.
+    // The first successful health check in the poller will open the gate.
+    info!(
+        "Admission health gate starts closed (fail-closed); \
+         background poller will evaluate and open on first healthy check"
+    );
 
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
