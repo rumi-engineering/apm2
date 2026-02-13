@@ -44,19 +44,32 @@ pub struct EcosystemConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_pid_file")]
-    pub pid_file: PathBuf,          // Default: /var/run/apm2/apm2.pid
+    pub pid_file: PathBuf,          // Default: $XDG_RUNTIME_DIR/apm2/apm2.pid (or $APM2_DATA_DIR/apm2.pid)
     pub operator_socket: PathBuf,   // Required - privileged operations (mode 0600)
     pub session_socket: PathBuf,    // Required - session-scoped operations (mode 0660)
     #[serde(default = "default_log_dir")]
-    pub log_dir: PathBuf,           // Default: /var/log/apm2
+    pub log_dir: PathBuf,           // Default: $APM2_DATA_DIR/logs (or ~/.local/share/apm2/logs)
     #[serde(default = "default_state_file")]
-    pub state_file: PathBuf,        // Default: /var/lib/apm2/state.json
+    pub state_file: PathBuf,        // Default: $APM2_DATA_DIR/state.json (or ~/.local/share/apm2/state.json)
     #[serde(default)]
     pub audit: AuditConfig,         // Audit event retention policy
     #[serde(default)]
     pub cas_path: Option<PathBuf>,  // Optional CAS directory (TCK-00383)
 }
 ```
+
+**Default Path Resolution (TCK-00595):**
+
+Default paths resolve through a three-tier fallback:
+1. `APM2_DATA_DIR` environment variable (if set)
+2. Platform data directory via `directories::ProjectDirs` (e.g., `~/.local/share/apm2` on Linux)
+3. `$HOME/.local/share/apm2` as final fallback
+
+Socket paths use `$XDG_RUNTIME_DIR/apm2/` when the runtime dir is set,
+falling back to the data directory. PID files follow the same XDG pattern.
+
+When running under systemd, `XDG_RUNTIME_DIR` is typically `/run/user/<uid>`.
+The `APM2_DATA_DIR` override is useful for development and CI environments.
 
 **CAS Configuration (TCK-00383):**
 - `cas_path`: Optional path to the durable content-addressed storage (CAS) directory. When provided, the daemon wires `ToolBroker`, `DurableCas`, ledger event emitter, and holonic clock via `with_persistence_and_cas()`. Without this, session-scoped operations (tool execution, event emission, evidence publishing) fail closed.
@@ -69,7 +82,7 @@ pub struct DaemonConfig {
 - The legacy `socket` field is no longer supported (DD-009 fail-closed validation).
 
 **Invariants:**
-- [INV-CFG-03] All paths have sensible FHS-compliant defaults for Unix systems
+- [INV-CFG-03] All paths have sensible XDG-compliant defaults: `APM2_DATA_DIR` > `ProjectDirs` > `$HOME/.local/share/apm2` (TCK-00595)
 - [INV-CFG-04] `Default` implementation provides sensible defaults for programmatic use
 - [INV-CFG-10] `operator_socket` and `session_socket` are required in TOML config (TCK-00280)
 
@@ -326,7 +339,7 @@ The following types are imported from other modules and embedded in `ProcessConf
 ```
 INV-CFG-01  serde(default) ensures partial TOML parsing
 INV-CFG-02  Process names should be unique (validation-time)
-INV-CFG-03  DaemonConfig paths have FHS-compliant defaults
+INV-CFG-03  DaemonConfig paths use XDG/APM2_DATA_DIR/HOME fallback (TCK-00595)
 INV-CFG-04  Default impl provides sensible defaults for programmatic use
 INV-CFG-05  Credential profile IDs must be unique
 INV-CFG-06  Process names must be non-empty and unique

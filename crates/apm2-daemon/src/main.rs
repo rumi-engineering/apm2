@@ -864,6 +864,18 @@ fn main() -> Result<()> {
     // Parse command-line arguments (synchronous, no threads)
     let args = Args::parse();
 
+    // TCK-00595 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from CWD.
+    //
+    // The daemon is a user-singleton (fixed XDG socket path). Binding it to
+    // the CWD at startup causes cross-context pollution: if the user starts
+    // the daemon from repo A's directory, it permanently serves repo A's
+    // projection even when the user switches to repo B.
+    //
+    // The daemon MUST require explicit configuration via ecosystem.toml's
+    // [daemon.projection] section (github_owner + github_repo). Auto-detect
+    // from `git remote` is appropriate only in the short-lived CLI client
+    // layer, not in the long-lived daemon.
+
     // Daemonize if requested - MUST happen before any async runtime!
     //
     // This is the critical fix for TCK-00282. By daemonizing here, we ensure
@@ -1254,6 +1266,21 @@ async fn async_main(args: Args) -> Result<()> {
         let projection_conn = Arc::clone(conn);
         let projection_config = &daemon_config.config.daemon.projection;
 
+        // TCK-00595 MAJOR-1 FIX: The daemon MUST NOT auto-detect owner/repo
+        // from CWD. The daemon is a user-singleton with a fixed socket path;
+        // binding it to the startup CWD's git remote would cause cross-context
+        // pollution if the user switches repositories. Only explicit config
+        // values are used.
+        let github_owner = projection_config.github_owner.clone();
+        let github_repo = projection_config.github_repo.clone();
+
+        if projection_config.enabled && (github_owner.is_empty() || github_repo.is_empty()) {
+            tracing::warn!(
+                "projection.enabled=true but github_owner or github_repo is not set in config; \
+                 set [daemon.projection] github_owner and github_repo in ecosystem.toml"
+            );
+        }
+
         // Build worker configuration from ecosystem config
         let mut config = ProjectionWorkerConfig::new()
             .with_poll_interval(Duration::from_secs(projection_config.poll_interval_secs))
@@ -1267,15 +1294,12 @@ async fn async_main(args: Args) -> Result<()> {
         let mut github_adapter: Option<GitHubProjectionAdapter> = None;
 
         // Enable GitHub projection if configured
-        if projection_config.enabled
-            && !projection_config.github_owner.is_empty()
-            && !projection_config.github_repo.is_empty()
-        {
+        if projection_config.enabled && !github_owner.is_empty() && !github_repo.is_empty() {
             // Build GitHub adapter config
             match GitHubAdapterConfig::new(
                 &projection_config.github_api_url,
-                &projection_config.github_owner,
-                &projection_config.github_repo,
+                &github_owner,
+                &github_repo,
             ) {
                 Ok(mut github_config) => {
                     // TCK-00322 MAJOR FIX: Fail-Open Mock Mode on Configuration Error
@@ -1367,8 +1391,8 @@ async fn async_main(args: Args) -> Result<()> {
                     match GitHubProjectionAdapter::new(signer, github_config, &cache_path) {
                         Ok(adapter) => {
                             info!(
-                                owner = %projection_config.github_owner,
-                                repo = %projection_config.github_repo,
+                                owner = %github_owner,
+                                repo = %github_repo,
                                 cache_path = %cache_path.display(),
                                 "GitHub projection adapter created"
                             );
@@ -2061,6 +2085,59 @@ async fn async_main(args: Args) -> Result<()> {
 /// BLAKE3 for CAS hashing.
 fn sha_to_32_bytes(hex_sha: &str) -> [u8; 32] {
     *blake3::hash(hex_sha.as_bytes()).as_bytes()
+}
+
+// TCK-00595 MAJOR-1: detect_github_owner_repo_from_remote() removed.
+// The daemon must not auto-detect owner/repo from CWD git remote.
+// Use explicit [daemon.projection] config in ecosystem.toml instead.
+
+/// Parse a GitHub remote URL into (owner, repo).
+///
+/// Supports ssh://, git@, https://, and http:// URL formats.
+///
+/// # NIT FIX: Strict regex validation
+///
+/// Owner and repo segments are validated against `[a-zA-Z0-9._-]+` to reject
+/// malformed or injection-prone values.
+#[cfg(test)]
+fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    /// Validate that a GitHub owner or repo segment contains only safe
+    /// characters. GitHub allows alphanumeric, hyphens, dots, and
+    /// underscores in owner/repo names.
+    fn is_valid_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 100
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    }
+
+    fn extract_owner_repo(path_str: &str) -> Option<(String, String)> {
+        let path = path_str.strip_suffix(".git").unwrap_or(path_str);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
+            Some((parts[0].to_string(), parts[1].to_string()))
+        } else {
+            None
+        }
+    }
+
+    // ssh://git@github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+        return extract_owner_repo(rest);
+    }
+    // git@github.com:owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        return extract_owner_repo(rest);
+    }
+    // https://github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        return extract_owner_repo(rest);
+    }
+    // http://github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("http://github.com/") {
+        return extract_owner_repo(rest);
+    }
+    None
 }
 
 /// Query the latest `MergeReceipt` HEAD from the ledger.
@@ -3079,5 +3156,65 @@ mod crash_recovery_integration_tests {
             0,
             "Sessions should be cleared after recovery even without ledger"
         );
+    }
+
+    #[test]
+    fn parse_github_ssh_url() {
+        let result = parse_github_owner_repo("git@github.com:guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_https_url() {
+        let result = parse_github_owner_repo("https://github.com/guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_https_no_suffix() {
+        let result = parse_github_owner_repo("https://github.com/guardian-intelligence/apm2");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_protocol_url() {
+        let result = parse_github_owner_repo("ssh://git@github.com/guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_http_url() {
+        let result = parse_github_owner_repo("http://github.com/guardian-intelligence/apm2");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_invalid_url() {
+        assert_eq!(parse_github_owner_repo("not-a-url"), None);
+    }
+
+    #[test]
+    fn parse_github_empty_owner() {
+        assert_eq!(parse_github_owner_repo("git@github.com:/repo.git"), None);
+    }
+
+    #[test]
+    fn parse_github_no_repo() {
+        assert_eq!(parse_github_owner_repo("git@github.com:owner"), None);
     }
 }

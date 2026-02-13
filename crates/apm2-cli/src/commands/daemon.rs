@@ -10,6 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use apm2_core::config::default_data_dir;
 use tracing::info;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
@@ -38,6 +39,427 @@ pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Install the systemd user service for apm2-daemon.
+pub fn install() -> Result<()> {
+    let exe_path = std::env::current_exe()
+        .context("failed to determine current executable path")?
+        .canonicalize()
+        .context("failed to canonicalize current executable path")?;
+    let exe_str = exe_path.display().to_string();
+
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let unit_path = std::path::Path::new(&home)
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("apm2-daemon.service");
+
+    if let Some(parent) = unit_path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(parent)
+                .context("failed to create systemd unit directory")?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent).context("failed to create systemd unit directory")?;
+        }
+    }
+
+    let unit_content = format!(
+        "\
+[Unit]
+Description=APM2 Daemon — Forge Admission Cycle runtime
+Documentation=https://github.com/guardian-intelligence/apm2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart={exe_str} daemon
+ExecStop={exe_str} kill
+PIDFile=%t/apm2/apm2.pid
+Restart=always
+RestartSec=5
+WatchdogSec=300
+# Environment passthrough — GITHUB_TOKEN must be set in user session
+# Do NOT put secrets in unit files. Use EnvironmentFile if needed.
+# EnvironmentFile=-%h/.config/apm2/env
+#
+# IMPORTANT: For projection to work under systemd, configure
+# [daemon.projection] with github_owner and github_repo in ecosystem.toml.
+# The daemon does NOT auto-detect from git remote (TCK-00595 MAJOR-1).
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
+"
+    );
+
+    std::fs::write(&unit_path, &unit_content).context("failed to write systemd unit file")?;
+
+    let daemon_reload_status = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("failed to run `systemctl --user daemon-reload`")?;
+    if !daemon_reload_status.success() {
+        bail!("`systemctl --user daemon-reload` failed with status: {daemon_reload_status}");
+    }
+
+    let enable_status = Command::new("systemctl")
+        .args(["--user", "enable", "apm2-daemon.service"])
+        .status()
+        .context("failed to run `systemctl --user enable apm2-daemon.service`")?;
+    if !enable_status.success() {
+        bail!("`systemctl --user enable apm2-daemon.service` failed with status: {enable_status}");
+    }
+
+    if let Ok(user) = std::env::var("USER") {
+        match Command::new("loginctl")
+            .args(["enable-linger", "--", &user])
+            .status()
+        {
+            Ok(status) if !status.success() => {
+                eprintln!(
+                    "WARNING: loginctl enable-linger {user} failed with status {status}; continuing without linger"
+                );
+            },
+            Err(error) => {
+                eprintln!("WARNING: loginctl enable-linger failed: {error}");
+            },
+            _ => {},
+        }
+    }
+
+    let start_status = Command::new("systemctl")
+        .args(["--user", "start", "apm2-daemon.service"])
+        .status()
+        .context("failed to run `systemctl --user start apm2-daemon.service`")?;
+    if !start_status.success() {
+        bail!("`systemctl --user start apm2-daemon.service` failed with status: {start_status}");
+    }
+
+    println!("Installed apm2 daemon service at {}", unit_path.display());
+    println!("Hint: ensure GITHUB_TOKEN is set in your user session.");
+    println!(
+        "Hint: for projection, configure [daemon.projection] in ecosystem.toml \
+         with github_owner and github_repo. The daemon does not auto-detect \
+         from git remote when running under systemd."
+    );
+
+    Ok(())
+}
+
+/// Ensure the daemon is running, starting it when necessary.
+///
+/// TCK-00595 MAJOR-2 FIX: The `config_path` parameter threads the caller's
+/// effective config file into the spawn path. When the direct-spawn fallback
+/// is used (systemctl unavailable), the daemon is launched with
+/// `--config <same-path>` so it binds to the same sockets the caller expects.
+pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for daemon check")?;
+
+    if check_socket_reachable(&rt, operator_socket).is_ok() {
+        return Ok(());
+    }
+
+    let launched_by_systemctl = match Command::new("systemctl")
+        .args(["--user", "start", "apm2-daemon.service"])
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(error) => {
+            eprintln!("systemctl start failed: {error}, falling back to direct spawn");
+            false
+        },
+    };
+
+    if !launched_by_systemctl {
+        let self_exe =
+            std::env::current_exe().context("failed to determine current executable path")?;
+        // TCK-00595 MAJOR-2 FIX: Forward the caller's --config path so the
+        // daemon binds to the same sockets the CLI client expects.
+        Command::new(&self_exe)
+            .arg("--config")
+            .arg(config_path)
+            .arg("daemon")
+            .spawn()
+            .context("failed to auto-start daemon via systemctl, and direct spawn failed")?;
+    }
+
+    let mut attempts = 0_u8;
+    while attempts < 10 {
+        if check_socket_reachable(&rt, operator_socket).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        attempts = attempts.saturating_add(1);
+    }
+
+    bail!(
+        "daemon did not become reachable on socket {} after auto-start attempts",
+        operator_socket.display()
+    );
+}
+
+/// Report health and prerequisite checks for daemon runtime.
+///
+/// TCK-00595 MAJOR-3 FIX: Now includes a projection-worker liveness probe.
+/// When projection is enabled in config, the check verifies that the
+/// projection cache database exists (created by the projection worker on
+/// startup), which serves as evidence the worker is active.
+pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct DoctorCheck {
+        name: String,
+        status: &'static str,
+        message: String,
+    }
+
+    let mut checks = Vec::new();
+    let mut has_error = false;
+
+    let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(value) if !value.is_empty());
+    checks.push(DoctorCheck {
+        name: "GITHUB_TOKEN".to_string(),
+        status: if github_token_set { "OK" } else { "ERROR" },
+        message: if github_token_set {
+            "GITHUB_TOKEN is set".to_string()
+        } else {
+            "GITHUB_TOKEN is not set".to_string()
+        },
+    });
+    if !github_token_set {
+        has_error = true;
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for doctor check")?;
+
+    let (daemon_running, daemon_probe_message) = match check_socket_reachable(&rt, operator_socket)
+    {
+        Ok(()) => (true, "operator socket is reachable".to_string()),
+        Err(msg) => (false, msg),
+    };
+    let daemon_running_ok = daemon_running;
+    checks.push(DoctorCheck {
+        name: "daemon_running".to_string(),
+        status: if daemon_running_ok { "OK" } else { "ERROR" },
+        message: if daemon_probe_message.is_empty() {
+            "operator socket is not reachable".to_string()
+        } else {
+            daemon_probe_message
+        },
+    });
+    if !daemon_running_ok {
+        has_error = true;
+    }
+
+    let data_dir = default_data_dir();
+    match available_space_bytes(&data_dir) {
+        Ok(free_bytes) => {
+            let has_space = free_bytes >= 1_073_741_824;
+            checks.push(DoctorCheck {
+                name: "disk_space".to_string(),
+                status: if has_space { "OK" } else { "ERROR" },
+                message: if has_space {
+                    format!("{} has {} free bytes", data_dir.display(), free_bytes)
+                } else {
+                    format!(
+                        "{} has only {} free bytes (minimum 1 GiB required)",
+                        data_dir.display(),
+                        free_bytes
+                    )
+                },
+            });
+            if !has_space {
+                has_error = true;
+            }
+        },
+        Err(error) => {
+            has_error = true;
+            checks.push(DoctorCheck {
+                name: "disk_space".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "failed to read free space for {}: {error}",
+                    data_dir.display()
+                ),
+            });
+        },
+    }
+
+    match socket_permission_check(operator_socket) {
+        Ok(permission_ok) => {
+            checks.push(DoctorCheck {
+                name: "socket_permissions".to_string(),
+                status: if permission_ok { "OK" } else { "ERROR" },
+                message: if permission_ok {
+                    format!("{} is mode 0600", operator_socket.display())
+                } else {
+                    format!("{} is not mode 0600", operator_socket.display())
+                },
+            });
+            if !permission_ok {
+                has_error = true;
+            }
+        },
+        Err(error) => {
+            has_error = true;
+            checks.push(DoctorCheck {
+                name: "socket_permissions".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "failed to check {} permissions: {error}",
+                    operator_socket.display()
+                ),
+            });
+        },
+    }
+
+    // TCK-00595 MAJOR-3 FIX: Projection worker liveness probe.
+    //
+    // When projection is enabled in config, verify the projection worker
+    // has started by checking for its cache database file. The projection
+    // worker creates this file on startup, so its absence indicates the
+    // worker is not active.
+    {
+        let projection_check = check_projection_worker_health(config_path, daemon_running_ok);
+        if projection_check.is_error {
+            has_error = true;
+        }
+        checks.push(DoctorCheck {
+            name: "projection_worker".to_string(),
+            status: projection_check.status,
+            message: projection_check.message,
+        });
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&checks)
+                .context("failed to serialize doctor checks to JSON")?
+        );
+    } else {
+        println!("{:<28} {:<6} Message", "Check", "Status");
+        println!("{}", "-".repeat(78));
+        for check in checks {
+            println!("{:<28} {:<6} {}", check.name, check.status, check.message);
+        }
+    }
+
+    if has_error {
+        bail!("one or more critical checks failed");
+    }
+
+    Ok(())
+}
+
+/// Result of a projection worker health probe.
+struct ProjectionHealthResult {
+    status: &'static str,
+    message: String,
+    is_error: bool,
+}
+
+/// Check projection worker health by examining config and runtime artifacts.
+///
+/// The projection worker creates a cache database file on startup. When
+/// projection is enabled in config but this file is absent, the worker
+/// is either not started or has failed.
+fn check_projection_worker_health(
+    config_path: &Path,
+    daemon_running: bool,
+) -> ProjectionHealthResult {
+    // Try to load the config to check projection settings
+    let config = config_path
+        .exists()
+        .then(|| apm2_core::config::EcosystemConfig::from_file(config_path).ok())
+        .flatten();
+
+    let Some(config) = config else {
+        return ProjectionHealthResult {
+            status: "WARN",
+            message: "no ecosystem.toml found; projection worker status unknown".to_string(),
+            is_error: false,
+        };
+    };
+
+    let projection = &config.daemon.projection;
+
+    if !projection.enabled {
+        return ProjectionHealthResult {
+            status: "OK",
+            message: "projection is disabled in config (no worker expected)".to_string(),
+            is_error: false,
+        };
+    }
+
+    // Projection is enabled -- check prerequisites
+    if projection.github_owner.is_empty() || projection.github_repo.is_empty() {
+        return ProjectionHealthResult {
+            status: "ERROR",
+            message: "projection.enabled=true but github_owner or github_repo \
+                      is not configured in ecosystem.toml"
+                .to_string(),
+            is_error: true,
+        };
+    }
+
+    if !daemon_running {
+        return ProjectionHealthResult {
+            status: "ERROR",
+            message: format!(
+                "projection.enabled=true for {}/{} but daemon is not running",
+                projection.github_owner, projection.github_repo
+            ),
+            is_error: true,
+        };
+    }
+
+    // Check for projection cache database as evidence the worker started.
+    // The worker creates {state_dir}/projection_cache.db on initialization.
+    let state_dir = config
+        .daemon
+        .state_file
+        .parent()
+        .map_or_else(default_data_dir, Path::to_path_buf);
+
+    let cache_path = state_dir.join("projection_cache.db");
+    if cache_path.exists() {
+        ProjectionHealthResult {
+            status: "OK",
+            message: format!(
+                "projection worker active for {}/{}",
+                projection.github_owner, projection.github_repo
+            ),
+            is_error: false,
+        }
+    } else {
+        ProjectionHealthResult {
+            status: "ERROR",
+            message: format!(
+                "projection.enabled=true for {}/{} but projection cache not found at {}; \
+                 worker may not be active",
+                projection.github_owner,
+                projection.github_repo,
+                cache_path.display()
+            ),
+            is_error: true,
+        }
+    }
 }
 
 /// Kill the daemon via protocol-based Shutdown request.
@@ -112,5 +534,193 @@ fn map_protocol_error(err: ProtocolClientError) -> anyhow::Error {
         ProtocolClientError::FrameTooLarge { size, max } => {
             anyhow::anyhow!("Response frame too large: {size} bytes (max: {max})")
         },
+    }
+}
+
+fn check_socket_reachable(rt: &tokio::runtime::Runtime, path: &Path) -> Result<(), String> {
+    let result = rt.block_on(async {
+        OperatorClient::connect_with_timeout(path, std::time::Duration::from_secs(1)).await
+    });
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(ProtocolClientError::DaemonNotRunning) => Err("daemon not running".to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn available_space_bytes(path: &std::path::Path) -> Result<u64> {
+    if !path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .context("failed to create data directory")?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(path).context("failed to create data directory")?;
+        }
+    }
+    fs2::available_space(path).context("failed to read available space")
+}
+
+fn socket_permission_check(path: &Path) -> Result<bool> {
+    let metadata = std::fs::symlink_metadata(path).context("socket path is missing")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        if metadata.file_type().is_socket() {
+            return Ok(metadata.permissions().mode() & 0o777 == 0o600);
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TCK-00595 MAJOR-2 regression: `ensure_daemon_running` accepts
+    /// `config_path` and the function signature is correct. We cannot test
+    /// the actual daemon spawn in unit tests, but we verify the function
+    /// compiles with the new signature and fails gracefully on a
+    /// non-existent socket.
+    #[test]
+    fn ensure_daemon_running_accepts_config_path() {
+        let socket = std::path::Path::new("/tmp/apm2-test-nonexistent/operator.sock");
+        let config = std::path::Path::new("/tmp/apm2-test-nonexistent/ecosystem.toml");
+        // Should fail (socket not reachable, systemctl/spawn will fail) but
+        // must not panic.
+        let result = ensure_daemon_running(socket, config);
+        assert!(result.is_err());
+    }
+
+    /// TCK-00595 MAJOR-3: projection worker health check returns OK when
+    /// projection is disabled in config.
+    #[test]
+    fn projection_health_disabled_returns_ok() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("ecosystem.toml");
+        // Minimal config with projection disabled (default)
+        std::fs::write(
+            &config_path,
+            "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n",
+        )
+        .unwrap();
+
+        let result = check_projection_worker_health(&config_path, true);
+        assert_eq!(result.status, "OK");
+        assert!(!result.is_error);
+    }
+
+    /// TCK-00595 MAJOR-3: projection worker health check returns ERROR when
+    /// enabled but daemon not running.
+    #[test]
+    fn projection_health_enabled_daemon_down_returns_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
+             [daemon.projection]\nenabled = true\ngithub_owner = \"owner\"\ngithub_repo = \"repo\"\n",
+        )
+        .unwrap();
+
+        let result = check_projection_worker_health(&config_path, false);
+        assert_eq!(result.status, "ERROR");
+        assert!(result.is_error);
+        assert!(result.message.contains("daemon is not running"));
+    }
+
+    /// TCK-00595 MAJOR-3: projection worker health check returns ERROR when
+    /// enabled but cache file missing.
+    #[test]
+    fn projection_health_enabled_no_cache_returns_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_path = temp.path().join("state.json");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
+                 state_file = \"{}\"\n\
+                 [daemon.projection]\nenabled = true\ngithub_owner = \"owner\"\ngithub_repo = \"repo\"\n",
+                state_path.display()
+            ),
+        )
+        .unwrap();
+
+        let result = check_projection_worker_health(&config_path, true);
+        assert_eq!(result.status, "ERROR");
+        assert!(result.is_error);
+        assert!(result.message.contains("projection cache not found"));
+    }
+
+    /// TCK-00595 MAJOR-3: projection worker health check returns OK when
+    /// enabled, daemon running, and cache exists.
+    #[test]
+    fn projection_health_enabled_with_cache_returns_ok() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_path = temp.path().join("state.json");
+        let config_path = temp.path().join("ecosystem.toml");
+        // Create the projection cache file to simulate active worker
+        let cache_path = temp.path().join("projection_cache.db");
+        std::fs::write(&cache_path, b"dummy").unwrap();
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
+                 state_file = \"{}\"\n\
+                 [daemon.projection]\nenabled = true\ngithub_owner = \"owner\"\ngithub_repo = \"repo\"\n",
+                state_path.display()
+            ),
+        )
+        .unwrap();
+
+        let result = check_projection_worker_health(&config_path, true);
+        assert_eq!(result.status, "OK");
+        assert!(!result.is_error);
+        assert!(result.message.contains("projection worker active"));
+    }
+
+    /// TCK-00595 MAJOR-3: projection health check returns ERROR when
+    /// enabled but `github_owner` is missing.
+    #[test]
+    fn projection_health_enabled_missing_owner_returns_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
+             [daemon.projection]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let result = check_projection_worker_health(&config_path, true);
+        assert_eq!(result.status, "ERROR");
+        assert!(result.is_error);
+        assert!(result.message.contains("github_owner or github_repo"));
+    }
+
+    /// TCK-00595 MAJOR-3: projection health check returns WARN when
+    /// no config file exists.
+    #[test]
+    fn projection_health_no_config_returns_warn() {
+        let result = check_projection_worker_health(
+            std::path::Path::new("/tmp/apm2-test-nonexistent/ecosystem.toml"),
+            true,
+        );
+        assert_eq!(result.status, "WARN");
+        assert!(!result.is_error);
     }
 }
