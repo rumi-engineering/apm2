@@ -11,6 +11,7 @@ use super::backend::{
     build_script_command_for_backend, build_sha_update_message,
 };
 use super::barrier::fetch_pr_head_sha_local;
+use super::decision::resolve_completion_signal_from_projection_for_home;
 use super::detection::{detect_comment_permission_denied, detect_http_400_or_rate_limit};
 use super::events::emit_event;
 use super::liveness::scan_log_liveness;
@@ -20,16 +21,18 @@ use super::model_pool::{
     select_cross_family_fallback, select_fallback_model, select_review_model_random,
 };
 use super::state::{
-    build_review_run_id, build_run_key, find_active_review_entry, get_process_start_time,
-    load_review_run_completion_receipt, load_review_run_state_strict, next_review_sequence_number,
-    remove_review_state_entry, try_acquire_review_lease, upsert_review_state_entry,
-    write_pulse_file, write_review_run_state,
+    COMPLETION_RECEIPT_SCHEMA, ReviewRunCompletionReceipt, build_review_run_id, build_run_key,
+    find_active_review_entry, get_process_start_time, load_review_run_completion_receipt,
+    load_review_run_state_strict, next_review_sequence_number, remove_review_state_entry,
+    try_acquire_review_lease, upsert_review_state_entry, write_pulse_file,
+    write_review_run_completion_receipt_for_home, write_review_run_state,
 };
 use super::types::{
     ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP, MAX_RESTART_ATTEMPTS,
     PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunState, ReviewRunStatus,
     ReviewRunSummary, ReviewRunType, ReviewStateEntry, STALL_THRESHOLD, SingleReviewResult,
-    SingleReviewSummary, SpawnMode, split_owner_repo, validate_expected_head_sha,
+    SingleReviewSummary, SpawnMode, apm2_home_dir, is_verdict_finalized_agent_stop_reason,
+    now_iso8601, split_owner_repo, validate_expected_head_sha,
 };
 
 const STALE_ARTIFACT_TTL_SECS_DEFAULT: u64 = 24 * 60 * 60;
@@ -205,7 +208,55 @@ fn load_completion_signal(
     head_sha: &str,
 ) -> Result<Option<CompletionSignal>, String> {
     let Some(receipt) = load_review_run_completion_receipt(pr_number, review_type)? else {
-        return Ok(None);
+        let Some(state) = load_review_run_state_strict(pr_number, review_type)? else {
+            return Ok(None);
+        };
+        if !state.owner_repo.eq_ignore_ascii_case(owner_repo)
+            || !state.run_id.eq_ignore_ascii_case(run_id)
+            || !state.head_sha.eq_ignore_ascii_case(head_sha)
+            || state.status != ReviewRunStatus::Done
+            || !state
+                .terminal_reason
+                .as_deref()
+                .is_some_and(is_verdict_finalized_agent_stop_reason)
+        {
+            return Ok(None);
+        }
+        let home = apm2_home_dir()?;
+        let Some(signal) = resolve_completion_signal_from_projection_for_home(
+            &home,
+            owner_repo,
+            pr_number,
+            review_type,
+            head_sha,
+        )?
+        else {
+            return Ok(None);
+        };
+        let receipt = ReviewRunCompletionReceipt {
+            schema: COMPLETION_RECEIPT_SCHEMA.to_string(),
+            emitted_at: now_iso8601(),
+            repo: owner_repo.to_string(),
+            pr_number,
+            review_type: review_type.to_string(),
+            run_id: run_id.to_string(),
+            head_sha: head_sha.to_string(),
+            decision: signal.decision.clone(),
+            decision_comment_id: signal.decision_comment_id,
+            decision_author: signal.decision_author,
+            decision_summary: signal.decision_summary,
+            integrity_hmac: String::new(),
+        };
+        if let Err(err) = write_review_run_completion_receipt_for_home(&home, &receipt) {
+            eprintln!(
+                "WARNING: failed to repair completion receipt for PR #{pr_number} type={review_type}: {err}"
+            );
+        }
+        return Ok(Some(CompletionSignal {
+            verdict: signal.verdict,
+            decision: signal.decision,
+            decision_comment_id: signal.decision_comment_id,
+        }));
     };
     if !receipt.repo.eq_ignore_ascii_case(owner_repo)
         || !receipt.run_id.eq_ignore_ascii_case(run_id)

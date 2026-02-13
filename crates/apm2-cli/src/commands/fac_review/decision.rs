@@ -84,6 +84,15 @@ struct ParsedDecisionComment {
     payload: DecisionComment,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ProjectionCompletionSignal {
+    pub decision: String,
+    pub verdict: String,
+    pub decision_comment_id: u64,
+    pub decision_author: String,
+    pub decision_summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectionIssueCommentsCache {
@@ -815,6 +824,55 @@ pub(super) fn resolve_termination_authority_for_home(
     ))
 }
 
+pub(super) fn resolve_completion_signal_from_projection_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+) -> Result<Option<ProjectionCompletionSignal>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let dimension = review_type_to_dimension(review_type)?;
+    let Ok(trusted_reviewer) = load_projection_reviewer_for_home(home, owner_repo, pr_number)
+    else {
+        return Ok(None);
+    };
+    let Ok(comments) = load_projection_issue_comments_for_home(home, owner_repo, pr_number) else {
+        return Ok(None);
+    };
+    let parsed = parse_decision_comments_for_author(&comments, Some(&trusted_reviewer));
+    let Some(latest) = latest_for_sha(&parsed, head_sha) else {
+        return Ok(None);
+    };
+    let Some(decision_entry) = latest.payload.dimensions.get(dimension) else {
+        return Ok(None);
+    };
+    let Some(decision) = normalize_decision_value(&decision_entry.decision) else {
+        return Err(format!(
+            "verdict projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
+            decision_entry.decision
+        ));
+    };
+    let verdict = match decision {
+        "approve" => "PASS",
+        "deny" => "FAIL",
+        _ => unreachable!("normalize_decision_value only returns approve|deny"),
+    };
+    let signature = signature_for_payload(&latest.payload);
+    if signature.trim().is_empty() {
+        return Err(format!(
+            "verdict projection for PR #{pr_number} sha {head_sha} produced empty signature"
+        ));
+    }
+    Ok(Some(ProjectionCompletionSignal {
+        decision: decision.to_string(),
+        verdict: verdict.to_string(),
+        decision_comment_id: latest.comment.id,
+        decision_author: trusted_reviewer,
+        decision_summary: signature,
+    }))
+}
+
 fn render_decision_comment_body(payload: &DecisionComment) -> Result<String, String> {
     let yaml = serde_yaml::to_string(payload)
         .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
@@ -1097,6 +1155,7 @@ enum TerminationOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1294,6 +1353,82 @@ dimensions:
         let parsed = parse_decision_comments_for_author(&[trusted, spoofed], Some("fac-bot"));
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].comment.id, 1);
+    }
+
+    #[test]
+    fn test_resolve_completion_signal_from_projection_for_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let owner_repo = "example/repo";
+        let pr_number = 441;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let pr_dir = super::projection_pr_dir_for_home(home, owner_repo, pr_number);
+        fs::create_dir_all(&pr_dir).expect("create projection dir");
+
+        let reviewer_projection = serde_json::json!({
+            "schema": "apm2.fac.projection.reviewer.v1",
+            "reviewer_id": "fac-bot",
+            "updated_at": "2026-02-13T00:00:00Z"
+        });
+        fs::write(
+            pr_dir.join("reviewer.json"),
+            serde_json::to_vec_pretty(&reviewer_projection).expect("serialize reviewer"),
+        )
+        .expect("write reviewer projection");
+
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-13T00:00:00Z".to_string(),
+            dimensions,
+        };
+        let comment_body = render_decision_comment_body(&payload).expect("render comment body");
+        let issue_comment = IssueComment {
+            id: 88,
+            body: comment_body,
+            html_url: "local://fac_projection/example/repo/pr-441/issue_comments#88".to_string(),
+            created_at: "2026-02-13T00:00:00Z".to_string(),
+            user: Some(IssueUser {
+                login: "fac-bot".to_string(),
+            }),
+        };
+        let issue_comments_projection = serde_json::json!({
+            "schema": "apm2.fac.projection.issue_comments.v1",
+            "owner_repo": owner_repo,
+            "pr_number": pr_number,
+            "updated_at": "2026-02-13T00:00:00Z",
+            "comments": [issue_comment]
+        });
+        fs::write(
+            pr_dir.join("issue_comments.json"),
+            serde_json::to_vec_pretty(&issue_comments_projection).expect("serialize comments"),
+        )
+        .expect("write issue comments projection");
+
+        let resolved = super::resolve_completion_signal_from_projection_for_home(
+            home, owner_repo, pr_number, "security", head_sha,
+        )
+        .expect("resolve completion signal")
+        .expect("signal should resolve");
+        assert_eq!(resolved.decision, "approve");
+        assert_eq!(resolved.verdict, "PASS");
+        assert_eq!(resolved.decision_comment_id, 88);
+        assert_eq!(resolved.decision_author, "fac-bot");
+        assert_eq!(
+            resolved.decision_summary,
+            "security:approve|code-quality:missing"
+        );
     }
 
     #[test]
