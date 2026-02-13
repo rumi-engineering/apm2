@@ -910,8 +910,21 @@ fn run_terminate_inner(
     review_type: &str,
     json_output: bool,
 ) -> Result<(), String> {
+    let home = types::apm2_home_dir()?;
+    run_terminate_inner_for_home(&home, repo, pr_number, pr_url, review_type, json_output)
+}
+
+fn run_terminate_inner_for_home(
+    home: &Path,
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type: &str,
+    json_output: bool,
+) -> Result<(), String> {
     let (owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
-    let state_opt = state::load_review_run_state_strict(resolved_pr, review_type)?;
+    let state_opt =
+        state::load_review_run_state_verified_strict_for_home(home, resolved_pr, review_type)?;
 
     let Some(mut run_state) = state_opt else {
         let msg = format!("no active reviewer for PR #{resolved_pr} type={review_type}");
@@ -980,6 +993,17 @@ fn run_terminate_inner(
         );
     }
 
+    if run_state.pid.is_some() && run_state.proc_start_time.is_some() {
+        if let Err(integrity_err) =
+            state::verify_review_run_state_integrity_binding(home, &mut run_state)
+        {
+            return Err(format!(
+                "integrity verification failed for PR #{resolved_pr} type={review_type}: {integrity_err} -- \
+                 refusing to terminate based on potentially tampered state"
+            ));
+        }
+    }
+
     let mut killed = false;
     if let Some(pid) = run_state.pid {
         if state::is_process_alive(pid) {
@@ -991,7 +1015,26 @@ fn run_terminate_inner(
 
     run_state.status = types::ReviewRunStatus::Failed;
     run_state.terminal_reason = Some("manual_termination".to_string());
-    state::write_review_run_state(&run_state)?;
+    state::write_review_run_state_for_home(home, &run_state)?;
+
+    let receipt = state::ReviewRunTerminationReceipt {
+        emitted_at: types::now_iso8601(),
+        repo: owner_repo,
+        pr_number: resolved_pr,
+        review_type: review_type.to_string(),
+        run_id: run_state.run_id.clone(),
+        head_sha: run_state.head_sha.clone(),
+        decision_comment_id: 0,
+        decision_author: "manual_operator".to_string(),
+        decision_signature: String::new(),
+        outcome: if killed {
+            "killed".to_string()
+        } else {
+            "already_dead".to_string()
+        },
+        outcome_reason: Some("manual_termination via `apm2 fac review terminate`".to_string()),
+    };
+    state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
 
     if json_output {
         println!(
@@ -1483,7 +1526,6 @@ mod tests {
     use super::{
         review_types_all_terminal, review_types_terminal_done, review_types_terminal_failed,
     };
-    use crate::commands::fac_review::types::apm2_home_dir;
 
     static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
 
@@ -1558,27 +1600,29 @@ mod tests {
     }
 
     #[test]
-    fn test_select_fallback_model_cycles() {
-        let next = select_fallback_model("gemini-3-flash-preview")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3-pro-preview");
-
-        let next = select_fallback_model("gemini-3-pro-preview")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gpt-5.3-codex");
-
-        let next =
-            select_fallback_model("gpt-5.3-codex").expect("known model should produce fallback");
-        assert_eq!(next.model, "gpt-5.3-codex-spark");
-
-        let next = select_fallback_model("gpt-5.3-codex-spark")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3-flash-preview");
+    fn test_select_fallback_model_excludes_failed_and_covers_pool() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let fallback = select_fallback_model("gpt-5.3-codex")
+                .expect("known model should produce fallback");
+            assert_ne!(fallback.model, "gpt-5.3-codex", "must exclude failed model");
+            seen.insert(fallback.model.clone());
+        }
+        assert!(seen.contains("gemini-3-flash-preview"));
+        assert!(seen.contains("gemini-3-pro-preview"));
+        assert!(seen.contains("gpt-5.3-codex-spark"));
     }
 
     #[test]
-    fn test_select_fallback_model_unknown_returns_none() {
-        assert!(select_fallback_model("unknown-model").is_none());
+    fn test_select_fallback_model_unknown_returns_pool_member() {
+        let fallback =
+            select_fallback_model("unknown-model").expect("unknown failure should still fallback");
+        assert!(
+            MODEL_POOL
+                .iter()
+                .map(|entry| entry.model)
+                .any(|candidate| candidate == fallback.model.as_str())
+        );
     }
 
     #[test]
@@ -1825,19 +1869,26 @@ mod tests {
     #[test]
     fn test_run_terminate_inner_skips_when_proc_start_time_missing() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
 
         let child = spawn_persistent_process();
         let pid = child.id();
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
-        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
-        let result =
-            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
         assert!(result.is_err());
         let error = result.expect_err("terminate should fail-closed");
-        assert!(error.contains("missing proc_start_time"));
+        assert!(error.contains("integrity"));
         assert!(super::state::is_process_alive(pid));
 
         kill_child(child);
@@ -1847,17 +1898,24 @@ mod tests {
     #[test]
     fn test_run_terminate_inner_skips_when_proc_start_time_mismatched() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
 
         let child = spawn_persistent_process();
         let pid = child.id();
         let observed_start = super::state::get_process_start_time(pid).expect("read start time");
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(observed_start + 1));
-        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
-        let result =
-            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
         assert!(result.is_err());
         let error = result.expect_err("terminate should fail-closed");
         assert!(error.contains("identity mismatch"));
@@ -1870,20 +1928,27 @@ mod tests {
     #[test]
     fn test_run_terminate_inner_fails_when_pid_missing_for_alive_state() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
 
         let mut state = sample_run_state(pr_number, 0, "abcdef1234567890", Some(123_456_789));
         state.pid = None;
-        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
-        let result =
-            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
         assert!(result.is_err());
         let error = result.expect_err("terminate should fail-closed");
         assert!(error.contains("PID is missing"));
 
-        let loaded = super::state::load_review_run_state_for_home(&home, pr_number, "security")
+        let loaded = super::state::load_review_run_state_for_home(home, pr_number, "security")
             .expect("load run-state");
         let state = match loaded {
             super::state::ReviewRunStateLoad::Present(state) => state,
@@ -1898,18 +1963,25 @@ mod tests {
     #[test]
     fn test_run_terminate_inner_skips_when_repo_mismatch() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
 
         let child = spawn_persistent_process();
         let pid = child.id();
         let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
         state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
-        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
-        let result =
-            super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "owner/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
         assert!(
             result.is_err(),
             "repo mismatch should now be treated as a failure"
@@ -1918,7 +1990,7 @@ mod tests {
         assert!(error.contains("repo mismatch"));
         assert!(super::state::is_process_alive(pid));
 
-        let loaded = super::state::load_review_run_state_for_home(&home, pr_number, "security")
+        let loaded = super::state::load_review_run_state_for_home(home, pr_number, "security")
             .expect("load run-state");
         let state = match loaded {
             super::state::ReviewRunStateLoad::Present(state) => state,
@@ -1933,18 +2005,25 @@ mod tests {
     #[test]
     fn test_run_terminate_inner_fails_when_repo_parse_failed() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
 
         let child = spawn_persistent_process();
         let pid = child.id();
         let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
         state.pr_url = "https://github.com/not-a-repo-url".to_string();
-        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
-        let result =
-            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
         assert!(
             result.is_err(),
             "repo parse failure should now be treated as an error"
@@ -1954,6 +2033,86 @@ mod tests {
 
         kill_child(child);
         let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_on_integrity_mismatch() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read run state json"))
+                .expect("parse run state json");
+        tampered["head_sha"] = serde_json::json!("fedcba0987654321");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&tampered).expect("serialize tampered run state"),
+        )
+        .expect("write tampered state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("integrity verification failed"));
+        assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_writes_manual_termination_receipt() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+        let dead_pid = dead_pid_for_test();
+        let state = sample_run_state(pr_number, dead_pid, "abcdef1234567890", Some(123_456_789));
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        )
+        .expect("terminate should succeed");
+
+        let receipt_path = state_path
+            .parent()
+            .expect("state parent")
+            .join("termination_receipt.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&receipt_path).expect("read termination receipt"),
+        )
+        .expect("parse termination receipt");
+        assert_eq!(receipt["repo"], serde_json::json!("example/repo"));
+        assert_eq!(receipt["review_type"], serde_json::json!("security"));
+        assert_eq!(receipt["outcome"], serde_json::json!("already_dead"));
+        assert_eq!(
+            receipt["decision_author"],
+            serde_json::json!("manual_operator")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(receipt_path);
     }
 
     #[test]

@@ -13,7 +13,8 @@ use fs2::FileExt;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
-    load_review_run_state_for_home, next_review_sequence_number_for_home, try_acquire_review_lease,
+    load_review_run_state_for_home, load_review_run_state_verified_for_home,
+    next_review_sequence_number_for_home, try_acquire_review_lease_for_home,
     write_review_run_state_for_home,
 };
 use super::types::{
@@ -24,6 +25,20 @@ use super::types::{
     ensure_parent_dir, now_iso8601,
 };
 use super::worktree::resolve_worktree_for_sha;
+
+const SYSTEMD_DISPATCH_ENV_ALLOWLIST: [&str; 11] = [
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "APM2_HOME",
+    "XDG_RUNTIME_DIR",
+];
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -629,7 +644,8 @@ fn dispatch_single_review_locked_for_home<F>(
 where
     F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
-    let run_state_load = load_review_run_state_for_home(home, key.pr_number, &key.review_type)?;
+    let run_state_load =
+        load_review_run_state_verified_for_home(home, key.pr_number, &key.review_type)?;
     let sequence_hint = next_sequence_hint_from_state(&run_state_load);
     match run_state_load {
         ReviewRunStateLoad::Ambiguous { dir, candidates } => {
@@ -835,44 +851,51 @@ where
 
     // Final dedup gate: if the orchestrator's review lease is already held,
     // a reviewer is actively running — no need to spawn another.
-    let review_lease =
-        match try_acquire_review_lease(&key.owner_repo, key.pr_number, &key.review_type) {
-            Ok(Some(lease)) => lease,
-            Ok(None) => {
-                // Lease held — enrich the response with current run state so callers
-                // can see which run_id/pid they joined.
-                let (run_state_str, run_id, seq, pid) =
-                    match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
-                        Ok(ReviewRunStateLoad::Present(state)) => (
-                            state.status.as_str().to_string(),
-                            Some(state.run_id),
-                            Some(state.sequence_number),
-                            state.pid,
-                        ),
-                        _ => ("unknown".to_string(), None, None, None),
-                    };
-                return Ok(DispatchReviewResult {
-                    review_type: key.review_type.clone(),
-                    mode: "joined".to_string(),
-                    run_state: run_state_str,
-                    run_id,
-                    sequence_number: seq,
-                    terminal_reason: None,
-                    pid,
-                    unit: None,
-                    log_file: None,
-                });
-            },
-            Err(err) => {
-                return Err(format!(
-                    "failed to acquire review lease for {}#{} {}: {err}",
-                    key.owner_repo, key.pr_number, key.review_type
-                ));
-            },
-        };
+    let review_lease = match try_acquire_review_lease_for_home(
+        home,
+        &key.owner_repo,
+        key.pr_number,
+        &key.review_type,
+    ) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            // Lease held — enrich the response with current run state so callers
+            // can see which run_id/pid they joined.
+            let (run_state_str, run_id, seq, pid) =
+                match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
+                    Ok(ReviewRunStateLoad::Present(state)) => (
+                        state.status.as_str().to_string(),
+                        Some(state.run_id),
+                        Some(state.sequence_number),
+                        state.pid,
+                    ),
+                    _ => ("unknown".to_string(), None, None, None),
+                };
+            return Ok(DispatchReviewResult {
+                review_type: key.review_type.clone(),
+                mode: "joined".to_string(),
+                run_state: run_state_str,
+                run_id,
+                sequence_number: seq,
+                terminal_reason: None,
+                pid,
+                unit: None,
+                log_file: None,
+            });
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to acquire review lease for {}#{} {}: {err}",
+                key.owner_repo, key.pr_number, key.review_type
+            ));
+        },
+    };
 
-    // Keep the lease open through spawn and state write so duplicate dispatchers
-    // cannot race this decision-critical transition.
+    // SECURITY NOTE (RSK-1601 TOCTOU): review_lease is intentionally held from
+    // acquisition through spawn and pending-marker write. The dispatch lock
+    // (held by caller) additionally serializes concurrent dispatchers for the
+    // same idempotency key. The child process re-acquires the lease after this
+    // function returns.
 
     if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
         return attach_run_state_contract_for_home(
@@ -1146,7 +1169,7 @@ fn spawn_detached_review(
             .arg("--property")
             .arg(format!("ReadOnlyPaths={}", workspace_root.display()));
 
-        for key in ["PATH", "HOME", "CARGO_HOME"] {
+        for key in SYSTEMD_DISPATCH_ENV_ALLOWLIST {
             if let Ok(value) = std::env::var(key) {
                 command.arg("--setenv").arg(format!("{key}={value}"));
             }

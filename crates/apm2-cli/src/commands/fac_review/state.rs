@@ -134,6 +134,7 @@ fn open_secret_for_write(path: &Path) -> Result<File, String> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     options
         .open(path)
@@ -255,8 +256,26 @@ pub fn review_run_state_path(pr_number: u32, review_type: &str) -> Result<PathBu
     ))
 }
 
+pub fn review_locks_dir_path_for_home(home: &Path) -> PathBuf {
+    home.join("review_locks")
+}
+
+#[allow(dead_code)]
 pub fn review_locks_dir_path() -> Result<PathBuf, String> {
-    Ok(apm2_home_dir()?.join("review_locks"))
+    Ok(review_locks_dir_path_for_home(&apm2_home_dir()?))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+pub fn review_lock_path_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<PathBuf, String> {
+    let safe_repo = sanitize_for_path(owner_repo);
+    let safe_type = sanitize_for_path(review_type);
+    Ok(review_locks_dir_path_for_home(home)
+        .join(format!("{safe_repo}-pr{pr_number}-{safe_type}.lock")))
 }
 
 pub fn review_lock_path(
@@ -264,9 +283,7 @@ pub fn review_lock_path(
     pr_number: u32,
     review_type: &str,
 ) -> Result<PathBuf, String> {
-    let safe_repo = sanitize_for_path(owner_repo);
-    let safe_type = sanitize_for_path(review_type);
-    Ok(review_locks_dir_path()?.join(format!("{safe_repo}-pr{pr_number}-{safe_type}.lock")))
+    review_lock_path_for_home(&apm2_home_dir()?, owner_repo, pr_number, review_type)
 }
 
 fn review_pulses_dir_path() -> Result<PathBuf, String> {
@@ -397,6 +414,48 @@ pub fn load_review_run_state_for_home(
     Ok(ReviewRunStateLoad::Present(parsed))
 }
 
+/// Loads review run state and verifies integrity binding when a live identity
+/// is present.
+///
+/// Use this path only for security-sensitive callers. Non-security paths
+/// (status display, telemetry reads, etc.) should continue to use
+/// `load_review_run_state_for_home`.
+pub fn load_review_run_state_verified_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    let canonical = review_run_state_path_for_home(home, pr_number, review_type);
+    let run_state_load = load_review_run_state_for_home(home, pr_number, review_type)?;
+    match run_state_load {
+        ReviewRunStateLoad::Present(mut state) => {
+            if state.pid.is_none() {
+                return Ok(ReviewRunStateLoad::Present(state));
+            }
+            if !is_process_alive(state.pid.unwrap()) {
+                return Ok(ReviewRunStateLoad::Present(state));
+            }
+            if let Err(err) = verify_review_run_state_integrity_binding(home, &mut state) {
+                return Ok(ReviewRunStateLoad::Corrupt {
+                    path: canonical,
+                    error: format!("run-state integrity verification failed: {err}"),
+                });
+            }
+            Ok(ReviewRunStateLoad::Present(state))
+        },
+        other => Ok(other),
+    }
+}
+
+#[allow(dead_code)]
+pub fn load_review_run_state_verified(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_state_verified_for_home(&home, pr_number, review_type)
+}
+
 pub fn load_review_run_state(
     pr_number: u32,
     review_type: &str,
@@ -405,7 +464,7 @@ pub fn load_review_run_state(
     load_review_run_state_for_home(&home, pr_number, review_type)
 }
 
-fn load_review_run_state_strict_for_home(
+pub fn load_review_run_state_strict_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -429,6 +488,41 @@ fn load_review_run_state_strict_for_home(
             ))
         },
     }
+}
+
+pub fn load_review_run_state_verified_strict_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunState>, String> {
+    match load_review_run_state_verified_for_home(home, pr_number, review_type)? {
+        ReviewRunStateLoad::Present(state) => Ok(Some(state)),
+        ReviewRunStateLoad::Missing { .. } => Ok(None),
+        ReviewRunStateLoad::Corrupt { path, error } => Err(format!(
+            "corrupt-state path={} detail={error}",
+            path.display()
+        )),
+        ReviewRunStateLoad::Ambiguous { dir, candidates } => {
+            let rendered = candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(format!(
+                "ambiguous-state dir={} candidates={rendered}",
+                dir.display()
+            ))
+        },
+    }
+}
+
+#[allow(dead_code)]
+pub fn load_review_run_state_verified_strict(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunState>, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_state_verified_strict_for_home(&home, pr_number, review_type)
 }
 
 pub fn load_review_run_state_strict(
@@ -489,14 +583,37 @@ pub fn write_review_run_state_integrity_receipt_for_home(
 
 pub fn verify_review_run_state_integrity_binding(
     home: &Path,
-    state: &ReviewRunState,
+    state: &mut ReviewRunState,
 ) -> Result<(), String> {
-    let secret = read_run_secret_for_home(home, state.pr_number, &state.review_type)?
-        .ok_or_else(|| "run secret missing".to_string())?;
-    let stored = state
-        .integrity_hmac
-        .as_deref()
+    let pid = state
+        .pid
         .ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+    let recorded_proc_start_time = state
+        .proc_start_time
+        .ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+    let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
+        Some(secret) => secret,
+        None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
+    };
+
+    let Some(stored) = state.integrity_hmac.as_deref() else {
+        let observed_proc_start_time =
+            get_process_start_time(pid).ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+        if observed_proc_start_time != recorded_proc_start_time {
+            return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+        }
+        bind_review_run_state_integrity(state, &secret)?;
+        let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
+        write_review_run_state_to_path(&path, state)
+            .map_err(|err| format!("failed to persist migrated integrity binding: {err}"))?;
+        eprintln!(
+            "WARNING: migrated legacy run-state integrity binding for PR #{} type={} path={}",
+            state.pr_number,
+            state.review_type,
+            path.display()
+        );
+        return Ok(());
+    };
     let expected =
         hex::decode(stored).map_err(|err| format!("failed to decode integrity_hmac: {err}"))?;
     let computed = hex::decode(compute_review_run_state_integrity_hmac(state, &secret)?)
@@ -712,13 +829,27 @@ pub fn try_acquire_review_lease(
     review_type: &str,
 ) -> Result<Option<File>, String> {
     let lock_path = review_lock_path(owner_repo, pr_number, review_type)?;
-    ensure_parent_dir(&lock_path)?;
+    try_acquire_review_lease_at_path(&lock_path)
+}
+
+pub fn try_acquire_review_lease_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<File>, String> {
+    let lock_path = review_lock_path_for_home(home, owner_repo, pr_number, review_type)?;
+    try_acquire_review_lease_at_path(&lock_path)
+}
+
+fn try_acquire_review_lease_at_path(lock_path: &Path) -> Result<Option<File>, String> {
+    ensure_parent_dir(lock_path)?;
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .map_err(|err| format!("failed to open review lock {}: {err}", lock_path.display()))?;
     match FileExt::try_lock_exclusive(&lock_file) {
         Ok(()) => Ok(Some(lock_file)),
@@ -852,8 +983,9 @@ mod tests {
         ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
         extract_repo_from_pr_url, get_process_start_time, load_review_run_state_for_home,
         load_review_run_state_strict_for_home, next_review_sequence_number_for_home,
-        parse_process_start_time, read_run_secret_for_home, review_run_secret_path_for_home,
-        review_run_state_path_for_home, rotate_run_secret_for_home,
+        parse_process_start_time, read_run_secret_for_home, review_lock_path_for_home,
+        review_run_secret_path_for_home, review_run_state_path_for_home,
+        rotate_run_secret_for_home, try_acquire_review_lease_for_home,
         verify_review_run_state_integrity, write_review_run_state_to_path,
     };
     use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
@@ -1060,6 +1192,42 @@ mod tests {
         let next =
             next_review_sequence_number_for_home(home, 441, "security").expect("next sequence");
         assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn test_try_acquire_review_lease_for_home_is_scoped_and_contentious() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let owner_repo = "example/repo";
+        let pr_number = 441;
+        let review_type = "security";
+
+        let first = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+            .expect("first lease attempt")
+            .expect("first lease should be acquired");
+        let lock_path =
+            review_lock_path_for_home(home, owner_repo, pr_number, review_type).expect("path");
+        assert!(
+            lock_path.starts_with(home),
+            "lock path must stay under provided home: {}",
+            lock_path.display()
+        );
+        assert!(lock_path.exists(), "lock file should exist");
+
+        let second = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+            .expect("second lease attempt");
+        assert!(
+            second.is_none(),
+            "second lease attempt must observe contention"
+        );
+
+        drop(first);
+        let third = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+            .expect("third lease attempt");
+        assert!(
+            third.is_some(),
+            "lease should be re-acquirable after release"
+        );
     }
 
     #[test]

@@ -796,8 +796,18 @@ impl TerminationAuthority {
 
 fn terminate_review_agent(authority: &TerminationAuthority) -> Result<TerminationOutcome, String> {
     let home = apm2_home_dir()?;
-    let Some(mut state) =
-        super::state::load_review_run_state_strict(authority.pr_number, &authority.review_type)?
+    terminate_review_agent_for_home(&home, authority)
+}
+
+fn terminate_review_agent_for_home(
+    home: &std::path::Path,
+    authority: &TerminationAuthority,
+) -> Result<TerminationOutcome, String> {
+    let Some(mut state) = super::state::load_review_run_state_strict_for_home(
+        home,
+        authority.pr_number,
+        &authority.review_type,
+    )?
     else {
         return Ok(TerminationOutcome::AlreadyDead);
     };
@@ -852,7 +862,7 @@ fn terminate_review_agent(authority: &TerminationAuthority) -> Result<Terminatio
             "failed to terminate review agent pid {pid}: missing proc_start_time"
         )));
     };
-    if let Err(err) = super::state::verify_review_run_state_integrity_binding(&home, &state) {
+    if let Err(err) = super::state::verify_review_run_state_integrity_binding(home, &mut state) {
         return Ok(TerminationOutcome::IntegrityFailure(err));
     }
 
@@ -881,7 +891,7 @@ fn terminate_review_agent(authority: &TerminationAuthority) -> Result<Terminatio
     let mut outcome = TerminationOutcome::Killed;
     state.status = ReviewRunStatus::Failed;
     state.terminal_reason = Some("manual_termination_after_decision".to_string());
-    if let Err(err) = super::state::write_review_run_state(&state).map_err(|err| {
+    if let Err(err) = super::state::write_review_run_state_for_home(home, &state).map_err(|err| {
         format!(
             "failed to persist terminal review state for PR #{}: {err}",
             authority.pr_number
@@ -890,7 +900,7 @@ fn terminate_review_agent(authority: &TerminationAuthority) -> Result<Terminatio
         outcome = TerminationOutcome::IdentityFailure(err);
     }
 
-    if let Err(err) = write_termination_receipt(&home, authority, &outcome) {
+    if let Err(err) = write_termination_receipt(home, authority, &outcome) {
         return Err(format!(
             "failed to persist termination receipt for PR #{}: {err}",
             authority.pr_number
@@ -953,7 +963,7 @@ mod tests {
     };
     use crate::commands::fac_review::state;
     use crate::commands::fac_review::types::{
-        ReviewRunState, ReviewRunStatus, TerminationAuthority, apm2_home_dir,
+        ReviewRunState, ReviewRunStatus, TerminationAuthority,
     };
 
     static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
@@ -1144,8 +1154,9 @@ dimensions:
     #[test]
     fn test_terminate_review_agent_skips_when_sha_mismatch() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
 
         let mut child = Command::new("sleep")
             .arg("1000")
@@ -1155,11 +1166,11 @@ dimensions:
         let proc_start_time =
             state::get_process_start_time(pid).expect("start time should be available");
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
-        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("owner/repo", &state, "1234567890abcdef");
 
-        let outcome =
-            super::terminate_review_agent(&authority).expect("termination result expected");
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
             matches!(outcome, super::TerminationOutcome::SkippedMismatch),
             "unexpected termination: should skip on sha mismatch"
@@ -1174,8 +1185,9 @@ dimensions:
     #[test]
     fn test_terminate_review_agent_skips_when_proc_start_time_missing() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
 
         let mut child = Command::new("sleep")
             .arg("1000")
@@ -1183,11 +1195,11 @@ dimensions:
             .expect("spawn review process");
         let pid = child.id();
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
-        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
 
-        let outcome =
-            super::terminate_review_agent(&authority).expect("termination result expected");
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
             matches!(outcome, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("missing proc_start_time")),
             "unexpected termination outcome"
@@ -1202,8 +1214,9 @@ dimensions:
     #[test]
     fn test_terminate_review_agent_skips_when_repo_mismatch() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
 
         let mut child = Command::new("sleep")
             .arg("1000")
@@ -1214,11 +1227,11 @@ dimensions:
             state::get_process_start_time(pid).expect("start time should be available");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
         state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
-        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("owner/repo", &state, "abcdef1234567890");
 
-        let outcome =
-            super::terminate_review_agent(&authority).expect("termination result expected");
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
             matches!(outcome, super::TerminationOutcome::SkippedMismatch),
             "unexpected termination: should skip on repo mismatch"
@@ -1233,8 +1246,9 @@ dimensions:
     #[test]
     fn test_terminate_review_agent_fails_when_pid_missing_for_active_state() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
 
         let state = ReviewRunState {
             head_sha: "abcdef1234567890".to_string(),
@@ -1242,10 +1256,11 @@ dimensions:
             pid: None,
             ..sample_run_state(pr_number, 0, "abcdef1234567890", Some(123_456_789))
         };
-        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
 
-        let err = super::terminate_review_agent(&authority).expect("termination result expected");
+        let err = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
             matches!(err, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("missing pid on active state"))
         );
@@ -1255,8 +1270,9 @@ dimensions:
     #[test]
     fn test_terminate_review_agent_allows_missing_proc_start_when_process_is_dead() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
 
         let mut child = Command::new("sleep")
             .arg("1000")
@@ -1264,14 +1280,14 @@ dimensions:
             .expect("spawn review process");
         let pid = child.id();
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
-        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
 
         let _ = child.kill();
         let _ = child.wait();
 
-        let outcome =
-            super::terminate_review_agent(&authority).expect("termination result expected");
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
             matches!(outcome, super::TerminationOutcome::AlreadyDead),
             "unexpected termination outcome"
@@ -1283,8 +1299,9 @@ dimensions:
     #[test]
     fn test_terminate_review_agent_skips_when_proc_start_time_mismatched() {
         let pr_number = next_test_pr();
-        let home = apm2_home_dir().expect("apm2 home");
-        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
 
         let mut child = Command::new("sleep")
             .arg("1000")
@@ -1299,10 +1316,11 @@ dimensions:
             "abcdef1234567890",
             Some(proc_start_time + 1),
         );
-        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
 
-        let err = super::terminate_review_agent(&authority).expect("termination result expected");
+        let err = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
             matches!(err, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("failed to verify process identity")),
             "unexpected termination outcome"

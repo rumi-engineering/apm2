@@ -39,10 +39,18 @@ ticket_meta:
       - "Restore missing `-y` flag to Gemini initial command in backend.rs."
       - "Add `terminate_review_agent` function in decision.rs that sends SIGTERM/SIGKILL to the review agent after decision persist, with process identity verification via proc_start_time."
       - "Call `terminate_review_agent` at the end of `run_decision_set` after cleanup."
+      - "Harden `run_terminate_inner` in fac_review/mod.rs with run-state HMAC integrity verification before PID-based termination."
+      - "Write `ReviewRunTerminationReceipt` for manual `apm2 fac review terminate` actions to preserve auditability."
+      - "Introduce home-scoped review lease acquisition for tests (`try_acquire_review_lease_for_home`) and use it in fac_review dispatch paths that already accept a `home` parameter."
+      - "Eliminate fac_review test leakage into `~/.apm2` by isolating test home state (temp `APM2_HOME` and/or explicit *_for_home helpers) for lease/run-state tests."
+      - "Replace real repository URLs in fac_review target-resolution tests with synthetic test repositories."
+      - "Add a daemon test policy note documenting that full agent-lifecycle E2E tests are not part of the default suite and must run with temp `APM2_HOME`, mock GitHub adapters, and EVID-HEF-0012 constraints when enabled."
+      - "Perform one-time cleanup of leaked fac_review test artifacts under `~/.apm2/review_locks/` and `~/.apm2/reviews/`."
     out_of_scope:
       - "Sandbox mode migration for Codex/Gemini backends (requires upstream support)."
       - "RoleSpec ToolAllowlist runtime enforcement (covered by RFC-0028 broker)."
       - "Prompt-level git prohibitions, ReadOnlyPaths systemd confinement, or other defense-in-depth measures."
+      - "Deleting existing RFC evidence harnesses without an explicit replacement coverage plan."
   plan:
     steps:
       - "Revert backend.rs line 19: restore `-y` flag to Gemini initial command."
@@ -61,6 +69,7 @@ ticket_meta:
       - "`cargo clippy -p apm2-cli -p apm2-core -- -D warnings` passes clean."
       - "`cargo test -p apm2-cli fac_review` — all tests pass."
   notes:
+    security: "E2E agent tests that spawn full agent lifecycles are banned from the default test suite; when enabled they must use temp `APM2_HOME`, mock GitHub adapters, and satisfy EVID-HEF-0012."
     critical_files:
       - "crates/apm2-cli/src/commands/fac_review/backend.rs — Codex/Gemini command builders"
       - "crates/apm2-cli/src/commands/fac_review/decision.rs — terminate_review_agent + call site"

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 use super::types::{
     DEFAULT_PROVIDER_SLOT_COUNT, ModelPoolEntry, PROVIDER_BACKOFF_BASE_SECS,
@@ -78,11 +79,15 @@ pub fn select_review_model_random() -> ReviewModelSelection {
 }
 
 pub fn select_fallback_model(failed: &str) -> Option<ReviewModelSelection> {
-    let current_idx = MODEL_POOL
+    let candidates: Vec<_> = MODEL_POOL
         .iter()
-        .position(|entry| entry.model.eq_ignore_ascii_case(failed))?;
-    let next_idx = (current_idx + 1) % MODEL_POOL.len();
-    let next = MODEL_POOL[next_idx];
+        .filter(|entry| !entry.model.eq_ignore_ascii_case(failed))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let idx = rand::thread_rng().gen_range(0..candidates.len());
+    let next = candidates[idx];
     Some(ReviewModelSelection {
         model: next.model.to_string(),
         backend: next.backend,
@@ -90,19 +95,22 @@ pub fn select_fallback_model(failed: &str) -> Option<ReviewModelSelection> {
 }
 
 pub fn select_cross_family_fallback(failed: &str) -> Option<ReviewModelSelection> {
-    let current_idx = MODEL_POOL
+    let current_backend = MODEL_POOL
         .iter()
-        .position(|entry| entry.model.eq_ignore_ascii_case(failed))?;
-    let current = MODEL_POOL[current_idx];
-    for offset in 1..MODEL_POOL.len() {
-        let idx = (current_idx + offset) % MODEL_POOL.len();
-        let candidate = MODEL_POOL[idx];
-        if candidate.backend != current.backend {
-            return Some(ReviewModelSelection {
-                model: candidate.model.to_string(),
-                backend: candidate.backend,
-            });
-        }
+        .find(|entry| entry.model.eq_ignore_ascii_case(failed))
+        .map(|entry| entry.backend);
+    let candidates: Vec<_> = MODEL_POOL
+        .iter()
+        .filter(|entry| !entry.model.eq_ignore_ascii_case(failed))
+        .filter(|entry| current_backend.is_none_or(|backend| entry.backend != backend))
+        .collect();
+    if !candidates.is_empty() {
+        let idx = rand::thread_rng().gen_range(0..candidates.len());
+        let selected = candidates[idx];
+        return Some(ReviewModelSelection {
+            model: selected.model.to_string(),
+            backend: selected.backend,
+        });
     }
     select_fallback_model(failed)
 }
@@ -117,16 +125,19 @@ pub fn ensure_model_backend_available(
         return Ok(selection);
     }
 
-    let mut candidate = selection;
-    for _ in 0..MODEL_POOL.len() {
-        let fallback = normalize_review_model_selection(
-            select_fallback_model(&candidate.model)
-                .ok_or_else(|| "could not select fallback model".to_string())?,
-        );
-        if backend_tool_available(fallback.backend) {
-            return Ok(fallback);
+    let mut candidates: Vec<_> = MODEL_POOL
+        .iter()
+        .filter(|entry| !entry.model.eq_ignore_ascii_case(&selection.model))
+        .collect();
+    candidates.shuffle(&mut rand::thread_rng());
+    for entry in candidates {
+        let normalized = normalize_review_model_selection(ReviewModelSelection {
+            model: entry.model.to_string(),
+            backend: entry.backend,
+        });
+        if backend_tool_available(normalized.backend) {
+            return Ok(normalized);
         }
-        candidate = fallback;
     }
 
     Err(
