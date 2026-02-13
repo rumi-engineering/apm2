@@ -279,7 +279,7 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - [INV-DR01] Authority revocation dominance: a buffered intent carrying authority that was valid at buffer time but has since been revoked is DENIED, even if the economics gate returns ALLOW.
 - [INV-DR02] Single-use consume semantics: intents whose authority token was consumed through an alternate path during the outage are DENIED.
 - [INV-DR03] Fail-closed: missing gate inputs, missing lifecycle gate, or unknown state always results in DENY.
-- [INV-DR04] Bounded replay: configurable batch size (default 64, max 4096) prevents post-outage thundering herd.
+- [INV-DR04] Bounded replay: configurable batch size (default 64, max 512) prevents post-outage thundering herd.
 - [INV-DR05] Deterministic ordering: backlog entries are drained in `ORDER BY rowid` (ledger order).
 - [INV-DR06] Intents outside the replay window are expired with a deny receipt (not silently dropped).
 - [INV-DR07] Idempotent: already-admitted or already-denied intents are skipped without error.
@@ -289,7 +289,7 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - [CTR-DR01] `drain_cycle()` processes at most `replay_batch_size` entries per invocation and returns a `ReplayCycleResult` with counts and convergence status.
 - [CTR-DR02] `backlog_digest` is computed as Blake3 over ordered intent digests of successfully replayed intents, included in the convergence receipt.
 - [CTR-DR03] Economics gate re-evaluation calls `evaluate_projection_continuity()` with current resolver state, not cached/stale state.
-- [CTR-DR04] Lifecycle gate evaluation uses `ledger_anchor` (derived from intent ID) as the revocation head hash to satisfy the revocation frontier invariant.
+- [CTR-DR04] Lifecycle gate evaluation uses `current_revocation_head` (passed into `drain_cycle` from the authoritative system/ledger revocation frontier) as the revocation head hash. This ensures intents with revoked authority are denied even if the economics gate returns ALLOW. Uses `PrivilegedPcacInputBuilder` for join input construction (RS-42) with `RiskTier::Tier2Plus` (fail-closed).
 - [CTR-DR05] Convergence receipt is only emitted when the backlog is fully drained (no remaining entries after the batch).
 - [CTR-DR06] All deny/expire paths record structured reasons via `IntentBuffer.deny()` before the entry is counted.
 
