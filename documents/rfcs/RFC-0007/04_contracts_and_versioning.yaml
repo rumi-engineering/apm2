@@ -104,14 +104,17 @@ rfc_contracts_and_versioning:
           - "TimeoutStopSec: default 240s"
         escape_prevention:
           - "sccache disabled in default FAC mode"
-          - "CARGO_HOME set under $APM2_HOME"
-          - "Ambient ~/.cargo/config.toml not used"
+          - "PLANNED: set CARGO_HOME under $APM2_HOME (not yet enforced in local fallback)"
+          - "PLANNED: ignore ambient ~/.cargo/config.toml during FAC execution (not yet enforced)"
+          - "Current local-mode execution inherits ambient environment, including cargo/rust wrapper settings"
       backward_compatible: true
       notes: |
-        If bounded execution cannot be proven available (no user bus,
-        no cgroup v2), the current implementation falls back to running
-        evidence gates without cgroup resource limits and uses
-        `cargo test --workspace` instead of `cargo nextest run`.
+        If bounded execution cannot be proven available (the bounded runner script is
+        missing or cgroup v2 is unavailable), the current implementation falls back
+        to running evidence gates without cgroup resource limits and uses
+        `cargo test --workspace` instead of `cargo nextest run`. Bounded execution
+        still requires a reachable user bus; if preflight user bus checks fail, the
+        fallback does not occur and bounded execution hard-fails.
         Fail-closed enforcement (rejecting execution when bounded
         execution is unavailable) is planned as future work. Operators
         are strongly encouraged to enable bounded execution by

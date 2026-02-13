@@ -54,11 +54,14 @@ echo $XDG_RUNTIME_DIR
 # Expected: /run/user/$(id -u)
 ```
 
-**If bounded execution is unavailable** (no user bus, no cgroup v2), `apm2 fac gates`
-falls back to running evidence gates without cgroup resource limits. The bounded
-execution path is strongly recommended. Fail-closed enforcement when bounded
-execution is unavailable is planned as future work (see DD-003 in RFC-0007).
-Fix the user session to enable bounded execution before proceeding.
+**If bounded execution is unavailable** (the bounded runner script is missing
+or cgroup v2 is unavailable), `apm2 fac gates` falls back to running evidence
+gates without cgroup resource limits. The bounded execution path is strongly
+recommended. Fail-closed enforcement when bounded execution is unavailable is
+planned as future work (see DD-003 in RFC-0007).
+When the bounded runner script is present but the user bus is unavailable,
+bounded execution does not fall back. It hard-fails in `run_bounded_tests.sh`
+preflight. Fix the user session to enable bounded execution before proceeding.
 
 ### 1.3 Build and install the apm2 CLI
 

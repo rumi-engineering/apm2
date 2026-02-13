@@ -238,10 +238,13 @@ rfc_design_decisions:
       lane-scoped CARGO_TARGET_DIR (target pool per lane per toolchain
       fingerprint), which provides artifact reuse without containment risk.
 
-      Additionally, FAC MUST NOT depend on ambient user configuration
-      (~/.cargo/config.toml). FAC sets CARGO_HOME under $APM2_HOME for
-      isolation, and .cargo/config.toml in the repo is the only cargo
-      config treated as policy input.
+      Additionally, this isolation behavior is currently a planned hardening goal.
+      The current local execution path inherits ambient environment, so user-level
+      cargo/rust settings can still influence command behavior. A future
+      implementation is expected to set CARGO_HOME under $APM2_HOME and treat only
+      repository policy files as cargo input while ignoring ambient cargo
+      settings.
+
     alternatives:
     - id: ALT-0001
       name: "Disable sccache in default FAC mode (chosen)"

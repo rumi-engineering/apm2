@@ -83,11 +83,12 @@ rfc_trust_boundaries:
           (e.g., sccache) are disabled by default unless proven to preserve
           cgroup membership.
 
-          If bounded execution cannot be proven available (e.g., no user bus,
-          no cgroup v2), the current implementation falls back to running
-          evidence gates without cgroup resource limits and uses `cargo test
-          --workspace` instead of `cargo nextest run`. Fail-closed enforcement
-          when bounded execution is unavailable is planned as future work.
+          If bounded execution cannot be proven available (the bounded runner
+          script is missing or cgroup v2 is unavailable), the current
+          implementation falls back to running evidence gates without cgroup
+          resource limits and uses `cargo test --workspace` instead of
+          `cargo nextest run`. If bounded execution is attempted without user bus,
+          `run_bounded_tests.sh` fails in preflight with hard failure.
 
       - id: TB-003
         name: "External Tool Installation"
