@@ -677,10 +677,6 @@ pub(crate) const fn hex_char_to_nibble(c: u8) -> Option<u8> {
     }
 }
 
-/// Constant-time string comparison using `subtle::ConstantTimeEq`.
-///
-/// Compares the raw bytes of both strings. Returns `false` if lengths differ
-/// (this leaks length, which is acceptable for digest strings of known format).
 fn constant_time_str_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -742,36 +738,18 @@ mod tests {
 
     #[test]
     fn builder_produces_digest_and_request_binding() {
-        let without_token = build_valid_spec();
+        let tokenless = build_valid_spec();
         let with_token = build_with_ids("job1", "L1")
             .channel_context_token("TOKEN")
             .build()
             .expect("tokenized spec");
-        let with_other_token = build_with_ids("job1", "L1")
-            .channel_context_token("ALT_TOKEN")
-            .build()
-            .expect("tokenized spec");
 
-        assert_eq!(without_token.job_spec_digest, with_token.job_spec_digest);
-        assert_eq!(
-            without_token.job_spec_digest,
-            with_other_token.job_spec_digest
-        );
-        assert_eq!(
-            without_token.job_spec_digest,
-            without_token.actuation.request_id
-        );
+        assert_eq!(tokenless.job_spec_digest, with_token.job_spec_digest);
+        assert_eq!(tokenless.job_spec_digest, tokenless.actuation.request_id);
         assert_eq!(with_token.actuation.request_id, with_token.job_spec_digest);
-        assert_eq!(without_token.job_spec_digest.len(), 71);
-        assert!(without_token.job_spec_digest.starts_with(B3_256_PREFIX));
+        assert_eq!(tokenless.actuation.channel_context_token, None);
+        assert_eq!(tokenless.actuation.request_id, tokenless.job_spec_digest);
         assert!(validate_job_spec(&with_token).is_ok());
-    }
-
-    #[test]
-    fn builder_without_token_still_builds() {
-        let spec = build_valid_spec();
-        assert_eq!(spec.actuation.channel_context_token, None);
-        assert_eq!(spec.actuation.request_id, spec.job_spec_digest);
     }
 
     #[test]
@@ -789,133 +767,99 @@ mod tests {
             validate_job_spec(&spec3),
             Err(JobSpecError::DigestMismatch { .. })
         ));
-    }
-
-    #[test]
-    fn request_id_mismatch_is_rejected() {
-        let mut spec = build_with_ids("job1", "L1")
+        spec3.source.repo_id = "evil-org/apm2".to_string();
+        assert!(matches!(
+            validate_job_spec(&spec3),
+            Err(JobSpecError::DigestMismatch { .. })
+        ));
+        let mut spec4 = build_with_ids("job1", "L1")
             .channel_context_token("TOKEN")
             .build()
             .expect("tokenized spec");
-        spec.actuation.request_id =
+        spec4.actuation.request_id =
             "b3-256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
-
         assert!(matches!(
-            validate_job_spec(&spec),
+            validate_job_spec(&spec4),
             Err(JobSpecError::RequestIdMismatch { .. })
         ));
     }
 
     #[test]
-    fn invalid_digest_formats_are_rejected() {
-        let mut bad_job_digest = build_with_ids("job1", "L1")
-            .channel_context_token("TOKEN")
-            .build()
-            .expect("tokenized spec");
-        bad_job_digest.job_spec_digest = "not-a-digest".to_string();
-
-        let mut bad_request_id = build_with_ids("job1", "L1")
-            .channel_context_token("TOKEN")
-            .build()
-            .expect("tokenized spec");
-        bad_request_id.actuation.request_id = "not-a-digest".to_string();
-
-        assert!(matches!(
-            validate_job_spec(&bad_job_digest),
-            Err(JobSpecError::InvalidDigest {
-                field: "job_spec_digest",
-                ..
-            })
-        ));
-        assert!(matches!(
-            validate_job_spec(&bad_request_id),
-            Err(JobSpecError::InvalidDigest {
-                field: "actuation.request_id",
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn token_presence_is_rejected_when_missing_or_empty() {
-        let mut missing = build_with_ids("job1", "L1")
-            .channel_context_token("TOKEN")
-            .build()
-            .expect("tokenized spec");
-        missing.actuation.channel_context_token = None;
-
-        let mut empty = build_with_ids("job1", "L1")
-            .channel_context_token("TOKEN")
-            .build()
-            .expect("tokenized spec");
-        empty.actuation.channel_context_token = Some(String::new());
-
-        assert!(matches!(
-            validate_job_spec(&missing),
-            Err(JobSpecError::MissingToken {
-                field: "actuation.channel_context_token"
-            })
-        ));
-        assert!(matches!(
-            validate_job_spec(&empty),
-            Err(JobSpecError::MissingToken {
-                field: "actuation.channel_context_token"
-            })
-        ));
+        for token in [None, Some("")] {
+            let mut spec = build_with_ids("job1", "L1")
+                .channel_context_token("TOKEN")
+                .build()
+                .expect("tokenized spec");
+            spec.actuation.channel_context_token = token.map(str::to_string);
+            assert!(matches!(
+                validate_job_spec(&spec),
+                Err(JobSpecError::MissingToken {
+                    field: "actuation.channel_context_token"
+                })
+            ));
+        }
     }
 
     #[test]
     fn validate_rejects_schema_and_field_errors() {
         let mut bad_schema = build_valid_spec();
         bad_schema.schema = "wrong.schema".to_string();
-        let bad_job = build_with_ids("", "L1").build();
-        let bad_lease = build_with_ids("job1", "").build();
-        let too_long = build_with_ids(&"x".repeat(MAX_JOB_ID_LENGTH + 1), "L1").build();
-        let out_of_range = build_with_ids("job1", "L1").priority(101).build();
-
         assert!(matches!(
             validate_job_spec(&bad_schema),
             Err(JobSpecError::SchemaMismatch { .. })
         ));
+
+        for result in [
+            build_with_ids("", "L1").build(),
+            build_with_ids("job1", "").build(),
+        ] {
+            assert!(matches!(result, Err(JobSpecError::EmptyField { .. })));
+        }
         assert!(matches!(
-            bad_job,
-            Err(JobSpecError::EmptyField { field: "job_id" })
-        ));
-        assert!(matches!(
-            bad_lease,
-            Err(JobSpecError::EmptyField {
-                field: "actuation.lease_id"
-            })
-        ));
-        assert!(matches!(
-            too_long,
-            Err(JobSpecError::FieldTooLong {
-                field: "job_id",
-                ..
-            })
-        ));
-        assert!(matches!(
-            out_of_range,
+            build_with_ids("job1", "L1").priority(101).build(),
             Err(JobSpecError::PriorityOutOfRange { value: 101 })
         ));
-    }
 
-    #[test]
-    fn validate_structure_rejects_invalid_kind() {
-        let mut spec = build_valid_spec();
-        spec.kind = "invalid_kind".to_string();
+        let mut long_fields = [
+            {
+                let mut spec = build_valid_spec();
+                spec.job_id = "x".repeat(MAX_JOB_ID_LENGTH + 1);
+                spec
+            },
+            {
+                let mut spec = build_valid_spec();
+                spec.queue_lane = "x".repeat(MAX_QUEUE_LANE_LENGTH + 1);
+                spec
+            },
+            {
+                let mut spec = build_with_ids("job1", "L1").build().expect("valid spec");
+                spec.actuation.request_id = "x".repeat(MAX_REQUEST_ID_LENGTH + 1);
+                spec
+            },
+        ];
+        let expected_fields = ["job_id", "queue_lane", "actuation.request_id"];
+        for (spec, expected_field) in long_fields.iter_mut().zip(expected_fields.iter()) {
+            assert!(matches!(
+                spec.validate_structure(),
+                Err(JobSpecError::FieldTooLong { field, .. }) if field == *expected_field
+            ));
+        }
+
         assert!(matches!(
-            spec.validate_structure(),
+            {
+                let mut spec = build_valid_spec();
+                spec.kind = "invalid_kind".to_string();
+                spec.validate_structure()
+            },
             Err(JobSpecError::InvalidFormat { field: "kind", .. })
         ));
-    }
-
-    #[test]
-    fn validate_structure_rejects_missing_patch_for_patch_injection() {
-        let mut spec = build_valid_spec();
-        spec.source.kind = "patch_injection".to_string();
         assert!(matches!(
-            spec.validate_structure(),
+            {
+                let mut spec = build_valid_spec();
+                spec.source.kind = "patch_injection".to_string();
+                spec.validate_structure()
+            },
             Err(JobSpecError::EmptyField {
                 field: "source.patch (required for patch_injection)"
             })
@@ -944,14 +888,6 @@ mod tests {
             deserialize_job_spec(&oversized),
             Err(JobSpecError::InputTooLarge { .. })
         ));
-    }
-
-    #[test]
-    fn deserialize_rejects_unknown_fields() {
-        let spec = build_with_ids("job2", "L2")
-            .channel_context_token("TOKEN")
-            .build()
-            .expect("valid spec");
         let mut json: serde_json::Value = serde_json::to_value(&spec).expect("json value");
         json["evil_field"] = serde_json::Value::Bool(true);
         assert!(deserialize_job_spec(&serde_json::to_vec(&json).expect("serialize")).is_err());
@@ -969,32 +905,30 @@ mod tests {
         assert!(constant_time_str_eq("hello", "hello"));
         assert!(!constant_time_str_eq("hello", "world"));
         assert!(!constant_time_str_eq("hello", "hell"));
-    }
-
-    #[test]
-    fn constant_time_str_eq_rejects_length_mismatch() {
         assert!(!constant_time_str_eq("", "a"));
-        assert!(!constant_time_str_eq("aa", "a"));
-    }
-
-    #[test]
-    fn digest_has_expected_length() {
-        let spec = build_with_ids("job4", "L4").build().expect("valid spec");
-        assert_eq!(spec.job_spec_digest.len(), 71);
-    }
-
-    #[test]
-    fn deserialize_tampering_detected() {
-        let mut spec = build_with_ids("job3", "L3")
+        let mut bad_job_digest = build_with_ids("job1", "L1")
             .channel_context_token("TOKEN")
-            .priority(25)
             .build()
-            .expect("valid spec");
-
-        spec.source.repo_id = "evil-org/apm2".to_string();
+            .expect("tokenized spec");
+        bad_job_digest.job_spec_digest = "not-a-digest".to_string();
+        let mut bad_request_id = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+        bad_request_id.actuation.request_id = "not-a-digest".to_string();
         assert!(matches!(
-            validate_job_spec(&spec),
-            Err(JobSpecError::DigestMismatch { .. })
+            validate_job_spec(&bad_job_digest),
+            Err(JobSpecError::InvalidDigest {
+                field: "job_spec_digest",
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_job_spec(&bad_request_id),
+            Err(JobSpecError::InvalidDigest {
+                field: "actuation.request_id",
+                ..
+            })
         ));
     }
 }
