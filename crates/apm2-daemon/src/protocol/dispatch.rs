@@ -27,6 +27,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -7294,6 +7295,26 @@ pub struct PrivilegedDispatcher {
     /// return an error indicating the watchdog is not configured.
     divergence_watchdog:
         Option<Arc<crate::projection::DivergenceWatchdog<crate::projection::SystemTimeSource>>>,
+
+    /// TCK-00585 / INV-BRK-HEALTH-GATE-001: Fail-closed health gate flag.
+    ///
+    /// Must be set to `true` by a successful broker health check before
+    /// token issuance via
+    /// [`validate_channel_boundary_and_issue_context_token_with_flow`] is
+    /// permitted. Default is `false` (fail-closed).
+    ///
+    /// # Synchronization Protocol (RS-21)
+    ///
+    /// - **Protected data**: admission eligibility flag for token issuance.
+    /// - **Who can mutate**: the broker health-check path calls
+    ///   [`set_admission_health_gate`] after a successful health evaluation.
+    /// - **Ordering**: `Release` on store, `Acquire` on load — the store in the
+    ///   health-check path *happens-before* the load in the token issuance
+    ///   path.
+    /// - **Interior mutability**: `AtomicBool` is used because
+    ///   `PrivilegedDispatcher` is stored as `&'static` via `OnceLock`, so
+    ///   `&mut self` methods are unavailable.
+    admission_health_gate: AtomicBool,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -7940,6 +7961,18 @@ impl PrivilegedDispatcher {
         context_firewall_verified: bool,
         boundary_flow: BoundaryFlowRuntimeState,
     ) -> Result<String, Vec<ChannelBoundaryDefect>> {
+        // TCK-00585 / INV-BRK-HEALTH-GATE-001: fail-closed health gate.
+        // The static `PrivilegedDispatcher` (via `OnceLock`) bypasses FacBroker,
+        // so we enforce the health gate here with an AtomicBool.
+        if !self.admission_health_gate.load(Ordering::Acquire) {
+            return Err(vec![ChannelBoundaryDefect::new(
+                ChannelViolationClass::MissingChannelMetadata,
+                "admission denied: broker health gate not satisfied \
+                 (INV-BRK-HEALTH-GATE-001)"
+                    .to_string(),
+            )]);
+        }
+
         let check = self.build_channel_boundary_check_with_flow(
             tool_class,
             policy_verified,
@@ -8047,7 +8080,31 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            // TCK-00585: Fail-closed — health gate starts unsatisfied.
+            admission_health_gate: AtomicBool::new(false),
         }
+    }
+
+    /// Sets the admission health gate status (TCK-00585).
+    ///
+    /// Called after a successful broker health check to permit token
+    /// issuance, or with `false` to revoke admission when health degrades.
+    ///
+    /// Uses `Ordering::Release` so that any state written by the
+    /// health-check path is visible to subsequent `Acquire` loads in
+    /// `validate_channel_boundary_and_issue_context_token_with_flow`.
+    pub fn set_admission_health_gate(&self, passed: bool) {
+        self.admission_health_gate.store(passed, Ordering::Release);
+    }
+
+    /// Returns the current admission health gate status (TCK-00585).
+    ///
+    /// `true` only after a successful broker health check has called
+    /// [`Self::set_admission_health_gate`] with `true`. `false` on
+    /// construction (fail-closed: INV-BRK-HEALTH-GATE-001).
+    #[must_use]
+    pub fn admission_health_gate_passed(&self) -> bool {
+        self.admission_health_gate.load(Ordering::Acquire)
     }
 
     /// Creates a new dispatcher with custom decode configuration (TEST ONLY).
@@ -8134,6 +8191,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            // TCK-00585: Fail-closed — health gate starts unsatisfied.
+            admission_health_gate: AtomicBool::new(false),
         }
     }
 
@@ -8238,6 +8297,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            // TCK-00585: Fail-closed — health gate starts unsatisfied.
+            admission_health_gate: AtomicBool::new(false),
         }
     }
 
@@ -8320,6 +8381,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            // TCK-00585: Fail-closed — health gate starts unsatisfied.
+            admission_health_gate: AtomicBool::new(false),
         }
     }
 
@@ -18642,6 +18705,8 @@ mod tests {
         #[test]
         fn test_channel_context_token_roundtrip() {
             let dispatcher = PrivilegedDispatcher::new();
+            // TCK-00585: Open health gate so token issuance is permitted.
+            dispatcher.set_admission_health_gate(true);
             let signer = apm2_core::crypto::Signer::generate();
             let issued_at_secs = std::time::UNIX_EPOCH
                 .elapsed()
@@ -34843,6 +34908,145 @@ mod tests {
                 },
                 other => panic!("Expected rejection for invalid risk tier, got: {other:?}"),
             }
+        }
+    }
+
+    /// TCK-00585: Tests for INV-BRK-HEALTH-GATE-001 admission health gate
+    /// enforcement on `PrivilegedDispatcher`.
+    mod admission_health_gate {
+        use super::*;
+
+        /// Verifies that token issuance is denied when the health gate is
+        /// false (fail-closed default).
+        #[test]
+        fn token_issuance_denied_when_health_gate_unsatisfied() {
+            let dispatcher = PrivilegedDispatcher::new();
+            // Default is false — health gate not satisfied.
+            assert!(
+                !dispatcher.admission_health_gate_passed(),
+                "health gate must default to false (fail-closed)"
+            );
+
+            let signer = apm2_core::crypto::Signer::generate();
+            #[allow(deprecated)]
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token(
+                &signer,
+                "lease-hg-001",
+                "REQ-HG-001",
+                1_700_000_000,
+                &ToolClass::Read,
+                true,
+                true,
+                true,
+                true,
+            );
+            let defects =
+                result.expect_err("token issuance must be denied when health gate is false");
+            assert_eq!(defects.len(), 1, "exactly one defect expected");
+            assert_eq!(
+                defects[0].violation_class,
+                ChannelViolationClass::MissingChannelMetadata,
+                "health gate denial must use MissingChannelMetadata violation class"
+            );
+            assert!(
+                defects[0].detail.contains("INV-BRK-HEALTH-GATE-001"),
+                "defect detail must reference INV-BRK-HEALTH-GATE-001: {}",
+                defects[0].detail
+            );
+        }
+
+        /// Verifies that token issuance succeeds after the health gate is
+        /// explicitly set to true.
+        #[test]
+        fn token_issuance_allowed_after_health_gate_set() {
+            let dispatcher = PrivilegedDispatcher::new();
+            // Open the health gate.
+            dispatcher.set_admission_health_gate(true);
+            assert!(
+                dispatcher.admission_health_gate_passed(),
+                "health gate must be true after set_admission_health_gate(true)"
+            );
+
+            let signer = apm2_core::crypto::Signer::generate();
+            let issued_at_secs = std::time::UNIX_EPOCH
+                .elapsed()
+                .expect("current time should be after unix epoch")
+                .as_secs();
+            #[allow(deprecated)]
+            let token = dispatcher
+                .validate_channel_boundary_and_issue_context_token(
+                    &signer,
+                    "lease-hg-002",
+                    "REQ-HG-002",
+                    issued_at_secs,
+                    &ToolClass::Execute,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .expect("token issuance must succeed when health gate is satisfied");
+            assert!(!token.is_empty(), "issued token must be non-empty");
+        }
+
+        /// Verifies that the health gate can be toggled back to false,
+        /// re-closing token issuance.
+        #[test]
+        fn health_gate_can_be_revoked() {
+            let dispatcher = PrivilegedDispatcher::new();
+            dispatcher.set_admission_health_gate(true);
+            assert!(dispatcher.admission_health_gate_passed());
+
+            // Revoke health gate.
+            dispatcher.set_admission_health_gate(false);
+            assert!(
+                !dispatcher.admission_health_gate_passed(),
+                "health gate must be false after revocation"
+            );
+
+            let signer = apm2_core::crypto::Signer::generate();
+            #[allow(deprecated)]
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token(
+                &signer,
+                "lease-hg-003",
+                "REQ-HG-003",
+                1_700_000_000,
+                &ToolClass::Read,
+                true,
+                true,
+                true,
+                true,
+            );
+            assert!(
+                result.is_err(),
+                "token issuance must be denied after health gate revocation"
+            );
+        }
+
+        /// Verifies health gate enforcement on the `_with_flow` variant.
+        #[test]
+        fn with_flow_variant_enforces_health_gate() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let signer = apm2_core::crypto::Signer::generate();
+            let boundary_flow = BoundaryFlowRuntimeState::allow_all(true);
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                "lease-hg-004",
+                "REQ-HG-004",
+                1_700_000_000,
+                &ToolClass::Inference,
+                true,
+                true,
+                true,
+                true,
+                boundary_flow,
+            );
+            let defects =
+                result.expect_err("with_flow variant must deny when health gate is unsatisfied");
+            assert!(
+                defects[0].detail.contains("INV-BRK-HEALTH-GATE-001"),
+                "with_flow defect must reference INV-BRK-HEALTH-GATE-001"
+            );
         }
     }
 }

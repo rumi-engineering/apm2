@@ -80,6 +80,10 @@ Privileged endpoint dispatcher for RFC-0017 control-plane IPC. Routes privileged
 
 - [CTR-PR05] Only accepts messages from operator socket connections.
 
+**Invariants:**
+
+- [INV-BRK-HEALTH-GATE-001] Token issuance via `validate_channel_boundary_and_issue_context_token_with_flow` requires `admission_health_gate` to be `true` (set by `set_admission_health_gate(true)` after a successful broker health check). Defaults to `false` (fail-closed). The `admission_health_gate` field is an `AtomicBool` because `PrivilegedDispatcher` is stored as `&'static` via `OnceLock` in session dispatch, preventing `&mut self` access. Uses `Release`/`Acquire` ordering. The static singleton is exposed via `channel_boundary_dispatcher()` (pub(crate) in session_dispatch.rs).
+
 ### `SessionDispatcher`
 
 Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after validating the session token.

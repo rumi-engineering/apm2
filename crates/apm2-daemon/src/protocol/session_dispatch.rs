@@ -745,7 +745,15 @@ impl V1ManifestStore {
 /// Shared reference to a [`V1ManifestStore`].
 pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
 
-fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
+/// Returns the shared `&'static PrivilegedDispatcher` used for channel
+/// boundary validation and token issuance in session dispatch.
+///
+/// The dispatcher is lazily initialized via `OnceLock` on first access.
+/// Its `admission_health_gate` defaults to `false` (fail-closed:
+/// INV-BRK-HEALTH-GATE-001). Production code must call
+/// [`PrivilegedDispatcher::set_admission_health_gate`] with `true` on
+/// the returned reference after a successful broker health check.
+pub(crate) fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
     static DISPATCHER: std::sync::OnceLock<PrivilegedDispatcher> = std::sync::OnceLock::new();
     DISPATCHER.get_or_init(PrivilegedDispatcher::new)
 }
@@ -13011,6 +13019,18 @@ mod tests {
     use crate::protocol::credentials::PeerCredentials;
     use crate::protocol::messages::{EvidenceKind, RetentionHint, TelemetryFrame};
 
+    /// Returns the shared `&'static PrivilegedDispatcher` with the
+    /// admission health gate set to `true` for test use.
+    ///
+    /// Production code uses [`channel_boundary_dispatcher()`] directly and
+    /// must explicitly set the health gate after a successful broker health
+    /// check. Tests need the gate open so token issuance tests can proceed.
+    fn test_channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
+        let d = channel_boundary_dispatcher();
+        d.set_admission_health_gate(true);
+        d
+    }
+
     fn test_minter() -> TokenMinter {
         TokenMinter::new(SecretString::from("test-daemon-secret-key-32bytes!!"))
     }
@@ -15329,7 +15349,7 @@ mod tests {
         );
 
         let signer = apm2_core::crypto::Signer::generate();
-        let first_result = channel_boundary_dispatcher()
+        let first_result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
                 lease_id,
@@ -15401,7 +15421,7 @@ mod tests {
             )
             .expect("second boundary-flow runtime state should build");
 
-        let second_result = channel_boundary_dispatcher()
+        let second_result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
                 lease_id,
@@ -16162,7 +16182,7 @@ mod tests {
         );
 
         let signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
+        let result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
                 "lease-001",
@@ -16392,7 +16412,7 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let token_signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
+        let result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &token_signer,
                 "lease-001",
@@ -16457,7 +16477,7 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
+        let result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
                 "lease-001",
@@ -16526,7 +16546,7 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
+        let result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
                 "lease-001",
@@ -16726,7 +16746,7 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let validation_signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
+        let result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &validation_signer,
                 "lease-001",
@@ -16796,7 +16816,7 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let validation_signer = apm2_core::crypto::Signer::generate();
-        let result = channel_boundary_dispatcher()
+        let result = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &validation_signer,
                 "lease-001",
@@ -18157,7 +18177,7 @@ mod tests {
             .expect("current time should be after unix epoch")
             .as_secs();
         #[allow(deprecated)]
-        let token = channel_boundary_dispatcher()
+        let token = test_channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token(
                 &signer,
                 "lease-1",
