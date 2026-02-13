@@ -158,38 +158,3 @@ pub fn extract_verdict_from_comment_body(body: &str) -> Option<String> {
     }
     None
 }
-
-pub fn infer_verdict(
-    review_kind: super::types::ReviewKind,
-    last_message: &std::path::Path,
-    log_path: &std::path::Path,
-) -> Result<String, String> {
-    let from_message = std::fs::read_to_string(last_message).unwrap_or_default();
-    let source = if from_message.trim().is_empty() {
-        super::state::read_tail(log_path, 120)?
-    } else {
-        from_message
-    };
-
-    let marker = review_kind.marker();
-    let has_marker = source.contains(marker);
-    let pass_re = Regex::new(r"(?i)\bPASS\b")
-        .map_err(|err| format!("failed to compile PASS regex: {err}"))?;
-    let fail_re = Regex::new(r"(?i)\bFAIL\b")
-        .map_err(|err| format!("failed to compile FAIL regex: {err}"))?;
-
-    let has_fail = fail_re.is_match(&source);
-    let has_pass = pass_re.is_match(&source);
-
-    if has_marker && has_fail {
-        Ok("FAIL".to_string())
-    } else if has_marker && has_pass {
-        Ok("PASS".to_string())
-    } else if has_fail && !has_pass {
-        Ok("FAIL".to_string())
-    } else if has_pass && !has_fail {
-        Ok("PASS".to_string())
-    } else {
-        Ok("UNKNOWN".to_string())
-    }
-}

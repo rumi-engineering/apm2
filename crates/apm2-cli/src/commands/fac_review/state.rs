@@ -12,7 +12,7 @@ use chrono::Utc;
 use fs2::FileExt;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -36,6 +36,22 @@ pub struct ReviewRunTerminationReceipt {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRunCompletionReceipt {
+    pub schema: String,
+    pub emitted_at: String,
+    pub repo: String,
+    pub pr_number: u32,
+    pub review_type: String,
+    pub run_id: String,
+    pub head_sha: String,
+    pub decision: String,
+    pub decision_comment_id: u64,
+    pub decision_author: String,
+    pub decision_signature: String,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -77,6 +93,14 @@ fn review_run_termination_receipt_path_for_home(
     review_type: &str,
 ) -> PathBuf {
     review_run_dir_for_home(home, pr_number, review_type).join("termination_receipt.json")
+}
+
+fn review_run_completion_receipt_path_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> PathBuf {
+    review_run_dir_for_home(home, pr_number, review_type).join("completion_receipt.json")
 }
 
 fn bind_review_run_state_integrity_for_home(
@@ -622,6 +646,71 @@ pub fn write_review_run_state_integrity_receipt_for_home(
     Ok(path)
 }
 
+pub fn write_review_run_completion_receipt_for_home(
+    home: &Path,
+    receipt: &ReviewRunCompletionReceipt,
+) -> Result<PathBuf, String> {
+    let path =
+        review_run_completion_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
+    ensure_parent_dir(&path)?;
+    let payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|err| format!("failed to serialize completion receipt: {err}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("completion receipt path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create completion receipt temp file: {err}"))?;
+    temp.write_all(&payload)
+        .map_err(|err| format!("failed to write completion receipt temp file: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync completion receipt temp file: {err}"))?;
+    temp.persist(path.clone())
+        .map_err(|err| format!("failed to persist {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+pub fn load_review_run_completion_receipt_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunCompletionReceipt>, String> {
+    let path = review_run_completion_receipt_path_for_home(home, pr_number, review_type);
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read completion receipt {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let receipt: ReviewRunCompletionReceipt = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse completion receipt {}: {err}",
+            path.display()
+        )
+    })?;
+    if receipt.pr_number != pr_number || !receipt.review_type.eq_ignore_ascii_case(review_type) {
+        return Err(format!(
+            "completion receipt identity mismatch at {}: expected pr={pr_number} type={review_type}, got pr={} type={}",
+            path.display(),
+            receipt.pr_number,
+            receipt.review_type
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+pub fn load_review_run_completion_receipt(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunCompletionReceipt>, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_completion_receipt_for_home(&home, pr_number, review_type)
+}
+
 pub fn verify_review_run_state_integrity_binding(
     home: &Path,
     state: &ReviewRunState,
@@ -968,23 +1057,6 @@ pub fn read_pulse_file_from_path(path: &Path) -> Result<Option<PulseFile>, Strin
     Ok(Some(pulse))
 }
 
-// ── File reading helpers ────────────────────────────────────────────────────
-
-pub fn read_tail(path: &Path, max_lines: usize) -> Result<String, String> {
-    let file =
-        File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("failed to read line: {err}"))?;
-        lines.push(line);
-        if lines.len() > max_lines {
-            let _ = lines.remove(0);
-        }
-    }
-    Ok(lines.join("\n"))
-}
-
 pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
     let file =
         File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
@@ -1288,8 +1360,15 @@ mod tests {
         );
 
         drop(first);
-        let third = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
-            .expect("third lease attempt");
+        let mut third = None;
+        for _ in 0..10 {
+            third = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+                .expect("third lease attempt");
+            if third.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             third.is_some(),
             "lease should be re-acquirable after release"

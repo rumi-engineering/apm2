@@ -16,8 +16,6 @@ pub const LIVENESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration::f
 pub const STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(90);
 pub const TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const LOOP_SLEEP: std::time::Duration = std::time::Duration::from_millis(1000);
-pub const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
-pub const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
 pub const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 pub const DISPATCH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 #[allow(dead_code)]
@@ -25,6 +23,7 @@ pub const MAX_EVENT_PAYLOAD_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_PROVIDER_SLOT_COUNT: usize = 10;
 pub const PROVIDER_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 pub const PROVIDER_SLOT_WAIT_JITTER_MS: u64 = 250;
+pub const PROVIDER_SLOT_MAX_WAIT_SECS_DEFAULT: u64 = 300;
 pub const PROVIDER_BACKOFF_BASE_SECS: u64 = 2;
 pub const PROVIDER_BACKOFF_MAX_SECS: u64 = 30;
 pub const PROVIDER_BACKOFF_JITTER_MS: u64 = 750;
@@ -130,13 +129,6 @@ impl ReviewKind {
         match self {
             Self::Security => SECURITY_PROMPT_PATH,
             Self::Quality => QUALITY_PROMPT_PATH,
-        }
-    }
-
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::Security => SECURITY_MARKER,
-            Self::Quality => QUALITY_MARKER,
         }
     }
 }
@@ -543,12 +535,6 @@ pub enum SpawnMode {
 pub struct SingleReviewResult {
     pub summary: SingleReviewSummary,
     pub final_head_sha: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct PostedReview {
-    pub id: u64,
-    pub verdict: Option<String>,
 }
 
 #[derive(Debug)]

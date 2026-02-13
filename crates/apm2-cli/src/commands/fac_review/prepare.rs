@@ -6,7 +6,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha};
+use super::projection_store;
 use super::target::resolve_pr_target;
 use super::types::{sanitize_for_path, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
@@ -34,12 +34,10 @@ pub fn run_prepare(
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
-    let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
-
     let repo_root = resolve_repo_root()?;
     let local_head = resolve_local_head_sha(&repo_root)?;
+    let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha, &local_head)?;
     if !local_head.eq_ignore_ascii_case(&head_sha) {
         return Err(format!(
             "local HEAD {local_head} does not match PR head {head_sha}; sync your branch and retry `apm2 fac review prepare`"
@@ -169,14 +167,22 @@ fn resolve_local_head_sha(repo_root: &Path) -> Result<String, String> {
     Ok(head)
 }
 
-fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {
+fn resolve_head_sha(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: Option<&str>,
+    local_head_sha: &str,
+) -> Result<String, String> {
     if let Some(value) = sha {
         validate_expected_head_sha(value)?;
         return Ok(value.to_ascii_lowercase());
     }
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    Ok(value.to_ascii_lowercase())
+    if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+    validate_expected_head_sha(local_head_sha)?;
+    Ok(local_head_sha.to_ascii_lowercase())
 }
 
 fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {

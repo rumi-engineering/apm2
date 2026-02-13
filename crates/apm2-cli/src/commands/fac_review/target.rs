@@ -2,8 +2,8 @@
 
 use std::process::Command;
 
+use super::projection_store;
 use super::types::{parse_pr_url, validate_expected_head_sha};
-use super::{github_projection, projection_store};
 
 pub fn resolve_pr_target(
     repo: &str,
@@ -29,19 +29,9 @@ pub fn resolve_pr_target(
                 return Ok((identity.owner_repo, identity.pr_number));
             }
 
-            if !projection_store::gh_read_fallback_enabled() {
-                return Err(format!(
-                    "no local PR mapping found for branch `{branch}` in repo `{repo}`. {}. pass --pr <N> or --pr-url <URL> to override auto-detection",
-                    projection_store::gh_read_fallback_disabled_error("resolve_pr_target")
-                ));
-            }
-
-            let number = find_pr_for_branch(repo, &branch).map_err(|err| {
-                format!("{err}. pass --pr <N> or --pr-url <URL> to override auto-detection")
-            })?;
-            let _ =
-                projection_store::record_fallback_read(repo, number, "target.find_pr_for_branch");
-            (repo.to_string(), number)
+            return Err(format!(
+                "no local PR mapping found for branch `{branch}` in repo `{repo}`; pass --pr <N> or --pr-url <URL> to run explicitly"
+            ));
         },
     };
 
@@ -62,13 +52,6 @@ pub fn current_branch() -> Result<String, String> {
         return Err("could not determine current branch (detached HEAD?)".to_string());
     }
     Ok(branch)
-}
-
-pub fn find_pr_for_branch(repo: &str, branch: &str) -> Result<u32, String> {
-    github_projection::find_pr_for_branch(repo, branch)?.map_or_else(
-        || Err(format!("no open PR found for branch {branch} in {repo}")),
-        Ok,
-    )
 }
 
 fn current_head_sha() -> Result<String, String> {

@@ -1,14 +1,17 @@
 //! Intelligent pipeline restart: reads CI state and re-enters the DAG at the
 //! optimal point (evidence gates, review dispatch, or noop).
 
+use std::process::Command;
+
 use serde::Serialize;
 
-use super::barrier::{fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::ci_status::{CiStatus, find_status_comment};
 use super::dispatch::dispatch_single_review;
 use super::evidence::run_evidence_gates_with_status;
+use super::projection_store;
+use super::state::{ReviewRunStateLoad, load_review_run_state, read_pulse_file};
 use super::target::resolve_pr_target;
-use super::types::{DispatchReviewResult, ReviewKind};
+use super::types::{DispatchReviewResult, ReviewKind, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
 
 // ── Strategy ────────────────────────────────────────────────────────────────
@@ -68,7 +71,7 @@ fn resolve_pr_context(
     let (owner_repo, pr_number) = resolve_pr_target(repo, pr, pr_url)?;
 
     let pr_url_resolved = format!("https://github.com/{owner_repo}/pull/{pr_number}");
-    let head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
+    let head_sha = resolve_head_sha_for_restart(&owner_repo, pr_number)?;
 
     Ok(PrContext {
         owner_repo,
@@ -76,6 +79,59 @@ fn resolve_pr_context(
         pr_url: pr_url_resolved,
         head_sha,
     })
+}
+
+fn resolve_head_sha_for_restart(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if let Some(value) = resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
+    }
+
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to resolve local HEAD for restart: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "missing local head SHA for PR #{pr_number}; run local FAC dispatch/push first or pass explicit PR context ({})",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let head = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    validate_expected_head_sha(&head)?;
+    Ok(head)
+}
+
+fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
+    for review_type in ["security", "quality"] {
+        let Ok(state) = load_review_run_state(pr_number, review_type) else {
+            continue;
+        };
+        if let ReviewRunStateLoad::Present(entry) = state {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    for review_type in ["security", "quality"] {
+        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
+            continue;
+        };
+        if let Some(entry) = pulse {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    None
 }
 
 // ── Strategy determination ──────────────────────────────────────────────────
@@ -90,16 +146,12 @@ fn determine_restart_strategy(
         return Ok(RestartStrategy::FullRestart);
     }
 
-    let expected_author_login = resolve_authenticated_gh_login();
-    let Some(expected_author_login) = expected_author_login else {
-        return Ok(RestartStrategy::FullRestart);
-    };
-
+    let expected_author_login = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)?;
     let status_opt = find_status_comment(
         owner_repo,
         pr_number,
         head_sha,
-        Some(&expected_author_login),
+        expected_author_login.as_deref(),
     )?;
     let Some((_comment_id, status)) = status_opt else {
         // No status comment for this SHA — either never ran or SHA changed.

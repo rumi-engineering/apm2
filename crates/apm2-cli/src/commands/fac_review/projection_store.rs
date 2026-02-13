@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +123,10 @@ fn identity_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
 
 fn issue_comments_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(pr_dir(owner_repo, pr_number)?.join("issue_comments.json"))
+}
+
+fn issue_comments_lock_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(pr_dir(owner_repo, pr_number)?.join("issue_comments.lock"))
 }
 
 fn reviewer_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
@@ -294,6 +299,27 @@ pub(super) fn upsert_issue_comment_cache_entry(
     body: &str,
     reviewer_login: &str,
 ) -> Result<(), String> {
+    let lock_path = issue_comments_lock_path(owner_repo, pr_number)?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open issue comment cache lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "failed to acquire issue comment cache lock {}: {err}",
+            lock_path.display()
+        )
+    })?;
+
     let mut comments =
         load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)?.unwrap_or_default();
     let entry = serde_json::json!({
@@ -313,7 +339,9 @@ pub(super) fn upsert_issue_comment_cache_entry(
         comments.push(entry);
     }
 
-    save_issue_comments_cache(owner_repo, pr_number, &comments)
+    let write_result = save_issue_comments_cache(owner_repo, pr_number, &comments);
+    drop(lock_file);
+    write_result
 }
 
 pub(super) fn save_trusted_reviewer_id(

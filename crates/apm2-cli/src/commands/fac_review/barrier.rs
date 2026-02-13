@@ -419,6 +419,27 @@ pub fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, Str
     Ok(sha)
 }
 
+pub fn fetch_pr_head_sha_local(pr_number: u32) -> Result<String, String> {
+    let pull_ref = format!("refs/pull/{pr_number}/head");
+    let output = Command::new("git")
+        .args(["ls-remote", "origin", &pull_ref])
+        .output()
+        .map_err(|err| format!("failed to execute git ls-remote for PR head SHA: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-remote failed resolving PR head SHA: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "git ls-remote returned empty PR head SHA".to_string())?;
+    validate_expected_head_sha(sha)?;
+    Ok(sha.to_ascii_lowercase())
+}
+
 pub fn ensure_gh_cli_ready() -> Result<(), String> {
     let output = Command::new("gh")
         .args(["auth", "status"])
@@ -561,131 +582,6 @@ fn patch_issue_comment_body(owner_repo: &str, comment_id: u64, body: &str) -> Re
         ));
     }
     Ok(())
-}
-
-pub fn confirm_review_posted(
-    owner_repo: &str,
-    pr_number: u32,
-    marker: &str,
-    head_sha: &str,
-    expected_author_login: Option<&str>,
-) -> Result<Option<super::types::PostedReview>, String> {
-    let marker_lower = marker.to_ascii_lowercase();
-    let head_sha_lower = head_sha.to_ascii_lowercase();
-    let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
-    let review_type = review_type_for_marker(marker);
-
-    for page in 1..=super::types::COMMENT_CONFIRM_MAX_PAGES {
-        let endpoint =
-            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
-        let output = Command::new("gh")
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-
-        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| format!("failed to parse comments response: {err}"))?;
-        let comments = payload
-            .as_array()
-            .ok_or_else(|| "comments response was not an array".to_string())?;
-        if comments.is_empty() {
-            break;
-        }
-
-        for comment in comments.iter().rev() {
-            let body = comment
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let body_lower = body.to_ascii_lowercase();
-            let has_marker_and_sha =
-                body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower);
-
-            let author_login = comment
-                .get("user")
-                .and_then(|value| value.get("login"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let author_lower = author_login.to_ascii_lowercase();
-
-            if let Some(expected_author) = expected_author_lower.as_deref() {
-                if author_lower != expected_author {
-                    continue;
-                }
-            }
-
-            let id = comment
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if has_marker_and_sha && id != 0 {
-                return Ok(Some(super::types::PostedReview {
-                    id,
-                    verdict: super::detection::extract_verdict_from_comment_body(body),
-                }));
-            }
-
-            let should_generate = review_type.is_some_and(|kind| {
-                id != 0
-                    && comment_matches_review_dimension(&body_lower, kind)
-                    && body_lower.contains(&head_sha_lower)
-            });
-            if !should_generate {
-                continue;
-            }
-
-            let reviewer_id = if author_login.is_empty() {
-                expected_author_login.unwrap_or("unknown")
-            } else {
-                author_login
-            };
-            let generated = render_comment_with_generated_metadata(
-                body,
-                marker,
-                review_type.unwrap_or(""),
-                pr_number,
-                head_sha,
-                reviewer_id,
-            )?;
-            if generated == body {
-                continue;
-            }
-            patch_issue_comment_body(owner_repo, id, &generated)?;
-            return Ok(Some(super::types::PostedReview {
-                id,
-                verdict: super::detection::extract_verdict_from_comment_body(&generated),
-            }));
-        }
-    }
-    Ok(None)
-}
-
-pub fn confirm_review_posted_with_retry(
-    owner_repo: &str,
-    pr_number: u32,
-    marker: &str,
-    head_sha: &str,
-    expected_author_login: Option<&str>,
-) -> Result<Option<super::types::PostedReview>, String> {
-    for attempt in 0..super::types::COMMENT_CONFIRM_MAX_ATTEMPTS {
-        let maybe_review = confirm_review_posted(
-            owner_repo,
-            pr_number,
-            marker,
-            head_sha,
-            expected_author_login,
-        )?;
-        if maybe_review.is_some() {
-            return Ok(maybe_review);
-        }
-        if attempt + 1 < super::types::COMMENT_CONFIRM_MAX_ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]

@@ -3,16 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::target::resolve_pr_target;
 use super::types::{
-    COMMENT_CONFIRM_MAX_PAGES, ReviewRunStatus, TerminationAuthority, apm2_home_dir, now_iso8601,
-    sanitize_for_path, validate_expected_head_sha,
+    ReviewRunStatus, TerminationAuthority, apm2_home_dir, now_iso8601, sanitize_for_path,
+    validate_expected_head_sha,
 };
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
@@ -161,7 +159,6 @@ pub fn run_decision_set(
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
     let normalized_dimension = normalize_dimension(dimension)?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
@@ -207,21 +204,49 @@ pub fn run_decision_set(
         },
     );
 
-    let active_comment_id = if let Some(existing) = latest_any {
-        update_decision_comment(&owner_repo, existing.comment.id, &payload)?;
-        existing.comment.id
+    let mut active_comment_id = latest_any.map_or_else(
+        || allocate_local_comment_id(&comments, resolved_pr),
+        |existing| existing.comment.id,
+    );
+    let mut source_comment_url = Some(format!(
+        "local://fac_projection/{owner_repo}/pr-{resolved_pr}/issue_comments#{active_comment_id}"
+    ));
+    if let Some(existing) = latest_any {
+        match update_decision_comment(&owner_repo, existing.comment.id, &payload) {
+            Ok(()) => {
+                source_comment_url = Some(format!(
+                    "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{}",
+                    existing.comment.id
+                ));
+            },
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to project decision comment update to GitHub for PR #{resolved_pr}: {err}"
+                );
+            },
+        }
     } else {
-        create_decision_comment(&owner_repo, resolved_pr, &payload)?
-    };
+        match create_decision_comment(&owner_repo, resolved_pr, &payload) {
+            Ok(comment_id) => {
+                active_comment_id = comment_id;
+                source_comment_url = Some(format!(
+                    "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{active_comment_id}"
+                ));
+            },
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to project decision comment create to GitHub for PR #{resolved_pr}: {err}"
+                );
+            },
+        }
+    }
 
     let report = build_report_from_payload(
         resolved_pr,
         &head_sha,
         &payload,
         Some(active_comment_id),
-        Some(format!(
-            "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{active_comment_id}"
-        )),
+        source_comment_url.clone(),
         false,
         Vec::new(),
     );
@@ -229,6 +254,7 @@ pub fn run_decision_set(
         &owner_repo,
         resolved_pr,
         active_comment_id,
+        source_comment_url.as_deref(),
         &payload,
         &expected_author_login,
     );
@@ -272,6 +298,21 @@ pub fn run_decision_set(
         &expected_author_login,
         &signature_for_payload(&payload),
     );
+    let home = apm2_home_dir()?;
+    let completion_receipt = super::state::ReviewRunCompletionReceipt {
+        schema: "apm2.review.completion_receipt.v1".to_string(),
+        emitted_at: now_iso8601(),
+        repo: owner_repo,
+        pr_number: resolved_pr,
+        review_type: review_state_type.to_string(),
+        run_id,
+        head_sha: head_sha.clone(),
+        decision: decision.as_str().to_string(),
+        decision_comment_id: active_comment_id,
+        decision_author: expected_author_login,
+        decision_signature: termination_authority.decision_signature.clone(),
+    };
+    super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
 
     let exit_code = match terminate_review_agent(&termination_authority) {
         Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => exit_codes::SUCCESS,
@@ -315,25 +356,39 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "decision.resolve_head_sha",
-        ));
+    if let Some(value) = resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
     }
 
-    ensure_gh_cli_ready()?;
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    let value = value.to_ascii_lowercase();
-    let _ =
-        projection_store::record_fallback_read(owner_repo, pr_number, "decision.resolve_head_sha");
-    let _ = projection_store::save_identity_with_context(
-        owner_repo,
-        pr_number,
-        &value,
-        "gh-fallback:decision.resolve_head_sha",
-    );
-    Ok(value)
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run a local FAC flow that persists identity first"
+    ))
+}
+
+fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
+    for review_type in ["security", "quality"] {
+        let Ok(state) = super::state::load_review_run_state(pr_number, review_type) else {
+            continue;
+        };
+        if let super::state::ReviewRunStateLoad::Present(entry) = state {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    for review_type in ["security", "quality"] {
+        let Ok(pulse) = super::state::read_pulse_file(pr_number, review_type) else {
+            continue;
+        };
+        if let Some(entry) = pulse {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    None
 }
 
 fn normalize_dimension(input: &str) -> Result<&'static str, String> {
@@ -348,47 +403,10 @@ fn normalize_dimension(input: &str) -> Result<&'static str, String> {
 }
 
 fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueComment>, String> {
-    if let Some(cached) =
+    Ok(
         projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
-    {
-        return Ok(cached);
-    }
-
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "decision.fetch_issue_comments",
-        ));
-    }
-
-    ensure_gh_cli_ready()?;
-    let mut collected = Vec::new();
-    for page in 1..=COMMENT_CONFIRM_MAX_PAGES {
-        let endpoint =
-            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
-        let output = Command::new("gh")
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "gh api failed fetching comments: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let page_comments: Vec<IssueComment> = serde_json::from_slice(&output.stdout)
-            .map_err(|err| format!("failed to parse comments response: {err}"))?;
-        if page_comments.is_empty() {
-            break;
-        }
-        collected.extend(page_comments);
-    }
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "decision.fetch_issue_comments",
-    );
-    let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &collected);
-    Ok(collected)
+            .unwrap_or_default(),
+    )
 }
 
 fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
@@ -396,24 +414,26 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         return Ok(cached);
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "decision.resolve_expected_author_login",
-        ));
-    }
-
-    ensure_gh_cli_ready()?;
-    let login = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
-            .to_string()
-    })?;
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "decision.resolve_expected_author_login",
-    );
+    let login = std::env::var("APM2_REVIEWER_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)
+}
+
+fn allocate_local_comment_id(comments: &[IssueComment], pr_number: u32) -> u64 {
+    comments
+        .iter()
+        .map(|comment| comment.id)
+        .max()
+        .unwrap_or_else(|| u64::from(pr_number).saturating_mul(1_000_000_000))
+        .saturating_add(1)
 }
 
 fn parse_decision_comments_for_author(
@@ -865,34 +885,27 @@ fn cache_written_decision_comment(
     owner_repo: &str,
     pr_number: u32,
     comment_id: u64,
+    comment_url: Option<&str>,
     payload: &DecisionComment,
     trusted_login: &str,
 ) -> Result<(), String> {
     let body = render_decision_comment_body(payload)?;
-    let mut comments =
-        projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
-            .unwrap_or_default();
-
-    if let Some(existing) = comments.iter_mut().find(|comment| comment.id == comment_id) {
-        existing.body = body;
-        existing.user = Some(IssueUser {
-            login: trusted_login.to_string(),
-        });
-    } else {
-        comments.push(IssueComment {
-            id: comment_id,
-            body,
-            html_url: format!(
-                "https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"
-            ),
-            created_at: now_iso8601(),
-            user: Some(IssueUser {
-                login: trusted_login.to_string(),
-            }),
-        });
-    }
-
-    projection_store::save_issue_comments_cache(owner_repo, pr_number, &comments)
+    let comment_url = comment_url.map_or_else(
+        || {
+            format!(
+                "local://fac_projection/{owner_repo}/pr-{pr_number}/issue_comments#{comment_id}"
+            )
+        },
+        ToString::to_string,
+    );
+    projection_store::upsert_issue_comment_cache_entry(
+        owner_repo,
+        pr_number,
+        comment_id,
+        &comment_url,
+        &body,
+        trusted_login,
+    )
 }
 
 fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<(), String> {

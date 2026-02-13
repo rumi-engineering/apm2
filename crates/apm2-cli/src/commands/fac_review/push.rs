@@ -463,20 +463,26 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         metadata.title,
         metadata.ticket_path.display()
     );
+    let local_pr_hint = projection_store::load_branch_identity(repo, &branch)
+        .ok()
+        .flatten()
+        .map(|identity| identity.pr_number);
 
-    // Step 1: git push.
-    let push_output = Command::new("git").args(["push", remote, &branch]).output();
+    // Step 1: git push (always force-with-lease for projection branches).
+    let push_output = Command::new("git")
+        .args(["push", "--force-with-lease", remote, &branch])
+        .output();
     match push_output {
         Ok(o) if o.status.success() => {
-            eprintln!("fac push: git push succeeded");
+            eprintln!("fac push: git push --force-with-lease succeeded");
         },
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!("ERROR: git push failed: {stderr}");
+            eprintln!("ERROR: git push --force-with-lease failed: {stderr}");
             return exit_codes::GENERIC_ERROR;
         },
         Err(e) => {
-            eprintln!("ERROR: failed to execute git push: {e}");
+            eprintln!("ERROR: failed to execute git push --force-with-lease: {e}");
             return exit_codes::GENERIC_ERROR;
         },
     }
@@ -492,7 +498,8 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
     };
     eprintln!("fac push: evidence gates PASSED");
 
-    // Step 3: create or update PR.
+    // Step 3: create or update PR (projection best-effort; local truth remains
+    // authoritative).
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
         match create_pr(repo, &metadata.title, &metadata.body) {
@@ -501,16 +508,27 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
                 num
             },
             Err(e) => {
-                eprintln!("ERROR: {e}");
-                return exit_codes::GENERIC_ERROR;
+                if let Some(local_pr) = local_pr_hint {
+                    eprintln!(
+                        "WARNING: failed to create PR projection ({e}); continuing with local PR mapping #{local_pr}"
+                    );
+                    local_pr
+                } else {
+                    eprintln!("ERROR: {e}");
+                    eprintln!(
+                        "ERROR: unable to resolve PR mapping for branch `{branch}`; projection bootstrap requires GitHub availability at least once"
+                    );
+                    return exit_codes::GENERIC_ERROR;
+                }
             },
         }
     } else {
         if let Err(err) = update_pr(repo, pr_number, &metadata.title, &metadata.body) {
-            eprintln!("ERROR: {err}");
-            return exit_codes::GENERIC_ERROR;
+            eprintln!(
+                "WARNING: failed to update PR projection for #{pr_number}: {err} (continuing with local authoritative flow)"
+            );
         }
-        eprintln!("fac push: updated PR #{pr_number}");
+        eprintln!("fac push: using PR #{pr_number}");
         pr_number
     };
     if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {

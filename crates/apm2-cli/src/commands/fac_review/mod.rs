@@ -1145,31 +1145,17 @@ fn run_dispatch_inner(
     force: bool,
 ) -> Result<DispatchSummary, String> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    let current_head_sha =
-        if let Some(identity) = projection_store::load_pr_identity(&owner_repo, pr_number)? {
-            validate_expected_head_sha(&identity.head_sha)?;
-            identity.head_sha.to_ascii_lowercase()
-        } else if projection_store::gh_read_fallback_enabled() {
-            let value = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
-            validate_expected_head_sha(&value)?;
-            let value = value.to_ascii_lowercase();
-            let _ = projection_store::record_fallback_read(
-                &owner_repo,
-                pr_number,
-                "dispatch.resolve_head_sha",
-            );
-            let _ = projection_store::save_identity_with_context(
-                &owner_repo,
-                pr_number,
-                &value,
-                "gh-fallback:dispatch.resolve_head_sha",
-            );
-            value
-        } else {
-            return Err(projection_store::gh_read_fallback_disabled_error(
-                "dispatch.resolve_head_sha",
-            ));
-        };
+    let current_head_sha = if let Some(expected) = expected_head_sha {
+        validate_expected_head_sha(expected)?;
+        expected.to_ascii_lowercase()
+    } else if let Some(identity) = projection_store::load_pr_identity(&owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        identity.head_sha.to_ascii_lowercase()
+    } else {
+        return Err(format!(
+            "missing local head SHA for PR #{pr_number}; pass --head-sha or run local FAC push/dispatch first"
+        ));
+    };
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
         if !expected.eq_ignore_ascii_case(&current_head_sha) {

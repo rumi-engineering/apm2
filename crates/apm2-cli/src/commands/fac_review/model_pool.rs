@@ -3,7 +3,7 @@
 use std::fs::OpenOptions;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use rand::Rng;
@@ -11,9 +11,9 @@ use rand::seq::SliceRandom;
 
 use super::types::{
     DEFAULT_PROVIDER_SLOT_COUNT, ModelPoolEntry, PROVIDER_BACKOFF_BASE_SECS,
-    PROVIDER_BACKOFF_JITTER_MS, PROVIDER_BACKOFF_MAX_SECS, PROVIDER_SLOT_POLL_INTERVAL,
-    PROVIDER_SLOT_WAIT_JITTER_MS, ProviderSlotLease, ReviewBackend, ReviewModelSelection,
-    apm2_home_dir, ensure_parent_dir,
+    PROVIDER_BACKOFF_JITTER_MS, PROVIDER_BACKOFF_MAX_SECS, PROVIDER_SLOT_MAX_WAIT_SECS_DEFAULT,
+    PROVIDER_SLOT_POLL_INTERVAL, PROVIDER_SLOT_WAIT_JITTER_MS, ProviderSlotLease, ReviewBackend,
+    ReviewModelSelection, apm2_home_dir, ensure_parent_dir,
 };
 
 // ── Model pool ──────────────────────────────────────────────────────────────
@@ -197,6 +197,12 @@ fn provider_slot_lock_path(
 
 pub fn acquire_provider_slot(backend: ReviewBackend) -> Result<ProviderSlotLease, String> {
     let slots = provider_slot_count(backend);
+    let max_wait = std::env::var("APM2_FAC_PROVIDER_SLOT_MAX_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PROVIDER_SLOT_MAX_WAIT_SECS_DEFAULT);
+    let deadline = Instant::now() + Duration::from_secs(max_wait);
     loop {
         for slot_index in 0..slots {
             let path = provider_slot_lock_path(backend, slot_index)?;
@@ -227,6 +233,14 @@ pub fn acquire_provider_slot(backend: ReviewBackend) -> Result<ProviderSlotLease
                     ));
                 },
             }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for {} provider slot after {}s (set APM2_FAC_PROVIDER_SLOT_MAX_WAIT_SECS to adjust)",
+                backend.as_str(),
+                max_wait
+            ));
         }
 
         let jitter_millis = rand::thread_rng().gen_range(0..=PROVIDER_SLOT_WAIT_JITTER_MS);

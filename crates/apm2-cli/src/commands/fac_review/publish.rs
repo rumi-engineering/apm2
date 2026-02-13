@@ -5,10 +5,7 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::Serialize;
 
-use super::barrier::{
-    ensure_gh_cli_ready, fetch_pr_head_sha, render_comment_with_generated_metadata,
-    resolve_authenticated_gh_login,
-};
+use super::barrier::{ensure_gh_cli_ready, render_comment_with_generated_metadata};
 use super::github_projection::{self, IssueCommentResponse};
 use super::projection_store;
 use super::target::resolve_pr_target;
@@ -134,24 +131,17 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "publish.resolve_head_sha",
-        ));
+    for review_type in ["security", "quality"] {
+        let state = super::state::load_review_run_state(pr_number, review_type)?;
+        if let super::state::ReviewRunStateLoad::Present(state) = state {
+            validate_expected_head_sha(&state.head_sha)?;
+            return Ok(state.head_sha.to_ascii_lowercase());
+        }
     }
 
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    let value = value.to_ascii_lowercase();
-    let _ =
-        projection_store::record_fallback_read(owner_repo, pr_number, "publish.resolve_head_sha");
-    let _ = projection_store::save_identity_with_context(
-        owner_repo,
-        pr_number,
-        &value,
-        "gh-fallback:publish.resolve_head_sha",
-    );
-    Ok(value)
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run local FAC review first"
+    ))
 }
 
 fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, String> {
@@ -159,20 +149,15 @@ fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, Strin
         return Ok(cached);
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "publish.resolve_reviewer_id",
-        ));
-    }
-
-    let reviewer_id = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for metadata reviewer_id".to_string()
-    })?;
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "publish.resolve_reviewer_id",
-    );
+    let reviewer_id = std::env::var("APM2_REVIEWER_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &reviewer_id);
     Ok(reviewer_id)
 }

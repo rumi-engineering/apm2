@@ -1,16 +1,13 @@
-//! FAC-native review findings retrieval from GitHub projection comments.
-
-use std::process::Command;
+//! FAC-native review findings retrieval from local projection comments.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::projection_store;
 use super::selector::render_finding_selector;
 use super::state::{ReviewRunStateLoad, load_review_run_state, read_pulse_file};
 use super::target::resolve_pr_target;
-use super::types::{COMMENT_CONFIRM_MAX_PAGES, validate_expected_head_sha};
+use super::types::validate_expected_head_sha;
 use crate::exit_codes::codes as exit_codes;
 
 const FINDINGS_SCHEMA: &str = "apm2.fac.review.findings.v1";
@@ -25,7 +22,6 @@ const FINDING_MARKER_PREFIX: &str = "<!-- apm2-finding:v1:";
 #[derive(Debug, Clone)]
 struct IssueCommentsFetch {
     comments: Vec<IssueComment>,
-    from_cache: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,28 +156,13 @@ pub fn run_findings(
     let resolved_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let initial_comments = fetch_issue_comments(&owner_repo, resolved_pr, refresh)?;
-    let mut report = build_findings_report(
+    let report = build_findings_report(
         &owner_repo,
         resolved_pr,
         &resolved_sha,
         &initial_comments.comments,
         &expected_author_login,
     );
-    if !refresh
-        && initial_comments.from_cache
-        && report.fail_closed
-        && projection_store::gh_read_fallback_enabled()
-    {
-        if let Ok(refreshed) = fetch_issue_comments(&owner_repo, resolved_pr, true) {
-            report = build_findings_report(
-                &owner_repo,
-                resolved_pr,
-                &resolved_sha,
-                &refreshed.comments,
-                &expected_author_login,
-            );
-        }
-    }
     emit_report(&report, json_output)?;
 
     if report.fail_closed {
@@ -206,25 +187,38 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "findings.resolve_head_sha",
-        ));
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run local FAC review first"
+    ))
+}
+
+fn fetch_issue_comments(
+    owner_repo: &str,
+    pr_number: u32,
+    _refresh: bool,
+) -> Result<IssueCommentsFetch, String> {
+    let comments =
+        projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
+            .unwrap_or_default();
+    Ok(IssueCommentsFetch { comments })
+}
+
+fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    if let Some(cached) = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)? {
+        return Ok(cached);
     }
 
-    ensure_gh_cli_ready()?;
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    let value = value.to_ascii_lowercase();
-    let _ =
-        projection_store::record_fallback_read(owner_repo, pr_number, "findings.resolve_head_sha");
-    let _ = projection_store::save_identity_with_context(
-        owner_repo,
-        pr_number,
-        &value,
-        "gh-fallback:findings.resolve_head_sha",
-    );
-    Ok(value)
+    let login = std::env::var("APM2_REVIEWER_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "local_reviewer".to_string());
+    let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
+    Ok(login)
 }
 
 fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
@@ -251,87 +245,6 @@ fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
     }
 
     None
-}
-
-fn fetch_issue_comments(
-    owner_repo: &str,
-    pr_number: u32,
-    refresh: bool,
-) -> Result<IssueCommentsFetch, String> {
-    if !refresh {
-        if let Some(cached) =
-            projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
-        {
-            return Ok(IssueCommentsFetch {
-                comments: cached,
-                from_cache: true,
-            });
-        }
-    }
-
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "findings.fetch_issue_comments",
-        ));
-    }
-
-    ensure_gh_cli_ready()?;
-    let mut collected = Vec::new();
-    for page in 1..=COMMENT_CONFIRM_MAX_PAGES {
-        let endpoint =
-            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
-        let output = Command::new("gh")
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "gh api failed fetching comments: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let page_comments: Vec<IssueComment> = serde_json::from_slice(&output.stdout)
-            .map_err(|err| format!("failed to parse comments response: {err}"))?;
-        if page_comments.is_empty() {
-            break;
-        }
-        collected.extend(page_comments);
-    }
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "findings.fetch_issue_comments",
-    );
-    let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &collected);
-    Ok(IssueCommentsFetch {
-        comments: collected,
-        from_cache: false,
-    })
-}
-
-fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
-    if let Some(cached) = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)? {
-        return Ok(cached);
-    }
-
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "findings.resolve_expected_author_login",
-        ));
-    }
-
-    ensure_gh_cli_ready()?;
-    let login = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
-            .to_string()
-    })?;
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "findings.resolve_expected_author_login",
-    );
-    let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
-    Ok(login)
 }
 
 fn build_findings_report(

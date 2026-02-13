@@ -1,0 +1,65 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00603"
+    title: "FAC truth-plane cutover: remove GitHub authority from fac_review core"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements:
+      - "RFC-0028/REQ-0008"
+      - "RFC-0028/REQ-0009"
+      - "RFC-0029/REQ-0008"
+      - "RFC-0029/REQ-0009"
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00602"
+        reason: "Security hardening in terminate/dispatch and run-state integrity is prerequisite context."
+  root_cause_analysis:
+    summary: |
+      fac_review still treats GitHub reads as operational authority in multiple CLI paths
+      (orchestrator completion checks, head-sha resolution, findings/decision read paths,
+      target auto-detection, and dispatch bootstrap). This creates fragile control-plane
+      coupling to external APIs and allows projection outages to cause local lifecycle
+      failures. FAC closure semantics must be local-authoritative and receipt-bound.
+  scope:
+    in_scope:
+      - "Remove GitHub REST authority from orchestrator control flow."
+      - "Use local issue-comment projection cache for completion/dedup checks."
+      - "Use git protocol (`git ls-remote origin refs/pull/<N>/head`) for non-REST SHA checks where needed."
+      - "Remove gh-read fallback branches from decision/findings/publish/target and dispatch head resolution paths."
+      - "Treat GitHub writes as projection-only best effort and keep local FAC progression authoritative."
+      - "Switch `apm2 fac push` branch projection to always use `git push --force-with-lease`."
+      - "Retain immediate GitHub comment projection attempts, but do not allow projection write failures to invalidate local decision authority when local projection artifacts exist."
+      - "Define closure-complete contract as local approvals (FAC receipts) + local merge progression, independent of GitHub merged state."
+      - "Update ticket notes to reflect local-main source-of-truth posture."
+    out_of_scope:
+      - "Replacing GitHub with a fully new external projection sink in this ticket."
+      - "Large daemon-side projection architecture migration beyond fac_review-affecting paths."
+      - "Protected-branch policy redesign on GitHub."
+  plan:
+    steps:
+      - "Patch barrier/orchestrator to remove gh REST read dependencies in run loop and completion checks."
+      - "Patch decision/findings/publish/target/mod dispatch bootstrap to resolve authority from local artifacts only."
+      - "Patch fac push to force-with-lease and projection-best-effort behavior."
+      - "Keep projection adapter writes in github_projection as sink-only integration surface."
+      - "Run formatting, clippy, and fac_review-targeted tests."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "No `gh api` read dependency remains in orchestrator authoritative flow."
+      - "Decision/findings/status paths can operate from local FAC artifacts without GitHub read fallback."
+      - "`fac push` always uses `--force-with-lease`."
+      - "Projection failures are warning-path where local authoritative state already has required identity."
+      - "FAC review tests for touched modules pass."
+  notes:
+    security: |
+      GitHub is a projection sink, not an authority source. Local FAC state, receipts,
+      and local merge progression define control-plane truth. Projection outages must
+      not mutate or roll back local truth.
