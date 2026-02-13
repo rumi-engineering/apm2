@@ -779,7 +779,6 @@ pub(crate) fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
 /// static dispatcher's `AtomicBool` stays synchronized with the broker's
 /// boolean flag. Failure to call this function leaves the dispatcher gate
 /// in its default `false` state (fail-closed).
-///
 // Note: No production caller yet — the daemon startup/health-check loop
 // will invoke this once wired (future ticket). Tested via E2E tests below.
 #[allow(dead_code)]
