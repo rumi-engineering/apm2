@@ -887,6 +887,7 @@ impl DeferredReplayWorker {
         let scope_witness_hash = EventHasher::hash_content(&intent.ledger_head);
         let freshness_policy_hash = EventHasher::hash_content(&intent.ledger_head);
         let stop_budget_profile_digest = capability_manifest_hash;
+        let directory_head_hash = intent.ledger_head;
 
         // Build join input via PrivilegedPcacInputBuilder (RS-42 section 4.1).
         // Risk tier: Tier2Plus (fail-closed — most restrictive because original
@@ -911,7 +912,7 @@ impl DeferredReplayWorker {
                     issued_at_tick,
                     time_authority_ref,
                     ledger_anchor,
-                    intent.ledger_head,
+                    directory_head_hash,
                 );
 
         let policy = PcacPolicyKnobs::default();
@@ -2110,6 +2111,7 @@ mod tests {
 
         insert_test_intent(&buffer, "intent-revoked-001", "work-revoked-001", 0xD0, 800);
         insert_test_backlog(&buffer, "intent-revoked-001", "work-revoked-001", 800);
+        let revocation_head = make_digest(0xAB);
 
         // Create a shared kernel and lifecycle gate.
         let kernel = Arc::new(InProcessKernel::new(1));
@@ -2139,8 +2141,6 @@ mod tests {
                 apm2_core::crypto::EventHasher::hash_content(&intent.ledger_head);
             let freshness_policy_hash =
                 apm2_core::crypto::EventHasher::hash_content(&intent.ledger_head);
-
-            let revocation_head = ledger_anchor;
 
             let join_input =
                 PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::RegisterRecoveryEvidence)
@@ -2212,7 +2212,7 @@ mod tests {
         )
         .expect("worker");
 
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-revoked-001");
+        let intent_anchor = revocation_head;
         let result = worker
             .drain_cycle(1000, make_digest(0xAA), make_digest(0xBB), intent_anchor)
             .expect("drain");
@@ -2267,9 +2267,9 @@ mod tests {
 
         let worker = make_worker(buffer.clone(), resolver, signer);
 
-        // Use same revocation head as what the builder sets for
-        // directory_head_hash (derived from intent_id via ledger_anchor).
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-notrev-001");
+        // Use same revocation head as what the builder sets for directory_head_hash
+        // (via intent ledger_head).
+        let intent_anchor = make_digest(0xAB);
         let result = worker
             .drain_cycle(1000, make_digest(0xAA), make_digest(0xBB), intent_anchor)
             .expect("drain");
