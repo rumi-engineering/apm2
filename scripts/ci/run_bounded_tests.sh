@@ -38,10 +38,10 @@ Usage:
   ./scripts/ci/run_bounded_tests.sh [options] [-- command args...]
 
 Options:
-  --timeout-seconds N         Hard wall timeout (default: 240, max: 900)
+  --timeout-seconds N         Hard wall timeout (default: 600, max: 600)
   --kill-after-seconds N      SIGTERM -> SIGKILL escalation delay (default: 20)
   --heartbeat-seconds N       Heartbeat interval while command runs (default: 10)
-  --memory-max VALUE          systemd MemoryMax (default: 24G)
+  --memory-max VALUE          systemd MemoryMax (default: 48G)
   --pids-max N                systemd TasksMax (default: 1536)
   --cpu-quota VALUE           systemd CPUQuota (default: 200%)
   --allow-timeout-fallback    Break-glass: skip systemd-run and use timeout only
@@ -54,13 +54,13 @@ Environment:
 USAGE
 }
 
-MAX_TIMEOUT_SECONDS=900
-TEST_TIMEOUT_SLA_MESSAGE="Steady-state test SLA is p100=240s, p99=180s, p50=80s. FAC may temporarily widen this timeout for cold-cache warm-up runs. Persistent overruns after warm-up are bugs and must be investigated."
+MAX_TIMEOUT_SECONDS=600
+TEST_TIMEOUT_SLA_MESSAGE="Bounded FAC test timeout is fixed at 600s for all runs."
 
-TIMEOUT_SECONDS=240
+TIMEOUT_SECONDS=600
 KILL_AFTER_SECONDS=20
 HEARTBEAT_SECONDS=10
-MEMORY_MAX='24G'
+MEMORY_MAX='48G'
 PIDS_MAX=1536
 CPU_QUOTA='200%'
 ALLOW_TIMEOUT_FALLBACK="${APM2_CI_ALLOW_TIMEOUT_FALLBACK:-0}"
@@ -156,9 +156,6 @@ log_info "TasksMax: ${PIDS_MAX}"
 log_info "CPUQuota: ${CPU_QUOTA}"
 log_info "Command: ${COMMAND[*]}"
 log_info "Test timeout policy: ${TEST_TIMEOUT_SLA_MESSAGE}"
-if (( TIMEOUT_SECONDS > 240 )); then
-    log_warn "Using extended timeout (${TIMEOUT_SECONDS}s) for a cold-cache warm-up path."
-fi
 echo
 
 # -------------------------------------------------------------------

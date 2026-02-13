@@ -52,7 +52,11 @@ tempfile.workspace = true
 chrono.workspace = true
 regex.workspace = true
 fs2 = "0.4"
-rand.workspace = true
+hmac = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+hex = "0.4"
 libc.workspace = true
 
 # Security / Credentials
@@ -61,9 +65,7 @@ secrecy.workspace = true
 
 # Cryptographic hashing
 blake3.workspace = true
-sha2.workspace = true
-hex.workspace = true
-subtle.workspace = true
+
 
 [lints]
 workspace = true

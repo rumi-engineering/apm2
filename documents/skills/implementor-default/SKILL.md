@@ -223,11 +223,18 @@ decision_tree:
 
     - id: VERIFY_WITH_FAC
       purpose: "Run deterministic merge-gate verification via FAC. Default mode runs gates locally using `apm2 fac gates`."
-      steps[7]:
+      CRITICAL_PREREQUISITE: |
+        ALL changes MUST be committed before running `apm2 fac gates` in full mode or `apm2 fac push`.
+        These commands WILL FAIL on a dirty working tree. Build artifacts are attested against
+        the committed HEAD SHA and reused as a source of truth — uncommitted changes produce
+        unattestable results. Commit first, then run gates/push.
+      steps[10]:
         - id: RUN_FAC_GATES_QUICK
-          action: "During active edits, run `apm2 fac gates --quick` for short-loop validation."
+          action: "During active edits, run `apm2 fac gates --quick` for short-loop validation (dirty tree OK for --quick only)."
         - id: RUN_FAC_GATES_FULL
-          action: "Immediately before push, run `apm2 fac gates`."
+          action: |
+            COMMIT ALL CHANGES FIRST, then run `apm2 fac gates`. Full gates require a clean working tree — no uncommitted, staged, or untracked files.
+            Immediately before push, run `apm2 fac gates`.
         - id: VERIFY_GATE_HEALTH
           action: |
             If gates fail to start, check: (1) evidence log directory exists: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`; (2) process health: `systemctl --user status apm2-daemon`; (3) disk space: `df -h`. If disk is full, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`.
@@ -243,20 +250,17 @@ decision_tree:
             - Re-run gates after cleanup: `apm2 fac gates`.
             Note: Queue-based quarantine/denial is PLANNED for the FESv1 queue/worker surface and does not apply to current local gate execution.
         - id: FIX_AND_RERUN
-          action: "Fix failures and re-run gates (`--quick` during iteration, full `apm2 fac gates` before push) until PASS or BLOCKED."
-      next: HANDLE_FAC_FAILURES
-
-    - id: HANDLE_FAC_FAILURES
-      purpose: "Respond to FAC gate execution failures: disk pressure, build errors, and evidence log issues."
-      steps[3]:
+          action: |
+            Fix failures, COMMIT, and re-run gates (`--quick` during iteration, full `apm2 fac gates` after committing before push) until PASS or BLOCKED.
         - id: HANDLE_DISK_PRESSURE
           action: |
             If gate execution fails due to disk exhaustion, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and build caches: `rm -rf target/`. Check disk usage: `df -h` and `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/"`.
         - id: HANDLE_BUILD_FAILURES
           action: |
-            If gates fail due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output. Common causes: missing dependencies, stale Cargo.lock, compiler version mismatch. Fix the root cause and re-run `apm2 fac gates`.
+            If gates fail due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output. Common causes: missing dependencies, stale Cargo.lock, compiler version mismatch.
         - id: ESCALATE_IF_BLOCKED
-          action: "If gate execution cannot be restored to a passing state, mark the task BLOCKED with concrete evidence (log excerpts, receipt hashes) and escalate."
+          action: |
+            If gate execution cannot be restored to a passing state, mark the task BLOCKED with concrete evidence (log excerpts, receipt hashes) and escalate.
       next: UPDATE_AGENTS_DOCS
 
     - id: UPDATE_AGENTS_DOCS
@@ -271,19 +275,24 @@ decision_tree:
       next: COMMIT
 
     - id: COMMIT
-      purpose: "Stage and commit all work before push — apm2 fac push only pushes existing commits."
+      purpose: |
+        MANDATORY: Stage and commit ALL work before gates or push.
+        `apm2 fac gates` and `apm2 fac push` WILL FAIL on a dirty working tree.
+        Build artifacts are attested against the committed HEAD SHA and reused as
+        a source of truth — uncommitted changes make attestation impossible.
+        There is NO workaround. Commit everything first.
       steps[2]:
         - id: STAGE_ALL_CHANGES
-          action: "Run `git add -A` to stage implementation code, test additions, and AGENTS.md updates."
+          action: "Run `git add -A` to stage ALL changes — implementation code, test additions, AGENTS.md updates, and any other modified files. Do NOT leave files unstaged."
         - id: CREATE_COMMIT
-          action: "Run `git commit` with a concise message summarizing what changed and why."
+          action: "Run `git commit` with a concise message summarizing what changed and why. Verify with `git status` that the tree is clean (no modified, staged, or untracked files remain)."
       next: PUSH
 
     - id: PUSH
-      purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures."
+      purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures. Requires a clean committed tree."
       steps[4]:
         - id: RUN_FAC_PUSH
-          action: "`apm2 fac push` only pushes committed work — it will not stage or commit for you. Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
+          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
         - id: CAPTURE_PR_CONTEXT
           action: "Capture PR number/URL from `apm2 fac push` output for monitoring and restart."
         - id: HANDLE_PUSH_FAILURE
@@ -305,7 +314,10 @@ decision_tree:
         - id: DONE
           action: "output DONE and nothing else, your task is complete."
 
-invariants[14]:
+invariants[15]:
+  # Clean Tree Invariant (HIGHEST PRIORITY — agents repeatedly violate this)
+  - "NEVER run `apm2 fac gates` (full) or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL. `--quick` mode is the ONLY exception."
+
   - "Do not ship fail-open defaults for missing, stale, unknown, or unverifiable authority/security state."
   - "Do not rely on shape-only validation for trust decisions; validate authenticity and binding claims."
   - "Do not mutate durable or single-use state before all deny gates that can reject the operation."

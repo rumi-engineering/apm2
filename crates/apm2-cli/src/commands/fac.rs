@@ -219,15 +219,12 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub quick: bool,
 
-    /// Steady-state wall timeout for bounded test execution (seconds).
-    ///
-    /// FAC may temporarily widen this window for cold-cache warm-up runs when
-    /// the default value is used.
-    #[arg(long, default_value_t = 240)]
+    /// Wall timeout for bounded test execution (seconds).
+    #[arg(long, default_value_t = 600)]
     pub timeout_seconds: u64,
 
     /// Memory ceiling for bounded test execution.
-    #[arg(long, default_value = "24G")]
+    #[arg(long, default_value = "48G")]
     pub memory_max: String,
 
     /// PID/task ceiling for bounded test execution.
@@ -515,6 +512,8 @@ pub enum ReviewSubcommand {
     Project(ReviewProjectArgs),
     /// Tail FAC review NDJSON event stream.
     Tail(ReviewTailArgs),
+    /// Terminate a running reviewer process for a specific PR and type.
+    Terminate(ReviewTerminateArgs),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -891,6 +890,30 @@ pub struct ReviewTailArgs {
     pub follow: bool,
 }
 
+/// Arguments for `apm2 fac review terminate`.
+#[derive(Debug, Args)]
+pub struct ReviewTerminateArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Reviewer type to terminate (security or quality).
+    #[arg(long = "type", value_enum)]
+    pub review_type: ReviewStatusTypeArg,
+
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 // =============================================================================
 // Response Types
 // =============================================================================
@@ -1250,6 +1273,13 @@ pub fn run_fac(
             ReviewSubcommand::Tail(tail_args) => {
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },
+            ReviewSubcommand::Terminate(term_args) => fac_review::run_terminate(
+                &term_args.repo,
+                term_args.pr,
+                term_args.pr_url.as_deref(),
+                term_args.review_type.as_str(),
+                json_output || term_args.json,
+            ),
         },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
     }

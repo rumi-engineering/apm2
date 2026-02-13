@@ -417,7 +417,7 @@ mod tests {
         let workspace_root = std::env::current_dir().expect("cwd");
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
-        let policy = GateResourcePolicy::from_cli(false, 240, "24G", 1536, "200%", true);
+        let policy = GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true);
 
         let one = compute_gate_attestation(
             &workspace_root,

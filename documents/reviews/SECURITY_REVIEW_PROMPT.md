@@ -12,6 +12,14 @@ outputs[2]:
   - ReviewCommentProjection
   - DecisionProjection
 
+constraints:
+  forbidden_operations:
+    - "NEVER run git commands that modify worktree state (git reset, git checkout, git clean, git stash, git rebase, git merge, git cherry-pick, git commit, git push, git pull, git fetch)."
+    - "NEVER run gh commands that modify PR state (gh pr merge, gh pr close, gh pr edit)."
+    - "NEVER use direct gh or git commands for any purpose. All repository and GitHub interactions MUST go through apm2 fac review commands exclusively."
+    - "If the worktree is dirty or in a conflicted state, STOP and report the issue — do not attempt to fix it."
+    - "All interactions with the repository MUST be read-only."
+
 metadata_contract:
   invariants[3]:
     - '"head_sha" MUST equal reviewed_sha.'

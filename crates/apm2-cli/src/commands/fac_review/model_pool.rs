@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 use super::types::{
     DEFAULT_PROVIDER_SLOT_COUNT, ModelPoolEntry, PROVIDER_BACKOFF_BASE_SECS,
@@ -17,7 +18,7 @@ use super::types::{
 
 // ── Model pool ──────────────────────────────────────────────────────────────
 
-pub const MODEL_POOL: [ModelPoolEntry; 3] = [
+pub const MODEL_POOL: [ModelPoolEntry; 4] = [
     ModelPoolEntry {
         model: "gemini-3-flash-preview",
         backend: ReviewBackend::Gemini,
@@ -28,6 +29,10 @@ pub const MODEL_POOL: [ModelPoolEntry; 3] = [
     },
     ModelPoolEntry {
         model: "gpt-5.3-codex",
+        backend: ReviewBackend::Codex,
+    },
+    ModelPoolEntry {
+        model: "gpt-5.3-codex-spark",
         backend: ReviewBackend::Codex,
     },
 ];
@@ -59,7 +64,7 @@ fn normalize_review_model_selection(selection: ReviewModelSelection) -> ReviewMo
             model: normalize_gemini_model(&selection.model).to_string(),
             backend: ReviewBackend::Gemini,
         },
-        ReviewBackend::Codex => selection,
+        ReviewBackend::Codex | ReviewBackend::ClaudeCode => selection,
     }
 }
 
@@ -74,11 +79,15 @@ pub fn select_review_model_random() -> ReviewModelSelection {
 }
 
 pub fn select_fallback_model(failed: &str) -> Option<ReviewModelSelection> {
-    let current_idx = MODEL_POOL
+    let candidates: Vec<_> = MODEL_POOL
         .iter()
-        .position(|entry| entry.model.eq_ignore_ascii_case(failed))?;
-    let next_idx = (current_idx + 1) % MODEL_POOL.len();
-    let next = MODEL_POOL[next_idx];
+        .filter(|entry| !entry.model.eq_ignore_ascii_case(failed))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let idx = rand::thread_rng().gen_range(0..candidates.len());
+    let next = candidates[idx];
     Some(ReviewModelSelection {
         model: next.model.to_string(),
         backend: next.backend,
@@ -86,19 +95,22 @@ pub fn select_fallback_model(failed: &str) -> Option<ReviewModelSelection> {
 }
 
 pub fn select_cross_family_fallback(failed: &str) -> Option<ReviewModelSelection> {
-    let current_idx = MODEL_POOL
+    let current_backend = MODEL_POOL
         .iter()
-        .position(|entry| entry.model.eq_ignore_ascii_case(failed))?;
-    let current = MODEL_POOL[current_idx];
-    for offset in 1..MODEL_POOL.len() {
-        let idx = (current_idx + offset) % MODEL_POOL.len();
-        let candidate = MODEL_POOL[idx];
-        if candidate.backend != current.backend {
-            return Some(ReviewModelSelection {
-                model: candidate.model.to_string(),
-                backend: candidate.backend,
-            });
-        }
+        .find(|entry| entry.model.eq_ignore_ascii_case(failed))
+        .map(|entry| entry.backend);
+    let candidates: Vec<_> = MODEL_POOL
+        .iter()
+        .filter(|entry| !entry.model.eq_ignore_ascii_case(failed))
+        .filter(|entry| current_backend.is_none_or(|backend| entry.backend != backend))
+        .collect();
+    if !candidates.is_empty() {
+        let idx = rand::thread_rng().gen_range(0..candidates.len());
+        let selected = candidates[idx];
+        return Some(ReviewModelSelection {
+            model: selected.model.to_string(),
+            backend: selected.backend,
+        });
     }
     select_fallback_model(failed)
 }
@@ -113,20 +125,23 @@ pub fn ensure_model_backend_available(
         return Ok(selection);
     }
 
-    let mut candidate = selection;
-    for _ in 0..MODEL_POOL.len() {
-        let fallback = normalize_review_model_selection(
-            select_fallback_model(&candidate.model)
-                .ok_or_else(|| "could not select fallback model".to_string())?,
-        );
-        if backend_tool_available(fallback.backend) {
-            return Ok(fallback);
+    let mut candidates: Vec<_> = MODEL_POOL
+        .iter()
+        .filter(|entry| !entry.model.eq_ignore_ascii_case(&selection.model))
+        .collect();
+    candidates.shuffle(&mut rand::thread_rng());
+    for entry in candidates {
+        let normalized = normalize_review_model_selection(ReviewModelSelection {
+            model: entry.model.to_string(),
+            backend: entry.backend,
+        });
+        if backend_tool_available(normalized.backend) {
+            return Ok(normalized);
         }
-        candidate = fallback;
     }
 
     Err(
-        "no configured review backend tool is available (need codex and/or gemini in PATH)"
+        "no configured review backend tool is available (need codex, gemini, and/or claude in PATH)"
             .to_string(),
     )
 }
@@ -135,6 +150,7 @@ pub fn backend_tool_available(backend: ReviewBackend) -> bool {
     let tool = match backend {
         ReviewBackend::Codex => "codex",
         ReviewBackend::Gemini => "gemini",
+        ReviewBackend::ClaudeCode => "claude",
     };
     Command::new("sh")
         .args(["-lc", &format!("command -v {tool} >/dev/null 2>&1")])
@@ -148,6 +164,7 @@ pub fn provider_slot_count(backend: ReviewBackend) -> usize {
     let key = match backend {
         ReviewBackend::Codex => "APM2_FAC_CODEX_SLOTS",
         ReviewBackend::Gemini => "APM2_FAC_GEMINI_SLOTS",
+        ReviewBackend::ClaudeCode => "APM2_FAC_CLAUDE_CODE_SLOTS",
     };
     std::env::var(key)
         .ok()

@@ -107,11 +107,11 @@ mod tests {
         let (repo, pr) = resolve_pr_target(
             "owner/repo",
             None,
-            Some("https://github.com/guardian-intelligence/apm2/pull/123"),
+            Some("https://github.com/test-org/test-repo/pull/42"),
         )
         .expect("target");
-        assert_eq!(repo, "guardian-intelligence/apm2");
-        assert_eq!(pr, 123);
+        assert_eq!(repo, "test-org/test-repo");
+        assert_eq!(pr, 42);
     }
 
     #[test]
@@ -119,10 +119,10 @@ mod tests {
         let err = resolve_pr_target(
             "owner/repo",
             Some(100),
-            Some("https://github.com/guardian-intelligence/apm2/pull/101"),
+            Some("https://github.com/test-org/test-repo/pull/99"),
         )
         .expect_err("mismatch should fail");
         assert!(err.contains("--pr=100"));
-        assert!(err.contains("#101"));
+        assert!(err.contains("#99"));
     }
 }

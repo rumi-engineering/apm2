@@ -380,6 +380,7 @@ fn run_single_review(
         previous_head_sha: None,
         pid: None,
         proc_start_time: None,
+        integrity_hmac: None,
     };
 
     let emit_run_event =

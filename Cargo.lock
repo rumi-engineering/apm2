@@ -117,6 +117,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "hmac",
  "keyring",
  "libc",
  "prost",

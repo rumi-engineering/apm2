@@ -875,6 +875,219 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
     }
 }
 
+pub fn run_terminate(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type: &str,
+    json_output: bool,
+) -> u8 {
+    match run_terminate_inner(repo, pr_number, pr_url, review_type, json_output) {
+        Ok(()) => exit_codes::SUCCESS,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "terminate_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+fn run_terminate_inner(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type: &str,
+    json_output: bool,
+) -> Result<(), String> {
+    let home = types::apm2_home_dir()?;
+    run_terminate_inner_for_home(&home, repo, pr_number, pr_url, review_type, json_output)
+}
+
+fn run_terminate_inner_for_home(
+    home: &Path,
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type: &str,
+    json_output: bool,
+) -> Result<(), String> {
+    let (owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
+    let state_opt =
+        state::load_review_run_state_verified_strict_for_home(home, resolved_pr, review_type)?;
+
+    let Some(mut run_state) = state_opt else {
+        let msg = format!("no active reviewer for PR #{resolved_pr} type={review_type}");
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "no_active_reviewer",
+                    "pr_number": resolved_pr,
+                    "review_type": review_type,
+                    "message": msg,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
+        return Ok(());
+    };
+
+    if run_state.status.is_terminal() {
+        let msg = format!(
+            "reviewer already terminal for PR #{resolved_pr} type={review_type} status={} reason={}",
+            run_state.status.as_str(),
+            run_state.terminal_reason.as_deref().unwrap_or("none"),
+        );
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "already_terminal",
+                    "pr_number": resolved_pr,
+                    "review_type": review_type,
+                    "run_status": run_state.status.as_str(),
+                    "terminal_reason": run_state.terminal_reason,
+                    "message": msg,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
+        return Ok(());
+    }
+
+    let Some(state_repo) = state::extract_repo_from_pr_url(&run_state.pr_url) else {
+        let msg = format!(
+            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: unable to parse owner/repo from run-state pr_url {}",
+            run_state.pr_url
+        );
+        eprintln!("WARNING: {msg}");
+        return Err(msg);
+    };
+    if !state_repo.eq_ignore_ascii_case(owner_repo.as_str()) {
+        let msg = format!(
+            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: run-state repo={state_repo} requested repo={owner_repo}"
+        );
+        eprintln!("WARNING: {msg}");
+        return Err(msg);
+    }
+
+    if run_state.status == types::ReviewRunStatus::Alive && run_state.pid.is_none() {
+        return Err(
+            "cannot terminate: run state is Alive but PID is missing - operator must investigate."
+                .to_string(),
+        );
+    }
+
+    if run_state.pid.is_some() && run_state.proc_start_time.is_some() {
+        if let Err(integrity_err) =
+            state::verify_review_run_state_integrity_binding(home, &run_state)
+        {
+            return Err(format!(
+                "integrity verification failed for PR #{resolved_pr} type={review_type}: {integrity_err} -- \
+                 refusing to terminate based on potentially tampered state"
+            ));
+        }
+    }
+
+    let authority = decision::resolve_termination_authority_for_home(
+        home,
+        &owner_repo,
+        resolved_pr,
+        review_type,
+        &run_state.head_sha,
+        &run_state.run_id,
+    )
+    .map_err(|err| {
+        format!(
+            "decision-bound authority required for PR #{resolved_pr} type={review_type} termination: {err}"
+        )
+    })?;
+    authority.matches_state(&run_state).map_err(|err| {
+        format!("decision authority mismatch for PR #{resolved_pr} type={review_type}: {err}")
+    })?;
+    if !authority.decision_signature_present() {
+        return Err(format!(
+            "decision-bound authority required for PR #{resolved_pr} type={review_type}: missing decision signature"
+        ));
+    }
+
+    let mut killed = false;
+    if let Some(pid) = run_state.pid {
+        if state::is_process_alive(pid) {
+            dispatch::verify_process_identity(pid, run_state.proc_start_time)?;
+            dispatch::terminate_process_with_timeout(pid)?;
+            killed = true;
+        }
+    }
+
+    run_state.status = types::ReviewRunStatus::Failed;
+    run_state.terminal_reason = Some("manual_termination_decision_bound".to_string());
+    state::write_review_run_state_for_home(home, &run_state)?;
+
+    let receipt = state::ReviewRunTerminationReceipt {
+        emitted_at: types::now_iso8601(),
+        repo: owner_repo,
+        pr_number: resolved_pr,
+        review_type: review_type.to_string(),
+        run_id: run_state.run_id.clone(),
+        head_sha: run_state.head_sha.clone(),
+        decision_comment_id: authority.decision_comment_id,
+        decision_author: authority.decision_author.clone(),
+        decision_signature: authority.decision_signature.clone(),
+        outcome: if killed {
+            "killed".to_string()
+        } else {
+            "already_dead".to_string()
+        },
+        outcome_reason: Some(format!(
+            "manual_termination via `apm2 fac review terminate` decision_comment_id={}",
+            authority.decision_comment_id
+        )),
+    };
+    state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "terminated",
+                "pr_number": resolved_pr,
+                "review_type": review_type,
+                "run_id": run_state.run_id,
+                "pid": run_state.pid,
+                "process_killed": killed,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        let pid_info = run_state
+            .pid
+            .map_or_else(|| "no-pid".to_string(), |p| p.to_string());
+        eprintln!(
+            "terminated reviewer PR #{resolved_pr} type={review_type} \
+             run_id={} pid={pid_info} killed={killed}",
+            run_state.run_id
+        );
+    }
+
+    Ok(())
+}
+
 pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
     push::run_push(repo, remote, branch, ticket)
 }
@@ -1309,6 +1522,8 @@ fn run_tail_inner(lines: usize, follow: bool) -> Result<(), String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use chrono::Utc;
 
@@ -1330,12 +1545,58 @@ mod tests {
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
         EVENT_ROTATE_BYTES, FacEventContext, ProjectionStatus, ReviewBackend, ReviewKind,
-        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, default_review_type,
-        now_iso8601_millis,
+        ReviewRunState, ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model,
+        default_review_type, now_iso8601_millis,
     };
     use super::{
         review_types_all_terminal, review_types_terminal_done, review_types_terminal_failed,
     };
+
+    static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
+
+    fn next_test_pr() -> u32 {
+        TEST_PR_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn sample_run_state(
+        pr_number: u32,
+        pid: u32,
+        head_sha: &str,
+        proc_start_time: Option<u64>,
+    ) -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s1-01234567".to_string(),
+            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: "2026-02-10T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(pid),
+            proc_start_time,
+            integrity_hmac: None,
+        }
+    }
+
+    fn spawn_persistent_process() -> std::process::Child {
+        Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn persistent process")
+    }
+
+    fn kill_child(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     fn dead_pid_for_test() -> u32 {
         let mut child = std::process::Command::new("sh")
@@ -1345,6 +1606,83 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    fn projection_pr_dir_for_home(
+        home: &std::path::Path,
+        owner_repo: &str,
+        pr_number: u32,
+    ) -> PathBuf {
+        home.join("fac_projection")
+            .join("repos")
+            .join(super::types::sanitize_for_path(owner_repo))
+            .join(format!("pr-{pr_number}"))
+    }
+
+    fn seed_decision_projection_for_terminate(
+        home: &std::path::Path,
+        owner_repo: &str,
+        pr_number: u32,
+        review_type: &str,
+        head_sha: &str,
+        reviewer_login: &str,
+        comment_id: u64,
+    ) {
+        let pr_dir = projection_pr_dir_for_home(home, owner_repo, pr_number);
+        std::fs::create_dir_all(&pr_dir).expect("create projection pr dir");
+        let dimension = if review_type.eq_ignore_ascii_case("quality") {
+            "code-quality"
+        } else {
+            "security"
+        };
+        let decision_yaml = serde_yaml::to_string(&serde_json::json!({
+            "schema": "apm2.review.decision.v1",
+            "pr": pr_number,
+            "sha": head_sha,
+            "updated_at": "2026-02-13T00:00:00Z",
+            "dimensions": {
+                dimension: {
+                    "decision": "approve",
+                    "reason": "test decision authority",
+                    "set_by": reviewer_login,
+                    "set_at": "2026-02-13T00:00:00Z"
+                }
+            }
+        }))
+        .expect("serialize decision yaml");
+        let body = format!("<!-- apm2-review-decision:v1 -->\n```yaml\n{decision_yaml}```\n");
+        let issue_comments_payload = serde_json::json!({
+            "schema": "apm2.fac.projection.issue_comments.v1",
+            "owner_repo": owner_repo,
+            "pr_number": pr_number,
+            "updated_at": "2026-02-13T00:00:00Z",
+            "comments": [
+                {
+                    "id": comment_id,
+                    "body": body,
+                    "html_url": format!("https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"),
+                    "created_at": "2026-02-13T00:00:00Z",
+                    "user": {
+                        "login": reviewer_login
+                    }
+                }
+            ]
+        });
+        let reviewer_payload = serde_json::json!({
+            "schema": "apm2.fac.projection.reviewer.v1",
+            "reviewer_id": reviewer_login,
+            "updated_at": "2026-02-13T00:00:00Z"
+        });
+        std::fs::write(
+            pr_dir.join("issue_comments.json"),
+            serde_json::to_vec_pretty(&issue_comments_payload).expect("serialize issue comments"),
+        )
+        .expect("write issue comments projection");
+        std::fs::write(
+            pr_dir.join("reviewer.json"),
+            serde_json::to_vec_pretty(&reviewer_payload).expect("serialize reviewer projection"),
+        )
+        .expect("write reviewer projection");
     }
 
     #[test]
@@ -1364,23 +1702,29 @@ mod tests {
     }
 
     #[test]
-    fn test_select_fallback_model_cycles() {
-        let next = select_fallback_model("gemini-3-flash-preview")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3-pro-preview");
-
-        let next = select_fallback_model("gemini-3-pro-preview")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gpt-5.3-codex");
-
-        let next =
-            select_fallback_model("gpt-5.3-codex").expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3-flash-preview");
+    fn test_select_fallback_model_excludes_failed_and_covers_pool() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let fallback = select_fallback_model("gpt-5.3-codex")
+                .expect("known model should produce fallback");
+            assert_ne!(fallback.model, "gpt-5.3-codex", "must exclude failed model");
+            seen.insert(fallback.model.clone());
+        }
+        assert!(seen.contains("gemini-3-flash-preview"));
+        assert!(seen.contains("gemini-3-pro-preview"));
+        assert!(seen.contains("gpt-5.3-codex-spark"));
     }
 
     #[test]
-    fn test_select_fallback_model_unknown_returns_none() {
-        assert!(select_fallback_model("unknown-model").is_none());
+    fn test_select_fallback_model_unknown_returns_pool_member() {
+        let fallback =
+            select_fallback_model("unknown-model").expect("unknown failure should still fallback");
+        assert!(
+            MODEL_POOL
+                .iter()
+                .map(|entry| entry.model)
+                .any(|candidate| candidate == fallback.model.as_str())
+        );
     }
 
     #[test]
@@ -1473,6 +1817,18 @@ mod tests {
         );
         assert!(gemini.contains("gemini -m"));
         assert!(gemini.contains("stream-json"));
+
+        let claude = build_script_command_for_backend(
+            ReviewBackend::ClaudeCode,
+            prompt,
+            log,
+            "claude-3-7-sonnet",
+            None,
+        );
+        assert!(claude.contains("claude"));
+        assert!(claude.contains("--output-format json"));
+        assert!(claude.contains("--permission-mode plan"));
+        assert!(!claude.contains("-p \"$(cat"));
     }
 
     #[test]
@@ -1610,6 +1966,322 @@ mod tests {
         .to_string();
         std::fs::write(&path, line).expect("write source-dump denied marker log");
         assert!(!detect_comment_permission_denied(&path));
+    }
+
+    #[test]
+    fn test_run_terminate_inner_skips_when_proc_start_time_missing() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("integrity"));
+        assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_skips_when_proc_start_time_mismatched() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let observed_start = super::state::get_process_start_time(pid).expect("read start time");
+        let head_sha = "abcdef1234567890abcdef1234567890abcdef12";
+        let state = sample_run_state(pr_number, pid, head_sha, Some(observed_start + 1));
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+        seed_decision_projection_for_terminate(
+            home,
+            "example/repo",
+            pr_number,
+            "security",
+            head_sha,
+            "test-reviewer",
+            43,
+        );
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("identity mismatch"));
+        assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_when_pid_missing_for_alive_state() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let mut state = sample_run_state(pr_number, 0, "abcdef1234567890", Some(123_456_789));
+        state.pid = None;
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("PID is missing"));
+
+        let loaded = super::state::load_review_run_state_for_home(home, pr_number, "security")
+            .expect("load run-state");
+        let state = match loaded {
+            super::state::ReviewRunStateLoad::Present(state) => state,
+            other => panic!("expected present state, got {other:?}"),
+        };
+        assert_eq!(state.status, ReviewRunStatus::Alive);
+        assert!(state.pid.is_none());
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_skips_when_repo_mismatch() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
+        let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "owner/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "repo mismatch should now be treated as a failure"
+        );
+        let error = result.expect_err("repo mismatch should be surfaced as an error");
+        assert!(error.contains("repo mismatch"));
+        assert!(super::state::is_process_alive(pid));
+
+        let loaded = super::state::load_review_run_state_for_home(home, pr_number, "security")
+            .expect("load run-state");
+        let state = match loaded {
+            super::state::ReviewRunStateLoad::Present(state) => state,
+            other => panic!("expected present state, got {other:?}"),
+        };
+        assert_eq!(state.status, ReviewRunStatus::Alive);
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_when_repo_parse_failed() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
+        let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state.pr_url = "https://github.com/not-a-repo-url".to_string();
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "repo parse failure should now be treated as an error"
+        );
+        let error = result.expect_err("repo parse failure should be surfaced as an error");
+        assert!(error.contains("unable to parse owner/repo"));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_on_integrity_mismatch() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read run state json"))
+                .expect("parse run state json");
+        tampered["head_sha"] = serde_json::json!("fedcba0987654321");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&tampered).expect("serialize tampered run state"),
+        )
+        .expect("write tampered state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("integrity verification failed"));
+        assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_writes_manual_termination_receipt() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
+        let dead_pid = dead_pid_for_test();
+        let state = sample_run_state(
+            pr_number,
+            dead_pid,
+            "abcdef1234567890abcdef1234567890abcdef12",
+            Some(123_456_789),
+        );
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+        seed_decision_projection_for_terminate(
+            home,
+            "example/repo",
+            pr_number,
+            "security",
+            &state.head_sha,
+            "test-reviewer",
+            42,
+        );
+
+        super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        )
+        .expect("terminate should succeed");
+
+        let receipt_path = state_path
+            .parent()
+            .expect("state parent")
+            .join("termination_receipt.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&receipt_path).expect("read termination receipt"),
+        )
+        .expect("parse termination receipt");
+        assert_eq!(receipt["repo"], serde_json::json!("example/repo"));
+        assert_eq!(receipt["review_type"], serde_json::json!("security"));
+        assert_eq!(receipt["outcome"], serde_json::json!("already_dead"));
+        assert_eq!(receipt["decision_comment_id"], serde_json::json!(42));
+        assert_eq!(
+            receipt["decision_author"],
+            serde_json::json!("test-reviewer")
+        );
+        assert_eq!(
+            receipt["decision_signature"],
+            serde_json::json!("security:approve|code-quality:missing")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(receipt_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_without_decision_projection() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let dead_pid = dead_pid_for_test();
+        let state = sample_run_state(
+            pr_number,
+            dead_pid,
+            "abcdef1234567890abcdef1234567890abcdef12",
+            Some(123_456_789),
+        );
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "terminate must fail without decision authority"
+        );
+        let error = result.expect_err("expected decision authority error");
+        assert!(
+            error.contains("decision-bound authority required"),
+            "unexpected error detail: {error}"
+        );
+        assert!(
+            error.contains("missing decision projection")
+                || error.contains("failed to read reviewer projection"),
+            "unexpected error detail: {error}"
+        );
     }
 
     #[test]

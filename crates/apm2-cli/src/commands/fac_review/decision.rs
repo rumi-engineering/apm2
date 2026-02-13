@@ -1,6 +1,8 @@
 //! FAC-native per-dimension decision projection (`approve` / `deny`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::ValueEnum;
@@ -8,12 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::target::resolve_pr_target;
-use super::types::{COMMENT_CONFIRM_MAX_PAGES, now_iso8601, validate_expected_head_sha};
+use super::types::{
+    COMMENT_CONFIRM_MAX_PAGES, ReviewRunStatus, TerminationAuthority, apm2_home_dir, now_iso8601,
+    sanitize_for_path, validate_expected_head_sha,
+};
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-decision:v1";
 const DECISION_SCHEMA: &str = "apm2.review.decision.v1";
+const PROJECTION_ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
+const PROJECTION_REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 
 const SECURITY_DIMENSION: &str = "security";
 const CODE_QUALITY_DIMENSION: &str = "code-quality";
@@ -76,6 +83,24 @@ struct IssueUser {
 struct ParsedDecisionComment {
     comment: IssueComment,
     payload: DecisionComment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionIssueCommentsCache {
+    schema: String,
+    owner_repo: String,
+    pr_number: u32,
+    updated_at: String,
+    comments: Vec<IssueComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionReviewerIdentity {
+    schema: String,
+    reviewer_id: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,7 +251,57 @@ pub fn run_decision_set(
             eprintln!("WARNING: failed to clean prepared review inputs: {err}");
         }
     }
-    Ok(exit_codes::SUCCESS)
+
+    let review_state_type = dimension_to_state_review_type(normalized_dimension);
+    let termination_state =
+        super::state::load_review_run_state_strict(resolved_pr, review_state_type)?;
+    let termination_state_non_terminal_alive = termination_state
+        .as_ref()
+        .is_some_and(|state| state.status == ReviewRunStatus::Alive);
+    let run_id = termination_state
+        .as_ref()
+        .map(|state| state.run_id.clone())
+        .unwrap_or_default();
+    let termination_authority = TerminationAuthority::from_decision_persist(
+        &owner_repo,
+        resolved_pr,
+        review_state_type,
+        &head_sha,
+        &run_id,
+        active_comment_id,
+        &expected_author_login,
+        &signature_for_payload(&payload),
+    );
+
+    let exit_code = match terminate_review_agent(&termination_authority) {
+        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => exit_codes::SUCCESS,
+        Ok(TerminationOutcome::SkippedMismatch) => {
+            if termination_state_non_terminal_alive {
+                // enforce lifecycle gate: decision set should only terminate active matched
+                // runs
+                exit_codes::GENERIC_ERROR
+            } else {
+                exit_codes::SUCCESS
+            }
+        },
+        Ok(TerminationOutcome::IdentityFailure(reason)) => {
+            eprintln!(
+                "ERROR: review termination failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
+            );
+            exit_codes::GENERIC_ERROR
+        },
+        Ok(TerminationOutcome::IntegrityFailure(reason)) => {
+            eprintln!(
+                "ERROR: review termination integrity check failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
+            );
+            exit_codes::GENERIC_ERROR
+        },
+        Err(err) => {
+            eprintln!("WARNING: review termination step failed: {err}");
+            exit_codes::GENERIC_ERROR
+        },
+    };
+    Ok(exit_code)
 }
 
 fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {
@@ -616,6 +691,150 @@ fn signature_for_payload(payload: &DecisionComment) -> String {
         .join("|")
 }
 
+fn review_type_to_dimension(review_type: &str) -> Result<&'static str, String> {
+    let normalized = review_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "security" => Ok(SECURITY_DIMENSION),
+        "quality" | "code-quality" => Ok(CODE_QUALITY_DIMENSION),
+        other => Err(format!(
+            "unsupported review type `{other}` for termination authority (expected security|quality)"
+        )),
+    }
+}
+
+fn projection_pr_dir_for_home(home: &Path, owner_repo: &str, pr_number: u32) -> PathBuf {
+    home.join("fac_projection")
+        .join("repos")
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}"))
+}
+
+fn load_projection_reviewer_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<String, String> {
+    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("reviewer.json");
+    let bytes = fs::read(&path).map_err(|err| {
+        format!(
+            "failed to read reviewer projection {}: {err}",
+            path.display()
+        )
+    })?;
+    let payload: ProjectionReviewerIdentity = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse reviewer projection {}: {err}",
+            path.display()
+        )
+    })?;
+    if payload.schema != PROJECTION_REVIEWER_SCHEMA {
+        return Err(format!(
+            "invalid reviewer projection schema in {}: {}",
+            path.display(),
+            payload.schema
+        ));
+    }
+    let reviewer = payload.reviewer_id.trim();
+    if reviewer.is_empty() {
+        return Err(format!(
+            "reviewer projection {} is missing reviewer_id",
+            path.display()
+        ));
+    }
+    Ok(reviewer.to_string())
+}
+
+fn load_projection_issue_comments_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Vec<IssueComment>, String> {
+    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("issue_comments.json");
+    let bytes = fs::read(&path).map_err(|err| {
+        format!(
+            "failed to read issue comment projection {}: {err}",
+            path.display()
+        )
+    })?;
+    let payload: ProjectionIssueCommentsCache = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse issue comment projection {}: {err}",
+            path.display()
+        )
+    })?;
+    if payload.schema != PROJECTION_ISSUE_COMMENTS_SCHEMA {
+        return Err(format!(
+            "invalid issue comment projection schema in {}: {}",
+            path.display(),
+            payload.schema
+        ));
+    }
+    if !payload.owner_repo.eq_ignore_ascii_case(owner_repo) {
+        return Err(format!(
+            "issue comment projection repo mismatch in {}: expected {} got {}",
+            path.display(),
+            owner_repo,
+            payload.owner_repo
+        ));
+    }
+    if payload.pr_number != pr_number {
+        return Err(format!(
+            "issue comment projection PR mismatch in {}: expected {} got {}",
+            path.display(),
+            pr_number,
+            payload.pr_number
+        ));
+    }
+    Ok(payload.comments)
+}
+
+pub(super) fn resolve_termination_authority_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+    run_id: &str,
+) -> Result<TerminationAuthority, String> {
+    validate_expected_head_sha(head_sha)?;
+    let dimension = review_type_to_dimension(review_type)?;
+    let trusted_reviewer = load_projection_reviewer_for_home(home, owner_repo, pr_number)?;
+    let comments = load_projection_issue_comments_for_home(home, owner_repo, pr_number)?;
+    let parsed = parse_decision_comments_for_author(&comments, Some(&trusted_reviewer));
+    let latest = latest_for_sha(&parsed, head_sha).ok_or_else(|| {
+        format!(
+            "missing decision projection for PR #{pr_number} sha {head_sha} (trusted reviewer: {trusted_reviewer})"
+        )
+    })?;
+    let decision_entry = latest.payload.dimensions.get(dimension).ok_or_else(|| {
+        format!(
+            "decision projection for PR #{pr_number} sha {head_sha} is missing `{dimension}` dimension"
+        )
+    })?;
+    if normalize_decision_value(&decision_entry.decision).is_none() {
+        return Err(format!(
+            "decision projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
+            decision_entry.decision
+        ));
+    }
+    let signature = signature_for_payload(&latest.payload);
+    if signature.trim().is_empty() {
+        return Err(format!(
+            "decision projection for PR #{pr_number} sha {head_sha} produced empty signature"
+        ));
+    }
+    Ok(TerminationAuthority::from_decision_persist(
+        owner_repo,
+        pr_number,
+        review_type,
+        head_sha,
+        run_id,
+        latest.comment.id,
+        &trusted_reviewer,
+        &signature,
+    ))
+}
+
 fn render_decision_comment_body(payload: &DecisionComment) -> Result<String, String> {
     let yaml = serde_yaml::to_string(payload)
         .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
@@ -708,9 +927,199 @@ fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<()
     Ok(())
 }
 
+fn dimension_to_state_review_type(dimension: &str) -> &str {
+    match dimension {
+        "code-quality" => "quality",
+        other => other,
+    }
+}
+
+impl TerminationAuthority {
+    #[allow(clippy::too_many_arguments)]
+    fn from_decision_persist(
+        repo: &str,
+        pr_number: u32,
+        review_type: &str,
+        head_sha: &str,
+        run_id: &str,
+        decision_comment_id: u64,
+        decision_author: &str,
+        decision_signature: &str,
+    ) -> Self {
+        Self::new(
+            repo,
+            pr_number,
+            review_type,
+            head_sha,
+            run_id,
+            decision_comment_id,
+            decision_author,
+            &now_iso8601(),
+            decision_signature,
+        )
+    }
+}
+
+fn terminate_review_agent(authority: &TerminationAuthority) -> Result<TerminationOutcome, String> {
+    let home = apm2_home_dir()?;
+    terminate_review_agent_for_home(&home, authority)
+}
+
+fn terminate_review_agent_for_home(
+    home: &std::path::Path,
+    authority: &TerminationAuthority,
+) -> Result<TerminationOutcome, String> {
+    let Some(mut state) = super::state::load_review_run_state_strict_for_home(
+        home,
+        authority.pr_number,
+        &authority.review_type,
+    )?
+    else {
+        return Ok(TerminationOutcome::AlreadyDead);
+    };
+    if state.run_id != authority.run_id {
+        return Ok(TerminationOutcome::IdentityFailure(format!(
+            "run-id mismatch for PR #{}: authority={} state={}",
+            authority.pr_number, authority.run_id, state.run_id
+        )));
+    }
+    let Some(state_repo) = super::state::extract_repo_from_pr_url(&state.pr_url) else {
+        eprintln!(
+            "WARNING: skipping agent termination: unable to parse repo from run-state pr_url {}",
+            state.pr_url
+        );
+        return Ok(TerminationOutcome::SkippedMismatch);
+    };
+    if !state_repo.eq_ignore_ascii_case(&authority.repo) {
+        eprintln!(
+            "WARNING: skipping agent termination: run-state repo {state_repo} does not match requested repo {}",
+            authority.repo
+        );
+        return Ok(TerminationOutcome::SkippedMismatch);
+    }
+    if state.status.is_terminal() {
+        eprintln!(
+            "INFO: skipping agent termination: run state for PR #{} type {} is already terminal",
+            authority.pr_number, authority.review_type
+        );
+        return Ok(TerminationOutcome::AlreadyDead);
+    }
+
+    if !state.head_sha.eq_ignore_ascii_case(&authority.head_sha) {
+        let message = format!(
+            "skipping agent termination: reviewed sha {} does not match state sha {}",
+            authority.head_sha, state.head_sha
+        );
+        eprintln!("WARNING: {message}");
+        return Ok(TerminationOutcome::SkippedMismatch);
+    }
+    let Some(pid) = state.pid else {
+        return Ok(TerminationOutcome::IdentityFailure(format!(
+            "failed to terminate review agent for PR #{}: missing pid on active state",
+            authority.pr_number
+        )));
+    };
+    if !super::state::is_process_alive(pid) {
+        eprintln!("WARNING: skipping agent termination: pid {pid} is already not alive");
+        return Ok(TerminationOutcome::AlreadyDead);
+    }
+    let Some(recorded_proc_start) = state.proc_start_time else {
+        return Ok(TerminationOutcome::IdentityFailure(format!(
+            "failed to terminate review agent pid {pid}: missing proc_start_time"
+        )));
+    };
+    if let Err(err) = super::state::verify_review_run_state_integrity_binding(home, &state) {
+        return Ok(TerminationOutcome::IntegrityFailure(err));
+    }
+
+    if let Err(err) = super::dispatch::verify_process_identity(pid, Some(recorded_proc_start)) {
+        return Ok(TerminationOutcome::IdentityFailure(format!(
+            "failed to verify process identity for pid {pid}: {err}"
+        )));
+    }
+    if !super::state::is_process_alive(pid) {
+        eprintln!("WARNING: skipping agent termination: pid {pid} is already not alive");
+        return Ok(TerminationOutcome::AlreadyDead);
+    }
+
+    if let Err(err) = super::dispatch::terminate_process_with_timeout(pid) {
+        return Ok(TerminationOutcome::IdentityFailure(format!(
+            "failed to terminate review agent pid={pid}: {err}"
+        )));
+    }
+
+    if super::state::is_process_alive(pid) {
+        return Ok(TerminationOutcome::IdentityFailure(format!(
+            "review agent pid={pid} is still alive after termination attempt"
+        )));
+    }
+
+    let mut outcome = TerminationOutcome::Killed;
+    state.status = ReviewRunStatus::Failed;
+    state.terminal_reason = Some("manual_termination_after_decision".to_string());
+    if let Err(err) = super::state::write_review_run_state_for_home(home, &state).map_err(|err| {
+        format!(
+            "failed to persist terminal review state for PR #{}: {err}",
+            authority.pr_number
+        )
+    }) {
+        outcome = TerminationOutcome::IdentityFailure(err);
+    }
+
+    if let Err(err) = write_termination_receipt(home, authority, &outcome) {
+        return Err(format!(
+            "failed to persist termination receipt for PR #{}: {err}",
+            authority.pr_number
+        ));
+    }
+
+    eprintln!("INFO: terminated review agent pid={pid} after decision set");
+    Ok(outcome)
+}
+
+fn write_termination_receipt(
+    home: &std::path::Path,
+    authority: &TerminationAuthority,
+    outcome: &TerminationOutcome,
+) -> Result<(), String> {
+    let (outcome_label, outcome_reason) = match outcome {
+        TerminationOutcome::Killed => ("killed", None),
+        TerminationOutcome::AlreadyDead => ("already_dead", None),
+        TerminationOutcome::SkippedMismatch => ("skipped_mismatch", None),
+        TerminationOutcome::IdentityFailure(reason) => ("identity_failure", Some(reason.clone())),
+        TerminationOutcome::IntegrityFailure(reason) => ("integrity_failure", Some(reason.clone())),
+    };
+    let receipt = super::state::ReviewRunTerminationReceipt {
+        emitted_at: now_iso8601(),
+        repo: authority.repo.clone(),
+        pr_number: authority.pr_number,
+        review_type: authority.review_type.clone(),
+        run_id: authority.run_id.clone(),
+        head_sha: authority.head_sha.clone(),
+        decision_comment_id: authority.decision_comment_id,
+        decision_author: authority.decision_author.clone(),
+        decision_signature: authority.decision_signature.clone(),
+        outcome: outcome_label.to_string(),
+        outcome_reason,
+    };
+    super::state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminationOutcome {
+    Killed,
+    AlreadyDead,
+    SkippedMismatch,
+    IntegrityFailure(String),
+    IdentityFailure(String),
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
         CODE_QUALITY_DIMENSION, DECISION_SCHEMA, DecisionComment, DecisionEntry,
@@ -718,6 +1127,61 @@ mod tests {
         normalize_decision_value, normalize_dimension, parse_decision_comments_for_author,
         render_decision_comment_body, signature_for_payload,
     };
+    use crate::commands::fac_review::state;
+    use crate::commands::fac_review::types::{
+        ReviewRunState, ReviewRunStatus, TerminationAuthority,
+    };
+
+    static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
+
+    fn next_test_pr() -> u32 {
+        TEST_PR_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn sample_run_state(
+        pr_number: u32,
+        pid: u32,
+        head_sha: &str,
+        proc_start_time: Option<u64>,
+    ) -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s1-01234567".to_string(),
+            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: "2026-02-10T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(pid),
+            proc_start_time,
+            integrity_hmac: None,
+        }
+    }
+
+    fn termination_authority_for_run(
+        repo: &str,
+        state: &ReviewRunState,
+        head_sha: &str,
+    ) -> TerminationAuthority {
+        TerminationAuthority::from_decision_persist(
+            repo,
+            state.pr_number,
+            &state.review_type,
+            head_sha,
+            &state.run_id,
+            123_456u64,
+            "fac-bot",
+            "security:approve|code-quality:approve",
+        )
+    }
 
     #[test]
     fn test_normalize_dimension_aliases() {
@@ -851,5 +1315,186 @@ dimensions:
         let parsed = parse_decision_comments_for_author(&[trusted, spoofed], Some("fac-bot"));
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].comment.id, 1);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_sha_mismatch() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let proc_start_time =
+            state::get_process_start_time(pid).expect("start time should be available");
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
+        let authority = termination_authority_for_run("owner/repo", &state, "1234567890abcdef");
+
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
+        assert!(
+            matches!(outcome, super::TerminationOutcome::SkippedMismatch),
+            "unexpected termination: should skip on sha mismatch"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_proc_start_time_missing() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
+        let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
+
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
+        assert!(
+            matches!(outcome, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("missing proc_start_time")),
+            "unexpected termination outcome"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_repo_mismatch() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let proc_start_time =
+            state::get_process_start_time(pid).expect("start time should be available");
+        let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
+        let authority = termination_authority_for_run("owner/repo", &state, "abcdef1234567890");
+
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
+        assert!(
+            matches!(outcome, super::TerminationOutcome::SkippedMismatch),
+            "unexpected termination: should skip on repo mismatch"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_fails_when_pid_missing_for_active_state() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let state = ReviewRunState {
+            head_sha: "abcdef1234567890".to_string(),
+            status: ReviewRunStatus::Alive,
+            pid: None,
+            ..sample_run_state(pr_number, 0, "abcdef1234567890", Some(123_456_789))
+        };
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
+        let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
+
+        let err = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
+        assert!(
+            matches!(err, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("missing pid on active state"))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_allows_missing_proc_start_when_process_is_dead() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
+        let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
+        assert!(
+            matches!(outcome, super::TerminationOutcome::AlreadyDead),
+            "unexpected termination outcome"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_proc_start_time_mismatched() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let state_path = state::review_run_state_path_for_home(home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let proc_start_time =
+            state::get_process_start_time(pid).expect("start time should be available");
+        let state = sample_run_state(
+            pr_number,
+            pid,
+            "abcdef1234567890",
+            Some(proc_start_time + 1),
+        );
+        state::write_review_run_state_for_home(home, &state).expect("write run state");
+        let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
+
+        let err = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
+        assert!(
+            matches!(err, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("failed to verify process identity")),
+            "unexpected termination outcome"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
     }
 }

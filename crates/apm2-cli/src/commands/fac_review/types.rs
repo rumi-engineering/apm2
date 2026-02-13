@@ -40,6 +40,7 @@ pub const TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP: &str = "ambiguous_dispatch_owne
 pub const TERMINAL_STALE_HEAD_AMBIGUITY: &str = "stale_head_ambiguity";
 pub const TERMINAL_SHA_DRIFT_SUPERSEDED: &str = "sha_drift_superseded";
 pub const TERMINAL_DISPATCH_LOCK_TIMEOUT: &str = "dispatch_lock_timeout";
+pub const TERMINAL_INTEGRITY_FAILURE: &str = "integrity_failure";
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,8 @@ pub enum ReviewBackend {
     #[default]
     Codex,
     Gemini,
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
 }
 
 impl ReviewBackend {
@@ -56,6 +59,7 @@ impl ReviewBackend {
         match self {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::ClaudeCode => "claude-code",
         }
     }
 }
@@ -202,6 +206,88 @@ fn normalize_dispatch_review_type(review_type: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TerminationAuthority {
+    pub repo: String,
+    pub pr_number: u32,
+    pub review_type: String,
+    pub head_sha: String,
+    pub run_id: String,
+    pub decision_comment_id: u64,
+    pub decision_author: String,
+    pub decision_set_at: String,
+    pub decision_signature: String,
+}
+
+#[allow(dead_code)]
+impl TerminationAuthority {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repo: &str,
+        pr_number: u32,
+        review_type: &str,
+        head_sha: &str,
+        run_id: &str,
+        decision_comment_id: u64,
+        decision_author: &str,
+        decision_set_at: &str,
+        decision_signature: &str,
+    ) -> Self {
+        Self {
+            repo: repo.trim().to_ascii_lowercase(),
+            pr_number,
+            review_type: normalize_dispatch_review_type(review_type),
+            head_sha: head_sha.trim().to_ascii_lowercase(),
+            run_id: run_id.to_string(),
+            decision_comment_id,
+            decision_author: decision_author.to_string(),
+            decision_set_at: decision_set_at.to_string(),
+            decision_signature: decision_signature.to_string(),
+        }
+    }
+
+    pub fn matches_state(&self, state: &ReviewRunState) -> Result<(), String> {
+        if state.pr_number != self.pr_number {
+            return Err(format!(
+                "authority pr mismatch: expected #{} got #{}",
+                self.pr_number, state.pr_number
+            ));
+        }
+        if !state.review_type.eq_ignore_ascii_case(&self.review_type) {
+            return Err(format!(
+                "authority review_type mismatch: expected {} got {}",
+                self.review_type, state.review_type
+            ));
+        }
+        if !state.head_sha.eq_ignore_ascii_case(&self.head_sha) {
+            return Err(format!(
+                "authority head mismatch: expected {} got {}",
+                self.head_sha, state.head_sha
+            ));
+        }
+        if state.run_id != self.run_id {
+            return Err(format!(
+                "authority run_id mismatch: expected {} got {}",
+                self.run_id, state.run_id
+            ));
+        }
+        let (state_repo, _state_pr) = parse_pr_url(&state.pr_url)
+            .map_err(|err| format!("invalid run-state pr_url: {err}"))?;
+        if !state_repo.eq_ignore_ascii_case(&self.repo) {
+            return Err(format!(
+                "authority repo mismatch: expected {} got {}",
+                self.repo, state_repo
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn decision_signature_present(&self) -> bool {
+        !self.decision_signature.is_empty()
+    }
+}
+
 // ── Data structs ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +371,8 @@ pub struct ReviewRunState {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proc_start_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_hmac: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2,17 +2,46 @@
 //! checks.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
 use fs2::FileExt;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use serde::Serialize;
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use super::types::{
-    PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, apm2_home_dir, ensure_parent_dir,
-    entry_pr_number, sanitize_for_path,
+    PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, TERMINAL_INTEGRITY_FAILURE,
+    apm2_home_dir, ensure_parent_dir, entry_pr_number, parse_pr_url, sanitize_for_path,
 };
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRunTerminationReceipt {
+    pub emitted_at: String,
+    pub repo: String,
+    pub pr_number: u32,
+    pub review_type: String,
+    pub run_id: String,
+    pub head_sha: String,
+    pub decision_comment_id: u64,
+    pub decision_author: String,
+    pub decision_signature: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_reason: Option<String>,
+}
+
+type HmacSha256 = Hmac<Sha256>;
+const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
+const RUN_SECRET_LEN_BYTES: usize = 32;
+const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -38,6 +67,227 @@ pub fn review_run_state_path_for_home(home: &Path, pr_number: u32, review_type: 
     review_run_dir_for_home(home, pr_number, review_type).join("state.json")
 }
 
+fn review_run_secret_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
+    review_run_dir_for_home(home, pr_number, review_type).join("run_secret")
+}
+
+fn review_run_termination_receipt_path_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> PathBuf {
+    review_run_dir_for_home(home, pr_number, review_type).join("termination_receipt.json")
+}
+
+fn bind_review_run_state_integrity_for_home(
+    home: &Path,
+    state: &mut ReviewRunState,
+) -> Result<(), String> {
+    if state.pid.is_none() || state.proc_start_time.is_none() {
+        return Ok(());
+    }
+    let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
+        Some(secret) => secret,
+        None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
+    };
+
+    if state.integrity_hmac.is_none() {
+        bind_review_run_state_integrity(state, &secret)?;
+        return Ok(());
+    }
+
+    match verify_review_run_state_integrity(state, &secret) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("run-state integrity check failed".to_string()),
+        Err(err) => Err(format!("run-state integrity check error: {err}")),
+    }
+}
+
+#[derive(Serialize)]
+struct ReviewRunStateIntegrityBinding<'a> {
+    run_id: &'a str,
+    pid: u32,
+    proc_start_time: u64,
+    pr_url: &'a str,
+    head_sha: &'a str,
+    pr_number: u32,
+    review_type: &'a str,
+}
+
+fn open_secret_for_read(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            "run secret missing".to_string()
+        } else {
+            format!("failed to open run secret {}: {err}", path.display())
+        }
+    })
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
+    let dir = File::open(parent)
+        .map_err(|err| format!("failed to open parent dir {}: {err}", parent.display()))?;
+    dir.sync_all()
+        .map_err(|err| format!("failed to sync parent dir {}: {err}", parent.display()))
+}
+
+fn write_secret_atomic(path: &Path, encoded_secret: &str) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("run secret path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create run secret temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        temp.as_file()
+            .set_permissions(permissions)
+            .map_err(|err| format!("failed to set run secret temp file mode: {err}"))?;
+    }
+    temp.write_all(encoded_secret.as_bytes())
+        .map_err(|err| format!("failed to write run secret temp file: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync run secret temp file: {err}"))?;
+    temp.persist(path)
+        .map_err(|err| format!("failed to persist run secret {}: {err}", path.display()))?;
+    sync_parent_dir(path)
+}
+
+pub fn rotate_run_secret_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Vec<u8>, String> {
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let path = review_run_secret_path_for_home(home, pr_number, review_type);
+    let encoded = hex::encode(secret);
+    write_secret_atomic(&path, &encoded)?;
+    Ok(secret.to_vec())
+}
+
+pub fn read_run_secret_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let path = review_run_secret_path_for_home(home, pr_number, review_type);
+    let mut file = match open_secret_for_read(&path) {
+        Ok(file) => file,
+        Err(err) if err == "run secret missing" => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let size = file
+        .metadata()
+        .map_err(|err| format!("failed to stat run secret {}: {err}", path.display()))?
+        .len();
+    if size > RUN_SECRET_MAX_FILE_BYTES {
+        return Err(format!(
+            "run secret {} exceeds maximum size ({} > {})",
+            path.display(),
+            size,
+            RUN_SECRET_MAX_FILE_BYTES
+        ));
+    }
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)
+        .map_err(|err| format!("failed to read run secret {}: {err}", path.display()))?;
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    if encoded.len() > RUN_SECRET_MAX_ENCODED_CHARS {
+        return Err(format!(
+            "run secret {} exceeds maximum encoded length",
+            path.display()
+        ));
+    }
+    let secret = hex::decode(encoded)
+        .map_err(|err| format!("failed to decode run secret {}: {err}", path.display()))?;
+    if secret.len() != RUN_SECRET_LEN_BYTES {
+        return Err(format!(
+            "run secret {} has invalid length {} (expected {})",
+            path.display(),
+            secret.len(),
+            RUN_SECRET_LEN_BYTES
+        ));
+    }
+    Ok(Some(secret))
+}
+
+#[allow(dead_code)]
+pub fn review_run_secret_path(pr_number: u32, review_type: &str) -> Result<PathBuf, String> {
+    Ok(review_run_secret_path_for_home(
+        &apm2_home_dir()?,
+        pr_number,
+        review_type,
+    ))
+}
+
+pub fn run_state_integrity_binding_payload(state: &ReviewRunState) -> Result<Vec<u8>, String> {
+    let binding = ReviewRunStateIntegrityBinding {
+        run_id: &state.run_id,
+        pid: state.pid.ok_or_else(|| "state missing pid".to_string())?,
+        proc_start_time: state
+            .proc_start_time
+            .ok_or_else(|| "state missing proc_start_time".to_string())?,
+        pr_url: &state.pr_url,
+        head_sha: &state.head_sha,
+        pr_number: state.pr_number,
+        review_type: &state.review_type,
+    };
+    serde_json::to_vec(&binding).map_err(|err| format!("failed to build integrity payload: {err}"))
+}
+
+pub fn compute_review_run_state_integrity_hmac(
+    state: &ReviewRunState,
+    secret: &[u8],
+) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|err| format!("invalid integrity secret: {err}"))?;
+    let payload = run_state_integrity_binding_payload(state)?;
+    mac.update(&payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+pub fn bind_review_run_state_integrity(
+    state: &mut ReviewRunState,
+    secret: &[u8],
+) -> Result<(), String> {
+    state.integrity_hmac = Some(compute_review_run_state_integrity_hmac(state, secret)?);
+    Ok(())
+}
+
+pub fn verify_review_run_state_integrity(
+    state: &ReviewRunState,
+    secret: &[u8],
+) -> Result<bool, String> {
+    let stored = state
+        .integrity_hmac
+        .as_deref()
+        .ok_or_else(|| "state missing integrity_hmac".to_string())?;
+    let expected =
+        hex::decode(stored).map_err(|err| format!("invalid integrity_hmac encoding: {err}"))?;
+    let actual = hex::decode(compute_review_run_state_integrity_hmac(state, secret)?)
+        .map_err(|err| format!("invalid computed integrity encoding: {err}"))?;
+    if expected.len() != actual.len() {
+        return Ok(false);
+    }
+    Ok(expected.ct_eq(actual.as_slice()).into())
+}
+
 fn review_runs_dir_path() -> Result<PathBuf, String> {
     Ok(review_runs_dir_for_home(&apm2_home_dir()?))
 }
@@ -50,8 +300,26 @@ pub fn review_run_state_path(pr_number: u32, review_type: &str) -> Result<PathBu
     ))
 }
 
+pub fn review_locks_dir_path_for_home(home: &Path) -> PathBuf {
+    home.join("review_locks")
+}
+
+#[allow(dead_code)]
 pub fn review_locks_dir_path() -> Result<PathBuf, String> {
-    Ok(apm2_home_dir()?.join("review_locks"))
+    Ok(review_locks_dir_path_for_home(&apm2_home_dir()?))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+pub fn review_lock_path_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<PathBuf, String> {
+    let safe_repo = sanitize_for_path(owner_repo);
+    let safe_type = sanitize_for_path(review_type);
+    Ok(review_locks_dir_path_for_home(home)
+        .join(format!("{safe_repo}-pr{pr_number}-{safe_type}.lock")))
 }
 
 pub fn review_lock_path(
@@ -59,9 +327,7 @@ pub fn review_lock_path(
     pr_number: u32,
     review_type: &str,
 ) -> Result<PathBuf, String> {
-    let safe_repo = sanitize_for_path(owner_repo);
-    let safe_type = sanitize_for_path(review_type);
-    Ok(review_locks_dir_path()?.join(format!("{safe_repo}-pr{pr_number}-{safe_type}.lock")))
+    review_lock_path_for_home(&apm2_home_dir()?, owner_repo, pr_number, review_type)
 }
 
 fn review_pulses_dir_path() -> Result<PathBuf, String> {
@@ -192,6 +458,45 @@ pub fn load_review_run_state_for_home(
     Ok(ReviewRunStateLoad::Present(parsed))
 }
 
+/// Loads review run state and verifies integrity binding for any state that
+/// carries a process identity (`pid`).
+///
+/// Use this path only for security-sensitive callers. Non-security paths
+/// (status display, telemetry reads, etc.) should continue to use
+/// `load_review_run_state_for_home`.
+pub fn load_review_run_state_verified_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    let canonical = review_run_state_path_for_home(home, pr_number, review_type);
+    let run_state_load = load_review_run_state_for_home(home, pr_number, review_type)?;
+    match run_state_load {
+        ReviewRunStateLoad::Present(state) => {
+            if state.pid.is_none() {
+                return Ok(ReviewRunStateLoad::Present(state));
+            }
+            if let Err(err) = verify_review_run_state_integrity_binding(home, &state) {
+                return Ok(ReviewRunStateLoad::Corrupt {
+                    path: canonical,
+                    error: format!("run-state integrity verification failed: {err}"),
+                });
+            }
+            Ok(ReviewRunStateLoad::Present(state))
+        },
+        other => Ok(other),
+    }
+}
+
+#[allow(dead_code)]
+pub fn load_review_run_state_verified(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_state_verified_for_home(&home, pr_number, review_type)
+}
+
 pub fn load_review_run_state(
     pr_number: u32,
     review_type: &str,
@@ -200,7 +505,7 @@ pub fn load_review_run_state(
     load_review_run_state_for_home(&home, pr_number, review_type)
 }
 
-fn load_review_run_state_strict_for_home(
+pub fn load_review_run_state_strict_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -226,6 +531,41 @@ fn load_review_run_state_strict_for_home(
     }
 }
 
+pub fn load_review_run_state_verified_strict_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunState>, String> {
+    match load_review_run_state_verified_for_home(home, pr_number, review_type)? {
+        ReviewRunStateLoad::Present(state) => Ok(Some(state)),
+        ReviewRunStateLoad::Missing { .. } => Ok(None),
+        ReviewRunStateLoad::Corrupt { path, error } => Err(format!(
+            "corrupt-state path={} detail={error}",
+            path.display()
+        )),
+        ReviewRunStateLoad::Ambiguous { dir, candidates } => {
+            let rendered = candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(format!(
+                "ambiguous-state dir={} candidates={rendered}",
+                dir.display()
+            ))
+        },
+    }
+}
+
+#[allow(dead_code)]
+pub fn load_review_run_state_verified_strict(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunState>, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_state_verified_strict_for_home(&home, pr_number, review_type)
+}
+
 pub fn load_review_run_state_strict(
     pr_number: u32,
     review_type: &str,
@@ -234,9 +574,16 @@ pub fn load_review_run_state_strict(
     load_review_run_state_strict_for_home(&home, pr_number, review_type)
 }
 
+pub fn extract_repo_from_pr_url(pr_url: &str) -> Option<String> {
+    parse_pr_url(pr_url).ok().map(|(owner_repo, _)| owner_repo)
+}
+
 pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String> {
     let path = review_run_state_path(state.pr_number, &state.review_type)?;
-    write_review_run_state_to_path(&path, state)?;
+    let home = apm2_home_dir()?;
+    let mut state = state.clone();
+    bind_review_run_state_integrity_for_home(&home, &mut state)?;
+    write_review_run_state_to_path(&path, &state)?;
     Ok(path)
 }
 
@@ -245,8 +592,61 @@ pub fn write_review_run_state_for_home(
     state: &ReviewRunState,
 ) -> Result<PathBuf, String> {
     let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
-    write_review_run_state_to_path(&path, state)?;
+    let mut state = state.clone();
+    bind_review_run_state_integrity_for_home(home, &mut state)?;
+    write_review_run_state_to_path(&path, &state)?;
     Ok(path)
+}
+
+pub fn write_review_run_state_integrity_receipt_for_home(
+    home: &Path,
+    receipt: &ReviewRunTerminationReceipt,
+) -> Result<PathBuf, String> {
+    let path =
+        review_run_termination_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
+    ensure_parent_dir(&path)?;
+    let payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|err| format!("failed to serialize termination receipt: {err}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("termination receipt path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create termination receipt temp file: {err}"))?;
+    temp.write_all(&payload)
+        .map_err(|err| format!("failed to write termination receipt temp file: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync termination receipt temp file: {err}"))?;
+    temp.persist(path.clone())
+        .map_err(|err| format!("failed to persist {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+pub fn verify_review_run_state_integrity_binding(
+    home: &Path,
+    state: &ReviewRunState,
+) -> Result<(), String> {
+    if state.pid.is_none() || state.proc_start_time.is_none() {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
+    let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
+        Some(secret) => secret,
+        None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
+    };
+
+    let Some(stored) = state.integrity_hmac.as_deref() else {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    };
+    let expected =
+        hex::decode(stored).map_err(|err| format!("failed to decode integrity_hmac: {err}"))?;
+    let computed = hex::decode(compute_review_run_state_integrity_hmac(state, &secret)?)
+        .map_err(|err| format!("failed to compute integrity_hmac: {err}"))?;
+    if expected.len() != computed.len()
+        || subtle::ConstantTimeEq::ct_eq(&expected[..], &computed[..]).unwrap_u8() != 1
+    {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
+    Ok(())
 }
 
 pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Result<(), String> {
@@ -452,13 +852,27 @@ pub fn try_acquire_review_lease(
     review_type: &str,
 ) -> Result<Option<File>, String> {
     let lock_path = review_lock_path(owner_repo, pr_number, review_type)?;
-    ensure_parent_dir(&lock_path)?;
+    try_acquire_review_lease_at_path(&lock_path)
+}
+
+pub fn try_acquire_review_lease_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<File>, String> {
+    let lock_path = review_lock_path_for_home(home, owner_repo, pr_number, review_type)?;
+    try_acquire_review_lease_at_path(&lock_path)
+}
+
+fn try_acquire_review_lease_at_path(lock_path: &Path) -> Result<Option<File>, String> {
+    ensure_parent_dir(lock_path)?;
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .map_err(|err| format!("failed to open review lock {}: {err}", lock_path.display()))?;
     match FileExt::try_lock_exclusive(&lock_file) {
         Ok(()) => Ok(Some(lock_file)),
@@ -589,10 +1003,14 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewRunStateLoad, build_review_run_id, get_process_start_time,
-        load_review_run_state_for_home, load_review_run_state_strict_for_home,
-        next_review_sequence_number_for_home, parse_process_start_time,
-        review_run_state_path_for_home, write_review_run_state_to_path,
+        ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
+        extract_repo_from_pr_url, get_process_start_time, load_review_run_state_for_home,
+        load_review_run_state_strict_for_home, load_review_run_state_verified_for_home,
+        next_review_sequence_number_for_home, parse_process_start_time, read_run_secret_for_home,
+        review_lock_path_for_home, review_run_secret_path_for_home, review_run_state_path_for_home,
+        rotate_run_secret_for_home, try_acquire_review_lease_for_home,
+        verify_review_run_state_integrity, write_review_run_state_for_home,
+        write_review_run_state_to_path,
     };
     use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
 
@@ -620,7 +1038,89 @@ mod tests {
             previous_head_sha: None,
             pid: Some(12345),
             proc_start_time: Some(987_654_321),
+            integrity_hmac: None,
         }
+    }
+
+    fn dead_pid_for_test() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .args(["-lc", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
+    #[test]
+    fn test_review_run_state_integrity_tamper_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        let _ = rotate_run_secret_for_home(home, 441, "security").expect("generate secret");
+        let secret = read_run_secret_for_home(home, 441, "security")
+            .expect("read secret")
+            .expect("secret present");
+        bind_review_run_state_integrity(&mut state, &secret).expect("bind integrity");
+        assert!(
+            verify_review_run_state_integrity(&state, &secret).expect("verify integrity"),
+            "tamper check should pass for original state"
+        );
+
+        state.proc_start_time = Some(111_111_111);
+        assert!(
+            !verify_review_run_state_integrity(&state, &secret).expect("verify modified state"),
+            "tampered state must fail integrity check"
+        );
+    }
+
+    #[test]
+    fn test_missing_run_secret_is_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        assert_eq!(
+            read_run_secret_for_home(home, 441, "security").expect("read missing secret"),
+            None,
+            "missing secret must be None"
+        );
+        assert_eq!(
+            review_run_secret_path_for_home(home, 441, "security")
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("run_secret")
+        );
+    }
+
+    #[test]
+    fn test_read_run_secret_rejects_oversized_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let path = review_run_secret_path_for_home(home, 441, "security");
+        std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
+        std::fs::write(&path, "a".repeat(129)).expect("write oversized run secret");
+
+        let err = read_run_secret_for_home(home, 441, "security")
+            .expect_err("oversized run secret must fail closed");
+        assert!(
+            err.contains("exceeds maximum size") || err.contains("maximum encoded length"),
+            "unexpected error detail: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_run_secret_rejects_non_32_byte_secret() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let path = review_run_secret_path_for_home(home, 441, "security");
+        std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
+        std::fs::write(&path, hex::encode([0u8; 16])).expect("write short run secret");
+
+        let err = read_run_secret_for_home(home, 441, "security")
+            .expect_err("non-32-byte run secret must fail closed");
+        assert!(
+            err.contains("invalid length"),
+            "unexpected error detail: {err}"
+        );
     }
 
     #[test]
@@ -637,6 +1137,19 @@ mod tests {
             get_process_start_time(current_pid).is_some(),
             "expected /proc start time for current process"
         );
+    }
+
+    #[test]
+    fn test_extract_repo_from_pr_url() {
+        assert_eq!(
+            extract_repo_from_pr_url("https://github.com/owner/repo/pull/123"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_from_pr_url("http://github.com/example/other/pull/999"),
+            Some("example/other".to_string())
+        );
+        assert!(extract_repo_from_pr_url("not-a-pr-url").is_none());
     }
 
     #[test]
@@ -748,6 +1261,42 @@ mod tests {
     }
 
     #[test]
+    fn test_try_acquire_review_lease_for_home_is_scoped_and_contentious() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let owner_repo = "example/repo";
+        let pr_number = 441;
+        let review_type = "security";
+
+        let first = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+            .expect("first lease attempt")
+            .expect("first lease should be acquired");
+        let lock_path =
+            review_lock_path_for_home(home, owner_repo, pr_number, review_type).expect("path");
+        assert!(
+            lock_path.starts_with(home),
+            "lock path must stay under provided home: {}",
+            lock_path.display()
+        );
+        assert!(lock_path.exists(), "lock file should exist");
+
+        let second = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+            .expect("second lease attempt");
+        assert!(
+            second.is_none(),
+            "second lease attempt must observe contention"
+        );
+
+        drop(first);
+        let third = try_acquire_review_lease_for_home(home, owner_repo, pr_number, review_type)
+            .expect("third lease attempt");
+        assert!(
+            third.is_some(),
+            "lease should be re-acquirable after release"
+        );
+    }
+
+    #[test]
     fn test_load_review_run_state_strict_fails_closed_for_corrupt_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -760,5 +1309,87 @@ mod tests {
             error.contains("corrupt-state"),
             "unexpected error detail: {error}"
         );
+    }
+
+    #[test]
+    fn test_load_review_run_state_verified_rejects_dead_pid_without_integrity_hmac() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        state.pid = Some(dead_pid_for_test());
+        state.proc_start_time = Some(987_654_321);
+        state.integrity_hmac = None;
+        let path = review_run_state_path_for_home(home, 441, "security");
+        write_review_run_state_to_path(&path, &state).expect("write run-state without integrity");
+
+        let loaded =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        match loaded {
+            ReviewRunStateLoad::Corrupt { error, .. } => {
+                assert!(
+                    error.contains("integrity"),
+                    "expected integrity verification failure, got: {error}"
+                );
+            },
+            other => panic!("expected corrupt state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_load_review_run_state_verified_rejects_live_pid_without_integrity_hmac() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn persistent child");
+        let pid = child.id();
+        let proc_start_time = get_process_start_time(pid).expect("read process start time");
+
+        let mut state = sample_state();
+        state.pid = Some(pid);
+        state.proc_start_time = Some(proc_start_time);
+        state.integrity_hmac = None;
+        let path = review_run_state_path_for_home(home, 441, "security");
+        write_review_run_state_to_path(&path, &state).expect("write run-state without integrity");
+
+        let loaded =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        match loaded {
+            ReviewRunStateLoad::Corrupt { error, .. } => {
+                assert!(
+                    error.contains("integrity"),
+                    "expected integrity verification failure, got: {error}"
+                );
+            },
+            other => panic!("expected corrupt state, got {other:?}"),
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_load_review_run_state_verified_accepts_dead_pid_with_integrity_hmac() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        state.pid = Some(dead_pid_for_test());
+        state.proc_start_time = Some(987_654_321);
+        write_review_run_state_for_home(home, &state).expect("write integrity-bound run-state");
+
+        let loaded =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        match loaded {
+            ReviewRunStateLoad::Present(found) => {
+                assert!(
+                    found.integrity_hmac.is_some(),
+                    "integrity binding must be present"
+                );
+                assert_eq!(found.pid, state.pid);
+                assert_eq!(found.proc_start_time, state.proc_start_time);
+            },
+            other => panic!("expected present state, got {other:?}"),
+        }
     }
 }

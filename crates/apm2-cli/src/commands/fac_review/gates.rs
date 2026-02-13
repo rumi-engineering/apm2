@@ -68,14 +68,7 @@ pub fn run_gates(
                     "  Mode:    {}",
                     if summary.quick { "quick" } else { "full" }
                 );
-                if summary.cold_cache_timeout_boosted {
-                    println!(
-                        "  Timeout: {}s (cold-cache boost from {}s)",
-                        summary.effective_timeout_seconds, summary.requested_timeout_seconds
-                    );
-                } else {
-                    println!("  Timeout: {}s", summary.effective_timeout_seconds);
-                }
+                println!("  Timeout: {}s", summary.effective_timeout_seconds);
                 println!("  Cache:   {}", summary.cache_status);
                 println!();
                 println!("  {:<25} {:<6} {:>8}", "Gate", "Status", "Duration");
@@ -129,7 +122,6 @@ struct GatesSummary {
     quick: bool,
     requested_timeout_seconds: u64,
     effective_timeout_seconds: u64,
-    cold_cache_timeout_boosted: bool,
     cache_status: String,
     gates: Vec<GateResult>,
 }
@@ -154,14 +146,6 @@ fn run_gates_inner(
     let workspace_root =
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
     let timeout_decision = resolve_bounded_test_timeout(&workspace_root, timeout_seconds);
-    if timeout_decision.boosted_for_cold_cache && !quick {
-        eprintln!(
-            "fac gates: cold build cache detected at {} — widening bounded test timeout from {}s to {}s for warm-up",
-            timeout_decision.target_dir.display(),
-            timeout_decision.requested_seconds,
-            timeout_decision.effective_seconds
-        );
-    }
 
     // 1. Require clean working tree for full gates only.
     ensure_clean_working_tree(&workspace_root, quick)?;
@@ -192,7 +176,6 @@ fn run_gates_inner(
             quick,
             requested_timeout_seconds: timeout_seconds,
             effective_timeout_seconds: timeout_decision.effective_seconds,
-            cold_cache_timeout_boosted: timeout_decision.boosted_for_cold_cache,
             cache_status: "disabled (merge conflicts)".to_string(),
             gates: vec![merge_gate],
         });
@@ -302,7 +285,6 @@ fn run_gates_inner(
         quick,
         requested_timeout_seconds: timeout_seconds,
         effective_timeout_seconds: timeout_decision.effective_seconds,
-        cold_cache_timeout_boosted: timeout_decision.boosted_for_cold_cache,
         cache_status: if quick {
             "disabled (quick mode)".to_string()
         } else if force {
@@ -406,7 +388,9 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         .map_err(|e| format!("failed to run git diff: {e}"))?;
     if !diff_status.status.success() {
         return Err(
-            "working tree has unstaged changes — commit or stash first (or use `apm2 fac gates --quick` for inner-loop development)"
+            "DIRTY TREE: working tree has unstaged changes. ALL changes must be committed before \
+             running full gates — build artifacts are SHA-attested and reused as a source of truth. \
+             Run `git add -A && git commit` first, or use `apm2 fac gates --quick` for inner-loop development."
                 .to_string(),
         );
     }
@@ -418,7 +402,10 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         .map_err(|e| format!("failed to run git diff --cached: {e}"))?;
     if !cached_status.status.success() {
         return Err(
-            "working tree has staged changes — commit or stash first (or use `apm2 fac gates --quick` for inner-loop development)"
+            "DIRTY TREE: working tree has staged but uncommitted changes. ALL changes must be \
+             committed before running full gates — build artifacts are SHA-attested and reused \
+             as a source of truth. Run `git commit` first, or use `apm2 fac gates --quick` for \
+             inner-loop development."
                 .to_string(),
         );
     }
@@ -433,7 +420,10 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
     }
     if !String::from_utf8_lossy(&untracked.stdout).trim().is_empty() {
         return Err(
-            "working tree has untracked files — commit, stash, or remove them first (or use `apm2 fac gates --quick` for inner-loop development)"
+            "DIRTY TREE: working tree has untracked files. ALL files must be committed (or \
+             .gitignored) before running full gates — build artifacts are SHA-attested and \
+             reused as a source of truth. Run `git add -A && git commit` first, or use \
+             `apm2 fac gates --quick` for inner-loop development."
                 .to_string(),
         );
     }

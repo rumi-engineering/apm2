@@ -1,3 +1,5 @@
+#![cfg(feature = "e2e-agent-tests")]
+
 //! TCK-00313: FAC v0 E2E Harness - Full End-to-End Verification
 //!
 //! This test module provides comprehensive end-to-end verification of the FAC

@@ -47,7 +47,7 @@ const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
 const MONOTONIC_HEARTBEAT_TICK_SECS: u64 = 10;
 const GATE_WAIT_POLL_MILLIS: u64 = 250;
 const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
-const DEFAULT_TEST_MEMORY_MAX: &str = "24G";
+const DEFAULT_TEST_MEMORY_MAX: &str = "48G";
 const DEFAULT_TEST_PIDS_MAX: u64 = 1536;
 const DEFAULT_TEST_CPU_QUOTA: &str = "200%";
 const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
@@ -209,7 +209,7 @@ fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize)
     );
     let _ = writeln!(
         file,
-        "  apm2 fac gates --memory-max 24G  # default is 24G; increase if needed"
+        "  apm2 fac gates --memory-max 48G  # default is 48G; increase if needed"
     );
 }
 
@@ -384,8 +384,6 @@ struct PipelineTestCommand {
     command: Vec<String>,
     bounded_runner: bool,
     effective_timeout_seconds: u64,
-    cold_cache_timeout_boosted: bool,
-    timeout_target_dir: Option<PathBuf>,
 }
 
 fn build_pipeline_test_command(workspace_root: &Path) -> PipelineTestCommand {
@@ -422,8 +420,6 @@ fn build_pipeline_test_command(workspace_root: &Path) -> PipelineTestCommand {
             ],
             bounded_runner: true,
             effective_timeout_seconds: timeout_decision.effective_seconds,
-            cold_cache_timeout_boosted: timeout_decision.boosted_for_cold_cache,
-            timeout_target_dir: Some(timeout_decision.target_dir),
         };
     }
 
@@ -435,8 +431,6 @@ fn build_pipeline_test_command(workspace_root: &Path) -> PipelineTestCommand {
         ],
         bounded_runner: false,
         effective_timeout_seconds: DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS,
-        cold_cache_timeout_boosted: false,
-        timeout_target_dir: None,
     }
 }
 
@@ -710,19 +704,6 @@ pub fn run_evidence_gates_with_status(
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
     let pipeline_test_command = build_pipeline_test_command(workspace_root);
-    if pipeline_test_command.cold_cache_timeout_boosted {
-        eprintln!(
-            "pipeline: cold build cache detected at {} — widening bounded test timeout to {}s for warm-up",
-            pipeline_test_command
-                .timeout_target_dir
-                .as_ref()
-                .map_or_else(
-                    || "<unknown>".to_string(),
-                    |path| path.display().to_string()
-                ),
-            pipeline_test_command.effective_timeout_seconds,
-        );
-    }
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,

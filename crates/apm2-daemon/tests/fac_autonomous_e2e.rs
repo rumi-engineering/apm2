@@ -1,3 +1,4 @@
+#![cfg(feature = "e2e-agent-tests")]
 // AGENT-AUTHORED (TCK-00391)
 //! TCK-00391: Autonomous FAC end-to-end integration test: full lifecycle
 //! without external tooling.

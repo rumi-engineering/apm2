@@ -323,10 +323,16 @@ pub fn code_quality_reviewer_role() -> RoleSpecV1 {
              3. Assess maintainability and readability\n\
              4. Run targeted tests to verify behavior\n\
              5. Provide specific, actionable feedback\n\
-             6. Prefer `apm2 fac review` commands for lifecycle/status/retrigger \
-                operations when needed\n\
-             7. Use direct `gh` commands only for PR comment-body interactions \
-                that FAC does not yet expose\n\n\
+             6. Use `apm2 fac review` commands exclusively for all lifecycle, \
+                status, and retrigger operations\n\
+             7. NEVER use direct `gh` or `git` commands. All repository and \
+                GitHub interactions MUST go through `apm2 fac review` commands \
+                exclusively\n\
+             8. NEVER run git commands that modify worktree state (git reset, \
+                git checkout, git clean, git stash, git rebase, git merge, \
+                git cherry-pick, git commit, git push, git pull, git fetch)\n\
+             9. If the worktree is dirty or in a conflicted state, STOP and \
+                report the issue — do not attempt to fix it\n\n\
              Produce a structured review with:\n\
              - APPROVE if the code meets quality standards\n\
              - REQUEST_CHANGES if improvements are needed\n\
@@ -417,10 +423,16 @@ pub fn security_reviewer_role() -> RoleSpecV1 {
              3. Verify secrets/credentials are not exposed\n\
              4. Assess policy compliance\n\
              5. Run security scanning tools where available\n\
-             6. Prefer `apm2 fac review` commands for lifecycle/status/retrigger \
-                operations when needed\n\
-             7. Use direct `gh` commands only for PR comment-body interactions \
-                that FAC does not yet expose\n\n\
+             6. Use `apm2 fac review` commands exclusively for all lifecycle, \
+                status, and retrigger operations\n\
+             7. NEVER use direct `gh` or `git` commands. All repository and \
+                GitHub interactions MUST go through `apm2 fac review` commands \
+                exclusively\n\
+             8. NEVER run git commands that modify worktree state (git reset, \
+                git checkout, git clean, git stash, git rebase, git merge, \
+                git cherry-pick, git commit, git push, git pull, git fetch)\n\
+             9. If the worktree is dirty or in a conflicted state, STOP and \
+                report the issue — do not attempt to fix it\n\n\
              Produce a structured security review with:\n\
              - APPROVE if no security issues found\n\
              - REQUEST_CHANGES if security issues must be addressed\n\

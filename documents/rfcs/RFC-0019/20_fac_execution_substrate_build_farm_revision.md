@@ -51,10 +51,12 @@ This amendment is a build-farm "kernel" spec. The following are MUSTs:
 3. **Networkless control-plane semantics.** Job/lane semantics MUST NOT assume inter-node networking or remote services. Networking MAY exist for tool/dependency retrieval (e.g., crates.io), but MUST NOT be required for correctness of scheduling, leases, receipts, or cache-reuse decisions. Any network use MUST be explicit, best-effort, and never authoritative. If/when networking is added for job/receipt transport, remote inputs MUST be treated as **external I/O** and validated via RFC-0028 channel boundary enforcement + RFC-0029 economics (fail-closed).
 4. **Declarative substrate target.** The design MUST map cleanly to flakes now and to a systemd-first Debian/Ubuntu host baseline. NixOS modules MAY be added later for greenfield nodes, but must not be assumed or required by FESv1.
 5. **Fail-closed attestation semantics.** If anything that can affect correctness changes, gate-cache reuse MUST NOT silently continue.
-6. **No ambient user state reliance.** FAC MUST NOT depend on aliases/dotfiles/`~/.cargo/config.toml`; FAC MUST set policy explicitly.
+6. **No ambient user state reliance.** FAC MUST NOT depend on aliases/dotfiles/`~/.cargo/config.toml`/`~/.config/gh` or other user-scoped mutable config; FAC MUST set policy explicitly (including `HOME`, `XDG_*`, and `CARGO_HOME`) for any bounded execution.
 7. **No new long-lived bash daemons.** Control plane MUST be Rust and/or systemd-managed units. Bash scripts may exist only as transitional leaf executors.
 8. **Brokered actuation is mandatory (RFC-0028).** Any FAC job that executes code (gates/warm/pipeline evidence/GC/reset) MUST be authorized by a **daemon-signed** RFC-0028 `ChannelContextToken` and MUST validate via `apm2_core::channel::decode_channel_context_token` + `validate_channel_boundary` before execution. Jobs lacking a valid token MUST be denied (fail-closed) and quarantined.
 9. **RFC-0029 admission is mandatory.** Any job scheduling/admission decision MUST be representable as RFC-0029 and MUST emit an RFC-0029 decision trace (queue admission, and where applicable budget admission). "Local FIFO without trace" is explicitly forbidden in default mode.
+10. **Deterministic control-plane availability.** Default-mode FAC commands MUST require a reachable broker and a liveness-observable worker pool. If the broker/worker are unavailable, commands MUST fail fast with actionable diagnostics. Indefinite hangs waiting for a worker are forbidden; waiters MUST have timeouts and MUST consult worker liveness signals.
+11. **Secrets posture is explicit.** Credentials required for external I/O MUST be injected via explicit mechanisms (systemd credentials preferred) and MUST NOT be a hidden precondition stored in interactive dotfiles or shell state. Secrets MUST NOT appear in job specs, receipts, logs, or error messages.
 
 ## 0.2 Scope and non-goals (normative)
 
@@ -114,12 +116,52 @@ FESv1 makes one security stance explicit:
 Therefore:
 
 1. **Filesystem state is never authoritative by itself.** Queue items, lease files, cached receipts, evidence bundles, patch blobs, and logs MUST be treated as **external inputs** to the current process. Any state that can cause actuation or cache reuse MUST be authenticated and validated.
-2. **FAC has a required broker.** A local Rust broker (implemented as part of `apm2-daemon` or a dedicated `fac-broker` unit) is the authority that:
+2. **FAC has a required broker.** In FESv1 the broker MUST be implemented inside `apm2-daemon` (shared signing key + admitted policy roots) and exposed over a dedicated local IPC surface. A separate `apm2-fac-broker` binary/unit is OPTIONAL, but MUST reuse the same on-disk trust roots (no forked signing keys or policy roots). The broker is the authority that:
    * issues RFC-0028 channel context tokens for job actuation,
    * issues RFC-0029 time authority envelopes (TP-EIO29-001),
    * and maintains the admitted policy roots used for RFC-0028 policy binding checks.
+   * IPC requirements:
+     * The broker IPC surface MUST be a Unix domain socket with filesystem permissions restricting access to the intended service user/group (0600/0660).
+     * The broker MUST authenticate peers via OS-level peer credentials (e.g., `SO_PEERCRED`) and MUST fail closed on mismatch.
+     * The broker MUST be systemd-managed (Restart=always or socket-activated). Manual/interactive startup as a prerequisite for default-mode FAC is forbidden.
 3. **Workers never trust "raw ChannelBoundaryCheck JSON".** A `ChannelBoundaryCheck` is authoritative only if reconstructed by decoding a daemon-signed channel context token (`decode_channel_context_token`). Accepting raw JSON is forbidden.
 4. **Quarantine is first-class.** Any job/evidence/cache artifact that fails RFC-0028 or RFC-0029 validation MUST be moved to a quarantine directory and MUST NOT be deleted blindly. Quarantine is how you preserve forensics for A2/A1 events.
+
+## 0.6 Secrets and credentials (normative)
+
+FAC must sometimes perform external I/O (e.g., fetching private git dependencies, posting GitHub statuses/comments, reading PR metadata). These actions require **credentials**, which are distinct from the **authorization** primitives introduced by RFC-0028 and RFC-0029:
+
+* **RFC-0028 ChannelContextToken**: authorizes *what intent is allowed* (typed tool intent), with fail-closed boundary checks.
+* **RFC-0029 economics**: authorizes *whether the intent is admissible* under deterministic budgets, lanes, and anti-starvation rules.
+* **Credentials**: enable *successful execution* of the allowed intent (e.g., `GH_TOKEN`, SSH keys, GitHub App private key).
+
+FESv1 requirements:
+
+1. **No secrets in specs/receipts.**
+   * `FacJobSpecV1`, `FacJobReceiptV1`, lane profiles, and policy objects MUST NOT contain secret material.
+   * Any required secret MUST be referenced indirectly (by handle/name) and injected at runtime by the broker/worker execution environment.
+
+2. **Credentials are job-kind scoped and fail-closed without collateral damage.**
+   * `gates`, `warm`, `gc`, and lane reset jobs MUST be executable in a **no-secrets** posture.
+   * Missing GitHub credentials MUST NOT prevent running local gates; they may only block job kinds that explicitly require GitHub actuation.
+
+3. **No interactive authentication as a hidden precondition.**
+   * The execution substrate MUST NOT rely on `gh auth login`, user dotfiles, or other interactive/manual state to succeed.
+   * Where GitHub access is required, the substrate MUST support non-interactive credentials injection (e.g., `GH_TOKEN`), under explicit policy control.
+
+4. **Credential injection mechanisms (ordered preference).**
+   * **Preferred (system services):** systemd credentials (`LoadCredential=`) delivered via `$CREDENTIALS_DIRECTORY`, then mapped into subprocesses as needed.
+   * **Acceptable (local user mode):** a broker-managed credential store (future extension) or explicit operator-managed files under `$APM2_HOME/private/creds/**` with strict permissions (0700 directories, 0600 files).
+   * **Forbidden:** plaintext secrets committed in repo, embedded in policy JSON, or present in job specs/receipts.
+
+   * GitHub App credential note: `APM2_GITHUB_APP_ID` and `APM2_GITHUB_INSTALLATION_ID` are non-secret configuration and SHOULD live in `$APM2_HOME/github_app.toml`; the private key MUST be provisioned via an approved secret mechanism (systemd credentials preferred).
+   * Reliance on shell-exported `APM2_GITHUB_*` environment variables MUST NOT be a prerequisite for non-GitHub job kinds (e.g., `gates`).
+
+5. **Redaction is mandatory.**
+   * Any credential handle, file path, or environment variable carrying secrets MUST be treated as sensitive in logs and receipts.
+   * Error messages MUST not echo secret values (even if they originate from environment variables).
+
+This section exists because "it worked in my shell" authentication is a frequent source of flakiness and accidental secret leakage. FESv1 makes credential requirements explicit and mechanically enforced.
 
 ## 0.1 Terminology (local build-farm primitives)
 
@@ -134,7 +176,10 @@ Therefore:
   `(monotonic_time_ns, node_fingerprint, receipt_digest)`.
 * **Execution profile**: The attested environment+policy facts (including lane profile hash + toolchain fingerprint) that gate-cache keys depend on.
 
-* **FAC Broker**: The local authority service (Rust; systemd-managed) that issues:
+* **Credential mount**: A policy-level description of how secret material is injected into an execution context at runtime (env var and/or file), referenced by a handle. Credential mounts MUST NOT embed secret values and MUST be job-kind scoped.
+* **Service user**: A dedicated Unix user (recommended) under which broker/worker services execute, used to enforce filesystem and IPC ACL boundaries.
+
+* **FAC Broker**: The local authority surface (Rust; systemd-managed; implemented inside `apm2-daemon`) that issues:
   * RFC-0028 channel context tokens (typed tool-intent actuation authorization),
   * RFC-0029 time authority envelopes (TP-EIO29-001) and horizon references (TP-EIO29-002/003),
   * and admitted policy root digests for RFC-0028 policy-binding checks.
@@ -679,14 +724,18 @@ Rules:
 * MUST fail closed if nextest is missing
 * MUST enforce the 240s/24G test policy (no override without explicit unsafe flag)
 
-Default execution mode change (required):
+Default execution mode change (normative):
+
 * `apm2 fac gates` MUST default to **brokered queue execution**:
   * create `FacJobSpecV1(kind="gates")`,
   * obtain an RFC-0028 channel context token from the broker for this job spec digest,
   * enqueue to `queue/pending/`,
   * and wait for completion by default.
-* `apm2 fac gates --direct` is allowed only as **explicit unsafe mode** and MUST:
-  * disable gate-cache read/write,
+  * Waiting MUST be bounded (default `--wait-timeout`; MUST NOT hang indefinitely) and MUST consult broker liveness/queue state; if no worker is live, `apm2 fac gates` MUST fail fast with actionable remediation (start services or run `--direct`).
+
+* `apm2 fac gates --direct` MUST remain available as an explicit unsafe fallback:
+  * executes immediately in-process,
+  * does **not** read/write gate cache,
   * emit a receipt marked `unsafe_direct: true`,
   * still acquire a lane lease and enforce containment, but MUST NOT be considered an authoritative "acceptance fact".
 
@@ -700,6 +749,29 @@ Consumes the local queue and executes jobs in lanes.
 * Worker MUST write receipts for:
   * deny/quarantine outcomes (authorization/admission failures),
   * and execution outcomes (success/failure).
+
+#### 5.2.8 `apm2 fac services` (new; recommended)
+
+Service-management helpers for non-flaky default-mode operation.
+
+* `apm2 fac services status` MUST report:
+  * whether the broker socket is reachable,
+  * whether at least one worker is live (liveness signal),
+  * and (where applicable) the systemd unit status for the broker/worker/daemon.
+* `apm2 fac services ensure` MUST attempt to start (and optionally enable) the broker/worker services, then re-run readiness checks.
+  * If automatic start is not possible (e.g., no systemd, insufficient privilege), it MUST print deterministic remediation steps.
+* These commands MUST NOT perform any destructive action (no GC, no lane reset).
+
+#### 5.2.9 `apm2 fac bootstrap` (new; recommended)
+
+One-shot provisioning for a compute host.
+
+* MUST create the required `$APM2_HOME/private/fac/**` directory tree with correct permissions and ownership.
+* MUST write a minimal default `FacPolicyV1` (safe no-secrets posture) and a stub lane set (or point to an existing one).
+* SHOULD offer flags for systemd deployment:
+  * `--system` to install/enable system services (broker/worker/daemon) under a dedicated service user,
+  * `--user` to install/enable user services for local development.
+* MUST run `apm2 fac doctor` and fail with actionable output if the host cannot support FESv1.
 
 ### 5.3 JSON schemas (required; with hashing rules + storage locations)
 
@@ -771,15 +843,25 @@ It MUST include (at minimum):
 
 Required environment policy fields (normative minimum):
 * `env_clear_by_default: bool` (default true for bounded execution)
-* `env_allowlist: [string]` (exact variable names)
-* `env_denylist_prefixes: [string]` (e.g., `AWS_`, `GITHUB_`, `SSH_`, `OPENAI_`), applied after allowlist to prevent "oops we allowed too much"
-* `env_set: { key: value }` for enforced variables:
+* `env_allowlist: [string]` (exact variable names; applies only to inherited environment)
+* `env_denylist_prefixes: [string]` (e.g., `AWS_`, `GITHUB_`, `SSH_`, `OPENAI_`), applied to inherited env after allowlist to prevent accidental leakage
+* `env_set: { key: value }` for enforced **non-secret** variables (policy + computed):
   * `CARGO_HOME=$APM2_HOME/private/fac/cargo_home`
   * `CARGO_TARGET_DIR=$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
   * `NEXTEST_TEST_THREADS=<computed>`
   * `CARGO_BUILD_JOBS=<computed>`
+* `credential_mounts: [CredentialMountV1]` (OPTIONAL in pure no-secrets profiles; REQUIRED for any job kind that performs authenticated external I/O)
+  * Credential mounts are **handles**, not secrets. The secret bytes MUST come from systemd credentials or a broker-managed credential store at runtime.
+  * Credential mounts MAY inject secrets as env vars (e.g., `GH_TOKEN`) and/or as files (e.g., `github_app_private_key.pem` under `$CREDENTIALS_DIRECTORY`).
+  * `env_denylist_prefixes` MUST NOT block secrets injected via `credential_mounts`; denylists apply to inherited env only.
 
-If `env_clear_by_default` is true, implementations MUST ensure required runtime variables (PATH, TERM when needed) are explicitly set, not inherited implicitly.
+Execution-order requirement (normative):
+* Start from an empty environment if `env_clear_by_default` is true.
+* Apply `env_set` (non-secret policy/computed values).
+* Import inherited env filtered by `env_allowlist`, then remove any remaining inherited vars matching `env_denylist_prefixes`.
+* Apply `credential_mounts` last (secret injection), without serializing secrets into receipts/logs.
+
+If `env_clear_by_default` is true, the worker MUST start with an empty environment and then inject required runtime variables via `env_set` and `env_allowlist` (not inherited implicitly).
 
 Any change to `FacPolicyV1` MUST change `FacPolicyHash` (fail-closed).
 `FacPolicyHash` MUST be computed using the same `b3-256:` hash ref rules as other substrate objects.
@@ -1031,6 +1113,10 @@ Deliverables:
   * broker issues RFC-0028 channel context tokens
   * broker issues RFC-0029 time authority envelopes + horizon refs
   * worker validates RFC-0028 + RFC-0029 and executes jobs
+* add deterministic service management primitives:
+  * systemd unit(s) for broker/worker/daemon (and/or socket activation)
+  * `apm2 fac services status/ensure` for startup + readiness
+  * bounded waiting semantics (no indefinite hangs)
 
 Acceptance criteria:
 * three concurrent `apm2 fac gates` invocations never exceed lane count
@@ -1038,6 +1124,8 @@ Acceptance criteria:
 * evidence logs are per-lane/per-job and do not clobber across concurrent runs
 * in default mode, workers deny/quarantine any job lacking a valid RFC-0028 token
 * in default mode, workers deny any job with RFC-0029 verdict != Allow (except stop_revoke emergency semantics)
+* if broker/worker are unavailable, default-mode commands fail fast with actionable remediation (no hangs)
+* `apm2 fac gates` does not require GitHub credentials; missing GitHub auth may only block GitHub-specific commands
 
 Rollback:
 * `APM2_FAC_LANES=0` (or `--legacy`) runs old path; lane directories remain but are inert
@@ -1047,6 +1135,7 @@ Rollback:
 Deliverables:
 * implement filesystem job queue (`pending/claimed/done/cancelled`)
 * implement `apm2 fac enqueue` and `apm2 fac gates --queued`
+* implement worker liveness/heartbeat signals surfaced via broker APIs for waiters + `apm2 fac services status`
 * implement `apm2 fac lane reset` with symlink-safe deletion
 * turn disk preflight from warn-only to enforced (auto GC, fail closed if still low)
 * implement `apm2 fac gc` + `GcReceiptV1`
@@ -1064,6 +1153,7 @@ Deliverables:
 * "assimilate node" playbook:
   * clone repo at pinned commit
   * `nix develop`
+  * provision required credentials via systemd credentials (no interactive `gh auth login`)
   * restore minimal `$APM2_HOME` state (receipts, configs, keys; not bulky caches)
   * run `apm2 fac warm` to rehydrate caches
 * local scheduler per host; no distributed routing required
@@ -2153,7 +2243,7 @@ ticket_meta:
       - "Dirty content execution requires patch injection and changes cache/attestation material."
 ```
 
-### TCK-00518 — Default-mode gates: enqueue+wait; add `--direct` unsafe; integrate with worker + broker
+### TCK-00518 — Default-mode gates: enqueue+wait (bounded) + `--direct` unsafe; integrate with worker + broker
 
 ```yaml
 ticket_meta:
@@ -2161,7 +2251,7 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00518"
-    title: "Default-mode gates: enqueue+wait; add `--direct` unsafe; integrate with worker + broker"
+    title: "Default-mode gates: enqueue+wait (bounded) + `--direct` unsafe; integrate with worker + broker"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
@@ -2179,9 +2269,14 @@ ticket_meta:
         reason: "Need worker to consume queue."
       - ticket_id: "TCK-00512"
         reason: "Need job spec digest + actuation schema."
+      - ticket_id: "TCK-00595"
+        reason: "Need worker liveness surfaced via broker to avoid indefinite waits."
+      - ticket_id: "TCK-00594"
+        reason: "Need services status/ensure UX for actionable remediation."
   scope:
     in_scope:
       - "`apm2 fac gates` creates job spec, obtains token, enqueues, and waits by default."
+      - "Default waiting MUST be bounded (`--wait-timeout`) and MUST consult broker liveness; if no worker is live, fail fast with actionable output."
       - "Implement `apm2 fac gates --direct` as explicit unsafe mode that disables cache read/write and marks receipt `unsafe_direct:true`."
       - "Implement `apm2 fac enqueue` paths to request tokens from broker."
       - "Implement wait-for-completion using receipt presence (not process state)."
@@ -2191,10 +2286,12 @@ ticket_meta:
     steps:
       - "Refactor gates entrypoint to produce job specs rather than running gates inline."
       - "Add waiter that watches done/receipt stream with bounded polling/backoff."
+      - "Call broker status API to detect worker liveness and surface progress; implement `--wait-timeout`."
   definition_of_done:
     evidence_ids: []
     criteria:
       - "Default `apm2 fac gates` path exercises broker token issuance, worker claim, RFC-0029 admission, lane lease execution, and receipt emission."
+      - "If no worker is live, `apm2 fac gates` exits within `--wait-timeout` with deterministic remediation (e.g., `apm2 fac services ensure` or `--direct`)."
       - "Direct mode produces receipts but never writes gate cache."
 ```
 
@@ -2583,7 +2680,7 @@ ticket_meta:
       - "Import refuses when economics receipts unverifiable."
 ```
 
-### TCK-00528 — Systemd units + runbook: broker + worker as managed services (user+system modes)
+### TCK-00528 — Systemd units + runbook: daemon/broker + worker as managed services (user+system modes)
 
 ```yaml
 ticket_meta:
@@ -2591,7 +2688,7 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00528"
-    title: "Systemd units + runbook: broker + worker as managed services (user+system modes)"
+    title: "Systemd units + runbook: daemon/broker + worker as managed services (user+system modes)"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
@@ -2609,26 +2706,34 @@ ticket_meta:
         reason: "Worker must exist before unit packaging."
   scope:
     in_scope:
-      - "Provide systemd unit templates for: FAC Broker and FAC Worker."
+      - "Provide systemd unit templates for: apm2-daemon (FAC Broker surface) and FAC Worker."
       - "Support both user-mode units (with linger guidance) and system-mode units (preferred hardening)."
       - "Define dedicated runtime directories under `$APM2_HOME/private/fac/**` with strict permissions."
-      - "Provide a minimal runbook: start/stop/status, logs, key rotation notes, failure modes."
-      - "Add `apm2 fac services status` command (optional) that reports unit health."
+      - "Support socket activation for broker IPC via `.socket` units (preferred) or an equivalent non-flaky auto-start approach."
+      - "Support systemd credentials (`LoadCredential=`) for secrets provisioning (e.g., `GH_TOKEN`, GitHub App private key), without relying on interactive dotfiles."
+      - "Provide a minimal runbook: start/stop/status, logs, credential provisioning notes, failure modes."
+      - "Add/extend `apm2 fac services status` (optional) to report unit health."
     out_of_scope:
-      - "Multi-node orchestration."
+      - "Cluster orchestration."
   plan:
     steps:
-      - "Author unit files with explicit WorkingDirectory, EnvironmentFile (optional), Restart policies, and hardening knobs."
+      - "Author unit files with explicit WorkingDirectory, Restart policies, and hardening knobs."
+      - "Use `EnvironmentFile=` only for non-secret configuration; forbid secrets in `EnvironmentFile=`."
+      - "Use `LoadCredential=` (systemd credentials) for any secret material required by broker/worker."
+      - "Add `.socket` unit(s) for broker IPC to support socket activation (preferred)."
       - "For system units: run as dedicated service user; define slices if needed."
       - "Add docs: how to enable linger for user-mode; how to run system-mode safely."
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "On a clean Ubuntu VPS, broker and worker can be started and stay running under systemd."
+      - "On a clean Ubuntu VPS, daemon/broker and worker can be enabled, started, and remain running after reboot."
+      - "Broker IPC is reachable without manual startup (Restart=always or socket activation)."
       - "Worker can execute at least one queued job end-to-end under unit management."
+      - "Secret provisioning uses systemd credentials (LoadCredential) rather than shell environment/dotfiles."
   notes:
     security: |
       Ensure units do not run with excessive privileges by default.
+      Prefer systemd credentials over environment variables to avoid accidental exposure.
       Default should avoid reliance on a user-bus for correctness.
 ```
 
@@ -3386,7 +3491,7 @@ ticket_meta:
       - "CAS-backed patch bytes can be used safely without expanding GC authority to unrelated CAS data."
 ```
 
-### TCK-00547 — `apm2 fac doctor`: verify prerequisites (cgroup v2, systemd backend, broker reachable, nextest present, permissions safe)
+### TCK-00547 — `apm2 fac doctor`: verify prerequisites (services, liveness, toolchain, permissions, credentials posture)
 
 ```yaml
 ticket_meta:
@@ -3394,7 +3499,7 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00547"
-    title: "`apm2 fac doctor`: verify prerequisites (cgroup v2, systemd backend, broker reachable, nextest present, permissions safe)"
+    title: "`apm2 fac doctor`: verify prerequisites (services, liveness, toolchain, permissions, credentials posture)"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
@@ -3403,7 +3508,7 @@ ticket_meta:
     evidence_artifacts: []
   custody:
     agent_roles: ["AGENT_IMPLEMENTER"]
-    responsibility_domains: ["DOMAIN_RUNTIME"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
   dependencies:
     tickets:
       - ticket_id: "TCK-00528"
@@ -3413,18 +3518,25 @@ ticket_meta:
   scope:
     in_scope:
       - "Add `apm2 fac doctor` command."
-      - "Checks: cgroup v2 availability, systemd backend selection viability, broker status, worker status, nextest availability, FAC root permissions, disk free policy."
+      - "Checks (ERROR/WARN/OK):"
+      - "  * Host capability: cgroup v2 availability, systemd backend selection viability."
+      - "  * Control-plane readiness: broker socket reachable; worker liveness visible (or direct mode configured)."
+      - "  * Toolchain: nextest availability; required binaries present."
+      - "  * Security posture: FAC root permissions, lane ownership, unsafe symlink patterns."
+      - "  * Credentials posture (WARN-only by default): detect whether GitHub credentials are provisioned for GitHub-facing commands (e.g., `GH_TOKEN` systemd credential or GitHub App config), without blocking local gates."
       - "Outputs actionable remediation steps."
     out_of_scope:
-      - "Automated remediation."
+      - "Automated remediation (except optionally `apm2 fac services ensure`)."
   plan:
     steps:
       - "Implement checks with clear categorization (ERROR/WARN/OK)."
       - "Add `--json` output for automation."
+      - "Add a `--full` or `--include-secrets` mode that upgrades credential checks from WARN to ERROR when running GitHub-facing workflows."
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "`apm2 fac doctor` correctly identifies common failure modes (user-bus missing, nextest missing, unsafe perms)."
+      - "`apm2 fac doctor` correctly identifies common failure modes (user-bus missing, nextest missing, unsafe perms, broker/worker down)."
+      - "Doctor output is deterministic and does not leak secrets (even if env vars are present)."
 ```
 
 ### TCK-00548 — Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled
@@ -5503,4 +5615,396 @@ ticket_meta:
     evidence_ids: []
     criteria:
       - "No schema is parsed without size bounds and deny_unknown_fields in default mode."
+```
+
+---
+
+### TCK-00594 — `apm2 fac services`: status/ensure + socket-activation glue for non-flaky startup
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00594"
+    title: "`apm2 fac services`: status/ensure + socket-activation glue for non-flaky startup"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Needs unit naming conventions and runbook semantics."
+      - ticket_id: "TCK-00547"
+        reason: "Doctor/readiness output should integrate."
+  scope:
+    in_scope:
+      - "Implement `apm2 fac services status` (broker reachability, worker liveness, and (if applicable) systemd unit status)."
+      - "Implement `apm2 fac services ensure` with best-effort start semantics:"
+      - "  * system-mode: attempt to start/enable system units (when permitted)."
+      - "  * user-mode: attempt to start/enable user units and print linger guidance."
+      - "Provide deterministic remediation output when auto-start is not possible."
+      - "Ensure commands are non-destructive (no GC, no lane reset)."
+    out_of_scope:
+      - "Full fleet orchestration."
+  plan:
+    steps:
+      - "Define a minimal broker status endpoint (or reuse existing) returning broker version and queue depth."
+      - "Wire `services status` to broker liveness + worker liveness."
+      - "Add optional systemd integration (D-Bus or `systemctl` invocation), gated by environment/privilege checks."
+      - "Add docs linking to TCK-00528 runbook."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "`apm2 fac services status` clearly distinguishes: broker unreachable vs worker absent vs healthy."
+      - "`apm2 fac services ensure` starts services where possible, otherwise prints deterministic remediation."
+      - "No secret values appear in output."
+```
+
+---
+
+### TCK-00595 — Worker heartbeat + broker liveness API (no-hang waiting semantics)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00595"
+    title: "Worker heartbeat + broker liveness API (no-hang waiting semantics)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker must expose status endpoints and store liveness state."
+      - ticket_id: "TCK-00511"
+        reason: "Worker must emit heartbeat signals."
+      - ticket_id: "TCK-00594"
+        reason: "Services status should display liveness."
+  scope:
+    in_scope:
+      - "Define a minimal worker heartbeat model (worker_id, last_seen, active_lane_claims)."
+      - "Worker periodically reports heartbeat to broker over local IPC."
+      - "Broker exposes a `GetStatus`-style API returning worker liveness and queue depth (pending/running counts)."
+      - "`apm2 fac wait` and `apm2 fac gates` waiting paths consult broker liveness and fail fast if no worker is live (bounded wait)."
+    out_of_scope:
+      - "Distributed cluster membership or multi-host leader election."
+  plan:
+    steps:
+      - "Implement worker heartbeat emission (e.g., every N seconds and on claim/complete)."
+      - "Persist liveness in broker state in an atomic, crash-safe manner."
+      - "Expose broker status endpoint for CLI consumption."
+      - "Update waiters to enforce `--wait-timeout` and to surface a clear error when worker is absent."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "With no worker running, `apm2 fac gates` fails quickly with an error indicating worker absence."
+      - "With a worker running, `apm2 fac gates` waits until completion (or timeout) and reports progress."
+      - "No secret values appear in status output."
+```
+
+---
+
+### TCK-00596 — Secrets & credentials management for FAC (systemd credentials + no dotfile preconditions)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00596"
+    title: "Secrets & credentials management for FAC (systemd credentials + no dotfile preconditions)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Unit-level credential provisioning should be standardized."
+      - ticket_id: "TCK-00575"
+        reason: "Deterministic env roots (HOME/XDG/CARGO_HOME) must exist before injecting creds."
+      - ticket_id: "TCK-00547"
+        reason: "Doctor should report credential posture."
+  scope:
+    in_scope:
+      - "Implement `CredentialMountV1` plumbing in worker/broker execution path."
+      - "Support systemd credentials as the preferred secret backend (read from `$CREDENTIALS_DIRECTORY`)."
+      - "Ensure secrets never enter job specs or receipts; redact in logs/errors."
+      - "Ensure missing credentials only block the job kinds that require them (GitHub-facing workflows), never `gates`."
+    out_of_scope:
+      - "Cross-host secret replication."
+  plan:
+    steps:
+      - "Define minimal credential mount schema (env + file mounts)."
+      - "Implement secret ingestion from systemd credentials and map into spawned processes."
+      - "Add redaction guards to all relevant logs and receipt fields."
+      - "Update docs/runbook: how to provision GH_TOKEN and GitHub App key via systemd credentials."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "`apm2 fac gates` runs with no GitHub credentials provisioned."
+      - "GitHub-facing commands fail fast with actionable errors when creds are missing."
+      - "Secrets do not appear in receipts/log output."
+```
+
+---
+
+### TCK-00597 — Make GitHub integration non-interactive (GH_TOKEN) and lane-scoped (no ~/.config/gh dependence)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00597"
+    title: "Make GitHub integration non-interactive (GH_TOKEN) and lane-scoped (no ~/.config/gh dependence)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00596"
+        reason: "Credential mounts + systemd credentials need to exist."
+      - ticket_id: "TCK-00575"
+        reason: "Lane-scoped HOME/XDG roots must be deterministic."
+  scope:
+    in_scope:
+      - "Update GitHub-facing CLI flows to accept `GH_TOKEN` (injected) without requiring `gh auth login`."
+      - "Remove hard dependency on `gh auth status` when token-based auth is present."
+      - "Ensure GitHub CLI config dirs are lane-scoped (HOME/XDG_CONFIG_HOME), never user-global by default."
+      - "Ensure failures are deterministic and do not block `gates`."
+    out_of_scope:
+      - "Replacing gh CLI with a pure-Rust GitHub client (optional future)."
+  plan:
+    steps:
+      - "Adjust readiness checks in `fac_review` to validate token-based auth paths."
+      - "Thread credential mounts into GitHub calls (GH_TOKEN env) and ensure redaction."
+      - "Document provisioning via systemd credentials."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "GitHub-facing workflows succeed with only `GH_TOKEN` provisioned via systemd credentials."
+      - "No requirement for interactive login or persistent ~/.config/gh state."
+```
+
+---
+
+### TCK-00598 — Headless GitHub App auth for `apm2 fac pr` (eliminate `APM2_GITHUB_APP_ID` flakiness)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00598"
+    title: "Headless GitHub App auth for `apm2 fac pr` (eliminate `APM2_GITHUB_APP_ID` flakiness)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00596"
+        reason: "Credential injection + redaction standards."
+  scope:
+    in_scope:
+      - "Add non-interactive mode(s) for GitHub App config provisioning:"
+      - "  * accept app_id + installation_id + private key path via flags (no prompts)"
+      - "  * support writing `$APM2_HOME/github_app.toml` for non-secret config"
+      - "  * support provisioning the private key via systemd credentials (preferred) or controlled file fallback"
+      - "Improve error messages for missing GitHub app config to include service-user paths and systemd-credential guidance."
+    out_of_scope:
+      - "Key rotation automation (future)."
+  plan:
+    steps:
+      - "Extend `apm2 fac pr auth-setup` with `--non-interactive` and `--for-systemd` variants."
+      - "Ensure it works when no desktop keyring is present (headless VPS)."
+      - "Update docs and `apm2 fac doctor --include-secrets` checks."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "A headless compute host can run `apm2 fac pr auth-setup --app-id ... --installation-id ... --private-key-file ...` successfully."
+      - "No requirement for a desktop keyring; systemd credentials path works."
+      - "Missing GitHub app config does not affect `apm2 fac gates`."
+```
+
+---
+
+### TCK-00599 — `apm2 fac bootstrap`: compute-host provisioning (dirs, perms, policy stub, services)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00599"
+    title: "`apm2 fac bootstrap`: compute-host provisioning (dirs, perms, policy stub, services)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00594"
+        reason: "`services ensure` should be invoked or referenced."
+      - ticket_id: "TCK-00528"
+        reason: "Needs unit conventions and $APM2_HOME layout."
+      - ticket_id: "TCK-00547"
+        reason: "Bootstrap should run doctor."
+  scope:
+    in_scope:
+      - "Implement `apm2 fac bootstrap` as described in §5.2.9."
+      - "Create directory tree with correct ownership/mode."
+      - "Write minimal default policy and stub lanes configuration (or pointers)."
+      - "Optionally install/enable services (system vs user)."
+    out_of_scope:
+      - "Automated cloud provisioning."
+  plan:
+    steps:
+      - "Implement idempotent bootstrap (safe re-run)."
+      - "Add `--dry-run` to show planned filesystem/systemd actions."
+      - "Integrate doctor and services ensure."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "On a clean host, `apm2 fac bootstrap` results in a host that can execute `apm2 fac gates` in default mode."
+      - "Bootstrap does not leak secrets and does not destroy existing lanes unless explicitly requested."
+```
+
+---
+
+### TCK-00600 — Broker/worker health + watchdog integration (ensure daemon is always running)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00600"
+    title: "Broker/worker health + watchdog integration (ensure daemon is always running)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Units must exist to wire watchdog/health semantics."
+      - ticket_id: "TCK-00594"
+        reason: "Services status/ensure should surface health."
+      - ticket_id: "TCK-00510"
+        reason: "Broker must expose a health endpoint."
+      - ticket_id: "TCK-00511"
+        reason: "Worker must expose heartbeat/health."
+      - ticket_id: "TCK-00595"
+        reason: "Liveness model should be reused."
+  scope:
+    in_scope:
+      - "Implement broker health endpoint (IPC) with version + readiness."
+      - "Implement worker health/heartbeat and ensure broker records it."
+      - "Add systemd watchdog wiring (sd_notify) where feasible."
+      - "Update runbook with monitoring guidance and failure mode diagnosis."
+    out_of_scope:
+      - "External SaaS monitoring integration."
+  plan:
+    steps:
+      - "Define readiness semantics for broker/worker."
+      - "Implement `sd_notify(READY=1)` and watchdog ping loops."
+      - "Update systemd unit templates with WatchdogSec where supported."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Services are restarted automatically by systemd on hangs/crashes."
+      - "`apm2 fac services status` surfaces degraded vs healthy states deterministically."
+```
+
+---
+
+### TCK-00601 — E2E tests: deterministic failures (no hangs) + secrets posture (gates unaffected)
+
+```yaml
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00601"
+    title: "E2E tests: deterministic failures (no hangs) + secrets posture (gates unaffected)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00595"
+        reason: "Need liveness signals to avoid hangs deterministically."
+      - ticket_id: "TCK-00596"
+        reason: "Need credential posture rules."
+      - ticket_id: "TCK-00594"
+        reason: "Services status output should be asserted."
+  scope:
+    in_scope:
+      - "Add E2E tests for `apm2 fac gates` default-mode failure modes:"
+      - "  * broker absent => fail fast with actionable error"
+      - "  * broker present, worker absent => bounded wait then fail with worker-absent error"
+      - "Add E2E tests for secrets posture:"
+      - "  * missing GitHub creds does not prevent `gates`"
+      - "  * GitHub-facing command fails fast with explicit credential remediation"
+      - "Assert no secrets appear in receipts/logs under test."
+    out_of_scope:
+      - "Multi-node CI."
+  plan:
+    steps:
+      - "Build a hermetic test harness using temp APM2_HOME + fake broker/worker where needed."
+      - "Add snapshot tests for error messages (redacted)."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Tests catch hangs and secret leakage regressions."
+      - "Tests run on CI deterministically."
 ```

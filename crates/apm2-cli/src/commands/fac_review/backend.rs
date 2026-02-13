@@ -2,9 +2,24 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use std::sync::OnceLock;
 
 use super::model_pool::normalize_gemini_model;
 use super::types::{ReviewBackend, sh_quote};
+
+fn claude_supports_prompt_file_argument() -> bool {
+    static HAS_PROMPT_FILE_FLAG: OnceLock<bool> = OnceLock::new();
+    *HAS_PROMPT_FILE_FLAG.get_or_init(|| match Command::new("claude").arg("--help").output() {
+        Ok(output) => {
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            text.contains("--prompt-file")
+        },
+        Err(_) => false,
+    })
+}
 
 fn build_script_wrapper_command(log_path: &Path, inner_command: &str, append: bool) -> String {
     let append_flag = if append { " -a" } else { "" };
@@ -41,6 +56,20 @@ pub fn build_script_command_for_backend(
             build_script_wrapper_command(log_path, &inner, false)
         },
         ReviewBackend::Gemini => build_gemini_script_command(prompt_path, log_path, model),
+        ReviewBackend::ClaudeCode => {
+            let prompt_q = sh_quote(&prompt_path.display().to_string());
+            let model_q = sh_quote(model);
+            let inner = if claude_supports_prompt_file_argument() {
+                format!(
+                    "claude --prompt-file {prompt_q} --model {model_q} --output-format json --permission-mode plan"
+                )
+            } else {
+                format!(
+                    "cat {prompt_q} | claude -p --model {model_q} --output-format json --permission-mode plan"
+                )
+            };
+            build_script_wrapper_command(log_path, &inner, false)
+        },
     }
 }
 
@@ -51,12 +80,20 @@ pub fn build_resume_command_for_backend(
 ) -> String {
     let msg_q = sh_quote(sha_update_msg);
     match backend {
-        ReviewBackend::Codex => format!(
-            "codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}"
-        ),
+        ReviewBackend::Codex => {
+            format!(
+                "codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}"
+            )
+        },
         ReviewBackend::Gemini => {
             let model_q = sh_quote(normalize_gemini_model(model));
             format!("gemini -m {model_q} -y --resume latest -p {msg_q}")
+        },
+        ReviewBackend::ClaudeCode => {
+            let model_q = sh_quote(model);
+            format!(
+                "claude -p {msg_q} --model {model_q} --output-format json --permission-mode plan --resume"
+            )
         },
     }
 }

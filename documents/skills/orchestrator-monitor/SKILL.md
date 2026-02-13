@@ -58,6 +58,12 @@ review_prompt_required_payload[1]:
 
 push_workflow:
   canonical_command: "apm2 fac push --ticket <TICKET_YAML>"
+  CRITICAL_PREREQUISITE: |
+    ALL changes MUST be committed before running `apm2 fac gates` or `apm2 fac push`.
+    These commands WILL FAIL on a dirty working tree. Build artifacts are attested
+    against the committed HEAD SHA and reused as a source of truth — uncommitted
+    changes produce unattestable results. Ensure implementor agents commit everything
+    (including docs, tickets, and config) before invoking gates or push.
   behavior:
     - "Pushes the current branch to remote."
     - "Creates or updates the PR from ticket YAML metadata (title, body)."
@@ -76,7 +82,7 @@ runtime_review_protocol:
     log_discovery: "apm2 fac logs --pr <PR_NUMBER> --json (canonical per-PR log path inventory for evidence gates, pipeline, and review runs)"
     live_logs: "Use `tail -f` on paths returned by `apm2 fac logs --pr <PR_NUMBER> --json` to monitor live reviewer output."
     liveness_check: "If no review progress appears for ~120s after push, run lane-scoped status for both lanes, then refresh log paths with `apm2 fac logs --pr <PR_NUMBER> --json` and tail the active run logs."
-    liveness_recovery: "If processes are stalled/dead or review state is ambiguous, run `apm2 fac restart --pr <PR_NUMBER>`."
+    liveness_recovery: "If a single reviewer lane is stuck, terminate it with `apm2 fac review terminate --pr <PR_NUMBER> --type <security|quality> --json` then restart with `apm2 fac restart --pr <PR_NUMBER>`. If both lanes or the full pipeline are stuck, run `apm2 fac restart --pr <PR_NUMBER>` directly."
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
     findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
   observability_surfaces:
@@ -104,8 +110,6 @@ decision_tree:
             Read all required references in order:
             (1) @documents/theory/unified-theory-v2.json (REQUIRED: APM2 terminology and ontology)
             (2) @documents/skills/implementor-default/SKILL.md (default implementor skill for all fix-agent dispatches)
-            (3) @documents/reviews/SECURITY_REVIEW_PROMPT.md (security review prompt contract)
-            (4) @documents/reviews/CODE_QUALITY_PROMPT.md (code-quality review prompt contract)
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <...> placeholders with concrete values."
         - id: DISCOVER_RELEVANT_FAC_HELP
@@ -122,7 +126,7 @@ decision_tree:
             (9) `apm2 fac gates --help`
             (10) `apm2 fac push --help`
             (11) `apm2 fac restart --help`
-            Help output is authoritative for names/flags.
+            (12) `apm2 fac review terminate --help`
         - id: VERIFY_REPO_AUTH
           action: "Run `apm2 fac pr auth-check`."
         - id: RESOLVE_PR_SCOPE
@@ -248,7 +252,6 @@ decision_tree:
             (2) synchronize branch ancestry with current mainline policy,
             (3) reduce merge-conflict count to zero,
             (4) proceed only when worktree is conflict-free.
-            Do NOT prescribe raw git/gh commands in orchestrator prompts.
         - id: REQUIRE_CONFLICT_EVIDENCE
           action: |
             Require branch hygiene facts to be verifiable from FAC artifacts:

@@ -13,7 +13,8 @@ use fs2::FileExt;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
-    load_review_run_state_for_home, next_review_sequence_number_for_home,
+    load_review_run_state_for_home, load_review_run_state_verified_for_home,
+    next_review_sequence_number_for_home, try_acquire_review_lease_for_home,
     write_review_run_state_for_home,
 };
 use super::types::{
@@ -24,6 +25,37 @@ use super::types::{
     ensure_parent_dir, now_iso8601,
 };
 use super::worktree::resolve_worktree_for_sha;
+
+const SYSTEMD_DISPATCH_ENV_ALLOWLIST: [&str; 11] = [
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "APM2_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+fn present_systemd_dispatch_env_keys() -> Vec<&'static str> {
+    SYSTEMD_DISPATCH_ENV_ALLOWLIST
+        .iter()
+        .copied()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect()
+}
+
+fn build_systemd_setenv_args(keys: &[&str]) -> Vec<String> {
+    let mut args = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in keys {
+        args.push("--setenv".to_string());
+        args.push((*key).to_string());
+    }
+    args
+}
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -207,20 +239,23 @@ fn run_state_has_live_process(state: &ReviewRunState) -> bool {
     state.pid.is_some_and(is_process_alive)
 }
 
-fn verify_process_identity(pid: u32, recorded_proc_start_time: Option<u64>) -> Result<(), String> {
-    let expected_start = recorded_proc_start_time
-        .ok_or_else(|| format!("missing recorded proc_start_time for pid={pid}"))?;
+pub(super) fn verify_process_identity(
+    pid: u32,
+    recorded_proc_start_time: Option<u64>,
+) -> Result<(), String> {
+    let expected_start =
+        recorded_proc_start_time.ok_or_else(|| format!("missing proc_start_time for pid={pid}"))?;
     let observed_start = get_process_start_time(pid)
         .ok_or_else(|| format!("failed to read /proc/{pid}/stat starttime"))?;
     if observed_start != expected_start {
         return Err(format!(
-            "pid starttime mismatch pid={pid} expected={expected_start} observed={observed_start}"
+            "identity mismatch pid={pid} expected={expected_start} observed={observed_start}"
         ));
     }
     Ok(())
 }
 
-fn wait_for_process_exit(pid: u32, timeout: Duration) {
+pub(super) fn wait_for_process_exit(pid: u32, timeout: Duration) {
     let started = Instant::now();
     while started.elapsed() < timeout {
         if !is_process_alive(pid) {
@@ -230,7 +265,7 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) {
     }
 }
 
-fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
+pub(super) fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
     if !is_process_alive(pid) {
         return Ok(());
     }
@@ -244,7 +279,7 @@ fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
     Err(format!("failed to send {signal} to pid {pid}"))
 }
 
-fn terminate_process_with_timeout(pid: u32) -> Result<(), String> {
+pub(super) fn terminate_process_with_timeout(pid: u32) -> Result<(), String> {
     if !is_process_alive(pid) {
         return Ok(());
     }
@@ -452,6 +487,7 @@ fn write_fail_closed_state_for_dispatch(
         previous_head_sha: None,
         pid: None,
         proc_start_time: None,
+        integrity_hmac: None,
     };
     write_review_run_state_for_home(home, &state)?;
     Ok(state)
@@ -598,6 +634,7 @@ fn seed_pending_run_state_for_dispatch_for_home(
         previous_head_sha: lineage.map(|value| value.previous_head_sha.clone()),
         pid: None,
         proc_start_time: None,
+        integrity_hmac: None,
     };
     write_review_run_state_for_home(home, &state)?;
     Ok(state)
@@ -624,7 +661,8 @@ fn dispatch_single_review_locked_for_home<F>(
 where
     F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
-    let run_state_load = load_review_run_state_for_home(home, key.pr_number, &key.review_type)?;
+    let run_state_load =
+        load_review_run_state_verified_for_home(home, key.pr_number, &key.review_type)?;
     let sequence_hint = next_sequence_hint_from_state(&run_state_load);
     match run_state_load {
         ReviewRunStateLoad::Ambiguous { dir, candidates } => {
@@ -656,21 +694,26 @@ where
             );
         },
         ReviewRunStateLoad::Present(state) => {
-            if state.head_sha.eq_ignore_ascii_case(&key.head_sha)
-                && state.status.is_terminal()
-                && !force_same_sha_retry
-            {
-                return Ok(DispatchReviewResult {
-                    review_type: key.review_type.clone(),
-                    mode: "joined".to_string(),
-                    run_state: state.status.as_str().to_string(),
-                    run_id: Some(state.run_id),
-                    sequence_number: Some(state.sequence_number),
-                    terminal_reason: state.terminal_reason,
-                    pid: state.pid,
-                    unit: None,
-                    log_file: None,
-                });
+            if state.head_sha.eq_ignore_ascii_case(&key.head_sha) && state.status.is_terminal() {
+                if !force_same_sha_retry && state.pid.is_some() {
+                    return Ok(DispatchReviewResult {
+                        review_type: key.review_type.clone(),
+                        mode: "joined".to_string(),
+                        run_state: state.status.as_str().to_string(),
+                        run_id: Some(state.run_id),
+                        sequence_number: Some(state.sequence_number),
+                        terminal_reason: state.terminal_reason,
+                        pid: state.pid,
+                        unit: None,
+                        log_file: None,
+                    });
+                }
+                if !force_same_sha_retry && state.pid.is_none() {
+                    eprintln!(
+                        "WARNING: terminal run-state missing pid for PR #{} type={} sha={}; dispatching new review",
+                        key.pr_number, key.review_type, key.head_sha
+                    );
+                }
             }
 
             if !state.status.is_terminal() && state.head_sha.eq_ignore_ascii_case(&key.head_sha) {
@@ -828,6 +871,54 @@ where
         ReviewRunStateLoad::Missing { .. } => {},
     }
 
+    // Final dedup gate: if the orchestrator's review lease is already held,
+    // a reviewer is actively running — no need to spawn another.
+    let review_lease = match try_acquire_review_lease_for_home(
+        home,
+        &key.owner_repo,
+        key.pr_number,
+        &key.review_type,
+    ) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            // Lease held — enrich the response with current run state so callers
+            // can see which run_id/pid they joined.
+            let (run_state_str, run_id, seq, pid) =
+                match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
+                    Ok(ReviewRunStateLoad::Present(state)) => (
+                        state.status.as_str().to_string(),
+                        Some(state.run_id),
+                        Some(state.sequence_number),
+                        state.pid,
+                    ),
+                    _ => ("unknown".to_string(), None, None, None),
+                };
+            return Ok(DispatchReviewResult {
+                review_type: key.review_type.clone(),
+                mode: "joined".to_string(),
+                run_state: run_state_str,
+                run_id,
+                sequence_number: seq,
+                terminal_reason: None,
+                pid,
+                unit: None,
+                log_file: None,
+            });
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to acquire review lease for {}#{} {}: {err}",
+                key.owner_repo, key.pr_number, key.review_type
+            ));
+        },
+    };
+
+    // SECURITY NOTE (RSK-1601 TOCTOU): review_lease is intentionally held from
+    // acquisition through spawn and pending-marker write. The dispatch lock
+    // (held by caller) additionally serializes concurrent dispatchers for the
+    // same idempotency key. The child process re-acquires the lease after this
+    // function returns.
+
     if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
         return attach_run_state_contract_for_home(
             home,
@@ -864,6 +955,7 @@ where
         },
     };
     write_pending_dispatch_for_home(home, key, &started)?;
+    let _ = review_lease;
     attach_run_state_contract_for_home(home, key, started)
 }
 
@@ -1081,10 +1173,9 @@ fn spawn_detached_review(
     let exe_path = resolve_dispatch_executable_path(workspace_root)?;
     let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let use_systemd_run = command_available("systemd-run");
 
-    let has_sensitive_token_env =
-        std::env::var_os("GH_TOKEN").is_some() || std::env::var_os("GITHUB_TOKEN").is_some();
-    if command_available("systemd-run") && !has_sensitive_token_env {
+    if use_systemd_run {
         let unit = format!(
             "apm2-review-pr{pr_number}-{}-{head_short}-{ts}",
             review_kind.as_str()
@@ -1096,13 +1187,15 @@ fn spawn_detached_review(
             .arg("--unit")
             .arg(&unit)
             .arg("--property")
-            .arg(format!("WorkingDirectory={}", workspace_root.display()));
+            .arg(format!("WorkingDirectory={}", workspace_root.display()))
+            .arg("--property")
+            .arg(format!("ReadOnlyPaths={}", workspace_root.display()));
 
-        for key in ["PATH", "HOME", "CARGO_HOME"] {
-            if let Ok(value) = std::env::var(key) {
-                command.arg("--setenv").arg(format!("{key}={value}"));
-            }
-        }
+        // Preserve env-auth compatibility without placing secret values on the
+        // systemd-run argv surface. `--setenv NAME` copies from caller env.
+        command.args(build_systemd_setenv_args(
+            &present_systemd_dispatch_env_keys(),
+        ));
 
         let output = command
             .arg(&exe_path)
@@ -1134,6 +1227,10 @@ fn spawn_detached_review(
             unit: Some(unit),
             log_file: None,
         });
+    }
+
+    if !use_systemd_run {
+        eprintln!("WARNING: systemd-run unavailable; read-only confinement not applied");
     }
 
     let dispatch_dir = apm2_home_dir()?.join("review_dispatch");
@@ -1193,7 +1290,7 @@ mod tests {
 
     use super::{
         DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
-        dispatch_single_review_for_home_with_spawn,
+        build_systemd_setenv_args, dispatch_single_review_for_home_with_spawn,
         dispatch_single_review_for_home_with_spawn_force, first_existing_dispatch_executable,
         review_dispatch_scope_lock_path_for_home, run_state_has_live_process,
         strip_deleted_executable_suffix, write_pending_dispatch_for_home,
@@ -1226,7 +1323,8 @@ mod tests {
             previous_run_id: None,
             previous_head_sha: None,
             pid,
-            proc_start_time: pid.and_then(get_process_start_time),
+            proc_start_time: pid.map(|process_id| get_process_start_time(process_id).unwrap_or(1)),
+            integrity_hmac: None,
         }
     }
 
@@ -1253,6 +1351,24 @@ mod tests {
         assert!(
             strip_deleted_executable_suffix(path).is_none(),
             "clean path should not change"
+        );
+    }
+
+    #[test]
+    fn systemd_setenv_args_do_not_embed_values() {
+        let args = build_systemd_setenv_args(&["GH_TOKEN", "OPENAI_API_KEY"]);
+        assert_eq!(
+            args,
+            vec![
+                "--setenv".to_string(),
+                "GH_TOKEN".to_string(),
+                "--setenv".to_string(),
+                "OPENAI_API_KEY".to_string()
+            ]
+        );
+        assert!(
+            args.iter().all(|arg| !arg.contains('=')),
+            "setenv args must not include KEY=VALUE pairs"
         );
     }
 
@@ -1304,6 +1420,10 @@ mod tests {
         DispatchIdempotencyKey::new("Example/Repo", 441, "security", head_sha)
     }
 
+    fn dispatch_key_with_owner(owner_repo: &str, head_sha: &str) -> DispatchIdempotencyKey {
+        DispatchIdempotencyKey::new(owner_repo, 441, "security", head_sha)
+    }
+
     fn pr_url() -> &'static str {
         "https://github.com/example/repo/pull/441"
     }
@@ -1324,7 +1444,10 @@ mod tests {
     fn test_idempotent_dispatch_dedup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-Idempotent",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let spawn_count = Arc::new(AtomicUsize::new(0));
         let spawned_children = Arc::new(Mutex::new(Vec::new()));
 
@@ -1409,7 +1532,10 @@ mod tests {
             })
         };
 
-        let key = dispatch_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-DifferentSha",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
         let result = dispatch_single_review_for_home_with_spawn(
             home,
             pr_url(),
@@ -1434,7 +1560,10 @@ mod tests {
         terminal.run_id = "pr441-security-s4-01234567".to_string();
         write_review_run_state_for_home(home, &terminal).expect("seed terminal state");
 
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-Force",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let spawn = |_: &str,
                      _: u32,
                      _: ReviewKind,
@@ -1456,6 +1585,56 @@ mod tests {
         assert_eq!(result.mode, "joined");
         assert_eq!(result.run_state, "done");
         assert_eq!(result.run_id.as_deref(), Some("pr441-security-s4-01234567"));
+    }
+
+    #[test]
+    fn test_same_sha_terminal_state_missing_pid_dispatches_new_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut terminal = sample_run_state(None);
+        terminal.status = ReviewRunStatus::Done;
+        terminal.sequence_number = 4;
+        terminal.run_id = "pr441-security-s4-01234567".to_string();
+        write_review_run_state_for_home(home, &terminal).expect("seed terminal state");
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_ref = Arc::clone(&spawn_count);
+        let spawn = move |_: &str,
+                          _: u32,
+                          _: ReviewKind,
+                          _: &str,
+                          _: u64|
+              -> Result<DispatchReviewResult, String> {
+            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "started".to_string(),
+                run_state: "pending".to_string(),
+                run_id: None,
+                sequence_number: None,
+                terminal_reason: None,
+                pid: Some(dead_pid_for_test()),
+                unit: None,
+                log_file: None,
+            })
+        };
+
+        let key = dispatch_key_with_owner(
+            "Example/Repo-TerminalMissingPid",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let result = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            100,
+            &spawn,
+        )
+        .expect("same-sha terminal without pid should dispatch");
+        assert_eq!(result.mode, "started");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1491,7 +1670,10 @@ mod tests {
             })
         };
 
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-Force-Spawn",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let result = dispatch_single_review_for_home_with_spawn_force(
             home,
             pr_url(),
@@ -1967,7 +2149,10 @@ mod tests {
             })
         };
 
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-StalePidNotJoined",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let result = dispatch_single_review_for_home_with_spawn(
             home,
             pr_url(),
