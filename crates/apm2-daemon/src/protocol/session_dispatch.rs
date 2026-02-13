@@ -8668,6 +8668,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .as_ref()
             .and_then(|r| r.journal_binding.as_ref());
 
+        // TCK-00501: Extract idempotency key hex for propagation into
+        // tool execution context.
+        let idempotency_key_hex = admission_result
+            .as_ref()
+            .map(|r| r.idempotency_key.as_hex());
+
         let mut response = self.handle_broker_decision(
             decision,
             &token.session_id,
@@ -8685,6 +8691,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_flow_state_for_package.as_ref(),
             journal_ref,
             binding_ref,
+            idempotency_key_hex,
         );
 
         // ================================================================
@@ -9272,6 +9279,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         clippy::items_after_statements,
         clippy::too_many_arguments
     )]
+    #[allow(clippy::too_many_arguments)]
     fn handle_broker_decision(
         &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
@@ -9292,6 +9300,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             &std::sync::Arc<dyn crate::admission_kernel::effect_journal::EffectJournal>,
         >,
         journal_binding: Option<&crate::admission_kernel::effect_journal::EffectJournalBindingV1>,
+        idempotency_key_hex: Option<String>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -9863,6 +9872,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     let verified_for_execution = verified_content.take();
                     let toctou_required_for_execution = toctou_verification_required;
                     let request_id_for_execution = request_id.clone();
+                    // TCK-00501: Propagate idempotency key into
+                    // ExecutionContext so tool handlers can use it for
+                    // external deduplication.
+                    let idempotency_key_for_execution = idempotency_key_hex;
                     let execution_result = tokio::task::block_in_place(move || {
                         let handle = tokio::runtime::Handle::current();
                         handle.block_on(async move {
@@ -9875,6 +9888,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     &request_id_for_execution,
                                     verified_for_execution,
                                     toctou_required_for_execution,
+                                    idempotency_key_for_execution,
                                 )
                                 .await
                         })
@@ -19257,6 +19271,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .expect("dispatch should return application-level error response");
 
@@ -19953,6 +19968,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20123,6 +20139,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                     None,
                     None,
@@ -20299,6 +20316,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20435,6 +20453,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                     None,
                     None,
@@ -20587,6 +20606,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                     None,
                     None,
                     None,

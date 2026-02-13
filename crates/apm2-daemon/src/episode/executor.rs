@@ -237,6 +237,13 @@ pub struct ExecutionContext {
 
     /// Whether handlers must fail-closed to TOCTOU-verified bytes.
     pub toctou_verification_required: bool,
+
+    /// Idempotency key for external deduplication (TCK-00501).
+    ///
+    /// When present, tool handlers that interact with external systems
+    /// supporting idempotency keys SHOULD propagate this value to
+    /// enable crash-safe retry deduplication.
+    pub idempotency_key: Option<String>,
 }
 
 impl ExecutionContext {
@@ -249,6 +256,7 @@ impl ExecutionContext {
             started_at_ns,
             verified_content: VerifiedToolContent::default(),
             toctou_verification_required: false,
+            idempotency_key: None,
         }
     }
 
@@ -266,6 +274,13 @@ impl ExecutionContext {
         toctou_verification_required: bool,
     ) -> Self {
         self.toctou_verification_required = toctou_verification_required;
+        self
+    }
+
+    /// Attaches an idempotency key for external deduplication (TCK-00501).
+    #[must_use]
+    pub fn with_idempotency_key(mut self, key: Option<String>) -> Self {
+        self.idempotency_key = key;
         self
     }
 }

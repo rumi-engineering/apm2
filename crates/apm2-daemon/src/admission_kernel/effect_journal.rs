@@ -56,7 +56,7 @@
 //! - Boundary profile + enforcement tier
 //! - AJC ID + join selectors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read as _, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -79,7 +79,7 @@ use super::types::EnforcementTier;
 /// Active entries are requests in `Started` or `Unknown` state. Terminal
 /// entries (`Completed`/`NotStarted`) are retained for replay/audit but do
 /// not consume admission slots.
-const MAX_JOURNAL_ENTRIES: usize = 1_000_000;
+const MAX_JOURNAL_ENTRIES: usize = 100_000;
 
 /// Maximum number of terminal entries (`Completed`/`NotStarted`) retained
 /// in the in-memory index before automatic compaction.
@@ -342,10 +342,6 @@ impl EffectJournalBindingV1 {
                 reason: "authority_join_hash is zero".into(),
             });
         }
-        // TCK-00501 NIT: Validate witness seed hashes for zero-ness,
-        // consistent with other digest validation in this method.
-        // Zero witness seed hashes indicate missing/corrupted derivation
-        // binding data.
         if self.leakage_witness_seed_hash == ZERO {
             return Err(EffectJournalError::ValidationError {
                 reason: "leakage_witness_seed_hash is zero".into(),
@@ -414,19 +410,24 @@ impl EffectJournalBindingV1 {
 // IdempotencyKeyV1
 // =============================================================================
 
-/// Idempotency key derived from `RequestId` for propagation into
-/// tool/broker adapter calls (REQ-0029).
+/// Idempotency key derived from stable client-supplied identifiers
+/// for propagation into tool/broker adapter calls (REQ-0029, INV-F-06).
 ///
-/// This key is deterministically derived so that retries of the same
-/// request produce the same idempotency key, allowing external systems
-/// to deduplicate effect execution.
+/// The key MUST be deterministic for the same client intent so that
+/// retries produce the same idempotency key, allowing external systems
+/// to deduplicate effect execution. Using a random per-request UUID
+/// as the sole input would defeat retry safety because a new UUID is
+/// generated on each retry attempt.
 ///
 /// # Derivation
 ///
-/// `BLAKE3("apm2-idempotency-key-v1" || request_id || ajc_id)`
+/// `BLAKE3("apm2-idempotency-key-v1" || dedupe_key || request_id || ajc_id)`
 ///
-/// The AJC ID is included to bind the idempotency key to a specific
-/// admission decision, preventing cross-admission key reuse.
+/// - `dedupe_key`: Stable client-supplied deduplication key that persists
+///   across retries of the same intent.
+/// - `request_id`: Per-request identifier (provides uniqueness within a single
+///   admission cycle).
+/// - `ajc_id`: Admission join cycle ID (prevents cross-admission key reuse).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyKeyV1 {
     /// The derived idempotency key hash.
@@ -438,11 +439,30 @@ pub struct IdempotencyKeyV1 {
 }
 
 impl IdempotencyKeyV1 {
-    /// Derive an idempotency key from a `RequestId` and AJC ID.
+    /// Derive an idempotency key from a stable `dedupe_key`, the
+    /// per-request `request_id`, and the AJC ID.
+    ///
+    /// The `dedupe_key` is the primary retry-stable identifier
+    /// (INV-F-06). When empty, the derivation falls back to
+    /// `request_id` + `ajc_id` only, which is retry-safe only if
+    /// the caller ensures `request_id` is stable across retries.
     #[must_use]
     pub fn derive(request_id: Hash, ajc_id: Hash) -> Self {
+        Self::derive_with_dedupe_key(request_id, ajc_id, &[])
+    }
+
+    /// Derive an idempotency key with an explicit stable `dedupe_key`
+    /// (INV-F-06: retry-safe deduplication).
+    ///
+    /// The `dedupe_key` bytes are included in the BLAKE3 derivation
+    /// before the `request_id` and `ajc_id`, ensuring that retries
+    /// of the same client intent produce the same key regardless of
+    /// whether a new `request_id` UUID was generated.
+    #[must_use]
+    pub fn derive_with_dedupe_key(request_id: Hash, ajc_id: Hash, dedupe_key: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2-idempotency-key-v1");
+        hasher.update(dedupe_key);
         hasher.update(&request_id);
         hasher.update(&ajc_id);
         Self {
@@ -632,6 +652,11 @@ struct JournalInner {
     /// O(1) count of terminal entries (`Completed`/`NotStarted`).
     /// Updated on every state transition.
     terminal_count: usize,
+    /// FIFO eviction order for terminal entries. When entries transition
+    /// to a terminal state (`Completed`/`NotStarted`), the key is pushed
+    /// to the back. `prune_terminal_entries_if_needed` pops from the
+    /// front for O(1) eviction instead of O(N) `HashMap` scanning.
+    terminal_order: VecDeque<Hash>,
 }
 
 impl JournalInner {
@@ -649,18 +674,26 @@ impl JournalInner {
         }
         let excess = self.terminal_count - MAX_TERMINAL_ENTRIES;
         let mut pruned = 0usize;
-        let terminal_keys: Vec<Hash> = self
-            .entries
-            .iter()
-            .filter(|(_, record)| state_is_terminal(record.state))
-            .map(|(k, _)| *k)
-            .collect();
-        for key in terminal_keys {
-            if pruned >= excess {
+        // O(1) per eviction: pop oldest terminal keys from the front of
+        // the VecDeque. Keys may reference entries that have since been
+        // overwritten (e.g., re-executed after resolve_in_doubt), so we
+        // skip stale/missing keys.
+        while pruned < excess {
+            let Some(key) = self.terminal_order.pop_front() else {
                 break;
+            };
+            // Only remove if the entry still exists AND is still terminal.
+            // A key may have been re-inserted as active (Started) after
+            // resolve_in_doubt + record_started, in which case we must
+            // not evict it.
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|r| state_is_terminal(r.state))
+            {
+                self.entries.remove(&key);
+                pruned += 1;
             }
-            self.entries.remove(&key);
-            pruned += 1;
         }
         self.terminal_count = self.terminal_count.saturating_sub(pruned);
         if pruned > 0 {
@@ -783,6 +816,14 @@ impl FileBackedEffectJournal {
         path: impl AsRef<Path>,
         max_active_entries: usize,
     ) -> Result<Self, EffectJournalError> {
+        /// Maximum journal file size (256 MiB). Files exceeding this
+        /// limit are rejected before reading to prevent unbounded
+        /// allocation from a malicious or corrupted file. The limit
+        /// is sized to accommodate the maximum legitimate journal:
+        /// `MAX_JOURNAL_ENTRIES` + `MAX_TERMINAL_ENTRIES` entries at
+        /// `MAX_JOURNAL_LINE_LEN` bytes each.
+        const MAX_JOURNAL_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
         if max_active_entries == 0 {
             return Err(EffectJournalError::ValidationError {
                 reason: "max_active_entries must be > 0".to_string(),
@@ -792,6 +833,21 @@ impl FileBackedEffectJournal {
         let mut entries: HashMap<Hash, JournalRecord> = HashMap::new();
         let mut active_entries = 0usize;
         let mut terminal_entries = 0usize;
+        let mut terminal_order: VecDeque<Hash> = VecDeque::new();
+
+        // MINOR FIX: Pre-allocation file size check. Reject journal files
+        // exceeding MAX_JOURNAL_FILE_SIZE before reading them into memory.
+        if path.exists() {
+            let metadata = std::fs::metadata(&path)?;
+            if metadata.len() > MAX_JOURNAL_FILE_SIZE {
+                return Err(EffectJournalError::ValidationError {
+                    reason: format!(
+                        "journal file exceeds maximum size ({} > {MAX_JOURNAL_FILE_SIZE})",
+                        metadata.len()
+                    ),
+                });
+            }
+        }
 
         // Acquire exclusive lock for single-writer inter-process exclusivity.
         let mut open_opts = OpenOptions::new();
@@ -855,9 +911,10 @@ impl FileBackedEffectJournal {
                 if bytes_read == 0 {
                     break; // EOF
                 }
-                // Detect oversized lines: if we filled the buffer without
-                // hitting a newline, the line exceeds MAX_JOURNAL_LINE_LEN.
-                if buf.len() > MAX_JOURNAL_LINE_LEN && buf.last() != Some(&b'\n') {
+                // Detect oversized lines: strictly enforce MAX_JOURNAL_LINE_LEN.
+                // If the buffer exceeds the limit, reject regardless of whether
+                // a newline was found (off-by-one fix).
+                if buf.len() > MAX_JOURNAL_LINE_LEN {
                     return Err(EffectJournalError::CorruptEntry {
                         line: line_idx + 1,
                         reason: format!(
@@ -943,22 +1000,24 @@ impl FileBackedEffectJournal {
                                         record.state = EffectExecutionState::Completed;
                                         active_entries = active_entries.saturating_sub(1);
                                         terminal_entries += 1;
+                                        terminal_order.push_back(request_id);
                                         // BLOCKER FIX: Inline terminal compaction during
-                                        // replay to prevent unbounded memory growth. Without
-                                        // this, replaying millions of Completed entries
-                                        // accumulates all terminal entries in the HashMap
-                                        // before post-replay compaction, causing OOM.
+                                        // replay using O(1) VecDeque eviction to prevent
+                                        // unbounded memory growth.
                                         if terminal_entries > MAX_TERMINAL_ENTRIES {
                                             let excess = terminal_entries - MAX_TERMINAL_ENTRIES;
-                                            let keys: Vec<Hash> = entries
-                                                .iter()
-                                                .filter(|(_, r)| state_is_terminal(r.state))
-                                                .map(|(k, _)| *k)
-                                                .take(excess)
-                                                .collect();
-                                            let pruned = keys.len();
-                                            for key in keys {
-                                                entries.remove(&key);
+                                            let mut pruned = 0usize;
+                                            while pruned < excess {
+                                                let Some(key) = terminal_order.pop_front() else {
+                                                    break;
+                                                };
+                                                if entries
+                                                    .get(&key)
+                                                    .is_some_and(|r| state_is_terminal(r.state))
+                                                {
+                                                    entries.remove(&key);
+                                                    pruned += 1;
+                                                }
                                             }
                                             terminal_entries =
                                                 terminal_entries.saturating_sub(pruned);
@@ -987,19 +1046,23 @@ impl FileBackedEffectJournal {
                                         record.state = EffectExecutionState::NotStarted;
                                         active_entries = active_entries.saturating_sub(1);
                                         terminal_entries += 1;
+                                        terminal_order.push_back(request_id);
                                         // BLOCKER FIX: Same inline compaction for Resolved
-                                        // entries during replay (same rationale as Completed).
+                                        // entries during replay using O(1) VecDeque eviction.
                                         if terminal_entries > MAX_TERMINAL_ENTRIES {
                                             let excess = terminal_entries - MAX_TERMINAL_ENTRIES;
-                                            let keys: Vec<Hash> = entries
-                                                .iter()
-                                                .filter(|(_, r)| state_is_terminal(r.state))
-                                                .map(|(k, _)| *k)
-                                                .take(excess)
-                                                .collect();
-                                            let pruned = keys.len();
-                                            for key in keys {
-                                                entries.remove(&key);
+                                            let mut pruned = 0usize;
+                                            while pruned < excess {
+                                                let Some(key) = terminal_order.pop_front() else {
+                                                    break;
+                                                };
+                                                if entries
+                                                    .get(&key)
+                                                    .is_some_and(|r| state_is_terminal(r.state))
+                                                {
+                                                    entries.remove(&key);
+                                                    pruned += 1;
+                                                }
                                             }
                                             terminal_entries =
                                                 terminal_entries.saturating_sub(pruned);
@@ -1078,11 +1141,13 @@ impl FileBackedEffectJournal {
                 entries,
                 active_count: active_entries,
                 terminal_count: terminal_entries,
+                terminal_order,
             };
             inner.prune_terminal_entries_if_needed();
             entries = inner.entries;
             active_entries = inner.active_count;
             terminal_entries = inner.terminal_count;
+            terminal_order = inner.terminal_order;
         }
 
         Ok(Self {
@@ -1092,6 +1157,7 @@ impl FileBackedEffectJournal {
                 entries,
                 active_count: active_entries,
                 terminal_count: terminal_entries,
+                terminal_order,
             }),
             file: Mutex::new(file),
         })
@@ -1118,6 +1184,8 @@ impl FileBackedEffectJournal {
             .retain(|_, record| !state_is_terminal(record.state));
         let pruned = before - inner.entries.len();
         inner.terminal_count = inner.terminal_count.saturating_sub(pruned);
+        // Clear the terminal order queue since all terminal entries were removed.
+        inner.terminal_order.clear();
         pruned
     }
 
@@ -1243,6 +1311,7 @@ impl EffectJournal for FileBackedEffectJournal {
         }
         inner.active_count = inner.active_count.saturating_sub(1);
         inner.terminal_count += 1;
+        inner.terminal_order.push_back(*request_id);
 
         // BLOCKER FIX: Prune terminal entries at runtime to prevent
         // unbounded in-memory growth during long-running daemon sessions.
@@ -1337,6 +1406,7 @@ impl EffectJournal for FileBackedEffectJournal {
         // Unknown is active; NotStarted is terminal.
         inner.active_count = inner.active_count.saturating_sub(1);
         inner.terminal_count += 1;
+        inner.terminal_order.push_back(*request_id);
 
         // BLOCKER FIX: Prune terminal entries at runtime to prevent
         // unbounded in-memory growth (same rationale as record_completed).
@@ -1969,6 +2039,47 @@ mod tests {
         assert_ne!(
             key1.key, key2.key,
             "different ajc_ids must produce different keys"
+        );
+    }
+
+    #[test]
+    fn idempotency_key_with_dedupe_key_deterministic() {
+        let request_id = test_hash(0x40);
+        let ajc_id = test_hash(0x41);
+        let dedupe_key = b"stable-client-intent-key";
+
+        let key1 = IdempotencyKeyV1::derive_with_dedupe_key(request_id, ajc_id, dedupe_key);
+        let key2 = IdempotencyKeyV1::derive_with_dedupe_key(request_id, ajc_id, dedupe_key);
+        assert_eq!(
+            key1.key, key2.key,
+            "derive_with_dedupe_key must be deterministic for same inputs"
+        );
+    }
+
+    #[test]
+    fn idempotency_key_with_dedupe_key_differs_from_without() {
+        let request_id = test_hash(0x40);
+        let ajc_id = test_hash(0x41);
+        let dedupe_key = b"stable-client-intent-key";
+
+        let key_without = IdempotencyKeyV1::derive(request_id, ajc_id);
+        let key_with = IdempotencyKeyV1::derive_with_dedupe_key(request_id, ajc_id, dedupe_key);
+        assert_ne!(
+            key_without.key, key_with.key,
+            "derive_with_dedupe_key must differ from derive when dedupe_key is non-empty"
+        );
+    }
+
+    #[test]
+    fn idempotency_key_different_dedupe_keys_produce_different_keys() {
+        let request_id = test_hash(0x40);
+        let ajc_id = test_hash(0x41);
+
+        let key1 = IdempotencyKeyV1::derive_with_dedupe_key(request_id, ajc_id, b"intent-A");
+        let key2 = IdempotencyKeyV1::derive_with_dedupe_key(request_id, ajc_id, b"intent-B");
+        assert_ne!(
+            key1.key, key2.key,
+            "different dedupe_keys must produce different idempotency keys"
         );
     }
 

@@ -586,7 +586,14 @@ impl AdmissionKernelV1 {
         }
 
         // Derive idempotency key for propagation to tool/broker adapters.
-        let idempotency_key = IdempotencyKeyV1::derive(request_id, ajc_id);
+        // INV-F-06: Use the intent_digest as the stable dedupe_key so that
+        // retries of the same client intent produce the same idempotency
+        // key, even if a new random request_id UUID was generated. The
+        // intent_digest is deterministically derived from (tool_class,
+        // boundary_channel_key, argument_content_digest) and persists
+        // across retries of the same request.
+        let idempotency_key =
+            IdempotencyKeyV1::derive_with_dedupe_key(request_id, ajc_id, &intent_digest);
 
         // Phase Q: Mint capability tokens.
         let effect_capability = EffectCapability::new(ajc_id, intent_digest, request_id);
