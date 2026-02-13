@@ -16,7 +16,8 @@
     "strategy/": "High-level roadmaps, business objectives, and SDLC pipeline governance models.",
     "policy/": "Operational configurations for environment access and development permission boundaries.",
     "reviews/": "Standardized prompts for security, code quality, and hypothesis validation gates.",
-    "releases/": "Procedures for artifact promotion, distribution channels, and release lifecycle management."
+    "releases/": "Procedures for artifact promotion, distribution channels, and release lifecycle management.",
+    "runbooks/": "Operational procedures for bootstrapping, running, and troubleshooting system components."
   },
   "naming_conventions": {
     "00_meta.yaml": "Document header containing IDs, ownership, status, and versioning state.",

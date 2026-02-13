@@ -109,42 +109,64 @@ rfc_design_decisions:
     - EVID-7002
 
   - id: DD-003
-    title: "Document cargo-nextest as Recommended Test Runner"
+    title: "Mandate cargo-nextest as FAC Test Runner"
     statement: |
-      Document cargo-nextest as the recommended test runner for local
-      development without mandating its use or modifying CI.
+      Mandate cargo-nextest as the preferred and recommended test runner for
+      FAC evidence gate execution. The FAC bounded test gate uses explicit
+      `cargo nextest run` invocation when cgroup v2 and the bounded runner
+      script are available. The current implementation falls back to
+      `cargo test --workspace` when the bounded runner inputs are absent.
+      Fail-closed enforcement (rejecting execution without nextest) is
+      planned as future work.
     context: |
       cargo-nextest provides significantly faster test execution through
-      process-level parallelism. It's a drop-in replacement for cargo test
-      but offers better performance and output formatting.
+      process-level parallelism and is already the default test runner
+      in the FAC bounded test gate when cgroup v2 is available. However,
+      two fallback paths currently degrade to `cargo test`:
+      (1) the pipeline path when the bounded runner is unavailable
+      (evidence.rs:430-435), and
+      (2) the local `apm2 fac gates` path when EvidenceGateOptions.test_command
+      is unset (evidence.rs:596-604, gates.rs:204-218).
+
+      RFC-0019 Amendment A1 (FESv1) mandates nextest as a substrate
+      requirement. This decision captures the design intent; full
+      fail-closed enforcement is tracked as future work.
     alternatives:
     - id: ALT-0001
-      name: "Mandate cargo-nextest in CI and locally"
+      name: "Mandate cargo-nextest in all FAC paths (chosen)"
       pros:
-      - "Consistent test execution"
-      - "Faster CI"
+      - "Consistent test execution across pipeline and local gates"
+      - "Faster test execution (2-3x)"
+      - "Reliable attestation (nextest version is already captured)"
+      - "Required by FESv1 substrate contract"
       cons:
-      - "Requires CI changes"
-      - "May have compatibility issues with some tests"
-      - "Additional CI dependency"
-      security_tradeoffs: []
+      - "nextest must be installed (fail-closed if missing)"
+      - "Additional tool dependency"
+      security_tradeoffs:
+      - "Eliminates silent degradation to cargo test (fail-closed improvement)"
       operability_tradeoffs:
-      - "CI complexity increases"
+      - "Operators must install nextest before running FAC gates"
     - id: ALT-0002
-      name: "Document as recommended, optional for developers (chosen)"
+      name: "Keep as optional recommendation"
       pros:
-      - "No CI changes required"
-      - "Developers can adopt incrementally"
-      - "Fallback to cargo test always works"
+      - "No installation requirement"
+      - "Backward compatible"
       cons:
-      - "Inconsistent test execution across developers"
-      security_tradeoffs: []
+      - "Inconsistent execution semantics between environments"
+      - "Silent fallback to cargo test defeats attestation correctness"
+      - "Conflicts with FESv1 substrate requirements"
+      security_tradeoffs:
+      - "Fail-open: silent degradation to different test runner"
       operability_tradeoffs:
-      - "Developers must install separately"
+      - "Cannot guarantee test-gate reproducibility"
     chosen_rationale: |
-      Making cargo-nextest a recommendation rather than a requirement allows
-      gradual adoption. The existing cargo test command remains fully
-      supported. Documentation helps developers discover the optimization.
+      FESv1 (RFC-0019 Amendment A1) requires nextest as a substrate
+      invariant. The bounded test gate (cgroup v2 + run_bounded_tests.sh)
+      uses `cargo nextest run`. When bounded execution is unavailable,
+      the current implementation falls back to `cargo test --workspace`.
+      Full fail-closed enforcement (rejecting execution without nextest)
+      is planned as future work. This captures the design intent while
+      accurately reflecting the current fallback behavior.
     impacted_requirement_ids:
     - PERF-003
     evidence_ids:
@@ -193,3 +215,73 @@ rfc_design_decisions:
     - PERF-005
     evidence_ids:
     - EVID-7004
+
+  - id: DD-005
+    title: "Containment Constraints for Compilation Caching"
+    statement: |
+      Compilation caching (sccache) MUST NOT be enabled in default FAC
+      execution mode because it can spawn compiler processes outside the
+      bounded cgroup unit, violating containment invariants. sccache MAY
+      be enabled only after explicit verification that it preserves cgroup
+      membership for all child processes.
+    context: |
+      FESv1 (RFC-0019 Amendment A1) requires that all compilers, tests,
+      and helper processes spawned by a FAC job remain inside the intended
+      cgroup boundary for the execution lane. sccache acts as a compiler
+      wrapper (RUSTC_WRAPPER) that can:
+      (1) spawn rustc processes that may inherit different cgroup membership,
+      (2) maintain a long-lived daemon that compiles outside the job cgroup,
+      (3) break resource accounting by shifting compilation work to the
+          daemon process.
+
+      The primary accelerator for cross-worktree build reuse in FESv1 is
+      lane-scoped CARGO_TARGET_DIR (target pool per lane per toolchain
+      fingerprint), which provides artifact reuse without containment risk.
+
+      Additionally, this isolation behavior is currently a planned hardening goal.
+      The current local execution path inherits ambient environment, so user-level
+      cargo/rust settings can still influence command behavior. A future
+      implementation is expected to set CARGO_HOME under $APM2_HOME and treat only
+      repository policy files as cargo input while ignoring ambient cargo
+      settings.
+
+    alternatives:
+    - id: ALT-0001
+      name: "Disable sccache in default FAC mode (chosen)"
+      pros:
+      - "Preserves cgroup containment invariants"
+      - "No risk of compiler escape"
+      - "Lane-scoped target pool provides sufficient reuse"
+      cons:
+      - "No cross-lane compilation cache"
+      - "Cold-start in new lanes requires full dependency build"
+      security_tradeoffs:
+      - "Eliminates containment bypass via compiler wrapper daemon"
+      operability_tradeoffs:
+      - "Operators use `apm2 fac warm` to pre-populate lane targets"
+    - id: ALT-0002
+      name: "Allow sccache unconditionally"
+      pros:
+      - "Maximum compilation reuse across lanes"
+      cons:
+      - "sccache daemon runs outside cgroup boundary"
+      - "Resource accounting is broken"
+      - "Containment violation in FESv1 threat model"
+      security_tradeoffs:
+      - "Fail-open: compiler processes escape containment"
+      operability_tradeoffs:
+      - "Unpredictable resource consumption from daemon"
+    chosen_rationale: |
+      Host safety is a non-negotiable FESv1 requirement. The sccache
+      daemon process model is incompatible with per-lane cgroup isolation.
+      Lane-scoped target directories plus manual pre-warming (currently
+      `cargo build --workspace`; a dedicated `apm2 fac warm` command is
+      PLANNED for the FESv1 lane surface) provide sufficient build reuse
+      for the current host class without violating containment. sccache
+      MAY be re-evaluated after proving that its processes remain inside
+      the job cgroup (e.g., via --no-daemon mode or systemd slice
+      inheritance).
+    impacted_requirement_ids:
+    - PERF-002
+    evidence_ids:
+    - EVID-7002

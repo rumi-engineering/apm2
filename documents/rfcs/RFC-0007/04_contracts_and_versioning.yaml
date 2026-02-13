@@ -31,15 +31,19 @@ rfc_contracts_and_versioning:
       name: "RUSTC_WRAPPER environment variable"
       description: |
         Developers MAY set RUSTC_WRAPPER=sccache in their shell profile
-        to enable compilation caching.
+        to enable compilation caching for manual builds outside FAC.
       interface:
         variable: "RUSTC_WRAPPER"
         value: "sccache"
-        scope: "Developer shell profile (optional)"
+        scope: "Developer shell profile (optional, manual builds only)"
       backward_compatible: true
       notes: |
-        This is a recommendation, not a requirement. The project builds
-        correctly without sccache.
+        This is a recommendation for manual developer builds, not a
+        requirement. The project builds correctly without sccache.
+        FESv1 CONSTRAINT: RUSTC_WRAPPER is NOT set in FAC execution
+        mode. FAC uses lane-scoped CARGO_TARGET_DIR for build reuse
+        and disables sccache to preserve cgroup containment. See
+        DD-005 and TB-002 containment_constraints.
 
     - id: CONTRACT-003
       name: "CARGO_INCREMENTAL environment variable"
@@ -60,18 +64,62 @@ rfc_contracts_and_versioning:
         Setting CARGO_INCREMENTAL=1 explicitly documents the intent.
 
     - id: CONTRACT-004
-      name: "cargo nextest run command"
+      name: "cargo nextest run command (preferred for FAC)"
       description: |
-        Developers MAY use cargo nextest run as a faster alternative to
-        cargo test.
+        FAC evidence gate execution SHOULD use `cargo nextest run` as the
+        test runner via the bounded test gate (cgroup v2 +
+        run_bounded_tests.sh). The current implementation falls back to
+        `cargo test --workspace` when the bounded runner inputs are absent.
+        For manual developer testing, cargo test remains available but
+        nextest is recommended.
       interface:
         command: "cargo nextest run"
-        equivalent_to: "cargo test"
+        equivalent_to: "cargo test (fallback when bounded runner unavailable)"
         flags: "Most cargo test flags supported"
+        fac_requirement: "PREFERRED — bounded gate uses nextest; fallback to cargo test exists"
       backward_compatible: true
       notes: |
-        cargo test remains fully supported. nextest is a recommendation
-        for faster local development.
+        FESv1 AMENDMENT: nextest is the preferred and recommended test
+        runner for FAC. The bounded test gate uses `cargo nextest run`
+        inside a cgroup unit. When bounded execution is unavailable
+        (no cgroup v2, no run_bounded_tests.sh), the current
+        implementation falls back to `cargo test --workspace`
+        (evidence.rs:430-435, evidence.rs:596-604, gates.rs:204-218).
+        Fail-closed enforcement (rejecting execution without nextest)
+        is planned as future work. Install nextest for best results:
+        `cargo install cargo-nextest`.
+
+    - id: CONTRACT-005
+      name: "FAC execution containment boundary"
+      description: |
+        All FAC evidence gate execution MUST run inside a bounded
+        cgroup unit with explicit resource limits. No process spawned
+        by the job may escape the containment boundary.
+      interface:
+        mechanism: "systemd-run --user transient scope/service"
+        resource_limits:
+          - "MemoryMax: default 24G"
+          - "CPUQuota: configurable"
+          - "TasksMax: default 1536"
+          - "TimeoutStopSec: default 240s"
+        escape_prevention:
+          - "sccache disabled in default FAC mode"
+          - "PLANNED: set CARGO_HOME under $APM2_HOME (not yet enforced in local fallback)"
+          - "PLANNED: ignore ambient ~/.cargo/config.toml during FAC execution (not yet enforced)"
+          - "Current local-mode execution inherits ambient environment, including cargo/rust wrapper settings"
+      backward_compatible: true
+      notes: |
+        If bounded execution cannot be proven available (the bounded runner script is
+        missing or cgroup v2 is unavailable), the current implementation falls back
+        to running evidence gates without cgroup resource limits and uses
+        `cargo test --workspace` instead of `cargo nextest run`. Bounded execution
+        still requires a reachable user bus; if preflight user bus checks fail, the
+        fallback does not occur and bounded execution hard-fails.
+        Fail-closed enforcement (rejecting execution when bounded
+        execution is unavailable) is planned as future work. Operators
+        are strongly encouraged to enable bounded execution by
+        configuring a systemd user session (enable linger, or run via
+        systemd-managed apm2-daemon).
 
   versioning:
     strategy: "No version bump required for configuration changes"
