@@ -868,7 +868,7 @@ impl DeferredReplayWorker {
 
         let intent_digest = EventHasher::hash_content(&intent.changeset_digest);
         let ledger_anchor = EventHasher::hash_content(intent.intent_id.as_bytes());
-        let freshness_tick = eval_tick.max(1);
+        let freshness_tick = intent.eval_tick.max(1);
 
         // Preserve original bindings from the buffered intent:
         // - capability_manifest_hash: derived by hashing the changeset_digest. The
@@ -887,6 +887,13 @@ impl DeferredReplayWorker {
         let scope_witness_hash = EventHasher::hash_content(&intent.ledger_head);
         let freshness_policy_hash = EventHasher::hash_content(&intent.ledger_head);
         let stop_budget_profile_digest = capability_manifest_hash;
+        let directory_head_hash = intent.ledger_head;
+        let policy = PcacPolicyKnobs::default();
+
+        if eval_tick.saturating_sub(freshness_tick) > policy.freshness_max_age_ticks {
+            increment_lifecycle_counter(&self.telemetry, lifecycle_deny::STALE);
+            return Err("lifecycle stale: replayed intent exceeds freshness age".to_string());
+        }
 
         // Build join input via PrivilegedPcacInputBuilder (RS-42 section 4.1).
         // Risk tier: Tier2Plus (fail-closed — most restrictive because original
@@ -911,10 +918,8 @@ impl DeferredReplayWorker {
                     freshness_tick,
                     time_authority_ref,
                     ledger_anchor,
-                    current_revocation_head,
+                    directory_head_hash,
                 );
-
-        let policy = PcacPolicyKnobs::default();
 
         self.lifecycle_gate.advance_tick(eval_tick);
 
@@ -1528,9 +1533,9 @@ mod tests {
                 intent_id,
                 work_id,
                 &make_digest(changeset_byte),
-                &make_digest(0xAB),
+                &make_digest(0xCC),
                 "pending",
-                eval_tick,
+                eval_tick.max(1000),
                 1_000_000,
             )
             .expect("insert intent");
@@ -2110,6 +2115,7 @@ mod tests {
 
         insert_test_intent(&buffer, "intent-revoked-001", "work-revoked-001", 0xD0, 800);
         insert_test_backlog(&buffer, "intent-revoked-001", "work-revoked-001", 800);
+        let revocation_head = make_digest(0xCC);
 
         // Create a shared kernel and lifecycle gate.
         let kernel = Arc::new(InProcessKernel::new(1));
@@ -2139,8 +2145,6 @@ mod tests {
                 apm2_core::crypto::EventHasher::hash_content(&intent.ledger_head);
             let freshness_policy_hash =
                 apm2_core::crypto::EventHasher::hash_content(&intent.ledger_head);
-
-            let revocation_head = ledger_anchor;
 
             let join_input =
                 PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::RegisterRecoveryEvidence)
@@ -2212,7 +2216,7 @@ mod tests {
         )
         .expect("worker");
 
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-revoked-001");
+        let intent_anchor = revocation_head;
         let result = worker
             .drain_cycle(1000, make_digest(0xAA), make_digest(0xBB), intent_anchor)
             .expect("drain");
@@ -2267,9 +2271,9 @@ mod tests {
 
         let worker = make_worker(buffer.clone(), resolver, signer);
 
-        // Use same revocation head as what the builder sets for
-        // directory_head_hash (derived from intent_id via ledger_anchor).
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-notrev-001");
+        // Use same revocation head as what the builder sets for directory_head_hash
+        // (via intent ledger_head).
+        let intent_anchor = make_digest(0xCC);
         let result = worker
             .drain_cycle(1000, make_digest(0xAA), make_digest(0xBB), intent_anchor)
             .expect("drain");
@@ -2329,7 +2333,7 @@ mod tests {
         .expect("worker1");
 
         // First replay: should succeed (token consumed).
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-consume-001");
+        let intent_anchor = make_digest(0xCC);
         let r1 = worker1
             .drain_cycle(1000, make_digest(0xAA), make_digest(0xBB), intent_anchor)
             .expect("drain1");
@@ -2360,7 +2364,7 @@ mod tests {
 
         // Second replay: uses same shared lifecycle gate where the first
         // intent's token scope was already consumed.
-        let intent_anchor2 = apm2_core::crypto::EventHasher::hash_content(b"intent-consume-002");
+        let intent_anchor2 = make_digest(0xCC);
         let r2 = worker2
             .drain_cycle(1001, make_digest(0xAA), make_digest(0xBB), intent_anchor2)
             .expect("drain2");
@@ -2435,7 +2439,7 @@ mod tests {
 
         // Use matching revocation head so we test tier behavior, not
         // revocation.
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-tier-001");
+        let intent_anchor = make_digest(0xCC);
         let result = worker
             .drain_cycle(1000, make_digest(0xAA), make_digest(0xBB), intent_anchor)
             .expect("drain");
@@ -2498,7 +2502,7 @@ mod tests {
 
         // Build worker with matching revocation head so economics and lifecycle
         // gates pass, but projection effect fails.
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-projfail-001");
+        let intent_anchor = make_digest(0xCC);
 
         let worker = make_worker_with_effect(buffer.clone(), resolver, signer, failing_effect);
 
@@ -2547,7 +2551,7 @@ mod tests {
         insert_test_intent(&buffer, "intent-projok-001", "work-projok-001", 0xF1, 800);
         insert_test_backlog(&buffer, "intent-projok-001", "work-projok-001", 800);
 
-        let intent_anchor = apm2_core::crypto::EventHasher::hash_content(b"intent-projok-001");
+        let intent_anchor = make_digest(0xCC);
 
         let worker = make_worker(buffer.clone(), resolver, signer);
 
