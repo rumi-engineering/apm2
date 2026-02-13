@@ -41,6 +41,14 @@ pub const TERMINAL_STALE_HEAD_AMBIGUITY: &str = "stale_head_ambiguity";
 pub const TERMINAL_SHA_DRIFT_SUPERSEDED: &str = "sha_drift_superseded";
 pub const TERMINAL_DISPATCH_LOCK_TIMEOUT: &str = "dispatch_lock_timeout";
 pub const TERMINAL_INTEGRITY_FAILURE: &str = "integrity_failure";
+pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED: &str = "verdict_finalized_agent_stopped";
+pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY: &str =
+    "manual_termination_after_decision";
+
+pub fn is_verdict_finalized_agent_stop_reason(reason: &str) -> bool {
+    reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED)
+        || reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY)
+}
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 

@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::target::resolve_pr_target;
 use super::types::{
-    ReviewRunStatus, TerminationAuthority, allocate_local_comment_id, apm2_home_dir, now_iso8601,
-    sanitize_for_path, validate_expected_head_sha,
+    ReviewRunStatus, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, TerminationAuthority,
+    allocate_local_comment_id, apm2_home_dir, now_iso8601, sanitize_for_path,
+    validate_expected_head_sha,
 };
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
@@ -1020,8 +1021,8 @@ fn terminate_review_agent_for_home(
     }
 
     let mut outcome = TerminationOutcome::Killed;
-    state.status = ReviewRunStatus::Failed;
-    state.terminal_reason = Some("manual_termination_after_decision".to_string());
+    state.status = ReviewRunStatus::Done;
+    state.terminal_reason = Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED.to_string());
     if let Err(err) = super::state::write_review_run_state_for_home(home, &state).map_err(|err| {
         format!(
             "failed to persist terminal review state for PR #{}: {err}",
@@ -1038,7 +1039,7 @@ fn terminate_review_agent_for_home(
         ));
     }
 
-    eprintln!("INFO: terminated review agent pid={pid} after verdict set");
+    eprintln!("INFO: terminated review agent pid={pid} after verdict finalized");
     Ok(outcome)
 }
 

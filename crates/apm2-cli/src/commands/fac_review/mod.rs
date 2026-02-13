@@ -62,7 +62,8 @@ use state::{
 };
 pub use types::ReviewRunType;
 use types::{
-    DispatchSummary, ProjectionStatus, ReviewKind, TERMINATE_TIMEOUT, validate_expected_head_sha,
+    DispatchSummary, ProjectionStatus, ReviewKind, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
+    TERMINATE_TIMEOUT, is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -417,6 +418,61 @@ pub fn run_status(
             exit_codes::GENERIC_ERROR
         },
     }
+}
+
+fn annotate_verdict_finalized_status_entry(
+    entry: &mut serde_json::Value,
+    current_head_sha: Option<&str>,
+) {
+    let Some(reason) = entry
+        .get("terminal_reason")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    if !is_verdict_finalized_agent_stop_reason(reason) {
+        return;
+    }
+
+    if entry
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|state| state == "failed")
+    {
+        entry["state"] = serde_json::json!("done");
+    }
+    entry["terminal_reason"] = serde_json::json!(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED);
+    entry["state_explanation"] = serde_json::json!(
+        "verdict was recorded and the reviewer process was intentionally stopped to prevent extra token spend"
+    );
+
+    let pr_number = entry
+        .get("pr_number")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let review_type = entry
+        .get("review_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("security");
+    let state_head_sha = entry.get("head_sha").and_then(serde_json::Value::as_str);
+    let action = match (state_head_sha, current_head_sha) {
+        (Some(state_sha), Some(current_sha))
+            if !state_sha.is_empty() && !state_sha.eq_ignore_ascii_case(current_sha) =>
+        {
+            serde_json::json!({
+                "action_required": true,
+                "next_action": format!(
+                    "head moved to {current_sha}; rerun this lane: `apm2 fac review dispatch --pr {pr_number} --type {review_type} --force`"
+                ),
+            })
+        },
+        _ => serde_json::json!({
+            "action_required": false,
+            "next_action": "no action required; rerun only if you want a fresh verdict on demand",
+        }),
+    };
+    entry["action_required"] = action["action_required"].clone();
+    entry["next_action"] = action["next_action"].clone();
 }
 
 pub fn run_wait(
@@ -1364,6 +1420,9 @@ fn run_status_inner(
                     .or_else(|| pulse_quality.as_ref().map(|pulse| pulse.head_sha.clone()))
             })
     });
+    for entry in &mut entries {
+        annotate_verdict_finalized_status_entry(entry, current_head_sha.as_deref());
+    }
 
     if json_output {
         let payload = serde_json::json!({
@@ -1411,6 +1470,12 @@ fn run_status_inner(
                 entry["head_sha"].as_str().unwrap_or("-"),
                 entry["terminal_reason"].as_str().unwrap_or("-"),
             );
+            if let Some(note) = entry["state_explanation"].as_str() {
+                println!("      note={note}");
+            }
+            if let Some(next_action) = entry["next_action"].as_str() {
+                println!("      next_action={next_action}");
+            }
         }
     }
 
@@ -1432,7 +1497,7 @@ fn run_status_inner(
     }
     println!("  Pulse Files:");
     if filter_pr.is_none() {
-        println!("    (set --pr or --pr-url to inspect PR-scoped pulse files)");
+        println!("    (set --pr to inspect PR-scoped pulse files)");
     } else if let Some(review_type) = normalized_review_type.as_deref() {
         let value = if review_type == "security" {
             pulse_security
@@ -1722,6 +1787,32 @@ mod tests {
             "failed:comment_post_permission_denied"
         ));
         assert!(!projection_state_failed("none"));
+    }
+
+    #[test]
+    fn test_status_annotation_for_verdict_finalized_lane_requires_rerun_when_head_drifts() {
+        let mut entry = serde_json::json!({
+            "pr_number": 654,
+            "review_type": "security",
+            "state": "failed",
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "terminal_reason": "manual_termination_after_decision",
+        });
+
+        super::annotate_verdict_finalized_status_entry(
+            &mut entry,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+
+        assert_eq!(entry["state"], serde_json::json!("done"));
+        assert_eq!(
+            entry["terminal_reason"],
+            serde_json::json!("verdict_finalized_agent_stopped")
+        );
+        assert_eq!(entry["action_required"], serde_json::json!(true));
+        assert!(entry["next_action"].as_str().is_some_and(|value| {
+            value.contains("apm2 fac review dispatch --pr 654 --type security --force")
+        }));
     }
 
     #[test]

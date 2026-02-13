@@ -17,9 +17,10 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use super::types::{
-    PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, TERMINAL_INTEGRITY_FAILURE,
-    apm2_home_dir, ensure_parent_dir, entry_pr_number, sanitize_for_path,
-    validate_expected_head_sha,
+    PulseFile, ReviewRunState, ReviewRunStatus, ReviewStateEntry, ReviewStateFile,
+    TERMINAL_INTEGRITY_FAILURE, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, apm2_home_dir,
+    ensure_parent_dir, entry_pr_number, is_verdict_finalized_agent_stop_reason, sanitize_for_path,
+    split_owner_repo, validate_expected_head_sha,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,6 +566,184 @@ pub enum ReviewRunStateLoad {
     },
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyReviewRunStateV1 {
+    run_id: String,
+    pr_url: String,
+    pr_number: u32,
+    head_sha: String,
+    review_type: String,
+    reviewer_role: String,
+    started_at: String,
+    status: ReviewRunStatus,
+    #[serde(default)]
+    terminal_reason: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    backend_id: Option<String>,
+    #[serde(default)]
+    restart_count: u32,
+    sequence_number: u32,
+    #[serde(default)]
+    previous_run_id: Option<String>,
+    #[serde(default)]
+    previous_head_sha: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    proc_start_time: Option<u64>,
+    #[serde(default)]
+    integrity_hmac: Option<String>,
+}
+
+fn owner_repo_from_pr_url(pr_url: &str) -> Option<String> {
+    let normalized = pr_url
+        .trim()
+        .split(['#', '?'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/');
+    let path = normalized
+        .strip_prefix("https://github.com/")
+        .or_else(|| normalized.strip_prefix("http://github.com/"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    let route = parts.next()?;
+    let pr_number = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    if !route.eq_ignore_ascii_case("pull") || pr_number.is_empty() {
+        return None;
+    }
+    let owner_repo = format!("{owner}/{repo}");
+    split_owner_repo(&owner_repo).ok()?;
+    Some(owner_repo.to_ascii_lowercase())
+}
+
+fn normalize_verdict_finalized_state_for_home(
+    home: &Path,
+    state_path: &Path,
+    state: &mut ReviewRunState,
+) -> Result<(), String> {
+    let Some(reason) = state.terminal_reason.as_deref() else {
+        return Ok(());
+    };
+    if state.status != ReviewRunStatus::Failed || !is_verdict_finalized_agent_stop_reason(reason) {
+        return Ok(());
+    }
+
+    state.status = ReviewRunStatus::Done;
+    state.terminal_reason = Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED.to_string());
+    // Re-bind integrity because the terminal status and reason changed.
+    state.integrity_hmac = None;
+    let persisted = persist_and_reload_run_state_for_home(home, state).map_err(|err| {
+        format!(
+            "failed to normalize verdict-finalized terminal state {}: {err}",
+            state_path.display()
+        )
+    })?;
+    *state = persisted;
+    Ok(())
+}
+
+fn migrate_legacy_run_state_for_home(
+    home: &Path,
+    state_path: &Path,
+    expected_pr_number: u32,
+    expected_review_type: &str,
+    content: &[u8],
+) -> Result<Option<ReviewRunState>, String> {
+    let Ok(legacy) = serde_json::from_slice::<LegacyReviewRunStateV1>(content) else {
+        return Ok(None);
+    };
+
+    if legacy.pr_number != expected_pr_number {
+        return Err(format!(
+            "legacy state PR mismatch (expected {}, got {})",
+            expected_pr_number, legacy.pr_number
+        ));
+    }
+    if !legacy
+        .review_type
+        .eq_ignore_ascii_case(expected_review_type)
+    {
+        return Err(format!(
+            "legacy state review type mismatch (expected {}, got {})",
+            expected_review_type, legacy.review_type
+        ));
+    }
+
+    let owner_repo = owner_repo_from_pr_url(&legacy.pr_url).ok_or_else(|| {
+        format!(
+            "legacy state contains invalid pr_url `{}` (cannot derive owner/repo)",
+            legacy.pr_url
+        )
+    })?;
+    let mut migrated = ReviewRunState {
+        run_id: legacy.run_id,
+        owner_repo,
+        pr_number: legacy.pr_number,
+        head_sha: legacy.head_sha,
+        review_type: legacy.review_type,
+        reviewer_role: legacy.reviewer_role,
+        started_at: legacy.started_at,
+        status: legacy.status,
+        terminal_reason: legacy.terminal_reason,
+        model_id: legacy.model_id,
+        backend_id: legacy.backend_id,
+        restart_count: legacy.restart_count,
+        sequence_number: legacy.sequence_number,
+        previous_run_id: legacy.previous_run_id,
+        previous_head_sha: legacy.previous_head_sha,
+        pid: legacy.pid,
+        proc_start_time: legacy.proc_start_time,
+        integrity_hmac: legacy.integrity_hmac,
+    };
+
+    if migrated.status == ReviewRunStatus::Failed
+        && migrated
+            .terminal_reason
+            .as_deref()
+            .is_some_and(is_verdict_finalized_agent_stop_reason)
+    {
+        migrated.status = ReviewRunStatus::Done;
+        migrated.terminal_reason = Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED.to_string());
+    }
+    // Legacy integrity payload included `pr_url`; re-bind against canonical
+    // `owner_repo`.
+    migrated.integrity_hmac = None;
+    let persisted = persist_and_reload_run_state_for_home(home, &migrated).map_err(|err| {
+        format!(
+            "failed to persist migrated legacy state {}: {err}",
+            state_path.display()
+        )
+    })?;
+    Ok(Some(persisted))
+}
+
+fn persist_and_reload_run_state_for_home(
+    home: &Path,
+    state: &ReviewRunState,
+) -> Result<ReviewRunState, String> {
+    let path = write_review_run_state_for_home(home, state)?;
+    let bytes = fs::read(&path).map_err(|err| {
+        format!(
+            "failed to read persisted run-state {}: {err}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice::<ReviewRunState>(&bytes).map_err(|err| {
+        format!(
+            "failed to parse persisted run-state {}: {err}",
+            path.display()
+        )
+    })
+}
+
 fn review_run_state_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -625,13 +804,30 @@ fn load_review_run_state_unverified_for_home_inner(
             });
         },
     };
-    let parsed = match serde_json::from_slice::<ReviewRunState>(&content) {
+    let mut parsed = match serde_json::from_slice::<ReviewRunState>(&content) {
         Ok(state) => state,
-        Err(err) => {
-            return Ok(ReviewRunStateLoad::Corrupt {
-                path: candidate,
-                error: format!("failed to parse run-state JSON: {err}"),
-            });
+        Err(parse_err) => match migrate_legacy_run_state_for_home(
+            home,
+            &candidate,
+            pr_number,
+            review_type,
+            &content,
+        ) {
+            Ok(Some(migrated)) => migrated,
+            Ok(None) => {
+                return Ok(ReviewRunStateLoad::Corrupt {
+                    path: candidate,
+                    error: format!("failed to parse run-state JSON: {parse_err}"),
+                });
+            },
+            Err(migration_err) => {
+                return Ok(ReviewRunStateLoad::Corrupt {
+                    path: candidate,
+                    error: format!(
+                        "failed to parse run-state JSON: {parse_err}; legacy migration failed: {migration_err}"
+                    ),
+                });
+            },
         },
     };
     if parsed.pr_number != pr_number || !parsed.review_type.eq_ignore_ascii_case(review_type) {
@@ -641,6 +837,12 @@ fn load_review_run_state_unverified_for_home_inner(
                 "run-state identity mismatch (expected pr={pr_number} type={review_type}, got pr={} type={})",
                 parsed.pr_number, parsed.review_type
             ),
+        });
+    }
+    if let Err(err) = normalize_verdict_finalized_state_for_home(home, &candidate, &mut parsed) {
+        return Ok(ReviewRunStateLoad::Corrupt {
+            path: candidate,
+            error: err,
         });
     }
     Ok(ReviewRunStateLoad::Present(parsed))
@@ -1372,13 +1574,16 @@ mod tests {
         ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
         get_process_start_time, load_review_run_state_for_home,
         load_review_run_state_strict_for_home, load_review_run_state_verified_for_home,
-        next_review_sequence_number_for_home, parse_process_start_time, read_run_secret_for_home,
-        review_lock_path_for_home, review_run_secret_path_for_home, review_run_state_path_for_home,
-        rotate_run_secret_for_home, try_acquire_review_lease_for_home,
-        verify_review_run_state_integrity, write_review_run_state_for_home,
-        write_review_run_state_to_path,
+        next_review_sequence_number_for_home, owner_repo_from_pr_url, parse_process_start_time,
+        read_run_secret_for_home, review_lock_path_for_home, review_run_secret_path_for_home,
+        review_run_state_path_for_home, rotate_run_secret_for_home,
+        try_acquire_review_lease_for_home, verify_review_run_state_integrity,
+        write_review_run_state_for_home, write_review_run_state_to_path,
     };
-    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
+    use crate::commands::fac_review::types::{
+        ReviewRunState, ReviewRunStatus, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
+        TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY,
+    };
 
     fn sample_state() -> ReviewRunState {
         ReviewRunState {
@@ -1497,6 +1702,19 @@ mod tests {
     }
 
     #[test]
+    fn test_owner_repo_from_pr_url_parses_github_pull_url() {
+        assert_eq!(
+            owner_repo_from_pr_url("https://github.com/Test-Org/Test-Repo/pull/42"),
+            Some("test-org/test-repo".to_string())
+        );
+        assert_eq!(
+            owner_repo_from_pr_url("https://github.com/test-org/test-repo/pull/42#issuecomment-1"),
+            Some("test-org/test-repo".to_string())
+        );
+        assert_eq!(owner_repo_from_pr_url("not-a-pr-url"), None);
+    }
+
+    #[test]
     fn test_get_process_start_time_current_pid() {
         let current_pid = std::process::id();
         assert!(
@@ -1520,6 +1738,66 @@ mod tests {
             },
             other => panic!("expected present state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_load_review_run_state_migrates_legacy_pr_url_schema_and_rebinds_integrity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let path = review_run_state_path_for_home(home, 441, "security");
+        std::fs::create_dir_all(path.parent().expect("path parent")).expect("create dir");
+
+        let legacy = serde_json::json!({
+            "run_id": "pr441-security-s3-01234567",
+            "pr_url": "https://github.com/example/repo/pull/441",
+            "pr_number": 441,
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "review_type": "security",
+            "reviewer_role": "fac_reviewer",
+            "started_at": "2026-02-10T00:00:00Z",
+            "status": "alive",
+            "terminal_reason": null,
+            "model_id": "gpt-5.3-codex",
+            "backend_id": "codex",
+            "restart_count": 1,
+            "sequence_number": 3,
+            "previous_run_id": null,
+            "previous_head_sha": null,
+            "pid": dead_pid_for_test(),
+            "proc_start_time": 987_654_321,
+            "integrity_hmac": "deadbeef"
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy state"),
+        )
+        .expect("write legacy run-state");
+
+        let loaded = load_review_run_state_for_home(home, 441, "security").expect("load run-state");
+        match loaded {
+            ReviewRunStateLoad::Present(found) => {
+                assert_eq!(found.owner_repo, "example/repo");
+                assert!(found.integrity_hmac.is_some());
+            },
+            other => panic!("expected migrated present state, got {other:?}"),
+        }
+
+        let persisted = std::fs::read_to_string(&path).expect("read migrated state");
+        assert!(
+            persisted.contains("\"owner_repo\""),
+            "migrated state must include owner_repo"
+        );
+        assert!(
+            !persisted.contains("\"pr_url\""),
+            "migrated state must drop legacy pr_url field"
+        );
+
+        let verified =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        assert!(
+            matches!(verified, ReviewRunStateLoad::Present(_)),
+            "migrated state must pass integrity verification"
+        );
     }
 
     #[test]
@@ -1667,6 +1945,31 @@ mod tests {
             error.contains("corrupt-state"),
             "unexpected error detail: {error}"
         );
+    }
+
+    #[test]
+    fn test_load_review_run_state_normalizes_legacy_verdict_termination_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        state.status = ReviewRunStatus::Failed;
+        state.terminal_reason = Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY.to_string());
+        state.pid = None;
+        state.proc_start_time = None;
+        state.integrity_hmac = None;
+        write_review_run_state_for_home(home, &state).expect("write legacy-style terminal state");
+
+        let loaded = load_review_run_state_for_home(home, 441, "security").expect("load state");
+        match loaded {
+            ReviewRunStateLoad::Present(found) => {
+                assert_eq!(found.status, ReviewRunStatus::Done);
+                assert_eq!(
+                    found.terminal_reason.as_deref(),
+                    Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED)
+                );
+            },
+            other => panic!("expected normalized state, got {other:?}"),
+        }
     }
 
     #[test]

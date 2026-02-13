@@ -15,6 +15,7 @@ use super::state::{
 use super::types::ReviewKind;
 use super::types::{
     MAX_RESTART_ATTEMPTS, ProjectionError, ProjectionStatus, ReviewStateFile, entry_pr_number,
+    is_verdict_finalized_agent_stop_reason,
 };
 
 // ── Projection state predicates ─────────────────────────────────────────────
@@ -405,6 +406,16 @@ fn render_state_code_from_run_state(
                     }
                 },
                 "failed" | "crashed" => {
+                    if state
+                        .terminal_reason
+                        .as_deref()
+                        .is_some_and(is_verdict_finalized_agent_stop_reason)
+                    {
+                        return format!(
+                            "done:{model}/{backend}:r{}:{head_short}",
+                            state.restart_count
+                        );
+                    }
                     let reason = state
                         .terminal_reason
                         .clone()
