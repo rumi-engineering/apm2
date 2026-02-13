@@ -71,6 +71,60 @@ default mode.
 - CTR-2501 deviation: `current_time_secs()` uses `SystemTime::now()` for token
   `issued_at` timestamps (wall-clock anchored expiry). Documented inline.
 
+## broker_health Submodule (TCK-00585)
+
+The `broker_health` submodule implements RFC-0029 invariant health monitoring for
+the FAC Broker. The broker periodically self-checks TP001/TP002/TP003 temporal
+predicates and emits signed `HealthReceiptV1` receipts. Workers use a policy-driven
+health gate to refuse job admission when broker health is degraded.
+
+### Key Types
+
+- `BrokerHealthStatus`: Three-state enum (`Healthy`, `Degraded`, `Failed`).
+  Default is `Failed` (fail-closed).
+- `InvariantCheckResult`: Per-predicate check result carrying `predicate_id`,
+  `passed` flag, and optional `deny_reason`.
+- `HealthReceiptV1`: Signed health receipt containing schema metadata, status,
+  broker tick, individual check results, content hash, Ed25519 signature, and
+  signer identity. Serialized to canonical JSON.
+- `HealthCheckInput`: Aggregated input bundle for health evaluation, including
+  optional envelope, evaluation window, signature verifier, freshness/revocation/
+  convergence horizons, convergence receipts, and required authority sets.
+- `BrokerHealthChecker`: Stateful checker maintaining a bounded history ring
+  (`MAX_HEALTH_HISTORY=64`). Runs TP001/TP002/TP003 checks, signs receipts, and
+  tracks history.
+- `WorkerHealthPolicy`: Policy enum for worker admission gate. `StrictHealthy`
+  (default) requires `Healthy`; `AllowDegraded` permits `Degraded`.
+- `WorkerHealthGateError`: Fail-closed error taxonomy for worker health gate
+  denial (no receipt, degraded, failed, invalid signature).
+
+### Core Capabilities
+
+- Delegates TP predicate validation to existing `economics::queue_admission`
+  functions (`validate_envelope_tp001`, `validate_freshness_horizon_tp002`,
+  `validate_convergence_horizon_tp003`).
+- `FacBroker::check_health()` convenience method wires broker state into the
+  health checker.
+- `evaluate_worker_health_gate()` enforces policy-driven admission control:
+  verifies receipt existence, signature authenticity (via `BrokerSignatureVerifier`),
+  and health status against worker policy.
+- Domain-separated BLAKE3 content hash (`apm2.health_receipt.v1`) over tick,
+  status, and per-check results.
+
+### Security Invariants (TCK-00585)
+
+- [INV-BH-001] Default `BrokerHealthStatus` is `Failed` (fail-closed). Missing
+  or ambiguous health state denies admission.
+- [INV-BH-002] Health receipts are Ed25519-signed by the broker key. Workers
+  verify signature authenticity before trusting health status.
+- [INV-BH-003] Worker health gate denies admission when no receipt exists, when
+  signature verification fails, or when status violates policy.
+- [INV-BH-004] All in-memory collections are bounded by hard `MAX_*` caps:
+  `MAX_HEALTH_HISTORY=64`, `MAX_HEALTH_FINDINGS=16`,
+  `MAX_HEALTH_REQUIRED_AUTHORITY_SETS=64`.
+- [INV-BH-005] Health check input bounds are enforced before evaluation:
+  required_authority_sets and findings are capped with explicit errors on overflow.
+
 ## projection_compromise Submodule
 
 The `projection_compromise` submodule implements compromise handling for public

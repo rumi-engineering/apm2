@@ -74,6 +74,7 @@ mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
 pub mod broker;
+pub mod broker_health;
 pub mod builtin_profiles;
 pub mod builtin_roles;
 mod changeset_bundle;
@@ -152,6 +153,13 @@ pub use broker::{
     BrokerError, BrokerSignatureVerifier, BrokerState, DEFAULT_ENVELOPE_TTL_TICKS, FacBroker,
     MAX_ADMITTED_POLICY_DIGESTS, MAX_AUTHORITY_CLOCK_LENGTH, MAX_BOUNDARY_ID_LENGTH,
     MAX_CONVERGENCE_RECEIPTS, MAX_ENVELOPE_TTL_TICKS,
+};
+// Re-export broker health types (TCK-00585)
+pub use broker_health::{
+    BrokerHealthChecker, BrokerHealthStatus, HEALTH_RECEIPT_SCHEMA_ID,
+    HEALTH_RECEIPT_SCHEMA_VERSION, HealthCheckInput, HealthReceiptV1, InvariantCheckResult,
+    MAX_HEALTH_FINDINGS, MAX_HEALTH_HISTORY, MAX_HEALTH_REQUIRED_AUTHORITY_SETS,
+    WorkerHealthGateError, WorkerHealthPolicy, evaluate_worker_health_gate,
 };
 // Re-export builtin profile types (TCK-00329)
 pub use builtin_profiles::{
