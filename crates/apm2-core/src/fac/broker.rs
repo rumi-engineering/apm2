@@ -856,6 +856,50 @@ impl FacBroker {
     }
 
     // -----------------------------------------------------------------------
+    // Health monitoring (TCK-00585)
+    // -----------------------------------------------------------------------
+
+    /// Performs a self-health check validating TP001/TP002/TP003 invariants
+    /// against the broker's current state.
+    ///
+    /// The caller supplies:
+    /// - `envelope`: a recently issued `TimeAuthorityEnvelopeV1` (or `None` if
+    ///   the broker has not yet issued one)
+    /// - `eval_window`: the evaluation window to check the envelope against
+    /// - `required_authority_sets`: authority set hashes that must have
+    ///   convergence receipts
+    /// - `checker`: mutable reference to a
+    ///   [`super::broker_health::BrokerHealthChecker`] that accumulates history
+    ///
+    /// Returns a signed [`super::broker_health::HealthReceiptV1`] capturing the
+    /// aggregate health status.
+    pub fn check_health(
+        &self,
+        envelope: Option<&TimeAuthorityEnvelopeV1>,
+        eval_window: &HtfEvaluationWindow,
+        required_authority_sets: &[Hash],
+        checker: &mut super::broker_health::BrokerHealthChecker,
+    ) -> super::broker_health::HealthReceiptV1 {
+        let verifier = BrokerSignatureVerifier::new(self.verifying_key());
+        let freshness = self.freshness_horizon();
+        let frontier = self.revocation_frontier();
+        let convergence = self.convergence_horizon();
+
+        let input = super::broker_health::HealthCheckInput {
+            envelope,
+            eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: self.convergence_receipts(),
+            required_authority_sets,
+        };
+
+        checker.check_health(&input, self.current_tick(), &self.signer)
+    }
+
+    // -----------------------------------------------------------------------
     // State serialization (for persistence)
     // -----------------------------------------------------------------------
 
