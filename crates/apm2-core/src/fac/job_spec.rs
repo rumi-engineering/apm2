@@ -54,6 +54,9 @@ pub const MAX_JOB_SPEC_SIZE: usize = 65_536;
 /// Digest prefix for BLAKE3-256 hashes.
 const B3_256_PREFIX: &str = "b3-256:";
 
+const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control"];
+const VALID_SOURCE_KINDS: &[&str] = &["mirror_commit", "patch_injection"];
+
 // Error type
 
 /// Errors from `FacJobSpecV1` construction and validation.
@@ -110,6 +113,15 @@ pub enum JobSpecError {
         /// Field that contained the invalid digest.
         field: &'static str,
         /// Invalid field value.
+        value: String,
+    },
+
+    /// A field failed format validation.
+    #[error("invalid format for {field}: {value}")]
+    InvalidFormat {
+        /// Field that failed format validation.
+        field: &'static str,
+        /// Invalid value that triggered the error.
         value: String,
     },
 
@@ -206,6 +218,7 @@ pub struct JobSource {
 #[serde(deny_unknown_fields)]
 pub struct LaneRequirements {
     /// Required lane profile hash. `None` if no specific lane is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_profile_hash: Option<String>,
 }
 
@@ -220,11 +233,11 @@ pub struct JobConstraints {
     pub require_nextest: bool,
 
     /// Test execution timeout in seconds.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_timeout_seconds: Option<u64>,
 
     /// Memory ceiling in bytes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_max_bytes: Option<u64>,
 }
 
@@ -324,6 +337,23 @@ impl FacJobSpecV1 {
         check_non_empty("source.kind", &self.source.kind)?;
         check_non_empty("source.repo_id", &self.source.repo_id)?;
         check_non_empty("source.head_sha", &self.source.head_sha)?;
+        if !VALID_JOB_KINDS.contains(&self.kind.as_str()) {
+            return Err(JobSpecError::InvalidFormat {
+                field: "kind",
+                value: self.kind.clone(),
+            });
+        }
+        if !VALID_SOURCE_KINDS.contains(&self.source.kind.as_str()) {
+            return Err(JobSpecError::InvalidFormat {
+                field: "source.kind",
+                value: self.source.kind.clone(),
+            });
+        }
+        if self.source.kind == "patch_injection" && self.source.patch.is_none() {
+            return Err(JobSpecError::EmptyField {
+                field: "source.patch (required for patch_injection)",
+            });
+        }
 
         check_length("job_id", &self.job_id, MAX_JOB_ID_LENGTH)?;
         check_length("kind", &self.kind, MAX_KIND_LENGTH)?;
@@ -355,6 +385,12 @@ impl FacJobSpecV1 {
             &self.source.head_sha,
             MAX_HEAD_SHA_LENGTH,
         )?;
+        if self.enqueue_time.len() < 20 || !self.enqueue_time.contains('T') {
+            return Err(JobSpecError::InvalidFormat {
+                field: "enqueue_time",
+                value: self.enqueue_time.clone(),
+            });
+        }
 
         if self.priority > 100 {
             return Err(JobSpecError::PriorityOutOfRange {
@@ -861,6 +897,28 @@ mod tests {
         assert!(matches!(
             out_of_range,
             Err(JobSpecError::PriorityOutOfRange { value: 101 })
+        ));
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_kind() {
+        let mut spec = build_valid_spec();
+        spec.kind = "invalid_kind".to_string();
+        assert!(matches!(
+            spec.validate_structure(),
+            Err(JobSpecError::InvalidFormat { field: "kind", .. })
+        ));
+    }
+
+    #[test]
+    fn validate_structure_rejects_missing_patch_for_patch_injection() {
+        let mut spec = build_valid_spec();
+        spec.source.kind = "patch_injection".to_string();
+        assert!(matches!(
+            spec.validate_structure(),
+            Err(JobSpecError::EmptyField {
+                field: "source.patch (required for patch_injection)"
+            })
         ));
     }
 

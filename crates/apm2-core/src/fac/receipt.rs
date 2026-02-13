@@ -217,6 +217,12 @@ pub struct GateReceipt {
     #[serde(with = "serde_bytes")]
     pub evidence_bundle_hash: [u8; 32],
 
+    /// BLAKE3 digest of the job spec that authorized this gate execution
+    /// (TCK-00512). Present when the gate was triggered from a
+    /// `FacJobSpecV1` queue item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_spec_digest: Option<String>,
+
     /// Explicit pass/fail verdict declared by the gate executor.
     ///
     /// This is the authoritative verdict field. The orchestrator uses this
@@ -254,6 +260,11 @@ impl GateReceipt {
             + 4   // payload_schema_version
             + 32  // payload_hash
             + 32  // evidence_bundle_hash
+            + 1   // job_spec_digest present flag
+            + self
+                .job_spec_digest
+                .as_ref()
+                .map_or(0, |digest| 4 + digest.len())
             + 1; // passed (bool)
 
         let mut bytes = Vec::with_capacity(capacity);
@@ -293,7 +304,19 @@ impl GateReceipt {
         // 10. evidence_bundle_hash
         bytes.extend_from_slice(&self.evidence_bundle_hash);
 
-        // 11. passed (1 byte: 0 = false, 1 = true)
+        // 11. job_spec_digest (optional)
+        match &self.job_spec_digest {
+            Some(digest) => {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(digest.as_bytes());
+            },
+            None => {
+                bytes.push(0u8);
+            },
+        }
+
+        // 12. passed (1 byte: 0 = false, 1 = true)
         bytes.push(u8::from(self.passed));
 
         bytes
@@ -434,6 +457,7 @@ pub struct GateReceiptBuilder {
     payload_schema_version: Option<u32>,
     payload_hash: Option<[u8; 32]>,
     evidence_bundle_hash: Option<[u8; 32]>,
+    job_spec_digest: Option<String>,
     passed: Option<bool>,
 }
 
@@ -502,6 +526,13 @@ impl GateReceiptBuilder {
         self
     }
 
+    /// Sets the optional job spec digest.
+    #[must_use]
+    pub fn job_spec_digest(mut self, digest: impl Into<String>) -> Self {
+        self.job_spec_digest = Some(digest.into());
+        self
+    }
+
     /// Sets the explicit pass/fail verdict.
     ///
     /// This is the authoritative verdict field that the orchestrator reads
@@ -558,6 +589,7 @@ impl GateReceiptBuilder {
             .evidence_bundle_hash
             .ok_or(ReceiptError::MissingField("evidence_bundle_hash"))?;
         let passed = self.passed.ok_or(ReceiptError::MissingField("passed"))?;
+        let job_spec_digest = self.job_spec_digest;
 
         // Validate string lengths to prevent DoS
         if self.receipt_id.len() > MAX_STRING_LENGTH {
@@ -608,6 +640,7 @@ impl GateReceiptBuilder {
             payload_schema_version,
             payload_hash,
             evidence_bundle_hash,
+            job_spec_digest,
             passed,
             receipt_signature: [0u8; 64],
         };
@@ -679,6 +712,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             proto.evidence_bundle_hash.try_into().map_err(|_| {
                 ReceiptError::InvalidData("evidence_bundle_hash must be 32 bytes".to_string())
             })?;
+        let job_spec_digest = None;
 
         let receipt_signature: [u8; 64] = proto.receipt_signature.try_into().map_err(|_| {
             ReceiptError::InvalidData("receipt_signature must be 64 bytes".to_string())
@@ -695,6 +729,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             payload_schema_version: proto.payload_schema_version,
             payload_hash,
             evidence_bundle_hash,
+            job_spec_digest,
             passed: proto.passed,
             receipt_signature,
         })
