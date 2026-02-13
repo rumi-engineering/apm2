@@ -265,6 +265,7 @@ impl std::fmt::Display for TaintSource {
 /// Tags propagate through evidence pointers. When content is aggregated,
 /// the highest (least-trusted) taint level propagates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaintTag {
     /// Trust level classification.
     pub level: TaintLevel,
@@ -428,6 +429,7 @@ impl std::fmt::Display for TargetContext {
 
 /// Result of evaluating a taint flow against policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaintFlowDecision {
     /// Whether the flow is allowed.
     pub allowed: bool,
@@ -482,6 +484,7 @@ impl TaintFlowDecision {
 /// This is emitted as part of `PolicyViolation` or `ReviewBlockedRecorded`
 /// events when untrusted content attempts to flow into a restricted context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaintViolation {
     /// The taint tag of the denied content.
     pub tag: TaintTag,
@@ -526,6 +529,7 @@ impl TaintViolation {
 ///
 /// Rules are evaluated in order; the first matching rule wins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowRule {
     /// Unique identifier for this rule.
     pub rule_id: String,
@@ -561,6 +565,7 @@ pub struct FlowRule {
 /// If no rule matches and the default check fails, the flow is denied.
 /// There is no implicit allow path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaintPolicy {
     /// Custom flow rules evaluated in order (first match wins).
     pub rules: Vec<FlowRule>,

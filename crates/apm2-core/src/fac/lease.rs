@@ -133,6 +133,7 @@ pub enum LeaseError {
 /// - `rcp_profile_id`: Identifier of the RCP profile being used
 /// - `selection_policy_id`: Identifier of the selection policy
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AatLeaseExtension {
     /// Hash of the view commitment for this AAT run.
     #[serde(with = "serde_bytes")]

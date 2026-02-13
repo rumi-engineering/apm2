@@ -81,6 +81,9 @@ default mode.
   `FacBroker` API are health-gated (fail-closed). The flag is protected by
   the same external lock that guards `&mut self` / `&self` access; no
   interior mutability is used.
+- [INV-BRK-008] FAC schema payload parsing uses bounded canonical JSON deserialization
+  via `schema_registry::fac_schemas::bounded_from_slice_with_limit` and rejects
+  non-canonical inputs.
 - All hash comparisons use `subtle::ConstantTimeEq::ct_eq()` consistent with
   INV-PC-001, including `find_admitted_policy_digest()` which uses
   non-short-circuiting iteration.

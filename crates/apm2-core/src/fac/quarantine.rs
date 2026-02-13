@@ -219,6 +219,7 @@ where
 
 /// Event indicating a runner pool has been quarantined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunnerPoolQuarantined {
     /// Unique identifier for this quarantine event.
     pub quarantine_id: String,
@@ -330,6 +331,7 @@ impl RunnerPoolQuarantined {
 
 /// Event indicating an AAT spec has been quarantined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AATSpecQuarantined {
     /// Unique identifier for this quarantine event.
     pub quarantine_id: String,
@@ -441,6 +443,7 @@ impl AATSpecQuarantined {
 
 /// Event indicating a quarantine has been cleared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineCleared {
     /// ID of the original quarantine event being cleared.
     pub quarantine_id: String,
@@ -564,6 +567,7 @@ pub enum QuarantineEvent {
 /// This type is not thread-safe. For concurrent access, wrap in appropriate
 /// synchronization primitives.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineProjection {
     /// Set of quarantined runner pool IDs.
     quarantined_pools: HashSet<String>,

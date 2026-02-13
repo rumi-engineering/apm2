@@ -64,6 +64,7 @@ use thiserror::Error;
 
 use crate::evidence::{CasError, ContentAddressedStore};
 use crate::htf::Canonicalizable;
+use crate::schema_registry::fac_schemas::bounded_from_slice;
 
 // =============================================================================
 // Schema Constants and Limits
@@ -821,7 +822,7 @@ impl RoleSpecV1 {
         let bytes = cas.retrieve(hash)?;
 
         // Deserialize
-        let spec: Self = serde_json::from_slice(&bytes).map_err(|e| {
+        let spec: Self = bounded_from_slice(&bytes).map_err(|e| {
             RoleSpecError::SerializationError(format!("deserialization failed: {e}"))
         })?;
 

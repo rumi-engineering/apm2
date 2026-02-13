@@ -218,6 +218,7 @@ impl ReviewVerdict {
 
 /// Metadata for a review.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewMetadata {
     /// Actor ID of the reviewer.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -296,6 +297,7 @@ impl ReviewMetadata {
 /// This structure represents the canonical form of review outputs that are
 /// stored in CAS and referenced by `ReviewReceiptRecorded` events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewArtifactBundleV1 {
     /// Schema identifier (always `apm2.review_artifact_bundle.v1`).
     pub schema: String,
@@ -670,6 +672,7 @@ impl ReviewArtifactBundleV1Builder {
 /// This event records the successful review outcome and stores it durably in
 /// the ledger. It binds the review artifacts to the changeset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewReceiptRecorded {
     /// Unique identifier for this receipt.
     pub receipt_id: String,

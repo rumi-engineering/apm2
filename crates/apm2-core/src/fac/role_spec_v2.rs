@@ -26,6 +26,7 @@ use super::role_spec::{
 };
 use crate::evidence::{CasError, ContentAddressedStore};
 use crate::htf::Canonicalizable;
+use crate::schema_registry::fac_schemas::bounded_from_slice;
 
 /// `RoleSpec` v2 schema identifier.
 pub const ROLE_SPEC_V2_SCHEMA: &str = "apm2.role_spec.v2";
@@ -686,7 +687,7 @@ impl RoleSpecV2 {
         hash: &[u8; 32],
     ) -> Result<Self, RoleSpecV2Error> {
         let bytes = cas.retrieve(hash)?;
-        let spec: Self = serde_json::from_slice(&bytes)
+        let spec: Self = bounded_from_slice(&bytes)
             .map_err(|e| RoleSpecV2Error::DeserializationError(e.to_string()))?;
         spec.validate()?;
 

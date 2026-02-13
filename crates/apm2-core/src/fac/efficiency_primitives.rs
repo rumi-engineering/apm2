@@ -445,6 +445,7 @@ impl From<CasError> for EfficiencyError {
 
 /// A file that changed between iterations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangedFile {
     /// File path.
     ///
@@ -515,6 +516,7 @@ impl ChangedFile {
 
 /// A finding or issue discovered during an iteration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     /// Category of the finding (e.g., "security", "quality").
     ///
@@ -622,6 +624,7 @@ impl Finding {
 
 /// Reference to a tool output stored in CAS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolOutputRef {
     /// Tool type (e.g., "`FileRead`", "`Search`").
     pub tool_type: String,
@@ -672,6 +675,7 @@ impl ToolOutputRef {
 /// - `to_iteration` = `from_iteration` + 1 (deltas are single-step)
 /// - All collections respect size limits
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextDelta {
     /// Schema identifier.
     pub schema: String,
@@ -976,6 +980,7 @@ impl ContextDeltaBuilder {
 
 /// Configuration for the tool output cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolOutputCacheConfig {
     /// Time-to-live for cache entries.
     pub ttl_secs: u64,
@@ -1410,6 +1415,7 @@ pub struct CacheStats {
 
 /// A selector for zooming into detail within the iteration context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ZoomSelector {
     /// Selector type (e.g., "file", "finding", "`tool_output`").
     pub selector_type: ZoomSelectorType,
@@ -1534,6 +1540,7 @@ impl ZoomSelector {
 /// The context tracks its size and enforces a budget limit.
 /// When the budget is exceeded, older deltas are compacted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IterationContext {
     /// Work ID.
     ///
@@ -1802,6 +1809,7 @@ impl IterationContextBuilder {
 ///
 /// Used to verify that a 20-iteration loop stays within a fixed budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextBudgetEnvelope {
     /// Maximum iterations allowed.
     pub max_iterations: u64,

@@ -66,6 +66,7 @@ use thiserror::Error;
 
 use crate::evidence::{CasError, ContentAddressedStore};
 use crate::htf::Canonicalizable;
+use crate::schema_registry::fac_schemas::bounded_from_slice;
 
 // =============================================================================
 // Schema Constants and Limits
@@ -917,7 +918,7 @@ impl AgentAdapterProfileV1 {
         let bytes = cas.retrieve(hash)?;
 
         // Deserialize
-        let profile: Self = serde_json::from_slice(&bytes).map_err(|e| {
+        let profile: Self = bounded_from_slice(&bytes).map_err(|e| {
             AgentAdapterProfileError::SerializationError(format!("deserialization failed: {e}"))
         })?;
 

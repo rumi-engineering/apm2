@@ -107,6 +107,7 @@ impl ProfileWeight {
 
 /// Snapshot of a profile's effective eligibility for one selection decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectionWeightSnapshot {
     /// CAS hash of the profile.
     pub profile_hash: [u8; 32],
@@ -128,6 +129,7 @@ pub struct SelectionWeightSnapshot {
 
 /// Full selection output, including deterministic metadata for ledger audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectionDecision {
     /// Selected profile CAS hash.
     pub selected_profile_hash: [u8; 32],

@@ -98,6 +98,7 @@ pub enum ReuseError {
 
 /// Provenance tuple identifying the context of an AAT execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AatProvenanceTuple {
     /// Hash binding to specific changeset.
     #[serde(with = "serde_bytes")]
@@ -195,6 +196,7 @@ impl AatProvenanceTuple {
 
 /// Event payload for reused AAT results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AATResultReused {
     /// Hash of the original `AatGateReceipt` being reused.
     #[serde(with = "serde_bytes")]

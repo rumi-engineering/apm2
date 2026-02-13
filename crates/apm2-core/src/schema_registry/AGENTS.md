@@ -214,6 +214,11 @@ if result.is_fully_compatible() {
 
 9. **Staging Pattern for DoS Prevention**: The `register()` method validates and hashes content BEFORE acquiring write locks. This prevents lock contention during expensive operations.
 
+10. **FAC schema gatekeeping**: New FAC schema modules register stable IDs in
+    `fac_schemas`, and all runtime load points should pass through bounded,
+    canonicalized deserialization to prevent non-canonical parse ambiguity and
+    oversized payload attacks.
+
 ## Related Modules
 
 - [`apm2_core::crypto`](../crypto/AGENTS.md) - BLAKE3 hashing via `EventHasher::hash_content()`

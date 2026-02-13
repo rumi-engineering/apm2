@@ -77,6 +77,7 @@
 //! # }
 //! ```
 
+pub mod fac_schemas;
 mod memory;
 mod traits;
 

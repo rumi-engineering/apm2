@@ -649,6 +649,7 @@ impl PolicyInheritanceValidator {
 /// This structure captures enough information for the validator to check
 /// whether a receipt satisfies the attestation requirement for its risk tier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptAttestation {
     /// The kind of receipt this attestation covers.
     pub kind: ReceiptKind,

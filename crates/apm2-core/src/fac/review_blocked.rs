@@ -298,6 +298,7 @@ impl ReasonCode {
 /// This event captures the blocked outcome and stores it durably in the ledger.
 /// It binds the failure to the changeset and provides CAS references for logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewBlockedRecorded {
     /// Unique identifier for this blocked event.
     pub blocked_id: String,

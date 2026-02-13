@@ -128,6 +128,7 @@ pub enum ToolExecutionReceiptError {
 /// - `signer_identity`: Hex-encoded public key of signer
 /// - `signature`: Ed25519 signature with domain separation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolExecutionReceipt {
     /// Schema identifier.
     pub schema: String,

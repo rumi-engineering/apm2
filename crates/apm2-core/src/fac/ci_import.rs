@@ -784,6 +784,7 @@ impl CiImportAttestationBuilder {
 /// CI gating is enabled. When CI gating is enabled, L0 (status-only)
 /// attestations are rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CiImportPolicy {
     /// Minimum attestation level required for import to be valid.
     minimum_level: CiAttestationLevel,

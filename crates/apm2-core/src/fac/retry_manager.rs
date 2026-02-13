@@ -91,6 +91,7 @@ pub enum RetryError {
 
 /// Manages retry budgets for FAC gates.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryManager {
     /// Map of gate ID to attempt count.
     gate_attempts: HashMap<String, u32>,

@@ -186,6 +186,7 @@ impl ReviewOutcome {
 /// The loss profile enables consumers to understand the trade-offs between
 /// summary compactness and information completeness.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LossProfile {
     /// Whether the full review text was omitted.
     pub review_text_omitted: bool,
@@ -297,6 +298,7 @@ impl LossProfile {
 /// - `signer_identity`: Hex-encoded public key of signer
 /// - `signature`: Ed25519 signature with domain separation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SummaryReceipt {
     /// Schema identifier.
     pub schema: String,

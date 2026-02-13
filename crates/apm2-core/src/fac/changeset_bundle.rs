@@ -197,6 +197,7 @@ impl std::str::FromStr for HashAlgo {
 
 /// A reference to a Git object.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitObjectRef {
     /// Hash algorithm used.
     pub algo: HashAlgo,
@@ -299,6 +300,7 @@ impl std::str::FromStr for ChangeKind {
 
 /// A single file change in the changeset.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileChange {
     /// Path of the changed file.
     pub path: String,
@@ -354,6 +356,7 @@ impl FileChange {
 /// bundle bytes with the `changeset_digest` field itself excluded from the
 /// hash input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeSetBundleV1 {
     /// Schema identifier (always `apm2.changeset_bundle.v1`).
     pub schema: String,
@@ -717,6 +720,7 @@ impl ChangeSetBundleV1Builder {
 /// This event MUST be emitted before any review activities begin for a work
 /// item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeSetPublished {
     /// Work item ID this changeset belongs to.
     pub work_id: String,

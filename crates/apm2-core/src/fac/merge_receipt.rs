@@ -87,6 +87,7 @@ pub enum MergeReceiptError {
 
 /// A receipt proving that a merge was executed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MergeReceipt {
     /// Base selector (e.g., branch name "main").
     pub base_selector: String,

@@ -39,6 +39,7 @@ use crate::economics::queue_admission::{
     HtfEvaluationWindow, RevocationFrontierSnapshot, TimeAuthorityEnvelopeV1,
     envelope_signature_canonical_bytes,
 };
+use crate::schema_registry::fac_schemas::{BoundedDeserializeError, bounded_from_slice_with_limit};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1152,7 +1153,7 @@ impl FacBroker {
     /// Deserializes broker state from JSON bytes.
     ///
     /// Enforces a strict size limit ([`MAX_BROKER_STATE_FILE_SIZE`]) on the
-    /// input **before** passing to the JSON parser. This prevents
+    /// input **before** parsing and canonicalization. This prevents
     /// memory-exhaustion attacks from a crafted state file containing
     /// unbounded `Vec` payloads (RSK-1601).
     ///
@@ -1160,19 +1161,20 @@ impl FacBroker {
     ///
     /// Returns an error if:
     /// - `bytes.len()` exceeds `MAX_BROKER_STATE_FILE_SIZE`
+    /// - canonicalization fails
     /// - deserialization fails
     /// - post-deserialization validation fails
     pub fn deserialize_state(bytes: &[u8]) -> Result<BrokerState, BrokerError> {
-        if bytes.len() > MAX_BROKER_STATE_FILE_SIZE {
-            return Err(BrokerError::StateTooLarge {
-                size: bytes.len(),
-                max: MAX_BROKER_STATE_FILE_SIZE,
-            });
-        }
         let state: BrokerState =
-            serde_json::from_slice(bytes).map_err(|e| BrokerError::Deserialization {
-                detail: e.to_string(),
-            })?;
+            bounded_from_slice_with_limit::<BrokerState>(bytes, MAX_BROKER_STATE_FILE_SIZE)
+                .map_err(|e| match e {
+                    BoundedDeserializeError::PayloadTooLarge { size, max } => {
+                        BrokerError::StateTooLarge { size, max }
+                    },
+                    _ => BrokerError::Deserialization {
+                        detail: e.to_string(),
+                    },
+                })?;
         state.validate()?;
         Ok(state)
     }

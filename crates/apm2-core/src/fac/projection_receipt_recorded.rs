@@ -545,6 +545,7 @@ impl ProjectionArtifactBundleV1Builder {
 /// This event records the successful projection outcome and stores it durably
 /// in the ledger. It binds the projection artifacts to the changeset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionReceiptRecorded {
     /// Unique identifier for this receipt.
     pub receipt_id: String,

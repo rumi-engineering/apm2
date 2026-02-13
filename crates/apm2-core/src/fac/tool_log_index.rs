@@ -105,6 +105,7 @@ pub enum ToolLogIndexError {
 
 /// Budget consumption and count summary for tool log index.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolLogCounts {
     /// Total number of tool executions.
     pub total_executions: u64,
@@ -177,6 +178,7 @@ impl ToolLogCounts {
 /// - `continuation_hashes`: Hashes of continuation chunks (if any)
 /// - `is_final_chunk`: Whether this is the last chunk
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolLogIndexV1 {
     /// Schema identifier.
     pub schema: String,

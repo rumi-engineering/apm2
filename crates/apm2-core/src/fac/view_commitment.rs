@@ -98,6 +98,7 @@ pub enum ViewCommitmentError {
 /// - **Temporal Authority**: Binds the view to a specific time
 ///   (`committed_at_ns`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ViewCommitmentV1 {
     /// Schema identifier (always `apm2.view_commitment.v1`).
     pub schema: String,
