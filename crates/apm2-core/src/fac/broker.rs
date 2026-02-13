@@ -56,6 +56,12 @@ pub const MAX_BOUNDARY_ID_LENGTH: usize = 256;
 /// Maximum length for authority clock identifiers.
 pub const MAX_AUTHORITY_CLOCK_LENGTH: usize = 256;
 
+/// Maximum size in bytes for the persisted broker state file.
+///
+/// Rejects state files larger than 1 MiB before JSON parsing to prevent
+/// OOM via a crafted state file with unbounded `Vec` payloads (RSK-1601).
+pub const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
+
 /// Maximum TTL for time authority envelopes (in ticks).
 pub const MAX_ENVELOPE_TTL_TICKS: u64 = 10_000;
 
@@ -160,6 +166,15 @@ pub enum BrokerError {
     Deserialization {
         /// Detail about the deserialization failure.
         detail: String,
+    },
+
+    /// Serialized state file exceeds the maximum allowed size.
+    #[error("state file size {size} exceeds maximum {max}")]
+    StateTooLarge {
+        /// Actual size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
     },
 
     /// Job spec digest is zero (not bound).
@@ -857,10 +872,24 @@ impl FacBroker {
 
     /// Deserializes broker state from JSON bytes.
     ///
+    /// Enforces a strict size limit ([`MAX_BROKER_STATE_FILE_SIZE`]) on the
+    /// input **before** passing to the JSON parser. This prevents
+    /// memory-exhaustion attacks from a crafted state file containing
+    /// unbounded `Vec` payloads (RSK-1601).
+    ///
     /// # Errors
     ///
-    /// Returns an error if deserialization or validation fails.
+    /// Returns an error if:
+    /// - `bytes.len()` exceeds `MAX_BROKER_STATE_FILE_SIZE`
+    /// - deserialization fails
+    /// - post-deserialization validation fails
     pub fn deserialize_state(bytes: &[u8]) -> Result<BrokerState, BrokerError> {
+        if bytes.len() > MAX_BROKER_STATE_FILE_SIZE {
+            return Err(BrokerError::StateTooLarge {
+                size: bytes.len(),
+                max: MAX_BROKER_STATE_FILE_SIZE,
+            });
+        }
         let state: BrokerState =
             serde_json::from_slice(bytes).map_err(|e| BrokerError::Deserialization {
                 detail: e.to_string(),
@@ -993,9 +1022,13 @@ fn compute_envelope_content_hash(
 
 #[allow(clippy::disallowed_methods)]
 fn current_time_secs() -> u64 {
-    // FAC token minting and expiry policy are anchored to trusted process wall
-    // time. This avoids adding an HTF dependency in broker-local issuance
-    // logic.
+    // CTR-2501 deviation: uses wall-clock `SystemTime::now()` instead of
+    // monotonic `Instant` or HTF tick. This is intentional — FAC token
+    // minting and expiry policy are anchored to trusted process wall time
+    // because `ChannelContextToken` encodes a Unix-epoch `issued_at`
+    // timestamp that recipients compare against their own wall clock for
+    // expiry checks. Adding an HTF dependency in broker-local issuance
+    // logic is out of scope (see TCK-00594 scope.out_of_scope).
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1602,6 +1635,61 @@ mod tests {
             result.is_ok(),
             "duplicate admission must not fail at capacity"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deserialization size limit (DoS prevention)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deserialization_rejects_oversized_input() {
+        // Construct a byte slice just over MAX_BROKER_STATE_FILE_SIZE.
+        let oversized = vec![0u8; MAX_BROKER_STATE_FILE_SIZE + 1];
+        let result = FacBroker::deserialize_state(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(BrokerError::StateTooLarge { size, max })
+                    if size == MAX_BROKER_STATE_FILE_SIZE + 1
+                    && max == MAX_BROKER_STATE_FILE_SIZE
+            ),
+            "must reject input exceeding MAX_BROKER_STATE_FILE_SIZE"
+        );
+    }
+
+    #[test]
+    fn deserialization_accepts_input_at_size_limit() {
+        // Valid broker state serialized should be well under the limit.
+        let broker = FacBroker::new();
+        let bytes = broker.serialize_state().expect("serialize should succeed");
+        assert!(
+            bytes.len() <= MAX_BROKER_STATE_FILE_SIZE,
+            "default state should be under size limit"
+        );
+        let result = FacBroker::deserialize_state(&bytes);
+        assert!(result.is_ok(), "valid state within limit must parse");
+    }
+
+    // -----------------------------------------------------------------------
+    // Constant-time find_admitted_policy_digest
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_admitted_policy_digest_returns_matching_digest() {
+        let mut broker = FacBroker::new();
+        let d1 = [0x11; 32];
+        let d2 = [0x22; 32];
+        let d3 = [0x33; 32];
+        broker.admit_policy_digest(d1).unwrap();
+        broker.admit_policy_digest(d2).unwrap();
+        broker.admit_policy_digest(d3).unwrap();
+
+        // Should find each digest regardless of position (tests that
+        // non-short-circuiting iteration visits all entries).
+        assert_eq!(broker.find_admitted_policy_digest(&d1), Some(d1));
+        assert_eq!(broker.find_admitted_policy_digest(&d2), Some(d2));
+        assert_eq!(broker.find_admitted_policy_digest(&d3), Some(d3));
+        assert_eq!(broker.find_admitted_policy_digest(&[0xFF; 32]), None);
     }
 
     // -----------------------------------------------------------------------
