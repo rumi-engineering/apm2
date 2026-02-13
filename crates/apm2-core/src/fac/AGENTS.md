@@ -51,6 +51,7 @@ default mode.
 - Worker admission health gate enforcement via
   `evaluate_admission_health_gate()`, the canonical production entry point
   for health-gated admission (TCK-00585).
+- Health gate query via `is_admission_health_gate_passed()` for observability.
 
 ### Security Invariants (TCK-00510)
 
@@ -68,6 +69,16 @@ default mode.
 - [INV-BRK-007] `deserialize_state()` enforces a strict I/O size limit
   (`MAX_BROKER_STATE_FILE_SIZE = 1 MiB`) **before** JSON parsing to prevent
   OOM from crafted state files with unbounded `Vec` payloads (RSK-1601).
+- [INV-BRK-HEALTH-GATE-001] `issue_channel_context_token()` enforces a
+  mandatory admission health gate as its first precondition. The gate is a
+  boolean `admission_health_gate_passed` flag that is set to `true` only by
+  `check_health()` returning `Healthy` or by a successful
+  `evaluate_admission_health_gate()`. It defaults to `false` on construction
+  and is cleared to `false` on any health check failure or gate evaluation
+  failure. This ensures all production token issuance paths through the
+  `FacBroker` API are health-gated (fail-closed). The flag is protected by
+  the same external lock that guards `&mut self` / `&self` access; no
+  interior mutability is used.
 - All hash comparisons use `subtle::ConstantTimeEq::ct_eq()` consistent with
   INV-PC-001, including `find_admitted_policy_digest()` which uses
   non-short-circuiting iteration.
@@ -187,8 +198,13 @@ health gate to refuse job admission when broker health is degraded.
 - [INV-BH-015] `FacBroker::evaluate_admission_health_gate()` is the
   canonical production entry point for worker admission health gating.
   It wires the broker's verifying key, computes the expected eval window
-  hash, and delegates to `evaluate_worker_health_gate()`. This ensures
-  health gate enforcement is active on non-test admission paths.
+  hash, and delegates to `evaluate_worker_health_gate()`. Both
+  `evaluate_admission_health_gate()` and `check_health()` update the
+  broker's `admission_health_gate_passed` flag, which is enforced by
+  `issue_channel_context_token()` as a mandatory precondition
+  (INV-BRK-HEALTH-GATE-001). This ensures health gate enforcement is
+  active on ALL production admission/token issuance paths through the
+  `FacBroker` API.
 
 ## projection_compromise Submodule
 

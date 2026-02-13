@@ -177,6 +177,19 @@ pub enum BrokerError {
         max: usize,
     },
 
+    /// Admission health gate has not been satisfied.
+    ///
+    /// Token issuance requires a prior successful health gate evaluation
+    /// via [`FacBroker::evaluate_admission_health_gate()`] or
+    /// [`FacBroker::check_health()`] returning `Healthy`. This error
+    /// is returned when no health check has been performed or the most
+    /// recent check did not yield a passing health status
+    /// (INV-BRK-HEALTH-GATE-001, fail-closed).
+    #[error(
+        "admission health gate not satisfied: broker health check required before token issuance"
+    )]
+    AdmissionHealthGateNotSatisfied,
+
     /// Job spec digest is zero (not bound).
     #[error("job_spec_digest is zero (not bound to a job)")]
     ZeroJobSpecDigest,
@@ -368,17 +381,43 @@ fn compute_initial_convergence_hash() -> Hash {
 /// (RFC-0028 `ChannelContextToken`) and economics/time authority envelopes
 /// (RFC-0029 `TimeAuthorityEnvelopeV1`).
 ///
+/// # Health Gate Enforcement (INV-BRK-HEALTH-GATE-001)
+///
+/// Token issuance via [`FacBroker::issue_channel_context_token()`] requires
+/// a prior successful health gate evaluation. The broker tracks an internal
+/// `admission_health_gate_passed` flag that is:
+/// - Set to `true` when [`FacBroker::check_health()`] returns a `Healthy`
+///   receipt, or when [`FacBroker::evaluate_admission_health_gate()`] succeeds.
+/// - Cleared to `false` on broker construction, when `check_health()` returns a
+///   non-`Healthy` receipt, or when `evaluate_admission_health_gate()` fails.
+///
+/// This ensures that all production token issuance paths through the
+/// `FacBroker` API are health-gated, even if callers omit an explicit
+/// `evaluate_admission_health_gate()` call before issuance (fail-closed).
+///
 /// # Thread Safety
 ///
 /// `FacBroker` is **not** internally synchronized. Callers must hold
 /// appropriate locks (e.g., `Mutex`) when accessing from multiple threads.
 /// This follows the pattern of `QueueSchedulerState` and `AntiEntropyBudget`
-/// in the economics module.
+/// in the economics module. The `admission_health_gate_passed` flag is
+/// protected by the same external lock that guards `&mut self` access;
+/// no interior mutability is used.
 pub struct FacBroker {
     /// Ed25519 signing key owned exclusively by the broker.
     signer: Signer,
     /// Mutable broker state (tick counter, admitted digests, horizons).
     state: BrokerState,
+    /// Whether the admission health gate has been satisfied.
+    ///
+    /// Set to `true` by successful `check_health()` (Healthy status) or
+    /// `evaluate_admission_health_gate()`. Cleared to `false` on failure.
+    /// Checked by `issue_channel_context_token()` as a mandatory
+    /// precondition (INV-BRK-HEALTH-GATE-001, fail-closed).
+    ///
+    /// Synchronization: protected by the same external lock that guards
+    /// `&mut self` / `&self` access. No interior mutability.
+    admission_health_gate_passed: bool,
 }
 
 impl Default for FacBroker {
@@ -389,24 +428,35 @@ impl Default for FacBroker {
 
 impl FacBroker {
     /// Creates a new broker with a freshly generated signing key.
+    ///
+    /// The admission health gate starts as `false` (fail-closed:
+    /// INV-BRK-HEALTH-GATE-001). A successful [`Self::check_health()`] or
+    /// [`Self::evaluate_admission_health_gate()`] must occur before token
+    /// issuance is permitted.
     #[must_use]
     pub fn new() -> Self {
         Self {
             signer: Signer::generate(),
             state: BrokerState::default(),
+            admission_health_gate_passed: false,
         }
     }
 
     /// Creates a broker from an existing signer and state.
     ///
-    /// Used when loading persisted state from disk.
+    /// Used when loading persisted state from disk. The admission health
+    /// gate starts as `false` (fail-closed: INV-BRK-HEALTH-GATE-001).
     ///
     /// # Errors
     ///
     /// Returns an error if the loaded state fails validation.
     pub fn from_signer_and_state(signer: Signer, state: BrokerState) -> Result<Self, BrokerError> {
         state.validate()?;
-        Ok(Self { signer, state })
+        Ok(Self {
+            signer,
+            state,
+            admission_health_gate_passed: false,
+        })
     }
 
     /// Returns the broker's verifying (public) key.
@@ -430,6 +480,26 @@ impl FacBroker {
         &self.state
     }
 
+    /// Returns whether the admission health gate is currently satisfied.
+    ///
+    /// This is `true` only after a successful [`Self::check_health()`]
+    /// returning `Healthy`, or a successful
+    /// [`Self::evaluate_admission_health_gate()`]. It is `false` on
+    /// construction and after any health check failure.
+    #[must_use]
+    pub const fn is_admission_health_gate_passed(&self) -> bool {
+        self.admission_health_gate_passed
+    }
+
+    /// Sets the admission health gate flag for testing purposes only.
+    ///
+    /// Production code MUST NOT use this method. The gate should only be
+    /// opened by successful health checks or gate evaluations.
+    #[cfg(test)]
+    pub(crate) const fn set_admission_health_gate_for_test(&mut self, passed: bool) {
+        self.admission_health_gate_passed = passed;
+    }
+
     /// Advances the broker tick by 1 (monotonic).
     ///
     /// Returns the new tick value.
@@ -450,9 +520,21 @@ impl FacBroker {
     /// `broker_verified = true` and all verification flags set, signed by
     /// the broker's Ed25519 key.
     ///
+    /// # Health Gate Precondition (INV-BRK-HEALTH-GATE-001)
+    ///
+    /// This method enforces the admission health gate as a mandatory
+    /// precondition. The broker must have a passing health status before
+    /// token issuance is permitted. The gate is satisfied by a prior
+    /// successful call to [`Self::check_health()`] returning `Healthy`,
+    /// or by a successful [`Self::evaluate_admission_health_gate()`].
+    /// If neither has occurred (or the most recent check failed), this
+    /// method returns [`BrokerError::AdmissionHealthGateNotSatisfied`]
+    /// (fail-closed).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - Admission health gate has not been satisfied (INV-BRK-HEALTH-GATE-001)
     /// - `job_spec_digest` is all-zero (not bound to a job)
     /// - `lease_id` is empty
     /// - `request_id` is empty
@@ -463,6 +545,16 @@ impl FacBroker {
         lease_id: &str,
         request_id: &str,
     ) -> Result<String, BrokerError> {
+        // INV-BRK-HEALTH-GATE-001: Enforce admission health gate before
+        // any token issuance. This is the mandatory pre-issuance guard
+        // ensuring all production admission/token issuance paths through
+        // the FacBroker API are health-gated. Fail-closed: if no health
+        // check has been performed or the last check was not Healthy,
+        // deny token issuance.
+        if !self.admission_health_gate_passed {
+            return Err(BrokerError::AdmissionHealthGateNotSatisfied);
+        }
+
         // Validate inputs (fail-closed)
         if bool::from(job_spec_digest.ct_eq(&[0u8; 32])) {
             return Err(BrokerError::ZeroJobSpecDigest);
@@ -879,7 +971,7 @@ impl FacBroker {
     /// Returns [`super::broker_health::BrokerHealthError`] if input bounds
     /// are violated (e.g., too many required authority sets).
     pub fn check_health(
-        &self,
+        &mut self,
         envelope: Option<&TimeAuthorityEnvelopeV1>,
         eval_window: &HtfEvaluationWindow,
         required_authority_sets: &[Hash],
@@ -902,7 +994,25 @@ impl FacBroker {
             required_authority_sets,
         };
 
-        checker.check_health(&input, self.current_tick(), &self.signer)
+        let result = checker.check_health(&input, self.current_tick(), &self.signer);
+
+        // INV-BRK-HEALTH-GATE-001: Update the admission health gate flag
+        // based on the health check outcome. Only a Healthy result opens
+        // the gate; all other outcomes (Failed, Degraded, or Err) close
+        // it. This ensures the gate is always consistent with the most
+        // recent health check. Mutation ordering: the gate flag is updated
+        // AFTER the health check completes, so there is no window where
+        // the flag is stale relative to the checker's receipt history.
+        match &result {
+            Ok(receipt) if receipt.status == super::broker_health::BrokerHealthStatus::Healthy => {
+                self.admission_health_gate_passed = true;
+            },
+            _ => {
+                self.admission_health_gate_passed = false;
+            },
+        }
+
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -938,7 +1048,7 @@ impl FacBroker {
     /// Returns a [`super::broker_health::WorkerHealthGateError`] if the gate
     /// rejects admission.
     pub fn evaluate_admission_health_gate(
-        &self,
+        &mut self,
         checker: &super::broker_health::BrokerHealthChecker,
         eval_window: &HtfEvaluationWindow,
         policy: super::broker_health::WorkerHealthPolicy,
@@ -948,14 +1058,24 @@ impl FacBroker {
         let verifier = BrokerSignatureVerifier::new(self.verifying_key());
         let expected_hash = super::broker_health::compute_eval_window_hash(eval_window);
 
-        super::broker_health::evaluate_worker_health_gate(
+        let result = super::broker_health::evaluate_worker_health_gate(
             checker.latest(),
             &verifier,
             policy,
             expected_hash,
             min_broker_tick,
             min_health_seq,
-        )
+        );
+
+        // INV-BRK-HEALTH-GATE-001: Update the admission health gate flag.
+        // A successful gate evaluation opens the gate for subsequent
+        // `issue_channel_context_token()` calls. A failure closes it.
+        // Mutation ordering: the flag is updated AFTER the gate evaluation
+        // completes, so there is no window where the flag is inconsistent
+        // with the gate result.
+        self.admission_health_gate_passed = result.is_ok();
+
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -1202,6 +1322,7 @@ mod tests {
     #[test]
     fn issue_and_decode_channel_context_token_roundtrip() {
         let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
         let job_digest = [0x42; 32];
         let lease_id = "lease-broker-001";
         let request_id = "REQ-001";
@@ -1234,7 +1355,8 @@ mod tests {
 
     #[test]
     fn issue_channel_context_token_rejects_zero_job_digest() {
-        let broker = FacBroker::new();
+        let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
         let result = broker.issue_channel_context_token(&[0u8; 32], "lease-1", "REQ-1");
         assert_eq!(result, Err(BrokerError::ZeroJobSpecDigest));
     }
@@ -1242,6 +1364,7 @@ mod tests {
     #[test]
     fn issue_channel_context_token_rejects_empty_lease_id() {
         let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
         broker
             .admit_policy_digest([0x11; 32])
             .expect("job digest should admit");
@@ -1252,6 +1375,7 @@ mod tests {
     #[test]
     fn issue_channel_context_token_rejects_empty_request_id() {
         let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
         broker
             .admit_policy_digest([0x11; 32])
             .expect("job digest should admit");
@@ -1261,7 +1385,8 @@ mod tests {
 
     #[test]
     fn issue_channel_context_token_rejects_unadmitted_job_digest() {
-        let broker = FacBroker::new();
+        let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
         let result = broker.issue_channel_context_token(&[0x11; 32], "lease-1", "REQ-1");
         assert!(matches!(
             result,
@@ -1269,10 +1394,141 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // Admission health gate enforcement (INV-BRK-HEALTH-GATE-001)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue_channel_context_token_rejects_when_health_gate_not_satisfied() {
+        // A freshly constructed broker has admission_health_gate_passed = false.
+        // Token issuance must be denied (fail-closed).
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
+
+        let result = broker.issue_channel_context_token(&job_digest, "lease-1", "REQ-1");
+        assert_eq!(
+            result,
+            Err(BrokerError::AdmissionHealthGateNotSatisfied),
+            "token issuance must be denied when health gate is not satisfied"
+        );
+        assert!(
+            !broker.is_admission_health_gate_passed(),
+            "gate must remain closed"
+        );
+    }
+
+    #[test]
+    fn issue_channel_context_token_succeeds_after_healthy_check_health() {
+        // Simulate a successful health check opening the gate, then issue a token.
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
+
+        // Before check_health: gate is closed
+        assert!(!broker.is_admission_health_gate_passed());
+
+        // Run a health check that should return Healthy
+        let mut checker = super::super::broker_health::BrokerHealthChecker::new();
+        let eval_window = crate::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-boundary".to_string(),
+            authority_clock: "test-clock".to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+
+        // Issue an envelope from the broker under test so TP001 passes
+        // (the envelope must be signed by the same key the health checker
+        // will verify against).
+        let envelope = broker
+            .issue_time_authority_envelope("test-boundary", "test-clock", 100, 200, 500)
+            .expect("envelope should issue");
+
+        // Set up horizons for TP002/TP003 to pass
+        broker.advance_freshness_horizon(300);
+
+        let receipt = broker
+            .check_health(Some(&envelope), &eval_window, &[], &mut checker)
+            .expect("health check should succeed");
+
+        assert_eq!(
+            receipt.status,
+            super::super::broker_health::BrokerHealthStatus::Healthy
+        );
+        assert!(
+            broker.is_admission_health_gate_passed(),
+            "gate must be open after Healthy check"
+        );
+
+        // Now token issuance should succeed
+        let token = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1")
+            .expect("token issuance should succeed after healthy check");
+        assert!(!token.is_empty());
+    }
+
+    #[test]
+    fn issue_channel_context_token_denied_after_failed_check_health() {
+        // First open the gate, then run a failing health check to close it.
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
+        broker.set_admission_health_gate_for_test(true);
+
+        // Confirm gate is open
+        assert!(broker.is_admission_health_gate_passed());
+
+        // Run a health check that will fail (no envelope => TP001 fails)
+        let mut checker = super::super::broker_health::BrokerHealthChecker::new();
+        let eval_window = crate::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-boundary".to_string(),
+            authority_clock: "test-clock".to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+
+        let receipt = broker
+            .check_health(None, &eval_window, &[], &mut checker)
+            .expect("health check should return a receipt (Failed, not Err)");
+
+        assert_eq!(
+            receipt.status,
+            super::super::broker_health::BrokerHealthStatus::Failed
+        );
+        assert!(
+            !broker.is_admission_health_gate_passed(),
+            "gate must be closed after Failed check"
+        );
+
+        // Token issuance must now be denied
+        let result = broker.issue_channel_context_token(&job_digest, "lease-1", "REQ-1");
+        assert_eq!(
+            result,
+            Err(BrokerError::AdmissionHealthGateNotSatisfied),
+            "token issuance must be denied after health check fails"
+        );
+    }
+
+    #[test]
+    fn admission_health_gate_default_is_false() {
+        let broker = FacBroker::new();
+        assert!(
+            !broker.is_admission_health_gate_passed(),
+            "newly constructed broker must have health gate closed (fail-closed)"
+        );
+    }
+
     #[test]
     fn forged_token_rejected_by_different_key() {
         let mut broker = FacBroker::new();
         let mut attacker = FacBroker::new();
+        attacker.set_admission_health_gate_for_test(true);
         let job_digest = [0x42; 32];
         broker
             .admit_policy_digest(job_digest)
@@ -1848,6 +2104,7 @@ mod tests {
     #[test]
     fn end_to_end_broker_token_envelope_horizons() {
         let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
         let job_digest = [0x42; 32];
         let lease_id = "lease-e2e-001";
         let request_id = "REQ-E2E-001";

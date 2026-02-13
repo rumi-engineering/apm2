@@ -3472,7 +3472,7 @@ mod tests {
     fn broker_admission_gate_denies_when_health_failed() {
         use crate::fac::FacBroker;
 
-        let broker = FacBroker::new();
+        let mut broker = FacBroker::new();
         let mut checker = BrokerHealthChecker::new();
 
         // Build an evaluation window from the broker.
@@ -3486,6 +3486,13 @@ mod tests {
             .check_health(None, &eval_window, &[], &mut checker)
             .unwrap();
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
+
+        // INV-BRK-HEALTH-GATE-001: After a FAILED check_health, the
+        // admission_health_gate_passed flag must be false.
+        assert!(
+            !broker.is_admission_health_gate_passed(),
+            "health gate must be closed after FAILED check"
+        );
 
         // Now use the production admission gate — it should DENY.
         let result = broker.evaluate_admission_health_gate(
@@ -3509,7 +3516,7 @@ mod tests {
     fn broker_admission_gate_denies_when_no_receipt() {
         use crate::fac::FacBroker;
 
-        let broker = FacBroker::new();
+        let mut broker = FacBroker::new();
         let checker = BrokerHealthChecker::new();
         let eval_window = broker
             .build_evaluation_window("test-boundary", "test-clock", 0, 100)
@@ -3537,7 +3544,7 @@ mod tests {
     fn broker_admission_gate_denies_stale_receipt() {
         use crate::fac::FacBroker;
 
-        let broker = FacBroker::new();
+        let mut broker = FacBroker::new();
         let mut checker = BrokerHealthChecker::new();
 
         let eval_window = broker
