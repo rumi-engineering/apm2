@@ -114,9 +114,6 @@ fn bind_review_run_state_integrity_for_home(
     home: &Path,
     state: &mut ReviewRunState,
 ) -> Result<(), String> {
-    if state.pid.is_none() || state.proc_start_time.is_none() {
-        return Ok(());
-    }
     let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
         Some(secret) => secret,
         None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
@@ -137,8 +134,8 @@ fn bind_review_run_state_integrity_for_home(
 #[derive(Serialize)]
 struct ReviewRunStateIntegrityBinding<'a> {
     run_id: &'a str,
-    pid: u32,
-    proc_start_time: u64,
+    pid: Option<u32>,
+    proc_start_time: Option<u64>,
     owner_repo: &'a str,
     head_sha: &'a str,
     pr_number: u32,
@@ -301,10 +298,8 @@ pub fn review_run_secret_path(pr_number: u32, review_type: &str) -> Result<PathB
 pub fn run_state_integrity_binding_payload(state: &ReviewRunState) -> Result<Vec<u8>, String> {
     let binding = ReviewRunStateIntegrityBinding {
         run_id: &state.run_id,
-        pid: state.pid.ok_or_else(|| "state missing pid".to_string())?,
-        proc_start_time: state
-            .proc_start_time
-            .ok_or_else(|| "state missing proc_start_time".to_string())?,
+        pid: state.pid,
+        proc_start_time: state.proc_start_time,
         owner_repo: &state.owner_repo,
         head_sha: &state.head_sha,
         pr_number: state.pr_number,
@@ -874,9 +869,6 @@ pub fn load_review_run_state_verified_for_home(
         load_review_run_state_unverified_for_home_inner(home, pr_number, review_type)?;
     match run_state_load {
         ReviewRunStateLoad::Present(state) => {
-            if state.pid.is_none() {
-                return Ok(ReviewRunStateLoad::Present(state));
-            }
             if let Err(err) = verify_review_run_state_integrity_binding(home, &state) {
                 return Ok(ReviewRunStateLoad::Corrupt {
                     path: canonical,
@@ -988,6 +980,7 @@ pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String>
     let path = review_run_state_path(state.pr_number, &state.review_type)?;
     let home = apm2_home_dir()?;
     let mut state = state.clone();
+    state.integrity_hmac = None; // force re-bind on every write
     bind_review_run_state_integrity_for_home(&home, &mut state)?;
     write_review_run_state_to_path(&path, &state)?;
     Ok(path)
@@ -999,6 +992,7 @@ pub fn write_review_run_state_for_home(
 ) -> Result<PathBuf, String> {
     let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
     let mut state = state.clone();
+    state.integrity_hmac = None; // force re-bind on every write
     bind_review_run_state_integrity_for_home(home, &mut state)?;
     write_review_run_state_to_path(&path, &state)?;
     Ok(path)
@@ -1021,6 +1015,13 @@ pub fn write_review_run_termination_receipt_for_home(
         .ok_or_else(|| format!("termination receipt path has no parent: {}", path.display()))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|err| format!("failed to create termination receipt temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to set termination receipt temp file mode: {err}"))?;
+    }
     temp.write_all(&payload)
         .map_err(|err| format!("failed to write termination receipt temp file: {err}"))?;
     temp.as_file()
@@ -1048,6 +1049,13 @@ pub fn write_review_run_completion_receipt_for_home(
         .ok_or_else(|| format!("completion receipt path has no parent: {}", path.display()))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|err| format!("failed to create completion receipt temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to set completion receipt temp file mode: {err}"))?;
+    }
     temp.write_all(&payload)
         .map_err(|err| format!("failed to write completion receipt temp file: {err}"))?;
     temp.as_file()
@@ -1185,9 +1193,6 @@ pub fn verify_review_run_state_integrity_binding(
     home: &Path,
     state: &ReviewRunState,
 ) -> Result<(), String> {
-    if state.pid.is_none() || state.proc_start_time.is_none() {
-        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
-    }
     let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
         Some(secret) => secret,
         None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
@@ -1217,6 +1222,13 @@ pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Re
         .ok_or_else(|| format!("run-state path has no parent: {}", path.display()))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|err| format!("failed to create run-state temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to set run-state temp file mode: {err}"))?;
+    }
     temp.write_all(&payload)
         .map_err(|err| format!("failed to write run-state temp file: {err}"))?;
     temp.as_file()

@@ -398,9 +398,7 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         return Ok(cached);
     }
 
-    let login = super::barrier::resolve_authenticated_gh_login()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "local_reviewer".to_string());
+    let login = super::barrier::resolve_local_reviewer_identity();
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)
 }
@@ -1478,11 +1476,11 @@ dimensions:
         state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
 
-        let err = super::terminate_review_agent_for_home(home, &authority)
-            .expect_err("missing proc_start_time state should fail closed");
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
-            err.contains("integrity verification failed") || err.contains("integrity_failure"),
-            "unexpected termination error: {err}"
+            matches!(outcome, super::TerminationOutcome::IdentityFailure(ref msg) if msg.contains("missing proc_start_time")),
+            "unexpected termination outcome: {outcome:?}"
         );
         assert!(state::is_process_alive(pid));
 
@@ -1566,11 +1564,11 @@ dimensions:
         let _ = child.kill();
         let _ = child.wait();
 
-        let err = super::terminate_review_agent_for_home(home, &authority)
-            .expect_err("missing proc_start_time state should fail closed");
+        let outcome = super::terminate_review_agent_for_home(home, &authority)
+            .expect("termination result expected");
         assert!(
-            err.contains("integrity verification failed") || err.contains("integrity_failure"),
-            "unexpected termination error: {err}"
+            matches!(outcome, super::TerminationOutcome::AlreadyDead),
+            "dead process with missing proc_start_time should be already dead: {outcome:?}"
         );
 
         let _ = std::fs::remove_file(state_path);

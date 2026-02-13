@@ -465,6 +465,12 @@ pub fn ensure_gh_cli_ready() -> Result<(), String> {
     }
 }
 
+pub fn resolve_local_reviewer_identity() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown_local_user".to_string())
+}
+
 pub fn resolve_authenticated_gh_login() -> Option<String> {
     let output = Command::new("gh")
         .args(["api", "user", "--jq", ".login"])

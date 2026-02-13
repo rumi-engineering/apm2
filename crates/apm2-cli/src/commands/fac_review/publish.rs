@@ -5,7 +5,7 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::Serialize;
 
-use super::barrier::{render_comment_with_generated_metadata, resolve_authenticated_gh_login};
+use super::barrier::render_comment_with_generated_metadata;
 use super::github_projection::{self, IssueCommentResponse};
 use super::projection_store;
 use super::target::resolve_pr_target;
@@ -163,9 +163,7 @@ fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, Strin
         return Ok(cached);
     }
 
-    let reviewer_id = resolve_authenticated_gh_login()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "local_reviewer".to_string());
+    let reviewer_id = super::barrier::resolve_local_reviewer_identity();
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &reviewer_id);
     Ok(reviewer_id)
 }
