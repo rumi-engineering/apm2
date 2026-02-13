@@ -1180,18 +1180,13 @@ fn spawn_detached_review(
     })?;
     if has_sensitive_token_env {
         eprintln!(
-            "WARNING: running fallback review dispatch without systemd-run read-only confinement because GH_TOKEN or GITHUB_TOKEN is set"
+            "WARNING: systemd-run unavailable with token env; read-only confinement not applied"
         );
     }
     let log_path = dispatch_dir.join(format!(
         "pr{pr_number}-{}-{head_short}-{dispatch_epoch}.log",
         review_kind.as_str()
     ));
-    let fallback_cwd = if has_sensitive_token_env {
-        std::env::temp_dir()
-    } else {
-        workspace_root.to_path_buf()
-    };
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1209,7 +1204,7 @@ fn spawn_detached_review(
         .arg(review_kind.as_str())
         .arg("--expected-head-sha")
         .arg(expected_head_sha)
-        .current_dir(fallback_cwd.as_path())
+        .current_dir(workspace_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr))

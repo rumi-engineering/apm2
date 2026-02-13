@@ -975,7 +975,7 @@ fn run_terminate_inner(
                 .unwrap_or_default()
             );
         }
-        return Ok(());
+        return Err(msg);
     };
     if !state_repo.eq_ignore_ascii_case(owner_repo.as_str()) {
         let msg = format!(
@@ -996,7 +996,7 @@ fn run_terminate_inner(
                 .unwrap_or_default()
             );
         }
-        return Ok(());
+        return Err(msg);
     }
 
     if run_state.status == types::ReviewRunStatus::Alive && run_state.pid.is_none() {
@@ -1696,6 +1696,18 @@ mod tests {
         );
         assert!(gemini.contains("gemini -m"));
         assert!(gemini.contains("stream-json"));
+
+        let claude = build_script_command_for_backend(
+            ReviewBackend::ClaudeCode,
+            prompt,
+            log,
+            "claude-3-7-sonnet",
+            None,
+        );
+        assert!(claude.contains("claude"));
+        assert!(claude.contains("--output-format json"));
+        assert!(claude.contains("--permission-mode plan"));
+        assert!(!claude.contains("-p \"$(cat"));
     }
 
     #[test]
@@ -1923,7 +1935,12 @@ mod tests {
 
         let result =
             super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
-        assert!(result.is_ok(), "should skip termination for repo mismatch");
+        assert!(
+            result.is_err(),
+            "repo mismatch should now be treated as a failure"
+        );
+        let error = result.expect_err("repo mismatch should be surfaced as an error");
+        assert!(error.contains("repo mismatch"));
         assert!(super::state::is_process_alive(pid));
 
         let loaded = super::state::load_review_run_state_for_home(&home, pr_number, "security")
@@ -1933,6 +1950,32 @@ mod tests {
             other => panic!("expected present state, got {other:?}"),
         };
         assert_eq!(state.status, ReviewRunStatus::Alive);
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_when_repo_parse_failed() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
+        let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state.pr_url = "https://github.com/not-a-repo-url".to_string();
+        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let result =
+            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
+        assert!(
+            result.is_err(),
+            "repo parse failure should now be treated as an error"
+        );
+        let error = result.expect_err("repo parse failure should be surfaced as an error");
+        assert!(error.contains("unable to parse owner/repo"));
 
         kill_child(child);
         let _ = std::fs::remove_file(state_path);
