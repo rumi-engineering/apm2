@@ -392,7 +392,8 @@ pub enum LaneSubcommand {
 /// Arguments for `apm2 fac lane status`.
 #[derive(Debug, Args)]
 pub struct LaneStatusArgs {
-    /// Show only lanes matching this state (IDLE, RUNNING, LEASED, CORRUPT).
+    /// Show only lanes matching this state (IDLE, RUNNING, LEASED, CLEANUP,
+    /// CORRUPT).
     #[arg(long)]
     pub state: Option<String>,
 }
@@ -2360,34 +2361,36 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
         statuses.iter().collect()
     };
 
-    // Build summary counts (always from unfiltered set)
+    // Build summary counts from filtered set.
     let summary = LaneStateSummary {
-        idle: statuses
+        idle: filtered
             .iter()
             .filter(|s| s.state == LaneState::Idle)
             .count(),
-        leased: statuses
+        leased: filtered
             .iter()
             .filter(|s| s.state == LaneState::Leased)
             .count(),
-        running: statuses
+        running: filtered
             .iter()
             .filter(|s| s.state == LaneState::Running)
             .count(),
-        cleanup: statuses
+        cleanup: filtered
             .iter()
             .filter(|s| s.state == LaneState::Cleanup)
             .count(),
-        corrupt: statuses
+        corrupt: filtered
             .iter()
             .filter(|s| s.state == LaneState::Corrupt)
             .count(),
     };
+    let filtered_count =
+        summary.idle + summary.leased + summary.running + summary.cleanup + summary.corrupt;
 
     if json_output {
         let response = LaneStatusResponse {
             lanes: filtered.into_iter().cloned().collect(),
-            total: statuses.len(),
+            total: filtered_count,
             summary,
         };
         match serde_json::to_string_pretty(&response) {
@@ -2411,7 +2414,7 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
         println!();
         println!(
             "Total: {}  (idle: {}, running: {}, leased: {}, cleanup: {}, corrupt: {})",
-            statuses.len(),
+            filtered_count,
             summary.idle,
             summary.running,
             summary.leased,

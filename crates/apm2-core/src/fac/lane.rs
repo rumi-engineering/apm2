@@ -39,6 +39,8 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -171,6 +173,15 @@ pub enum LaneError {
     /// Lane profile hash computation failed.
     #[error("profile hash computation failed: {0}")]
     HashComputation(String),
+
+    /// Invalid lane profile or lease record.
+    #[error("invalid lane record for lane {lane_id}: {reason}")]
+    InvalidRecord {
+        /// Affected lane.
+        lane_id: String,
+        /// Why the record is invalid.
+        reason: String,
+    },
 }
 
 impl LaneError {
@@ -390,6 +401,25 @@ impl LaneProfileV1 {
                 profile_path.display()
             ))
         })?;
+        let expected_lane_id = lane_dir_lane_id(lane_dir)?;
+        if profile.schema != LANE_PROFILE_V1_SCHEMA {
+            return Err(LaneError::InvalidRecord {
+                lane_id: expected_lane_id.to_string(),
+                reason: format!(
+                    "schema mismatch: expected '{LANE_PROFILE_V1_SCHEMA}', got '{}'",
+                    profile.schema
+                ),
+            });
+        }
+        if profile.lane_id != expected_lane_id {
+            return Err(LaneError::InvalidRecord {
+                lane_id: expected_lane_id.to_string(),
+                reason: format!(
+                    "lane_id mismatch: expected '{expected_lane_id}', got '{}'",
+                    profile.lane_id
+                ),
+            });
+        }
         validate_lane_id(&profile.lane_id)?;
         Ok(profile)
     }
@@ -495,6 +525,25 @@ impl LaneLeaseV1 {
                 lease_path.display()
             ))
         })?;
+        let expected_lane_id = lane_dir_lane_id(lane_dir)?;
+        if lease.schema != LANE_LEASE_V1_SCHEMA {
+            return Err(LaneError::InvalidRecord {
+                lane_id: expected_lane_id.to_string(),
+                reason: format!(
+                    "schema mismatch: expected '{LANE_LEASE_V1_SCHEMA}', got '{}'",
+                    lease.schema
+                ),
+            });
+        }
+        if lease.lane_id != expected_lane_id {
+            return Err(LaneError::InvalidRecord {
+                lane_id: expected_lane_id.to_string(),
+                reason: format!(
+                    "lane_id mismatch: expected '{expected_lane_id}', got '{}'",
+                    lease.lane_id
+                ),
+            });
+        }
         validate_lane_id(&lease.lane_id)?;
         Ok(Some(lease))
     }
@@ -550,12 +599,8 @@ impl fmt::Display for LaneStatusV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:<12} {:<10}", self.lane_id, self.state)?;
         if let Some(ref job_id) = self.job_id {
-            // Truncate job_id for display
-            let display_id = if job_id.len() > 30 {
-                &job_id[..30]
-            } else {
-                job_id
-            };
+            // Truncate job_id for display using Unicode-safe boundaries.
+            let display_id = job_id.chars().take(30).collect::<String>();
             write!(f, " {display_id:<32}")?;
         } else {
             write!(f, " {:<32}", "-")?;
@@ -900,13 +945,16 @@ fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false;
+    };
     #[cfg(unix)]
     {
         // SAFETY: kill with signal 0 only checks for process existence.
-        // This is a standard POSIX pattern. The pid is a u32 from a lease
-        // record; casting to i32 is safe for valid PIDs (max ~4M on Linux).
-        #[allow(unsafe_code, clippy::cast_possible_wrap)]
-        let result = unsafe { libc::kill(pid as i32, 0) };
+        // This is a standard POSIX pattern. PID casting is validated against
+        // platform bounds before invocation.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::kill(pid_i32, 0) };
         if result == 0 {
             return true;
         }
@@ -980,9 +1028,21 @@ fn apm2_home_dir() -> Result<PathBuf, String> {
 ///
 /// Uses `DirBuilder` with mode set at create-time to avoid TOCTOU window.
 fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
-    if path.exists() {
-        return Ok(());
+    ensure_safe_path(path, "create_dir_restricted")?;
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.is_dir() {
+            return Ok(());
+        }
+        return Err(LaneError::io(
+            format!("expected directory at {}", path.display()),
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path exists but is not a directory",
+            ),
+        ));
     }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -1009,7 +1069,16 @@ fn ensure_parent_dir(path: &Path) -> Result<(), LaneError> {
 
 /// Atomic write: write to temp file then rename (CTR-2607).
 fn atomic_write(target: &Path, data: &[u8]) -> Result<(), LaneError> {
+    ensure_safe_path(target, "atomic_write")?;
     ensure_parent_dir(target)?;
+    if let Ok(metadata) = fs::symlink_metadata(target) {
+        if metadata.is_dir() {
+            return Err(LaneError::io(
+                format!("target path is a directory: {}", target.display()),
+                io::Error::new(io::ErrorKind::InvalidInput, "target must be a file"),
+            ));
+        }
+    }
     let parent = target.parent().ok_or_else(|| {
         LaneError::io(
             format!("path has no parent: {}", target.display()),
@@ -1047,29 +1116,127 @@ fn atomic_write(target: &Path, data: &[u8]) -> Result<(), LaneError> {
 
 /// Read a file with a size bound (CTR-1603).
 ///
-/// Checks file size before reading to prevent memory exhaustion from crafted
+/// Streams into a bounded buffer to prevent memory exhaustion from crafted
 /// files.
 fn bounded_read_file(path: &Path, max_size: u64) -> Result<Vec<u8>, LaneError> {
-    let metadata = fs::metadata(path)
-        .map_err(|e| LaneError::io(format!("reading metadata for {}", path.display()), e))?;
-    let size = metadata.len();
-    if size > max_size {
-        return Err(LaneError::io(
-            format!(
-                "file {} is too large: {size} bytes > {max_size} max",
-                path.display()
-            ),
-            io::Error::new(io::ErrorKind::InvalidData, "file too large"),
+    ensure_safe_path(path, "bounded_read_file")?;
+    let mut file = open_file_no_follow(path)?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let remaining = max_size.saturating_sub(buf.len() as u64);
+        let read_len = if remaining == 0 {
+            1u64
+        } else {
+            remaining.min(chunk.len() as u64)
+        };
+        let Ok(read_len) = usize::try_from(read_len) else {
+            return Err(LaneError::io(
+                format!(
+                    "file {} exceeds maximum size {max_size} bytes",
+                    path.display()
+                ),
+                io::Error::new(io::ErrorKind::InvalidData, "file too large"),
+            ));
+        };
+
+        let n = file
+            .read(&mut chunk[..read_len])
+            .map_err(|e| LaneError::io(format!("reading {}", path.display()), e))?;
+        if n == 0 {
+            return Ok(buf);
+        }
+
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() as u64 > max_size {
+            return Err(LaneError::io(
+                format!(
+                    "file {} exceeds maximum size {max_size} bytes",
+                    path.display()
+                ),
+                io::Error::new(io::ErrorKind::InvalidData, "file too large"),
+            ));
+        }
+    }
+}
+
+/// Open file for read without following symlinks on Unix.
+fn open_file_no_follow(path: &Path) -> Result<File, LaneError> {
+    #[cfg(unix)]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_NOFOLLOW);
+        options
+            .open(path)
+            .map_err(|e| LaneError::io(format!("opening {}", path.display()), e))
+    }
+
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| LaneError::io(format!("opening {}", path.display()), e))
+    }
+}
+
+fn lane_dir_lane_id(lane_dir: &Path) -> Result<&str, LaneError> {
+    let lane_id = lane_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            LaneError::InvalidLaneId("lane directory name is invalid UTF-8".to_string())
+        })?;
+    if lane_id.is_empty() {
+        return Err(LaneError::InvalidLaneId(
+            "lane directory name is empty".to_string(),
         ));
     }
 
-    let mut file =
-        File::open(path).map_err(|e| LaneError::io(format!("opening {}", path.display()), e))?;
-    let capacity = usize::try_from(size).unwrap_or(usize::MAX);
-    let mut buf = Vec::with_capacity(capacity);
-    file.read_to_end(&mut buf)
-        .map_err(|e| LaneError::io(format!("reading {}", path.display()), e))?;
-    Ok(buf)
+    Ok(lane_id)
+}
+
+fn ensure_safe_path(path: &Path, context: &str) -> Result<(), LaneError> {
+    for component in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if component.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(component) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(LaneError::io(
+                        format!(
+                            "{context}: symlink component in path: {}",
+                            component.display()
+                        ),
+                        io::Error::new(io::ErrorKind::InvalidInput, "symlink component detected"),
+                    ));
+                }
+                if component != path && !metadata.is_dir() {
+                    return Err(LaneError::io(
+                        format!(
+                            "{context}: non-directory path component: {}",
+                            component.display()
+                        ),
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "path component is not a directory",
+                        ),
+                    ));
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+            Err(e) => {
+                return Err(LaneError::io(
+                    format!("failed to validate path component: {}", component.display()),
+                    e,
+                ));
+            },
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1263,9 +1430,11 @@ mod tests {
     #[test]
     fn lane_profile_persist_and_load() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
         let profile = LaneProfileV1::new("lane-00", "b3-256:abc123").expect("create profile");
-        profile.persist(dir.path()).expect("persist");
-        let loaded = LaneProfileV1::load(dir.path()).expect("load");
+        profile.persist(&lane_dir).expect("persist");
+        let loaded = LaneProfileV1::load(&lane_dir).expect("load");
         assert_eq!(profile, loaded);
     }
 
@@ -1316,6 +1485,8 @@ mod tests {
     #[test]
     fn lane_lease_persist_load_remove() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
         let lease = LaneLeaseV1::new(
             "lane-00",
             "job_test",
@@ -1328,17 +1499,17 @@ mod tests {
         .expect("create lease");
 
         // Persist
-        lease.persist(dir.path()).expect("persist");
+        lease.persist(&lane_dir).expect("persist");
 
         // Load
-        let loaded = LaneLeaseV1::load(dir.path())
+        let loaded = LaneLeaseV1::load(&lane_dir)
             .expect("load")
             .expect("should exist");
         assert_eq!(lease, loaded);
 
         // Remove
-        LaneLeaseV1::remove(dir.path()).expect("remove");
-        let after_remove = LaneLeaseV1::load(dir.path()).expect("load after remove");
+        LaneLeaseV1::remove(&lane_dir).expect("remove");
+        let after_remove = LaneLeaseV1::load(&lane_dir).expect("load after remove");
         assert!(after_remove.is_none());
     }
 
@@ -1362,6 +1533,196 @@ mod tests {
         let long_id = "x".repeat(MAX_STRING_LENGTH + 1);
         let result = LaneLeaseV1::new("lane-00", &long_id, 1, LaneState::Idle, "t", "h", "f");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lane_profile_load_rejects_schema_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let profile = LaneProfileV1::new("lane-00", "fp").expect("create profile");
+        let mut value = serde_json::to_value(profile).expect("to value");
+        value["schema"] = serde_json::Value::String("apm2.fac.lane_profile.wrong".to_string());
+        fs::write(
+            lane_dir.join("profile.v1.json"),
+            serde_json::to_vec_pretty(&value).expect("to json"),
+        )
+        .expect("write bad profile");
+
+        let err = LaneProfileV1::load(&lane_dir).expect_err("schema mismatch should fail");
+        match err {
+            LaneError::InvalidRecord { lane_id, reason } => {
+                assert_eq!(lane_id, "lane-00");
+                assert!(
+                    reason.contains("schema mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            },
+            other => panic!("expected invalid record, got {other}"),
+        }
+    }
+
+    #[test]
+    fn lane_profile_load_rejects_lane_id_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let profile = LaneProfileV1::new("lane-00", "fp").expect("create profile");
+        let mut value = serde_json::to_value(profile).expect("to value");
+        value["lane_id"] = serde_json::Value::String("lane-99".to_string());
+        fs::write(
+            lane_dir.join("profile.v1.json"),
+            serde_json::to_vec_pretty(&value).expect("to json"),
+        )
+        .expect("write bad profile");
+
+        let err = LaneProfileV1::load(&lane_dir).expect_err("lane_id mismatch should fail");
+        match err {
+            LaneError::InvalidRecord { lane_id, reason } => {
+                assert_eq!(lane_id, "lane-00");
+                assert!(
+                    reason.contains("lane_id mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            },
+            other => panic!("expected invalid record, got {other}"),
+        }
+    }
+
+    #[test]
+    fn lane_lease_load_rejects_schema_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let lease = LaneLeaseV1::new(
+            "lane-00",
+            "job_20260213T000000Z",
+            123,
+            LaneState::Running,
+            "2026-02-13T00:00:00Z",
+            "b3-256:ph",
+            "b3-256:tf",
+        )
+        .expect("create lease");
+        let mut value = serde_json::to_value(lease).expect("to value");
+        value["schema"] = serde_json::Value::String("apm2.fac.lane_lease.wrong".to_string());
+        fs::write(
+            lane_dir.join("lease.v1.json"),
+            serde_json::to_vec_pretty(&value).expect("to json"),
+        )
+        .expect("write bad lease");
+
+        let err = LaneLeaseV1::load(&lane_dir).expect_err("schema mismatch should fail");
+        match err {
+            LaneError::InvalidRecord { lane_id, reason } => {
+                assert_eq!(lane_id, "lane-00");
+                assert!(
+                    reason.contains("schema mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            },
+            other => panic!("expected invalid record, got {other}"),
+        }
+    }
+
+    #[test]
+    fn lane_lease_load_rejects_lane_id_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let lease = LaneLeaseV1::new(
+            "lane-00",
+            "job_20260213T000000Z",
+            123,
+            LaneState::Running,
+            "2026-02-13T00:00:00Z",
+            "b3-256:ph",
+            "b3-256:tf",
+        )
+        .expect("create lease");
+        let mut value = serde_json::to_value(lease).expect("to value");
+        value["lane_id"] = serde_json::Value::String("lane-99".to_string());
+        fs::write(
+            lane_dir.join("lease.v1.json"),
+            serde_json::to_vec_pretty(&value).expect("to json"),
+        )
+        .expect("write bad lease");
+
+        let err = LaneLeaseV1::load(&lane_dir).expect_err("lane_id mismatch should fail");
+        match err {
+            LaneError::InvalidRecord { lane_id, reason } => {
+                assert_eq!(lane_id, "lane-00");
+                assert!(
+                    reason.contains("lane_id mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            },
+            other => panic!("expected invalid record, got {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_restricted_rejects_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let target = workspace.join("target_dir");
+        fs::create_dir_all(&target).expect("create target");
+        let symlink_path = workspace.join("symlink_dir");
+        symlink(&target, &symlink_path).expect("create symlink dir");
+
+        assert!(create_dir_restricted(&symlink_path.join("child")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let target = workspace.join("target.txt");
+        fs::write(&target, b"target").expect("write target");
+
+        let symlink_path = workspace.join("target_link.json");
+        symlink(&target, &symlink_path).expect("create symlink target");
+
+        assert!(atomic_write(&symlink_path, b"payload").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_file_rejects_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let target = workspace.join("target.json");
+        fs::write(&target, b"{}").expect("write target");
+
+        let link = workspace.join("target_link.json");
+        symlink(&target, &link).expect("create symlink");
+
+        let result = bounded_read_file(&link, 1024);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pid_above_i32_max_is_not_alive() {
+        let pid = (i32::MAX as u32) + 1;
+        assert!(!is_pid_alive(pid));
     }
 
     #[test]
