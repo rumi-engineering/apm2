@@ -213,15 +213,12 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub quick: bool,
 
-    /// Steady-state wall timeout for bounded test execution (seconds).
-    ///
-    /// FAC may temporarily widen this window for cold-cache warm-up runs when
-    /// the default value is used.
+    /// Wall timeout for bounded test execution (seconds).
     #[arg(long, default_value_t = 600)]
     pub timeout_seconds: u64,
 
     /// Memory ceiling for bounded test execution.
-    #[arg(long, default_value = "24G")]
+    #[arg(long, default_value = "48G")]
     pub memory_max: String,
 
     /// PID/task ceiling for bounded test execution.

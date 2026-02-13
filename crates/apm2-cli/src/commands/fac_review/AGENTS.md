@@ -21,7 +21,7 @@ apm2 fac review run --pr-url <URL> --type all
        |      +-- restart.rs      (CI-state-aware pipeline restart)
        |      +-- merge_conflicts.rs (merge conflict detection)
        |      +-- worktree.rs     (SHA-to-worktree resolution for detached dispatch)
-       |      +-- timeout_policy.rs (cold-cache-aware bounded test timeout policy)
+       |      +-- timeout_policy.rs (uniform bounded test timeout policy)
        |
        +-- state.rs          (ReviewStateFile persistence, pulse files, locking)
        +-- types.rs          (shared types, constants, utility functions)
@@ -55,7 +55,7 @@ apm2 fac review run --pr-url <URL> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
-- **Adaptive bounded tests**: Test gate keeps a 600s steady-state SLA but can temporarily widen timeout on detected cold build caches.
+- **Uniform bounded tests**: Test gate uses a fixed 600s timeout for all workspaces.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.

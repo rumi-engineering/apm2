@@ -51,6 +51,7 @@ ticket_meta:
       - "Write manual termination receipts with decision metadata sourced from decision-bound authority (`decision_comment_id`, `decision_author`, `decision_signature`)."
       - "Remove legacy missing-HMAC migration in run-state integrity verification; fail closed when `integrity_hmac` is absent on PID-bearing state."
       - "Bound run-secret file reads and enforce decoded secret length = 32 bytes."
+      - "Standardize bounded FAC test policy to fixed 600s timeout and 48G MemoryMax across gates/pipeline/runner paths, removing cold-cache timeout divergence."
       - "Perform one-time cleanup of leaked fac_review test artifacts under `~/.apm2/review_locks/` and `~/.apm2/reviews/`."
     out_of_scope:
       - "Sandbox mode migration for Codex/Gemini backends (requires upstream support)."
@@ -64,6 +65,7 @@ ticket_meta:
       - "Add `dimension_to_state_review_type` helper mapping 'code-quality' to 'quality' in decision.rs."
       - "Add `terminate_review_agent` function in decision.rs: load run state, verify PID identity, SIGTERM with 5s timeout, SIGKILL fallback."
       - "Call `terminate_review_agent` in `run_decision_set` after cleanup block."
+      - "Set bounded test defaults to timeout=600s and memory=48G everywhere (CLI defaults, bounded runner, evidence pipeline, gate attestations, and nextest profile); remove cold/warm timeout branching."
   definition_of_done:
     evidence_ids: []
     criteria:
@@ -74,6 +76,7 @@ ticket_meta:
       - "`apm2 fac review terminate` fails closed unless decision-bound authority is present in local projection data."
       - "Run-state integrity verification rejects PID-bearing state without `integrity_hmac`."
       - "Run-secret loading rejects oversized files and non-32-byte decoded secrets."
+      - "Bounded FAC test policy is uniform at 600s timeout and 48G MemoryMax, with no cold-cache timeout boost behavior."
       - "`cargo clippy -p apm2-cli -p apm2-core -- -D warnings` passes clean."
       - "`cargo test -p apm2-cli fac_review` — all tests pass."
   notes:
