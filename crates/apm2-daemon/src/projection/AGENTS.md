@@ -20,6 +20,7 @@ The `projection` module implements write-only projection adapters that synchroni
 - **`IntentBuffer`**: SQLite-backed durable buffer for projection intents and deferred replay backlog (TCK-00504)
 - **`ConfigBackedResolver`**: Config-backed continuity profile resolver for economics gate input assembly (TCK-00507)
 - **`ContinuityProfileResolver`**: Trait for resolving continuity profiles, sink snapshots, and continuity windows
+- **`DeferredReplayWorker`**: Worker that drains the deferred replay backlog after sink recovery, re-evaluating economics gate AND PCAC lifecycle enforcement for each replayed intent (TCK-00508)
 
 ### Security Model
 
@@ -242,6 +243,22 @@ Config-backed continuity profile resolver for economics gate input assembly. Loa
 - [CTR-CR02] `resolve_*` methods are `O(1)` hash map lookups.
 - [CTR-CR03] The resolver is `Send + Sync` for concurrent access.
 
+### `ReplayProjectionEffect` (trait, TCK-00508)
+
+```rust
+pub trait ReplayProjectionEffect: Send + Sync {
+    fn execute_projection(
+        &self,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+        ledger_head: [u8; 32],
+        status: ProjectedStatus,
+    ) -> Result<(), String>;
+}
+```
+
+Synchronous projection effect callback injected into `DeferredReplayWorker`. In production, this wraps the async `ProjectionAdapter::project_status` call via a sync bridge (e.g., `tokio::task::block_in_place`). Required dependency -- construction of `DeferredReplayWorker` fails without it.
+
 ### `ContinuityProfileResolver` (trait, TCK-00507)
 
 ```rust
@@ -258,6 +275,44 @@ Trait boundary for resolving continuity profiles, sink snapshots, and continuity
 
 Pre-validated value types that map directly to economics module input types (`ProjectionSinkContinuityProfileV1`, `ProjectionContinuityWindowV1`) without lossy conversion.
 
+### `DeferredReplayWorker` (TCK-00508)
+
+```rust
+pub struct DeferredReplayWorker {
+    config: DeferredReplayWorkerConfig,
+    intent_buffer: Arc<IntentBuffer>,
+    resolver: Arc<dyn ContinuityProfileResolver>,
+    gate_signer: Arc<Signer>,
+    lifecycle_gate: Arc<LifecycleGate>,
+    telemetry: Arc<AdmissionTelemetry>,
+    projection_effect: Arc<dyn ReplayProjectionEffect>,
+}
+```
+
+Worker that drains the deferred replay backlog after sink recovery. For each replayed intent, the worker performs: (1) replay window check, (2) idempotency check, (3) economics gate re-evaluation via `evaluate_projection_continuity()`, (4) PCAC lifecycle enforcement (`join -> revalidate -> consume`), (5) projection side effect via `ReplayProjectionEffect`, (6) intent admission/convergence. Emits a convergence receipt (`DeferredReplayReceiptV1`) when the backlog is fully drained.
+
+**Invariants:**
+
+- [INV-DR01] Authority revocation dominance: a buffered intent carrying authority that was valid at buffer time but has since been revoked is DENIED, even if the economics gate returns ALLOW.
+- [INV-DR02] Single-use consume semantics: intents whose authority token was consumed through an alternate path during the outage are DENIED.
+- [INV-DR03] Fail-closed: missing gate inputs, missing lifecycle gate, or unknown state always results in DENY.
+- [INV-DR04] Bounded replay: configurable batch size (default 64, max 512) prevents post-outage thundering herd.
+- [INV-DR05] Deterministic ordering: backlog entries are drained in `ORDER BY rowid` (ledger order).
+- [INV-DR06] Intents outside the replay window are expired with a deny receipt (not silently dropped).
+- [INV-DR07] Projection side effect executes BEFORE intent is marked admitted/converged. Projection failure results in DENY with `DENY_REPLAY_PROJECTION_EFFECT` reason.
+- [INV-DR08] All IntentBuffer state-transition booleans (`admit()`, `deny()`, `mark_replayed()`, `mark_converged()` returning `Ok(false)`) are checked; `false` is treated as a hard error (no silent partial state commits).
+- [INV-DR09] Idempotent: already-admitted or already-denied intents are skipped without error.
+
+**Contracts:**
+
+- [CTR-DR01] `drain_cycle()` processes at most `replay_batch_size` entries per invocation and returns a `ReplayCycleResult` with counts and convergence status.
+- [CTR-DR02] `backlog_digest` is computed as Blake3 over ordered intent digests of successfully replayed intents, included in the convergence receipt.
+- [CTR-DR03] Economics gate re-evaluation calls `evaluate_projection_continuity()` with current resolver state, not cached/stale state.
+- [CTR-DR04] Lifecycle gate evaluation uses `current_revocation_head` (passed into `drain_cycle` from the authoritative system/ledger revocation frontier) as the revocation head hash. This ensures intents with revoked authority are denied even if the economics gate returns ALLOW. Uses `PrivilegedPcacInputBuilder` for join input construction (RS-42) with `RiskTier::Tier2Plus` (fail-closed).
+- [CTR-DR05] Convergence receipt is only emitted when the backlog is fully drained (no remaining entries after the batch).
+- [CTR-DR06] All deny/expire paths record structured reasons via `IntentBuffer.deny()` before the entry is counted.
+- [CTR-DR07] `ReplayProjectionEffect::execute_projection()` is called after lifecycle gate success but before `IntentBuffer::admit()`. Failure triggers deny-and-converge with `DENY_REPLAY_PROJECTION_EFFECT` prefix.
+
 ## Public API
 
 - `ProjectionWorker`, `ProjectionWorkerConfig`, `ProjectionWorkerError`, `AdmissionTelemetry`, `lifecycle_deny`
@@ -270,6 +325,8 @@ Pre-validated value types that map directly to economics module input types (`Pr
 - `WorkIndex`, `PrMetadata`, `LedgerTailer`
 - `IntentBuffer`, `IntentBufferError`, `IntentVerdict`, `ProjectionIntent`, `DeferredReplayEntry`, `MAX_BACKLOG_ITEMS`
 - `ConfigBackedResolver`, `ConfigResolverError`, `ContinuityProfileResolver`, `ResolvedContinuityProfile`, `ResolvedContinuityWindow`, `MAX_RESOLVED_PROFILES`
+- `DeferredReplayWorker`, `DeferredReplayWorkerConfig`, `DeferredReplayError`, `ReplayCycleResult`, `ReplayProjectionEffect`, `DEFAULT_REPLAY_BATCH_SIZE`, `MAX_REPLAY_BATCH_SIZE`
+- `DENY_REPLAY_HORIZON_OUT_OF_WINDOW`, `DENY_REPLAY_ALREADY_PROJECTED`, `DENY_REPLAY_ECONOMICS_GATE`, `DENY_REPLAY_LIFECYCLE_GATE`, `DENY_REPLAY_MISSING_DEPENDENCY`, `DENY_REPLAY_PROJECTION_EFFECT`
 
 ## Related Modules
 
@@ -292,3 +349,4 @@ Pre-validated value types that map directly to economics module input types (`Pr
 - TCK-00506: Projection receipt format bridge for economics gate compatibility
 - TCK-00505: Wire economics admission gate into projection worker pre-projection path
 - TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly
+- TCK-00508: Deferred replay worker for projection intent buffer drain after outage recovery
