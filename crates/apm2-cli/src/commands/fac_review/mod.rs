@@ -910,7 +910,7 @@ fn run_terminate_inner(
     review_type: &str,
     json_output: bool,
 ) -> Result<(), String> {
-    let (_owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
     let state_opt = state::load_review_run_state_strict(resolved_pr, review_type)?;
 
     let Some(mut run_state) = state_opt else {
@@ -953,6 +953,48 @@ fn run_terminate_inner(
             );
         } else {
             eprintln!("{msg}");
+        }
+        return Ok(());
+    }
+
+    let Some(state_repo) = state::extract_repo_from_pr_url(&run_state.pr_url) else {
+        let msg = format!(
+            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: unable to parse owner/repo from run-state pr_url {}",
+            run_state.pr_url
+        );
+        eprintln!("WARNING: {msg}");
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "repo_mismatch",
+                    "pr_number": resolved_pr,
+                    "review_type": review_type,
+                    "message": msg,
+                }))
+                .unwrap_or_default()
+            );
+        }
+        return Ok(());
+    };
+    if !state_repo.eq_ignore_ascii_case(owner_repo.as_str()) {
+        let msg = format!(
+            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: run-state repo={state_repo} requested repo={owner_repo}"
+        );
+        eprintln!("WARNING: {msg}");
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "repo_mismatch",
+                    "pr_number": resolved_pr,
+                    "review_type": review_type,
+                    "run_state_repo": state_repo,
+                    "requested_repo": owner_repo,
+                    "message": msg,
+                }))
+                .unwrap_or_default()
+            );
         }
         return Ok(());
     }
@@ -1798,7 +1840,7 @@ mod tests {
         super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
         let result =
-            super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
+            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
         assert!(result.is_err());
         let error = result.expect_err("terminate should fail-closed");
         assert!(error.contains("missing proc_start_time"));
@@ -1821,11 +1863,41 @@ mod tests {
         super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
         let result =
-            super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
+            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
         assert!(result.is_err());
         let error = result.expect_err("terminate should fail-closed");
         assert!(error.contains("identity mismatch"));
         assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_skips_when_repo_mismatch() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
+        let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let result =
+            super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
+        assert!(result.is_ok(), "should skip termination for repo mismatch");
+        assert!(super::state::is_process_alive(pid));
+
+        let loaded = super::state::load_review_run_state_for_home(&home, pr_number, "security")
+            .expect("load run-state");
+        let state = match loaded {
+            super::state::ReviewRunStateLoad::Present(state) => state,
+            other => panic!("expected present state, got {other:?}"),
+        };
+        assert_eq!(state.status, ReviewRunStatus::Alive);
 
         kill_child(child);
         let _ = std::fs::remove_file(state_path);

@@ -14,7 +14,7 @@ apm2 fac review run --pr-url <URL> --type all
        +-- orchestrator.rs   (main loop: spawn, monitor, restart, collect)
        |      |
        |      +-- dispatch.rs     (idempotent detached dispatch via systemd)
-       |      +-- backend.rs      (model backend selection: Codex / Gemini)
+       |      +-- backend.rs      (model backend selection: Codex / Gemini / ClaudeCode)
        |      +-- model_pool.rs   (fallback model pool with priority)
        |      +-- liveness.rs     (stall detection via pulse files)
        |      +-- selector.rs     (review model selection logic)
@@ -101,6 +101,7 @@ pub enum ReviewBackend {
     #[default]
     Codex,
     Gemini,
+    ClaudeCode,
 }
 ```
 

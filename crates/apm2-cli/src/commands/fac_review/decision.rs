@@ -228,13 +228,15 @@ pub fn run_decision_set(
             eprintln!("WARNING: failed to clean prepared review inputs: {err}");
         }
     }
-    match terminate_review_agent(resolved_pr, normalized_dimension, &head_sha) {
-        Ok(_terminated) => {},
-        Err(err) => {
-            eprintln!("WARNING: review termination step skipped: {err}");
-        },
-    }
-    Ok(exit_codes::SUCCESS)
+    let exit_code =
+        match terminate_review_agent(&owner_repo, resolved_pr, normalized_dimension, &head_sha) {
+            Ok(_terminated) => exit_codes::SUCCESS,
+            Err(err) => {
+                eprintln!("WARNING: review termination step failed: {err}");
+                exit_codes::GENERIC_ERROR
+            },
+        };
+    Ok(exit_code)
 }
 
 fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {
@@ -724,6 +726,7 @@ fn dimension_to_state_review_type(dimension: &str) -> &str {
 }
 
 fn terminate_review_agent(
+    repo: &str,
     pr_number: u32,
     dimension: &str,
     reviewed_sha: &str,
@@ -733,6 +736,25 @@ fn terminate_review_agent(
     else {
         return Ok(false);
     };
+    let Some(state_repo) = super::state::extract_repo_from_pr_url(&state.pr_url) else {
+        eprintln!(
+            "WARNING: skipping agent termination: unable to parse repo from run-state pr_url {}",
+            state.pr_url
+        );
+        return Ok(false);
+    };
+    if !state_repo.eq_ignore_ascii_case(repo) {
+        eprintln!(
+            "WARNING: skipping agent termination: run-state repo {state_repo} does not match requested repo {repo}"
+        );
+        return Ok(false);
+    }
+    if state.status.is_terminal() {
+        eprintln!(
+            "INFO: skipping agent termination: run state for PR #{pr_number} type {review_type} is already terminal"
+        );
+        return Ok(false);
+    }
 
     if !state.head_sha.eq_ignore_ascii_case(reviewed_sha) {
         let message = format!(
@@ -743,19 +765,19 @@ fn terminate_review_agent(
         return Ok(false);
     }
     let Some(pid) = state.pid else {
-        eprintln!(
-            "WARNING: skipping agent termination: no pid on active state for PR #{pr_number}"
-        );
-        return Ok(false);
-    };
-    let Some(recorded_proc_start) = state.proc_start_time else {
-        eprintln!("WARNING: skipping agent termination: missing proc_start_time for pid {pid}");
-        return Ok(false);
+        return Err(format!(
+            "failed to terminate review agent for PR #{pr_number}: missing pid on active state"
+        ));
     };
     if !super::state::is_process_alive(pid) {
         eprintln!("WARNING: skipping agent termination: pid {pid} is already not alive");
         return Ok(false);
     }
+    let Some(recorded_proc_start) = state.proc_start_time else {
+        return Err(format!(
+            "failed to terminate review agent pid {pid}: missing proc_start_time"
+        ));
+    };
 
     super::dispatch::verify_process_identity(pid, Some(recorded_proc_start))
         .map_err(|err| format!("failed to verify process identity for pid {pid}: {err}"))?;
@@ -977,8 +999,9 @@ dimensions:
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
         state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
-        let killed = super::terminate_review_agent(pr_number, "security", "1234567890abcdef")
-            .expect("termination result expected");
+        let killed =
+            super::terminate_review_agent("owner/repo", pr_number, "security", "1234567890abcdef")
+                .expect("termination result expected");
         assert!(
             !killed,
             "unexpected termination: should skip on sha mismatch"
@@ -1004,16 +1027,99 @@ dimensions:
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
         state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
-        let killed = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
-            .expect("termination result expected");
+        let err = super::terminate_review_agent(
+            "example/repo",
+            pr_number,
+            "security",
+            "abcdef1234567890",
+        )
+        .expect_err("missing proc_start_time should fail");
+        assert!(err.contains("missing proc_start_time"));
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_repo_mismatch() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let proc_start_time =
+            state::get_process_start_time(pid).expect("start time should be available");
+        let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let killed =
+            super::terminate_review_agent("owner/repo", pr_number, "security", "abcdef1234567890")
+                .expect("termination result expected");
         assert!(
             !killed,
-            "unexpected termination: should skip when proc_start_time missing"
+            "unexpected termination: should skip on repo mismatch"
         );
         assert!(state::is_process_alive(pid));
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_fails_when_pid_missing_for_active_state() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let state = ReviewRunState {
+            head_sha: "abcdef1234567890".to_string(),
+            status: ReviewRunStatus::Alive,
+            pid: None,
+            ..sample_run_state(pr_number, 0, "abcdef1234567890", Some(123_456_789))
+        };
+        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let err = super::terminate_review_agent(
+            "example/repo",
+            pr_number,
+            "security",
+            "abcdef1234567890",
+        )
+        .expect_err("missing pid should fail");
+        assert!(err.contains("missing pid on active state"));
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_allows_missing_proc_start_when_process_is_dead() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
+        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let terminated =
+            super::terminate_review_agent("owner/repo", pr_number, "security", "abcdef1234567890")
+                .expect("termination result expected");
+        assert!(!terminated, "unexpected termination: process already dead");
+
         let _ = std::fs::remove_file(state_path);
     }
 
@@ -1038,8 +1144,13 @@ dimensions:
         );
         state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
-        let err = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
-            .expect_err("identity mismatch should fail");
+        let err = super::terminate_review_agent(
+            "example/repo",
+            pr_number,
+            "security",
+            "abcdef1234567890",
+        )
+        .expect_err("identity mismatch should fail");
         assert!(err.contains("failed to verify process identity"));
         assert!(state::is_process_alive(pid));
 

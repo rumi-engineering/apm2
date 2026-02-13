@@ -11,7 +11,7 @@ use fs2::FileExt;
 
 use super::types::{
     PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, apm2_home_dir, ensure_parent_dir,
-    entry_pr_number, sanitize_for_path,
+    entry_pr_number, parse_pr_url, sanitize_for_path,
 };
 
 // ── Path helpers ────────────────────────────────────────────────────────────
@@ -232,6 +232,10 @@ pub fn load_review_run_state_strict(
 ) -> Result<Option<ReviewRunState>, String> {
     let home = apm2_home_dir()?;
     load_review_run_state_strict_for_home(&home, pr_number, review_type)
+}
+
+pub fn extract_repo_from_pr_url(pr_url: &str) -> Option<String> {
+    parse_pr_url(pr_url).ok().map(|(owner_repo, _)| owner_repo)
 }
 
 pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String> {
@@ -589,7 +593,7 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewRunStateLoad, build_review_run_id, get_process_start_time,
+        ReviewRunStateLoad, build_review_run_id, extract_repo_from_pr_url, get_process_start_time,
         load_review_run_state_for_home, load_review_run_state_strict_for_home,
         next_review_sequence_number_for_home, parse_process_start_time,
         review_run_state_path_for_home, write_review_run_state_to_path,
@@ -637,6 +641,19 @@ mod tests {
             get_process_start_time(current_pid).is_some(),
             "expected /proc start time for current process"
         );
+    }
+
+    #[test]
+    fn test_extract_repo_from_pr_url() {
+        assert_eq!(
+            extract_repo_from_pr_url("https://github.com/owner/repo/pull/123"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_from_pr_url("http://github.com/example/other/pull/999"),
+            Some("example/other".to_string())
+        );
+        assert!(extract_repo_from_pr_url("not-a-pr-url").is_none());
     }
 
     #[test]

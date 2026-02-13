@@ -49,6 +49,7 @@ pub enum ReviewBackend {
     #[default]
     Codex,
     Gemini,
+    #[serde(rename = "claude-code")]
     ClaudeCode,
 }
 
