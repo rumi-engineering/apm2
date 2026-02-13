@@ -202,6 +202,20 @@ impl ProjectedStatus {
             Self::Error => "error",
         }
     }
+
+    /// Parses from canonical string. Returns `None` for unrecognized values
+    /// (fail-closed: unknown status is not silently accepted).
+    #[must_use]
+    pub fn from_str_checked(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "success" => Some(Self::Success),
+            "failure" => Some(Self::Failure),
+            "cancelled" => Some(Self::Cancelled),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ProjectedStatus {
