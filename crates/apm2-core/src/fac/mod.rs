@@ -73,6 +73,7 @@ pub mod adapter_selection;
 mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
+pub mod broker;
 pub mod builtin_profiles;
 pub mod builtin_roles;
 mod changeset_bundle;
@@ -106,6 +107,7 @@ pub mod taint;
 mod terminal_verifier;
 pub mod transcript_binding;
 
+// Re-export broker types (TCK-00510)
 // Re-export taint tracking types (TCK-00339)
 // Re-export AAT receipt types
 pub use aat_receipt::{
@@ -145,6 +147,11 @@ pub use artifact_manifest::{
     ArtifactDigest, ArtifactManifest, ArtifactManifestBuilder, ArtifactManifestError, ArtifactType,
     DataClassification, HygieneError, MAX_ARTIFACTS,
     MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH, validate_evidence_hygiene_for_admission,
+};
+pub use broker::{
+    BrokerError, BrokerSignatureVerifier, BrokerState, DEFAULT_ENVELOPE_TTL_TICKS, FacBroker,
+    MAX_ADMITTED_POLICY_DIGESTS, MAX_AUTHORITY_CLOCK_LENGTH, MAX_BOUNDARY_ID_LENGTH,
+    MAX_CONVERGENCE_RECEIPTS, MAX_ENVELOPE_TTL_TICKS,
 };
 // Re-export builtin profile types (TCK-00329)
 pub use builtin_profiles::{

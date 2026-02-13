@@ -1415,12 +1415,131 @@ async fn async_main(args: Args) -> Result<()> {
                     info!("Projection worker started without adapter (projection disabled)");
                 }
 
+                // TCK-00505 MAJOR FIX: Wire economics admission gate dependencies.
+                //
+                // The economics gate requires three components:
+                // 1. IntentBuffer for durable admission decisions
+                // 2. ConfigBackedResolver for continuity profile resolution
+                // 3. Gate signer for constructing signed window/profile artifacts
+                //
+                // All three must be present for has_economics_gate() to return true.
+                // If any fails to initialize, the worker starts without the gate.
+                //
+                // SECURITY (MAJOR-1 fix): When the gate is NOT wired, ALL
+                // events are DENIED (fail-closed). Events with economics
+                // selectors are denied due to missing gate; events without
+                // selectors are denied due to missing economics selectors.
+                // This prevents init failure from silently bypassing
+                // economics enforcement.
+                {
+                    use apm2_daemon::projection::{ConfigBackedResolver, IntentBuffer};
+
+                    // Intent buffer: uses a separate SQLite connection for isolation.
+                    let intent_db_path = daemon_config.state_file_path.parent().map_or_else(
+                        || std::path::PathBuf::from("/var/lib/apm2/projection_intents.db"),
+                        |p| p.join("projection_intents.db"),
+                    );
+                    match Connection::open(&intent_db_path) {
+                        Ok(intent_conn) => {
+                            let intent_conn = Arc::new(Mutex::new(intent_conn));
+                            match IntentBuffer::new(Arc::clone(&intent_conn)) {
+                                Ok(buffer) => {
+                                    worker.set_intent_buffer(buffer);
+                                    info!(
+                                        path = %intent_db_path.display(),
+                                        "Intent buffer initialized for economics gate"
+                                    );
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "Failed to initialize intent buffer; economics gate disabled"
+                                    );
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                path = %intent_db_path.display(),
+                                error = %e,
+                                "Failed to open intent buffer database; economics gate disabled"
+                            );
+                        },
+                    }
+
+                    // Continuity resolver: built from config sink profiles.
+                    if projection_config.sinks.is_empty() {
+                        info!(
+                            "No projection sinks configured; economics gate disabled \
+                             (projections proceed without economics checking)"
+                        );
+                    } else {
+                        match ConfigBackedResolver::from_config(&projection_config.sinks) {
+                            Ok(resolver) => {
+                                worker.set_continuity_resolver(Arc::new(resolver));
+                                info!(
+                                    sink_count = projection_config.sinks.len(),
+                                    "Continuity resolver initialized for economics gate"
+                                );
+                            },
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Failed to initialize continuity resolver; economics gate disabled"
+                                );
+                            },
+                        }
+                    }
+
+                    // Gate signer: reuse the persistent projection signer key.
+                    // The signer_key_path was already resolved above for the adapter.
+                    let gate_signer_key_path = projection_config
+                        .signer_key_file
+                        .clone()
+                        .unwrap_or_else(|| {
+                            daemon_config.state_file_path.parent().map_or_else(
+                                || PathBuf::from("/var/lib/apm2/projection_signer.key"),
+                                |p| p.join("projection_signer.key"),
+                            )
+                        });
+                    match load_or_create_persistent_signer(&gate_signer_key_path) {
+                        Ok(signer) => {
+                            worker.set_gate_signer(Arc::new(signer));
+                            info!(
+                                key_path = %gate_signer_key_path.display(),
+                                "Gate signer initialized for economics gate"
+                            );
+                        },
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Failed to load gate signer; economics gate disabled"
+                            );
+                        },
+                    }
+
+                    if worker.has_economics_gate() {
+                        info!(
+                            "Economics admission gate ACTIVE: projections will be \
+                             economics-gated with idempotent-insert replay prevention"
+                        );
+                    } else {
+                        warn!(
+                            "Economics admission gate INACTIVE: ALL events will be \
+                             DENIED (fail-closed). Events with economics selectors \
+                             are denied due to missing gate; events without selectors \
+                             are denied due to missing economics selectors."
+                        );
+                    }
+                }
+
                 let shutdown_flag = worker.shutdown_handle();
                 let worker_state = state.clone();
 
                 info!(
                     github_enabled = projection_config.enabled,
                     has_adapter = worker.has_adapter(),
+                    has_economics_gate = worker.has_economics_gate(),
                     "Starting projection worker"
                 );
                 let worker_task = tokio::spawn(async move {

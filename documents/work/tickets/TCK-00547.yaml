@@ -1,0 +1,36 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00547"
+    title: "`apm2 fac doctor`: verify prerequisites (cgroup v2, systemd backend, broker reachable, nextest present, permissions safe)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00528"
+        reason: "Doctor should check service units."
+      - ticket_id: "TCK-00519"
+        reason: "Doctor should verify nextest requirement."
+  scope:
+    in_scope:
+      - "Add `apm2 fac doctor` command."
+      - "Checks: cgroup v2 availability, systemd backend selection viability, broker status, worker status, nextest availability, FAC root permissions, disk free policy."
+      - "Outputs actionable remediation steps."
+    out_of_scope:
+      - "Automated remediation."
+  plan:
+    steps:
+      - "Implement checks with clear categorization (ERROR/WARN/OK)."
+      - "Add `--json` output for automation."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "`apm2 fac doctor` correctly identifies common failure modes (user-bus missing, nextest missing, unsafe perms)."
