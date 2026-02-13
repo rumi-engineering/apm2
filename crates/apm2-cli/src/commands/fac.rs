@@ -2686,6 +2686,11 @@ mod tests {
         subcommand: FacSubcommand,
     }
 
+    fn assert_fac_command_parses(args: &[&str]) {
+        FacLogsCliHarness::try_parse_from(args.iter().copied())
+            .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
+    }
+
     #[test]
     fn test_work_status_response_serialization() {
         let response = WorkStatusResponse {
@@ -3059,5 +3064,57 @@ mod tests {
             },
             other => panic!("expected logs subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_review_prompt_command_sequence_parses_with_verdict_surface() {
+        assert_fac_command_parses(&["fac", "review", "prepare", "--json"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "publish",
+            "--type",
+            "security",
+            "--body-file",
+            "/tmp/security_findings.md",
+            "--json",
+        ]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "publish",
+            "--type",
+            "code-quality",
+            "--body-file",
+            "/tmp/code_quality_findings.md",
+            "--json",
+        ]);
+        assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "verdict",
+            "set",
+            "--dimension",
+            "security",
+            "--verdict",
+            "approve",
+            "--reason",
+            "PASS for 0123456789abcdef0123456789abcdef01234567",
+            "--json",
+        ]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "verdict",
+            "set",
+            "--dimension",
+            "code-quality",
+            "--verdict",
+            "deny",
+            "--reason",
+            "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
+            "--json",
+        ]);
     }
 }

@@ -126,9 +126,9 @@ decision_tree:
         - action: command
           run: "apm2 fac review findings --help"
         - action: command
-          run: "apm2 fac review decision --help"
+          run: "apm2 fac review verdict --help"
         - action: command
-          run: "apm2 fac review decision set --help"
+          run: "apm2 fac review verdict set --help"
       next: STEP_2_PREPARE_INPUTS
 
     - id: STEP_2_PREPARE_INPUTS
@@ -209,20 +209,20 @@ decision_tree:
         - action: command
           run: "apm2 fac review publish --type code-quality --body-file \"$temp_dir/code_quality_findings.md\" --json"
           capture_as: publish_json
-      next: STEP_7_SET_DECISION
+      next: STEP_7_SET_VERDICT
 
-    - id: STEP_7_SET_DECISION
-      purpose: "Write SHA-bound decision for code-quality dimension."
+    - id: STEP_7_SET_VERDICT
+      purpose: "Write SHA-bound verdict for code-quality dimension."
       decisions[2]:
         - if: "blocker_count == 0 AND major_count == 0"
           then:
             action: command
-            run: "apm2 fac review decision set --dimension code-quality --decision approve --reason \"PASS for $head_sha\" --json"
+            run: "apm2 fac review verdict set --dimension code-quality --verdict approve --reason \"PASS for $head_sha\" --json"
         - if: "blocker_count > 0 OR major_count > 0"
           then:
             action: command
-            run: "apm2 fac review decision set --dimension code-quality --decision deny --reason \"BLOCKER/MAJOR findings for $head_sha\" --json"
-      note: "Decision command removes prepared tmp review inputs by default. Use --keep-prepared-inputs only when debugging."
+            run: "apm2 fac review verdict set --dimension code-quality --verdict deny --reason \"BLOCKER/MAJOR findings for $head_sha\" --json"
+      note: "Verdict command removes prepared tmp review inputs by default. Use --keep-prepared-inputs only when debugging."
       next: STEP_8_VERIFY_AND_STOP
 
     - id: STEP_8_VERIFY_AND_STOP

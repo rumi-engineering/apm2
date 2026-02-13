@@ -74,7 +74,9 @@ decision_tree:
             (4) `apm2 fac push --help`
             (5) `apm2 fac review --help`
             (6) `apm2 fac review status --help`
-            (7) `apm2 fac restart --help`
+            (7) `apm2 fac review verdict --help`
+            (8) `apm2 fac review verdict set --help`
+            (9) `apm2 fac restart --help`
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |

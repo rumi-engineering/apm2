@@ -53,8 +53,8 @@ implementor_dispatch_defaults:
   instruction: "All implementor subagent dispatches use implementor-default unless a ticket explicitly overrides it."
 
 review_prompt_required_payload[1]:
-  - field: pr_url
-    requirement: "Provide PR_URL to SECURITY_REVIEW_PROMPT and CODE_QUALITY_PROMPT; each prompt should resolve reviewed SHA from PR_URL."
+  - field: pr_number
+    requirement: "Provide PR_NUMBER context to SECURITY_REVIEW_PROMPT and CODE_QUALITY_PROMPT; each prompt resolves reviewed SHA from local FAC prepare/status surfaces."
 
 push_workflow:
   canonical_command: "apm2 fac push --ticket <TICKET_YAML>"
@@ -122,11 +122,13 @@ decision_tree:
             (5) `apm2 fac review status --help`
             (6) `apm2 fac review findings --help`
             (7) `apm2 fac review tail --help`
-            (8) `apm2 fac logs --help`
-            (9) `apm2 fac gates --help`
-            (10) `apm2 fac push --help`
-            (11) `apm2 fac restart --help`
-            (12) `apm2 fac review terminate --help`
+            (8) `apm2 fac review verdict --help`
+            (9) `apm2 fac review verdict set --help`
+            (10) `apm2 fac logs --help`
+            (11) `apm2 fac gates --help`
+            (12) `apm2 fac push --help`
+            (13) `apm2 fac restart --help`
+            (14) `apm2 fac review terminate --help`
         - id: VERIFY_REPO_AUTH
           action: "Run `apm2 fac pr auth-check`."
         - id: RESOLVE_PR_SCOPE
@@ -143,7 +145,7 @@ decision_tree:
         - id: COLLECT_FINDINGS_FROM_FAC
           action: |
             For each PR, fetch structured findings via FAC:
-            `apm2 fac review findings --repo <OWNER/REPO> --pr <PR_NUMBER> --json`
+            `apm2 fac review findings --pr <PR_NUMBER> --json`
             Use this output as the source for BLOCKER/MAJOR/MINOR/NIT findings in implementor handoff.
         - id: CLASSIFY
           action: |
@@ -240,7 +242,7 @@ decision_tree:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
           action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
         - id: REQUIRE_FINDINGS_SOURCE
-          action: "Build explicit findings list from `apm2 fac review findings --repo <OWNER/REPO> --pr <PR_NUMBER> --json` output and include it in handoff."
+          action: "Build explicit findings list from `apm2 fac review findings --pr <PR_NUMBER> --json` output and include it in handoff."
         - id: INCLUDE_REQUIRED_CONTEXT
           action: |
             Include PR number, branch, HEAD SHA, explicit findings list, and required reference:

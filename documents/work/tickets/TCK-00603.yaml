@@ -48,6 +48,8 @@ ticket_meta:
       - "Treat persisted verdict artifacts as closure-authoritative even when reviewer termination is best-effort."
       - "Preserve deterministic parallel review aggregation: join security+quality runs and aggregate both outcomes before declaring sequence completion/failure."
       - "Codify deployment target as Anveio current VPS; avoid adding compatibility layers for broad enterprise/custom remote topologies in this ticket."
+      - "Atomically migrate executable prompt/spec command surfaces from `decision` to `verdict` (reviewer prompts + orchestrator/implementor skill prompts)."
+      - "Keep fac_review AGENTS API signature table synchronized with current function signatures."
     out_of_scope:
       - "Replacing GitHub with a fully new external projection sink in this ticket."
       - "Large daemon-side projection architecture migration beyond fac_review-affecting paths."
@@ -61,6 +63,7 @@ ticket_meta:
       - "Patch fac push to --force and projection-best-effort behavior."
       - "Patch parallel review orchestration to aggregate both lane outcomes deterministically before terminal decision."
       - "Keep projection adapter writes in github_projection as sink-only integration surface."
+      - "Patch executable prompt/spec documents to use verdict/findings command surfaces that match current CLI."
       - "Run formatting, clippy, and fac_review-targeted tests."
   definition_of_done:
     evidence_ids: []
@@ -71,6 +74,7 @@ ticket_meta:
       - "Projection failures are warning-path where local authoritative state already has required identity."
       - "Parallel `--type all` waits for both lane outcomes before returning aggregate success/failure."
       - "FAC review tests for touched modules pass."
+      - "No executable prompt/spec in this repository references `apm2 fac review decision ...` or obsolete `apm2 fac review findings --repo ...` forms."
   notes:
     security: |
       GitHub is a projection sink, not an authority source. Local FAC state, receipts,

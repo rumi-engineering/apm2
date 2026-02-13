@@ -258,12 +258,12 @@ pub use types::ReviewRunType;
 | `run_prepare(repo, pr, sha, json)` | Prepare review inputs |
 | `run_publish(repo, pr, sha, type, body, json)` | Publish review comment to GitHub |
 | `run_verdict_set(repo, pr, sha, dim, verdict, reason, keep, json)` | Set review verdict |
-| `run_verdict_show(repo, pr, url, sha, json)` | Show review verdicts |
-| `run_project(pr, sha, since, after_seq, errors, fail_term, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
+| `run_verdict_show(repo, pr, sha, json)` | Show review verdicts |
+| `run_project(pr, sha, since, after_seq, errors, fail_term, format_json, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
 | `run_tail(lines, follow)` | Tail review event log |
 | `run_push(repo, remote, branch, ticket)` | Push review branch with commit signing |
-| `run_restart(repo, pr, url, force, json)` | CI-aware pipeline restart |
-| `run_pipeline(repo, pr_url, pr_number, sha)` | End-to-end: dispatch + project |
+| `run_restart(repo, pr, force, json)` | CI-aware pipeline restart |
+| `run_pipeline(repo, pr_number, sha)` | End-to-end: dispatch + project |
 | `run_logs(pr, repo, selector_type, selector, json)` | Retrieve review logs |
 | `run_gates(force, quick, timeout, mem, pids, cpu, json)` | Run pre-review gate checks |
 
