@@ -54,9 +54,9 @@
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::{
-    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
-    SUMMARY_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA,
-    ToolLogIndexV1,
+    LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, SUMMARY_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -160,6 +160,12 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
+
+    /// Manage FAC execution lanes.
+    ///
+    /// Shows lane states derived from lock state, lease records, and PID
+    /// liveness. Lanes are the sole concurrency primitive for FAC execution.
+    Lane(LaneArgs),
 
     /// Push code and create/update PR (lean push).
     ///
@@ -364,6 +370,32 @@ pub struct ResumeArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+}
+
+/// Arguments for `apm2 fac lane`.
+#[derive(Debug, Args)]
+pub struct LaneArgs {
+    #[command(subcommand)]
+    pub subcommand: LaneSubcommand,
+}
+
+/// Lane subcommands.
+#[derive(Debug, Subcommand)]
+pub enum LaneSubcommand {
+    /// Show status of all FAC execution lanes.
+    ///
+    /// Reports each lane's state derived from lock state, lease records,
+    /// and PID liveness checks. Detects stale leases from crashed jobs.
+    Status(LaneStatusArgs),
+}
+
+/// Arguments for `apm2 fac lane status`.
+#[derive(Debug, Args)]
+pub struct LaneStatusArgs {
+    /// Show only lanes matching this state (IDLE, RUNNING, LEASED, CLEANUP,
+    /// CORRUPT).
+    #[arg(long)]
+    pub state: Option<String>,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -1019,7 +1051,7 @@ pub fn run_fac(
 
     if !matches!(
         cmd.subcommand,
-        FacSubcommand::Gates(_) | FacSubcommand::Doctor(_)
+        FacSubcommand::Gates(_) | FacSubcommand::Doctor(_) | FacSubcommand::Lane(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -1095,6 +1127,9 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
+        FacSubcommand::Lane(args) => match &args.subcommand {
+            LaneSubcommand::Status(status_args) => run_lane_status(status_args, json_output),
+        },
         FacSubcommand::Push(args) => fac_review::run_push(
             &args.repo,
             &args.remote,
@@ -2232,6 +2267,163 @@ fn retrieve_artifact_to_dir(
 
     std::fs::copy(&src_path, &dst_path)?;
     Ok(())
+}
+
+// =============================================================================
+// Lane Status Command (TCK-00515)
+// =============================================================================
+
+/// JSON response for `apm2 fac lane status`.
+#[derive(Debug, Clone, Serialize)]
+struct LaneStatusResponse {
+    /// All lane statuses.
+    lanes: Vec<LaneStatusV1>,
+    /// Total number of lanes.
+    total: usize,
+    /// Number of lanes in each state.
+    summary: LaneStateSummary,
+}
+
+/// Summary counts by lane state.
+#[derive(Debug, Clone, Serialize)]
+struct LaneStateSummary {
+    idle: usize,
+    leased: usize,
+    running: usize,
+    cleanup: usize,
+    corrupt: usize,
+}
+
+/// Execute `apm2 fac lane status`.
+///
+/// Reports lane states derived from lock state + lease record + PID liveness.
+/// Supports human-readable and JSON output modes.
+fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
+    let manager = match LaneManager::from_default_home() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to initialize lane manager: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Ensure directories exist so status queries don't fail on fresh installs
+    if let Err(e) = manager.ensure_directories() {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!("Failed to ensure lane directories: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let statuses = match manager.all_lane_statuses() {
+        Ok(s) => s,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to query lane statuses: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Apply state filter if provided
+    let filtered: Vec<&LaneStatusV1> = if let Some(ref state_filter) = args.state {
+        let target_state = match state_filter.to_uppercase().as_str() {
+            "IDLE" => LaneState::Idle,
+            "LEASED" => LaneState::Leased,
+            "RUNNING" => LaneState::Running,
+            "CLEANUP" => LaneState::Cleanup,
+            "CORRUPT" => LaneState::Corrupt,
+            other => {
+                return output_error(
+                    json_output,
+                    "invalid_state_filter",
+                    &format!(
+                        "Unknown lane state: {other}. \
+                         Valid states: IDLE, LEASED, RUNNING, CLEANUP, CORRUPT"
+                    ),
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+        };
+        statuses
+            .iter()
+            .filter(|s| s.state == target_state)
+            .collect()
+    } else {
+        statuses.iter().collect()
+    };
+
+    // Build summary counts from filtered set.
+    let summary = LaneStateSummary {
+        idle: filtered
+            .iter()
+            .filter(|s| s.state == LaneState::Idle)
+            .count(),
+        leased: filtered
+            .iter()
+            .filter(|s| s.state == LaneState::Leased)
+            .count(),
+        running: filtered
+            .iter()
+            .filter(|s| s.state == LaneState::Running)
+            .count(),
+        cleanup: filtered
+            .iter()
+            .filter(|s| s.state == LaneState::Cleanup)
+            .count(),
+        corrupt: filtered
+            .iter()
+            .filter(|s| s.state == LaneState::Corrupt)
+            .count(),
+    };
+    let filtered_count =
+        summary.idle + summary.leased + summary.running + summary.cleanup + summary.corrupt;
+
+    if json_output {
+        let response = LaneStatusResponse {
+            lanes: filtered.into_iter().cloned().collect(),
+            total: filtered_count,
+            summary,
+        };
+        match serde_json::to_string_pretty(&response) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "serialization_error",
+                    &format!("Failed to serialize lane status: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        }
+    } else {
+        // Human-readable table output
+        println!("{:<12} {:<10} {:<32} STARTED", "LANE", "STATE", "JOB");
+        println!("{}", "-".repeat(72));
+        for status in &filtered {
+            println!("{status}");
+        }
+        println!();
+        println!(
+            "Total: {}  (idle: {}, running: {}, leased: {}, cleanup: {}, corrupt: {})",
+            filtered_count,
+            summary.idle,
+            summary.running,
+            summary.leased,
+            summary.cleanup,
+            summary.corrupt,
+        );
+    }
+
+    exit_codes::SUCCESS
 }
 
 // =============================================================================

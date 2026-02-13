@@ -129,6 +129,18 @@ Credential management subcommands.
 | `apm2 status <name>` | Show process details |
 | `apm2 logs <name>` | Tail process logs |
 
+### FAC Lane Management (TCK-00515)
+
+| Command | Description |
+|---------|-------------|
+| `apm2 fac lane status` | Show all lane states (lock + lease + PID liveness) |
+| `apm2 fac lane status --state RUNNING` | Filter lanes by state |
+
+**Invariants:**
+- [INV-LANE-001] At most one job executes in a lane at a time (enforced via `flock(LOCK_EX)`).
+- [INV-LANE-004] Stale lease detection is fail-closed: ambiguous PID state reports CORRUPT.
+- Lane commands operate directly on filesystem (no daemon required).
+
 ### Credential Management
 
 | Command | Description |

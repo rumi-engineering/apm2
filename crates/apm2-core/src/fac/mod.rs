@@ -86,6 +86,7 @@ pub mod echo_trap;
 pub mod flake_class;
 pub mod harness_sandbox;
 mod key_policy;
+pub mod lane;
 mod lease;
 pub mod merge_receipt;
 pub mod policy_inheritance;
@@ -495,4 +496,12 @@ pub use efficiency_primitives::{
     IterationContext, IterationContextBuilder, MAX_CACHE_ENTRIES, MAX_CHANGED_FILES,
     MAX_CONTEXT_BUDGET_BYTES, MAX_DELTAS, MAX_FINDINGS, MAX_TOOL_OUTPUTS, MAX_ZOOM_SELECTORS,
     ToolOutputCache, ToolOutputCacheConfig, ToolOutputRef, ZoomSelector, ZoomSelectorType,
+};
+// Re-export lane types (TCK-00515)
+pub use lane::{
+    DEFAULT_LANE_COUNT, LANE_COUNT_ENV_VAR, LANE_ID_PREFIX, LANE_LEASE_V1_SCHEMA,
+    LANE_LOCK_TIMEOUT, LANE_PROFILE_V1_SCHEMA, LaneError, LaneLeaseV1, LaneLockGuard, LaneManager,
+    LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
+    MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_PROFILE_FILE_SIZE,
+    MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, ResourceProfile,
 };
