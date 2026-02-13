@@ -243,6 +243,22 @@ Config-backed continuity profile resolver for economics gate input assembly. Loa
 - [CTR-CR02] `resolve_*` methods are `O(1)` hash map lookups.
 - [CTR-CR03] The resolver is `Send + Sync` for concurrent access.
 
+### `ReplayProjectionEffect` (trait, TCK-00508)
+
+```rust
+pub trait ReplayProjectionEffect: Send + Sync {
+    fn execute_projection(
+        &self,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+        ledger_head: [u8; 32],
+        status: ProjectedStatus,
+    ) -> Result<(), String>;
+}
+```
+
+Synchronous projection effect callback injected into `DeferredReplayWorker`. In production, this wraps the async `ProjectionAdapter::project_status` call via a sync bridge (e.g., `tokio::task::block_in_place`). Required dependency -- construction of `DeferredReplayWorker` fails without it.
+
 ### `ContinuityProfileResolver` (trait, TCK-00507)
 
 ```rust
@@ -269,10 +285,11 @@ pub struct DeferredReplayWorker {
     gate_signer: Arc<Signer>,
     lifecycle_gate: Arc<LifecycleGate>,
     telemetry: Arc<AdmissionTelemetry>,
+    projection_effect: Arc<dyn ReplayProjectionEffect>,
 }
 ```
 
-Worker that drains the deferred replay backlog after sink recovery. For each replayed intent, the worker performs: (1) replay window check, (2) idempotency check, (3) economics gate re-evaluation via `evaluate_projection_continuity()`, (4) PCAC lifecycle enforcement (`join -> revalidate -> consume`), (5) projection effect (admit). Emits a convergence receipt (`DeferredReplayReceiptV1`) when the backlog is fully drained.
+Worker that drains the deferred replay backlog after sink recovery. For each replayed intent, the worker performs: (1) replay window check, (2) idempotency check, (3) economics gate re-evaluation via `evaluate_projection_continuity()`, (4) PCAC lifecycle enforcement (`join -> revalidate -> consume`), (5) projection side effect via `ReplayProjectionEffect`, (6) intent admission/convergence. Emits a convergence receipt (`DeferredReplayReceiptV1`) when the backlog is fully drained.
 
 **Invariants:**
 
@@ -282,7 +299,9 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - [INV-DR04] Bounded replay: configurable batch size (default 64, max 512) prevents post-outage thundering herd.
 - [INV-DR05] Deterministic ordering: backlog entries are drained in `ORDER BY rowid` (ledger order).
 - [INV-DR06] Intents outside the replay window are expired with a deny receipt (not silently dropped).
-- [INV-DR07] Idempotent: already-admitted or already-denied intents are skipped without error.
+- [INV-DR07] Projection side effect executes BEFORE intent is marked admitted/converged. Projection failure results in DENY with `DENY_REPLAY_PROJECTION_EFFECT` reason.
+- [INV-DR08] All IntentBuffer state-transition booleans (`admit()`, `deny()`, `mark_replayed()`, `mark_converged()` returning `Ok(false)`) are checked; `false` is treated as a hard error (no silent partial state commits).
+- [INV-DR09] Idempotent: already-admitted or already-denied intents are skipped without error.
 
 **Contracts:**
 
@@ -292,6 +311,7 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - [CTR-DR04] Lifecycle gate evaluation uses `current_revocation_head` (passed into `drain_cycle` from the authoritative system/ledger revocation frontier) as the revocation head hash. This ensures intents with revoked authority are denied even if the economics gate returns ALLOW. Uses `PrivilegedPcacInputBuilder` for join input construction (RS-42) with `RiskTier::Tier2Plus` (fail-closed).
 - [CTR-DR05] Convergence receipt is only emitted when the backlog is fully drained (no remaining entries after the batch).
 - [CTR-DR06] All deny/expire paths record structured reasons via `IntentBuffer.deny()` before the entry is counted.
+- [CTR-DR07] `ReplayProjectionEffect::execute_projection()` is called after lifecycle gate success but before `IntentBuffer::admit()`. Failure triggers deny-and-converge with `DENY_REPLAY_PROJECTION_EFFECT` prefix.
 
 ## Public API
 
@@ -305,8 +325,8 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - `WorkIndex`, `PrMetadata`, `LedgerTailer`
 - `IntentBuffer`, `IntentBufferError`, `IntentVerdict`, `ProjectionIntent`, `DeferredReplayEntry`, `MAX_BACKLOG_ITEMS`
 - `ConfigBackedResolver`, `ConfigResolverError`, `ContinuityProfileResolver`, `ResolvedContinuityProfile`, `ResolvedContinuityWindow`, `MAX_RESOLVED_PROFILES`
-- `DeferredReplayWorker`, `DeferredReplayWorkerConfig`, `DeferredReplayError`, `ReplayCycleResult`, `DEFAULT_REPLAY_BATCH_SIZE`, `MAX_REPLAY_BATCH_SIZE`
-- `DENY_REPLAY_HORIZON_OUT_OF_WINDOW`, `DENY_REPLAY_ALREADY_PROJECTED`, `DENY_REPLAY_ECONOMICS_GATE`, `DENY_REPLAY_LIFECYCLE_GATE`, `DENY_REPLAY_MISSING_DEPENDENCY`
+- `DeferredReplayWorker`, `DeferredReplayWorkerConfig`, `DeferredReplayError`, `ReplayCycleResult`, `ReplayProjectionEffect`, `DEFAULT_REPLAY_BATCH_SIZE`, `MAX_REPLAY_BATCH_SIZE`
+- `DENY_REPLAY_HORIZON_OUT_OF_WINDOW`, `DENY_REPLAY_ALREADY_PROJECTED`, `DENY_REPLAY_ECONOMICS_GATE`, `DENY_REPLAY_LIFECYCLE_GATE`, `DENY_REPLAY_MISSING_DEPENDENCY`, `DENY_REPLAY_PROJECTION_EFFECT`
 
 ## Related Modules
 

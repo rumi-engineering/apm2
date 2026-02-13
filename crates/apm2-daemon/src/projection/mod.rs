@@ -137,7 +137,8 @@ pub use continuity_resolver::{
 pub use deferred_replay_worker::{
     DEFAULT_REPLAY_BATCH_SIZE, DENY_REPLAY_ALREADY_PROJECTED, DENY_REPLAY_ECONOMICS_GATE,
     DENY_REPLAY_HORIZON_OUT_OF_WINDOW, DENY_REPLAY_LIFECYCLE_GATE, DENY_REPLAY_MISSING_DEPENDENCY,
-    DeferredReplayError, DeferredReplayWorker, DeferredReplayWorkerConfig, ReplayCycleResult,
+    DENY_REPLAY_PROJECTION_EFFECT, DeferredReplayError, DeferredReplayWorker,
+    DeferredReplayWorkerConfig, ReplayCycleResult, ReplayProjectionEffect,
 };
 pub use divergence_watchdog::{
     DivergenceError, DivergenceResult, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeCheck,
