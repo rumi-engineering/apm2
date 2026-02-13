@@ -84,7 +84,10 @@ rfc_trust_boundaries:
           cgroup membership.
 
           If bounded execution cannot be proven available (e.g., no user bus,
-          no cgroup v2), FAC MUST fail closed with actionable remediation.
+          no cgroup v2), the current implementation falls back to running
+          evidence gates without cgroup resource limits and uses `cargo test
+          --workspace` instead of `cargo nextest run`. Fail-closed enforcement
+          when bounded execution is unavailable is planned as future work.
 
       - id: TB-003
         name: "External Tool Installation"
@@ -131,10 +134,14 @@ rfc_trust_boundaries:
        manual developer builds outside FAC, sccache remains a recommended
        optimization with no containment concern.
 
-    3. **cargo-nextest**: Mandatory test runner for FAC evidence gates
-       (see DD-003). nextest MUST be installed for FAC gate execution;
-       FAC fails closed if nextest is missing. For manual developer
-       testing, cargo test remains available but nextest is recommended.
+    3. **cargo-nextest**: Preferred and recommended test runner for FAC
+       evidence gates (see DD-003). The bounded test gate uses nextest
+       when cgroup v2 and the bounded runner script are available. The
+       current implementation falls back to `cargo test --workspace`
+       when the bounded runner inputs are absent. Fail-closed enforcement
+       (rejecting execution without nextest) is planned as future work.
+       For manual developer testing, cargo test remains available but
+       nextest is recommended.
 
     4. **Configuration files**: .cargo/config.toml is checked into the
        repository and subject to code review. No secrets stored.

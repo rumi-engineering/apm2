@@ -64,25 +64,30 @@ rfc_contracts_and_versioning:
         Setting CARGO_INCREMENTAL=1 explicitly documents the intent.
 
     - id: CONTRACT-004
-      name: "cargo nextest run command (mandatory for FAC)"
+      name: "cargo nextest run command (preferred for FAC)"
       description: |
-        FAC evidence gate execution MUST use `cargo nextest run` as the
-        test runner. FAC MUST fail closed if nextest is not installed.
+        FAC evidence gate execution SHOULD use `cargo nextest run` as the
+        test runner via the bounded test gate (cgroup v2 +
+        run_bounded_tests.sh). The current implementation falls back to
+        `cargo test --workspace` when the bounded runner inputs are absent.
         For manual developer testing, cargo test remains available but
         nextest is recommended.
       interface:
         command: "cargo nextest run"
-        equivalent_to: "cargo test (for manual use)"
+        equivalent_to: "cargo test (fallback when bounded runner unavailable)"
         flags: "Most cargo test flags supported"
-        fac_requirement: "MANDATORY — FAC fails closed without nextest"
+        fac_requirement: "PREFERRED — bounded gate uses nextest; fallback to cargo test exists"
       backward_compatible: true
       notes: |
-        FESv1 AMENDMENT: nextest is now mandatory for FAC. Both the
-        pipeline path (run_evidence_gates_with_status) and the local
-        gates path (apm2 fac gates) MUST use explicit cargo nextest run
-        invocation. Silent fallback to cargo test is no longer permitted.
-        If nextest is missing, FAC emits an actionable error with
-        installation instructions: `cargo install cargo-nextest`.
+        FESv1 AMENDMENT: nextest is the preferred and recommended test
+        runner for FAC. The bounded test gate uses `cargo nextest run`
+        inside a cgroup unit. When bounded execution is unavailable
+        (no cgroup v2, no run_bounded_tests.sh), the current
+        implementation falls back to `cargo test --workspace`
+        (evidence.rs:430-435, evidence.rs:596-604, gates.rs:204-218).
+        Fail-closed enforcement (rejecting execution without nextest)
+        is planned as future work. Install nextest for best results:
+        `cargo install cargo-nextest`.
 
     - id: CONTRACT-005
       name: "FAC execution containment boundary"
@@ -104,8 +109,13 @@ rfc_contracts_and_versioning:
       backward_compatible: true
       notes: |
         If bounded execution cannot be proven available (no user bus,
-        no cgroup v2), FAC MUST fail closed with actionable remediation
-        (enable linger, configure systemd user session, or run via
+        no cgroup v2), the current implementation falls back to running
+        evidence gates without cgroup resource limits and uses
+        `cargo test --workspace` instead of `cargo nextest run`.
+        Fail-closed enforcement (rejecting execution when bounded
+        execution is unavailable) is planned as future work. Operators
+        are strongly encouraged to enable bounded execution by
+        configuring a systemd user session (enable linger, or run via
         systemd-managed apm2-daemon).
 
   versioning:

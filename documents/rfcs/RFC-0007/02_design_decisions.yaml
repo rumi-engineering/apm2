@@ -111,22 +111,26 @@ rfc_design_decisions:
   - id: DD-003
     title: "Mandate cargo-nextest as FAC Test Runner"
     statement: |
-      Mandate cargo-nextest as the required test runner for FAC evidence
-      gate execution. The FAC test gate MUST use explicit `cargo nextest run`
-      invocation and MUST fail closed if nextest is not available. No
-      fallback to `cargo test` is permitted in the default FAC path.
+      Mandate cargo-nextest as the preferred and recommended test runner for
+      FAC evidence gate execution. The FAC bounded test gate uses explicit
+      `cargo nextest run` invocation when cgroup v2 and the bounded runner
+      script are available. The current implementation falls back to
+      `cargo test --workspace` when the bounded runner inputs are absent.
+      Fail-closed enforcement (rejecting execution without nextest) is
+      planned as future work.
     context: |
       cargo-nextest provides significantly faster test execution through
       process-level parallelism and is already the default test runner
       in the FAC bounded test gate when cgroup v2 is available. However,
-      two fallback paths still silently degrade to `cargo test`:
-      (1) the pipeline path when the bounded runner is unavailable, and
+      two fallback paths currently degrade to `cargo test`:
+      (1) the pipeline path when the bounded runner is unavailable
+      (evidence.rs:430-435), and
       (2) the local `apm2 fac gates` path when EvidenceGateOptions.test_command
-      is unset. This creates inconsistent execution semantics and prevents
-      reliable attestation of test environment properties.
+      is unset (evidence.rs:596-604, gates.rs:204-218).
 
       RFC-0019 Amendment A1 (FESv1) mandates nextest as a substrate
-      requirement. This decision aligns RFC-0007 with that mandate.
+      requirement. This decision captures the design intent; full
+      fail-closed enforcement is tracked as future work.
     alternatives:
     - id: ALT-0001
       name: "Mandate cargo-nextest in all FAC paths (chosen)"
@@ -157,11 +161,12 @@ rfc_design_decisions:
       - "Cannot guarantee test-gate reproducibility"
     chosen_rationale: |
       FESv1 (RFC-0019 Amendment A1) requires nextest as a substrate
-      invariant. Both the pipeline and local gates paths must use explicit
-      `cargo nextest run` invocation. If nextest is not available, FAC
-      MUST fail closed with an actionable error message including
-      installation instructions. This eliminates the silent degradation
-      to cargo test that currently undermines attestation correctness.
+      invariant. The bounded test gate (cgroup v2 + run_bounded_tests.sh)
+      uses `cargo nextest run`. When bounded execution is unavailable,
+      the current implementation falls back to `cargo test --workspace`.
+      Full fail-closed enforcement (rejecting execution without nextest)
+      is planned as future work. This captures the design intent while
+      accurately reflecting the current fallback behavior.
     impacted_requirement_ids:
     - PERF-003
     evidence_ids:

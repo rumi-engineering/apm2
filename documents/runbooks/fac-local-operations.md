@@ -20,7 +20,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # mold linker (faster linking)
 sudo apt install mold clang
 
-# cargo-nextest (MANDATORY for FAC evidence gates)
+# cargo-nextest (recommended for FAC bounded test gate)
 cargo install cargo-nextest
 
 # Verify installations
@@ -28,8 +28,13 @@ which mold         # /usr/bin/mold
 cargo nextest --version
 ```
 
-**nextest is mandatory.** FAC evidence gates fail closed if nextest is not
-installed. There is no fallback to `cargo test` in the default FAC path.
+**nextest is the preferred and recommended test runner.** When the bounded
+test runner is available (cgroup v2 + `run_bounded_tests.sh`), FAC uses
+`cargo nextest run` inside a resource-bounded cgroup unit. When the bounded
+runner inputs are absent, the current implementation falls back to
+`cargo test --workspace`. Fail-closed enforcement (rejecting execution when
+nextest is unavailable) is planned for a future ticket (see DD-003 in
+RFC-0007 for the design intent).
 
 ### 1.2 Enable systemd user session (required for bounded execution)
 
@@ -49,8 +54,11 @@ echo $XDG_RUNTIME_DIR
 # Expected: /run/user/$(id -u)
 ```
 
-**If bounded execution is unavailable**, FAC fails closed with an actionable
-error. Fix the user session before proceeding.
+**If bounded execution is unavailable** (no user bus, no cgroup v2), `apm2 fac gates`
+falls back to running evidence gates without cgroup resource limits. The bounded
+execution path is strongly recommended. Fail-closed enforcement when bounded
+execution is unavailable is planned as future work (see DD-003 in RFC-0007).
+Fix the user session to enable bounded execution before proceeding.
 
 ### 1.3 Build and install the apm2 CLI
 
@@ -112,23 +120,29 @@ per lane = 3 concurrent lanes, with headroom for OS and non-FAC processes).
 
 ### 2.2 Check lane status
 
-```bash
-apm2 fac lane status
-```
-
-Expected output (healthy state):
-
-```
-LANE       STATE   JOB_ID   STARTED_AT   TOOLCHAIN   LAST_EXIT
-lane-0     IDLE    -        -            -           0 (success)
-lane-1     IDLE    -        -            -           0 (success)
-lane-2     IDLE    -        -            -           0 (success)
-```
-
-JSON output for scripting:
+> **PLANNED -- not yet implemented.** The `apm2 fac lane` subcommand does not
+> exist in the current CLI. Lane status inspection is planned for a future
+> ticket implementing the FESv1 lane management surface. For now, inspect
+> lane state by examining the filesystem directly:
 
 ```bash
-apm2 fac lane status --json
+# Check lane lease files
+ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null
+
+# Check lane workspace directories
+ls -la $APM2_HOME/private/fac/lanes/
+```
+
+Expected directory layout (healthy state — no active leases):
+
+```
+$APM2_HOME/private/fac/lanes/
+  lane-0/
+    workspace/
+    target/
+    logs/
+  lane-1/
+  lane-2/
 ```
 
 ### 2.3 Pre-warm lane targets (reduce cold-start probability)
@@ -137,16 +151,17 @@ Cold-start compilation (building all dependencies from scratch) can exceed
 the 240-second wall-time limit for the test gate. Pre-warming populates
 each lane's target directory with compiled dependencies.
 
-```bash
-# Warm all lanes
-apm2 fac warm
+> **PLANNED -- not yet implemented.** The `apm2 fac warm` subcommand does not
+> exist in the current CLI. Lane pre-warming is planned for a future ticket
+> implementing the FESv1 lane management surface. For now, pre-warm manually:
 
-# Warm a specific lane
-apm2 fac warm --lane lane-0
+```bash
+# Pre-warm a lane's target directory by running a build in the lane workspace
+cd $APM2_HOME/private/fac/lanes/lane-0/workspace
+CARGO_TARGET_DIR=$APM2_HOME/private/fac/lanes/lane-0/target cargo build --workspace
 ```
 
-Warm writes a `WarmReceiptV1` for auditability. After warming, gate
-execution avoids full dependency recompilation.
+After warming, gate execution avoids full dependency recompilation.
 
 **When to warm:**
 - After initial bootstrap (lanes have empty target directories)
@@ -177,17 +192,12 @@ apm2 fac gates --quick
 
 ### 3.2 Running a worker
 
-The worker consumes the local queue and executes jobs in lanes:
+> **PLANNED -- not yet implemented.** The `apm2 fac worker` subcommand does not
+> exist in the current CLI. Standalone worker execution is planned for a future
+> ticket implementing the FESv1 queue/worker surface.
 
-```bash
-# Run one claim/execute cycle then exit
-apm2 fac worker --once
-
-# Run continuously (recommended: use systemd to manage)
-apm2 fac worker
-```
-
-For production operation, the worker should be managed by systemd:
+For production operation, use the apm2-daemon service which includes worker
+functionality:
 
 ```bash
 # The apm2-daemon service includes worker functionality
@@ -203,33 +213,33 @@ systemctl --user enable apm2-daemon
 
 ### 3.3 Running GC (garbage collection)
 
-GC reclaims disk space from old logs, stale targets, and expired receipts:
+> **PLANNED -- not yet implemented.** The `apm2 fac gc` subcommand does not
+> exist in the current CLI. Automated garbage collection is planned for a
+> future ticket implementing the FESv1 lane management surface. For now,
+> reclaim disk space manually:
 
 ```bash
-# Global GC across all FAC-controlled roots
-apm2 fac gc
+# Remove old lane target directories (compilation caches — safe to delete)
+rm -rf $APM2_HOME/private/fac/lanes/*/target/
 
-# Lane-scoped GC
-apm2 fac gc --lane lane-0
+# Remove old evidence logs
+rm -rf $APM2_HOME/private/fac/evidence/
+
+# Check disk usage
+du -sh $APM2_HOME/private/fac/lanes/*/target/ 2>/dev/null
 ```
 
-GC writes a `GcReceiptV1` recording bytes reclaimed. Run GC when:
+Run manual cleanup when:
 - Disk usage exceeds comfortable thresholds
 - Before large batch operations
 - Periodically via cron/systemd timer
 
 ### 3.4 Enqueueing jobs manually
 
-```bash
-# Enqueue a job from a spec file
-apm2 fac enqueue /path/to/job_spec.json
-
-# Enqueue from stdin
-cat job_spec.json | apm2 fac enqueue -
-
-# Cancel a pending job
-apm2 fac enqueue --cancel <job_id>
-```
+> **PLANNED -- not yet implemented.** The `apm2 fac enqueue` subcommand does
+> not exist in the current CLI. Manual job enqueueing is planned for a future
+> ticket implementing the FESv1 queue/worker surface. For now, use `apm2 fac gates`
+> which handles job creation and execution automatically.
 
 ---
 
@@ -294,9 +304,10 @@ cat $APM2_HOME/private/fac/queue/denied/<job_id>.reason.json
 # 1. Create a fresh job spec (do NOT reuse the quarantined file)
 apm2 fac gates  # This creates and enqueues a new job automatically
 
-# 2. If lanes are full, free resources:
-apm2 fac gc
-apm2 fac lane status  # Check for stuck/corrupt lanes
+# 2. If lanes are full, free resources (see section 3.3 for manual GC):
+du -sh $APM2_HOME/private/fac/lanes/*/target/ 2>/dev/null
+# Check for stuck/corrupt lanes:
+ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null
 ```
 
 ---
@@ -315,63 +326,79 @@ from a failed cleanup. Common triggers:
 
 ### 5.2 Check lane state before reset
 
+> **Note:** `apm2 fac lane status` is **PLANNED -- not yet implemented**.
+> For now, inspect lane state by examining lease files directly:
+
 ```bash
-apm2 fac lane status
+# Check for active leases
+for lane in $APM2_HOME/private/fac/lanes/lane-*/; do
+  echo "=== $(basename $lane) ==="
+  cat "$lane/lease.v1.json" 2>/dev/null || echo "  (no lease)"
+done
 ```
 
-If a lane shows `CORRUPT`:
-
-```
-LANE       STATE     JOB_ID          STARTED_AT           TOOLCHAIN   LAST_EXIT
-lane-1     CORRUPT   fac-job-abc123  2026-02-13T10:00:00  stable-1.85 -
-```
+If a lane's lease file indicates a CORRUPT state, proceed with the reset
+procedure below.
 
 ### 5.3 Perform safe lane reset
 
-```bash
-# Reset an IDLE or CORRUPT lane
-apm2 fac lane reset lane-1
+> **Note:** `apm2 fac lane reset` is **PLANNED -- not yet implemented**.
+> For now, perform manual lane reset carefully:
 
-# Reset a RUNNING lane (kills active unit first)
-apm2 fac lane reset lane-1 --force
+```bash
+# 1. Kill any active systemd unit for the lane (if RUNNING)
+systemctl --user stop "apm2-lane-lane-1.scope" 2>/dev/null || true
+
+# 2. Remove the lane workspace and target (safe for compilation caches)
+rm -rf $APM2_HOME/private/fac/lanes/lane-1/workspace/
+rm -rf $APM2_HOME/private/fac/lanes/lane-1/target/
+rm -rf $APM2_HOME/private/fac/lanes/lane-1/logs/
+
+# 3. Remove the lease file
+rm -f $APM2_HOME/private/fac/lanes/lane-1/lease.v1.json
+
+# 4. Re-create empty directories
+mkdir -p $APM2_HOME/private/fac/lanes/lane-1/{workspace,target,logs}
 ```
 
-The reset command:
-1. If `--force`: kills the active systemd unit (KillMode=control-group)
-2. Uses `safe_rmtree_v1` for symlink-safe deletion of the lane workspace
-3. Verifies each path component is not a symlink before descending
-4. Refuses to cross filesystem boundaries
-5. Refuses to delete unexpected file types (device nodes, sockets)
-6. Writes a reset receipt with the lane state before and after
+**Caution:** Manual reset does not perform symlink-safe deletion
+(`safe_rmtree_v1`) or write reset receipts. When the automated `apm2 fac
+lane reset` command is implemented, it will provide these safety guarantees:
+1. Symlink-safe recursive deletion (verifies each path component)
+2. Refuses to cross filesystem boundaries
+3. Refuses to delete unexpected file types (device nodes, sockets)
+4. Writes a reset receipt with lane state before and after
 
-**If reset fails** (e.g., ambiguous symlink detected):
-- The lane remains CORRUPT
-- A `refused_delete` receipt is written with the reason
-- Manual investigation is required before the lane can be reused
+**If a lane is in suspicious filesystem state** (unexpected symlinks, device
+nodes, etc.), do NOT use `rm -rf`. Investigate manually before proceeding.
 
 ### 5.4 Verify lane health after reset
 
 ```bash
-apm2 fac lane status
-# Expected: lane-1 shows IDLE
+# Verify lane directory structure was recreated
+ls -la $APM2_HOME/private/fac/lanes/lane-1/
+# Expected: workspace/, target/, logs/ directories exist; no lease.v1.json
 
-# Optionally pre-warm the reset lane
-apm2 fac warm --lane lane-1
+# Optionally pre-warm the reset lane (see section 2.3 for manual warming)
 ```
 
 ### 5.5 Emergency: reset all lanes
 
 ```bash
-# Reset all lanes (use with caution)
+# Reset all lanes (use with caution — see section 5.3 for manual reset steps)
 for lane in lane-0 lane-1 lane-2; do
-  apm2 fac lane reset "$lane" --force
+  systemctl --user stop "apm2-lane-${lane}.scope" 2>/dev/null || true
+  rm -rf "$APM2_HOME/private/fac/lanes/${lane}/workspace/"
+  rm -rf "$APM2_HOME/private/fac/lanes/${lane}/target/"
+  rm -rf "$APM2_HOME/private/fac/lanes/${lane}/logs/"
+  rm -f  "$APM2_HOME/private/fac/lanes/${lane}/lease.v1.json"
+  mkdir -p "$APM2_HOME/private/fac/lanes/${lane}"/{workspace,target,logs}
 done
 
 # Verify
-apm2 fac lane status
+ls -la $APM2_HOME/private/fac/lanes/
 
-# Re-warm all lanes
-apm2 fac warm
+# Re-warm lanes (see section 2.3 for manual warming procedure)
 ```
 
 ---
@@ -384,7 +411,7 @@ apm2 fac warm
 Symptom: apm2 fac gates hangs or returns immediately with no output
 ```
 
-1. Check lane availability: `apm2 fac lane status`
+1. Check lane availability: `ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null` (PLANNED: `apm2 fac lane status`)
 2. Check broker health: `systemctl --user status apm2-daemon`
 3. Check queue state: `ls $APM2_HOME/private/fac/queue/pending/`
 4. Check logs: `apm2 fac --json logs`
@@ -395,20 +422,24 @@ Symptom: apm2 fac gates hangs or returns immediately with no output
 Symptom: Test gate fails with timeout during large compilation
 ```
 
-1. Pre-warm the lane: `apm2 fac warm --lane <lane_id>`
+1. Pre-warm the lane manually (see section 2.3) (PLANNED: `apm2 fac warm --lane <lane_id>`)
 2. If warming itself times out, check if dependencies changed significantly
-3. Consider running GC to free disk space: `apm2 fac gc`
+3. Consider freeing disk space manually (see section 3.3) (PLANNED: `apm2 fac gc`)
 
 ### 6.3 nextest not found
 
 ```
-Symptom: FAC fails closed with "nextest not found" error
+Symptom: Test gate falls back to cargo test instead of cargo nextest run
 ```
 
 Fix: `cargo install cargo-nextest`
 
-nextest is mandatory for FAC evidence gates (DD-003, RFC-0007). There is
-no cargo test fallback.
+nextest is the preferred and recommended test runner for FAC evidence gates
+(DD-003, RFC-0007). The current implementation falls back to `cargo test
+--workspace` when the bounded runner (which uses nextest) is not available.
+Install nextest to enable the bounded test execution path with cgroup
+resource limits. Fail-closed enforcement (rejecting execution without
+nextest) is planned as future work.
 
 ### 6.4 systemd-run fails (no user bus)
 
@@ -427,9 +458,9 @@ Symptom: "Failed to connect to user bus" or similar systemd error
 Symptom: Builds fail with "No space left on device"
 ```
 
-1. Run GC: `apm2 fac gc`
+1. Free disk space manually (see section 3.3) (PLANNED: `apm2 fac gc`)
 2. Check lane target directories: `du -sh $APM2_HOME/private/fac/lanes/*/target/`
-3. Target directories are compilation caches (safe to delete): `apm2 fac lane reset <lane_id>`
+3. Target directories are compilation caches (safe to delete): `rm -rf $APM2_HOME/private/fac/lanes/<lane_id>/target/` (PLANNED: `apm2 fac lane reset`)
 4. Check for orphaned evidence logs: `du -sh $APM2_HOME/private/fac/evidence/`
 
 ### 6.6 Stale lease (dead process holding lane)
@@ -439,10 +470,11 @@ Symptom: Lane shows LEASED but no process is running
 ```
 
 The scheduler automatically transitions stale leases to CLEANUP then IDLE
-when the lease holder's PID is dead. If automatic recovery does not occur:
+when the lease holder's PID is dead. If automatic recovery does not occur,
+manually remove the stale lease (PLANNED: `apm2 fac lane reset`):
 
 ```bash
-apm2 fac lane reset <lane_id>
+rm -f $APM2_HOME/private/fac/lanes/<lane_id>/lease.v1.json
 ```
 
 ### 6.7 Containment violation (process escape)
@@ -454,7 +486,7 @@ Symptom: Resource accounting shows more consumption than lane limits allow
 1. Check for sccache daemon: `ps aux | grep sccache`
    - sccache is disabled in default FAC mode; if running, it indicates
      a configuration error
-2. Kill escaped processes: `apm2 fac lane reset <lane_id> --force`
+2. Kill escaped processes: `systemctl --user stop "apm2-lane-<lane_id>.scope" 2>/dev/null` then perform manual lane reset (see section 5.3) (PLANNED: `apm2 fac lane reset <lane_id> --force`)
 3. Verify RUSTC_WRAPPER is not set in FAC execution environment
 4. Check that no ambient ~/.cargo/config.toml overrides FAC policy
 
@@ -462,10 +494,29 @@ Symptom: Resource accounting shows more consumption than lane limits allow
 
 ## 7. Reference: CLI commands
 
+### Currently implemented
+
 | Command | Purpose |
 |---------|---------|
 | `apm2 fac gates` | Run evidence gates (queue-based, default) |
 | `apm2 fac gates --quick` | Quick validation (skips tests, accepts dirty tree) |
+| `apm2 fac push --ticket <yaml>` | Push and create/update PR |
+| `apm2 fac --json logs` | Show log file paths |
+| `apm2 fac --json logs --pr <N>` | Show logs for a specific PR |
+| `apm2 fac review` | Run and observe FAC review orchestration |
+| `apm2 fac restart` | Restart evidence/review pipeline |
+| `apm2 fac work` | Query projection-backed work authority |
+| `apm2 fac receipt` | Show receipt from CAS |
+| `apm2 fac episode` | Inspect episode details and tool log index |
+| `apm2 fac context` | Rebuild role-scoped context deterministically |
+| `apm2 fac resume` | Show crash-only resume helpers from ledger anchor |
+| `apm2 fac role-launch` | Launch a FAC role with hash-bound admission checks |
+| `apm2 fac pr` | GitHub App credential management and PR operations |
+
+### PLANNED -- not yet implemented
+
+| Command | Purpose |
+|---------|---------|
 | `apm2 fac lane status` | Show all lane states |
 | `apm2 fac lane reset <id>` | Reset a lane to known-good state |
 | `apm2 fac lane reset <id> --force` | Force-reset a running lane |
@@ -477,9 +528,6 @@ Symptom: Resource accounting shows more consumption than lane limits allow
 | `apm2 fac worker` | Run worker continuously |
 | `apm2 fac enqueue <spec>` | Enqueue a job from a spec file |
 | `apm2 fac enqueue --cancel <id>` | Cancel a pending job |
-| `apm2 fac push --ticket <yaml>` | Push and create/update PR |
-| `apm2 fac --json logs` | Show log file paths |
-| `apm2 fac --json logs --pr <N>` | Show logs for a specific PR |
 
 ---
 

@@ -227,13 +227,13 @@ decision_tree:
         - id: RUN_FAC_GATES_QUICK
           action: "During active edits, run `apm2 fac gates --quick` for short-loop validation."
         - id: RUN_FAC_GATES_FULL
-          action: "Immediately before push, run `apm2 fac gates`. Default mode enqueues a job to the broker and waits for a worker to execute it in a leased lane."
+          action: "Immediately before push, run `apm2 fac gates`."
         - id: VERIFY_LANE_HEALTH
           action: |
-            If gates fail to start, check lane availability with `apm2 fac lane status`. Lanes follow the lifecycle: IDLE -> LEASED -> RUNNING -> CLEANUP -> IDLE. If a lane is stuck in CORRUPT state, reset it with `apm2 fac lane reset <lane_id>` before retrying.
+            If gates fail to start, check lane availability by inspecting lease files: `ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null`. Lanes follow the lifecycle: IDLE -> LEASED -> RUNNING -> CLEANUP -> IDLE. If a lane is stuck in CORRUPT state, manually remove the lease file and reset the lane workspace before retrying (PLANNED: `apm2 fac lane status` and `apm2 fac lane reset` are not yet implemented as CLI subcommands).
         - id: WARM_LANES_IF_COLD
           action: |
-            If gate execution hits cold-start timeouts (240s wall-time exceeded during large compilations), pre-warm the lane targets: `apm2 fac warm` (all lanes) or `apm2 fac warm --lane <lane_id>` (specific lane). Warm populates the lane-scoped CARGO_TARGET_DIR with compiled dependencies so subsequent gate runs avoid full recompilation. Warm receipts are written for auditability.
+            If gate execution hits cold-start timeouts (240s wall-time exceeded during large compilations), pre-warm the lane targets manually by running `cargo build --workspace` in the lane workspace with CARGO_TARGET_DIR pointing to the lane's target directory. This populates compiled dependencies so subsequent gate runs avoid full recompilation (PLANNED: `apm2 fac warm` is not yet implemented as a CLI subcommand).
         - id: READ_FAC_LOGS_ON_FAIL
           action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs. Per-lane logs are under `$APM2_HOME/private/fac/lanes/<lane_id>/logs/<job_id>/`."
         - id: HANDLE_QUARANTINE_OR_DENIAL
@@ -251,16 +251,16 @@ decision_tree:
       steps[5]:
         - id: DETECT_CORRUPT_LANE
           action: |
-            A lane enters CORRUPT state when cleanup fails, a process outlives its lease, or symlink safety checks refuse deletion. Detect via `apm2 fac lane status` (state=CORRUPT). Reset with `apm2 fac lane reset <lane_id>`. If the lane is still RUNNING, use `--force` to kill the active unit first. Reset uses symlink-safe deletion (safe_rmtree_v1) and writes a reset receipt.
+            A lane enters CORRUPT state when cleanup fails, a process outlives its lease, or symlink safety checks refuse deletion. Detect by inspecting lease files: `cat $APM2_HOME/private/fac/lanes/<lane_id>/lease.v1.json`. To reset, manually remove the lease file and clear the lane workspace/target/logs directories. If the lane process is still RUNNING, kill the active systemd unit first: `systemctl --user stop "apm2-lane-<lane_id>.scope"` (PLANNED: `apm2 fac lane status` and `apm2 fac lane reset` are not yet implemented as CLI subcommands).
         - id: HANDLE_DISK_PRESSURE
           action: |
-            If gate execution fails due to disk exhaustion, run `apm2 fac gc` to reclaim space from old logs, stale targets, and expired receipts across all lanes. For targeted cleanup: `apm2 fac gc --lane <lane_id>`. GC writes a receipt recording bytes reclaimed. If GC is insufficient, manually prune `$APM2_HOME/private/fac/lanes/*/target/` directories (these are compilation caches, not truth).
+            If gate execution fails due to disk exhaustion, reclaim space by manually removing old lane target directories: `rm -rf $APM2_HOME/private/fac/lanes/*/target/` (these are compilation caches, not truth). Also check for orphaned evidence logs: `du -sh $APM2_HOME/private/fac/evidence/` (PLANNED: `apm2 fac gc` is not yet implemented as a CLI subcommand).
         - id: HANDLE_STALE_LEASE
           action: |
-            If a lane shows LEASED but its process is dead (pid no longer exists), the scheduler transitions it through CLEANUP to IDLE automatically. If this does not happen, `apm2 fac lane reset <lane_id>` forces the transition. Never manually delete lease files; use the reset command to ensure receipts are written.
+            If a lane has a lease file but its process is dead (pid no longer exists), the scheduler transitions it through CLEANUP to IDLE automatically. If this does not happen, manually remove the stale lease: `rm -f $APM2_HOME/private/fac/lanes/<lane_id>/lease.v1.json` (PLANNED: `apm2 fac lane reset` is not yet implemented as a CLI subcommand).
         - id: HANDLE_CONTAINMENT_VIOLATION
           action: |
-            If processes escape the bounded cgroup unit (detected by resource accounting mismatches or orphan processes), this is a containment violation. Stop the lane with `apm2 fac lane reset <lane_id> --force`, investigate the cause, and check that helpers like sccache are not spawning compilers outside the cgroup boundary. In default mode, sccache is disabled to prevent containment bypass.
+            If processes escape the bounded cgroup unit (detected by resource accounting mismatches or orphan processes), this is a containment violation. Stop the lane by killing the active systemd unit: `systemctl --user stop "apm2-lane-<lane_id>.scope"`, then manually reset the lane workspace. Investigate the cause and check that helpers like sccache are not spawning compilers outside the cgroup boundary. In default mode, sccache is disabled to prevent containment bypass.
         - id: ESCALATE_IF_BLOCKED
           action: "If lane infrastructure cannot be restored to healthy state, mark the task BLOCKED with concrete evidence (lane status output, log excerpts, receipt hashes) and escalate."
       next: UPDATE_AGENTS_DOCS
