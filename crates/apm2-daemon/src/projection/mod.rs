@@ -53,6 +53,9 @@
 //!   economics gate input assembly (TCK-00507)
 //! - [`ContinuityProfileResolver`]: Trait for resolving continuity profiles,
 //!   sink snapshots, and continuity windows
+//! - [`DeferredReplayWorker`]: Worker that drains the deferred replay backlog
+//!   after sink recovery, re-evaluating economics gate AND PCAC lifecycle
+//!   enforcement for each replayed intent (TCK-00508)
 //!
 //! # Divergence Watchdog (TCK-00213)
 //!
@@ -119,6 +122,7 @@
 //! ```
 
 pub mod continuity_resolver;
+pub mod deferred_replay_worker;
 pub mod divergence_watchdog;
 pub mod github_sync;
 pub mod intent_buffer;
@@ -129,6 +133,11 @@ pub mod worker;
 pub use continuity_resolver::{
     ConfigBackedResolver, ConfigResolverError, ContinuityProfileResolver, MAX_RESOLVED_PROFILES,
     ResolvedContinuityProfile, ResolvedContinuityWindow,
+};
+pub use deferred_replay_worker::{
+    DEFAULT_REPLAY_BATCH_SIZE, DENY_REPLAY_ALREADY_PROJECTED, DENY_REPLAY_ECONOMICS_GATE,
+    DENY_REPLAY_HORIZON_OUT_OF_WINDOW, DENY_REPLAY_LIFECYCLE_GATE, DENY_REPLAY_MISSING_DEPENDENCY,
+    DeferredReplayError, DeferredReplayWorker, DeferredReplayWorkerConfig, ReplayCycleResult,
 };
 pub use divergence_watchdog::{
     DivergenceError, DivergenceResult, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeCheck,
