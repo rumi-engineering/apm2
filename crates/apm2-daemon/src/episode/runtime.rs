@@ -2281,6 +2281,7 @@ impl EpisodeRuntime {
             request_id,
             None,
             false,
+            None,
         )
         .await
     }
@@ -2297,6 +2298,7 @@ impl EpisodeRuntime {
         request_id: &str,
         verified_content: Option<VerifiedToolContent>,
         toctou_verification_required: bool,
+        idempotency_key: Option<String>,
     ) -> Result<ToolResult, EpisodeError> {
         // Step 1: Read lock to get executor and validate state
         let executor = {
@@ -2327,7 +2329,8 @@ impl EpisodeRuntime {
         // Step 2: Execute the tool
         let ctx = ExecutionContext::new(episode_id.clone(), request_id, timestamp_ns)
             .with_verified_content(verified_content.unwrap_or_default())
-            .with_toctou_verification_required(toctou_verification_required);
+            .with_toctou_verification_required(toctou_verification_required)
+            .with_idempotency_key(idempotency_key);
         let executor_guard = executor.write().await;
         let result = executor_guard
             .execute(&ctx, args, credential)

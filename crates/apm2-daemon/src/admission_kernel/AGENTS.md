@@ -1,6 +1,6 @@
 # AdmissionKernel Module
 
-> Plan/execute API with capability-gated effect surfaces for authoritative request admission (RFC-0019 REQ-0023, TCK-00492).
+> Plan/execute API with capability-gated effect surfaces for authoritative request admission (RFC-0019 REQ-0023, TCK-00492). Crash-safe effect execution via durable effect journal with fail-closed in-doubt handling (RFC-0019 REQ-0029, TCK-00501).
 
 ## Overview
 
@@ -14,6 +14,7 @@ The module enforces:
 4. **Fail-Closed Prerequisites**: Missing ledger state, policy root, or anti-rollback anchor denies for fail-closed tiers.
 5. **Daemon-Created Witness Seeds**: With provider provenance binding.
 6. **Boundary Output Mediation**: Output held until post-effect checks for fail-closed tiers.
+7. **Crash-Safe Effect Execution**: Durable effect journal with `NotStarted -> Started -> Completed` state machine, crash window classification, and fail-closed in-doubt handling for `Unknown` state (TCK-00501).
 
 ## Key Types
 
@@ -27,6 +28,7 @@ pub struct AdmissionKernelV1 {
     anti_rollback: Option<Arc<dyn AntiRollbackAnchor>>,
     quarantine_guard: Option<Arc<dyn QuarantineGuard>>,
     witness_provider: WitnessProviderConfig,
+    effect_journal: Option<Arc<dyn EffectJournal>>,
 }
 ```
 
@@ -58,6 +60,9 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK19] `verify_anti_rollback()` tolerates `ExternalAnchorUnavailable` from `verify_committed()` as the bootstrap path: on fresh install, no prior anchor exists to protect and the anti-rollback invariant is vacuously satisfied. Other `TrustError` variants still produce denial (TCK-00502 BLOCKER-1).
 - [CTR-AK20] `resolve_post_effect_anchor()` queries `LedgerTrustVerifier::validated_state()` for the current verified head AFTER the authoritative effect. Returns the verifier anchor when its height >= the fallback anchor; otherwise returns the fallback. Falls back to the caller-supplied anchor when no verifier is wired or when `validated_state()` errors. MUST be called between effect confirmation and `finalize_anti_rollback()` so the anti-rollback commit advances to the actual post-effect head, not the stale pre-plan anchor (TCK-00502 MAJOR-2).
 - [CTR-AK21] `probe_anti_rollback_health()` performs a non-mutating health check via `verify_committed()` (read-only). MUST NOT call `commit()`. Returns `Ok(())` when the anchor verifies or `AdmitError` on failure. Used by the pre-effect circuit breaker to test anti-rollback availability without advancing the anchor watermark (TCK-00502 MINOR-4).
+- [CTR-AK22] `execute()` enforces EffectJournal presence for fail-closed tiers (`MissingPrerequisite` if absent) and builds an `EffectJournalBindingV1` that is returned in `AdmissionResultV1.journal_binding`. The caller MUST call `journal.record_started(&binding)` at the true pre-dispatch boundary (TCK-00501).
+- [CTR-AK23] `IdempotencyKeyV1` is derived deterministically from `(dedupe_key, request_id, ajc_id)` via domain-separated BLAKE3 and included in `AdmissionResultV1` for propagation to broker/tool calls (TCK-00501). The `dedupe_key` is the stable client-supplied intent identifier (INV-F-06) that persists across retries; `execute()` uses `intent_digest` as the dedupe key. The key is also wired into `ExecutionContext.idempotency_key` for tool handler propagation.
+- [CTR-AK24] `check_output_release_permitted()` denies output release for `Unknown` state unless an explicit `InDoubtResolutionV1::AllowReExecution` resolution is provided with matching `request_id` and `idempotency_key`. Fail-closed: no resolution means deny (TCK-00501).
 
 ### `KernelRequestV1` (types.rs)
 
@@ -69,11 +74,14 @@ Single-use admission plan containing join-time bindings. Not `Clone`, `Copy`, `S
 
 ### `AdmissionResultV1` (types.rs)
 
-Result of successful execution containing capability tokens, consume receipts, boundary span, and witness seeds. The `leakage_witness_seed` and `timing_witness_seed` fields are carried through from the consumed plan so the runtime post-effect path can invoke `finalize_post_effect_witness` with actual seeds rather than ad-hoc hash-only checks (TCK-00497 QUALITY MAJOR 1).
+Result of successful execution containing capability tokens, consume receipts, boundary span, witness seeds, idempotency key, effect journal handle, and journal binding. The `leakage_witness_seed` and `timing_witness_seed` fields are carried through from the consumed plan so the runtime post-effect path can invoke `finalize_post_effect_witness` with actual seeds rather than ad-hoc hash-only checks (TCK-00497 QUALITY MAJOR 1). The `idempotency_key`, `effect_journal`, and `journal_binding` fields support crash-safe effect execution (TCK-00501). The `journal_binding` is built by `execute()` but NOT persisted; the caller controls when `record_started` is called to prevent false in-doubt classification (SEC-MAJOR-1 fix).
 
 - [CTR-AK15] Seeds in `AdmissionResultV1` match the plan-time seeds (same content hash).
 - [CTR-AK16] Runtime post-effect path MUST use `kernel.finalize_post_effect_witness()` with the result's seeds as the single source of truth for seed/provider/temporal binding validation. Ad-hoc validation is forbidden.
 - [CTR-AK17] Monitor tiers MUST construct a `MonitorWaiverV1` and pass it to `finalize_post_effect_witness()`. Silent log-and-continue bypass is forbidden (QUALITY MAJOR 2).
+- [CTR-AK21] `idempotency_key` MUST be propagated to all external broker/tool calls that support idempotency. Callers use `idempotency_key.as_hex()` for transport encoding. The key is now propagated into `BrokerToolRequest.idempotency_key` via `with_idempotency_key()` in session dispatch (TCK-00501 MAJOR 1 fix).
+- [CTR-AK23] `declared_idempotent` in `KernelRequestV1` is currently hardcoded to `false` because `Capability` does not yet carry this field. This makes `resolve_in_doubt` always deny in production (fail-closed safe). TODO(TCK-00501): source from manifest/capability metadata when the schema is extended.
+- [CTR-AK22] Post-effect path MUST call `effect_journal.record_completed()` after successful effect execution. Failure to record completion causes `Unknown` state on crash recovery, which triggers fail-closed in-doubt handling.
 
 ### `AdmissionSpineJoinExtV1` (types.rs)
 
@@ -105,6 +113,45 @@ Explicit waiver for monitor-tier witness bypass (TCK-00497). Monitor tiers may s
 - [INV-AK36] Waiver `reason` must be non-empty and bounded by `MAX_WAIVER_REASON_LENGTH`.
 - [INV-AK37] Waiver hash is included in audit binding (outcome index evidence hashes).
 - [INV-AK38] Waiver `expires_at_tick` is enforced against current tick. Non-zero expired waivers are denied (SECURITY MAJOR 2).
+
+### `EffectJournal` trait and `FileBackedEffectJournal` (effect_journal.rs)
+
+Crash-safe effect execution journal (TCK-00501). Tracks effect execution state per `RequestId` with a durable, append-only, file-backed journal. Modeled after `FileBackedConsumeIndex` with exclusive file locking and streaming replay.
+
+**State machine:** `NotStarted -> Started -> Completed`. On crash recovery (replay), entries with `Started` but no `Completed` are classified as `Unknown`. An `Unknown` entry can be resolved to `NotStarted` via `resolve_in_doubt()` (persisted as 'R' tag) when both conditions (idempotent + boundary confirms) are met.
+
+**Key types:**
+
+- `EffectExecutionState`: `NotStarted`, `Started`, `Completed`, `Unknown` -- the four possible states for any effect execution.
+- `EffectJournalBindingV1`: Complete pre-effect binding data persisted with journal entry (request digest, ledger anchor, policy root, witness seeds, boundary profile, tier, join ID, selectors). Domain-separated BLAKE3 content hash. Validated before persistence.
+- `IdempotencyKeyV1`: Deterministic BLAKE3 key derived from `(dedupe_key, request_id, ajc_id)` with domain separation `"apm2-idempotency-key-v1"`. The `dedupe_key` is the stable client-supplied intent identifier (INV-F-06). Propagated to external systems for deduplication via `ExecutionContext.idempotency_key`.
+- `InDoubtResolutionV1`: Resolution for `Unknown` state -- `Deny { reason }` (default, fail-closed) or `AllowReExecution { request_id, idempotency_key, boundary_confirmation, reason }` (requires explicit proof).
+- `EffectJournalError`: Structured error type covering I/O, corruption, duplicate entries, bounds overflow, and validation failures.
+
+**Invariants:**
+
+- [INV-AK40] Journal entries are append-only; no in-place mutation or deletion. Tags: 'S' (Started), 'C' (Completed), 'R' (Resolved: Unknown -> NotStarted).
+- [INV-AK41] `Started` without `Completed` on replay produces `Unknown`, never silent re-execution.
+- [INV-AK42] `Unknown` state denies output release unless explicit `AllowReExecution` resolution with matching `request_id` and `idempotency_key` is provided.
+- [INV-AK43] Journal replay tolerates torn tail entries (partial writes from crash) by skipping unparseable trailing lines.
+- [INV-AK44] In-memory **active** entry count (`Started`/`Unknown`) bounded by `MAX_JOURNAL_ENTRIES` (100,000). Overflow returns `EffectJournalError::CapacityExhausted`. Terminal entries (`Completed`/`NotStarted`) do not consume active capacity slots.
+- [INV-AK59] In-memory **terminal** entry count (`Completed`/`NotStarted`) bounded by `MAX_TERMINAL_ENTRIES` (100,000). Pruning uses O(1) FIFO eviction via `terminal_order: VecDeque<Hash>`. Entries are pushed to the back when they transition to terminal state; eviction pops from the front. Stale keys (entries re-inserted as active after `resolve_in_doubt` + `record_started`) are skipped. Pruning fires automatically: (a) inline during journal replay, (b) at runtime after `record_completed()` and `resolve_in_doubt()`, and (c) as a post-replay safety-net pass. Only in-memory pruning; the on-disk journal retains all records.
+- [INV-AK60] Journal file size is checked BEFORE reading (256 MiB limit, `MAX_JOURNAL_FILE_SIZE`). Files exceeding the limit are rejected with `ValidationError` to prevent unbounded allocation.
+- [INV-AK61] Journal line length check strictly enforces `MAX_JOURNAL_LINE_LEN` (64,000 bytes) without off-by-one tolerance.
+- [INV-AK45] Exclusive file lock (`flock LOCK_EX`) prevents concurrent journal access from multiple daemon instances.
+- [INV-AK46] Binding data is validated (`validate()`) before persistence; zero hashes and empty fields are rejected.
+- [INV-AK47] `record_started()` rejects duplicate `request_id` entries UNLESS state is `NotStarted` (from `resolve_in_doubt`), which permits re-execution by removing the stale entry before inserting the new binding.
+- [INV-AK48] `resolve_in_doubt()` persists resolution atomically (fsync 'R' tag) BEFORE updating in-memory state; prevents infinite resolution loops on crash (TCK-00501 fix).
+- [INV-AK49] Fail-closed tiers MUST have an effect journal wired; `execute()` denies with `MissingPrerequisite` if journal is absent for `FailClosed` tier (TCK-00501 fix).
+- [INV-AK50] Journal file is created with mode `0o600` (owner-only read/write) to prevent world-readable exposure of request IDs, session IDs, and policy root digests (TCK-00501 fix). Pre-existing files with broader permissions are remediated to `0o600` on open (MINOR-1 fix).
+- [INV-AK51] Post-effect path MUST call `record_completed()` after successful effect execution to transition journal state from `Started` to `Completed`; wired in `session_dispatch.rs` (TCK-00501 fix).
+- [INV-AK52] C and R journal records enforce exact 64 hex char length (not minimum). Trailing garbage after the hex is rejected as `CorruptEntry` during replay (MAJOR-1 fix, TCK-00501 round 6).
+- [INV-AK53] S journal records verify line-key `request_id` matches `binding.request_id`. A mismatch is rejected as `CorruptEntry` during replay to prevent identity confusion between lookup key and authoritative binding (MAJOR-2 fix, TCK-00501 round 6).
+- [INV-AK54] Journal replay uses bounded read (`Read::take()` + `read_until()` with `Vec<u8>`) capped at `MAX_JOURNAL_LINE_LEN + 1` bytes per line. Oversized lines are detected BEFORE memory allocation, preventing OOM from malicious/corrupted journal files (BLOCKER fix, TCK-00501 round 7).
+- [INV-AK55] `EffectJournalBindingV1` has `#[serde(deny_unknown_fields)]` to reject corrupted/tampered entries with extra JSON fields during replay (MAJOR-2 fix, TCK-00501 round 7).
+- [INV-AK56] `EffectJournalError::IoError` preserves `std::io::ErrorKind` for programmatic matching (MAJOR-1 fix, TCK-00501 round 7).
+- [INV-AK57] Kernel plan/execute runs whenever `admission_kernel` is wired, regardless of `pcac_lifecycle_gate` presence. The PCAC gate handles authority lifecycle; the kernel additionally provides effect journal crash-safety tracking. Both run when both are wired in production (SEC-MAJOR-2 fix, TCK-00501 round 7).
+- [INV-AK58] Permission remediation (`enforce_journal_permissions`) is extracted to a helper function and called at both open and truncation paths (NIT fix, TCK-00501 round 7).
 
 ### `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability` (capabilities.rs)
 
@@ -197,7 +244,7 @@ Individual quarantine action record within `AdmissionBundleV1`. Contains `reserv
 
 ### `AdmitError` (types.rs)
 
-Error type with 17 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute, `BundleSealFailure` for bundle validation/serialization failures (TCK-00493), and `WitnessEvidenceFailure`/`OutputReleaseDenied`/`WitnessWaiverInvalid` for witness enforcement (TCK-00497).
+Error type with 17 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute, `BundleSealFailure` for bundle validation/serialization failures (TCK-00493), `WitnessEvidenceFailure`/`OutputReleaseDenied`/`WitnessWaiverInvalid` for witness enforcement (TCK-00497), and `BundleSealFailure` (reused) for effect journal `record_started` failures (TCK-00501).
 
 ## Phase Ordering
 
@@ -207,8 +254,11 @@ plan():    validate -> prerequisite resolution -> witness seed creation ->
            PCAC join -> PCAC revalidate
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
-           durable consume -> bundle seal (TCK-00493) ->
+           durable consume -> bundle construction + validation (TCK-00493) ->
+           journal binding build (TCK-00501, deferred to caller) ->
+           bundle seal -> idempotency key derivation (TCK-00501) ->
            capability mint (tier-gated) -> boundary span -> result
+           [caller: record_started at true pre-dispatch boundary]
 
 POST-EFFECT FINALIZATION (caller responsibility, TCK-00502):
 finalize_anti_rollback(): anti-rollback anchor commit (fail-closed tiers only)
@@ -226,6 +276,8 @@ BEFORE persisting the AdmissionOutcomeIndexV1.
 - `KernelRequestV1`, `WitnessSeedV1`, `WitnessEvidenceV1`, `MonitorWaiverV1`, `BoundarySpanV1`
 - `EnforcementTier`, `AdmitError`
 - `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability`
+- `EffectJournal`, `FileBackedEffectJournal`, `EffectExecutionState`, `EffectJournalBindingV1`
+- `IdempotencyKeyV1`, `InDoubtResolutionV1`, `EffectJournalError`
 - `LedgerTrustVerifier`, `PolicyRootResolver`, `AntiRollbackAnchor`
 - `LedgerAnchorV1`, `ValidatedLedgerStateV1`, `ExternalAnchorStateV1`
 - `PolicyRootStateV1`, `GovernanceProvenanceV1`
@@ -275,3 +327,5 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 - TCK-00502: Implementation ticket (anti-rollback anchoring -- DurableAntiRollbackAnchor, InMemoryAntiRollbackAnchor, production wiring, fail-closed tier gating)
 - REQ-0028: Ledger trust stack requirements
 - REQ-0030: Anti-rollback anchoring requirements
+- TCK-00501: Implementation ticket (crash-safe effect execution -- effect journal, idempotency key propagation, fail-closed in-doubt handling)
+- REQ-0029: Crash-safe effect execution with durable journal and deterministic recovery
