@@ -79,7 +79,7 @@ pub fn current_branch() -> Result<String, String> {
     Ok(branch)
 }
 
-fn current_head_sha() -> Result<String, String> {
+pub(super) fn current_head_sha() -> Result<String, String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()

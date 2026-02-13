@@ -8,8 +8,8 @@ use std::process::Command;
 
 use super::events::emit_review_event;
 use super::types::{
-    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, QUALITY_MARKER, SECURITY_MARKER, now_iso8601_millis,
-    split_owner_repo, validate_expected_head_sha,
+    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, now_iso8601_millis, split_owner_repo,
+    validate_expected_head_sha,
 };
 
 // ── Event context resolution ────────────────────────────────────────────────
@@ -422,19 +422,23 @@ pub fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, Str
 pub fn fetch_pr_head_sha_local(pr_number: u32) -> Result<String, String> {
     let owner_repo = super::target::derive_repo_from_origin()?;
 
-    if let Some(identity) = super::projection_store::load_pr_identity(&owner_repo, pr_number)? {
-        validate_expected_head_sha(&identity.head_sha)?;
-        return Ok(identity.head_sha.to_ascii_lowercase());
-    }
-
+    // When on a branch associated with this PR, git rev-parse HEAD is authoritative
     if let Ok(branch) = super::target::current_branch() {
         if let Some(identity) = super::projection_store::load_branch_identity(&owner_repo, &branch)?
         {
             if identity.pr_number == pr_number {
-                validate_expected_head_sha(&identity.head_sha)?;
-                return Ok(identity.head_sha.to_ascii_lowercase());
+                if let Ok(workspace_sha) = super::target::current_head_sha() {
+                    validate_expected_head_sha(&workspace_sha)?;
+                    return Ok(workspace_sha.to_ascii_lowercase());
+                }
             }
         }
+    }
+
+    // Cross-branch fallback: trust projection store cache
+    if let Some(identity) = super::projection_store::load_pr_identity(&owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
     if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
@@ -481,27 +485,6 @@ pub fn resolve_authenticated_gh_login() -> Option<String> {
     }
     let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if login.is_empty() { None } else { Some(login) }
-}
-
-fn review_type_for_marker(marker: &str) -> Option<&'static str> {
-    if marker == SECURITY_MARKER {
-        Some("security")
-    } else if marker == QUALITY_MARKER {
-        Some("code-quality")
-    } else {
-        None
-    }
-}
-
-fn comment_matches_review_dimension(body_lower: &str, review_type: &str) -> bool {
-    match review_type {
-        "security" => body_lower.contains("## security review:"),
-        "code-quality" => {
-            body_lower.contains("## code quality review:")
-                || body_lower.contains("## quality review:")
-        },
-        _ => false,
-    }
 }
 
 fn strip_existing_metadata_block(body: &str, marker: &str) -> String {
@@ -598,15 +581,8 @@ fn patch_issue_comment_body(owner_repo: &str, comment_id: u64, body: &str) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{render_comment_with_generated_metadata, review_type_for_marker};
+    use super::render_comment_with_generated_metadata;
     use crate::commands::fac_review::types::{QUALITY_MARKER, SECURITY_MARKER};
-
-    #[test]
-    fn review_type_for_marker_maps_known_markers() {
-        assert_eq!(review_type_for_marker(SECURITY_MARKER), Some("security"));
-        assert_eq!(review_type_for_marker(QUALITY_MARKER), Some("code-quality"));
-        assert_eq!(review_type_for_marker("<!-- unknown -->"), None);
-    }
 
     #[test]
     fn render_comment_with_generated_metadata_appends_block() {

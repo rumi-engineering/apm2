@@ -321,38 +321,36 @@ pub fn run_verdict_set(
         decision_summary: termination_authority.decision_signature.clone(),
         integrity_hmac: String::new(),
     };
-    super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
 
     match terminate_review_agent(&termination_authority) {
-        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => {},
+        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => {
+            super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
+            Ok(exit_codes::SUCCESS)
+        },
         Ok(TerminationOutcome::SkippedMismatch) => {
             if termination_state_non_terminal_alive {
                 eprintln!(
-                    "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}, \
-                     but termination authority no longer matches active state"
+                    "WARNING: verdict for PR #{resolved_pr} type={normalized_dimension}: \
+                     termination authority no longer matches active state"
                 );
             }
+            // State has drifted but process is not confirmed alive — persist receipt
+            super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
+            Ok(exit_codes::SUCCESS)
         },
-        Ok(TerminationOutcome::IdentityFailure(reason)) => {
-            eprintln!(
-                "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}; \
-                 reviewer termination failed: {reason}"
-            );
-        },
-        Ok(TerminationOutcome::IntegrityFailure(reason)) => {
-            eprintln!(
-                "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}; \
-                 reviewer termination integrity check failed: {reason}"
-            );
-        },
-        Err(err) => {
-            eprintln!(
-                "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}; \
-                 reviewer termination step failed: {err}"
-            );
-        },
+        Ok(TerminationOutcome::IdentityFailure(reason)) => Err(format!(
+            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+             reviewer termination failed (identity): {reason}"
+        )),
+        Ok(TerminationOutcome::IntegrityFailure(reason)) => Err(format!(
+            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+             reviewer termination integrity check failed: {reason}"
+        )),
+        Err(err) => Err(format!(
+            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+             reviewer termination step failed: {err}"
+        )),
     }
-    Ok(exit_codes::SUCCESS)
 }
 
 fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {
