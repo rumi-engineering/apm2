@@ -31,15 +31,19 @@ rfc_contracts_and_versioning:
       name: "RUSTC_WRAPPER environment variable"
       description: |
         Developers MAY set RUSTC_WRAPPER=sccache in their shell profile
-        to enable compilation caching.
+        to enable compilation caching for manual builds outside FAC.
       interface:
         variable: "RUSTC_WRAPPER"
         value: "sccache"
-        scope: "Developer shell profile (optional)"
+        scope: "Developer shell profile (optional, manual builds only)"
       backward_compatible: true
       notes: |
-        This is a recommendation, not a requirement. The project builds
-        correctly without sccache.
+        This is a recommendation for manual developer builds, not a
+        requirement. The project builds correctly without sccache.
+        FESv1 CONSTRAINT: RUSTC_WRAPPER is NOT set in FAC execution
+        mode. FAC uses lane-scoped CARGO_TARGET_DIR for build reuse
+        and disables sccache to preserve cgroup containment. See
+        DD-005 and TB-002 containment_constraints.
 
     - id: CONTRACT-003
       name: "CARGO_INCREMENTAL environment variable"
@@ -60,18 +64,49 @@ rfc_contracts_and_versioning:
         Setting CARGO_INCREMENTAL=1 explicitly documents the intent.
 
     - id: CONTRACT-004
-      name: "cargo nextest run command"
+      name: "cargo nextest run command (mandatory for FAC)"
       description: |
-        Developers MAY use cargo nextest run as a faster alternative to
-        cargo test.
+        FAC evidence gate execution MUST use `cargo nextest run` as the
+        test runner. FAC MUST fail closed if nextest is not installed.
+        For manual developer testing, cargo test remains available but
+        nextest is recommended.
       interface:
         command: "cargo nextest run"
-        equivalent_to: "cargo test"
+        equivalent_to: "cargo test (for manual use)"
         flags: "Most cargo test flags supported"
+        fac_requirement: "MANDATORY — FAC fails closed without nextest"
       backward_compatible: true
       notes: |
-        cargo test remains fully supported. nextest is a recommendation
-        for faster local development.
+        FESv1 AMENDMENT: nextest is now mandatory for FAC. Both the
+        pipeline path (run_evidence_gates_with_status) and the local
+        gates path (apm2 fac gates) MUST use explicit cargo nextest run
+        invocation. Silent fallback to cargo test is no longer permitted.
+        If nextest is missing, FAC emits an actionable error with
+        installation instructions: `cargo install cargo-nextest`.
+
+    - id: CONTRACT-005
+      name: "FAC execution containment boundary"
+      description: |
+        All FAC evidence gate execution MUST run inside a bounded
+        cgroup unit with explicit resource limits. No process spawned
+        by the job may escape the containment boundary.
+      interface:
+        mechanism: "systemd-run --user transient scope/service"
+        resource_limits:
+          - "MemoryMax: default 24G"
+          - "CPUQuota: configurable"
+          - "TasksMax: default 1536"
+          - "TimeoutStopSec: default 240s"
+        escape_prevention:
+          - "sccache disabled in default FAC mode"
+          - "CARGO_HOME set under $APM2_HOME"
+          - "Ambient ~/.cargo/config.toml not used"
+      backward_compatible: true
+      notes: |
+        If bounded execution cannot be proven available (no user bus,
+        no cgroup v2), FAC MUST fail closed with actionable remediation
+        (enable linger, configure systemd user session, or run via
+        systemd-managed apm2-daemon).
 
   versioning:
     strategy: "No version bump required for configuration changes"

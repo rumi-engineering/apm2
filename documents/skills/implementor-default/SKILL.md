@@ -17,11 +17,13 @@ protocol:
 variables:
   IMPLEMENTATION_SCOPE_OPTIONAL: "$1"
 
-references[16]:
+references[17]:
   - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
+  - path: "@documents/rfcs/RFC-0019/20_fac_execution_substrate_build_farm_revision.md"
+    purpose: "FESv1 execution substrate: lanes, broker/worker queue, warm lifecycle, GC, and failure mode handling. Read for operational context on queue-based gate execution."
 
   # Core standards
   - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
@@ -55,7 +57,7 @@ references[16]:
 
 decision_tree:
   entrypoint: START
-  nodes[10]:
+  nodes[11]:
     - id: START
       purpose: "Initialize scope, collect authoritative context, and avoid ambient assumptions."
       steps[11]:
@@ -220,16 +222,47 @@ decision_tree:
       next: VERIFY_WITH_FAC
 
     - id: VERIFY_WITH_FAC
-      purpose: "Run deterministic merge-gate verification via FAC."
-      steps[4]:
+      purpose: "Run deterministic merge-gate verification via FAC. Default mode uses queue-based execution through the FESv1 broker/worker substrate."
+      steps[7]:
         - id: RUN_FAC_GATES_QUICK
           action: "During active edits, run `apm2 fac gates --quick` for short-loop validation."
         - id: RUN_FAC_GATES_FULL
-          action: "Immediately before push, run `apm2 fac gates`."
+          action: "Immediately before push, run `apm2 fac gates`. Default mode enqueues a job to the broker and waits for a worker to execute it in a leased lane."
+        - id: VERIFY_LANE_HEALTH
+          action: |
+            If gates fail to start, check lane availability with `apm2 fac lane status`. Lanes follow the lifecycle: IDLE -> LEASED -> RUNNING -> CLEANUP -> IDLE. If a lane is stuck in CORRUPT state, reset it with `apm2 fac lane reset <lane_id>` before retrying.
+        - id: WARM_LANES_IF_COLD
+          action: |
+            If gate execution hits cold-start timeouts (240s wall-time exceeded during large compilations), pre-warm the lane targets: `apm2 fac warm` (all lanes) or `apm2 fac warm --lane <lane_id>` (specific lane). Warm populates the lane-scoped CARGO_TARGET_DIR with compiled dependencies so subsequent gate runs avoid full recompilation. Warm receipts are written for auditability.
         - id: READ_FAC_LOGS_ON_FAIL
-          action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs."
+          action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs. Per-lane logs are under `$APM2_HOME/private/fac/lanes/<lane_id>/logs/<job_id>/`."
+        - id: HANDLE_QUARANTINE_OR_DENIAL
+          action: |
+            If a job is moved to `queue/quarantine/` or `queue/denied/`:
+            - Quarantine: the job spec failed RFC-0028 channel boundary validation or was malformed. Check broker health and re-enqueue after fixing the issue. Quarantined artifacts are preserved for forensics.
+            - Denied: the job failed RFC-0029 queue admission (e.g., budget exceeded, lane capacity). Wait for lane availability or run `apm2 fac gc` to reclaim resources, then retry.
+            Never delete quarantined items manually; they contain forensic evidence.
         - id: FIX_AND_RERUN
           action: "Fix failures and re-run gates (`--quick` during iteration, full `apm2 fac gates` before push) until PASS or BLOCKED."
+      next: HANDLE_FAC_FAILURES
+
+    - id: HANDLE_FAC_FAILURES
+      purpose: "Respond to FAC execution substrate failures: corrupt lanes, disk pressure, stale leases, and containment violations."
+      steps[5]:
+        - id: DETECT_CORRUPT_LANE
+          action: |
+            A lane enters CORRUPT state when cleanup fails, a process outlives its lease, or symlink safety checks refuse deletion. Detect via `apm2 fac lane status` (state=CORRUPT). Reset with `apm2 fac lane reset <lane_id>`. If the lane is still RUNNING, use `--force` to kill the active unit first. Reset uses symlink-safe deletion (safe_rmtree_v1) and writes a reset receipt.
+        - id: HANDLE_DISK_PRESSURE
+          action: |
+            If gate execution fails due to disk exhaustion, run `apm2 fac gc` to reclaim space from old logs, stale targets, and expired receipts across all lanes. For targeted cleanup: `apm2 fac gc --lane <lane_id>`. GC writes a receipt recording bytes reclaimed. If GC is insufficient, manually prune `$APM2_HOME/private/fac/lanes/*/target/` directories (these are compilation caches, not truth).
+        - id: HANDLE_STALE_LEASE
+          action: |
+            If a lane shows LEASED but its process is dead (pid no longer exists), the scheduler transitions it through CLEANUP to IDLE automatically. If this does not happen, `apm2 fac lane reset <lane_id>` forces the transition. Never manually delete lease files; use the reset command to ensure receipts are written.
+        - id: HANDLE_CONTAINMENT_VIOLATION
+          action: |
+            If processes escape the bounded cgroup unit (detected by resource accounting mismatches or orphan processes), this is a containment violation. Stop the lane with `apm2 fac lane reset <lane_id> --force`, investigate the cause, and check that helpers like sccache are not spawning compilers outside the cgroup boundary. In default mode, sccache is disabled to prevent containment bypass.
+        - id: ESCALATE_IF_BLOCKED
+          action: "If lane infrastructure cannot be restored to healthy state, mark the task BLOCKED with concrete evidence (lane status output, log excerpts, receipt hashes) and escalate."
       next: UPDATE_AGENTS_DOCS
 
     - id: UPDATE_AGENTS_DOCS
