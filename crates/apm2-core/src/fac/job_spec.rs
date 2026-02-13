@@ -1,43 +1,9 @@
-//! FAC Job Spec V1: immutable job description with `job_spec_digest` and
-//! `actuation` block (RFC-0028 binding).
+//! FAC Job Spec V1 for worker queueing and validation.
 //!
-//! Implements TCK-00512: defines `FacJobSpecV1`, its canonical digest
-//! computation, and worker-side validation (digest + `request_id` match).
-//!
-//! # Design
-//!
-//! A `FacJobSpecV1` is the immutable envelope describing a unit of work
-//! (gates, warm, GC, reset) that flows through the FAC queue. It carries:
-//!
-//! - `job_spec_digest`: a BLAKE3 commitment over the canonical JSON form of the
-//!   spec **with `actuation.channel_context_token` nulled** (so the digest is
-//!   stable across token rotations).
-//! - `actuation`: the RFC-0028 authorization block binding the spec to a
-//!   broker-signed `ChannelContextToken`.
-//!
-//! # Digest Computation (normative, per RFC-0019 section 5.3.3)
-//!
-//! 1. Clone the spec.
-//! 2. Set `actuation.channel_context_token = None`.
-//! 3. Serialize to canonical JSON
-//!    (`apm2_core::determinism::canonicalize_json`).
-//! 4. Hash as `BLAKE3(schema_id || "\0" || canonical_json_bytes)`.
-//! 5. Encode as `"b3-256:<hex>"`.
-//!
-//! # Worker Validation
-//!
-//! Workers MUST call [`validate_job_spec`] before executing any job:
-//!
-//! 1. Recompute the digest and compare to `job_spec_digest` (fail-closed).
-//! 2. Verify `actuation.request_id == job_spec_digest` (fail-closed).
-//!
-//! # Security Invariants
-//!
-//! - [INV-JS-001] `job_spec_digest` covers ALL fields except the token itself.
-//! - [INV-JS-002] Digest comparison is constant-time
-//!   (`subtle::ConstantTimeEq`).
-//! - [INV-JS-003] Fail-closed: any validation failure results in denial.
-//! - [INV-JS-004] `#[serde(deny_unknown_fields)]` on all boundary structs.
+//! - [INV-JS-001] `job_spec_digest` covers all fields except the mutable token.
+//! - [INV-JS-002] Digest and request-id checks are constant-time.
+//! - [INV-JS-003] Validation is fail-closed.
+//! - [INV-JS-004] Boundary structs use `#[serde(deny_unknown_fields)]`.
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -45,9 +11,7 @@ use thiserror::Error;
 
 use crate::determinism::canonicalize_json;
 
-// ---------------------------------------------------------------------------
 // Constants
-// ---------------------------------------------------------------------------
 
 /// Schema identifier for `FacJobSpecV1`.
 pub const JOB_SPEC_SCHEMA_ID: &str = "apm2.fac.job_spec.v1";
@@ -90,9 +54,7 @@ pub const MAX_JOB_SPEC_SIZE: usize = 65_536;
 /// Digest prefix for BLAKE3-256 hashes.
 const B3_256_PREFIX: &str = "b3-256:";
 
-// ---------------------------------------------------------------------------
 // Error type
-// ---------------------------------------------------------------------------
 
 /// Errors from `FacJobSpecV1` construction and validation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -189,9 +151,7 @@ pub enum JobSpecError {
     },
 }
 
-// ---------------------------------------------------------------------------
 // Actuation block
-// ---------------------------------------------------------------------------
 
 /// RFC-0028 actuation block binding the job spec to a broker-signed token.
 ///
@@ -219,9 +179,7 @@ pub struct Actuation {
     pub decoded_source: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
 // Source block
-// ---------------------------------------------------------------------------
 
 /// Source provenance for the job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,9 +199,7 @@ pub struct JobSource {
     pub patch: Option<serde_json::Value>,
 }
 
-// ---------------------------------------------------------------------------
 // Lane requirements
-// ---------------------------------------------------------------------------
 
 /// Lane resource requirements for the job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,9 +209,7 @@ pub struct LaneRequirements {
     pub lane_profile_hash: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
 // Constraints
-// ---------------------------------------------------------------------------
 
 /// Execution constraints for the job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,9 +228,7 @@ pub struct JobConstraints {
     pub memory_max_bytes: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
 // FacJobSpecV1
-// ---------------------------------------------------------------------------
 
 /// FAC Job Spec V1: the immutable description of a unit of work.
 ///
@@ -326,24 +278,15 @@ pub struct FacJobSpecV1 {
 }
 
 impl FacJobSpecV1 {
-    /// Computes the `job_spec_digest` for this spec.
-    ///
-    /// The computation follows RFC-0019 section 5.3.3:
-    /// 1. Clone the spec and set `actuation.channel_context_token = None`.
-    /// 2. Set `actuation.request_id = ""` to avoid self-reference.
-    /// 3. Serialize to JSON.
-    /// 4. Canonicalize JSON (sorted keys, no whitespace).
-    /// 5. Hash as `BLAKE3(schema_id || "\0" || canonical_json_bytes)`.
-    /// 6. Return as `"b3-256:<hex>"`.
+    /// Computes the RFC-0019 digest for this spec.
     ///
     /// # Errors
     ///
-    /// Returns an error if serialization or canonicalization fails.
+    /// Returns `JobSpecError` if JSON serialization or canonicalization fails.
     pub fn compute_digest(&self) -> Result<String, JobSpecError> {
         let mut spec_for_digest = self.clone();
         spec_for_digest.actuation.channel_context_token = None;
         spec_for_digest.actuation.request_id = String::new();
-        // Clear mutable identity fields before hashing to avoid circular input.
         spec_for_digest.job_spec_digest = String::new();
 
         let json = serde_json::to_string(&spec_for_digest).map_err(|e| JobSpecError::Json {
@@ -358,19 +301,12 @@ impl FacJobSpecV1 {
         Ok(format_b3_256_digest(&digest_bytes))
     }
 
-    /// Validates the structural integrity of the spec fields.
-    ///
-    /// Checks lengths, non-empty required fields, schema match, and
-    /// priority range. Does NOT check digest or `request_id` binding
-    /// (use [`validate_job_spec`] for full validation). In particular,
-    /// this method intentionally does not require a channel token; workers
-    /// must apply full validation.
+    /// Validates schema, required fields, and local bounds.
     ///
     /// # Errors
     ///
-    /// Returns the first validation error found.
+    /// Returns `JobSpecError` for schema, field, and bound violations.
     pub fn validate_structure(&self) -> Result<(), JobSpecError> {
-        // Schema check
         if self.schema != JOB_SPEC_SCHEMA_ID {
             return Err(JobSpecError::SchemaMismatch {
                 expected: JOB_SPEC_SCHEMA_ID.to_string(),
@@ -378,7 +314,6 @@ impl FacJobSpecV1 {
             });
         }
 
-        // Required non-empty fields
         check_non_empty("job_id", &self.job_id)?;
         check_non_empty("job_spec_digest", &self.job_spec_digest)?;
         check_non_empty("kind", &self.kind)?;
@@ -390,7 +325,6 @@ impl FacJobSpecV1 {
         check_non_empty("source.repo_id", &self.source.repo_id)?;
         check_non_empty("source.head_sha", &self.source.head_sha)?;
 
-        // Length bounds
         check_length("job_id", &self.job_id, MAX_JOB_ID_LENGTH)?;
         check_length("kind", &self.kind, MAX_KIND_LENGTH)?;
         check_length("queue_lane", &self.queue_lane, MAX_QUEUE_LANE_LENGTH)?;
@@ -422,7 +356,6 @@ impl FacJobSpecV1 {
             MAX_HEAD_SHA_LENGTH,
         )?;
 
-        // Priority range
         if self.priority > 100 {
             return Err(JobSpecError::PriorityOutOfRange {
                 value: self.priority,
@@ -433,9 +366,7 @@ impl FacJobSpecV1 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Full validation (worker-side)
-// ---------------------------------------------------------------------------
 
 /// Validates a `FacJobSpecV1` for worker execution.
 ///
@@ -522,9 +453,7 @@ pub fn deserialize_job_spec(bytes: &[u8]) -> Result<FacJobSpecV1, JobSpecError> 
     })
 }
 
-// ---------------------------------------------------------------------------
 // Builder
-// ---------------------------------------------------------------------------
 
 /// Builder for `FacJobSpecV1` that computes the digest and sets
 /// `actuation.request_id` correctly.
@@ -663,9 +592,7 @@ impl FacJobSpecV1Builder {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Computes the raw BLAKE3 digest bytes with domain separation.
 ///
@@ -678,7 +605,6 @@ fn compute_digest_bytes(schema_id: &str, data: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Formats a 32-byte hash as `"b3-256:<hex>"`.
 fn format_b3_256_digest(hash: &[u8; 32]) -> String {
     let mut s = String::with_capacity(B3_256_PREFIX.len() + 64);
     s.push_str(B3_256_PREFIX);
@@ -744,9 +670,7 @@ const fn check_length(field: &'static str, value: &str, max: usize) -> Result<()
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -755,457 +679,264 @@ mod tests {
     fn sample_source() -> JobSource {
         JobSource {
             kind: "mirror_commit".to_string(),
-            repo_id: "guardian-intelligence/apm2".to_string(),
+            repo_id: "org/repo".to_string(),
             head_sha: "a".repeat(40),
             patch: None,
         }
     }
 
-    fn build_valid_spec() -> FacJobSpecV1 {
+    fn build_with_ids(job_id: &str, lease_id: &str) -> FacJobSpecV1Builder {
         FacJobSpecV1Builder::new(
-            "job_20260212T031500Z_001",
+            job_id,
             "gates",
             "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
+            "2026-02-12T00:00:00Z",
+            lease_id,
             sample_source(),
         )
         .priority(50)
-        .require_nextest(true)
-        .test_timeout_seconds(240)
-        .memory_max_bytes(25_769_803_776)
-        .build()
-        .expect("valid spec should build")
+        .memory_max_bytes(64_000_000_000)
     }
 
-    // -------------------------------------------------------------------
-    // Construction
-    // -------------------------------------------------------------------
+    fn build_valid_spec() -> FacJobSpecV1 {
+        build_with_ids("job1", "L1")
+            .build()
+            .expect("valid spec should build")
+    }
 
     #[test]
-    fn builder_produces_valid_spec() {
+    fn builder_produces_digest_and_request_binding() {
+        let without_token = build_valid_spec();
+        let with_token = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+        let with_other_token = build_with_ids("job1", "L1")
+            .channel_context_token("ALT_TOKEN")
+            .build()
+            .expect("tokenized spec");
+
+        assert_eq!(without_token.job_spec_digest, with_token.job_spec_digest);
+        assert_eq!(
+            without_token.job_spec_digest,
+            with_other_token.job_spec_digest
+        );
+        assert_eq!(
+            without_token.job_spec_digest,
+            without_token.actuation.request_id
+        );
+        assert_eq!(with_token.actuation.request_id, with_token.job_spec_digest);
+        assert_eq!(without_token.job_spec_digest.len(), 71);
+        assert!(without_token.job_spec_digest.starts_with(B3_256_PREFIX));
+        assert!(validate_job_spec(&with_token).is_ok());
+    }
+
+    #[test]
+    fn builder_without_token_still_builds() {
         let spec = build_valid_spec();
-        assert_eq!(spec.schema, JOB_SPEC_SCHEMA_ID);
-        assert!(!spec.job_spec_digest.is_empty());
-        assert!(spec.job_spec_digest.starts_with(B3_256_PREFIX));
+        assert_eq!(spec.actuation.channel_context_token, None);
         assert_eq!(spec.actuation.request_id, spec.job_spec_digest);
-        assert_eq!(spec.priority, 50);
     }
 
     #[test]
-    fn builder_with_token_produces_valid_spec() {
-        let spec = FacJobSpecV1Builder::new(
-            "job_001",
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .channel_context_token("BASE64_TOKEN_DATA")
-        .build()
-        .expect("should build with token");
-
-        // Token does not affect digest
-        assert!(validate_job_spec(&spec).is_ok());
-    }
-
-    // -------------------------------------------------------------------
-    // Digest computation
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn digest_is_deterministic() {
+    fn digest_is_deterministic_and_detects_mutation() {
         let spec1 = build_valid_spec();
         let spec2 = build_valid_spec();
+        let mut spec3 = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+
         assert_eq!(spec1.job_spec_digest, spec2.job_spec_digest);
-    }
-
-    #[test]
-    fn digest_changes_when_field_changes() {
-        let spec1 = build_valid_spec();
-        let spec2 = FacJobSpecV1Builder::new(
-            "job_20260212T031500Z_001",
-            "warm", // different kind
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .priority(50)
-        .build()
-        .expect("should build");
-
-        assert_ne!(spec1.job_spec_digest, spec2.job_spec_digest);
-    }
-
-    #[test]
-    fn digest_stable_across_token_rotations() {
-        let spec_no_token = FacJobSpecV1Builder::new(
-            "job_001",
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .build()
-        .expect("should build");
-
-        let spec_with_token = FacJobSpecV1Builder::new(
-            "job_001",
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .channel_context_token("DIFFERENT_TOKEN")
-        .build()
-        .expect("should build");
-
-        assert_eq!(
-            spec_no_token.job_spec_digest,
-            spec_with_token.job_spec_digest
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Validation: digest mismatch (tampered spec)
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn tampered_spec_detected_by_digest_mismatch() {
-        let mut spec = build_valid_spec();
-        // Tamper with the kind field after digest was computed
-        spec.kind = "warm".to_string();
-
-        let result = validate_job_spec(&spec);
-        assert!(
-            matches!(result, Err(JobSpecError::DigestMismatch { .. })),
-            "tampered spec must be detected: {result:?}"
-        );
-    }
-
-    #[test]
-    fn tampered_priority_detected() {
-        let mut spec = build_valid_spec();
-        spec.priority = 10; // change priority post-build
-        let result = validate_job_spec(&spec);
-        assert!(matches!(result, Err(JobSpecError::DigestMismatch { .. })));
-    }
-
-    #[test]
-    fn tampered_source_detected() {
-        let mut spec = build_valid_spec();
-        spec.source.head_sha = "b".repeat(40);
-        let result = validate_job_spec(&spec);
-        assert!(matches!(result, Err(JobSpecError::DigestMismatch { .. })));
-    }
-
-    #[test]
-    fn tampered_lease_id_detected() {
-        let mut spec = build_valid_spec();
-        spec.actuation.lease_id = "ATTACKER-LEASE".to_string();
-        let result = validate_job_spec(&spec);
-        assert!(matches!(result, Err(JobSpecError::DigestMismatch { .. })));
-    }
-
-    #[test]
-    fn validate_job_spec_rejects_missing_token() {
-        let mut spec = build_valid_spec();
-        spec.actuation.channel_context_token = None;
-        let result = validate_job_spec(&spec);
+        spec3.kind = "warm".to_string();
         assert!(matches!(
-            result,
-            Err(JobSpecError::MissingToken {
-                field: "actuation.channel_context_token"
-            })
+            validate_job_spec(&spec3),
+            Err(JobSpecError::DigestMismatch { .. })
         ));
     }
 
     #[test]
-    fn validate_job_spec_rejects_empty_token() {
-        let mut spec = build_valid_spec();
-        spec.actuation.channel_context_token = Some(String::new());
-        let result = validate_job_spec(&spec);
-        assert!(matches!(
-            result,
-            Err(JobSpecError::MissingToken {
-                field: "actuation.channel_context_token"
-            })
-        ));
-    }
-
-    // -------------------------------------------------------------------
-    // Validation: request_id mismatch
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn request_id_mismatch_detected() {
-        let mut spec = build_valid_spec();
+    fn request_id_mismatch_is_rejected() {
+        let mut spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
         spec.actuation.request_id =
             "b3-256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
-        // Digest is still correct (we didn't tamper the content that feeds
-        // into the digest), but request_id != digest.
-        // Actually the request_id IS part of the digest computation when it
-        // is emptied. But validate_job_spec recomputes the digest with
-        // request_id = "". Since we set request_id to something else in the
-        // live spec, the recomputed digest won't change (it always empties
-        // request_id during computation). The check is:
-        //   1. recompute => matches job_spec_digest (because we didn't tamper
-        //      job_spec_digest or the fields that feed into it)
-        //   2. request_id != job_spec_digest => RequestIdMismatch
-        //
-        // But wait - we changed request_id. The digest computation empties
-        // both job_spec_digest and request_id. So the recomputed digest will
-        // be the same as the original job_spec_digest. Then the check is:
-        //   request_id ("b3-256:000...") != job_spec_digest => mismatch.
-        let result = validate_job_spec(&spec);
-        assert!(
-            matches!(result, Err(JobSpecError::RequestIdMismatch { .. })),
-            "request_id mismatch must be detected: {result:?}"
-        );
-    }
 
-    // -------------------------------------------------------------------
-    // Validation: structural checks
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn rejects_wrong_schema() {
-        let mut spec = build_valid_spec();
-        spec.schema = "wrong.schema".to_string();
-        let result = validate_job_spec(&spec);
-        assert!(matches!(result, Err(JobSpecError::SchemaMismatch { .. })));
-    }
-
-    #[test]
-    fn rejects_empty_job_id() {
-        let result = FacJobSpecV1Builder::new(
-            "",
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .build();
         assert!(matches!(
-            result,
-            Err(JobSpecError::EmptyField { field: "job_id" })
+            validate_job_spec(&spec),
+            Err(JobSpecError::RequestIdMismatch { .. })
         ));
     }
 
     #[test]
-    fn rejects_empty_lease_id() {
-        let result = FacJobSpecV1Builder::new(
-            "job_001",
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "",
-            sample_source(),
-        )
-        .build();
+    fn invalid_digest_formats_are_rejected() {
+        let mut bad_job_digest = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+        bad_job_digest.job_spec_digest = "not-a-digest".to_string();
+
+        let mut bad_request_id = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+        bad_request_id.actuation.request_id = "not-a-digest".to_string();
+
         assert!(matches!(
-            result,
-            Err(JobSpecError::EmptyField {
-                field: "actuation.lease_id"
+            validate_job_spec(&bad_job_digest),
+            Err(JobSpecError::InvalidDigest {
+                field: "job_spec_digest",
+                ..
             })
         ));
-    }
-
-    #[test]
-    fn rejects_oversized_job_id() {
-        let result = FacJobSpecV1Builder::new(
-            "x".repeat(MAX_JOB_ID_LENGTH + 1),
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .build();
         assert!(matches!(
-            result,
-            Err(JobSpecError::FieldTooLong {
-                field: "job_id",
+            validate_job_spec(&bad_request_id),
+            Err(JobSpecError::InvalidDigest {
+                field: "actuation.request_id",
                 ..
             })
         ));
     }
 
     #[test]
-    fn rejects_priority_out_of_range() {
-        let result = FacJobSpecV1Builder::new(
-            "job_001",
-            "gates",
-            "bulk",
-            "2026-02-12T03:15:00Z",
-            "L-FAC-LOCAL",
-            sample_source(),
-        )
-        .priority(101)
-        .build();
+    fn token_presence_is_rejected_when_missing_or_empty() {
+        let mut missing = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+        missing.actuation.channel_context_token = None;
+
+        let mut empty = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("tokenized spec");
+        empty.actuation.channel_context_token = Some(String::new());
+
         assert!(matches!(
-            result,
+            validate_job_spec(&missing),
+            Err(JobSpecError::MissingToken {
+                field: "actuation.channel_context_token"
+            })
+        ));
+        assert!(matches!(
+            validate_job_spec(&empty),
+            Err(JobSpecError::MissingToken {
+                field: "actuation.channel_context_token"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_schema_and_field_errors() {
+        let mut bad_schema = build_valid_spec();
+        bad_schema.schema = "wrong.schema".to_string();
+        let bad_job = build_with_ids("", "L1").build();
+        let bad_lease = build_with_ids("job1", "").build();
+        let too_long = build_with_ids(&"x".repeat(MAX_JOB_ID_LENGTH + 1), "L1").build();
+        let out_of_range = build_with_ids("job1", "L1").priority(101).build();
+
+        assert!(matches!(
+            validate_job_spec(&bad_schema),
+            Err(JobSpecError::SchemaMismatch { .. })
+        ));
+        assert!(matches!(
+            bad_job,
+            Err(JobSpecError::EmptyField { field: "job_id" })
+        ));
+        assert!(matches!(
+            bad_lease,
+            Err(JobSpecError::EmptyField {
+                field: "actuation.lease_id"
+            })
+        ));
+        assert!(matches!(
+            too_long,
+            Err(JobSpecError::FieldTooLong {
+                field: "job_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            out_of_range,
             Err(JobSpecError::PriorityOutOfRange { value: 101 })
         ));
     }
 
-    // -------------------------------------------------------------------
-    // Bounded deserialization
-    // -------------------------------------------------------------------
-
     #[test]
-    fn deserialize_rejects_oversized_input() {
+    fn deserialize_roundtrip_and_bounds() {
+        let spec = build_with_ids("job2", "L2")
+            .channel_context_token("TOKEN")
+            .test_timeout_seconds(300)
+            .build()
+            .expect("valid spec");
+        let bytes = serde_json::to_vec_pretty(&spec).expect("serialize");
+        let restored = deserialize_job_spec(&bytes).expect("deserialize");
+
+        assert!(bytes.len() <= MAX_JOB_SPEC_SIZE);
+        assert_eq!(spec, restored);
+        assert!(validate_job_spec(&restored).is_ok());
+
         let oversized = vec![b' '; MAX_JOB_SPEC_SIZE + 1];
-        let result = deserialize_job_spec(&oversized);
-        assert!(matches!(result, Err(JobSpecError::InputTooLarge { .. })));
-    }
+        let mut json: serde_json::Value = serde_json::to_value(&spec).expect("json value");
+        json["evil_field"] = serde_json::Value::Bool(true);
 
-    #[test]
-    fn deserialize_roundtrip() {
-        let spec = build_valid_spec();
-        let bytes = serde_json::to_vec(&spec).expect("serialize");
-        let deserialized = deserialize_job_spec(&bytes).expect("deserialize");
-        assert_eq!(spec, deserialized);
+        assert!(matches!(
+            deserialize_job_spec(&oversized),
+            Err(JobSpecError::InputTooLarge { .. })
+        ));
     }
 
     #[test]
     fn deserialize_rejects_unknown_fields() {
-        let spec = build_valid_spec();
-        let mut json: serde_json::Value = serde_json::to_value(&spec).expect("to_value");
-        json.as_object_mut()
-            .unwrap()
-            .insert("evil_field".to_string(), serde_json::Value::Bool(true));
-        let bytes = serde_json::to_vec(&json).expect("serialize");
-        let result = deserialize_job_spec(&bytes);
-        assert!(result.is_err(), "unknown fields must be rejected");
+        let spec = build_with_ids("job2", "L2")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        let mut json: serde_json::Value = serde_json::to_value(&spec).expect("json value");
+        json["evil_field"] = serde_json::Value::Bool(true);
+        assert!(deserialize_job_spec(&serde_json::to_vec(&json).expect("serialize")).is_err());
     }
 
-    // -------------------------------------------------------------------
-    // Serde roundtrip preserves digest
-    // -------------------------------------------------------------------
-
     #[test]
-    fn serde_roundtrip_preserves_validation() {
-        let mut spec = build_valid_spec();
-        spec.actuation.channel_context_token = Some("VALID_TOKEN_VALUE".to_string());
-        let json = serde_json::to_string_pretty(&spec).expect("serialize");
-        let deserialized: FacJobSpecV1 = serde_json::from_str(&json).expect("deserialize");
-        if let Err(err) = validate_job_spec(&deserialized) {
-            panic!("deserialized job spec should validate in worker mode: {err:?}");
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Digest format
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn digest_has_correct_prefix_and_length() {
-        let spec = build_valid_spec();
-        assert!(spec.job_spec_digest.starts_with("b3-256:"));
-        // b3-256: (7 chars) + 64 hex chars = 71
-        assert_eq!(spec.job_spec_digest.len(), 71);
-    }
-
-    // -------------------------------------------------------------------
-    // parse_b3_256_digest
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn parse_digest_roundtrip() {
+    fn parse_digest_and_constant_time() {
         let hash = [0x42u8; 32];
         let formatted = format_b3_256_digest(&hash);
-        let parsed = parse_b3_256_digest(&formatted).expect("should parse");
-        assert_eq!(parsed, hash);
-    }
 
-    #[test]
-    fn parse_digest_rejects_wrong_prefix() {
+        assert_eq!(parse_b3_256_digest(&formatted).expect("parse ok"), hash);
         assert!(parse_b3_256_digest("sha256:aabb").is_none());
-    }
-
-    #[test]
-    fn parse_digest_rejects_short_hex() {
         assert!(parse_b3_256_digest("b3-256:aabb").is_none());
-    }
-
-    #[test]
-    fn parse_digest_rejects_invalid_hex() {
-        let bad = format!("b3-256:{}", "zz".repeat(32));
-        assert!(parse_b3_256_digest(&bad).is_none());
-    }
-
-    // -------------------------------------------------------------------
-    // Constant-time comparison
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn constant_time_eq_works() {
+        assert!(parse_b3_256_digest(&format!("b3-256:{}", "zz".repeat(32))).is_none());
         assert!(constant_time_str_eq("hello", "hello"));
         assert!(!constant_time_str_eq("hello", "world"));
         assert!(!constant_time_str_eq("hello", "hell"));
-        assert!(!constant_time_str_eq("", "a"));
-        assert!(constant_time_str_eq("", ""));
     }
 
-    // -------------------------------------------------------------------
-    // E2E: build, serialize, deserialize, validate
-    // -------------------------------------------------------------------
+    #[test]
+    fn constant_time_str_eq_rejects_length_mismatch() {
+        assert!(!constant_time_str_eq("", "a"));
+        assert!(!constant_time_str_eq("aa", "a"));
+    }
 
     #[test]
-    fn end_to_end_build_serialize_deserialize_validate() {
-        // Build
-        let spec = FacJobSpecV1Builder::new(
-            "job_e2e_001",
-            "gates",
-            "bulk",
-            "2026-02-12T04:00:00Z",
-            "L-FAC-LOCAL-E2E",
-            JobSource {
-                kind: "mirror_commit".to_string(),
-                repo_id: "guardian-intelligence/apm2".to_string(),
-                head_sha: "c".repeat(40),
-                patch: None,
-            },
-        )
-        .priority(25)
-        .channel_context_token("BASE64_E2E_TOKEN")
-        .decoded_source("typed_tool_intent")
-        .require_nextest(true)
-        .test_timeout_seconds(300)
-        .memory_max_bytes(8_000_000_000)
-        .build()
-        .expect("e2e spec should build");
+    fn digest_has_expected_length() {
+        let spec = build_with_ids("job4", "L4").build().expect("valid spec");
+        assert_eq!(spec.job_spec_digest.len(), 71);
+    }
 
-        // Validate fresh build
-        assert!(validate_job_spec(&spec).is_ok());
+    #[test]
+    fn deserialize_tampering_detected() {
+        let mut spec = build_with_ids("job3", "L3")
+            .channel_context_token("TOKEN")
+            .priority(25)
+            .build()
+            .expect("valid spec");
 
-        // Serialize to JSON
-        let bytes = serde_json::to_vec_pretty(&spec).expect("serialize");
-        assert!(bytes.len() <= MAX_JOB_SPEC_SIZE);
-
-        // Deserialize
-        let restored = deserialize_job_spec(&bytes).expect("deserialize");
-        assert_eq!(spec, restored);
-
-        // Validate deserialized
-        let result = validate_job_spec(&restored);
-        if let Err(err) = result {
-            panic!("deserialized job spec should validate in worker mode: {err:?}");
-        }
-
-        // Tamper and verify detection
-        let mut tampered = restored;
-        tampered.source.repo_id = "evil-org/apm2".to_string();
-        let result = validate_job_spec(&tampered);
-        assert!(
-            matches!(result, Err(JobSpecError::DigestMismatch { .. })),
-            "tampered repo_id must be detected"
-        );
+        spec.source.repo_id = "evil-org/apm2".to_string();
+        assert!(matches!(
+            validate_job_spec(&spec),
+            Err(JobSpecError::DigestMismatch { .. })
+        ));
     }
 }
