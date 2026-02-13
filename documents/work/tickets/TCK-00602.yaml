@@ -47,6 +47,10 @@ ticket_meta:
       - "Keep FAC agent lifecycle E2E coverage behind an explicit gated path (`e2e-agent-tests`) so default test runs remain safe while replacement lifecycle harnesses stay runnable on demand."
       - "Add a daemon test policy note documenting that full agent-lifecycle E2E tests are not part of the default suite and must run with temp `APM2_HOME`, mock GitHub adapters, and EVID-HEF-0012 constraints when enabled."
       - "Eliminate credential value exposure on systemd-run argv by forwarding allowlisted environment variables via `--setenv NAME` (name-only) instead of `NAME=value`."
+      - "Require decision-projection-backed authority for `apm2 fac review terminate`; fail closed when trusted reviewer identity or signed decision metadata is missing."
+      - "Write manual termination receipts with decision metadata sourced from decision-bound authority (`decision_comment_id`, `decision_author`, `decision_signature`)."
+      - "Remove legacy missing-HMAC migration in run-state integrity verification; fail closed when `integrity_hmac` is absent on PID-bearing state."
+      - "Bound run-secret file reads and enforce decoded secret length = 32 bytes."
       - "Perform one-time cleanup of leaked fac_review test artifacts under `~/.apm2/review_locks/` and `~/.apm2/reviews/`."
     out_of_scope:
       - "Sandbox mode migration for Codex/Gemini backends (requires upstream support)."
@@ -67,10 +71,13 @@ ticket_meta:
       - "backend.rs Gemini initial command includes `-y` flag."
       - "`run_decision_set` terminates the review agent process after persisting the decision."
       - "Process identity verification prevents killing unrelated processes on PID reuse."
+      - "`apm2 fac review terminate` fails closed unless decision-bound authority is present in local projection data."
+      - "Run-state integrity verification rejects PID-bearing state without `integrity_hmac`."
+      - "Run-secret loading rejects oversized files and non-32-byte decoded secrets."
       - "`cargo clippy -p apm2-cli -p apm2-core -- -D warnings` passes clean."
       - "`cargo test -p apm2-cli fac_review` — all tests pass."
   notes:
-    security: "E2E agent tests that spawn full agent lifecycles are banned from the default test suite; when enabled they must use temp `APM2_HOME`, mock GitHub adapters, and satisfy EVID-HEF-0012."
+    security: "E2E agent tests that spawn full agent lifecycles are banned from the default test suite; when enabled they must use temp `APM2_HOME`, mock GitHub adapters, and satisfy EVID-HEF-0012. Manual terminate is decision-authority-gated and fails closed without signed decision projection."
     critical_files:
       - "crates/apm2-cli/src/commands/fac_review/backend.rs — Codex/Gemini command builders"
       - "crates/apm2-cli/src/commands/fac_review/decision.rs — terminate_review_agent + call site"

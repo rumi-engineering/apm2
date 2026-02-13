@@ -1,6 +1,8 @@
 //! FAC-native per-dimension decision projection (`approve` / `deny`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::ValueEnum;
@@ -10,13 +12,15 @@ use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticat
 use super::target::resolve_pr_target;
 use super::types::{
     COMMENT_CONFIRM_MAX_PAGES, ReviewRunStatus, TerminationAuthority, apm2_home_dir, now_iso8601,
-    validate_expected_head_sha,
+    sanitize_for_path, validate_expected_head_sha,
 };
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-decision:v1";
 const DECISION_SCHEMA: &str = "apm2.review.decision.v1";
+const PROJECTION_ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
+const PROJECTION_REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 
 const SECURITY_DIMENSION: &str = "security";
 const CODE_QUALITY_DIMENSION: &str = "code-quality";
@@ -79,6 +83,24 @@ struct IssueUser {
 struct ParsedDecisionComment {
     comment: IssueComment,
     payload: DecisionComment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionIssueCommentsCache {
+    schema: String,
+    owner_repo: String,
+    pr_number: u32,
+    updated_at: String,
+    comments: Vec<IssueComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionReviewerIdentity {
+    schema: String,
+    reviewer_id: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -669,6 +691,150 @@ fn signature_for_payload(payload: &DecisionComment) -> String {
         .join("|")
 }
 
+fn review_type_to_dimension(review_type: &str) -> Result<&'static str, String> {
+    let normalized = review_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "security" => Ok(SECURITY_DIMENSION),
+        "quality" | "code-quality" => Ok(CODE_QUALITY_DIMENSION),
+        other => Err(format!(
+            "unsupported review type `{other}` for termination authority (expected security|quality)"
+        )),
+    }
+}
+
+fn projection_pr_dir_for_home(home: &Path, owner_repo: &str, pr_number: u32) -> PathBuf {
+    home.join("fac_projection")
+        .join("repos")
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}"))
+}
+
+fn load_projection_reviewer_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<String, String> {
+    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("reviewer.json");
+    let bytes = fs::read(&path).map_err(|err| {
+        format!(
+            "failed to read reviewer projection {}: {err}",
+            path.display()
+        )
+    })?;
+    let payload: ProjectionReviewerIdentity = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse reviewer projection {}: {err}",
+            path.display()
+        )
+    })?;
+    if payload.schema != PROJECTION_REVIEWER_SCHEMA {
+        return Err(format!(
+            "invalid reviewer projection schema in {}: {}",
+            path.display(),
+            payload.schema
+        ));
+    }
+    let reviewer = payload.reviewer_id.trim();
+    if reviewer.is_empty() {
+        return Err(format!(
+            "reviewer projection {} is missing reviewer_id",
+            path.display()
+        ));
+    }
+    Ok(reviewer.to_string())
+}
+
+fn load_projection_issue_comments_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Vec<IssueComment>, String> {
+    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("issue_comments.json");
+    let bytes = fs::read(&path).map_err(|err| {
+        format!(
+            "failed to read issue comment projection {}: {err}",
+            path.display()
+        )
+    })?;
+    let payload: ProjectionIssueCommentsCache = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse issue comment projection {}: {err}",
+            path.display()
+        )
+    })?;
+    if payload.schema != PROJECTION_ISSUE_COMMENTS_SCHEMA {
+        return Err(format!(
+            "invalid issue comment projection schema in {}: {}",
+            path.display(),
+            payload.schema
+        ));
+    }
+    if !payload.owner_repo.eq_ignore_ascii_case(owner_repo) {
+        return Err(format!(
+            "issue comment projection repo mismatch in {}: expected {} got {}",
+            path.display(),
+            owner_repo,
+            payload.owner_repo
+        ));
+    }
+    if payload.pr_number != pr_number {
+        return Err(format!(
+            "issue comment projection PR mismatch in {}: expected {} got {}",
+            path.display(),
+            pr_number,
+            payload.pr_number
+        ));
+    }
+    Ok(payload.comments)
+}
+
+pub(super) fn resolve_termination_authority_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+    run_id: &str,
+) -> Result<TerminationAuthority, String> {
+    validate_expected_head_sha(head_sha)?;
+    let dimension = review_type_to_dimension(review_type)?;
+    let trusted_reviewer = load_projection_reviewer_for_home(home, owner_repo, pr_number)?;
+    let comments = load_projection_issue_comments_for_home(home, owner_repo, pr_number)?;
+    let parsed = parse_decision_comments_for_author(&comments, Some(&trusted_reviewer));
+    let latest = latest_for_sha(&parsed, head_sha).ok_or_else(|| {
+        format!(
+            "missing decision projection for PR #{pr_number} sha {head_sha} (trusted reviewer: {trusted_reviewer})"
+        )
+    })?;
+    let decision_entry = latest.payload.dimensions.get(dimension).ok_or_else(|| {
+        format!(
+            "decision projection for PR #{pr_number} sha {head_sha} is missing `{dimension}` dimension"
+        )
+    })?;
+    if normalize_decision_value(&decision_entry.decision).is_none() {
+        return Err(format!(
+            "decision projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
+            decision_entry.decision
+        ));
+    }
+    let signature = signature_for_payload(&latest.payload);
+    if signature.trim().is_empty() {
+        return Err(format!(
+            "decision projection for PR #{pr_number} sha {head_sha} produced empty signature"
+        ));
+    }
+    Ok(TerminationAuthority::from_decision_persist(
+        owner_repo,
+        pr_number,
+        review_type,
+        head_sha,
+        run_id,
+        latest.comment.id,
+        &trusted_reviewer,
+        &signature,
+    ))
+}
+
 fn render_decision_comment_body(payload: &DecisionComment) -> Result<String, String> {
     let yaml = serde_yaml::to_string(payload)
         .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
@@ -862,7 +1028,7 @@ fn terminate_review_agent_for_home(
             "failed to terminate review agent pid {pid}: missing proc_start_time"
         )));
     };
-    if let Err(err) = super::state::verify_review_run_state_integrity_binding(home, &mut state) {
+    if let Err(err) = super::state::verify_review_run_state_integrity_binding(home, &state) {
         return Ok(TerminationOutcome::IntegrityFailure(err));
     }
 

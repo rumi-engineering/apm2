@@ -39,6 +39,9 @@ pub struct ReviewRunTerminationReceipt {
 }
 
 type HmacSha256 = Hmac<Sha256>;
+const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
+const RUN_SECRET_LEN_BYTES: usize = 32;
+const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -186,14 +189,41 @@ pub fn read_run_secret_for_home(
         Err(err) if err == "run secret missing" => return Ok(None),
         Err(err) => return Err(err),
     };
+    let size = file
+        .metadata()
+        .map_err(|err| format!("failed to stat run secret {}: {err}", path.display()))?
+        .len();
+    if size > RUN_SECRET_MAX_FILE_BYTES {
+        return Err(format!(
+            "run secret {} exceeds maximum size ({} > {})",
+            path.display(),
+            size,
+            RUN_SECRET_MAX_FILE_BYTES
+        ));
+    }
     let mut encoded = String::new();
     file.read_to_string(&mut encoded)
         .map_err(|err| format!("failed to read run secret {}: {err}", path.display()))?;
-    if encoded.trim().is_empty() {
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
         return Ok(None);
     }
-    let secret = hex::decode(encoded.trim())
+    if encoded.len() > RUN_SECRET_MAX_ENCODED_CHARS {
+        return Err(format!(
+            "run secret {} exceeds maximum encoded length",
+            path.display()
+        ));
+    }
+    let secret = hex::decode(encoded)
         .map_err(|err| format!("failed to decode run secret {}: {err}", path.display()))?;
+    if secret.len() != RUN_SECRET_LEN_BYTES {
+        return Err(format!(
+            "run secret {} has invalid length {} (expected {})",
+            path.display(),
+            secret.len(),
+            RUN_SECRET_LEN_BYTES
+        ));
+    }
     Ok(Some(secret))
 }
 
@@ -442,11 +472,11 @@ pub fn load_review_run_state_verified_for_home(
     let canonical = review_run_state_path_for_home(home, pr_number, review_type);
     let run_state_load = load_review_run_state_for_home(home, pr_number, review_type)?;
     match run_state_load {
-        ReviewRunStateLoad::Present(mut state) => {
+        ReviewRunStateLoad::Present(state) => {
             if state.pid.is_none() {
                 return Ok(ReviewRunStateLoad::Present(state));
             }
-            if let Err(err) = verify_review_run_state_integrity_binding(home, &mut state) {
+            if let Err(err) = verify_review_run_state_integrity_binding(home, &state) {
                 return Ok(ReviewRunStateLoad::Corrupt {
                     path: canonical,
                     error: format!("run-state integrity verification failed: {err}"),
@@ -594,36 +624,18 @@ pub fn write_review_run_state_integrity_receipt_for_home(
 
 pub fn verify_review_run_state_integrity_binding(
     home: &Path,
-    state: &mut ReviewRunState,
+    state: &ReviewRunState,
 ) -> Result<(), String> {
-    let pid = state
-        .pid
-        .ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
-    let recorded_proc_start_time = state
-        .proc_start_time
-        .ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+    if state.pid.is_none() || state.proc_start_time.is_none() {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
     let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
         Some(secret) => secret,
         None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
     };
 
     let Some(stored) = state.integrity_hmac.as_deref() else {
-        let observed_proc_start_time =
-            get_process_start_time(pid).ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
-        if observed_proc_start_time != recorded_proc_start_time {
-            return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
-        }
-        bind_review_run_state_integrity(state, &secret)?;
-        let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
-        write_review_run_state_to_path(&path, state)
-            .map_err(|err| format!("failed to persist migrated integrity binding: {err}"))?;
-        eprintln!(
-            "WARNING: migrated legacy run-state integrity binding for PR #{} type={} path={}",
-            state.pr_number,
-            state.review_type,
-            path.display()
-        );
-        return Ok(());
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
     };
     let expected =
         hex::decode(stored).map_err(|err| format!("failed to decode integrity_hmac: {err}"))?;
@@ -1080,6 +1092,38 @@ mod tests {
     }
 
     #[test]
+    fn test_read_run_secret_rejects_oversized_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let path = review_run_secret_path_for_home(home, 441, "security");
+        std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
+        std::fs::write(&path, "a".repeat(129)).expect("write oversized run secret");
+
+        let err = read_run_secret_for_home(home, 441, "security")
+            .expect_err("oversized run secret must fail closed");
+        assert!(
+            err.contains("exceeds maximum size") || err.contains("maximum encoded length"),
+            "unexpected error detail: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_run_secret_rejects_non_32_byte_secret() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let path = review_run_secret_path_for_home(home, 441, "security");
+        std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
+        std::fs::write(&path, hex::encode([0u8; 16])).expect("write short run secret");
+
+        let err = read_run_secret_for_home(home, 441, "security")
+            .expect_err("non-32-byte run secret must fail closed");
+        assert!(
+            err.contains("invalid length"),
+            "unexpected error detail: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_process_start_time_extracts_field_22() {
         let stat =
             "12345 (apm2 worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 21 22";
@@ -1289,6 +1333,40 @@ mod tests {
             },
             other => panic!("expected corrupt state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_load_review_run_state_verified_rejects_live_pid_without_integrity_hmac() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn persistent child");
+        let pid = child.id();
+        let proc_start_time = get_process_start_time(pid).expect("read process start time");
+
+        let mut state = sample_state();
+        state.pid = Some(pid);
+        state.proc_start_time = Some(proc_start_time);
+        state.integrity_hmac = None;
+        let path = review_run_state_path_for_home(home, 441, "security");
+        write_review_run_state_to_path(&path, &state).expect("write run-state without integrity");
+
+        let loaded =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        match loaded {
+            ReviewRunStateLoad::Corrupt { error, .. } => {
+                assert!(
+                    error.contains("integrity"),
+                    "expected integrity verification failure, got: {error}"
+                );
+            },
+            other => panic!("expected corrupt state, got {other:?}"),
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

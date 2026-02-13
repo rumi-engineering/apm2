@@ -995,13 +995,35 @@ fn run_terminate_inner_for_home(
 
     if run_state.pid.is_some() && run_state.proc_start_time.is_some() {
         if let Err(integrity_err) =
-            state::verify_review_run_state_integrity_binding(home, &mut run_state)
+            state::verify_review_run_state_integrity_binding(home, &run_state)
         {
             return Err(format!(
                 "integrity verification failed for PR #{resolved_pr} type={review_type}: {integrity_err} -- \
                  refusing to terminate based on potentially tampered state"
             ));
         }
+    }
+
+    let authority = decision::resolve_termination_authority_for_home(
+        home,
+        &owner_repo,
+        resolved_pr,
+        review_type,
+        &run_state.head_sha,
+        &run_state.run_id,
+    )
+    .map_err(|err| {
+        format!(
+            "decision-bound authority required for PR #{resolved_pr} type={review_type} termination: {err}"
+        )
+    })?;
+    authority.matches_state(&run_state).map_err(|err| {
+        format!("decision authority mismatch for PR #{resolved_pr} type={review_type}: {err}")
+    })?;
+    if !authority.decision_signature_present() {
+        return Err(format!(
+            "decision-bound authority required for PR #{resolved_pr} type={review_type}: missing decision signature"
+        ));
     }
 
     let mut killed = false;
@@ -1014,7 +1036,7 @@ fn run_terminate_inner_for_home(
     }
 
     run_state.status = types::ReviewRunStatus::Failed;
-    run_state.terminal_reason = Some("manual_termination".to_string());
+    run_state.terminal_reason = Some("manual_termination_decision_bound".to_string());
     state::write_review_run_state_for_home(home, &run_state)?;
 
     let receipt = state::ReviewRunTerminationReceipt {
@@ -1024,15 +1046,18 @@ fn run_terminate_inner_for_home(
         review_type: review_type.to_string(),
         run_id: run_state.run_id.clone(),
         head_sha: run_state.head_sha.clone(),
-        decision_comment_id: 0,
-        decision_author: "manual_operator".to_string(),
-        decision_signature: String::new(),
+        decision_comment_id: authority.decision_comment_id,
+        decision_author: authority.decision_author.clone(),
+        decision_signature: authority.decision_signature.clone(),
         outcome: if killed {
             "killed".to_string()
         } else {
             "already_dead".to_string()
         },
-        outcome_reason: Some("manual_termination via `apm2 fac review terminate`".to_string()),
+        outcome_reason: Some(format!(
+            "manual_termination via `apm2 fac review terminate` decision_comment_id={}",
+            authority.decision_comment_id
+        )),
     };
     state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
 
@@ -1583,6 +1608,83 @@ mod tests {
         pid
     }
 
+    fn projection_pr_dir_for_home(
+        home: &std::path::Path,
+        owner_repo: &str,
+        pr_number: u32,
+    ) -> PathBuf {
+        home.join("fac_projection")
+            .join("repos")
+            .join(super::types::sanitize_for_path(owner_repo))
+            .join(format!("pr-{pr_number}"))
+    }
+
+    fn seed_decision_projection_for_terminate(
+        home: &std::path::Path,
+        owner_repo: &str,
+        pr_number: u32,
+        review_type: &str,
+        head_sha: &str,
+        reviewer_login: &str,
+        comment_id: u64,
+    ) {
+        let pr_dir = projection_pr_dir_for_home(home, owner_repo, pr_number);
+        std::fs::create_dir_all(&pr_dir).expect("create projection pr dir");
+        let dimension = if review_type.eq_ignore_ascii_case("quality") {
+            "code-quality"
+        } else {
+            "security"
+        };
+        let decision_yaml = serde_yaml::to_string(&serde_json::json!({
+            "schema": "apm2.review.decision.v1",
+            "pr": pr_number,
+            "sha": head_sha,
+            "updated_at": "2026-02-13T00:00:00Z",
+            "dimensions": {
+                dimension: {
+                    "decision": "approve",
+                    "reason": "test decision authority",
+                    "set_by": reviewer_login,
+                    "set_at": "2026-02-13T00:00:00Z"
+                }
+            }
+        }))
+        .expect("serialize decision yaml");
+        let body = format!("<!-- apm2-review-decision:v1 -->\n```yaml\n{decision_yaml}```\n");
+        let issue_comments_payload = serde_json::json!({
+            "schema": "apm2.fac.projection.issue_comments.v1",
+            "owner_repo": owner_repo,
+            "pr_number": pr_number,
+            "updated_at": "2026-02-13T00:00:00Z",
+            "comments": [
+                {
+                    "id": comment_id,
+                    "body": body,
+                    "html_url": format!("https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"),
+                    "created_at": "2026-02-13T00:00:00Z",
+                    "user": {
+                        "login": reviewer_login
+                    }
+                }
+            ]
+        });
+        let reviewer_payload = serde_json::json!({
+            "schema": "apm2.fac.projection.reviewer.v1",
+            "reviewer_id": reviewer_login,
+            "updated_at": "2026-02-13T00:00:00Z"
+        });
+        std::fs::write(
+            pr_dir.join("issue_comments.json"),
+            serde_json::to_vec_pretty(&issue_comments_payload).expect("serialize issue comments"),
+        )
+        .expect("write issue comments projection");
+        std::fs::write(
+            pr_dir.join("reviewer.json"),
+            serde_json::to_vec_pretty(&reviewer_payload).expect("serialize reviewer projection"),
+        )
+        .expect("write reviewer projection");
+    }
+
     #[test]
     fn test_select_review_model_random_returns_pool_member() {
         let models = MODEL_POOL
@@ -1905,8 +2007,18 @@ mod tests {
         let child = spawn_persistent_process();
         let pid = child.id();
         let observed_start = super::state::get_process_start_time(pid).expect("read start time");
-        let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(observed_start + 1));
+        let head_sha = "abcdef1234567890abcdef1234567890abcdef12";
+        let state = sample_run_state(pr_number, pid, head_sha, Some(observed_start + 1));
         super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+        seed_decision_projection_for_terminate(
+            home,
+            "example/repo",
+            pr_number,
+            "security",
+            head_sha,
+            "test-reviewer",
+            43,
+        );
 
         let result = super::run_terminate_inner_for_home(
             home,
@@ -2082,8 +2194,22 @@ mod tests {
         let home = temp.path();
         let state_path = super::state::review_run_state_path_for_home(home, pr_number, "security");
         let dead_pid = dead_pid_for_test();
-        let state = sample_run_state(pr_number, dead_pid, "abcdef1234567890", Some(123_456_789));
+        let state = sample_run_state(
+            pr_number,
+            dead_pid,
+            "abcdef1234567890abcdef1234567890abcdef12",
+            Some(123_456_789),
+        );
         super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+        seed_decision_projection_for_terminate(
+            home,
+            "example/repo",
+            pr_number,
+            "security",
+            &state.head_sha,
+            "test-reviewer",
+            42,
+        );
 
         super::run_terminate_inner_for_home(
             home,
@@ -2106,13 +2232,56 @@ mod tests {
         assert_eq!(receipt["repo"], serde_json::json!("example/repo"));
         assert_eq!(receipt["review_type"], serde_json::json!("security"));
         assert_eq!(receipt["outcome"], serde_json::json!("already_dead"));
+        assert_eq!(receipt["decision_comment_id"], serde_json::json!(42));
         assert_eq!(
             receipt["decision_author"],
-            serde_json::json!("manual_operator")
+            serde_json::json!("test-reviewer")
+        );
+        assert_eq!(
+            receipt["decision_signature"],
+            serde_json::json!("security:approve|code-quality:missing")
         );
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(receipt_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_without_decision_projection() {
+        let pr_number = next_test_pr();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let dead_pid = dead_pid_for_test();
+        let state = sample_run_state(
+            pr_number,
+            dead_pid,
+            "abcdef1234567890abcdef1234567890abcdef12",
+            Some(123_456_789),
+        );
+        super::state::write_review_run_state_for_home(home, &state).expect("write run state");
+
+        let result = super::run_terminate_inner_for_home(
+            home,
+            "example/repo",
+            Some(pr_number),
+            None,
+            "security",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "terminate must fail without decision authority"
+        );
+        let error = result.expect_err("expected decision authority error");
+        assert!(
+            error.contains("decision-bound authority required"),
+            "unexpected error detail: {error}"
+        );
+        assert!(
+            error.contains("missing decision projection")
+                || error.contains("failed to read reviewer projection"),
+            "unexpected error detail: {error}"
+        );
     }
 
     #[test]
