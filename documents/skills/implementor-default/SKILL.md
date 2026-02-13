@@ -238,10 +238,11 @@ decision_tree:
           action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs. Per-lane logs are under `$APM2_HOME/private/fac/lanes/<lane_id>/logs/<job_id>/`."
         - id: HANDLE_QUARANTINE_OR_DENIAL
           action: |
-            If a job is moved to `queue/quarantine/` or `queue/denied/`:
-            - Quarantine: the job spec failed RFC-0028 channel boundary validation or was malformed. Check broker health and re-enqueue after fixing the issue. Quarantined artifacts are preserved for forensics.
-            - Denied: the job failed RFC-0029 queue admission (e.g., budget exceeded, lane capacity). Wait for lane availability or run `apm2 fac gc` to reclaim resources, then retry.
-            Never delete quarantined items manually; they contain forensic evidence.
+            If gate execution fails due to resource exhaustion or lane issues:
+            - Reclaim disk space manually: `rm -rf $APM2_HOME/private/fac/lanes/*/target/` (compilation caches, safe to delete). PLANNED: `apm2 fac gc` is not yet implemented as a CLI subcommand.
+            - Check for stuck lanes: `ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null`. If a lane is stuck, manually remove the lease file and reset the workspace.
+            - Re-run gates after cleanup: `apm2 fac gates`.
+            Note: Queue-based quarantine/denial (queue/quarantine/, queue/denied/, FacJobSpecV1 artifacts) is PLANNED for the FESv1 queue/worker surface and does not apply to current local gate execution.
         - id: FIX_AND_RERUN
           action: "Fix failures and re-run gates (`--quick` during iteration, full `apm2 fac gates` before push) until PASS or BLOCKED."
       next: HANDLE_FAC_FAILURES

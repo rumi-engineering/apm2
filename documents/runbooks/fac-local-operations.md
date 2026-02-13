@@ -173,22 +173,30 @@ After warming, gate execution avoids full dependency recompilation.
 
 ## 3. Start services
 
-### 3.1 Running gates (default queue-based mode)
+### 3.1 Running gates (local execution)
 
-The default `apm2 fac gates` command uses queue-based execution:
+The `apm2 fac gates` command executes evidence gates locally in-process:
 
-1. Creates a `FacJobSpecV1(kind="gates")` job spec
-2. Obtains an RFC-0028 channel context token from the broker
-3. Enqueues the job to `queue/pending/`
-4. Waits for a worker to claim, execute, and return results
+1. Checks for a clean working tree (full mode) or skips the check (`--quick`)
+2. Resolves the HEAD SHA
+3. Runs the merge-conflict gate first (always recomputed)
+4. Runs evidence gates (with bounded test runner if `cargo-nextest` is available)
+5. Writes attested gate cache receipts for full runs
+6. Prints a summary table with verdict (PASS / FAIL)
 
 ```bash
-# Run all evidence gates (queue-based, default)
+# Run all evidence gates locally
 apm2 fac gates
 
 # Quick mode for development iteration (skips test gate, accepts dirty tree)
 apm2 fac gates --quick
 ```
+
+> **PLANNED -- not yet implemented.** Queue-based execution (creating a
+> `FacJobSpecV1` job spec, obtaining an RFC-0028 channel context token from
+> the broker, enqueueing to `queue/pending/`, and waiting for a worker to
+> claim and execute) is planned for a future ticket implementing the FESv1
+> queue/worker surface. The current CLI runs all gates locally.
 
 ### 3.2 Running a worker
 
@@ -245,9 +253,16 @@ Run manual cleanup when:
 
 ## 4. Respond to quarantine and denials
 
-### 4.1 Understanding quarantine
+> **PLANNED -- not yet implemented.** Queue-based quarantine and denial
+> handling applies to the FESv1 queue/worker surface, which is not yet
+> implemented. The current `apm2 fac gates` command executes gates locally
+> and does not produce `queue/quarantine/` or `queue/denied/` artifacts.
+> The procedures below describe the planned queue-based behavior.
 
-A job is moved to `queue/quarantine/` when it fails validation:
+### 4.1 Understanding quarantine (PLANNED)
+
+When queue-based execution is implemented, a job will be moved to
+`queue/quarantine/` when it fails validation:
 
 - **RFC-0028 channel boundary check failed:** The job's `channel_context_token`
   did not pass `decode_channel_context_token` + `validate_channel_boundary`.
@@ -259,7 +274,7 @@ A job is moved to `queue/quarantine/` when it fails validation:
 
 **Quarantined items are preserved for forensics. Never delete them manually.**
 
-### 4.2 Diagnosing quarantined jobs
+### 4.2 Diagnosing quarantined jobs (PLANNED)
 
 ```bash
 # List quarantined items
@@ -281,9 +296,10 @@ Common causes and remediation:
 | Malformed spec | Corrupted file or incompatible schema version | Regenerate job spec |
 | Digest mismatch | File modified after creation (possible A2 attack) | Investigate, re-enqueue from trusted source |
 
-### 4.3 Understanding denials
+### 4.3 Understanding denials (PLANNED)
 
-A job is moved to `queue/denied/` when it fails RFC-0029 queue admission:
+When queue-based execution is implemented, a job will be moved to
+`queue/denied/` when it fails RFC-0029 queue admission:
 
 - **Budget exceeded:** The job's resource cost exceeds available budget
 - **Lane capacity:** No lanes available within the admission window
@@ -297,14 +313,13 @@ ls $APM2_HOME/private/fac/queue/denied/
 cat $APM2_HOME/private/fac/queue/denied/<job_id>.reason.json
 ```
 
-### 4.4 Recovering from quarantine/denial
+### 4.4 Recovering from quarantine/denial (PLANNED)
 
 ```bash
-# After fixing the root cause, re-enqueue the job:
-# 1. Create a fresh job spec (do NOT reuse the quarantined file)
-apm2 fac gates  # This creates and enqueues a new job automatically
+# After fixing the root cause, re-run gates locally:
+apm2 fac gates
 
-# 2. If lanes are full, free resources (see section 3.3 for manual GC):
+# If lanes are full, free resources (see section 3.3 for manual GC):
 du -sh $APM2_HOME/private/fac/lanes/*/target/ 2>/dev/null
 # Check for stuck/corrupt lanes:
 ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null
@@ -412,9 +427,9 @@ Symptom: apm2 fac gates hangs or returns immediately with no output
 ```
 
 1. Check lane availability: `ls $APM2_HOME/private/fac/lanes/*/lease.v1.json 2>/dev/null` (PLANNED: `apm2 fac lane status`)
-2. Check broker health: `systemctl --user status apm2-daemon`
-3. Check queue state: `ls $APM2_HOME/private/fac/queue/pending/`
-4. Check logs: `apm2 fac --json logs`
+2. Check process health: `systemctl --user status apm2-daemon`
+3. Check evidence logs: `ls $APM2_HOME/private/fac/evidence/` and `apm2 fac --json logs`
+4. Check disk space: `du -sh $APM2_HOME/private/fac/lanes/*/target/ 2>/dev/null`
 
 ### 6.2 Cold-start timeout (240s exceeded)
 
