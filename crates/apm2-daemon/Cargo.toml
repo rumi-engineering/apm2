@@ -116,6 +116,9 @@ futures = "0.3"
 # File locking for durable consume index (TCK-00426)
 fs2 = "0.4"
 
+# O_NOFOLLOW for symlink-safe file opens (TCK-00537)
+libc.workspace = true
+
 # Atomic file writes with restrictive permissions (TCK-00502: anti-rollback anchor persistence)
 tempfile.workspace = true
 

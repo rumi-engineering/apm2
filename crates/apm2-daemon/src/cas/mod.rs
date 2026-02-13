@@ -744,17 +744,19 @@ impl DurableCas {
     }
 
     /// Persists the current total size to the metadata file.
+    ///
+    /// TCK-00537: Uses [`crate::fs_safe::atomic_write`] for crash-safe
+    /// persistence with fsync + atomic rename + directory fsync.
     fn persist_total_size(&self) -> Result<(), DurableCasError> {
         let size_file = self.metadata_path.join(TOTAL_SIZE_FILE);
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_file = size_file.with_extension(format!("tmp.{}.{counter}", std::process::id()));
         let size = self.current_total_size.load(Ordering::Relaxed);
 
-        fs::write(&temp_file, size.to_string())
-            .map_err(|e| DurableCasError::io("write total size temp file", e))?;
-
-        fs::rename(&temp_file, &size_file)
-            .map_err(|e| DurableCasError::io("rename total size file", e))?;
+        crate::fs_safe::atomic_write(&size_file, size.to_string().as_bytes()).map_err(|e| {
+            DurableCasError::io(
+                "atomic write total size file",
+                std::io::Error::other(e.to_string()),
+            )
+        })?;
 
         Ok(())
     }

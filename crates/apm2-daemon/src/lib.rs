@@ -46,12 +46,15 @@
 //! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (TCK-00347)
 //! - [`identity`]: Canonical identity identifiers (`PublicKeyIdV1`,
 //!   `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) for RFC-0020
+//! - [`fs_safe`]: Safe atomic file I/O primitives (atomic write, symlink
+//!   refusal, bounded JSON read) for queue/lease/receipt state files
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
 pub mod admission_kernel;
 pub mod cas;
 pub mod episode;
 pub mod evidence;
+pub mod fs_safe;
 pub mod gate;
 pub mod governance;
 pub mod governance_channel;

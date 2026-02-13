@@ -327,6 +327,40 @@ PCAC lifecycle enforcement before mutation.
 - [INV-DW-003] GitHub API tokens are stored as `secrecy::SecretString` and
   exposed only at the HTTP header construction boundary via `ExposeSecret`.
 
+## Safe Atomic File I/O (TCK-00537)
+
+### `fs_safe` Module
+
+Safe atomic file I/O primitives for queue, lease, and receipt state files.
+Located at `src/fs_safe.rs`.
+
+**Public API:**
+- `atomic_write(path, data)` — write bytes atomically (temp + fsync + rename + dir fsync)
+- `atomic_write_json(path, value)` — serialize to JSON + atomic write
+- `safe_open(path)` — open with `O_NOFOLLOW` (Linux) + regular-file verification
+- `bounded_read_json(path, max_size)` — size-capped JSON read via safe_open
+- `bounded_read(path, max_size)` — size-capped raw bytes read via safe_open
+
+**Security Invariants:**
+- [INV-FS-001] Atomic writes never produce partial files at the target path.
+  Power loss at any point leaves either the old file or the new complete file.
+- [INV-FS-002] `safe_open` refuses symlinks on Linux (via `O_NOFOLLOW` / ELOOP)
+  and on other platforms (via `symlink_metadata`). Post-open fstat verifies regular file.
+- [INV-FS-003] Bounded reads check file size on the handle (not the path) before
+  allocation, preventing TOCTOU between stat and read.
+- [INV-FS-004] Parent directories are created with mode 0700; files with mode 0600.
+
+**Contracts:**
+- [CTR-FS-001] `atomic_write_json` serializes entirely in memory before any file I/O.
+  Serialization failure never touches disk.
+- [CTR-FS-002] `bounded_read_json` uses `Read::take` as belt-and-suspenders even
+  after the metadata size check, preventing reads beyond max_size.
+
+**Migration (TCK-00537):**
+- `PersistentSessionRegistry::persist()` and related methods now use `atomic_write_json`.
+- `PersistentSessionRegistry::load_from_file()` now uses `safe_open` for symlink refusal.
+- `DurableCas::persist_total_size()` now uses `atomic_write`.
+
 ## Related Modules
 
 - [`apm2_core::process`](../apm2-core/src/process/AGENTS.md) - `ProcessSpec`, `ProcessState`, `ProcessRunner`

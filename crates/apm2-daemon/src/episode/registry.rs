@@ -1506,11 +1506,10 @@ fn wall_clock_secs() -> u64 {
 // Persistent Session Registry (TCK-00266)
 // =============================================================================
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+
+use crate::fs_safe;
 
 /// Maximum file size for state files (10 MB).
 ///
@@ -1671,7 +1670,7 @@ impl Default for PersistentStateFile {
 pub enum PersistentRegistryError {
     /// I/O error during state file operations.
     #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
 
     /// JSON serialization/deserialization error.
     #[error("JSON error: {0}")]
@@ -1797,8 +1796,11 @@ impl PersistentSessionRegistry {
         let registry = Self::new(path);
 
         if path.exists() {
-            // SEC-003: Open file first, then check metadata to avoid TOCTOU
-            let file = File::open(path)?;
+            // SEC-003 + TCK-00537: Use safe_open (O_NOFOLLOW + regular-file
+            // verification) to prevent symlink replacement attacks, then
+            // check metadata on the handle to avoid TOCTOU.
+            let file = fs_safe::safe_open(path)
+                .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
             let metadata = file.metadata()?;
             let file_size = metadata.len();
 
@@ -1987,54 +1989,10 @@ impl PersistentSessionRegistry {
             terminated,
         };
 
-        // Serialize to JSON with pretty printing for human readability
-        let json = serde_json::to_string_pretty(&state_file)?;
-
-        // Write to temp file in same directory (for atomic rename)
-        let temp_path = self.state_file_path.with_extension("tmp");
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.state_file_path.parent() {
-            #[cfg(unix)]
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700) // SEC-002: Owner access only
-                .create(parent)?;
-
-            #[cfg(not(unix))]
-            fs::create_dir_all(parent)?;
-        }
-
-        // Write to temp file with SEC-002 secure permissions
-        {
-            #[cfg(unix)]
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600) // SEC-002: Owner read/write only
-                .open(&temp_path)?;
-
-            #[cfg(not(unix))]
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?;
-
-            let mut file = file;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?; // fsync to ensure durability
-        }
-
-        // Atomic rename
-        fs::rename(&temp_path, &self.state_file_path)?;
-
-        // Durability: fsync the parent directory to ensure the rename is committed
-        if let Some(parent) = self.state_file_path.parent() {
-            let dir = File::open(parent)?;
-            dir.sync_all()?;
-        }
+        // TCK-00537: Use atomic_write_json for crash-safe persistence with
+        // restrictive permissions (0600 file, 0700 parent dir).
+        fs_safe::atomic_write_json(&self.state_file_path, &state_file)
+            .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(())
     }
@@ -2096,53 +2054,10 @@ impl PersistentSessionRegistry {
             terminated: Vec::new(),
         };
 
-        let json = serde_json::to_string_pretty(&state_file)?;
-
-        // Write to temp file in same directory (for atomic rename)
-        let temp_path = self.state_file_path.with_extension("tmp");
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.state_file_path.parent() {
-            #[cfg(unix)]
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-
-            #[cfg(not(unix))]
-            fs::create_dir_all(parent)?;
-        }
-
-        // Write to temp file with secure permissions
-        {
-            #[cfg(unix)]
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp_path)?;
-
-            #[cfg(not(unix))]
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?;
-
-            let mut file = file;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-
-        // Atomic rename
-        fs::rename(&temp_path, &self.state_file_path)?;
-
-        // Durability: fsync the parent directory
-        if let Some(parent) = self.state_file_path.parent() {
-            let dir = File::open(parent)?;
-            dir.sync_all()?;
-        }
+        // TCK-00537: Use atomic_write_json for crash-safe empty-state
+        // persistence.
+        fs_safe::atomic_write_json(&self.state_file_path, &state_file)
+            .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(())
     }
@@ -2195,53 +2110,9 @@ impl PersistentSessionRegistry {
         };
         drop(state);
 
-        let json = serde_json::to_string_pretty(&state_file)?;
-
-        // Write to temp file in same directory (for atomic rename)
-        let temp_path = self.state_file_path.with_extension("tmp");
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.state_file_path.parent() {
-            #[cfg(unix)]
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-
-            #[cfg(not(unix))]
-            fs::create_dir_all(parent)?;
-        }
-
-        // Write to temp file with secure permissions
-        {
-            #[cfg(unix)]
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp_path)?;
-
-            #[cfg(not(unix))]
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?;
-
-            let mut file = file;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-
-        // Atomic rename
-        fs::rename(&temp_path, &self.state_file_path)?;
-
-        // Durability: fsync the parent directory
-        if let Some(parent) = self.state_file_path.parent() {
-            let dir = File::open(parent)?;
-            dir.sync_all()?;
-        }
+        // TCK-00537: Use atomic_write_json for crash-safe persistence.
+        fs_safe::atomic_write_json(&self.state_file_path, &state_file)
+            .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(())
     }
