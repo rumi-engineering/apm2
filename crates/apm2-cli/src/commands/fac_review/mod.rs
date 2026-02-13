@@ -60,11 +60,11 @@ pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
-pub use types::ReviewRunType;
 use types::{
     DispatchSummary, ProjectionStatus, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
     validate_expected_head_sha,
 };
+pub use types::{ReviewRunType, apm2_home_dir};
 
 use crate::exit_codes::codes as exit_codes;
 
@@ -1629,7 +1629,8 @@ mod tests {
         comment_id: u64,
     ) {
         let pr_dir = projection_pr_dir_for_home(home, owner_repo, pr_number);
-        std::fs::create_dir_all(&pr_dir).expect("create projection pr dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&pr_dir)
+            .expect("create projection pr dir");
         let dimension = if review_type.eq_ignore_ascii_case("quality") {
             "code-quality"
         } else {

@@ -8,10 +8,11 @@ use serde::Serialize;
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha};
 use super::target::resolve_pr_target;
-use super::types::{sanitize_for_path, validate_expected_head_sha};
+use super::types::{apm2_home_dir, sanitize_for_path, validate_expected_head_sha};
+use crate::commands::fac_permissions;
 use crate::exit_codes::codes as exit_codes;
 
-const DEFAULT_TMP_ROOT: &str = "/tmp/apm2-fac-review";
+const DEFAULT_TMP_SUBDIR: &str = "private/fac/prepared";
 const PREPARE_SCHEMA: &str = "apm2.fac.review.prepare.v1";
 
 #[derive(Debug, Serialize)]
@@ -50,8 +51,8 @@ pub fn run_prepare(
     let diff = collect_diff_against_main(&repo_root, &base_ref, &head_sha)?;
     let commit_history = collect_commit_history_against_main(&repo_root, &base_ref, &head_sha)?;
 
-    let prepared_dir = prepared_review_dir(&owner_repo, resolved_pr, &head_sha);
-    fs::create_dir_all(&prepared_dir).map_err(|err| {
+    let prepared_dir = prepared_review_dir(&owner_repo, resolved_pr, &head_sha)?;
+    fac_permissions::ensure_dir_with_mode(&prepared_dir).map_err(|err| {
         format!(
             "failed to create prepared review directory {}: {err}",
             prepared_dir.display()
@@ -110,7 +111,7 @@ pub fn cleanup_prepared_review_inputs(
     pr_number: u32,
     head_sha: &str,
 ) -> Result<bool, String> {
-    cleanup_prepared_review_inputs_at(&review_tmp_root(), owner_repo, pr_number, head_sha)
+    cleanup_prepared_review_inputs_at(&review_tmp_root()?, owner_repo, pr_number, head_sha)
 }
 
 fn cleanup_prepared_review_inputs_at(
@@ -260,10 +261,14 @@ fn collect_commit_history_against_main(
     Ok(String::from_utf8_lossy(&head_output.stdout).to_string())
 }
 
-fn review_tmp_root() -> PathBuf {
-    std::env::var_os("APM2_FAC_REVIEW_TMP_DIR")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| PathBuf::from(DEFAULT_TMP_ROOT), PathBuf::from)
+fn review_tmp_root() -> Result<PathBuf, String> {
+    let Some(custom_root) =
+        std::env::var_os("APM2_FAC_REVIEW_TMP_DIR").filter(|value| !value.is_empty())
+    else {
+        return apm2_home_dir().map(|apm2_home| apm2_home.join(DEFAULT_TMP_SUBDIR));
+    };
+
+    Ok(PathBuf::from(custom_root))
 }
 
 fn prepared_review_dir_from_root(
@@ -277,8 +282,17 @@ fn prepared_review_dir_from_root(
         .join(head_sha.to_ascii_lowercase())
 }
 
-pub fn prepared_review_dir(owner_repo: &str, pr_number: u32, head_sha: &str) -> PathBuf {
-    prepared_review_dir_from_root(&review_tmp_root(), owner_repo, pr_number, head_sha)
+pub fn prepared_review_dir(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<PathBuf, String> {
+    Ok(prepared_review_dir_from_root(
+        &review_tmp_root()?,
+        owner_repo,
+        pr_number,
+        head_sha,
+    ))
 }
 
 #[cfg(test)]
@@ -311,7 +325,8 @@ mod tests {
             99,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        std::fs::create_dir_all(&prepared).expect("create prepared dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&prepared)
+            .expect("create prepared dir");
         std::fs::write(prepared.join("review.diff"), "diff").expect("write diff");
 
         let removed = cleanup_prepared_review_inputs_at(

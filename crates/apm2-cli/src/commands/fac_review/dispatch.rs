@@ -2076,7 +2076,8 @@ mod tests {
             .parent()
             .expect("parent")
             .join("state.backup.json");
-        fs::create_dir_all(alt.parent().expect("alt parent")).expect("create alt parent");
+        crate::commands::fac_permissions::ensure_dir_with_mode(alt.parent().expect("alt parent"))
+            .expect("create alt parent");
         fs::write(
             &alt,
             serde_json::to_vec_pretty(&state).expect("serialize state"),

@@ -33,6 +33,8 @@ const FAC_SUBDIRS: &[&str] = &[
     "private/fac",
     "private/fac/gate_cache",
     "private/fac/gate_cache_v2",
+    "private/fac/prepared",
+    "private/fac/tickets",
     "private/fac/evidence",
 ];
 
@@ -226,26 +228,7 @@ fn resolve_apm2_home() -> Result<PathBuf, FacPermissionsError> {
 #[cfg(unix)]
 pub fn ensure_dir_with_mode(path: &Path) -> Result<(), FacPermissionsError> {
     if path.exists() {
-        ensure_path_is_directory(path)?;
-        #[cfg(unix)]
-        {
-            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-                FacPermissionsError::MetadataError {
-                    path: path.to_path_buf(),
-                    error,
-                }
-            })?;
-            let actual_uid = metadata.uid();
-            let mode = metadata.mode() & 0o7777;
-            if mode & 0o077 != 0 {
-                return Err(FacPermissionsError::UnsafePermissions {
-                    path: path.to_path_buf(),
-                    actual_mode: mode,
-                    actual_uid,
-                    expected_uid: geteuid().as_raw(),
-                });
-            }
-        }
+        validate_directory(path, geteuid().as_raw())?;
         return Ok(());
     }
 
@@ -272,10 +255,6 @@ pub fn ensure_dir_with_mode(path: &Path) -> Result<(), FacPermissionsError> {
 }
 
 fn ensure_parent_dir_for_file(path: &Path) -> Result<(), FacPermissionsError> {
-    if path.exists() {
-        ensure_path_is_directory(path)?;
-        return Ok(());
-    }
     ensure_dir_with_mode(path)
 }
 
@@ -629,6 +608,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::TempDir::new().expect("create temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("harden temp dir");
         let target = dir.path().join("artifact");
         std::fs::write(&target, b"prior").expect("create file");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
@@ -647,6 +628,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::TempDir::new().expect("create temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("harden temp dir");
         let target = dir.path().join("artifact");
         std::fs::write(&target, b"prior").expect("create file");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))

@@ -2062,14 +2062,29 @@ fn run_context_rebuild(
     }
 
     // Determine output directory
-    let output_dir = args.output_dir.clone().unwrap_or_else(|| {
-        std::env::temp_dir()
-            .join("apm2-context-rebuild")
+    let output_dir = if let Some(output_dir) = &args.output_dir {
+        output_dir.clone()
+    } else {
+        let apm2_home = match crate::commands::fac_review::apm2_home_dir() {
+            Ok(apm2_home) => apm2_home,
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "home_dir_error",
+                    &format!("failed to resolve APM2 home directory: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        };
+        apm2_home
+            .join("private")
+            .join("fac")
+            .join("context_rebuild")
             .join(&args.episode_id)
-    });
+    };
 
     // Create output directory
-    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+    if let Err(e) = crate::commands::fac_permissions::ensure_dir_with_mode(&output_dir) {
         return output_error(
             json_output,
             "io_error",

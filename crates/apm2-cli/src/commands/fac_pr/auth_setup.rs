@@ -163,7 +163,7 @@ fn write_persistent_config(
     let apm2_home = resolve_apm2_home()
         .ok_or_else(|| "cannot determine home directory for ~/.apm2".to_string())?;
 
-    std::fs::create_dir_all(&apm2_home)
+    crate::commands::fac_permissions::ensure_dir_with_mode(&apm2_home)
         .map_err(|e| format!("failed to create {}: {e}", apm2_home.display()))?;
 
     let fallback_private_key_file = if args.allow_private_key_file_fallback {
@@ -210,7 +210,7 @@ fn write_persistent_config(
 /// Writes `content` to `path` with Unix file mode 0600.
 fn write_file_mode_0600(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        crate::commands::fac_permissions::ensure_dir_with_mode(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     if path.exists() {
@@ -264,6 +264,11 @@ mod tests {
     #[test]
     fn write_file_mode_0600_enforces_mode_on_existing_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(
+            tmp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("harden temp dir");
         let path = tmp.path().join("secret.pem");
         fs::write(&path, "old").expect("seed file");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set weak mode");
@@ -279,6 +284,11 @@ mod tests {
     #[test]
     fn write_file_mode_0600_rejects_symlink_target() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(
+            tmp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("harden temp dir");
         let target = tmp.path().join("target.pem");
         fs::write(&target, "target").expect("seed target");
         let link = tmp.path().join("link.pem");

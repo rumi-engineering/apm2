@@ -1258,7 +1258,7 @@ mod tests {
             "apm2-evidence-tests-{test_name}-{}-{nonce}",
             std::process::id()
         ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&dir).expect("create temp dir");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

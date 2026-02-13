@@ -728,7 +728,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let repo_root = temp_dir.path();
         let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&tickets_dir)
+            .expect("create tickets dir");
         let ticket_path = tickets_dir.join("TCK-00412.yaml");
         let ticket_content = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Any\"\n";
         fs::write(&ticket_path, ticket_content).expect("write ticket");
@@ -757,7 +758,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let repo_root = temp_dir.path();
         let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&tickets_dir)
+            .expect("create tickets dir");
         let ticket_path = tickets_dir.join("TCK-00444.yaml");
         let ticket_content =
             "ticket_meta:\n  ticket:\n    id: \"TCK-00444\"\n    title: \"Fallback Title\"\n";
@@ -787,7 +789,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let repo_root = temp_dir.path();
         let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&tickets_dir)
+            .expect("create tickets dir");
         fs::write(tickets_dir.join("TCK-00412.yaml"), "ticket_meta:\n").expect("write ticket");
 
         let err = resolve_pr_metadata(
