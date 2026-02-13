@@ -1,172 +1,241 @@
-# M12: Dependency and Build Surface
+# M12: Dependency and build surface (Supply chain)
 
 ```yaml
 module_id: M12
 domain: supply_chain
-inputs: [ChangeSetBundle]
+inputs: [ChangeSetBundle, QCP_Result]
 outputs: [Finding[]]
 ```
 
 ---
 
-## Review Protocol
+## Purpose
+
+In APM2, dependencies and build-time execution are part of the trusted computing base.
+This module is intentionally conservative.
+
+Triggers that are presumptive QCP:
+- new dependencies,
+- lockfile churn,
+- build scripts / proc-macros,
+- spawning external processes.
+
+---
+
+## Review protocol
 
 ```mermaid
 flowchart TD
-    START[Begin] --> A[New Dependency Scan]
-    A --> B[Default Features Discipline]
-    B --> C[Build Script Review]
-    C --> D[License Compliance Check]
-    D --> E[Emit Findings]
+    START[Begin] --> A[Dependency and lockfile delta]
+    A --> B[Default-features + feature surface]
+    B --> C[Build scripts + proc-macros]
+    C --> D[License + advisory policy]
+    D --> E[Process execution + shell safety]
+    E --> F[Emit findings]
 ```
 
 ---
 
-## State: New Dependency Scan
+## State: Dependency and lockfile delta
 
 ```yaml
-IF diff.adds_dependency:
+IF diff.adds_or_changes_dependency:
   requirements:
     - id: DEP-JUSTIFY
-      predicate: "justification provided"
+      predicate: "rationale provided (what capability is missing without it)"
       on_fail:
-        severity: MAJOR
-        remediation: "Document why dependency is needed"
+        EMIT Finding:
+          id: DEP-JUSTIFY-001
+          severity: MAJOR
+          remediation:
+            type: DOC
+            specification: "Document why the dependency is needed and why std/Existing deps are insufficient."
 
-    - id: DEP-ALT
-      predicate: "alternatives analysis provided"
+    - id: DEP-ALTS
+      predicate: "alternatives considered (at least: std, existing workspace crates, smaller deps)"
       on_fail:
-        severity: MINOR
-        remediation: "Document considered alternatives"
+        EMIT Finding:
+          id: DEP-ALTS-001
+          severity: MINOR
+          remediation:
+            type: DOC
+            specification: "List considered alternatives and tradeoffs."
 
-    - id: DEP-PROC
+    - id: DEP-RISK
       predicate: |
         IF dependency.is_proc_macro OR dependency.has_build_script THEN
-          elevated_risk_acknowledged
+          elevated_risk_acknowledged AND mitigation_plan_exists
       on_fail:
-        severity: MAJOR
-        remediation: "Acknowledge elevated risk of proc-macro/build deps"
+        EMIT Finding:
+          id: DEP-RISK-001
+          severity: MAJOR
+          remediation:
+            type: DOC
+            specification: "Acknowledge proc-macro/build-script risk; document mitigation + CI coverage."
 
-  checks:
-    - default_features_pull_heavy: "unnecessary bloat?"
-    - proc_macro_deps: "elevated risk"
-    - build_script_deps: "elevated risk"
+IF diff.changes_Cargo_lock_significantly:
+  requirements:
+    - id: LOCK-RATIONALE
+      predicate: "lockfile churn explained (what dependency changed and why)"
+      on_fail:
+        EMIT Finding:
+          id: LOCK-001
+          severity: MAJOR
+          remediation:
+            type: DOC
+            specification: "Explain lockfile churn; avoid drive-by updates."
 ```
 
 ---
 
-## State: Default Features Discipline
+## State: Default-features and feature surface
 
 ```yaml
 for_foundational_crates:
   requirements:
-    - id: DEP-DEFAULT
+    - id: DEP-DEFAULTS
       predicate: |
         IF enables_default_features THEN
           justification_documented
       on_fail:
         EMIT Finding:
-          id: DEP-DEFAULT-001
+          id: DEP-DEFAULTS-001
           severity: MAJOR
           remediation:
             type: DOC
-            specification: "Justify default features or use default-features = false"
+            specification: "Prefer `default-features = false`; explicitly enable only required features."
 
-  rationale:
-    - "Default features often pull in std"
-    - "Default features add code weight"
-    - "Default features may add license obligations"
-
-  recommended_pattern:
-    cargo_toml: |
-      [dependencies]
-      foo = { version = "1.0", default-features = false, features = ["needed"] }
+recommended_pattern:
+  cargo_toml: |
+    [dependencies]
+    foo = { version = "1.0", default-features = false, features = ["needed"] }
 ```
 
 ---
 
-## State: Build Script and Proc-Macro Review
+## State: Build scripts and proc-macros
 
 ```yaml
-IF diff.adds_or_modifies(build.rs | proc_macro):
+IF diff.adds_or_modifies(build.rs OR proc_macro):
   auto_qcp: true
 
   requirements:
-    - id: BUILD-SCOPE
-      predicate: "tight scoping and clear reasoning"
-      on_fail:
-        severity: MAJOR
-        remediation: "Minimize build script scope"
-
     - id: BUILD-DETERM
-      predicate: "pure Rust, deterministic, no network"
+      predicate: "deterministic outputs; no network; declared inputs only"
       on_fail:
         EMIT Finding:
-          id: BUILD-DETERM-001
+          id: BUILD-001
           severity: BLOCKER
           holonic_constraint: BOUNDARY_INTEGRITY
           remediation:
             type: CODE
-            specification: "Remove network/nondeterministic operations"
+            specification: "Remove network/ambient dependency; restrict to Cargo-declared inputs and deterministic outputs."
 
-    - id: BUILD-DOCS
-      predicate: "generated artifacts documented"
+    - id: BUILD-SCOPE
+      predicate: "tight scope (minimal code, minimal deps, clear purpose)"
       on_fail:
-        severity: MAJOR
-        remediation: "Document what build script generates"
+        EMIT Finding:
+          id: BUILD-002
+          severity: MAJOR
+          remediation:
+            type: CODE
+            specification: "Minimize build/proc-macro scope and dependency graph."
+
+    - id: BUILD-DOC
+      predicate: "generated artifacts documented; rerun-if-* used correctly"
+      on_fail:
+        EMIT Finding:
+          id: BUILD-003
+          severity: MAJOR
+          remediation:
+            type: DOC
+            specification: "Document what is generated and ensure correct rerun triggers."
 ```
 
 ---
 
-## State: License Compliance Check
+## State: License and advisory policy (cargo-deny / cargo-audit)
+
+APM2 contains a `deny.toml` policy and CI expects dependency governance gates.
 
 ```yaml
-policy:
-  merge_gating: true
-  tool_enforced: true
-
-preferred_tool: cargo-deny
-  config: deny.toml
-  requirements:
-    - license_allowlist: defined
-    - unknown_denied: true
-    - transitive_covered: true
-
-procedure:
-  IF ci_runs_cargo_deny:
-    - verify: "check exists and passed"
-    - verify: "runs under --all-features"
-  ELSE:
-    EMIT Finding:
-      id: LICENSE-001
-      severity: BLOCKER
-      remediation:
-        type: CI
-        specification: |
-          Add cargo-deny with license allowlist
-          OR implement equivalent license verification
-
-feature_flag_rule:
-  - id: LICENSE-FEATURE
-    predicate: "license checks run under --all-features"
-    rationale: "Feature flags can pull in additional deps"
+requirements:
+  - id: LICENSE-001
+    predicate: "cargo-deny policy exists and is enforced"
     on_fail:
-      severity: MAJOR
-      remediation: "Run license checks with --all-features"
+      EMIT Finding:
+        id: LICENSE-001
+        severity: BLOCKER
+        remediation:
+          type: CI
+          specification: "Add/restore cargo-deny enforcement (license + bans + sources)."
 
-edge_cases:
-  dual_licensing:
-    patterns: [OpenSSL, SSLeay, AGPL]
-    requirement: "explicitly addressed in policy"
-
-  build_deps:
-    note: "build-dependencies and dev-dependencies may have different requirements"
-    requirement: "policy must be explicit"
+  - id: ADVISORY-001
+    predicate: "cargo-audit (or equivalent) is enforced with explicit ignores documented"
+    on_fail:
+      EMIT Finding:
+        id: ADVISORY-001
+        severity: BLOCKER
+        remediation:
+          type: CI
+          specification: "Add/restore advisory scanning; document any ignores with rationale and expiry."
 ```
 
 ---
 
-## Output Schema
+## State: Process execution and shell safety
+
+This covers `std::process::Command`, `sh -c`, and any host-command invocation.
+
+```yaml
+IF diff.spawns_process:
+  auto_qcp: true
+
+  requirements:
+    - id: PROC-NO-SHELL
+      predicate: "does not invoke a shell (no `sh -c`, no stringly-typed pipelines)"
+      on_fail:
+        EMIT Finding:
+          id: PROC-001
+          severity: BLOCKER
+          remediation:
+            type: CODE
+            specification: "Use `Command` with explicit argv; never use a shell for composition."
+
+    - id: PROC-ARGS
+      predicate: "untrusted or complex strings are not passed as argv fragments"
+      on_fail:
+        EMIT Finding:
+          id: PROC-002
+          severity: BLOCKER
+          remediation:
+            type: CODE
+            specification: "Pass data via stdin/temp files; keep argv structured and non-ambiguous."
+
+    - id: PROC-ENV
+      predicate: "explicit environment management (clear or allowlist; do not inherit secrets by default)"
+      on_fail:
+        EMIT Finding:
+          id: PROC-003
+          severity: MAJOR
+          remediation:
+            type: CODE
+            specification: "Clear env and re-add an allowlist; never inherit tokens/credentials implicitly."
+
+    - id: PROC-HEADLESS
+      predicate: "verified non-interactive behavior (no hangs; bounded timeouts; deterministic outputs)"
+      on_fail:
+        EMIT Finding:
+          id: PROC-004
+          severity: MAJOR
+          remediation:
+            type: TEST
+            specification: "Add a headless-mode test; ensure timeouts and non-interactive operation."
+```
+
+---
+
+## Output schema
 
 ```typescript
 interface DependencyFinding extends Finding {
@@ -179,14 +248,14 @@ interface DependencyFinding extends Finding {
 type DependencyIssue =
   | "UNJUSTIFIED"
   | "NO_ALTERNATIVES_ANALYSIS"
-  | "HEAVY_DEFAULTS"
-  | "ELEVATED_RISK";
+  | "ELEVATED_RISK"
+  | "LOCKFILE_CHURN";
 
 type LicenseIssue =
   | "NO_VERIFICATION"
   | "INCOMPATIBLE"
   | "UNKNOWN"
-  | "FEATURE_UNCOVERED";
+  | "ADVISORY_UNCHECKED";
 
 type BuildIssue =
   | "NONDETERMINISTIC"
@@ -194,43 +263,8 @@ type BuildIssue =
   | "UNDOCUMENTED_OUTPUT";
 
 type ProcessIssue =
+  | "SHELL_INVOCATION"
   | "ARGUMENT_INJECTION"
   | "ENVIRONMENT_BLEED"
   | "HEADLESS_FAILURE";
-
----
-
-## State: Process Execution and Shell Safety
-
-```yaml
-IF diff.spawns_process (Command::new | shelling out):
-  auto_qcp: true
-
-  requirements:
-    - id: PROC-ARGS
-      predicate: "complex strings (prompts/markdown) NOT passed as CLI arguments"
-      on_fail:
-        EMIT Finding:
-          id: PROC-ARGS-001
-          severity: BLOCKER
-          remediation:
-            type: CODE
-            specification: "Write content to temp file and redirect via stdin"
-
-    - id: PROC-ENV
-      predicate: "explicit environment management (no silent inheritance of secrets)"
-      on_fail:
-        severity: MAJOR
-        remediation: "Clear or allowlist specific environment variables"
-
-    - id: PROC-HEADLESS
-      predicate: "behavior verified in headless/non-interactive contexts"
-      on_fail:
-        severity: MEDIUM
-        remediation: "Ensure tool does not hang or fail in headless mode (CI)"
-
-  rationale:
-    - "Argument injection: markdown backticks/quotes break CLI parsing"
-    - "Privilege bleed: child processes inherit sensitive env vars"
-```
 ```

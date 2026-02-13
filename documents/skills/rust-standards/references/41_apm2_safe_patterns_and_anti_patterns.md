@@ -13,6 +13,7 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 [CONTRACT: CTR-2602] Type-Safe Identifiers (No Raw `String`/`Uuid` for IDs).
 - REJECT IF: distinct ID domains share the same primitive type in public APIs (mix-up risk).
 - ENFORCE BY: newtypes (`struct ProcessId(Uuid);`) + `FromStr/TryFrom` for parsing; keep constructors validated.
+- NOTE: legacy surfaces that currently use `String` IDs are not excused—validation and canonicalization must happen at the boundary; new code should migrate toward newtypes.
 
 [CONTRACT: CTR-2603] Construction Is Validated (Builders/Typestate).
 - APPLY: CTR-1205.
@@ -91,7 +92,7 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - ENFORCE BY:
   - If state corruption is fatal: propagate the error (don't unwrap).
   - If state corruption is acceptable/recoverable (e.g., metrics, cache): use `.lock().unwrap_or_else(|e| e.into_inner())` to ignore poison.
-  - Ideally: use `parking_lot` (which does not poison) if the project policy allows.
+  - Optionally: propose `parking_lot` (no poisoning) **only** via `M12` dependency review; do not add it ad-hoc.
 [PROVENANCE] std `Mutex` poisons on panic; `unwrap` propagates the panic, causing cascading DoS.
 
 [CONTRACT: CTR-2619] Infallible Serialization Wrapper.
@@ -112,34 +113,34 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 [CONTRACT: CTR-2622] Centralized Configuration.
 - REJECT IF: `std::env::var` is called in business logic (outside `crate::config`).
 - ENFORCE BY: Load all config into a typed `Config` struct at startup; pass `Config` or specific fields to components.
-- PROVENANCE: Ensures 12-factor app compliance and testability (environment injection).
+[PROVENANCE] Ensures 12-factor app compliance and testability (environment injection).
 
 [CONTRACT: CTR-2623] No Boolean Blindness in APIs.
 - REJECT IF: public function arguments use `bool` for logic options (e.g., `validate(true)`).
 - ENFORCE BY: Use specific `enum`s (e.g., `ValidationMode::Strict`) or `struct` options patterns.
-- PROVENANCE: Improves readability and prevents regression when refactoring (swapped booleans).
+[PROVENANCE] Improves readability and prevents regression when refactoring (swapped booleans).
 
 [CONTRACT: CTR-2624] Finite State Machines Are Typed.
 - REJECT IF: internal state or status is represented as a `String` (e.g., `status: "running"`).
 - ENFORCE BY: Use `enum` for all finite states; use `String` only for arbitrary user input or unbounded identifiers.
-- PROVENANCE: Enables compiler-checked exhaustive matching and prevents invalid states.
+[PROVENANCE] Enables compiler-checked exhaustive matching and prevents invalid states.
 
-[RISK: RSK-2625] Unbounded Channels.
+[HAZARD: RSK-2625] Unbounded Channels.
 - APPLY: CTR-1004 (Bounded Concurrency).
 - REJECT IF: `std::sync::mpsc::channel()` or `tokio::sync::mpsc::unbounded_channel()` is used without strict, proven upper bounds on production rates.
 - ENFORCE BY: `mpsc::sync_channel(bound)` or `tokio::sync::mpsc::channel(bound)` to provide backpressure.
-- PROVENANCE: Prevents OOM DoS attacks (CWE-400).
+[PROVENANCE] Prevents OOM DoS attacks (CWE-400).
 
 [CONTRACT: CTR-2626] Technical Debt Must Be Accounted.
 - REJECT IF: `TODO`, `FIXME`, or `HACK` comments exist without a referenced Ticket ID (e.g., `TODO(TCK-123): ...`).
 - ENFORCE BY: CI lint (grep) that rejects orphaned TODOs.
-- PROVENANCE: Prevents "temporary" hacks from becoming permanent load-bearing tech debt.
+[PROVENANCE] Prevents "temporary" hacks from becoming permanent load-bearing tech debt.
 
 [INVARIANT: INV-2627] Identity Boundaries Use Shared Spec-Driven Contracts.
 - REJECT IF: canonical identity parse/encode paths implement ad-hoc wire/tag handling instead of the shared identity abstraction (`IdentitySpec` + `IdentityWireKernel`) without an explicit documented waiver.
 - REJECT IF: digest-first identity forms silently coerce unresolved semantics into resolved semantics.
 - ENFORCE BY: define all four semantic axes (`wire_form`, `tag_semantics`, `derivation_semantics`, `resolution_semantics`) per identity type; use fail-closed resolver contracts where text omits semantics; preserve canonical text/binary acceptance boundaries.
-- PROVENANCE: RFC-0020 REQ-0007/REQ-0008 boundary determinism and fail-closed identity semantics.
+[PROVENANCE] RFC-0020 REQ-0007/REQ-0008 boundary determinism and fail-closed identity semantics.
 
 ## Anti-Patterns (Lessons Learned)
 
