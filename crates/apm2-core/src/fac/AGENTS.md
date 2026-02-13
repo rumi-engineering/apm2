@@ -26,7 +26,9 @@ default mode.
   synchronized; callers must hold appropriate locks for concurrent access.
 - `BrokerState`: Persisted broker state including schema metadata, monotonic tick
   counter, admitted policy digest set, freshness/revocation/convergence hashes,
-  and convergence receipts. Serialized to canonical JSON.
+  convergence receipts, and persisted `health_seq` counter. Serialized to
+  canonical JSON. The `health_seq` field uses `#[serde(default)]` for backwards
+  compatibility with state files predating TCK-00585.
 - `BrokerError`: Fail-closed error taxonomy covering input validation, capacity
   limits, persistence, and deserialization failures.
 - `BrokerSignatureVerifier`: Implements `SignatureVerifier` trait from
@@ -48,6 +50,10 @@ default mode.
 - State serialization/deserialization for persistence (`serialize_state()`,
   `deserialize_state()`).
 - Verifying key publication (`verifying_key()`) for real signature verification.
+- Worker admission health gate enforcement via
+  `evaluate_admission_health_gate()`, the canonical production entry point
+  for health-gated admission (TCK-00585).
+- Health gate query via `is_admission_health_gate_passed()` for observability.
 
 ### Security Invariants (TCK-00510)
 
@@ -65,11 +71,154 @@ default mode.
 - [INV-BRK-007] `deserialize_state()` enforces a strict I/O size limit
   (`MAX_BROKER_STATE_FILE_SIZE = 1 MiB`) **before** JSON parsing to prevent
   OOM from crafted state files with unbounded `Vec` payloads (RSK-1601).
+- [INV-BRK-HEALTH-GATE-001] `issue_channel_context_token()` enforces a
+  mandatory admission health gate as its first precondition. The gate is a
+  boolean `admission_health_gate_passed` flag that is set to `true` only by
+  `check_health()` returning `Healthy` or by a successful
+  `evaluate_admission_health_gate()`. It defaults to `false` on construction
+  and is cleared to `false` on any health check failure or gate evaluation
+  failure. This ensures all production token issuance paths through the
+  `FacBroker` API are health-gated (fail-closed). The flag is protected by
+  the same external lock that guards `&mut self` / `&self` access; no
+  interior mutability is used.
 - All hash comparisons use `subtle::ConstantTimeEq::ct_eq()` consistent with
   INV-PC-001, including `find_admitted_policy_digest()` which uses
   non-short-circuiting iteration.
 - CTR-2501 deviation: `current_time_secs()` uses `SystemTime::now()` for token
   `issued_at` timestamps (wall-clock anchored expiry). Documented inline.
+- CTR-HEALTH-001 deviation: `check_health()` and `evaluate_admission_health_gate()`
+  do not follow PCAC lifecycle. They are control-plane safety predicates, not
+  authority-bearing effects. Documented inline.
+
+## broker_health Submodule (TCK-00585)
+
+The `broker_health` submodule implements RFC-0029 invariant health monitoring for
+the FAC Broker. The broker periodically self-checks TP001/TP002/TP003 temporal
+predicates and emits signed `HealthReceiptV1` receipts. Workers use a policy-driven
+health gate to refuse job admission when broker health is degraded.
+
+### Key Types
+
+- `BrokerHealthStatus`: Three-state enum (`Healthy`, `Degraded`, `Failed`).
+  Default is `Failed` (fail-closed). `Degraded` is reserved for future use and
+  is not currently emitted by `BrokerHealthChecker::check_health`.
+- `InvariantCheckResult`: Per-predicate check result carrying `predicate_id`,
+  `passed` flag, and optional `deny_reason`. All string fields enforce bounded
+  deserialization (`MAX_PREDICATE_ID_LENGTH=64`, `MAX_DENY_REASON_LENGTH=1024`).
+- `HealthReceiptV1`: Signed health receipt containing schema metadata, status,
+  broker tick, evaluation window hash, individual check results, content hash,
+  Ed25519 signature, and signer identity. All string and Vec fields enforce
+  bounded deserialization (SEC-CTRL-FAC-0016). `verify()` performs full
+  payload-binding verification: recomputes canonical hash from payload fields
+  and constant-time compares before signature check.
+- `BrokerHealthError`: Error taxonomy for health check input bounds violations,
+  validation failures, and verification failures.
+- `HealthCheckInput`: Aggregated input bundle for health evaluation, including
+  optional envelope, evaluation window, signature verifier, freshness/revocation/
+  convergence horizons, convergence receipts, and required authority sets.
+- `BrokerHealthChecker`: Stateful checker maintaining a bounded history ring
+  (`MAX_HEALTH_HISTORY=64`) and a monotonic `health_seq` counter. Runs
+  TP001/TP002/TP003 checks, signs receipts, and tracks history. The `health_seq`
+  advances on every health check invocation (including error-path synthetic
+  receipts), providing per-invocation freshness independent of broker tick.
+  Returns `Result` to enforce input bounds. Can be restored from persisted state
+  via `from_persisted_seq(health_seq)` using the `BrokerState::health_seq` value.
+- `WorkerHealthPolicy`: Policy enum for worker admission gate. `StrictHealthy`
+  (default) requires `Healthy`; `AllowDegraded` permits `Degraded`.
+- `WorkerHealthGateError`: Fail-closed error taxonomy for worker health gate
+  denial (no receipt, degraded, failed, verification failed, stale health
+  sequence).
+
+### Core Capabilities
+
+- Delegates TP predicate validation to existing `economics::queue_admission`
+  functions (`validate_envelope_tp001`, `validate_freshness_horizon_tp002`,
+  `validate_convergence_horizon_tp003`).
+- `FacBroker::check_health()` convenience method wires broker state into the
+  health checker. Persists `health_seq` to `BrokerState` after each call.
+  Returns `Result` for input bounds enforcement.
+- `FacBroker::evaluate_admission_health_gate()` enforces policy-driven admission
+  control using the broker's own `current_tick()` and `state.health_seq` as
+  minimum floors (preventing caller-supplied staleness). Delegates to
+  `evaluate_worker_health_gate()`.
+- `evaluate_worker_health_gate()` enforces policy-driven admission control:
+  verifies receipt existence, payload integrity (content hash recomputation +
+  constant-time comparison), signature authenticity (via `BrokerSignatureVerifier`),
+  evaluation window context binding (`expected_eval_window_hash`), receipt
+  recency (`min_broker_tick`), health sequence freshness (`min_health_seq`),
+  and health status against worker policy.
+- Domain-separated BLAKE3 content hash (`apm2.fac_broker.health_receipt.v1`) over
+  schema identity, tick, health_seq, eval window hash, status, and all per-check
+  results with injective u64 length-prefix framing.
+- Bounded deserialization on all string fields (`schema_id`, `schema_version`,
+  `predicate_id`, `deny_reason`) and Vec fields (`checks`) during JSON parsing.
+- Evaluation window hash included in receipt for boundary context binding.
+- `compute_eval_window_hash()` is public for production callers to compute
+  the expected `eval_window_hash` before calling the worker health gate.
+
+### Security Invariants (TCK-00585)
+
+- [INV-BH-001] Default `BrokerHealthStatus` is `Failed` (fail-closed). Missing
+  or ambiguous health state denies admission.
+- [INV-BH-002] Health receipts are Ed25519-signed by the broker key. Workers
+  verify signature authenticity before trusting health status.
+- [INV-BH-003] Worker health gate denies admission when no receipt exists, when
+  verification fails, or when status violates policy.
+- [INV-BH-004] All in-memory collections are bounded by hard `MAX_*` caps:
+  `MAX_HEALTH_HISTORY=64`, `MAX_HEALTH_FINDINGS=16`,
+  `MAX_HEALTH_REQUIRED_AUTHORITY_SETS=64`.
+- [INV-BH-005] Health check input bounds are enforced before evaluation:
+  `required_authority_sets` is capped at `MAX_HEALTH_REQUIRED_AUTHORITY_SETS`
+  with explicit `Err` on overflow.
+- [INV-BH-006] `HealthReceiptV1::verify()` recomputes the canonical content
+  hash from all payload fields and constant-time compares it against the stored
+  `content_hash` before signature verification. This binds the signature to all
+  receipt payload fields, preventing post-signing field tampering. Schema ID and
+  version are included in the canonical hash.
+- [INV-BH-007] All string fields and Vec collections enforce bounded
+  deserialization via visitor-based implementations that validate length BEFORE
+  ownership allocation, preventing memory exhaustion from malformed JSON
+  (RSK-1601, SEC-CTRL-FAC-0016). The `visit_str` path checks length before
+  `to_owned()`, closing the Check-After-Allocate OOM-DoS vector.
+- [INV-BH-008] Hash computation uses `u64::to_le_bytes()` length prefixes for
+  injective framing of variable-length fields.
+- [INV-BH-009] Evaluation window hash is included in the receipt payload for
+  boundary context binding.
+- [INV-BH-010] Worker health gate requires `expected_eval_window_hash` and
+  rejects receipts generated for a different evaluation window (context binding,
+  anti-replay). Uses constant-time comparison.
+- [INV-BH-011] Worker health gate requires `min_broker_tick` and rejects
+  receipts with stale broker ticks (recency enforcement, anti-replay).
+- [INV-BH-012] On health check input validation errors, a synthetic FAILED
+  receipt is persisted so downstream gates cannot continue on a stale HEALTHY
+  receipt. The synthetic receipt carries a machine-readable reason.
+- [INV-BH-013] A monotonically increasing `health_seq` counter in
+  `BrokerHealthChecker` advances on every health check invocation (including
+  error-path synthetic receipts). The counter is included in each
+  `HealthReceiptV1` and bound into the content hash via `u64::to_le_bytes()`.
+  The worker health gate enforces `receipt.health_seq >= min_health_seq` to
+  prevent same-tick replay attacks where an old HEALTHY receipt is presented
+  after health has degraded but the broker tick has not advanced.
+- [INV-BH-014] The `health_seq` counter uses `checked_add` (not
+  `wrapping_add`) to detect overflow at `u64::MAX`. On overflow, a synthetic
+  FAILED receipt is persisted (SEQ_OVERFLOW predicate) and
+  `BrokerHealthError::HealthSeqOverflow` is returned. This is a terminal
+  condition requiring broker key/epoch rotation (fail-closed). Synthetic
+  receipts in error paths use `saturating_add` to cap at `u64::MAX` without
+  wrapping.
+- [INV-BH-015] `FacBroker::evaluate_admission_health_gate()` is the
+  canonical production entry point for worker admission health gating.
+  It wires the broker's verifying key, computes the expected eval window
+  hash, and uses `self.current_tick()` and `self.state.health_seq` as
+  minimum floors (preventing caller-supplied staleness). Both
+  `evaluate_admission_health_gate()` and `check_health()` update the
+  broker's `admission_health_gate_passed` flag, which is enforced by
+  `issue_channel_context_token()` as a mandatory precondition
+  (INV-BRK-HEALTH-GATE-001). `check_health()` also persists
+  `health_seq` to `BrokerState` after each call so the counter survives
+  daemon restarts. This ensures health gate enforcement is
+  active on ALL production admission/token issuance paths through the
+  `FacBroker` API.
 
 ## projection_compromise Submodule
 
