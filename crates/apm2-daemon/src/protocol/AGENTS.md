@@ -80,6 +80,11 @@ Privileged endpoint dispatcher for RFC-0017 control-plane IPC. Routes privileged
 
 - [CTR-PR05] Only accepts messages from operator socket connections.
 
+**Invariants:**
+
+- [INV-BRK-HEALTH-GATE-001] The `PrivilegedDispatcher` enforces a fail-closed admission health gate on all token issuance paths. The `admission_health_gate` (`AtomicBool`) starts `false` (fail-closed) and is continuously re-evaluated by the background health poller (10s interval in `main.rs`). The poller creates a daemon-level `FacBroker` and `BrokerHealthChecker`, performs a full TP001/TP002/TP003 health check on each cycle, and updates the gate: `true` on `Healthy`, `false` on `Failed`/`Degraded`/error. `validate_channel_boundary_and_issue_context_token_with_flow()` checks this gate before proceeding; if the gate is closed, it returns a `MissingChannelMetadata` defect citing `INV-BRK-HEALTH-GATE-001`. This is defense-in-depth alongside `FacBroker`'s per-session health gate.
+- The `channel_boundary_dispatcher()` function in `session_dispatch.rs` returns the `&'static PrivilegedDispatcher` singleton. The background health poller updates its health gate every 10s; the singleton is shared across all session dispatch calls.
+
 ### `SessionDispatcher`
 
 Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after validating the session token.
