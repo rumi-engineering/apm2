@@ -25,6 +25,7 @@ use super::types::{
     ensure_parent_dir, now_iso8601,
 };
 use super::worktree::resolve_worktree_for_sha;
+use crate::commands::fac_permissions;
 
 const SYSTEMD_DISPATCH_ENV_ALLOWLIST: [&str; 11] = [
     "PATH",
@@ -1234,7 +1235,7 @@ fn spawn_detached_review(
     }
 
     let dispatch_dir = apm2_home_dir()?.join("review_dispatch");
-    fs::create_dir_all(&dispatch_dir).map_err(|err| {
+    fac_permissions::ensure_dir_with_mode(&dispatch_dir).map_err(|err| {
         format!(
             "failed to create dispatch directory {}: {err}",
             dispatch_dir.display()
@@ -1244,10 +1245,7 @@ fn spawn_detached_review(
         "pr{pr_number}-{}-{head_short}-{dispatch_epoch}.log",
         review_kind.as_str()
     ));
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let stdout = fac_permissions::append_fac_file_with_mode(&log_path)
         .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
     let stderr = stdout
         .try_clone()

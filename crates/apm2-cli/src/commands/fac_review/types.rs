@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::commands::fac_permissions;
+
 // ── Duration / count constants ──────────────────────────────────────────────
 
 pub const EVENT_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
@@ -670,11 +672,13 @@ pub fn apm2_home_dir() -> Result<PathBuf, String> {
     Ok(base_dirs.home_dir().join(".apm2"))
 }
 
+/// Ensure the parent directory of `path` exists, creating it with mode 0700
+/// if necessary (TCK-00536: safe permissions at create-time).
 pub fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Err(format!("path has no parent: {}", path.display()));
     };
-    std::fs::create_dir_all(parent)
+    fac_permissions::ensure_dir_with_mode(parent)
         .map_err(|err| format!("failed to create parent dir {}: {err}", parent.display()))
 }
 

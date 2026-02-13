@@ -58,6 +58,7 @@ sha2 = "0.10"
 subtle = "2"
 hex = "0.4"
 libc.workspace = true
+nix.workspace = true
 
 # Security / Credentials
 keyring.workspace = true

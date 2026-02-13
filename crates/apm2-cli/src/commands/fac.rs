@@ -1069,6 +1069,16 @@ pub fn run_fac(
     config_path: &Path,
 ) -> u8 {
     let json_output = cmd.json;
+
+    // TCK-00536: Validate FAC root permissions on every FAC command entry.
+    // Refuse to proceed if `$APM2_HOME` or `$APM2_HOME/private/fac` have
+    // unsafe permissions (group/world-writable or wrong ownership).
+    if let Err(err) = crate::commands::fac_permissions::validate_fac_root_permissions() {
+        eprintln!("ERROR: FAC root permissions check failed (fail-closed).");
+        eprintln!("{err}");
+        return exit_codes::GENERIC_ERROR;
+    }
+
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
 

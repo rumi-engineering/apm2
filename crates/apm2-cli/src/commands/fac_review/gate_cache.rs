@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::gate_attestation::MERGE_CONFLICT_GATE_NAME;
 use super::types::{apm2_home_dir, now_iso8601};
+use crate::commands::fac_permissions;
 
 const CACHE_SCHEMA_V2: &str = "apm2.fac.gate_result_receipt.v2";
 const MAX_CACHE_READ_BYTES: usize = 1_048_576;
@@ -133,7 +134,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         ));
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        fac_permissions::ensure_dir_with_mode(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
     let tmp = path.with_extension("tmp");
@@ -218,7 +219,7 @@ impl GateCache {
     /// Write cache to disk using v2 per-gate files.
     pub fn save(&self) -> Result<(), String> {
         let dir = cache_sha_dir_v2(&self.sha)?;
-        fs::create_dir_all(&dir)
+        fac_permissions::ensure_dir_with_mode(&dir)
             .map_err(|err| format!("failed to create gate cache dir: {err}"))?;
 
         for (gate_name, result) in &self.gates {
