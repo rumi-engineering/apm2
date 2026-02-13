@@ -873,13 +873,19 @@ impl FacBroker {
     ///
     /// Returns a signed [`super::broker_health::HealthReceiptV1`] capturing the
     /// aggregate health status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::broker_health::BrokerHealthError`] if input bounds
+    /// are violated (e.g., too many required authority sets).
     pub fn check_health(
         &self,
         envelope: Option<&TimeAuthorityEnvelopeV1>,
         eval_window: &HtfEvaluationWindow,
         required_authority_sets: &[Hash],
         checker: &mut super::broker_health::BrokerHealthChecker,
-    ) -> super::broker_health::HealthReceiptV1 {
+    ) -> Result<super::broker_health::HealthReceiptV1, super::broker_health::BrokerHealthError>
+    {
         let verifier = BrokerSignatureVerifier::new(self.verifying_key());
         let freshness = self.freshness_horizon();
         let frontier = self.revocation_frontier();

@@ -16,8 +16,18 @@
 //!   authenticity.
 //! - [INV-BRK-HEALTH-004] All in-memory collections are bounded by `MAX_*`
 //!   caps. The check result history is capped at [`MAX_HEALTH_HISTORY`].
+//! - [INV-BRK-HEALTH-005] Health receipt verification recomputes the canonical
+//!   content hash from payload fields and constant-time compares it against
+//!   `content_hash` before signature verification. This binds the signature to
+//!   all receipt payload fields, preventing post-signing field tampering.
+//! - [INV-BRK-HEALTH-006] All string fields and Vec collections enforce bounded
+//!   deserialization to prevent memory exhaustion (RSK-1601).
+//! - [INV-BRK-HEALTH-007] Hash computation uses `u64::to_le_bytes()` length
+//!   prefixes for injective framing of variable-length fields.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::BrokerSignatureVerifier;
 use super::broker::Hash;
@@ -45,6 +55,18 @@ pub const MAX_HEALTH_REQUIRED_AUTHORITY_SETS: usize = 64;
 /// Maximum number of findings in a single health receipt.
 pub const MAX_HEALTH_FINDINGS: usize = 16;
 
+/// Maximum string length for `predicate_id` fields (SEC-CTRL-FAC-0016).
+pub const MAX_PREDICATE_ID_LENGTH: usize = 64;
+
+/// Maximum string length for `deny_reason` fields (SEC-CTRL-FAC-0016).
+pub const MAX_DENY_REASON_LENGTH: usize = 1024;
+
+/// Maximum string length for `schema_id` fields (SEC-CTRL-FAC-0016).
+pub const MAX_SCHEMA_ID_LENGTH: usize = 256;
+
+/// Maximum string length for `schema_version` fields (SEC-CTRL-FAC-0016).
+pub const MAX_SCHEMA_VERSION_LENGTH: usize = 64;
+
 /// Domain separator for health receipt content hashing.
 const HEALTH_RECEIPT_HASH_DOMAIN: &[u8] = b"apm2.fac_broker.health_receipt.v1";
 
@@ -53,6 +75,156 @@ pub const HEALTH_RECEIPT_SCHEMA_ID: &str = "apm2.fac_broker_health_receipt.v1";
 
 /// Schema version for health receipts.
 pub const HEALTH_RECEIPT_SCHEMA_VERSION: &str = "1.0.0";
+
+// ---------------------------------------------------------------------------
+// Bounded deserialization helpers (SEC-CTRL-FAC-0016)
+// ---------------------------------------------------------------------------
+
+/// Deserialize a `Vec` with a maximum size bound to prevent OOM attacks.
+///
+/// Per SEC-CTRL-FAC-0016, all collections deserialized from untrusted input
+/// must enforce size limits during parsing to prevent denial-of-service via
+/// memory exhaustion.
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    max_items: usize,
+    field_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        max_items: usize,
+        field_name: &'static str,
+        _marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence with at most {} items",
+                self.max_items
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max_items));
+
+            while let Some(item) = seq.next_element()? {
+                if vec.len() >= self.max_items {
+                    return Err(de::Error::custom(format!(
+                        "collection '{}' exceeds maximum size of {}",
+                        self.field_name, self.max_items
+                    )));
+                }
+                vec.push(item);
+            }
+
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        max_items,
+        field_name,
+        _marker: std::marker::PhantomData,
+    })
+}
+
+/// Deserialize a string with a maximum length bound to prevent OOM attacks.
+///
+/// Per SEC-CTRL-FAC-0016, all string fields deserialized from untrusted input
+/// must enforce length limits during parsing to prevent denial-of-service via
+/// memory exhaustion.
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > max_len {
+        return Err(de::Error::custom(format!(
+            "string field '{}' exceeds maximum length ({} > {})",
+            field_name,
+            s.len(),
+            max_len
+        )));
+    }
+    Ok(s)
+}
+
+/// Deserialize an optional string with a maximum length bound.
+fn deserialize_bounded_option_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &'static str,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(ref s) = opt {
+        if s.len() > max_len {
+            return Err(de::Error::custom(format!(
+                "string field '{}' exceeds maximum length ({} > {})",
+                field_name,
+                s.len(),
+                max_len
+            )));
+        }
+    }
+    Ok(opt)
+}
+
+// Field-specific deserializers
+
+fn deserialize_schema_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SCHEMA_ID_LENGTH, "schema_id")
+}
+
+fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SCHEMA_VERSION_LENGTH, "schema_version")
+}
+
+fn deserialize_predicate_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_PREDICATE_ID_LENGTH, "predicate_id")
+}
+
+fn deserialize_deny_reason<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_option_string(deserializer, MAX_DENY_REASON_LENGTH, "deny_reason")
+}
+
+fn deserialize_checks<'de, D>(deserializer: D) -> Result<Vec<InvariantCheckResult>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_HEALTH_FINDINGS, "checks")
+}
 
 // ---------------------------------------------------------------------------
 // Health status (fail-closed default)
@@ -67,9 +239,11 @@ pub const HEALTH_RECEIPT_SCHEMA_VERSION: &str = "1.0.0";
 pub enum BrokerHealthStatus {
     /// All invariants passed.
     Healthy,
-    /// At least one invariant has a non-blocking warning but all critical
-    /// checks passed. Workers MAY admit jobs under policy-configured
-    /// degraded-mode tolerance.
+    /// Reserved for future use. This variant exists to support future
+    /// degraded-mode policies where some invariants produce non-blocking
+    /// warnings while all critical checks pass. It is not currently emitted
+    /// by `BrokerHealthChecker::check_health` but is recognized by the
+    /// worker health gate under [`WorkerHealthPolicy::AllowDegraded`].
     Degraded,
     /// At least one critical invariant failed. Workers MUST NOT admit jobs
     /// (fail-closed).
@@ -84,6 +258,61 @@ impl Default for BrokerHealthStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Errors from health check operations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BrokerHealthError {
+    /// Input `required_authority_sets` exceeds
+    /// `MAX_HEALTH_REQUIRED_AUTHORITY_SETS`.
+    #[error("required_authority_sets exceeds maximum ({actual} > {max})")]
+    TooManyRequiredAuthoritySets {
+        /// Actual count.
+        actual: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Input `checks` exceeds `MAX_HEALTH_FINDINGS`.
+    #[error("checks exceeds maximum ({actual} > {max})")]
+    TooManyChecks {
+        /// Actual count.
+        actual: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// A string field exceeds its maximum length.
+    #[error("string field '{field}' exceeds maximum length ({len} > {max})")]
+    StringTooLong {
+        /// Field name.
+        field: &'static str,
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Schema ID does not match expected value.
+    #[error("schema_id mismatch: expected '{expected}', got '{actual}'")]
+    SchemaMismatch {
+        /// Expected schema ID.
+        expected: String,
+        /// Actual schema ID.
+        actual: String,
+    },
+
+    /// Content hash does not match recomputed value (payload tampering).
+    #[error("content_hash does not match recomputed hash (payload tampered)")]
+    ContentHashMismatch,
+
+    /// Signature verification failed.
+    #[error("signature verification failed")]
+    InvalidSignature,
+}
+
+// ---------------------------------------------------------------------------
 // Individual invariant check result
 // ---------------------------------------------------------------------------
 
@@ -92,10 +321,18 @@ impl Default for BrokerHealthStatus {
 #[serde(deny_unknown_fields)]
 pub struct InvariantCheckResult {
     /// Predicate identifier (e.g., "TP001", "TP002", "TP003").
+    ///
+    /// Bounded at deserialization time to `MAX_PREDICATE_ID_LENGTH`
+    /// (SEC-CTRL-FAC-0016).
+    #[serde(deserialize_with = "deserialize_predicate_id")]
     pub predicate_id: String,
     /// Whether the check passed.
     pub passed: bool,
     /// Human-readable reason code when the check fails.
+    ///
+    /// Bounded at deserialization time to `MAX_DENY_REASON_LENGTH`
+    /// (SEC-CTRL-FAC-0016).
+    #[serde(deserialize_with = "deserialize_deny_reason")]
     pub deny_reason: Option<String>,
 }
 
@@ -108,18 +345,46 @@ pub struct InvariantCheckResult {
 /// Workers inspect this receipt to decide whether to admit jobs. The receipt
 /// is signed by the broker's Ed25519 key so recipients can verify authenticity
 /// (INV-BRK-HEALTH-003).
+///
+/// # Verification
+///
+/// [`HealthReceiptV1::verify`] performs full payload-binding verification:
+/// 1. Validates `schema_id` and `schema_version` match expected constants.
+/// 2. Recomputes the canonical content hash from `(schema_id, schema_version,
+///    broker_tick, eval_window_hash, status, checks)`.
+/// 3. Constant-time compares the recomputed hash with the stored
+///    `content_hash`.
+/// 4. Verifies the Ed25519 signature over `content_hash`.
+///
+/// This ensures an attacker cannot tamper with payload fields (e.g., changing
+/// `status` from `FAILED` to `HEALTHY`) while keeping the original signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthReceiptV1 {
     /// Schema identifier for version checking.
+    ///
+    /// Bounded at deserialization time to `MAX_SCHEMA_ID_LENGTH`
+    /// (SEC-CTRL-FAC-0016).
+    #[serde(deserialize_with = "deserialize_schema_id")]
     pub schema_id: String,
     /// Schema version.
+    ///
+    /// Bounded at deserialization time to `MAX_SCHEMA_VERSION_LENGTH`
+    /// (SEC-CTRL-FAC-0016).
+    #[serde(deserialize_with = "deserialize_schema_version")]
     pub schema_version: String,
     /// Overall health status (fail-closed aggregate).
     pub status: BrokerHealthStatus,
     /// Broker tick at the time of the health check.
     pub broker_tick: u64,
+    /// BLAKE3 hash of the evaluation window used for this health check,
+    /// binding the receipt to a specific boundary context.
+    pub eval_window_hash: Hash,
     /// Individual invariant check results.
+    ///
+    /// Bounded at deserialization time to `MAX_HEALTH_FINDINGS`
+    /// (SEC-CTRL-FAC-0016).
+    #[serde(deserialize_with = "deserialize_checks")]
     pub checks: Vec<InvariantCheckResult>,
     /// Content hash of the receipt (domain-separated).
     pub content_hash: Hash,
@@ -133,10 +398,107 @@ pub struct HealthReceiptV1 {
 impl HealthReceiptV1 {
     /// Verifies the receipt signature using the provided verifier.
     ///
-    /// Returns `true` if the signature is valid, `false` otherwise.
-    #[must_use]
-    pub fn verify(&self, verifier: &BrokerSignatureVerifier) -> bool {
-        verifier.verify_broker_signature(&self.content_hash, &self.signer_id, &self.signature)
+    /// Performs full payload-binding verification (INV-BRK-HEALTH-005):
+    /// 1. Validates `schema_id` and `schema_version`.
+    /// 2. Recomputes canonical hash from payload fields.
+    /// 3. Constant-time compares recomputed hash with stored `content_hash`.
+    /// 4. Verifies Ed25519 signature over `content_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BrokerHealthError`] describing the verification failure.
+    pub fn verify(&self, verifier: &BrokerSignatureVerifier) -> Result<(), BrokerHealthError> {
+        // Step 1: Validate schema identity
+        if self.schema_id != HEALTH_RECEIPT_SCHEMA_ID {
+            return Err(BrokerHealthError::SchemaMismatch {
+                expected: HEALTH_RECEIPT_SCHEMA_ID.to_string(),
+                actual: self.schema_id.clone(),
+            });
+        }
+        if self.schema_version != HEALTH_RECEIPT_SCHEMA_VERSION {
+            return Err(BrokerHealthError::SchemaMismatch {
+                expected: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
+                actual: self.schema_version.clone(),
+            });
+        }
+
+        // Step 2: Recompute canonical hash from payload fields
+        let recomputed = compute_health_receipt_hash(
+            self.broker_tick,
+            self.eval_window_hash,
+            self.status,
+            &self.checks,
+        );
+
+        // Step 3: Constant-time compare recomputed hash with stored content_hash
+        if !bool::from(recomputed.ct_eq(&self.content_hash)) {
+            return Err(BrokerHealthError::ContentHashMismatch);
+        }
+
+        // Step 4: Verify Ed25519 signature
+        if !verifier.verify_broker_signature(&self.content_hash, &self.signer_id, &self.signature) {
+            return Err(BrokerHealthError::InvalidSignature);
+        }
+
+        Ok(())
+    }
+
+    /// Validates the receipt's structural integrity without signature
+    /// verification.
+    ///
+    /// Enforces:
+    /// - `schema_id` matches [`HEALTH_RECEIPT_SCHEMA_ID`]
+    /// - `schema_version` matches [`HEALTH_RECEIPT_SCHEMA_VERSION`]
+    /// - `checks.len() <= MAX_HEALTH_FINDINGS`
+    /// - All string fields within length bounds
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BrokerHealthError`] describing the validation failure.
+    pub fn validate(&self) -> Result<(), BrokerHealthError> {
+        // Schema identity
+        if self.schema_id != HEALTH_RECEIPT_SCHEMA_ID {
+            return Err(BrokerHealthError::SchemaMismatch {
+                expected: HEALTH_RECEIPT_SCHEMA_ID.to_string(),
+                actual: self.schema_id.clone(),
+            });
+        }
+        if self.schema_version != HEALTH_RECEIPT_SCHEMA_VERSION {
+            return Err(BrokerHealthError::SchemaMismatch {
+                expected: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
+                actual: self.schema_version.clone(),
+            });
+        }
+
+        // Checks vector bound
+        if self.checks.len() > MAX_HEALTH_FINDINGS {
+            return Err(BrokerHealthError::TooManyChecks {
+                actual: self.checks.len(),
+                max: MAX_HEALTH_FINDINGS,
+            });
+        }
+
+        // String field bounds within checks
+        for check in &self.checks {
+            if check.predicate_id.len() > MAX_PREDICATE_ID_LENGTH {
+                return Err(BrokerHealthError::StringTooLong {
+                    field: "predicate_id",
+                    len: check.predicate_id.len(),
+                    max: MAX_PREDICATE_ID_LENGTH,
+                });
+            }
+            if let Some(ref reason) = check.deny_reason {
+                if reason.len() > MAX_DENY_REASON_LENGTH {
+                    return Err(BrokerHealthError::StringTooLong {
+                        field: "deny_reason",
+                        len: reason.len(),
+                        max: MAX_DENY_REASON_LENGTH,
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -211,12 +573,26 @@ impl BrokerHealthChecker {
     ///
     /// The result is signed by the broker's Ed25519 key and appended to the
     /// bounded history ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerHealthError::TooManyRequiredAuthoritySets`] if
+    /// `input.required_authority_sets` exceeds
+    /// [`MAX_HEALTH_REQUIRED_AUTHORITY_SETS`] (INV-BH-005).
     pub fn check_health(
         &mut self,
         input: &HealthCheckInput<'_>,
         broker_tick: u64,
         signer: &Signer,
-    ) -> HealthReceiptV1 {
+    ) -> Result<HealthReceiptV1, BrokerHealthError> {
+        // INV-BH-005: Enforce input bounds before evaluation (fail-closed).
+        if input.required_authority_sets.len() > MAX_HEALTH_REQUIRED_AUTHORITY_SETS {
+            return Err(BrokerHealthError::TooManyRequiredAuthoritySets {
+                actual: input.required_authority_sets.len(),
+                max: MAX_HEALTH_REQUIRED_AUTHORITY_SETS,
+            });
+        }
+
         let mut checks = Vec::with_capacity(3);
 
         // TP001: envelope signature validity
@@ -260,8 +636,12 @@ impl BrokerHealthChecker {
             BrokerHealthStatus::Failed
         };
 
-        // Compute content hash (domain-separated)
-        let content_hash = compute_health_receipt_hash(broker_tick, status, &checks);
+        // Compute eval_window hash for boundary context binding (SEC-MINOR-2)
+        let eval_window_hash = compute_eval_window_hash(input.eval_window);
+
+        // Compute content hash (domain-separated, includes schema + eval_window)
+        let content_hash =
+            compute_health_receipt_hash(broker_tick, eval_window_hash, status, &checks);
 
         // Sign the content hash
         let signature_bytes = signer.sign(&content_hash);
@@ -272,6 +652,7 @@ impl BrokerHealthChecker {
             schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
             status,
             broker_tick,
+            eval_window_hash,
             checks,
             content_hash,
             signature: signature_bytes.to_bytes(),
@@ -284,7 +665,7 @@ impl BrokerHealthChecker {
         }
         self.history.push(receipt.clone());
 
-        receipt
+        Ok(receipt)
     }
 
     /// Returns the most recent health receipt, if any.
@@ -341,9 +722,9 @@ pub enum WorkerHealthGateError {
         reason: String,
     },
 
-    /// Health receipt signature verification failed.
-    #[error("health receipt signature invalid")]
-    InvalidSignature,
+    /// Health receipt verification failed (signature, content hash, or schema).
+    #[error("health receipt verification failed: {0}")]
+    VerificationFailed(#[from] BrokerHealthError),
 }
 
 /// Policy for the worker health admission gate.
@@ -363,8 +744,9 @@ pub enum WorkerHealthPolicy {
 ///
 /// The gate checks:
 /// 1. A health receipt exists (fail-closed if missing).
-/// 2. The receipt signature is valid.
-/// 3. The health status meets the configured policy.
+/// 2. The receipt payload integrity (content hash recomputed and compared).
+/// 3. The receipt signature is valid.
+/// 4. The health status meets the configured policy.
 ///
 /// # Errors
 ///
@@ -376,10 +758,9 @@ pub fn evaluate_worker_health_gate(
 ) -> Result<(), WorkerHealthGateError> {
     let receipt = receipt.ok_or(WorkerHealthGateError::NoHealthReceipt)?;
 
-    // Verify receipt signature (authenticity gate)
-    if !receipt.verify(verifier) {
-        return Err(WorkerHealthGateError::InvalidSignature);
-    }
+    // Verify receipt: schema + content hash recompute + signature
+    // (INV-BRK-HEALTH-005)
+    receipt.verify(verifier)?;
 
     match receipt.status {
         BrokerHealthStatus::Healthy => Ok(()),
@@ -401,14 +782,42 @@ pub fn evaluate_worker_health_gate(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Computes the canonical content hash for a health receipt.
+///
+/// The hash covers all semantically relevant fields using injective framing
+/// (u64 length prefixes) to prevent ambiguity between different payloads:
+/// - Domain separator
+/// - Schema ID and version (bound to interpretation)
+/// - Broker tick
+/// - Evaluation window hash (boundary context binding)
+/// - Status byte
+/// - All check results (`predicate_id`, `passed`, `deny_reason`)
+///
+/// # INV-BRK-HEALTH-007
+///
+/// Length prefixes use `u64::to_le_bytes()` for injective framing.
 fn compute_health_receipt_hash(
     broker_tick: u64,
+    eval_window_hash: Hash,
     status: BrokerHealthStatus,
     checks: &[InvariantCheckResult],
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(HEALTH_RECEIPT_HASH_DOMAIN);
+
+    // Schema identity binding (CQ-BLOCKER-1)
+    let schema_id_bytes = HEALTH_RECEIPT_SCHEMA_ID.as_bytes();
+    hasher.update(&(schema_id_bytes.len() as u64).to_le_bytes());
+    hasher.update(schema_id_bytes);
+    let schema_version_bytes = HEALTH_RECEIPT_SCHEMA_VERSION.as_bytes();
+    hasher.update(&(schema_version_bytes.len() as u64).to_le_bytes());
+    hasher.update(schema_version_bytes);
+
+    // Broker tick
     hasher.update(&broker_tick.to_le_bytes());
+
+    // Evaluation window hash (SEC-MINOR-2: boundary context binding)
+    hasher.update(&eval_window_hash);
 
     // Encode status as a single byte
     let status_byte = match status {
@@ -418,29 +827,42 @@ fn compute_health_receipt_hash(
     };
     hasher.update(&[status_byte]);
 
-    // Encode check results (bounded by MAX_HEALTH_FINDINGS)
-    let check_count = checks.len().min(MAX_HEALTH_FINDINGS);
-    #[allow(clippy::cast_possible_truncation)]
-    let count_u8 = check_count as u8;
-    hasher.update(&[count_u8]);
-    for check in checks.iter().take(MAX_HEALTH_FINDINGS) {
-        // Length-prefix the predicate_id for framing
-        #[allow(clippy::cast_possible_truncation)]
-        let pid_len = check.predicate_id.len().min(255) as u8;
-        hasher.update(&[pid_len]);
-        hasher.update(check.predicate_id.as_bytes());
+    // Encode ALL check results with u64 length prefixes (SEC-MINOR-1)
+    // No truncation: callers must enforce MAX_HEALTH_FINDINGS before hashing.
+    let check_count = checks.len() as u64;
+    hasher.update(&check_count.to_le_bytes());
+    for check in checks {
+        // Length-prefix the predicate_id with u64 for injective framing
+        let pid_bytes = check.predicate_id.as_bytes();
+        hasher.update(&(pid_bytes.len() as u64).to_le_bytes());
+        hasher.update(pid_bytes);
         hasher.update(&[u8::from(check.passed)]);
         if let Some(ref reason) = check.deny_reason {
             hasher.update(&[1u8]); // present marker
-            #[allow(clippy::cast_possible_truncation)]
-            let reason_len = reason.len().min(u16::MAX as usize) as u16;
-            hasher.update(&reason_len.to_le_bytes());
-            hasher.update(reason.as_bytes());
+            let reason_bytes = reason.as_bytes();
+            hasher.update(&(reason_bytes.len() as u64).to_le_bytes());
+            hasher.update(reason_bytes);
         } else {
             hasher.update(&[0u8]); // absent marker
         }
     }
 
+    *hasher.finalize().as_bytes()
+}
+
+/// Computes a BLAKE3 hash of the evaluation window fields for boundary
+/// context binding.
+fn compute_eval_window_hash(eval_window: &HtfEvaluationWindow) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.eval_window.v1");
+    let bid = eval_window.boundary_id.as_bytes();
+    hasher.update(&(bid.len() as u64).to_le_bytes());
+    hasher.update(bid);
+    let ac = eval_window.authority_clock.as_bytes();
+    hasher.update(&(ac.len() as u64).to_le_bytes());
+    hasher.update(ac);
+    hasher.update(&eval_window.tick_start.to_le_bytes());
+    hasher.update(&eval_window.tick_end.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -588,7 +1010,7 @@ mod tests {
             required_authority_sets: &[authority_set],
         };
 
-        let receipt = checker.check_health(&input, 42, &signer);
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
 
         assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
         assert_eq!(receipt.broker_tick, 42);
@@ -596,7 +1018,7 @@ mod tests {
         assert!(receipt.checks.iter().all(|c| c.passed));
         assert_ne!(receipt.content_hash, [0u8; 32]);
         assert_ne!(receipt.signature, [0u8; 64]);
-        assert!(receipt.verify(&verifier));
+        assert!(receipt.verify(&verifier).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -625,7 +1047,7 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 10, &signer);
+        let receipt = checker.check_health(&input, 10, &signer).unwrap();
 
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
         assert!(!receipt.checks[0].passed); // TP001
@@ -660,7 +1082,7 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 10, &signer);
+        let receipt = checker.check_health(&input, 10, &signer).unwrap();
 
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
         assert!(receipt.checks[0].passed); // TP001
@@ -697,7 +1119,7 @@ mod tests {
             required_authority_sets: &[required],
         };
 
-        let receipt = checker.check_health(&input, 10, &signer);
+        let receipt = checker.check_health(&input, 10, &signer).unwrap();
 
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
         assert!(receipt.checks[0].passed); // TP001
@@ -729,7 +1151,7 @@ mod tests {
             required_authority_sets: &[required],
         };
 
-        let receipt = checker.check_health(&input, 10, &signer);
+        let receipt = checker.check_health(&input, 10, &signer).unwrap();
 
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
         assert!(!receipt.checks[0].passed);
@@ -759,8 +1181,8 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 1, &signer);
-        assert!(receipt.verify(&verifier));
+        let receipt = checker.check_health(&input, 1, &signer).unwrap();
+        assert!(receipt.verify(&verifier).is_ok());
     }
 
     #[test]
@@ -782,8 +1204,8 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 1, &signer);
-        assert!(!receipt.verify(&other_verifier));
+        let receipt = checker.check_health(&input, 1, &signer).unwrap();
+        assert!(receipt.verify(&other_verifier).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -854,7 +1276,7 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 42, &signer);
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
         assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
 
         let result =
@@ -901,7 +1323,7 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 1, &signer);
+        let receipt = checker.check_health(&input, 1, &signer).unwrap();
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
 
         let result = evaluate_worker_health_gate(
@@ -943,7 +1365,7 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let receipt = checker.check_health(&input, 42, &signer);
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
 
         // Verify with a different key => must reject
         let result = evaluate_worker_health_gate(
@@ -953,7 +1375,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(WorkerHealthGateError::InvalidSignature)
+            Err(WorkerHealthGateError::VerificationFailed(_))
         ));
     }
 
@@ -967,6 +1389,7 @@ mod tests {
         // construct a degraded receipt to test the policy path.
         let signer = test_signer();
         let verifier = make_verifier(&signer);
+        let eval_window = valid_eval_window();
 
         let checks = vec![
             InvariantCheckResult {
@@ -986,7 +1409,13 @@ mod tests {
             },
         ];
 
-        let content_hash = compute_health_receipt_hash(42, BrokerHealthStatus::Degraded, &checks);
+        let eval_window_hash = compute_eval_window_hash(&eval_window);
+        let content_hash = compute_health_receipt_hash(
+            42,
+            eval_window_hash,
+            BrokerHealthStatus::Degraded,
+            &checks,
+        );
         let signature_bytes = signer.sign(&content_hash);
 
         let receipt = HealthReceiptV1 {
@@ -994,6 +1423,7 @@ mod tests {
             schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
             status: BrokerHealthStatus::Degraded,
             broker_tick: 42,
+            eval_window_hash,
             checks,
             content_hash,
             signature: signature_bytes.to_bytes(),
@@ -1042,8 +1472,8 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let r1 = checker1.check_health(&input, 42, &signer);
-        let r2 = checker2.check_health(&input, 42, &signer);
+        let r1 = checker1.check_health(&input, 42, &signer).unwrap();
+        let r2 = checker2.check_health(&input, 42, &signer).unwrap();
 
         // Same inputs => same content hash
         assert_eq!(r1.content_hash, r2.content_hash);
@@ -1072,9 +1502,59 @@ mod tests {
             required_authority_sets: &[],
         };
 
-        let r1 = checker.check_health(&input, 1, &signer);
-        let r2 = checker.check_health(&input, 2, &signer);
+        let r1 = checker.check_health(&input, 1, &signer).unwrap();
+        let r2 = checker.check_health(&input, 2, &signer).unwrap();
 
+        assert_ne!(r1.content_hash, r2.content_hash);
+    }
+
+    // -----------------------------------------------------------------------
+    // Content hash changes with different eval windows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_hash_changes_with_different_eval_window() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window1 = HtfEvaluationWindow {
+            boundary_id: "boundary-A".to_string(),
+            authority_clock: "clock-1".to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+        let eval_window2 = HtfEvaluationWindow {
+            boundary_id: "boundary-B".to_string(),
+            authority_clock: "clock-1".to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+
+        let input1 = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window1,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let input2 = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window2,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let r1 = checker.check_health(&input1, 1, &signer).unwrap();
+        let r2 = checker.check_health(&input2, 1, &signer).unwrap();
+
+        assert_ne!(r1.eval_window_hash, r2.eval_window_hash);
         assert_ne!(r1.content_hash, r2.content_hash);
     }
 
@@ -1117,5 +1597,341 @@ mod tests {
         }];
 
         assert_eq!(format_deny_reasons(&checks), "unknown");
+    }
+
+    // -----------------------------------------------------------------------
+    // CQ-BLOCKER-1: Payload tampering detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_rejects_tampered_status() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let mut receipt = checker.check_health(&input, 1, &signer).unwrap();
+        assert_eq!(receipt.status, BrokerHealthStatus::Failed);
+
+        // Tamper: change Failed -> Healthy without re-signing
+        receipt.status = BrokerHealthStatus::Healthy;
+
+        // Verification must detect the tampering via content hash mismatch
+        let result = receipt.verify(&verifier);
+        assert!(
+            matches!(result, Err(BrokerHealthError::ContentHashMismatch)),
+            "expected ContentHashMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_broker_tick() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let mut receipt = checker.check_health(&input, 1, &signer).unwrap();
+
+        // Tamper: change broker_tick without re-signing
+        receipt.broker_tick = 9999;
+
+        let result = receipt.verify(&verifier);
+        assert!(matches!(
+            result,
+            Err(BrokerHealthError::ContentHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_checks() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let mut receipt = checker.check_health(&input, 1, &signer).unwrap();
+
+        // Tamper: mark TP001 as passed without re-signing
+        receipt.checks[0].passed = true;
+        receipt.checks[0].deny_reason = None;
+
+        let result = receipt.verify(&verifier);
+        assert!(matches!(
+            result,
+            Err(BrokerHealthError::ContentHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_schema_id() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let mut receipt = checker.check_health(&input, 1, &signer).unwrap();
+
+        // Tamper: change schema_id
+        receipt.schema_id = "evil.schema.v1".to_string();
+
+        let result = receipt.verify(&verifier);
+        assert!(matches!(
+            result,
+            Err(BrokerHealthError::SchemaMismatch { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-MAJOR-2: required_authority_sets bound enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_health_rejects_too_many_required_authority_sets() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let oversized: Vec<Hash> = (0..=MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &oversized,
+        };
+
+        let result = checker.check_health(&input, 1, &signer);
+        assert!(matches!(
+            result,
+            Err(BrokerHealthError::TooManyRequiredAuthoritySets { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_health_accepts_max_required_authority_sets() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let at_limit: Vec<Hash> = (0..MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &at_limit,
+        };
+
+        // Should succeed (at limit, not over)
+        let result = checker.check_health(&input, 1, &signer);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-BLOCKER-1: Bounded deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deserialize_rejects_oversized_predicate_id() {
+        let long_id = "x".repeat(MAX_PREDICATE_ID_LENGTH + 1);
+        let json =
+            format!(r#"{{"predicate_id": "{long_id}", "passed": true, "deny_reason": null}}"#);
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject oversized predicate_id");
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_deny_reason() {
+        let long_reason = "x".repeat(MAX_DENY_REASON_LENGTH + 1);
+        let json = format!(
+            r#"{{"predicate_id": "TP001", "passed": false, "deny_reason": "{long_reason}"}}"#
+        );
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject oversized deny_reason");
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_checks_vec() {
+        // Build a JSON with MAX_HEALTH_FINDINGS + 1 checks
+        let check_json = r#"{"predicate_id": "TP", "passed": true, "deny_reason": null}"#;
+        let checks_array = format!(
+            "[{}]",
+            std::iter::repeat_n(check_json, MAX_HEALTH_FINDINGS + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let receipt_json = format!(
+            r#"{{
+                "schema_id": "apm2.fac_broker_health_receipt.v1",
+                "schema_version": "1.0.0",
+                "status": "HEALTHY",
+                "broker_tick": 1,
+                "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "checks": {checks_array},
+                "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signer_id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }}"#
+        );
+        let result: Result<HealthReceiptV1, _> = serde_json::from_str(&receipt_json);
+        assert!(result.is_err(), "should reject oversized checks vec");
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_schema_id() {
+        let long_schema = "x".repeat(MAX_SCHEMA_ID_LENGTH + 1);
+        let receipt_json = format!(
+            r#"{{
+                "schema_id": "{long_schema}",
+                "schema_version": "1.0.0",
+                "status": "HEALTHY",
+                "broker_tick": 1,
+                "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "checks": [],
+                "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signer_id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }}"#
+        );
+        let result: Result<HealthReceiptV1, _> = serde_json::from_str(&receipt_json);
+        assert!(result.is_err(), "should reject oversized schema_id");
+    }
+
+    // -----------------------------------------------------------------------
+    // HealthReceiptV1::validate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_valid_receipt() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let receipt = checker.check_health(&input, 1, &signer).unwrap();
+        assert!(receipt.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_schema() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let mut receipt = checker.check_health(&input, 1, &signer).unwrap();
+        receipt.schema_id = "wrong.schema".to_string();
+        assert!(matches!(
+            receipt.validate(),
+            Err(BrokerHealthError::SchemaMismatch { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-MINOR-2: eval_window_hash binding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eval_window_hash_is_deterministic() {
+        let w1 = valid_eval_window();
+        let w2 = valid_eval_window();
+        assert_eq!(compute_eval_window_hash(&w1), compute_eval_window_hash(&w2));
+    }
+
+    #[test]
+    fn eval_window_hash_differs_for_different_windows() {
+        let w1 = valid_eval_window();
+        let mut w2 = valid_eval_window();
+        w2.tick_end = 999;
+        assert_ne!(compute_eval_window_hash(&w1), compute_eval_window_hash(&w2));
     }
 }

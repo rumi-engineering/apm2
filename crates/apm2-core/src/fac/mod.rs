@@ -156,7 +156,7 @@ pub use broker::{
 };
 // Re-export broker health types (TCK-00585)
 pub use broker_health::{
-    BrokerHealthChecker, BrokerHealthStatus, HEALTH_RECEIPT_SCHEMA_ID,
+    BrokerHealthChecker, BrokerHealthError, BrokerHealthStatus, HEALTH_RECEIPT_SCHEMA_ID,
     HEALTH_RECEIPT_SCHEMA_VERSION, HealthCheckInput, HealthReceiptV1, InvariantCheckResult,
     MAX_HEALTH_FINDINGS, MAX_HEALTH_HISTORY, MAX_HEALTH_REQUIRED_AUTHORITY_SETS,
     WorkerHealthGateError, WorkerHealthPolicy, evaluate_worker_health_gate,

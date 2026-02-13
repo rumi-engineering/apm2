@@ -81,22 +81,29 @@ health gate to refuse job admission when broker health is degraded.
 ### Key Types
 
 - `BrokerHealthStatus`: Three-state enum (`Healthy`, `Degraded`, `Failed`).
-  Default is `Failed` (fail-closed).
+  Default is `Failed` (fail-closed). `Degraded` is reserved for future use and
+  is not currently emitted by `BrokerHealthChecker::check_health`.
 - `InvariantCheckResult`: Per-predicate check result carrying `predicate_id`,
-  `passed` flag, and optional `deny_reason`.
+  `passed` flag, and optional `deny_reason`. All string fields enforce bounded
+  deserialization (`MAX_PREDICATE_ID_LENGTH=64`, `MAX_DENY_REASON_LENGTH=1024`).
 - `HealthReceiptV1`: Signed health receipt containing schema metadata, status,
-  broker tick, individual check results, content hash, Ed25519 signature, and
-  signer identity. Serialized to canonical JSON.
+  broker tick, evaluation window hash, individual check results, content hash,
+  Ed25519 signature, and signer identity. All string and Vec fields enforce
+  bounded deserialization (SEC-CTRL-FAC-0016). `verify()` performs full
+  payload-binding verification: recomputes canonical hash from payload fields
+  and constant-time compares before signature check.
+- `BrokerHealthError`: Error taxonomy for health check input bounds violations,
+  validation failures, and verification failures.
 - `HealthCheckInput`: Aggregated input bundle for health evaluation, including
   optional envelope, evaluation window, signature verifier, freshness/revocation/
   convergence horizons, convergence receipts, and required authority sets.
 - `BrokerHealthChecker`: Stateful checker maintaining a bounded history ring
   (`MAX_HEALTH_HISTORY=64`). Runs TP001/TP002/TP003 checks, signs receipts, and
-  tracks history.
+  tracks history. Returns `Result` to enforce input bounds.
 - `WorkerHealthPolicy`: Policy enum for worker admission gate. `StrictHealthy`
   (default) requires `Healthy`; `AllowDegraded` permits `Degraded`.
 - `WorkerHealthGateError`: Fail-closed error taxonomy for worker health gate
-  denial (no receipt, degraded, failed, invalid signature).
+  denial (no receipt, degraded, failed, verification failed).
 
 ### Core Capabilities
 
@@ -104,12 +111,17 @@ health gate to refuse job admission when broker health is degraded.
   functions (`validate_envelope_tp001`, `validate_freshness_horizon_tp002`,
   `validate_convergence_horizon_tp003`).
 - `FacBroker::check_health()` convenience method wires broker state into the
-  health checker.
+  health checker. Returns `Result` for input bounds enforcement.
 - `evaluate_worker_health_gate()` enforces policy-driven admission control:
-  verifies receipt existence, signature authenticity (via `BrokerSignatureVerifier`),
+  verifies receipt existence, payload integrity (content hash recomputation +
+  constant-time comparison), signature authenticity (via `BrokerSignatureVerifier`),
   and health status against worker policy.
-- Domain-separated BLAKE3 content hash (`apm2.health_receipt.v1`) over tick,
-  status, and per-check results.
+- Domain-separated BLAKE3 content hash (`apm2.fac_broker.health_receipt.v1`) over
+  schema identity, tick, eval window hash, status, and all per-check results
+  with injective u64 length-prefix framing.
+- Bounded deserialization on all string fields (`schema_id`, `schema_version`,
+  `predicate_id`, `deny_reason`) and Vec fields (`checks`) during JSON parsing.
+- Evaluation window hash included in receipt for boundary context binding.
 
 ### Security Invariants (TCK-00585)
 
@@ -118,12 +130,24 @@ health gate to refuse job admission when broker health is degraded.
 - [INV-BH-002] Health receipts are Ed25519-signed by the broker key. Workers
   verify signature authenticity before trusting health status.
 - [INV-BH-003] Worker health gate denies admission when no receipt exists, when
-  signature verification fails, or when status violates policy.
+  verification fails, or when status violates policy.
 - [INV-BH-004] All in-memory collections are bounded by hard `MAX_*` caps:
   `MAX_HEALTH_HISTORY=64`, `MAX_HEALTH_FINDINGS=16`,
   `MAX_HEALTH_REQUIRED_AUTHORITY_SETS=64`.
 - [INV-BH-005] Health check input bounds are enforced before evaluation:
-  required_authority_sets and findings are capped with explicit errors on overflow.
+  `required_authority_sets` is capped at `MAX_HEALTH_REQUIRED_AUTHORITY_SETS`
+  with explicit `Err` on overflow.
+- [INV-BH-006] `HealthReceiptV1::verify()` recomputes the canonical content
+  hash from all payload fields and constant-time compares it against the stored
+  `content_hash` before signature verification. This binds the signature to all
+  receipt payload fields, preventing post-signing field tampering. Schema ID and
+  version are included in the canonical hash.
+- [INV-BH-007] All string fields and Vec collections enforce bounded
+  deserialization to prevent memory exhaustion from malformed JSON (RSK-1601).
+- [INV-BH-008] Hash computation uses `u64::to_le_bytes()` length prefixes for
+  injective framing of variable-length fields.
+- [INV-BH-009] Evaluation window hash is included in the receipt payload for
+  boundary context binding.
 
 ## projection_compromise Submodule
 
