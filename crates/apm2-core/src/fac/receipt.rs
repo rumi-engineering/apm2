@@ -163,7 +163,7 @@ pub enum ReceiptError {
 /// binds a gate's output to a specific lease and changeset, enabling audit
 /// and verification of the gate execution.
 ///
-/// # Fields (11 total)
+/// # Fields (12 total)
 ///
 /// - `receipt_id`: Unique identifier for this receipt
 /// - `gate_id`: Gate that generated this receipt
@@ -175,6 +175,8 @@ pub enum ReceiptError {
 /// - `payload_schema_version`: Version of the payload schema
 /// - `payload_hash`: Hash of the payload content
 /// - `evidence_bundle_hash`: Hash of the evidence bundle
+/// - `job_spec_digest`: Optional digest for the FAC job spec that triggered
+///   this receipt.
 /// - `passed`: Explicit pass/fail verdict declared by the executor
 /// - `receipt_signature`: Ed25519 signature with domain separation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +219,12 @@ pub struct GateReceipt {
     #[serde(with = "serde_bytes")]
     pub evidence_bundle_hash: [u8; 32],
 
+    /// BLAKE3 digest of the job spec that authorized this gate execution
+    /// (TCK-00512). Present when the gate was triggered from a
+    /// `FacJobSpecV1` queue item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_spec_digest: Option<String>,
+
     /// Explicit pass/fail verdict declared by the gate executor.
     ///
     /// This is the authoritative verdict field. The orchestrator uses this
@@ -254,6 +262,11 @@ impl GateReceipt {
             + 4   // payload_schema_version
             + 32  // payload_hash
             + 32  // evidence_bundle_hash
+            + 1   // job_spec_digest present marker when present
+            + self
+                .job_spec_digest
+                .as_ref()
+                .map_or(0, |digest| 1 + 4 + digest.len())
             + 1; // passed (bool)
 
         let mut bytes = Vec::with_capacity(capacity);
@@ -293,7 +306,14 @@ impl GateReceipt {
         // 10. evidence_bundle_hash
         bytes.extend_from_slice(&self.evidence_bundle_hash);
 
-        // 11. passed (1 byte: 0 = false, 1 = true)
+        // 11. job_spec_digest (optional)
+        if let Some(digest) = self.job_spec_digest.as_ref() {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(digest.as_bytes());
+        }
+
+        // 12. passed (1 byte: 0 = false, 1 = true)
         bytes.push(u8::from(self.passed));
 
         bytes
@@ -434,6 +454,7 @@ pub struct GateReceiptBuilder {
     payload_schema_version: Option<u32>,
     payload_hash: Option<[u8; 32]>,
     evidence_bundle_hash: Option<[u8; 32]>,
+    job_spec_digest: Option<String>,
     passed: Option<bool>,
 }
 
@@ -502,6 +523,13 @@ impl GateReceiptBuilder {
         self
     }
 
+    /// Sets the optional job spec digest.
+    #[must_use]
+    pub fn job_spec_digest(mut self, digest: impl Into<String>) -> Self {
+        self.job_spec_digest = Some(digest.into());
+        self
+    }
+
     /// Sets the explicit pass/fail verdict.
     ///
     /// This is the authoritative verdict field that the orchestrator reads
@@ -558,6 +586,16 @@ impl GateReceiptBuilder {
             .evidence_bundle_hash
             .ok_or(ReceiptError::MissingField("evidence_bundle_hash"))?;
         let passed = self.passed.ok_or(ReceiptError::MissingField("passed"))?;
+        let job_spec_digest = self.job_spec_digest;
+
+        if let Some(ref digest) = job_spec_digest {
+            if !digest.starts_with("b3-256:") || digest.len() != 71 {
+                return Err(ReceiptError::InvalidData(format!(
+                    "job_spec_digest must be 'b3-256:<64 hex chars>', got length {}",
+                    digest.len()
+                )));
+            }
+        }
 
         // Validate string lengths to prevent DoS
         if self.receipt_id.len() > MAX_STRING_LENGTH {
@@ -608,6 +646,7 @@ impl GateReceiptBuilder {
             payload_schema_version,
             payload_hash,
             evidence_bundle_hash,
+            job_spec_digest,
             passed,
             receipt_signature: [0u8; 64],
         };
@@ -679,6 +718,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             proto.evidence_bundle_hash.try_into().map_err(|_| {
                 ReceiptError::InvalidData("evidence_bundle_hash must be 32 bytes".to_string())
             })?;
+        let job_spec_digest = proto.job_spec_digest;
 
         let receipt_signature: [u8; 64] = proto.receipt_signature.try_into().map_err(|_| {
             ReceiptError::InvalidData("receipt_signature must be 64 bytes".to_string())
@@ -695,6 +735,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             payload_schema_version: proto.payload_schema_version,
             payload_hash,
             evidence_bundle_hash,
+            job_spec_digest,
             passed: proto.passed,
             receipt_signature,
         })
@@ -714,6 +755,7 @@ impl From<GateReceipt> for GateReceiptProto {
             payload_schema_version: receipt.payload_schema_version,
             payload_hash: receipt.payload_hash.to_vec(),
             evidence_bundle_hash: receipt.evidence_bundle_hash.to_vec(),
+            job_spec_digest: receipt.job_spec_digest,
             receipt_signature: receipt.receipt_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
@@ -745,6 +787,28 @@ pub mod tests {
             .evidence_bundle_hash([0xCD; 32])
             .passed(true)
             .build_and_sign(signer)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn legacy_gate_receipt_bytes_without_job_spec(receipt: &GateReceipt) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(receipt.receipt_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(receipt.receipt_id.as_bytes());
+        bytes.extend_from_slice(&(receipt.gate_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(receipt.gate_id.as_bytes());
+        bytes.extend_from_slice(&(receipt.lease_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(receipt.lease_id.as_bytes());
+        bytes.extend_from_slice(&receipt.changeset_digest);
+        bytes.extend_from_slice(&(receipt.executor_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(receipt.executor_actor_id.as_bytes());
+        bytes.extend_from_slice(&receipt.receipt_version.to_be_bytes());
+        bytes.extend_from_slice(&(receipt.payload_kind.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(receipt.payload_kind.as_bytes());
+        bytes.extend_from_slice(&receipt.payload_schema_version.to_be_bytes());
+        bytes.extend_from_slice(&receipt.payload_hash);
+        bytes.extend_from_slice(&receipt.evidence_bundle_hash);
+        bytes.push(u8::from(receipt.passed));
+        bytes
     }
 
     #[test]
@@ -804,6 +868,17 @@ pub mod tests {
     }
 
     #[test]
+    fn test_canonical_bytes_without_job_spec_digest_matches_v1() {
+        let signer = Signer::generate();
+        let receipt = create_test_receipt(&signer);
+
+        assert_eq!(
+            receipt.canonical_bytes(),
+            legacy_gate_receipt_bytes_without_job_spec(&receipt)
+        );
+    }
+
+    #[test]
     fn test_missing_field_error() {
         let signer = Signer::generate();
 
@@ -821,6 +896,29 @@ pub mod tests {
         assert!(matches!(
             result,
             Err(ReceiptError::MissingField("changeset_digest"))
+        ));
+    }
+
+    #[test]
+    fn test_builder_rejects_invalid_job_spec_digest() {
+        let signer = Signer::generate();
+        let bad_digest = "b3-256:not-a-valid-digest";
+
+        let result = GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .job_spec_digest(bad_digest)
+            .passed(true)
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiptError::InvalidData(message)) if message.contains("job_spec_digest")
         ));
     }
 
@@ -1055,6 +1153,36 @@ pub mod tests {
     }
 
     #[test]
+    fn test_proto_roundtrip_with_job_spec_digest() {
+        let signer = Signer::generate();
+        let original = GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .job_spec_digest(
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .passed(true)
+            .build_and_sign(&signer);
+
+        let proto: GateReceiptProto = original.clone().into();
+        let encoded = proto.encode_to_vec();
+        let decoded_proto = GateReceiptProto::decode(encoded.as_slice()).unwrap();
+        let recovered = GateReceipt::try_from(decoded_proto).unwrap();
+
+        assert_eq!(original.job_spec_digest, recovered.job_spec_digest);
+        assert!(
+            recovered
+                .validate_signature(&signer.verifying_key())
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_invalid_proto_changeset_digest_length() {
         let proto = GateReceiptProto {
             receipt_id: "receipt-001".to_string(),
@@ -1067,6 +1195,7 @@ pub mod tests {
             payload_schema_version: 1,
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
+            job_spec_digest: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -1090,6 +1219,7 @@ pub mod tests {
             payload_schema_version: 1,
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
+            job_spec_digest: None,
             receipt_signature: vec![0u8; 32], // Wrong length - should be 64
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -1139,6 +1269,7 @@ pub mod tests {
             payload_schema_version: 1,
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
+            job_spec_digest: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,

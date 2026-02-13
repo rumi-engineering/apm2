@@ -85,6 +85,7 @@ mod domain_separator;
 pub mod echo_trap;
 pub mod flake_class;
 pub mod harness_sandbox;
+pub mod job_spec;
 mod key_policy;
 pub mod lane;
 mod lease;
@@ -221,6 +222,14 @@ pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
     MAX_STRING_LENGTH as MAX_HARNESS_SANDBOX_STRING_LENGTH, NetworkPolicyProfile,
     NetworkPolicyProfileBuilder, Protocol,
+};
+// Re-export job spec types (TCK-00512)
+pub use job_spec::{
+    Actuation, FacJobSpecV1, FacJobSpecV1Builder, JOB_SPEC_SCHEMA_ID, JobConstraints, JobSource,
+    JobSpecError, LaneRequirements, MAX_CHANNEL_CONTEXT_TOKEN_LENGTH, MAX_DECODED_SOURCE_LENGTH,
+    MAX_HEAD_SHA_LENGTH, MAX_JOB_ID_LENGTH, MAX_JOB_SPEC_SIZE, MAX_KIND_LENGTH,
+    MAX_LEASE_ID_LENGTH, MAX_QUEUE_LANE_LENGTH, MAX_REPO_ID_LENGTH, MAX_REQUEST_ID_LENGTH,
+    MAX_SOURCE_KIND_LENGTH, deserialize_job_spec, validate_job_spec,
 };
 // Re-export key policy types
 pub use key_policy::{
