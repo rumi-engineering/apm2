@@ -8675,14 +8675,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     if let Some(kernel) = self.admission_kernel.clone() {
                         let plan_tier = admission_res.boundary_span.enforcement_tier;
                         let anchor = admission_res.bundle.ledger_anchor.clone();
-                        let anti_rollback_result =
-                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                                handle.block_on(tokio::task::spawn_blocking(move || {
-                                    kernel.finalize_anti_rollback(plan_tier, &anchor)
-                                }))
-                            } else {
-                                Ok(kernel.finalize_anti_rollback(plan_tier, &anchor))
-                            };
+                        let post_effect_anchor = kernel.resolve_post_effect_anchor(&anchor);
+                        let anti_rollback_result: std::result::Result<
+                            std::result::Result<(), crate::admission_kernel::types::AdmitError>,
+                            tokio::task::JoinError,
+                        > = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                        }) {
+                            Ok(tokio::task::block_in_place(|| {
+                                kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor)
+                            }))
+                        } else {
+                            Ok(kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor))
+                        };
                         match anti_rollback_result {
                             Ok(Ok(())) => {
                                 if plan_tier
@@ -11620,14 +11625,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         let plan_tier = result.boundary_span.enforcement_tier;
                         let post_effect_anchor =
                             kernel.resolve_post_effect_anchor(&result.bundle.ledger_anchor);
-                        let anti_rollback_result =
-                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                                handle.block_on(tokio::task::spawn_blocking(move || {
-                                    kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor)
-                                }))
-                            } else {
-                                Ok(kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor))
-                            };
+                        let anti_rollback_result: std::result::Result<
+                            std::result::Result<(), crate::admission_kernel::types::AdmitError>,
+                            tokio::task::JoinError,
+                        > = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                        }) {
+                            Ok(tokio::task::block_in_place(|| {
+                                kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor)
+                            }))
+                        } else {
+                            Ok(kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor))
+                        };
                         match anti_rollback_result {
                             Ok(Ok(())) => {
                                 if plan_tier
@@ -11920,13 +11929,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             if let Some(kernel) = self.admission_kernel.clone() {
                 let plan_tier = result.boundary_span.enforcement_tier;
                 let anchor = result.bundle.ledger_anchor.clone();
-                let anti_rollback_result = if let Ok(handle) = tokio::runtime::Handle::try_current()
-                {
-                    handle.block_on(tokio::task::spawn_blocking(move || {
-                        kernel.finalize_anti_rollback(plan_tier, &anchor)
+                let post_effect_anchor = kernel.resolve_post_effect_anchor(&anchor);
+                let anti_rollback_result: std::result::Result<
+                    std::result::Result<(), crate::admission_kernel::types::AdmitError>,
+                    tokio::task::JoinError,
+                > = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                    handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                }) {
+                    Ok(tokio::task::block_in_place(|| {
+                        kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor)
                     }))
                 } else {
-                    Ok(kernel.finalize_anti_rollback(plan_tier, &anchor))
+                    Ok(kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor))
                 };
                 match anti_rollback_result {
                     Ok(Ok(())) => {
