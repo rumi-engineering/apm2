@@ -327,20 +327,23 @@ Symptom: Test gate fails with timeout during large compilation
 2. If warming itself times out, check if dependencies changed significantly
 3. Consider freeing disk space manually (see section 3.3)
 
-### 6.3 nextest not found
+### 6.3 bounded test execution unavailable
 
 ```
-Symptom: Test gate falls back to cargo test instead of cargo nextest run
+Symptom: Test gate falls back to `cargo test --workspace` instead of bounded
+         `cargo nextest run`
 ```
 
-Fix: `cargo install cargo-nextest`
+Fix: Ensure the bounded runner can start. The fallback to `cargo test
+--workspace` is expected only when `run_bounded_tests.sh` is missing or
+cgroup v2 is unavailable.
 
-nextest is the preferred and recommended test runner for FAC evidence gates
-(DD-003, RFC-0007). The current implementation falls back to `cargo test
---workspace` when the bounded runner (which uses nextest) is not available.
-Install nextest to enable the bounded test execution path with cgroup
-resource limits. Fail-closed enforcement (rejecting execution without
-nextest) is planned as future work.
+nextest remains the preferred and recommended test runner for FAC evidence
+gates (DD-003, RFC-0007). If bounded execution is available but
+`cargo nextest` is not installed, FAC gates fail closed (test-gate
+failure). Install nextest to enable bounded execution with resource limits.
+Fail-closed enforcement for missing nextest in unbounded mode is planned as
+future work.
 
 ### 6.4 systemd-run fails (no user bus)
 
@@ -390,6 +393,7 @@ Symptom: Builds fail with "No space left on device"
 | Command | Purpose |
 |---------|---------|
 | `apm2 fac gates` | Run evidence gates locally (default) |
+| `apm2 fac doctor` | Check daemon health and prerequisites |
 | `apm2 fac gates --quick` | Quick validation (skips tests, accepts dirty tree) |
 | `apm2 fac push --ticket <yaml>` | Push and create/update PR |
 | `apm2 fac --json logs` | Show log file paths |
@@ -408,7 +412,6 @@ Symptom: Builds fail with "No space left on device"
 
 | Command | Purpose |
 |---------|---------|
-| `apm2 fac doctor` | Check daemon health and prerequisites |
 | `apm2 fac lane status` | Show all lane states |
 | `apm2 fac lane reset <id>` | Reset a lane to known-good state |
 | `apm2 fac lane reset <id> --force` | Force-reset a running lane |

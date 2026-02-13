@@ -146,11 +146,12 @@ rfc_trust_boundaries:
 
     4. **Configuration files**: .cargo/config.toml is checked into the
        repository and subject to code review. No secrets stored.
-       **FESv1 CONSTRAINT**: FAC MUST NOT depend on ambient
-       ~/.cargo/config.toml; FAC sets CARGO_HOME under $APM2_HOME and
-       treats only the in-repo .cargo/config.toml as policy input. This
-       prevents ambient user configuration from affecting attestation
-       correctness.
+       **FESv1 CONSTRAINT (PLANNED)**: FAC SHOULD NOT depend on ambient
+       ~/.cargo/config.toml. A future implementation will set CARGO_HOME
+       under $APM2_HOME and treat only the in-repo .cargo/config.toml as
+       policy input. Currently, the local execution path inherits ambient
+       environment including ~/.cargo/config.toml. This isolation is a
+       planned hardening goal.
 
     5. **Tool installation security**: Tools are installed via trusted sources:
        - mold: System package manager (apt/dnf/pacman) or Homebrew
