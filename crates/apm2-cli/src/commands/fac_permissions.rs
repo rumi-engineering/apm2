@@ -301,14 +301,17 @@ pub fn write_fac_file_with_mode(path: &Path, data: &[u8]) -> Result<(), FacPermi
             });
         }
 
-        let mode = metadata.mode() & 0o7777;
-        if mode & 0o077 != 0 {
-            return Err(FacPermissionsError::UnsafePermissions {
-                path: path.to_path_buf(),
-                actual_mode: mode,
-                actual_uid: metadata.uid(),
-                expected_uid: geteuid().as_raw(),
-            });
+        #[cfg(unix)]
+        {
+            let mode = metadata.mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                return Err(FacPermissionsError::UnsafePermissions {
+                    path: path.to_path_buf(),
+                    actual_mode: mode,
+                    actual_uid: metadata.uid(),
+                    expected_uid: geteuid().as_raw(),
+                });
+            }
         }
     }
     let mut options = std::fs::OpenOptions::new();
@@ -353,14 +356,17 @@ pub fn append_fac_file_with_mode(path: &Path) -> Result<std::fs::File, FacPermis
             });
         }
 
-        let mode = metadata.mode() & 0o7777;
-        if mode & 0o077 != 0 {
-            return Err(FacPermissionsError::UnsafePermissions {
-                path: path.to_path_buf(),
-                actual_mode: mode,
-                actual_uid: metadata.uid(),
-                expected_uid: geteuid().as_raw(),
-            });
+        #[cfg(unix)]
+        {
+            let mode = metadata.mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                return Err(FacPermissionsError::UnsafePermissions {
+                    path: path.to_path_buf(),
+                    actual_mode: mode,
+                    actual_uid: metadata.uid(),
+                    expected_uid: geteuid().as_raw(),
+                });
+            }
         }
     }
     let mut options = std::fs::OpenOptions::new();
