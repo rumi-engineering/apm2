@@ -65,11 +65,9 @@ default mode.
 - [INV-BRK-007] `deserialize_state()` enforces a strict I/O size limit
   (`MAX_BROKER_STATE_FILE_SIZE = 1 MiB`) **before** JSON parsing to prevent
   OOM from crafted state files with unbounded `Vec` payloads (RSK-1601).
-- [INV-BRK-008] `find_admitted_policy_digest()` uses non-short-circuiting
-  iteration (visits all entries) to prevent timing side-channels that reveal
-  the position of a matching digest. Consistent with `is_policy_digest_admitted`.
 - All hash comparisons use `subtle::ConstantTimeEq::ct_eq()` consistent with
-  INV-PC-001.
+  INV-PC-001, including `find_admitted_policy_digest()` which uses
+  non-short-circuiting iteration.
 - CTR-2501 deviation: `current_time_secs()` uses `SystemTime::now()` for token
   `issued_at` timestamps (wall-clock anchored expiry). Documented inline.
 

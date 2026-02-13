@@ -199,6 +199,13 @@ pub enum BrokerError {
     /// Policy digest cannot be zero.
     #[error("policy digest cannot be zero")]
     ZeroPolicyDigest,
+
+    /// Convergence receipt hash cannot be zero.
+    #[error("convergence receipt contains zero hash: {field}")]
+    ZeroConvergenceReceiptHash {
+        /// Which field was zero.
+        field: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +735,16 @@ impl FacBroker {
         authority_set_hash: Hash,
         proof_hash: Hash,
     ) -> Result<(), BrokerError> {
+        if is_zero_hash(&authority_set_hash) {
+            return Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "authority_set_hash",
+            });
+        }
+        if is_zero_hash(&proof_hash) {
+            return Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "proof_hash",
+            });
+        }
         if self.state.convergence_receipts.len() >= MAX_CONVERGENCE_RECEIPTS {
             return Err(BrokerError::ConvergenceReceiptStoreAtCapacity {
                 max: MAX_CONVERGENCE_RECEIPTS,
@@ -764,10 +781,14 @@ impl FacBroker {
         if is_zero_hash(&digest) {
             return Err(BrokerError::ZeroPolicyDigest);
         }
+        // Constant-time duplicate scan: examine ALL entries regardless of match
+        // position to preserve INV-PC-001 timing invariant.
+        let mut found = 0u8;
         for existing in &self.state.admitted_policy_digests {
-            if bool::from(existing.ct_eq(&digest)) {
-                return Ok(());
-            }
+            found |= u8::from(bool::from(existing.ct_eq(&digest)));
+        }
+        if found != 0 {
+            return Ok(());
         }
         if self.state.admitted_policy_digests.len() >= MAX_ADMITTED_POLICY_DIGESTS {
             return Err(BrokerError::PolicyDigestStoreAtCapacity {
@@ -789,30 +810,15 @@ impl FacBroker {
         found != 0
     }
 
-    /// Finds the exact admitted policy digest using constant-time iteration.
-    ///
-    /// Iterates ALL entries (non-short-circuiting) to avoid timing
-    /// side-channels that would reveal the position of a matching digest.
-    /// Matches the constant-time pattern used in [`is_policy_digest_admitted`].
+    /// Finds the exact admitted policy digest using constant-time scan
+    /// (INV-PC-001: no short-circuit on match position).
     #[must_use]
     fn find_admitted_policy_digest(&self, digest: &Hash) -> Option<Hash> {
-        let mut result: Option<Hash> = None;
+        let mut found = 0u8;
         for existing in &self.state.admitted_policy_digests {
-            // ct_eq returns a subtle::Choice; convert to u8 for bitwise OR.
-            // We unconditionally overwrite `result` when matched — but since
-            // all admitted digests are unique (enforced by admit_policy_digest),
-            // at most one entry matches and the final value is correct.
-            let is_match = bool::from(existing.ct_eq(digest));
-            // Use conditional_select-style assignment: always evaluate, only
-            // store when matched.  The branch here is on data derived from
-            // ct_eq (constant-time comparison) — we intentionally do NOT
-            // short-circuit the loop, so iteration count is always
-            // admitted_policy_digests.len().
-            if is_match {
-                result = Some(*existing);
-            }
+            found |= u8::from(bool::from(existing.ct_eq(digest)));
         }
-        result
+        if found != 0 { Some(*digest) } else { None }
     }
 
     // -----------------------------------------------------------------------
@@ -1403,7 +1409,7 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn convergence_receipt_store_cap_enforced() {
         let mut broker = FacBroker::new();
-        for i in 0..MAX_CONVERGENCE_RECEIPTS {
+        for i in 1..=MAX_CONVERGENCE_RECEIPTS {
             broker
                 .add_convergence_receipt([i as u8; 32], [i as u8; 32])
                 .expect("receipt should be added");
@@ -1418,6 +1424,32 @@ mod tests {
             broker.convergence_receipts().len(),
             MAX_CONVERGENCE_RECEIPTS
         );
+    }
+
+    #[test]
+    fn add_convergence_receipt_rejects_zero_authority_set_hash() {
+        let mut broker = FacBroker::new();
+        let result = broker.add_convergence_receipt([0u8; 32], [0x11; 32]);
+        assert!(matches!(
+            result,
+            Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "authority_set_hash"
+            })
+        ));
+        assert!(broker.convergence_receipts().is_empty());
+    }
+
+    #[test]
+    fn add_convergence_receipt_rejects_zero_proof_hash() {
+        let mut broker = FacBroker::new();
+        let result = broker.add_convergence_receipt([0x11; 32], [0u8; 32]);
+        assert!(matches!(
+            result,
+            Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "proof_hash"
+            })
+        ));
+        assert!(broker.convergence_receipts().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1615,9 +1647,12 @@ mod tests {
         let oversized = vec![0u8; MAX_BROKER_STATE_FILE_SIZE + 1];
         let result = FacBroker::deserialize_state(&oversized);
         assert!(
-            matches!(result, Err(BrokerError::StateTooLarge { size, max })
-                if size == MAX_BROKER_STATE_FILE_SIZE + 1
-                && max == MAX_BROKER_STATE_FILE_SIZE),
+            matches!(
+                result,
+                Err(BrokerError::StateTooLarge { size, max })
+                    if size == MAX_BROKER_STATE_FILE_SIZE + 1
+                    && max == MAX_BROKER_STATE_FILE_SIZE
+            ),
             "must reject input exceeding MAX_BROKER_STATE_FILE_SIZE"
         );
     }
