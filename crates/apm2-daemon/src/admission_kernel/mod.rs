@@ -905,6 +905,69 @@ impl AdmissionKernelV1 {
         Ok(())
     }
 
+    /// Non-mutating health probe for anti-rollback anchor state
+    /// (TCK-00502 MINOR fix: circuit probe must not mutate state).
+    ///
+    /// Used by the fail-closed circuit breaker to test whether the anchor
+    /// subsystem is healthy without advancing the anchor watermark. Unlike
+    /// [`finalize_anti_rollback`](Self::finalize_anti_rollback) which calls
+    /// `commit()` (mutating), this calls `verify_committed()` (read-only).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmitError::AntiRollbackFailure`] if:
+    /// - The anchor provider is not wired (fail-closed prerequisite missing).
+    /// - The anchor verification fails (mismatch, unavailable, etc.).
+    #[allow(clippy::option_if_let_else)] // match on Option<Arc<dyn>> is clearer than map_or_else
+    pub fn probe_anti_rollback_health(&self, anchor: &LedgerAnchorV1) -> Result<(), AdmitError> {
+        match &self.anti_rollback {
+            Some(ar) => ar
+                .verify_committed(anchor)
+                .map_err(|e| AdmitError::AntiRollbackFailure {
+                    reason: format!("anti-rollback health probe failed: {e}"),
+                }),
+            None => Err(AdmitError::MissingPrerequisite {
+                prerequisite: "AntiRollbackAnchor".into(),
+            }),
+        }
+    }
+
+    /// Resolve the current ledger trust anchor for post-effect anti-rollback
+    /// commit (TCK-00502 MAJOR fix: post-effect anchor).
+    ///
+    /// On authoritative write paths (e.g., `EmitEvent`), the caller SHOULD
+    /// use the post-effect anchor (from the ledger trust verifier) rather
+    /// than the pre-effect bundle anchor. This ensures the anti-rollback
+    /// watermark reflects the actual resulting ledger head, preventing
+    /// rollback of the most recent effect.
+    ///
+    /// If the ledger verifier is unavailable, falls back to the provided
+    /// `fallback` anchor (pre-effect), which is still safe (just slightly
+    /// less tight than the post-effect anchor).
+    ///
+    /// # Arguments
+    ///
+    /// * `fallback` — The pre-effect anchor to use if the verifier is
+    ///   unavailable.
+    #[allow(clippy::option_if_let_else)] // nested match on verifier result
+    pub fn resolve_post_effect_anchor(&self, fallback: &LedgerAnchorV1) -> LedgerAnchorV1 {
+        match &self.ledger_verifier {
+            Some(verifier) => match verifier.validated_state() {
+                Ok(state) => {
+                    // Use the post-effect anchor only if it is at or ahead
+                    // of the fallback (defense in depth: never regress).
+                    if state.validated_anchor.height >= fallback.height {
+                        state.validated_anchor
+                    } else {
+                        fallback.clone()
+                    }
+                },
+                Err(_) => fallback.clone(),
+            },
+            None => fallback.clone(),
+        }
+    }
+
     // =========================================================================
     // Internal prerequisite resolution
     // =========================================================================

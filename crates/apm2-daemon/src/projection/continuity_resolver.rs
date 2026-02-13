@@ -607,6 +607,15 @@ mod tests {
     // Config validation: malformed config fails at startup
     // ===================================================================
 
+    /// Creates a valid baseline sink config for use as the second sink in
+    /// tests, satisfying the >= 2 sinks requirement (TCK-00502).
+    fn make_valid_baseline_sink() -> (String, ProjectionSinkProfileConfig) {
+        (
+            "baseline-secondary".to_string(),
+            make_sink_config(100, 200, 1, 1, vec![valid_test_key_hex_2()]),
+        )
+    }
+
     /// UT-00507-10: Valid hex key passes config validation.
     #[test]
     fn config_valid_hex_key_passes() {
@@ -618,6 +627,8 @@ mod tests {
                     "github-primary".to_string(),
                     make_sink_config(100, 200, 1, 1, vec![key_hex]),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -635,6 +646,8 @@ mod tests {
                     "github-primary".to_string(),
                     make_sink_config(100, 200, 1, 1, vec!["abc".to_string()]),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -662,6 +675,8 @@ mod tests {
                         ],
                     ),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -684,6 +699,8 @@ mod tests {
                     "github-primary".to_string(),
                     make_sink_config(100, 200, 1, 1, vec![short_key.to_string()]),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -703,6 +720,8 @@ mod tests {
                     "github-primary".to_string(),
                     make_sink_config(100, 200, 1, 1, vec![]),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -722,6 +741,8 @@ mod tests {
                     "github-primary".to_string(),
                     make_sink_config(0, 200, 1, 1, vec![key_hex]),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -744,6 +765,8 @@ mod tests {
                     "github-primary".to_string(),
                     make_sink_config(100, 0, 1, 1, vec![key_hex]),
                 );
+                let (baseline_id, baseline_cfg) = make_valid_baseline_sink();
+                m.insert(baseline_id, baseline_cfg);
                 m
             },
             ..Default::default()
@@ -760,9 +783,11 @@ mod tests {
     // ===================================================================
 
     /// UT-00507-17: Sink profile parsed from TOML and resolved correctly.
+    /// TCK-00502: requires >= 2 sinks for multi-sink continuity.
     #[test]
     fn toml_sink_profile_round_trip() {
         let key_hex = valid_test_key_hex();
+        let key_hex_2 = valid_test_key_hex_2();
         let toml_str = format!(
             r#"
             [daemon]
@@ -776,6 +801,13 @@ mod tests {
             partition_tolerance = 2
             trusted_signers = ["{key_hex}"]
 
+            [daemon.projection.sinks.gitlab-secondary]
+            outage_window_ticks = 1800000000
+            replay_window_ticks = 3600000000
+            churn_tolerance = 2
+            partition_tolerance = 1
+            trusted_signers = ["{key_hex_2}"]
+
             [[processes]]
             name = "test"
             command = "echo"
@@ -785,7 +817,7 @@ mod tests {
         let config = apm2_core::config::EcosystemConfig::from_toml(&toml_str)
             .expect("config must parse and validate");
 
-        assert_eq!(config.daemon.projection.sinks.len(), 1);
+        assert_eq!(config.daemon.projection.sinks.len(), 2);
         let sink = config
             .daemon
             .projection
@@ -810,9 +842,12 @@ mod tests {
     }
 
     /// UT-00507-18: Malformed hex key in TOML causes startup failure.
+    /// TCK-00502: requires >= 2 sinks, so a valid secondary is included.
     #[test]
     fn toml_malformed_key_fails_at_parse_time() {
-        let toml_str = r#"
+        let key_hex_2 = valid_test_key_hex_2();
+        let toml_str = format!(
+            r#"
             [daemon]
             operator_socket = "/tmp/apm2/operator.sock"
             session_socket = "/tmp/apm2/session.sock"
@@ -824,12 +859,20 @@ mod tests {
             partition_tolerance = 2
             trusted_signers = ["not_valid_hex_at_all!!"]
 
+            [daemon.projection.sinks.gitlab-secondary]
+            outage_window_ticks = 1800000000
+            replay_window_ticks = 3600000000
+            churn_tolerance = 2
+            partition_tolerance = 1
+            trusted_signers = ["{key_hex_2}"]
+
             [[processes]]
             name = "test"
             command = "echo"
-        "#;
+        "#,
+        );
 
-        let err = apm2_core::config::EcosystemConfig::from_toml(toml_str)
+        let err = apm2_core::config::EcosystemConfig::from_toml(&toml_str)
             .expect_err("must fail with invalid key");
         match err {
             apm2_core::config::ConfigError::Validation(msg) => {

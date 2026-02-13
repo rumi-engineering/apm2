@@ -5333,3 +5333,259 @@ fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
          (all three handler paths must be no-ops)"
     );
 }
+
+// =============================================================================
+// TCK-00502 round 6: Bootstrap receipt, post-effect anchor, health probe
+// =============================================================================
+
+/// Verifies that `DurableAntiRollbackAnchor` persists a bootstrap receipt
+/// after the first successful commit, and that a subsequent construction
+/// with the anchor state file missing (but bootstrap receipt present)
+/// fails with `ExternalAnchorUnavailable`.
+///
+/// This is the SECURITY BLOCKER fix: an attacker deleting the anchor file
+/// after genesis no longer bypasses anti-rollback via the bootstrap path.
+#[test]
+fn test_tck_00502_bootstrap_receipt_prevents_bypass_on_missing_anchor() {
+    use tempfile::TempDir;
+
+    use super::trust_stack::DurableAntiRollbackAnchor;
+
+    let tmp = TempDir::new().expect("tempdir must succeed");
+    let state_path = tmp.path().join("anchor_state.json");
+    let bootstrap_receipt_path = tmp.path().join("anchor_state.json.bootstrapped");
+
+    // Phase 1: fresh install — no files exist.
+    assert!(!state_path.exists(), "state file must not exist initially");
+    assert!(
+        !bootstrap_receipt_path.exists(),
+        "bootstrap receipt must not exist initially"
+    );
+
+    let anchor = DurableAntiRollbackAnchor::new(state_path.clone(), "test_mech".to_string())
+        .expect("new must succeed on fresh install");
+
+    // First commit should persist the bootstrap receipt.
+    let genesis_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 1,
+        he_time: 100,
+    };
+    anchor
+        .commit(&genesis_anchor)
+        .expect("first commit must succeed");
+
+    assert!(state_path.exists(), "state file must exist after commit");
+    assert!(
+        bootstrap_receipt_path.exists(),
+        "bootstrap receipt must exist after first commit"
+    );
+
+    // Phase 2: simulate anchor loss by deleting the state file.
+    std::fs::remove_file(&state_path).expect("remove state file must succeed");
+    assert!(!state_path.exists(), "state file must be deleted for test");
+    assert!(
+        bootstrap_receipt_path.exists(),
+        "bootstrap receipt must still exist"
+    );
+
+    // Phase 3: re-constructing the anchor MUST fail with
+    // ExternalAnchorUnavailable (not ExternalAnchorNotInitialized).
+    let result = DurableAntiRollbackAnchor::new(state_path, "test_mech".to_string());
+    match result {
+        Err(TrustError::ExternalAnchorUnavailable { reason }) => {
+            assert!(
+                reason.contains("bootstrap receipt"),
+                "error must mention bootstrap receipt: {reason}"
+            );
+        },
+        other => panic!(
+            "expected ExternalAnchorUnavailable when state missing but bootstrap receipt \
+             exists, got {other:?}"
+        ),
+    }
+}
+
+/// Verifies that `DurableAntiRollbackAnchor` allows fresh-install bootstrap
+/// when neither the state file nor the bootstrap receipt exists.
+#[test]
+fn test_tck_00502_fresh_install_allowed_without_bootstrap_receipt() {
+    use tempfile::TempDir;
+
+    use super::trust_stack::DurableAntiRollbackAnchor;
+
+    let tmp = TempDir::new().expect("tempdir must succeed");
+    let state_path = tmp.path().join("fresh_anchor.json");
+
+    // No state file, no bootstrap receipt — fresh install.
+    let anchor = DurableAntiRollbackAnchor::new(state_path, "test_mech".to_string())
+        .expect("new must succeed on fresh install");
+
+    // latest() should return ExternalAnchorNotInitialized (not Unavailable).
+    match anchor.latest() {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!("expected ExternalAnchorNotInitialized on fresh install, got {other:?}"),
+    }
+
+    // verify_committed() should also return ExternalAnchorNotInitialized.
+    let test_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 1,
+        he_time: 100,
+    };
+    match anchor.verify_committed(&test_anchor) {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!(
+            "expected ExternalAnchorNotInitialized for verify_committed on fresh install, \
+             got {other:?}"
+        ),
+    }
+}
+
+/// Verifies that `probe_anti_rollback_health` is non-mutating: it calls
+/// `verify_committed()` instead of `commit()`.
+///
+/// This is the SECURITY MINOR fix: the circuit probe must not advance the
+/// anchor watermark.
+#[test]
+fn test_tck_00502_probe_health_does_not_mutate_anchor() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct ProbeTrackingAnchor {
+        verify_count: AtomicU32,
+        commit_count: AtomicU32,
+    }
+
+    impl AntiRollbackAnchor for ProbeTrackingAnchor {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Ok(ExternalAnchorStateV1 {
+                anchor: LedgerAnchorV1 {
+                    ledger_id: test_hash(20),
+                    event_hash: test_hash(21),
+                    height: 100,
+                    he_time: 1000,
+                },
+                mechanism_id: "tracking_test".to_string(),
+                proof_hash: test_hash(99),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            self.verify_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            self.commit_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let tracking_anchor = Arc::new(ProbeTrackingAnchor {
+        verify_count: AtomicU32::new(0),
+        commit_count: AtomicU32::new(0),
+    });
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_anti_rollback(tracking_anchor.clone());
+
+    let test_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    // probe_anti_rollback_health MUST call verify_committed, NOT commit.
+    kernel
+        .probe_anti_rollback_health(&test_anchor)
+        .expect("probe must succeed");
+
+    assert_eq!(
+        tracking_anchor.verify_count.load(Ordering::SeqCst),
+        1,
+        "probe must call verify_committed exactly once"
+    );
+    assert_eq!(
+        tracking_anchor.commit_count.load(Ordering::SeqCst),
+        0,
+        "probe must NOT call commit (non-mutating)"
+    );
+}
+
+/// Verifies that `probe_anti_rollback_health` returns an error when the
+/// anti-rollback provider is not wired.
+#[test]
+fn test_tck_00502_probe_health_fails_without_provider() {
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider());
+
+    let test_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = kernel.probe_anti_rollback_health(&test_anchor);
+    assert!(
+        result.is_err(),
+        "probe must fail when anti-rollback not wired"
+    );
+    match result {
+        Err(AdmitError::MissingPrerequisite { prerequisite }) => {
+            assert_eq!(prerequisite, "AntiRollbackAnchor");
+        },
+        other => panic!("expected MissingPrerequisite, got {other:?}"),
+    }
+}
+
+/// Verifies that `resolve_post_effect_anchor` returns the verifier's current
+/// anchor when it is at or ahead of the fallback.
+#[test]
+fn test_tck_00502_resolve_post_effect_anchor_uses_verifier_when_ahead() {
+    let mock_verifier = Arc::new(MockLedgerVerifier::passing());
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(mock_verifier);
+
+    // MockLedgerVerifier::passing() returns anchor at height 100.
+    // Fallback is at height 50 (behind verifier).
+    let fallback = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 50,
+        he_time: 500,
+    };
+
+    let result = kernel.resolve_post_effect_anchor(&fallback);
+    assert_eq!(
+        result.height, 100,
+        "must return verifier anchor (height 100) when it is ahead of fallback (height 50)"
+    );
+}
+
+/// Verifies that `resolve_post_effect_anchor` falls back to the provided
+/// anchor when the verifier is unavailable.
+#[test]
+fn test_tck_00502_resolve_post_effect_anchor_fallback_without_verifier() {
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider());
+    // No ledger verifier wired.
+
+    let fallback = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let result = kernel.resolve_post_effect_anchor(&fallback);
+    assert_eq!(
+        result.height, fallback.height,
+        "must return fallback anchor when verifier is not wired"
+    );
+    assert_eq!(
+        result.event_hash, fallback.event_hash,
+        "must return exact fallback when verifier is not wired"
+    );
+}

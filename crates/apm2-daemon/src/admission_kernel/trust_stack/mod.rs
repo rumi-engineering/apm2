@@ -1334,6 +1334,16 @@ const ANTI_ROLLBACK_ANCHOR_SCHEMA_VERSION: u32 = 1;
 /// to ~500 bytes; 8 KiB provides ample headroom.
 const MAX_ANCHOR_STATE_FILE_SIZE: u64 = 8_192;
 
+/// File extension for the tamper-evident bootstrap receipt.
+///
+/// The bootstrap receipt is a small file written alongside the anchor state
+/// file after the first successful `commit()`. On subsequent daemon starts,
+/// if the anchor state file is missing but the bootstrap receipt exists, the
+/// anchor was lost post-genesis (not a fresh install) and the provider
+/// returns `ExternalAnchorUnavailable` instead of
+/// `ExternalAnchorNotInitialized`, denying fail-closed flows.
+const BOOTSTRAP_RECEIPT_EXTENSION: &str = ".bootstrapped";
+
 /// Persisted external anchor state for atomic file operations.
 ///
 /// `deny_unknown_fields` prevents injection of unexpected fields.
@@ -1366,6 +1376,10 @@ struct PersistedAnchorStateV1 {
 /// - If no anchor has ever been committed (fresh-install bootstrap), `latest()`
 ///   and `verify_committed()` return
 ///   `TrustError::ExternalAnchorNotInitialized`.
+/// - If the anchor state file is missing but a bootstrap receipt exists (anchor
+///   was lost post-genesis), `latest()` and `verify_committed()` return
+///   `TrustError::ExternalAnchorUnavailable` — NOT `NotInitialized` — denying
+///   fail-closed flows (TCK-00502 BLOCKER fix: bootstrap/outage distinction).
 /// - If the requested anchor regresses relative to persisted state,
 ///   `verify_committed()` returns `TrustError::ExternalAnchorMismatch`.
 /// - If the anchor height matches but the event hash differs (fork),
@@ -1384,8 +1398,26 @@ struct PersistedAnchorStateV1 {
 pub struct DurableAntiRollbackAnchor {
     /// Path to the persisted anchor state file.
     state_path: std::path::PathBuf,
+    /// Path to the bootstrap receipt file (derived from `state_path`).
+    ///
+    /// Written once on the first successful `commit()`. Presence of this
+    /// file without the anchor state file indicates anchor loss (not fresh
+    /// install), triggering `ExternalAnchorUnavailable` instead of
+    /// `ExternalAnchorNotInitialized`.
+    bootstrap_receipt_path: std::path::PathBuf,
     /// Mechanism identifier for this anchor provider.
     mechanism_id: String,
+    /// Whether a bootstrap commit has ever occurred (receipt file exists or
+    /// commit has succeeded during this instance's lifetime).
+    ///
+    /// Synchronization protocol:
+    /// - Protected data: boolean flag.
+    /// - Writers: `commit()` sets to `true` after first successful persist.
+    /// - Readers: `latest()` and `verify_committed()` read to distinguish
+    ///   fresh-install from anchor loss.
+    /// - Happens-before: `RwLock` on `state` provides ordering; this flag is
+    ///   only read/written under `state` write lock or during construction.
+    bootstrapped: std::sync::atomic::AtomicBool,
     /// Cached anchor state, synchronized via `RwLock`.
     ///
     /// Synchronization protocol:
@@ -1406,6 +1438,10 @@ impl std::fmt::Debug for DurableAntiRollbackAnchor {
             .field(
                 "has_state",
                 &self.state.read().map(|g| g.is_some()).unwrap_or(false),
+            )
+            .field(
+                "bootstrapped",
+                &self.bootstrapped.load(std::sync::atomic::Ordering::Acquire),
             )
             .finish_non_exhaustive()
     }
@@ -1441,15 +1477,42 @@ impl DurableAntiRollbackAnchor {
             });
         }
 
+        // Derive the bootstrap receipt path from the state path by appending
+        // the bootstrap receipt extension.
+        let bootstrap_receipt_path = {
+            let mut p = state_path.as_os_str().to_owned();
+            p.push(BOOTSTRAP_RECEIPT_EXTENSION);
+            std::path::PathBuf::from(p)
+        };
+
+        let bootstrap_receipt_exists = bootstrap_receipt_path.exists();
+
         let initial_state = if state_path.exists() {
             Some(Self::load_state_from_file(&state_path, &mechanism_id)?)
+        } else if bootstrap_receipt_exists {
+            // TCK-00502 BLOCKER fix: the bootstrap receipt exists but the
+            // anchor state file is missing. This means the anchor was lost
+            // after initial genesis commit (e.g., file deletion, disk
+            // corruption). This is NOT a fresh install; it is an anchor
+            // loss event. Return ExternalAnchorUnavailable to deny
+            // fail-closed flows instead of allowing bootstrap bypass.
+            return Err(TrustError::ExternalAnchorUnavailable {
+                reason: "anti-rollback anchor state file missing but bootstrap receipt \
+                         exists — anchor was lost post-genesis (not fresh install); \
+                         restore anchor state or re-bootstrap with governance approval"
+                    .into(),
+            });
         } else {
             None
         };
 
         Ok(Self {
             state_path,
+            bootstrap_receipt_path,
             mechanism_id,
+            bootstrapped: std::sync::atomic::AtomicBool::new(
+                bootstrap_receipt_exists || initial_state.is_some(),
+            ),
             state: RwLock::new(initial_state),
         })
     }
@@ -1496,6 +1559,19 @@ impl DurableAntiRollbackAnchor {
 
         // Atomic file write: serialize to temp, rename to final path.
         Self::atomic_write_state(&self.state_path, &new_state)?;
+
+        // TCK-00502 BLOCKER fix: persist bootstrap receipt on first
+        // successful commit. This receipt marks that the anchor has been
+        // initialized at least once. If the anchor state file is later
+        // lost/deleted, the bootstrap receipt prevents the provider from
+        // returning `ExternalAnchorNotInitialized` (which would allow
+        // bypass). Instead, `new()` detects the discrepancy and returns
+        // `ExternalAnchorUnavailable`, denying fail-closed flows.
+        if !self.bootstrapped.load(std::sync::atomic::Ordering::Acquire) {
+            Self::persist_bootstrap_receipt(&self.bootstrap_receipt_path)?;
+            self.bootstrapped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
 
         // Update in-memory cache AFTER successful file write.
         *guard = Some(new_state);
@@ -1675,6 +1751,64 @@ impl DurableAntiRollbackAnchor {
                     parent_dir.display()
                 )),
             })?;
+        }
+
+        Ok(())
+    }
+
+    /// Persist a bootstrap receipt file after the first successful commit.
+    ///
+    /// The receipt is a simple marker file (empty content) that signals that
+    /// the anchor has been initialized at least once. Its presence is checked
+    /// in `new()` to distinguish fresh-install bootstrap from post-genesis
+    /// anchor loss.
+    ///
+    /// Uses atomic temp+rename for crash safety and restrictive permissions.
+    fn persist_bootstrap_receipt(path: &std::path::Path) -> Result<(), TrustError> {
+        use std::io::Write;
+
+        let parent = path.parent().ok_or_else(|| TrustError::IntegrityFailure {
+            reason: "bootstrap receipt path has no parent directory".into(),
+        })?;
+
+        // Parent directory should already exist from anchor state write.
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to create temp file for bootstrap receipt in {}: {e}",
+                    parent.display()
+                )),
+            })?;
+
+        // Write a minimal receipt payload for auditability.
+        tmp.write_all(b"{\"bootstrapped\":true}\n")
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to write bootstrap receipt: {e}")),
+            })?;
+
+        tmp.flush().map_err(|e| TrustError::IntegrityFailure {
+            reason: truncate_reason(&format!("failed to flush bootstrap receipt: {e}")),
+        })?;
+
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to fsync bootstrap receipt: {e}")),
+            })?;
+
+        tmp.persist(path)
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to atomically persist bootstrap receipt to {}: {e}",
+                    path.display()
+                )),
+            })?;
+
+        // fsync parent directory for durability.
+        if let Some(parent_dir) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent_dir) {
+                let _ = dir.sync_all();
+            }
         }
 
         Ok(())

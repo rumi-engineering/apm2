@@ -303,6 +303,7 @@ Per-sink continuity profile for economics gate input assembly. Configured under 
 - [INV-CFG-14] Trusted signers per sink bounded by `MAX_TRUSTED_SIGNERS_PER_SINK` (32).
 - [INV-CFG-15] All trusted signer hex strings decode to valid 32-byte Ed25519 public keys.
 - [INV-CFG-16] Validation at startup -- not lazily at first use.
+- [INV-CFG-17] When projection sinks are configured, at least 2 sinks are required (REQ-0009 multi-sink continuity). Exactly 1 sink is rejected at startup. Zero sinks (no projection configured) are allowed (TCK-00502 MAJOR-3).
 
 **Contracts:**
 - [CTR-CFG-07] `ProjectionConfig::validate_sink_profiles()` runs at `from_toml()` time.
@@ -339,6 +340,7 @@ INV-CFG-13  Projection sink count bounded by MAX_PROJECTION_SINKS (TCK-00507)
 INV-CFG-14  Trusted signers per sink bounded by MAX_TRUSTED_SIGNERS_PER_SINK (TCK-00507)
 INV-CFG-15  All trusted signer hex decode to valid Ed25519 public keys (TCK-00507)
 INV-CFG-16  Signer key validation runs at startup, not lazily (TCK-00507)
+INV-CFG-17  Minimum 2 sinks required when projection configured (TCK-00502)
 ```
 
 ## Contract Summary

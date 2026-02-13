@@ -462,6 +462,22 @@ impl ProjectionConfig {
     /// Invalid keys prevent daemon startup (fail-closed).
     pub fn validate_sink_profiles(&self) -> Result<(), String> {
         let sink_count = self.sinks.len();
+        // TCK-00502 MAJOR fix: enforce minimum 2 sinks at startup to match
+        // the economics gate runtime requirement (REQ-0009 multi-sink
+        // continuity requires >= 2 distinct sinks). A single-sink config
+        // passes startup validation but is deterministically denied at
+        // runtime by DENY_SINK_SNAPSHOT_INSUFFICIENT_SINKS, making the
+        // deployment non-functional. Fail fast at startup instead.
+        //
+        // Zero sinks (no projection configured) is valid — the economics
+        // gate simply has no sinks to evaluate.
+        if sink_count == 1 {
+            return Err(format!(
+                "daemon.projection.sinks: at least 2 sinks required for multi-sink \
+                 continuity (REQ-0009) when projection is configured, got {sink_count}; \
+                 either add a second sink or remove projection configuration",
+            ));
+        }
         if sink_count > MAX_PROJECTION_SINKS {
             return Err(format!(
                 "daemon.projection.sinks: too many sinks ({sink_count} > {MAX_PROJECTION_SINKS})",
@@ -1075,5 +1091,74 @@ mod tests {
 
         let err = EcosystemConfig::from_toml(toml).expect_err("config should fail validation");
         assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    /// TCK-00502 MAJOR fix: validates that `validate_sink_profiles()` rejects
+    /// a single-sink configuration at startup, matching the economics gate
+    /// runtime requirement of >= 2 distinct sinks (REQ-0009).
+    #[test]
+    fn test_validate_sink_profiles_rejects_single_sink() {
+        let mut projection = ProjectionConfig::default();
+        projection.sinks.insert(
+            "sink-1".to_string(),
+            ProjectionSinkProfileConfig {
+                outage_window_ticks: 100,
+                replay_window_ticks: 50,
+                churn_tolerance: 3,
+                partition_tolerance: 2,
+                trusted_signers: vec![
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                ],
+            },
+        );
+
+        let result = projection.validate_sink_profiles();
+        assert!(
+            result.is_err(),
+            "single-sink config must be rejected at startup"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("at least 2 sinks"),
+            "error must mention minimum sink count: {err}"
+        );
+    }
+
+    /// TCK-00502: validates that `validate_sink_profiles()` accepts a
+    /// two-sink configuration.
+    #[test]
+    fn test_validate_sink_profiles_accepts_two_sinks() {
+        let mut projection = ProjectionConfig::default();
+        let profile = ProjectionSinkProfileConfig {
+            outage_window_ticks: 100,
+            replay_window_ticks: 50,
+            churn_tolerance: 3,
+            partition_tolerance: 2,
+            trusted_signers: vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ],
+        };
+        projection
+            .sinks
+            .insert("sink-1".to_string(), profile.clone());
+        projection.sinks.insert("sink-2".to_string(), profile);
+
+        let result = projection.validate_sink_profiles();
+        assert!(
+            result.is_ok(),
+            "two-sink config must be accepted: {result:?}"
+        );
+    }
+
+    /// TCK-00502: validates that empty sinks configuration is accepted
+    /// (no projection configured is a valid deployment).
+    #[test]
+    fn test_validate_sink_profiles_accepts_empty_sinks() {
+        let projection = ProjectionConfig::default();
+        let result = projection.validate_sink_profiles();
+        assert!(
+            result.is_ok(),
+            "empty sinks config must be accepted (no projection): {result:?}"
+        );
     }
 }

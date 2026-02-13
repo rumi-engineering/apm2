@@ -56,6 +56,8 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK14] `WitnessEvidenceV1.measured_values` uses bounded visitor deserialization (`bounded_vec_deser!`) with max `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` to prevent unbounded allocation from untrusted input (QUALITY MAJOR 1 + SECURITY MAJOR 1, TCK-00497).
 - [CTR-AK18] `finalize_anti_rollback()` commits the anti-rollback anchor AFTER confirmed effect success. For fail-closed tiers, this advances the external anchor watermark. For monitor tiers, this is a no-op. MUST NOT be called before effect confirmation (pre-commit hazard). Called from all effect-capable handler post-effect paths: `handle_request_tool` (after `DecisionType::Allow`), `handle_emit_event` (after ledger write), and `handle_publish_evidence` (after CAS write) (TCK-00502).
 - [CTR-AK19] `verify_anti_rollback()` tolerates `ExternalAnchorUnavailable` from `verify_committed()` as the bootstrap path: on fresh install, no prior anchor exists to protect and the anti-rollback invariant is vacuously satisfied. Other `TrustError` variants still produce denial (TCK-00502 BLOCKER-1).
+- [CTR-AK20] `resolve_post_effect_anchor()` queries `LedgerTrustVerifier::validated_state()` for the current verified head AFTER the authoritative effect. Returns the verifier anchor when its height >= the fallback anchor; otherwise returns the fallback. Falls back to the caller-supplied anchor when no verifier is wired or when `validated_state()` errors. MUST be called between effect confirmation and `finalize_anti_rollback()` so the anti-rollback commit advances to the actual post-effect head, not the stale pre-plan anchor (TCK-00502 MAJOR-2).
+- [CTR-AK21] `probe_anti_rollback_health()` performs a non-mutating health check via `verify_committed()` (read-only). MUST NOT call `commit()`. Returns `Ok(())` when the anchor verifies or `AdmitError` on failure. Used by the pre-effect circuit breaker to test anti-rollback availability without advancing the anchor watermark (TCK-00502 MINOR-4).
 
 ### `KernelRequestV1` (types.rs)
 
@@ -154,6 +156,8 @@ Concrete implementations of `LedgerTrustVerifier`, `PolicyRootResolver`, and `An
 - [INV-TS21] `PersistedAnchorStateV1` uses `deny_unknown_fields` serde and `schema_version` validation for forward-compatible deserialization.
 - [INV-TS22] `DurableAntiRollbackAnchor` proof hash uses domain-separated BLAKE3 with length-prefixed framing for all variable fields.
 - [INV-TS23] `InMemoryAntiRollbackAnchor` provides identical semantics to `DurableAntiRollbackAnchor` without file I/O (for testing).
+- [INV-TS24] `DurableAntiRollbackAnchor` persists a bootstrap receipt file (`.bootstrapped` extension) on first successful `commit()`. On subsequent construction, if the state file is missing but the bootstrap receipt exists, construction fails with `ExternalAnchorUnavailable` (anchor loss after genesis). If both are absent, construction succeeds (fresh install). This prevents an attacker from bypassing anti-rollback protection by deleting the anchor state file after the system has been bootstrapped (TCK-00502 BLOCKER-1).
+- [INV-TS25] Bootstrap receipt persistence uses the same atomic write pattern as anchor state (tempfile + rename + fsync) for crash safety.
 
 #### Anti-Rollback Anchor Providers (TCK-00502)
 

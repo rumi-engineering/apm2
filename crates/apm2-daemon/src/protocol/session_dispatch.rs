@@ -1963,13 +1963,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_id = %token.session_id,
             endpoint = %endpoint_class,
             "fail-closed anti-rollback admission circuit is open; probing anchor \
-             commit health before effect"
+             health before effect (non-mutating)"
         );
 
-        match kernel.finalize_anti_rollback(
-            crate::admission_kernel::types::EnforcementTier::FailClosed,
-            &result.bundle.ledger_anchor,
-        ) {
+        // TCK-00502 MINOR fix: use non-mutating health probe instead of
+        // finalize_anti_rollback(). The pre-effect circuit probe must NOT
+        // advance the anchor watermark; it only verifies that the anchor
+        // subsystem is healthy (can verify committed state). Anchor
+        // advancement happens in the post-effect finalize path.
+        match kernel.probe_anti_rollback_health(&result.bundle.ledger_anchor) {
             Ok(()) => {
                 self.close_fail_closed_anchor_circuit_if_open(endpoint_class, &token.session_id);
                 Ok(())
@@ -11578,18 +11580,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
 
                 // ====================================================
-                // TCK-00502: Finalize anti-rollback anchor AFTER
-                // confirmed effect success (ledger write). Mirrors
-                // handle_request_tool post-effect path. The anchor
-                // commit was deferred from execute() to prevent the
-                // pre-commit hazard where a failed effect would leave
-                // the anchor watermark ahead of the actual ledger head.
+                // TCK-00502 MAJOR fix: Finalize anti-rollback anchor
+                // AFTER confirmed effect success (ledger write) using
+                // the POST-EFFECT anchor from the ledger trust verifier,
+                // not the pre-effect bundle anchor. EmitEvent advances
+                // the ledger head; anchoring at the pre-effect head
+                // would leave a 1-event rollback window undetected.
+                //
+                // resolve_post_effect_anchor() queries the ledger trust
+                // verifier for the current head and falls back to the
+                // pre-effect anchor if the verifier is unavailable.
                 // ====================================================
                 if let Some(ref result) = admission_result {
                     if let Some(ref kernel) = self.admission_kernel {
                         let plan_tier = result.boundary_span.enforcement_tier;
-                        match kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor)
-                        {
+                        let post_effect_anchor =
+                            kernel.resolve_post_effect_anchor(&result.bundle.ledger_anchor);
+                        match kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor) {
                             Ok(()) => {
                                 if plan_tier
                                     == crate::admission_kernel::types::EnforcementTier::FailClosed
@@ -25478,6 +25485,13 @@ mod tests {
                 "outcome index must not persist when finalize fails in fail-closed mode"
             );
 
+            // TCK-00502 MINOR fix: the circuit probe is now non-mutating
+            // (uses verify_committed instead of finalize_anti_rollback).
+            // Since verify_committed passes in this test setup, the circuit
+            // closes on probe, allowing the second request through. The
+            // second request then also fails at finalize (commit still fails),
+            // re-opening the circuit. The response is a finalize error, not
+            // a circuit-break "suspended" error.
             let second_request = EmitEventRequest {
                 session_token: serde_json::to_string(&token).unwrap(),
                 event_type: "user.test_event".to_string(),
@@ -25491,12 +25505,14 @@ mod tests {
                 SessionResponse::Error(err) => {
                     assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
                     assert!(
-                        err.message.contains("fail-closed effects suspended"),
-                        "circuit-break response should report suspended fail-closed effects: {}",
+                        err.message
+                            .contains("anti-rollback anchor finalization failed for emit_event"),
+                        "second request should also get finalize error \
+                         (circuit probe passes via verify_committed, then finalize fails): {}",
                         err.message
                     );
                 },
-                other => panic!("expected circuit-break error response, got: {other:?}"),
+                other => panic!("expected finalize error response, got: {other:?}"),
             }
         }
 
@@ -25566,6 +25582,10 @@ mod tests {
                 "outcome index must not persist when finalize fails in fail-closed mode"
             );
 
+            // TCK-00502 MINOR fix: non-mutating circuit probe. See emit_event
+            // test above for the rationale. The circuit probe passes via
+            // verify_committed, allowing the second request through, which
+            // then also fails at finalize.
             let second_request = PublishEvidenceRequest {
                 session_token: serde_json::to_string(&token).unwrap(),
                 artifact: b"test-artifact-data-2".to_vec(),
@@ -25579,12 +25599,15 @@ mod tests {
                 SessionResponse::Error(err) => {
                     assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
                     assert!(
-                        err.message.contains("fail-closed effects suspended"),
-                        "circuit-break response should report suspended fail-closed effects: {}",
+                        err.message.contains(
+                            "anti-rollback anchor finalization failed for publish_evidence"
+                        ),
+                        "second request should also get finalize error \
+                         (circuit probe passes via verify_committed, then finalize fails): {}",
                         err.message
                     );
                 },
-                other => panic!("expected circuit-break error response, got: {other:?}"),
+                other => panic!("expected finalize error response, got: {other:?}"),
             }
         }
 
