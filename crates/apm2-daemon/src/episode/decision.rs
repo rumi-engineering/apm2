@@ -208,6 +208,16 @@ pub struct BrokerToolRequest {
     /// `tool_request::Tool` should populate this via
     /// [`with_tool_kind`](Self::with_tool_kind).
     pub tool_kind: Option<apm2_core::tool::ToolKind>,
+
+    /// Idempotency key for external deduplication (TCK-00501).
+    ///
+    /// Derived from `RequestId` + AJC ID in the admission kernel. External
+    /// systems that support idempotency keys should use this to deduplicate
+    /// effect execution after crash-recovery re-execution.
+    ///
+    /// `None` when the admission kernel does not produce an idempotency key
+    /// (e.g., monitor-tier requests without an effect journal).
+    pub idempotency_key: Option<String>,
 }
 
 /// Error type for request validation.
@@ -364,6 +374,7 @@ impl BrokerToolRequest {
             risk_tier,
             epoch_seal: None,
             tool_kind: None,
+            idempotency_key: None,
         }
     }
 
@@ -462,6 +473,17 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn with_tool_kind(mut self, tool_kind: apm2_core::tool::ToolKind) -> Self {
         self.tool_kind = Some(tool_kind);
+        self
+    }
+
+    /// Sets the idempotency key for external deduplication (TCK-00501).
+    ///
+    /// When set, external systems that support idempotency keys can use
+    /// this to deduplicate effect execution during crash-recovery
+    /// re-execution.
+    #[must_use]
+    pub fn with_idempotency_key(mut self, key: Option<String>) -> Self {
+        self.idempotency_key = key;
         self
     }
 

@@ -1216,12 +1216,35 @@ impl DispatcherState {
                             })?,
                         );
 
+                        // TCK-00501: Wire FileBackedEffectJournal for
+                        // crash-safe effect execution tracking. The journal
+                        // file is co-located as a sibling of the admission
+                        // consume log for per-instance isolation.
+                        let effect_journal_path = {
+                            let parent = consume_log_path
+                                .parent()
+                                .unwrap_or(consume_log_path.as_path());
+                            parent.join("effect.journal")
+                        };
+                        let effect_journal = Arc::new(
+                            crate::admission_kernel::effect_journal::FileBackedEffectJournal::open(
+                                &effect_journal_path,
+                            )
+                            .map_err(|e| {
+                                format!(
+                                    "failed to open effect journal at {}: {e}",
+                                    effect_journal_path.display()
+                                )
+                            })?,
+                        );
+
                         let admission_kernel = Arc::new(
                             crate::admission_kernel::AdmissionKernelV1::new(
                                 admission_pcac,
                                 witness_provider,
                             )
-                            .with_anti_rollback(anti_rollback_anchor),
+                            .with_anti_rollback(anti_rollback_anchor)
+                            .with_effect_journal(effect_journal),
                         );
                         session_dispatcher =
                             session_dispatcher.with_admission_kernel(admission_kernel);
@@ -1703,10 +1726,29 @@ impl DispatcherState {
                 })?,
             );
 
+            // TCK-00501: Wire FileBackedEffectJournal for crash-safe
+            // effect execution tracking. The journal file is co-located
+            // inside the CAS directory for per-instance isolation.
+            let effect_journal_path = cas_path.as_ref().join("effect.journal");
+            let effect_journal = Arc::new(
+                crate::admission_kernel::effect_journal::FileBackedEffectJournal::open(
+                    &effect_journal_path,
+                )
+                .map_err(|e| {
+                    crate::cas::DurableCasError::InitializationFailed {
+                        message: format!(
+                            "failed to open effect journal at {}: {e}",
+                            effect_journal_path.display()
+                        ),
+                    }
+                })?,
+            );
+
             let admission_kernel = Arc::new(
                 crate::admission_kernel::AdmissionKernelV1::new(admission_pcac, witness_provider)
                     .with_quarantine_guard(quarantine_guard)
-                    .with_anti_rollback(anti_rollback_anchor),
+                    .with_anti_rollback(anti_rollback_anchor)
+                    .with_effect_journal(effect_journal),
             );
             session_dispatcher = session_dispatcher.with_admission_kernel(admission_kernel);
         }

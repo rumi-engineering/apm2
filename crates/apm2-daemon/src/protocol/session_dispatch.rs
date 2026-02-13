@@ -7695,16 +7695,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // ================================================================
-        // TCK-00494 BLOCKER FIX: AdmissionKernel plan/execute invocation.
+        // TCK-00494 BLOCKER FIX + TCK-00501 SEC-MAJOR-2 FIX:
+        // AdmissionKernel plan/execute invocation.
         //
-        // When the AdmissionKernel is wired and the PCAC LifecycleGate is
-        // NOT (kernel is sole authority gate), we MUST invoke the kernel's
-        // plan() and execute() lifecycle before broker dispatch.
+        // The kernel MUST run WHENEVER it is wired, regardless of whether
+        // the PCAC LifecycleGate is also present. The kernel provides the
+        // effect journal lifecycle (record_started/record_completed) that
+        // the PCAC gate does not. Production wires BOTH pcac_lifecycle_gate
+        // AND admission_kernel, so the previous condition
+        // `pcac_lifecycle_gate.is_none()` caused the kernel (and therefore
+        // the effect journal) to be entirely bypassed in production.
         //
-        // This closes the authority bypass where admission_kernel.is_some()
-        // passed the no-bypass guard but the handler never actually called
-        // plan()/execute(), allowing fail-closed tier requests to reach the
-        // effect-capable broker path ungated.
+        // The PCAC gate handles authority lifecycle (join/revalidate/consume);
+        // the kernel additionally provides effect journal crash-safety
+        // tracking. Both run when both are wired.
         //
         // For fail-closed tiers: kernel plan+execute is MANDATORY.
         // For monitor tiers: kernel plan+execute runs if wired (defense in
@@ -7714,9 +7718,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // granted. Without it, broker dispatch MUST NOT proceed for
         // fail-closed tiers.
         // ================================================================
-        let admission_result = if self.pcac_lifecycle_gate.is_none() && self.is_authoritative_mode()
-        {
-            if let Some(ref kernel) = self.admission_kernel {
+        let admission_result = if let Some(ref kernel) = self.admission_kernel {
+            if self.is_authoritative_mode() {
                 // Resolve the PCAC risk tier for this tool class.
                 let pcac_risk_tier = self
                     .derive_pcac_risk_tier_from_policy(&token.session_id, tool_class)
@@ -7844,6 +7847,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     hsi_envelope_binding_digest,
                     stop_budget_digest,
                     pcac_policy,
+                    // TODO(TCK-00501): Source declared_idempotent from
+                    // manifest/capability metadata. Currently hardcoded to
+                    // false because `Capability` does not yet carry a
+                    // `declared_idempotent` field. Until the manifest schema
+                    // is extended, resolve_in_doubt will always deny
+                    // re-execution (fail-closed). This is safe but prevents
+                    // the AllowReExecution path from being reachable in
+                    // production.
                     declared_idempotent: false,
                     lease_id: token.lease_id.clone(),
                     identity_proof_hash,
@@ -7925,11 +7936,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                 Some(result)
             } else {
-                // No kernel wired in authoritative mode without PCAC gate.
-                // The no-bypass guard at the top already handles fail-closed
-                // tier denial; monitor tiers proceed without kernel.
+                // Not in authoritative mode: kernel plan/execute not required.
                 None
             }
+        } else if self.pcac_lifecycle_gate.is_none() && self.is_authoritative_mode() {
+            // No kernel AND no PCAC gate in authoritative mode.
+            // The no-bypass guard at the top already handles fail-closed
+            // tier denial; monitor tiers proceed without kernel.
+            None
         } else {
             None
         };
@@ -8368,6 +8382,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // TCK-00501: Propagate idempotency key from admission result into
+        // broker transport for external deduplication.
+        if let Some(ref result) = admission_result {
+            broker_request =
+                broker_request.with_idempotency_key(Some(result.idempotency_key.as_hex()));
+        }
+
         // Call broker.request() asynchronously using tokio runtime
         let tool_actuation_started = Instant::now();
         let broker_response = tokio::task::block_in_place(|| {
@@ -8628,6 +8649,31 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             );
         }
 
+        let broker_decision_allows_effect_dispatch =
+            matches!(&decision, Ok(ToolDecision::Allow { .. }));
+
+        // ================================================================
+        // TCK-00501 SEC-BLOCKER FIX: record_started is now called INSIDE
+        // handle_broker_decision, immediately before actual tool execution
+        // (execute_tool_with_verified_content). This ensures Started entries
+        // are only created when ALL pre-dispatch checks have passed.
+        // Previously, record_started was called HERE, before
+        // handle_broker_decision, which created orphaned Started entries
+        // when pre-dispatch deny paths returned early.
+        // ================================================================
+        let journal_ref = admission_result
+            .as_ref()
+            .and_then(|r| r.effect_journal.as_ref());
+        let binding_ref = admission_result
+            .as_ref()
+            .and_then(|r| r.journal_binding.as_ref());
+
+        // TCK-00501: Extract idempotency key hex for propagation into
+        // tool execution context.
+        let idempotency_key_hex = admission_result
+            .as_ref()
+            .map(|r| r.idempotency_key.as_hex());
+
         let mut response = self.handle_broker_decision(
             decision,
             &token.session_id,
@@ -8643,6 +8689,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pending_pcac,
             channel_context_token,
             boundary_flow_state_for_package.as_ref(),
+            journal_ref,
+            binding_ref,
+            idempotency_key_hex,
         );
 
         // ================================================================
@@ -9072,6 +9121,50 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // ================================================================
+        // TCK-00501: Record effect completion in the journal after
+        // successful witness closure and outcome index persistence.
+        //
+        // This transitions the journal state from Started -> Completed,
+        // ensuring that a restart after this point will NOT classify
+        // the effect as Unknown (in-doubt). Without this call, every
+        // successfully executed effect remains in Started state and
+        // would be classified as Unknown on restart.
+        //
+        // For fail-closed tiers, completion recording failure is an
+        // error: the effect executed but we cannot record it, meaning
+        // restart will classify it as Unknown.
+        // ================================================================
+        if let Some(ref admission_res) = admission_result {
+            if let Ok(SessionResponse::RequestTool(ref resp)) = response {
+                if broker_decision_allows_effect_dispatch
+                    && resp.decision == i32::from(DecisionType::Allow)
+                {
+                    if let Some(ref journal) = admission_res.effect_journal {
+                        if let Err(e) = journal.record_completed(&admission_res.bundle.request_id) {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "effect journal record_completed failed"
+                            );
+                            // For fail-closed tiers, completion recording failure
+                            // is treated as an error — the effect executed but
+                            // we cannot record it, so restart will classify it
+                            // as Unknown.
+                            if admission_res.boundary_span.enforcement_tier
+                                == crate::admission_kernel::types::EnforcementTier::FailClosed
+                            {
+                                response = Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    format!("effect journal completion recording failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if !defects.is_empty() {
             let has_mandatory_termination_defect = defects
                 .iter()
@@ -9186,6 +9279,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         clippy::items_after_statements,
         clippy::too_many_arguments
     )]
+    #[allow(clippy::too_many_arguments)]
     fn handle_broker_decision(
         &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
@@ -9202,6 +9296,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         pending_pcac: Option<PendingPcacAuthority>,
         channel_context_token: Option<String>,
         boundary_flow_state_for_package: Option<&BoundaryFlowRuntimeState>,
+        effect_journal: Option<
+            &std::sync::Arc<dyn crate::admission_kernel::effect_journal::EffectJournal>,
+        >,
+        journal_binding: Option<&crate::admission_kernel::effect_journal::EffectJournalBindingV1>,
+        idempotency_key_hex: Option<String>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -9727,6 +9826,33 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             },
                         };
 
+                    // ============================================================
+                    // TCK-00501 SEC-BLOCKER FIX: Record effect journal Started
+                    // at the TRUE pre-dispatch boundary — immediately before
+                    // tool execution, AFTER all pre-dispatch deny gates have
+                    // passed (replay ordering, PCAC revalidate, PCAC consume,
+                    // intent digest, redundancy receipt, acceptance evidence).
+                    //
+                    // This ensures Started entries are only created when the
+                    // effect WILL actually execute. Pre-dispatch deny paths
+                    // never orphan Started entries, preventing false in-doubt
+                    // classification on restart that would exhaust journal
+                    // capacity.
+                    // ============================================================
+                    if let (Some(journal), Some(binding)) = (effect_journal, journal_binding) {
+                        if let Err(e) = journal.record_started(binding) {
+                            warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "effect journal record_started failed at true pre-dispatch boundary (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!("effect journal record_started failed: {e}"),
+                            ));
+                        }
+                    }
+
                     // Execute tool
                     // We use the timestamp from the start of the request for consistency.
                     //
@@ -9746,6 +9872,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     let verified_for_execution = verified_content.take();
                     let toctou_required_for_execution = toctou_verification_required;
                     let request_id_for_execution = request_id.clone();
+                    // TCK-00501: Propagate idempotency key into
+                    // ExecutionContext so tool handlers can use it for
+                    // external deduplication.
+                    let idempotency_key_for_execution = idempotency_key_hex;
                     let execution_result = tokio::task::block_in_place(move || {
                         let handle = tokio::runtime::Handle::current();
                         handle.block_on(async move {
@@ -9758,6 +9888,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     &request_id_for_execution,
                                     verified_for_execution,
                                     toctou_required_for_execution,
+                                    idempotency_key_for_execution,
                                 )
                                 .await
                         })
@@ -10976,13 +11107,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             );
 
             // CONTRACT: PCAC lifecycle has been fully enforced and
-            // evidence persisted. Return Ok(None) -- the caller may
-            // proceed to the authoritative effect.
-            return Ok(None);
+            // evidence persisted. If the kernel is NOT wired, the caller
+            // may proceed. If the kernel IS wired, fall through to also
+            // run kernel plan/execute for effect journal tracking
+            // (TCK-00501 SEC-MAJOR-2 fix).
+            if self.admission_kernel.is_none() {
+                return Ok(None);
+            }
+            // Fall through to kernel plan/execute below.
         }
 
-        // At this point: authoritative mode, kernel is wired, no PCAC gate.
-        // Route through kernel plan/execute.
+        // Route through kernel plan/execute for effect journal tracking.
+        // This runs when:
+        // (a) PCAC gate is present AND kernel is wired (production path), or
+        // (b) Only kernel is wired (no PCAC gate).
         let Some(kernel) = self.admission_kernel.as_ref() else {
             // Should not reach here given the guard above, but fail-closed.
             return Err(SessionResponse::error(
@@ -11179,6 +11317,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             hsi_envelope_binding_digest,
             stop_budget_digest,
             pcac_policy,
+            // TODO(TCK-00501): Source declared_idempotent from
+            // manifest/capability metadata (see KernelRequestV1 in
+            // handle_tool_request for rationale).
             declared_idempotent: false,
             lease_id: token.lease_id.clone(),
             identity_proof_hash,
@@ -11588,6 +11729,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // Increment sequence counter atomically
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
+        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // true pre-dispatch boundary for EmitEvent — immediately before
+        // the ledger write.
+        if let Some(ref result) = admission_result {
+            if let (Some(journal), Some(binding)) =
+                (&result.effect_journal, &result.journal_binding)
+            {
+                if let Err(e) = journal.record_started(binding) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_started failed for EmitEvent (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("effect journal record_started failed for EmitEvent: {e}"),
+                    ));
+                }
+            }
+        }
+
         // TCK-00290 BLOCKER 2: Use emit_session_event with proper parameters
         // - event_type: The actual event type from the request (not coerced)
         // - payload: The actual payload bytes from the request (not discarded)
@@ -11705,6 +11867,41 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // closure for the session endpoint.
                 if let Some(ref result) = admission_result {
                     self.persist_session_endpoint_outcome_index("emit_event", &token, result);
+                }
+
+                // ============================================================
+                // TCK-00501: Record effect completion in the journal after
+                // successful ledger persistence (EmitEvent).
+                //
+                // This transitions Started -> Completed so that a restart
+                // will NOT classify this effect as Unknown (in-doubt).
+                // Without this call, every successfully emitted event
+                // remains Started in the journal -> becomes Unknown on
+                // restart -> journal bloat + unnecessary fail-closed
+                // re-execution denials.
+                //
+                // Pattern mirrors handle_request_tool record_completed.
+                // ============================================================
+                if let Some(ref result) = admission_result {
+                    if let Some(ref journal) = result.effect_journal {
+                        if let Err(e) = journal.record_completed(&result.bundle.request_id) {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "effect journal record_completed failed for EmitEvent"
+                            );
+                            // For fail-closed tiers, completion recording failure
+                            // means restart will classify as Unknown.
+                            if result.boundary_span.enforcement_tier
+                                == crate::admission_kernel::types::EnforcementTier::FailClosed
+                            {
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    format!("effect journal completion recording failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
                 }
 
                 info!(
@@ -11859,6 +12056,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // true pre-dispatch boundary for PublishEvidence — immediately
+        // before the CAS write.
+        if let Some(ref result) = admission_result {
+            if let (Some(journal), Some(binding)) =
+                (&result.effect_journal, &result.journal_binding)
+            {
+                if let Err(e) = journal.record_started(binding) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_started failed for PublishEvidence (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("effect journal record_started failed for PublishEvidence: {e}"),
+                    ));
+                }
+            }
+        }
+
         // Store artifact in CAS
         let evidence_publish_started = Instant::now();
         let hash = cas.store(&request.artifact);
@@ -12006,6 +12224,41 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // effect (CAS write).
         if let Some(ref result) = admission_result {
             self.persist_session_endpoint_outcome_index("publish_evidence", &token, result);
+        }
+
+        // ================================================================
+        // TCK-00501: Record effect completion in the journal after
+        // successful CAS persistence (PublishEvidence).
+        //
+        // This transitions Started -> Completed so that a restart
+        // will NOT classify this effect as Unknown (in-doubt).
+        // Without this call, every successfully published evidence
+        // artifact remains Started in the journal -> becomes Unknown
+        // on restart -> journal bloat + unnecessary fail-closed
+        // re-execution denials.
+        //
+        // Pattern mirrors handle_request_tool record_completed.
+        // ================================================================
+        if let Some(ref result) = admission_result {
+            if let Some(ref journal) = result.effect_journal {
+                if let Err(e) = journal.record_completed(&result.bundle.request_id) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_completed failed for PublishEvidence"
+                    );
+                    // For fail-closed tiers, completion recording failure
+                    // means restart will classify as Unknown.
+                    if result.boundary_span.enforcement_tier
+                        == crate::admission_kernel::types::EnforcementTier::FailClosed
+                    {
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorInternal,
+                            format!("effect journal completion recording failed: {e}"),
+                        ));
+                    }
+                }
+            }
         }
 
         // Build storage path using hash prefix sharding (consistent with DurableCas)
@@ -14526,7 +14779,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -14568,7 +14821,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -14688,7 +14941,7 @@ mod tests {
             RiskTier as CapabilityRiskTier, ToolBroker, ToolBrokerConfig, ToolClass,
         };
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -14746,7 +14999,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -16574,7 +16827,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -16616,7 +16869,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -16754,7 +17007,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -16796,7 +17049,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -16929,7 +17182,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -16975,7 +17228,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -17111,7 +17364,7 @@ mod tests {
         use crate::protocol::dispatch::{
             LedgerEventEmitter, LedgerEventError, SignedLedgerEvent, StubLedgerEventEmitter,
         };
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         #[derive(Debug)]
         struct MockInferenceHandler {
@@ -17499,7 +17752,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -18865,7 +19118,7 @@ mod tests {
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
         use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         /// TCK-00316: Verify fail-closed behavior when broker is configured but
         /// holonic clock is missing.
@@ -19013,6 +19266,9 @@ mod tests {
                     Some(&receipt),
                     None,
                     false,
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -19196,7 +19452,7 @@ mod tests {
                     .expect("session registration");
                 let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|duration| {
@@ -19333,7 +19589,7 @@ mod tests {
                     .expect("session registration");
                 let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|duration| {
@@ -19487,7 +19743,7 @@ mod tests {
                     .expect("session registration");
                 let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|duration| {
@@ -19710,6 +19966,9 @@ mod tests {
                     Some(pending_pcac),
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -19882,6 +20141,9 @@ mod tests {
                     Some(pending_pcac),
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20052,6 +20314,9 @@ mod tests {
                     Some(pending_pcac),
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20188,6 +20453,9 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -20338,6 +20606,9 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -21988,7 +22259,7 @@ mod tests {
                     .expect("register session");
 
                 // Telemetry store - register with real start time
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|d| {
@@ -24185,7 +24456,7 @@ mod tests {
 
         /// Creates a capability manifest where the given tool class is at Tier3
         /// (fail-closed enforcement).
-        fn make_tier3_manifest(tool: ToolClass) -> crate::episode::CapabilityManifest {
+        pub(super) fn make_tier3_manifest(tool: ToolClass) -> crate::episode::CapabilityManifest {
             let capability = Capability {
                 capability_id: format!("cap-{tool}-tier3"),
                 tool_class: tool,
@@ -24430,6 +24701,54 @@ mod tests {
                 }
             }
 
+            struct PassingEffectJournal;
+            impl crate::admission_kernel::effect_journal::EffectJournal for PassingEffectJournal {
+                fn record_started(
+                    &self,
+                    _binding: &crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    Ok(())
+                }
+                fn record_completed(
+                    &self,
+                    _request_id: &Hash,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    Ok(())
+                }
+                fn query_state(
+                    &self,
+                    _request_id: &Hash,
+                ) -> crate::admission_kernel::effect_journal::EffectExecutionState {
+                    crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted
+                }
+                fn query_binding(
+                    &self,
+                    _request_id: &Hash,
+                ) -> Option<crate::admission_kernel::effect_journal::EffectJournalBindingV1>
+                {
+                    None
+                }
+                fn resolve_in_doubt(
+                    &self,
+                    _request_id: &Hash,
+                    _boundary_confirms_not_executed: bool,
+                ) -> Result<
+                    crate::admission_kernel::effect_journal::InDoubtResolutionV1,
+                    crate::admission_kernel::effect_journal::EffectJournalError,
+                > {
+                    Err(crate::admission_kernel::effect_journal::EffectJournalError::InvalidTransition {
+                        request_id: [0u8; 32],
+                        current: crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted,
+                        target: crate::admission_kernel::effect_journal::EffectExecutionState::Unknown,
+                    })
+                }
+                fn len(&self) -> usize {
+                    0
+                }
+            }
+
             let pcac_kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(PassingPcacKernel);
             let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
                 provider_id: "test-provider/finalize-failure".to_string(),
@@ -24440,7 +24759,8 @@ mod tests {
                     .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
                     .with_policy_resolver(Arc::new(PassingPolicyResolver))
                     .with_anti_rollback(Arc::new(FailingCommitAntiRollback))
-                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard)),
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard))
+                    .with_effect_journal(Arc::new(PassingEffectJournal)),
             )
         }
 
@@ -25163,6 +25483,109 @@ mod tests {
                 }
             }
 
+            /// In-memory mock effect journal for tests.
+            struct MockEffectJournal {
+                entries: std::sync::Mutex<
+                    std::collections::HashMap<
+                        apm2_core::crypto::Hash,
+                        crate::admission_kernel::effect_journal::EffectExecutionState,
+                    >,
+                >,
+                bindings: std::sync::Mutex<
+                    std::collections::HashMap<
+                        apm2_core::crypto::Hash,
+                        crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                    >,
+                >,
+            }
+
+            impl MockEffectJournal {
+                fn new() -> Self {
+                    Self {
+                        entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                        bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    }
+                }
+            }
+
+            impl crate::admission_kernel::effect_journal::EffectJournal for MockEffectJournal {
+                fn record_started(
+                    &self,
+                    binding: &crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    binding.validate()?;
+                    let mut entries = self.entries.lock().expect("lock");
+                    entries.insert(
+                        binding.request_id,
+                        crate::admission_kernel::effect_journal::EffectExecutionState::Started,
+                    );
+                    self.bindings
+                        .lock()
+                        .expect("lock")
+                        .insert(binding.request_id, binding.clone());
+                    Ok(())
+                }
+
+                fn record_completed(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    let mut entries = self.entries.lock().expect("lock");
+                    entries.insert(
+                        *request_id,
+                        crate::admission_kernel::effect_journal::EffectExecutionState::Completed,
+                    );
+                    Ok(())
+                }
+
+                fn query_state(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                ) -> crate::admission_kernel::effect_journal::EffectExecutionState {
+                    self.entries
+                        .lock()
+                        .expect("lock")
+                        .get(request_id)
+                        .copied()
+                        .unwrap_or(
+                        crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted,
+                    )
+                }
+
+                fn query_binding(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                ) -> Option<crate::admission_kernel::effect_journal::EffectJournalBindingV1>
+                {
+                    self.bindings.lock().expect("lock").get(request_id).cloned()
+                }
+
+                fn resolve_in_doubt(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                    _boundary_confirms_not_executed: bool,
+                ) -> Result<
+                    crate::admission_kernel::effect_journal::InDoubtResolutionV1,
+                    crate::admission_kernel::effect_journal::EffectJournalError,
+                > {
+                    Err(
+                        crate::admission_kernel::effect_journal::EffectJournalError::ReExecutionDenied {
+                            request_id: *request_id,
+                            enforcement_tier:
+                                crate::admission_kernel::types::EnforcementTier::FailClosed,
+                            declared_idempotent: false,
+                            reason: "mock: not implemented".into(),
+                        },
+                    )
+                }
+
+                fn len(&self) -> usize {
+                    self.entries.lock().expect("lock").len()
+                }
+            }
+
             // -- Build a kernel with all prerequisites passing --
             let pcac_kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(PassingPcacKernel);
             let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
@@ -25174,7 +25597,8 @@ mod tests {
                     .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
                     .with_policy_resolver(Arc::new(PassingPolicyResolver))
                     .with_anti_rollback(Arc::new(PassingAntiRollback))
-                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard)),
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard))
+                    .with_effect_journal(Arc::new(MockEffectJournal::new())),
             );
 
             let minter = test_minter();
@@ -26115,6 +26539,696 @@ mod tests {
                     );
                 },
             }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00501: Effect journal record_completed for session endpoints
+    // ========================================================================
+
+    mod tck_00501_session_endpoint_record_completed {
+        use std::time::Duration;
+
+        use secrecy::SecretString;
+
+        use super::*;
+        use crate::admission_kernel::QuarantineGuard;
+        use crate::admission_kernel::prerequisites::{
+            AntiRollbackAnchor, ExternalAnchorStateV1, LedgerAnchorV1, LedgerTrustVerifier,
+            PolicyError, PolicyRootResolver, PolicyRootStateV1, TrustError, ValidatedLedgerStateV1,
+        };
+        use crate::episode::InMemorySessionRegistry;
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::protocol::credentials::PeerCredentials;
+        use crate::protocol::dispatch::StubLedgerEventEmitter;
+        use crate::session::{SessionRegistry, SessionState};
+
+        fn test_hash(byte: u8) -> apm2_core::crypto::Hash {
+            let mut h = [0u8; 32];
+            h[0] = byte;
+            h[31] = byte;
+            h
+        }
+
+        fn test_minter() -> TokenMinter {
+            TokenMinter::new(SecretString::from("test-daemon-secret-key-32bytes!!"))
+        }
+
+        fn test_token(minter: &TokenMinter) -> SessionToken {
+            let spawn_time = SystemTime::now();
+            let ttl = Duration::from_secs(3600);
+            minter
+                .mint("session-001", "lease-001", spawn_time, ttl)
+                .unwrap()
+        }
+
+        fn make_session_ctx() -> ConnectionContext {
+            ConnectionContext::session_open(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some("session-001".to_string()),
+            )
+        }
+
+        fn register_session(
+            registry: &Arc<InMemorySessionRegistry>,
+            session_id: &str,
+        ) -> Arc<dyn SessionRegistry> {
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-TCK-00501".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-tck-00501".to_string(),
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: blake3::hash(b"tck-00501-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration should succeed");
+            Arc::clone(registry) as Arc<dyn SessionRegistry>
+        }
+
+        // ---- Passing kernel prerequisites ----
+
+        struct PassingPcacKernel;
+        impl apm2_core::pcac::AuthorityJoinKernel for PassingPcacKernel {
+            fn join(
+                &self,
+                _input: &apm2_core::pcac::AuthorityJoinInputV1,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
+            ) -> Result<
+                apm2_core::pcac::AuthorityJoinCertificateV1,
+                Box<apm2_core::pcac::AuthorityDenyV1>,
+            > {
+                Ok(apm2_core::pcac::AuthorityJoinCertificateV1 {
+                    ajc_id: test_hash(0x60),
+                    authority_join_hash: test_hash(0x61),
+                    intent_digest: test_hash(0x03),
+                    boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
+                    risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                    issued_time_envelope_ref: test_hash(0x62),
+                    issued_at_tick: 40,
+                    as_of_ledger_anchor: test_hash(0x63),
+                    expires_at_tick: 999_999,
+                    revocation_head_hash: test_hash(0x64),
+                    identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                    admission_capacity_token: None,
+                })
+            }
+            fn revalidate(
+                &self,
+                _cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
+                _time: apm2_core::crypto::Hash,
+                _ledger: apm2_core::crypto::Hash,
+                _revocation: apm2_core::crypto::Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
+            ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
+                Ok(())
+            }
+            fn consume(
+                &self,
+                cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
+                _intent: apm2_core::crypto::Hash,
+                _class: apm2_core::pcac::BoundaryIntentClass,
+                _requires_auth: bool,
+                _time: apm2_core::crypto::Hash,
+                _revocation: apm2_core::crypto::Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
+            ) -> Result<
+                (
+                    apm2_core::pcac::AuthorityConsumedV1,
+                    apm2_core::pcac::AuthorityConsumeRecordV1,
+                ),
+                Box<apm2_core::pcac::AuthorityDenyV1>,
+            > {
+                Ok((
+                    apm2_core::pcac::AuthorityConsumedV1 {
+                        ajc_id: cert.ajc_id,
+                        intent_digest: test_hash(0x03),
+                        consumed_time_envelope_ref: test_hash(0x71),
+                        consumed_at_tick: 45,
+                    },
+                    apm2_core::pcac::AuthorityConsumeRecordV1 {
+                        ajc_id: cert.ajc_id,
+                        consumed_time_envelope_ref: test_hash(0x71),
+                        consumed_at_tick: 45,
+                        effect_selector_digest: test_hash(0x72),
+                    },
+                ))
+            }
+        }
+
+        struct PassingLedgerVerifier;
+        impl LedgerTrustVerifier for PassingLedgerVerifier {
+            fn validated_state(&self) -> Result<ValidatedLedgerStateV1, TrustError> {
+                Ok(ValidatedLedgerStateV1 {
+                    validated_anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    tip_anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    ledger_keyset_digest: test_hash(0x23),
+                    root_trust_bundle_digest: test_hash(0x24),
+                })
+            }
+        }
+
+        struct PassingPolicyResolver;
+        impl PolicyRootResolver for PassingPolicyResolver {
+            fn resolve(
+                &self,
+                _as_of: &LedgerAnchorV1,
+            ) -> Result<crate::admission_kernel::prerequisites::PolicyRootStateV1, PolicyError>
+            {
+                Ok(PolicyRootStateV1 {
+                    policy_root_digest: test_hash(0x30),
+                    policy_root_epoch: 5,
+                    anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    provenance: crate::admission_kernel::prerequisites::GovernanceProvenanceV1 {
+                        signer_key_id: test_hash(0x31),
+                        algorithm_id: "ed25519".to_string(),
+                    },
+                })
+            }
+        }
+
+        struct PassingAntiRollback;
+        impl AntiRollbackAnchor for PassingAntiRollback {
+            fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+                Ok(ExternalAnchorStateV1 {
+                    anchor: LedgerAnchorV1 {
+                        ledger_id: test_hash(0x20),
+                        event_hash: test_hash(0x21),
+                        height: 100,
+                        he_time: 1000,
+                    },
+                    mechanism_id: "test".to_string(),
+                    proof_hash: test_hash(0x40),
+                })
+            }
+            fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                Ok(())
+            }
+            fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                Ok(())
+            }
+        }
+
+        struct PassingQuarantineGuardImpl;
+        impl QuarantineGuard for PassingQuarantineGuardImpl {
+            fn reserve(
+                &self,
+                _session_id: &str,
+                _request_id: &apm2_core::crypto::Hash,
+                _ajc_id: &apm2_core::crypto::Hash,
+            ) -> Result<apm2_core::crypto::Hash, String> {
+                Ok(test_hash(0x70))
+            }
+        }
+
+        // ---- MockEffectJournal with Arc-shared inspection ----
+
+        struct MockEffectJournal {
+            entries: std::sync::Mutex<
+                std::collections::HashMap<
+                    apm2_core::crypto::Hash,
+                    crate::admission_kernel::effect_journal::EffectExecutionState,
+                >,
+            >,
+            bindings: std::sync::Mutex<
+                std::collections::HashMap<
+                    apm2_core::crypto::Hash,
+                    crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                >,
+            >,
+        }
+
+        impl MockEffectJournal {
+            fn new() -> Self {
+                Self {
+                    entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
+                }
+            }
+
+            /// Returns all entries that are in Completed state.
+            fn completed_count(&self) -> usize {
+                self.entries
+                    .lock()
+                    .expect("lock")
+                    .values()
+                    .filter(|s| {
+                        **s == crate::admission_kernel::effect_journal::EffectExecutionState::Completed
+                    })
+                    .count()
+            }
+
+            /// Returns all entries that are in Started state.
+            fn started_count(&self) -> usize {
+                self.entries
+                    .lock()
+                    .expect("lock")
+                    .values()
+                    .filter(|s| {
+                        **s == crate::admission_kernel::effect_journal::EffectExecutionState::Started
+                    })
+                    .count()
+            }
+        }
+
+        impl crate::admission_kernel::effect_journal::EffectJournal for MockEffectJournal {
+            fn record_started(
+                &self,
+                binding: &crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+            ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+            {
+                binding.validate()?;
+                let mut entries = self.entries.lock().expect("lock");
+                entries.insert(
+                    binding.request_id,
+                    crate::admission_kernel::effect_journal::EffectExecutionState::Started,
+                );
+                self.bindings
+                    .lock()
+                    .expect("lock")
+                    .insert(binding.request_id, binding.clone());
+                Ok(())
+            }
+
+            fn record_completed(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+            ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+            {
+                let mut entries = self.entries.lock().expect("lock");
+                entries.insert(
+                    *request_id,
+                    crate::admission_kernel::effect_journal::EffectExecutionState::Completed,
+                );
+                Ok(())
+            }
+
+            fn query_state(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+            ) -> crate::admission_kernel::effect_journal::EffectExecutionState {
+                self.entries
+                    .lock()
+                    .expect("lock")
+                    .get(request_id)
+                    .copied()
+                    .unwrap_or(
+                        crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted,
+                    )
+            }
+
+            fn query_binding(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+            ) -> Option<crate::admission_kernel::effect_journal::EffectJournalBindingV1>
+            {
+                self.bindings.lock().expect("lock").get(request_id).cloned()
+            }
+
+            fn resolve_in_doubt(
+                &self,
+                request_id: &apm2_core::crypto::Hash,
+                _boundary_confirms_not_executed: bool,
+            ) -> Result<
+                crate::admission_kernel::effect_journal::InDoubtResolutionV1,
+                crate::admission_kernel::effect_journal::EffectJournalError,
+            > {
+                Err(
+                    crate::admission_kernel::effect_journal::EffectJournalError::ReExecutionDenied {
+                        request_id: *request_id,
+                        enforcement_tier:
+                            crate::admission_kernel::types::EnforcementTier::FailClosed,
+                        declared_idempotent: false,
+                        reason: "mock: not implemented".into(),
+                    },
+                )
+            }
+
+            fn len(&self) -> usize {
+                self.entries.lock().expect("lock").len()
+            }
+        }
+
+        /// Build a kernel with the given mock journal.
+        fn build_kernel(
+            mock_journal: Arc<MockEffectJournal>,
+        ) -> Arc<crate::admission_kernel::AdmissionKernelV1> {
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(PassingPcacKernel);
+            let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
+                provider_id: "test-provider/tck-00501".to_string(),
+                provider_build_digest: *blake3::hash(b"test-build-digest-501").as_bytes(),
+            };
+            Arc::new(
+                crate::admission_kernel::AdmissionKernelV1::new(pcac_kernel, witness_cfg)
+                    .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
+                    .with_policy_resolver(Arc::new(PassingPolicyResolver))
+                    .with_anti_rollback(Arc::new(PassingAntiRollback))
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuardImpl))
+                    .with_effect_journal(mock_journal),
+            )
+        }
+
+        /// Seed a governance policy event in the ledger so the kernel path
+        /// can resolve the authoritative policy root digest.
+        fn seed_governance_event(ledger: &StubLedgerEventEmitter) {
+            let policy_hash = test_hash(0x30); // Matches PassingPolicyResolver
+            let governance_payload =
+                serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                    work_id: "W-TCK-00501-GOVERNANCE".to_string(),
+                    policy_hash,
+                    timestamp_ms: 1,
+                })
+                .expect("governance payload serialization");
+            ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &governance_payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("governance event emission should succeed");
+        }
+
+        /// **SEC-MAJOR-1 regression**: repeated broker-denied `RequestTool`
+        /// calls must not create stale `Started` journal entries.
+        ///
+        /// This test drives the real `handle_request_tool` path through
+        /// kernel plan/execute with a broker manifest mismatch (dispatch
+        /// allows `read`, broker allows only `search`) and repeats deny
+        /// outcomes. Journal cardinality must remain bounded at zero.
+        #[test]
+        fn request_tool_broker_deny_does_not_accumulate_started_entries() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let mock_journal = Arc::new(MockEffectJournal::new());
+                let kernel = build_kernel(Arc::clone(&mock_journal));
+
+                let dispatch_manifest = super::tck_00494_admission_kernel_guard::make_tier3_manifest(
+                    crate::episode::ToolClass::Read,
+                );
+                let broker_manifest = super::tck_00494_admission_kernel_guard::make_tier3_manifest(
+                    crate::episode::ToolClass::Search,
+                );
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                manifest_store.register("session-001", dispatch_manifest);
+
+                let broker = Arc::new(crate::episode::ToolBroker::new(
+                    crate::episode::ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(broker_manifest)
+                    .await
+                    .expect("broker manifest initialization");
+
+                let ledger = StubLedgerEventEmitter::new();
+                seed_governance_event(&ledger);
+                let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                    Arc::new(ledger);
+
+                let session_registry = Arc::new(InMemorySessionRegistry::new());
+                let session_registry_dyn = register_session(&session_registry, "session-001");
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|duration| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let value = duration.as_nanos() as u64;
+                        value
+                    })
+                    .unwrap_or(1);
+                telemetry_store
+                    .register("session-001", started_at_ns)
+                    .expect("telemetry registration should succeed");
+
+                let clock = Arc::new(
+                    crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                        .expect("test clock should initialize"),
+                );
+                let stop_authority =
+                    Arc::new(crate::episode::preactuation::StopAuthority::new());
+                let preactuation_gate = Arc::new(
+                    crate::episode::preactuation::PreActuationGate::production_gate(
+                        Arc::clone(&stop_authority),
+                        None,
+                    ),
+                );
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_ledger(ledger_dyn)
+                        .with_session_registry(session_registry_dyn)
+                        .with_admission_kernel(kernel)
+                        .with_clock(clock)
+                        .with_telemetry_store(telemetry_store)
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority);
+
+                let token = test_token(&minter);
+                let ctx = make_session_ctx();
+
+                for i in 0..32usize {
+                    let request = RequestToolRequest {
+                        session_token: serde_json::to_string(&token).unwrap(),
+                        tool_id: "read".to_string(),
+                        arguments: serde_json::to_vec(&serde_json::json!({
+                            "path": format!("/tmp/deny-storm-{i}.txt")
+                        }))
+                        .unwrap(),
+                        dedupe_key: format!("deny-storm-{i}"),
+                        epoch_seal: None,
+                    };
+                    let frame = encode_request_tool_request(&request);
+                    let response = dispatcher
+                        .dispatch(&frame, &ctx)
+                        .expect("dispatch should return application response");
+                    match response {
+                        SessionResponse::RequestTool(resp) => {
+                            assert_eq!(
+                                resp.decision,
+                                i32::from(DecisionType::Deny),
+                                "broker deny expected for read request against search-only broker manifest"
+                            );
+                        },
+                        other => panic!("expected RequestTool deny response, got: {other:?}"),
+                    }
+                }
+
+                assert_eq!(
+                    mock_journal.started_count(),
+                    0,
+                    "broker-denied requests must not leave Started entries"
+                );
+                assert_eq!(
+                    mock_journal.completed_count(),
+                    0,
+                    "broker-denied requests must not create Completed entries"
+                );
+                assert_eq!(
+                    mock_journal.started_count() + mock_journal.completed_count(),
+                    0,
+                    "journal cardinality must remain bounded for repeated deny outcomes"
+                );
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // TCK-00501 BLOCKER: EmitEvent must call record_completed
+        // ----------------------------------------------------------------
+
+        /// **TCK-00501**: After a successful `EmitEvent` through the
+        /// `AdmissionKernel` path, the journal state for the request MUST
+        /// be `Completed`, not `Started`.
+        ///
+        /// Before this fix, the journal entry stayed `Started` indefinitely,
+        /// becoming `Unknown` on restart, causing journal bloat and
+        /// unnecessary fail-closed re-execution denials.
+        #[test]
+        fn emit_event_records_completed_in_effect_journal() {
+            let minter = test_minter();
+            let mock_journal = Arc::new(MockEffectJournal::new());
+
+            let kernel = build_kernel(Arc::clone(&mock_journal));
+
+            let ledger = StubLedgerEventEmitter::new();
+            seed_governance_event(&ledger);
+            let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(ledger);
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let clock = Arc::new(
+                crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                    .expect("test clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_dyn)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload-for-journal".to_vec(),
+                correlation_id: "corr-journal-001".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                SessionResponse::EmitEvent(resp) => {
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "EmitEvent must return a non-empty event_id"
+                    );
+                },
+                SessionResponse::Error(err) => {
+                    panic!(
+                        "EmitEvent should succeed through kernel path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected EmitEvent response, got: {other:?}"),
+            }
+
+            // CRITICAL ASSERTION: journal must have transitioned to Completed.
+            assert_eq!(
+                mock_journal.completed_count(),
+                1,
+                "After successful EmitEvent, exactly 1 journal entry must be \
+                 Completed (not Started). Found {} completed, {} started.",
+                mock_journal.completed_count(),
+                mock_journal.started_count()
+            );
+            assert_eq!(
+                mock_journal.started_count(),
+                0,
+                "No journal entries should remain in Started state after \
+                 successful EmitEvent. Found {} still Started.",
+                mock_journal.started_count()
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // TCK-00501 BLOCKER: PublishEvidence must call record_completed
+        // ----------------------------------------------------------------
+
+        /// **TCK-00501**: After a successful `PublishEvidence` through the
+        /// `AdmissionKernel` path, the journal state for the request MUST
+        /// be `Completed`, not `Started`.
+        #[test]
+        fn publish_evidence_records_completed_in_effect_journal() {
+            let minter = test_minter();
+            let mock_journal = Arc::new(MockEffectJournal::new());
+
+            let kernel = build_kernel(Arc::clone(&mock_journal));
+
+            let ledger = StubLedgerEventEmitter::new();
+            seed_governance_event(&ledger);
+            let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(ledger);
+
+            let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            let clock = Arc::new(
+                crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                    .expect("test clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_dyn)
+                .with_cas(cas)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-for-journal".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                SessionResponse::PublishEvidence(resp) => {
+                    assert!(
+                        !resp.artifact_hash.is_empty(),
+                        "PublishEvidence must return a non-empty artifact_hash"
+                    );
+                },
+                SessionResponse::Error(err) => {
+                    panic!(
+                        "PublishEvidence should succeed through kernel path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected PublishEvidence response, got: {other:?}"),
+            }
+
+            // CRITICAL ASSERTION: journal must have transitioned to Completed.
+            assert_eq!(
+                mock_journal.completed_count(),
+                1,
+                "After successful PublishEvidence, exactly 1 journal entry must \
+                 be Completed (not Started). Found {} completed, {} started.",
+                mock_journal.completed_count(),
+                mock_journal.started_count()
+            );
+            assert_eq!(
+                mock_journal.started_count(),
+                0,
+                "No journal entries should remain in Started state after \
+                 successful PublishEvidence. Found {} still Started.",
+                mock_journal.started_count()
+            );
         }
     }
 }

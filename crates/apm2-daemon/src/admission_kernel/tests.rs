@@ -518,6 +518,127 @@ impl AuthorityJoinKernel for DriftDetectingPcacKernel {
     }
 }
 
+/// In-memory mock effect journal for tests.
+///
+/// Tracks state transitions without file I/O. Suitable for kernel
+/// unit tests that need an effect journal wired but do not test
+/// crash recovery semantics.
+struct MockEffectJournal {
+    entries: std::sync::Mutex<
+        std::collections::HashMap<Hash, super::effect_journal::EffectExecutionState>,
+    >,
+    bindings: std::sync::Mutex<
+        std::collections::HashMap<Hash, super::effect_journal::EffectJournalBindingV1>,
+    >,
+}
+
+impl MockEffectJournal {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl super::effect_journal::EffectJournal for MockEffectJournal {
+    fn record_started(
+        &self,
+        binding: &super::effect_journal::EffectJournalBindingV1,
+    ) -> Result<(), super::effect_journal::EffectJournalError> {
+        binding.validate()?;
+        let mut entries = self.entries.lock().expect("lock");
+        if let Some(&state) = entries.get(&binding.request_id) {
+            // Allow NotStarted -> Started (re-execution after resolve_in_doubt).
+            if state != super::effect_journal::EffectExecutionState::NotStarted {
+                return Err(
+                    super::effect_journal::EffectJournalError::InvalidTransition {
+                        request_id: binding.request_id,
+                        current: state,
+                        target: super::effect_journal::EffectExecutionState::Started,
+                    },
+                );
+            }
+            entries.remove(&binding.request_id);
+        }
+        entries.insert(
+            binding.request_id,
+            super::effect_journal::EffectExecutionState::Started,
+        );
+        self.bindings
+            .lock()
+            .expect("lock")
+            .insert(binding.request_id, binding.clone());
+        Ok(())
+    }
+
+    fn record_completed(
+        &self,
+        request_id: &Hash,
+    ) -> Result<(), super::effect_journal::EffectJournalError> {
+        let mut entries = self.entries.lock().expect("lock");
+        match entries.get(request_id) {
+            Some(&super::effect_journal::EffectExecutionState::Started) => {
+                entries.insert(
+                    *request_id,
+                    super::effect_journal::EffectExecutionState::Completed,
+                );
+                Ok(())
+            },
+            Some(&state) => Err(
+                super::effect_journal::EffectJournalError::InvalidTransition {
+                    request_id: *request_id,
+                    current: state,
+                    target: super::effect_journal::EffectExecutionState::Completed,
+                },
+            ),
+            None => Err(
+                super::effect_journal::EffectJournalError::InvalidTransition {
+                    request_id: *request_id,
+                    current: super::effect_journal::EffectExecutionState::NotStarted,
+                    target: super::effect_journal::EffectExecutionState::Completed,
+                },
+            ),
+        }
+    }
+
+    fn query_state(&self, request_id: &Hash) -> super::effect_journal::EffectExecutionState {
+        self.entries
+            .lock()
+            .expect("lock")
+            .get(request_id)
+            .copied()
+            .unwrap_or(super::effect_journal::EffectExecutionState::NotStarted)
+    }
+
+    fn query_binding(
+        &self,
+        request_id: &Hash,
+    ) -> Option<super::effect_journal::EffectJournalBindingV1> {
+        self.bindings.lock().expect("lock").get(request_id).cloned()
+    }
+
+    fn resolve_in_doubt(
+        &self,
+        request_id: &Hash,
+        _boundary_confirms_not_executed: bool,
+    ) -> Result<super::effect_journal::InDoubtResolutionV1, super::effect_journal::EffectJournalError>
+    {
+        Err(
+            super::effect_journal::EffectJournalError::ReExecutionDenied {
+                request_id: *request_id,
+                enforcement_tier: EnforcementTier::FailClosed,
+                declared_idempotent: false,
+                reason: "mock: not implemented".into(),
+            },
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.entries.lock().expect("lock").len()
+    }
+}
+
 /// Build a fully-wired kernel for fail-closed tier testing.
 fn fully_wired_kernel() -> AdmissionKernelV1 {
     AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
@@ -525,6 +646,7 @@ fn fully_wired_kernel() -> AdmissionKernelV1 {
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
         .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()))
 }
 
 /// Build a minimal kernel (no optional prerequisites).
@@ -709,7 +831,8 @@ fn test_intent_mismatch_denies_at_consume() {
     .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
     .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
     .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
-    .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+    .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+    .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan should succeed");
@@ -769,7 +892,8 @@ fn test_plan_consumed_even_on_execute_failure() {
     .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
     .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
     .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
-    .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+    .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+    .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan should succeed");
@@ -1295,7 +1419,8 @@ fn test_execute_detects_ledger_anchor_drift_fail_closed() {
         )))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan should succeed");
@@ -1362,7 +1487,8 @@ fn test_execute_detects_policy_root_drift_fail_closed() {
             second_policy,
         )))
         .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan should succeed");
@@ -1396,7 +1522,8 @@ fn test_execute_detects_anti_rollback_failure_fail_closed() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(Arc::new(DriftingAntiRollback::new()))
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan should succeed");
@@ -1696,7 +1823,8 @@ fn test_zero_provider_build_digest_denied() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let result = kernel.plan(&request);
@@ -2738,6 +2866,7 @@ fn fail_closed_kernel() -> AdmissionKernelV1 {
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
         .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()))
 }
 
 /// Helper: build witness evidence from a seed (valid binding).
@@ -4146,6 +4275,203 @@ fn test_tck_00497_witness_evidence_json_round_trip() {
     );
 }
 
+// =============================================================================
+// TCK-00501 MAJOR 2: record_started must NOT be persisted before fallible
+// pre-effect steps (bundle validation). This test verifies that when
+// PCAC consume fails, the effect journal has NO Started entry.
+// =============================================================================
+
+/// A tracking mock journal that records whether `record_started` was called.
+struct TrackingEffectJournal {
+    started_called: std::sync::Mutex<bool>,
+}
+
+impl TrackingEffectJournal {
+    fn new() -> Self {
+        Self {
+            started_called: std::sync::Mutex::new(false),
+        }
+    }
+
+    fn was_started_called(&self) -> bool {
+        *self.started_called.lock().expect("lock")
+    }
+}
+
+impl super::effect_journal::EffectJournal for TrackingEffectJournal {
+    fn record_started(
+        &self,
+        binding: &super::effect_journal::EffectJournalBindingV1,
+    ) -> Result<(), super::effect_journal::EffectJournalError> {
+        binding.validate()?;
+        *self.started_called.lock().expect("lock") = true;
+        Ok(())
+    }
+
+    fn record_completed(
+        &self,
+        _request_id: &Hash,
+    ) -> Result<(), super::effect_journal::EffectJournalError> {
+        Ok(())
+    }
+
+    fn query_state(&self, _request_id: &Hash) -> super::effect_journal::EffectExecutionState {
+        super::effect_journal::EffectExecutionState::NotStarted
+    }
+
+    fn query_binding(
+        &self,
+        _request_id: &Hash,
+    ) -> Option<super::effect_journal::EffectJournalBindingV1> {
+        None
+    }
+
+    fn resolve_in_doubt(
+        &self,
+        request_id: &Hash,
+        _boundary_confirms_not_executed: bool,
+    ) -> Result<super::effect_journal::InDoubtResolutionV1, super::effect_journal::EffectJournalError>
+    {
+        Err(
+            super::effect_journal::EffectJournalError::ReExecutionDenied {
+                request_id: *request_id,
+                enforcement_tier: EnforcementTier::FailClosed,
+                declared_idempotent: false,
+                reason: "tracking mock: not implemented".into(),
+            },
+        )
+    }
+
+    fn len(&self) -> usize {
+        0
+    }
+}
+
+#[test]
+fn test_tck_00501_consume_failure_does_not_leave_stale_started_entry() {
+    // TCK-00501 regression test: when execute() fails (e.g., PCAC consume
+    // failure), no journal_binding is returned to the caller, so
+    // record_started is never called. This validates that failed execute()
+    // cannot produce orphaned Started entries.
+    let tracking_journal = Arc::new(TrackingEffectJournal::new());
+
+    let kernel = AdmissionKernelV1::new(
+        Arc::new(MockPcacKernel::with_consume_error(
+            AuthorityDenyClass::IntentDigestMismatch {
+                expected: test_hash(3),
+                actual: test_hash(99),
+            },
+        )),
+        witness_provider(),
+    )
+    .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+    .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+    .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+    .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+    .with_effect_journal(tracking_journal.clone());
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Execute fails because consume is denied.
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+    assert!(result.is_err(), "execute must fail due to consume error");
+
+    // The journal must NOT have recorded Started — the failure occurred
+    // before bundle construction/validation, so record_started (which is
+    // after bundle.validate()) must not have been called.
+    assert!(
+        !tracking_journal.was_started_called(),
+        "record_started must NOT be called when execute fails before bundle validation"
+    );
+}
+
+#[test]
+fn test_tck_00501_successful_execute_returns_journal_binding() {
+    // Positive test: verify that a successful execute() returns a
+    // journal_binding that the caller can use to call record_started
+    // at the true pre-dispatch boundary (TCK-00501 SEC-MAJOR-1 fix).
+    //
+    // execute() no longer calls record_started directly — instead it
+    // exposes the binding in AdmissionResultV1 so the caller controls
+    // when Started is persisted, preventing false in-doubt classification
+    // from orphaned Started entries.
+    let tracking_journal = Arc::new(TrackingEffectJournal::new());
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(tracking_journal.clone());
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // execute() must NOT call record_started — caller controls timing.
+    assert!(
+        !tracking_journal.was_started_called(),
+        "execute() must NOT call record_started (caller responsibility)"
+    );
+
+    // journal_binding must be present when effect journal is wired.
+    let binding = result
+        .journal_binding
+        .as_ref()
+        .expect("journal_binding MUST be present when effect journal is wired");
+
+    // Verify binding is well-formed (non-zero request_id, valid fields).
+    binding
+        .validate()
+        .expect("journal_binding must pass validation");
+
+    // Caller can now call record_started at the dispatch boundary.
+    result
+        .effect_journal
+        .as_ref()
+        .expect("effect_journal MUST be present")
+        .record_started(binding)
+        .expect("record_started must succeed with returned binding");
+
+    assert!(
+        tracking_journal.was_started_called(),
+        "record_started MUST succeed when called by caller with returned binding"
+    );
+}
+
+// =============================================================================
+// TCK-00501 MAJOR 1: idempotency key derivation test
+// =============================================================================
+
+#[test]
+fn test_tck_00501_idempotency_key_is_derived_on_successful_execute() {
+    // Verify that the admission result contains a non-zero idempotency key
+    // even though declared_idempotent is not yet sourced from the manifest.
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // The idempotency key must be derived and non-empty.
+    let key_hex = result.idempotency_key.as_hex();
+    assert!(
+        !key_hex.is_empty(),
+        "idempotency key must be derived (non-empty hex)"
+    );
+    assert!(
+        key_hex.len() >= 64,
+        "idempotency key hex must be at least 64 chars (32 bytes), got {}",
+        key_hex.len()
+    );
+}
+
 // ---- MonitorWaiverV1 JSON round-trip ----
 
 #[test]
@@ -4897,7 +5223,8 @@ fn test_tck_00502_execute_commits_anti_rollback_anchor() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan must succeed");
@@ -5045,7 +5372,8 @@ fn test_tck_00502_fresh_install_bootstrap_without_preseeding() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     // plan() MUST succeed on fresh install (BLOCKER-1 fix).
     let request = valid_request(RiskTier::Tier2Plus);
@@ -5116,7 +5444,8 @@ fn test_tck_00502_effect_failure_does_not_advance_anchor() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     // plan() + execute() succeed.
     let request = valid_request(RiskTier::Tier2Plus);
@@ -5185,7 +5514,8 @@ fn test_tck_00502_sequential_finalize_advances_anchor_monotonically() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     // Simulate effect 1 (e.g., RequestTool): plan + execute + finalize
     let request1 = valid_request(RiskTier::Tier2Plus);
