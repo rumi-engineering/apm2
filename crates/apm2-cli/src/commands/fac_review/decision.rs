@@ -718,8 +718,7 @@ fn dimension_to_state_review_type(dimension: &str) -> &str {
 
 fn terminate_review_agent(pr_number: u32, dimension: &str) {
     let review_type = dimension_to_state_review_type(dimension);
-    let Ok(Some(state)) = super::state::load_review_run_state_strict(pr_number, review_type)
-    else {
+    let Ok(Some(state)) = super::state::load_review_run_state_strict(pr_number, review_type) else {
         return;
     };
     let Some(pid) = state.pid else { return };

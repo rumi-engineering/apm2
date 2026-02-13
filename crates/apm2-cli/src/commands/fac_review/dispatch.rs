@@ -13,8 +13,8 @@ use fs2::FileExt;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
-    load_review_run_state_for_home, next_review_sequence_number_for_home,
-    try_acquire_review_lease, write_review_run_state_for_home,
+    load_review_run_state_for_home, next_review_sequence_number_for_home, try_acquire_review_lease,
+    write_review_run_state_for_home,
 };
 use super::types::{
     DISPATCH_LOCK_ACQUIRE_TIMEOUT, DISPATCH_PENDING_TTL, DispatchIdempotencyKey,
@@ -830,9 +830,7 @@ where
 
     // Final dedup gate: if the orchestrator's review lease is already held,
     // a reviewer is actively running — no need to spawn another.
-    if try_acquire_review_lease(&key.owner_repo, key.pr_number, &key.review_type)?
-        .is_none()
-    {
+    if try_acquire_review_lease(&key.owner_repo, key.pr_number, &key.review_type)?.is_none() {
         // Lease held — enrich the response with current run state so callers
         // can see which run_id/pid they joined.
         let (run_state_str, run_id, seq, pid) =
@@ -857,7 +855,8 @@ where
             log_file: None,
         });
     }
-    // Lease was free (we acquired it) — drop immediately so the spawned process can take it.
+    // Lease was free (we acquired it) — drop immediately so the spawned process can
+    // take it.
 
     if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
         return attach_run_state_contract_for_home(

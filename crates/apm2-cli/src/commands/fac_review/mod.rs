@@ -911,13 +911,10 @@ fn run_terminate_inner(
     json_output: bool,
 ) -> Result<(), String> {
     let (_owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
-    let state_opt =
-        state::load_review_run_state_strict(resolved_pr, review_type)?;
+    let state_opt = state::load_review_run_state_strict(resolved_pr, review_type)?;
 
     let Some(mut run_state) = state_opt else {
-        let msg = format!(
-            "no active reviewer for PR #{resolved_pr} type={review_type}"
-        );
+        let msg = format!("no active reviewer for PR #{resolved_pr} type={review_type}");
         if json_output {
             println!(
                 "{}",

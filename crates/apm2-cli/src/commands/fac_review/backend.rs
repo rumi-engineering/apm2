@@ -60,7 +60,9 @@ pub fn build_resume_command_for_backend(
     let msg_q = sh_quote(sha_update_msg);
     match backend {
         ReviewBackend::Codex => {
-            format!("codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}")
+            format!(
+                "codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}"
+            )
         },
         ReviewBackend::Gemini => {
             let model_q = sh_quote(normalize_gemini_model(model));
