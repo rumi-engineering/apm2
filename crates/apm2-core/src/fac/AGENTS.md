@@ -48,6 +48,9 @@ default mode.
 - State serialization/deserialization for persistence (`serialize_state()`,
   `deserialize_state()`).
 - Verifying key publication (`verifying_key()`) for real signature verification.
+- Worker admission health gate enforcement via
+  `evaluate_admission_health_gate()`, the canonical production entry point
+  for health-gated admission (TCK-00585).
 
 ### Security Invariants (TCK-00510)
 
@@ -128,6 +131,8 @@ health gate to refuse job admission when broker health is degraded.
 - Bounded deserialization on all string fields (`schema_id`, `schema_version`,
   `predicate_id`, `deny_reason`) and Vec fields (`checks`) during JSON parsing.
 - Evaluation window hash included in receipt for boundary context binding.
+- `compute_eval_window_hash()` is public for production callers to compute
+  the expected `eval_window_hash` before calling the worker health gate.
 
 ### Security Invariants (TCK-00585)
 
@@ -172,6 +177,18 @@ health gate to refuse job admission when broker health is degraded.
   The worker health gate enforces `receipt.health_seq >= min_health_seq` to
   prevent same-tick replay attacks where an old HEALTHY receipt is presented
   after health has degraded but the broker tick has not advanced.
+- [INV-BH-014] The `health_seq` counter uses `checked_add` (not
+  `wrapping_add`) to detect overflow at `u64::MAX`. On overflow, a synthetic
+  FAILED receipt is persisted (SEQ_OVERFLOW predicate) and
+  `BrokerHealthError::HealthSeqOverflow` is returned. This is a terminal
+  condition requiring broker key/epoch rotation (fail-closed). Synthetic
+  receipts in error paths use `saturating_add` to cap at `u64::MAX` without
+  wrapping.
+- [INV-BH-015] `FacBroker::evaluate_admission_health_gate()` is the
+  canonical production entry point for worker admission health gating.
+  It wires the broker's verifying key, computes the expected eval window
+  hash, and delegates to `evaluate_worker_health_gate()`. This ensures
+  health gate enforcement is active on non-test admission paths.
 
 ## projection_compromise Submodule
 

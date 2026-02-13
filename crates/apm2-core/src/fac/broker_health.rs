@@ -39,6 +39,10 @@
 //!   per-invocation freshness independent of broker tick advancement. The
 //!   worker gate enforces `receipt.health_seq >= min_health_seq` to prevent
 //!   same-tick replay attacks.
+//! - [INV-BRK-HEALTH-014] The `health_seq` counter uses `checked_add` (not
+//!   `wrapping_add`) to detect overflow at `u64::MAX`. On overflow, a synthetic
+//!   FAILED receipt is persisted and `HealthSeqOverflow` is returned. This is a
+//!   terminal condition requiring broker key/epoch rotation (fail-closed).
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -402,6 +406,17 @@ pub enum BrokerHealthError {
     /// Signature verification failed.
     #[error("signature verification failed")]
     InvalidSignature,
+
+    /// Health sequence counter overflow (`u64::MAX` reached).
+    ///
+    /// The monotonic health sequence has exhausted its u64 range. This is a
+    /// terminal condition requiring broker key/epoch rotation. Fail-closed:
+    /// no further health receipts can be issued until the broker is
+    /// re-initialized with a fresh sequence epoch.
+    #[error(
+        "health sequence counter overflow: u64::MAX reached, broker requires key/epoch rotation"
+    )]
+    HealthSeqOverflow,
 }
 
 // ---------------------------------------------------------------------------
@@ -787,8 +802,20 @@ impl BrokerHealthChecker {
         // INV-BH-013: Capture and advance the monotonic health sequence.
         // This happens AFTER input validation but BEFORE receipt construction,
         // ensuring each receipt gets a unique, strictly increasing sequence.
+        // Fail-closed on overflow: if the u64 sequence space is exhausted,
+        // persist a synthetic FAILED receipt and return an error.
         let seq = self.health_seq;
-        self.health_seq = self.health_seq.wrapping_add(1);
+        if let Some(next) = self.health_seq.checked_add(1) {
+            self.health_seq = next;
+        } else {
+            // Sequence exhausted — persist synthetic FAILED at current
+            // (saturated) seq so downstream gates see a FAILED receipt,
+            // then return the overflow error.
+            let reason =
+                "health_seq overflow: u64::MAX reached, broker requires key/epoch rotation";
+            self.persist_overflow_failed_receipt(broker_tick, input.eval_window, reason, signer);
+            return Err(BrokerHealthError::HealthSeqOverflow);
+        }
 
         // Compute content hash (domain-separated, includes schema + eval_window +
         // health_seq)
@@ -844,8 +871,66 @@ impl BrokerHealthChecker {
         }];
 
         // INV-BH-013: Capture and advance sequence for synthetic receipt.
+        // Fail-closed on overflow: saturate at u64::MAX. The next
+        // `check_health` call will detect the overflow and return
+        // `HealthSeqOverflow`. We do NOT skip the synthetic receipt here
+        // because the primary invariant (INV-BH-012: downstream gates must
+        // not see a stale HEALTHY receipt) takes precedence.
         let seq = self.health_seq;
-        self.health_seq = self.health_seq.wrapping_add(1);
+        self.health_seq = self.health_seq.saturating_add(1);
+
+        let eval_window_hash = compute_eval_window_hash(eval_window);
+        let content_hash = compute_health_receipt_hash(
+            broker_tick,
+            seq,
+            eval_window_hash,
+            BrokerHealthStatus::Failed,
+            &checks,
+        );
+        let signature_bytes = signer.sign(&content_hash);
+
+        let receipt = HealthReceiptV1 {
+            schema_id: HEALTH_RECEIPT_SCHEMA_ID.to_string(),
+            schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
+            status: BrokerHealthStatus::Failed,
+            broker_tick,
+            health_seq: seq,
+            eval_window_hash,
+            checks,
+            content_hash,
+            signature: signature_bytes.to_bytes(),
+            signer_id: signer.verifying_key().to_bytes(),
+        };
+
+        // Append to bounded history (evict oldest when at cap)
+        if self.history.len() >= MAX_HEALTH_HISTORY {
+            self.history.remove(0);
+        }
+        self.history.push(receipt);
+    }
+
+    /// Persists a synthetic `FAILED` receipt when the health sequence counter
+    /// overflows (`u64::MAX` reached).
+    ///
+    /// Unlike [`Self::persist_synthetic_failed_receipt`], this method does NOT
+    /// advance the sequence counter (it is already at `u64::MAX`). The receipt
+    /// is stamped with the current (saturated) sequence value so downstream
+    /// gates see a `FAILED` status.
+    fn persist_overflow_failed_receipt(
+        &mut self,
+        broker_tick: u64,
+        eval_window: &HtfEvaluationWindow,
+        reason: &str,
+        signer: &Signer,
+    ) {
+        let checks = vec![InvariantCheckResult {
+            predicate_id: "SEQ_OVERFLOW".to_string(),
+            passed: false,
+            deny_reason: Some(reason.to_string()),
+        }];
+
+        // Use the current (saturated) sequence — do NOT advance further.
+        let seq = self.health_seq;
 
         let eval_window_hash = compute_eval_window_hash(eval_window);
         let content_hash = compute_health_receipt_hash(
@@ -1149,7 +1234,13 @@ fn compute_health_receipt_hash(
 
 /// Computes a BLAKE3 hash of the evaluation window fields for boundary
 /// context binding.
-fn compute_eval_window_hash(eval_window: &HtfEvaluationWindow) -> Hash {
+///
+/// This is the canonical hash used for `expected_eval_window_hash` in
+/// [`evaluate_worker_health_gate`]. Production callers must use this
+/// function to compute the expected hash from the current evaluation
+/// window before calling the gate.
+#[must_use]
+pub fn compute_eval_window_hash(eval_window: &HtfEvaluationWindow) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.eval_window.v1");
     let bid = eval_window.boundary_id.as_bytes();
@@ -3248,6 +3339,228 @@ mod tests {
         assert!(
             matches!(result, Err(BrokerHealthError::ContentHashMismatch)),
             "expected ContentHashMismatch for tampered health_seq, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MINOR-1 regression: health_seq overflow (checked_add fail-closed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn health_seq_overflow_returns_error_and_persists_failed_receipt() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        // Artificially set the sequence to u64::MAX - 1 so the next
+        // successful check uses u64::MAX - 1 and advances to u64::MAX.
+        // The check after that should overflow and fail.
+        checker.health_seq = u64::MAX - 1;
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        // First check at u64::MAX - 1 should succeed and advance to
+        // u64::MAX.
+        let r1 = checker.check_health(&input, 1, &signer).unwrap();
+        assert_eq!(r1.health_seq, u64::MAX - 1);
+        assert_eq!(checker.current_health_seq(), u64::MAX);
+
+        // Second check at u64::MAX should succeed (uses u64::MAX) and try
+        // to advance to u64::MAX + 1 — but checked_add(1) wraps, so it
+        // should detect overflow and fail.
+        // Wait — actually the seq u64::MAX is valid. checked_add(1) on
+        // u64::MAX returns None. So this call should fail.
+        let r2 = checker.check_health(&input, 2, &signer);
+        assert!(
+            matches!(r2, Err(BrokerHealthError::HealthSeqOverflow)),
+            "expected HealthSeqOverflow, got {r2:?}"
+        );
+
+        // A synthetic FAILED receipt should have been persisted at
+        // health_seq = u64::MAX (the saturated value).
+        let latest = checker.latest().unwrap();
+        assert_eq!(latest.status, BrokerHealthStatus::Failed);
+        assert_eq!(latest.health_seq, u64::MAX);
+        assert!(
+            latest
+                .checks
+                .iter()
+                .any(|c| c.predicate_id == "SEQ_OVERFLOW"),
+            "expected SEQ_OVERFLOW check in synthetic receipt"
+        );
+
+        // Subsequent calls should also fail with overflow.
+        let r3 = checker.check_health(&input, 3, &signer);
+        assert!(
+            matches!(r3, Err(BrokerHealthError::HealthSeqOverflow)),
+            "expected repeated HealthSeqOverflow, got {r3:?}"
+        );
+    }
+
+    #[test]
+    fn health_seq_overflow_synthetic_receipt_also_saturates() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        // Set sequence to u64::MAX - 1 so that the next
+        // persist_synthetic_failed_receipt uses u64::MAX - 1 and saturates
+        // to u64::MAX.
+        checker.health_seq = u64::MAX - 1;
+
+        let eval_window = valid_eval_window();
+
+        // Trigger an error path that calls persist_synthetic_failed_receipt.
+        #[allow(clippy::cast_possible_truncation)]
+        let oversized: Vec<Hash> = (0..=MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let error_input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &oversized,
+        };
+
+        // This should persist a synthetic FAILED receipt at
+        // health_seq = u64::MAX - 1 and saturate to u64::MAX.
+        let _ = checker.check_health(&error_input, 1, &signer);
+
+        let synthetic = checker.latest().unwrap();
+        assert_eq!(synthetic.health_seq, u64::MAX - 1);
+        assert_eq!(
+            checker.current_health_seq(),
+            u64::MAX,
+            "saturating_add should cap at u64::MAX, not wrap to 0"
+        );
+
+        // One more synthetic receipt at u64::MAX — saturating_add(1)
+        // should still be u64::MAX (no wrap).
+        let _ = checker.check_health(&error_input, 2, &signer);
+        let synthetic2 = checker.latest().unwrap();
+        assert_eq!(synthetic2.health_seq, u64::MAX);
+        assert_eq!(
+            checker.current_health_seq(),
+            u64::MAX,
+            "must stay saturated at u64::MAX, not wrap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAJOR-1: Production admission gate integration test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn broker_admission_gate_denies_when_health_failed() {
+        use crate::fac::FacBroker;
+
+        let broker = FacBroker::new();
+        let mut checker = BrokerHealthChecker::new();
+
+        // Build an evaluation window from the broker.
+        let eval_window = broker
+            .build_evaluation_window("test-boundary", "test-clock", 0, 100)
+            .unwrap();
+
+        // Run a health check — with no envelope and no freshness/convergence
+        // data, TP001/TP002/TP003 will fail, resulting in FAILED status.
+        let receipt = broker
+            .check_health(None, &eval_window, &[], &mut checker)
+            .unwrap();
+        assert_eq!(receipt.status, BrokerHealthStatus::Failed);
+
+        // Now use the production admission gate — it should DENY.
+        let result = broker.evaluate_admission_health_gate(
+            &checker,
+            &eval_window,
+            WorkerHealthPolicy::StrictHealthy,
+            0,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "admission gate must deny when broker health is FAILED"
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::HealthFailed { .. })),
+            "expected HealthFailed error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn broker_admission_gate_denies_when_no_receipt() {
+        use crate::fac::FacBroker;
+
+        let broker = FacBroker::new();
+        let checker = BrokerHealthChecker::new();
+        let eval_window = broker
+            .build_evaluation_window("test-boundary", "test-clock", 0, 100)
+            .unwrap();
+
+        // No health check has been run — gate should deny (fail-closed).
+        let result = broker.evaluate_admission_health_gate(
+            &checker,
+            &eval_window,
+            WorkerHealthPolicy::StrictHealthy,
+            0,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "admission gate must deny when no health receipt exists"
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::NoHealthReceipt)),
+            "expected NoHealthReceipt error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn broker_admission_gate_denies_stale_receipt() {
+        use crate::fac::FacBroker;
+
+        let broker = FacBroker::new();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = broker
+            .build_evaluation_window("test-boundary", "test-clock", 0, 100)
+            .unwrap();
+
+        // Run health check at current tick (0).
+        let _ = broker
+            .check_health(None, &eval_window, &[], &mut checker)
+            .unwrap();
+
+        // Require a minimum broker tick of 100 — the receipt was issued at
+        // tick 0, so it should be rejected as stale.
+        let result = broker.evaluate_admission_health_gate(
+            &checker,
+            &eval_window,
+            WorkerHealthPolicy::StrictHealthy,
+            100, // min_broker_tick
+            0,
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::StaleReceipt { .. })),
+            "expected StaleReceipt error, got {result:?}"
         );
     }
 }

@@ -906,6 +906,59 @@ impl FacBroker {
     }
 
     // -----------------------------------------------------------------------
+    // Worker admission gate (TCK-00585)
+    // -----------------------------------------------------------------------
+
+    /// Evaluates the worker admission health gate against the broker's current
+    /// state.
+    ///
+    /// This is the **canonical production entry point** for worker admission.
+    /// Workers MUST call this method before admitting any job to enforce
+    /// broker health gating (INV-BRK-HEALTH-002).
+    ///
+    /// The gate enforces (fail-closed):
+    /// 1. A valid, signed health receipt exists.
+    /// 2. The receipt was generated for the current evaluation window
+    ///    (anti-replay context binding).
+    /// 3. The receipt's broker tick meets the minimum recency threshold.
+    /// 4. The receipt's health sequence meets the minimum freshness threshold.
+    /// 5. The broker's health status meets the configured policy.
+    ///
+    /// # Arguments
+    ///
+    /// - `checker`: the health checker holding the receipt history
+    /// - `eval_window`: the current evaluation window (used to compute the
+    ///   expected `eval_window_hash`)
+    /// - `policy`: the admission policy (strict-healthy or allow-degraded)
+    /// - `min_broker_tick`: minimum acceptable broker tick on the receipt
+    /// - `min_health_seq`: minimum acceptable health sequence on the receipt
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`super::broker_health::WorkerHealthGateError`] if the gate
+    /// rejects admission.
+    pub fn evaluate_admission_health_gate(
+        &self,
+        checker: &super::broker_health::BrokerHealthChecker,
+        eval_window: &HtfEvaluationWindow,
+        policy: super::broker_health::WorkerHealthPolicy,
+        min_broker_tick: u64,
+        min_health_seq: u64,
+    ) -> Result<(), super::broker_health::WorkerHealthGateError> {
+        let verifier = BrokerSignatureVerifier::new(self.verifying_key());
+        let expected_hash = super::broker_health::compute_eval_window_hash(eval_window);
+
+        super::broker_health::evaluate_worker_health_gate(
+            checker.latest(),
+            &verifier,
+            policy,
+            expected_hash,
+            min_broker_tick,
+            min_health_seq,
+        )
+    }
+
+    // -----------------------------------------------------------------------
     // State serialization (for persistence)
     // -----------------------------------------------------------------------
 

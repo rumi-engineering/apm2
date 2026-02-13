@@ -159,7 +159,8 @@ pub use broker_health::{
     BrokerHealthChecker, BrokerHealthError, BrokerHealthStatus, HEALTH_RECEIPT_SCHEMA_ID,
     HEALTH_RECEIPT_SCHEMA_VERSION, HealthCheckInput, HealthReceiptV1, InvariantCheckResult,
     MAX_HEALTH_FINDINGS, MAX_HEALTH_HISTORY, MAX_HEALTH_REQUIRED_AUTHORITY_SETS,
-    WorkerHealthGateError, WorkerHealthPolicy, evaluate_worker_health_gate,
+    WorkerHealthGateError, WorkerHealthPolicy, compute_eval_window_hash,
+    evaluate_worker_health_gate,
 };
 // Re-export builtin profile types (TCK-00329)
 pub use builtin_profiles::{
