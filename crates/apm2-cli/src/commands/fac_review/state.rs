@@ -18,12 +18,14 @@ use subtle::ConstantTimeEq;
 
 use super::types::{
     PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, TERMINAL_INTEGRITY_FAILURE,
-    apm2_home_dir, ensure_parent_dir, entry_pr_number, parse_pr_url, sanitize_for_path,
+    apm2_home_dir, ensure_parent_dir, entry_pr_number, sanitize_for_path,
+    validate_expected_head_sha,
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewRunTerminationReceipt {
+    pub schema: String,
     pub emitted_at: String,
     pub repo: String,
     pub pr_number: u32,
@@ -60,6 +62,8 @@ type HmacSha256 = Hmac<Sha256>;
 const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
 const RUN_SECRET_LEN_BYTES: usize = 32;
 const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
+pub const TERMINATION_RECEIPT_SCHEMA: &str = "apm2.review.termination_receipt.v1";
+pub const COMPLETION_RECEIPT_SCHEMA: &str = "apm2.review.completion_receipt.v1";
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -134,7 +138,7 @@ struct ReviewRunStateIntegrityBinding<'a> {
     run_id: &'a str,
     pid: u32,
     proc_start_time: u64,
-    pr_url: &'a str,
+    owner_repo: &'a str,
     head_sha: &'a str,
     pr_number: u32,
     review_type: &'a str,
@@ -157,6 +161,7 @@ struct ReviewRunCompletionReceiptIntegrityBinding<'a> {
 
 #[derive(Serialize)]
 struct ReviewRunTerminationReceiptIntegrityBinding<'a> {
+    schema: &'a str,
     emitted_at: &'a str,
     repo: &'a str,
     pr_number: u32,
@@ -299,7 +304,7 @@ pub fn run_state_integrity_binding_payload(state: &ReviewRunState) -> Result<Vec
         proc_start_time: state
             .proc_start_time
             .ok_or_else(|| "state missing proc_start_time".to_string())?,
-        pr_url: &state.pr_url,
+        owner_repo: &state.owner_repo,
         head_sha: &state.head_sha,
         pr_number: state.pr_number,
         review_type: &state.review_type,
@@ -386,6 +391,7 @@ fn termination_receipt_integrity_payload(
     receipt: &ReviewRunTerminationReceipt,
 ) -> Result<Vec<u8>, String> {
     let binding = ReviewRunTerminationReceiptIntegrityBinding {
+        schema: &receipt.schema,
         emitted_at: &receipt.emitted_at,
         repo: &receipt.repo,
         pr_number: receipt.pr_number,
@@ -446,6 +452,27 @@ fn bind_termination_receipt_integrity_for_home(
     };
     let payload = termination_receipt_integrity_payload(receipt)?;
     receipt.integrity_hmac = compute_hmac_hex(&payload, &secret)?;
+    Ok(())
+}
+
+fn verify_termination_receipt_integrity_for_home(
+    home: &Path,
+    receipt: &ReviewRunTerminationReceipt,
+) -> Result<(), String> {
+    let Some(secret) = read_run_secret_for_home(home, receipt.pr_number, &receipt.review_type)?
+    else {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    };
+    if receipt.integrity_hmac.trim().is_empty() {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
+    let payload = termination_receipt_integrity_payload(receipt)?;
+    let computed = compute_hmac_hex(&payload, &secret)?;
+    let matches = verify_hmac_hex(&receipt.integrity_hmac, &computed)
+        .map_err(|_| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+    if !matches {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
     Ok(())
 }
 
@@ -562,7 +589,7 @@ fn review_run_state_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
-pub fn load_review_run_state_for_home(
+fn load_review_run_state_unverified_for_home_inner(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -619,19 +646,30 @@ pub fn load_review_run_state_for_home(
     Ok(ReviewRunStateLoad::Present(parsed))
 }
 
-/// Loads review run state and verifies integrity binding for any state that
-/// carries a process identity (`pid`).
-///
-/// Use this path only for security-sensitive callers. Non-security paths
-/// (status display, telemetry reads, etc.) should continue to use
-/// `load_review_run_state_for_home`.
+pub fn load_review_run_state_unverified_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    load_review_run_state_unverified_for_home_inner(home, pr_number, review_type)
+}
+
+pub fn load_review_run_state_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    load_review_run_state_verified_for_home(home, pr_number, review_type)
+}
+
 pub fn load_review_run_state_verified_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
 ) -> Result<ReviewRunStateLoad, String> {
     let canonical = review_run_state_path_for_home(home, pr_number, review_type);
-    let run_state_load = load_review_run_state_for_home(home, pr_number, review_type)?;
+    let run_state_load =
+        load_review_run_state_unverified_for_home_inner(home, pr_number, review_type)?;
     match run_state_load {
         ReviewRunStateLoad::Present(state) => {
             if state.pid.is_none() {
@@ -664,6 +702,15 @@ pub fn load_review_run_state(
 ) -> Result<ReviewRunStateLoad, String> {
     let home = apm2_home_dir()?;
     load_review_run_state_for_home(&home, pr_number, review_type)
+}
+
+#[allow(dead_code)]
+pub fn load_review_run_state_unverified(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<ReviewRunStateLoad, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_state_unverified_for_home(&home, pr_number, review_type)
 }
 
 pub fn load_review_run_state_strict_for_home(
@@ -735,10 +782,6 @@ pub fn load_review_run_state_strict(
     load_review_run_state_strict_for_home(&home, pr_number, review_type)
 }
 
-pub fn extract_repo_from_pr_url(pr_url: &str) -> Option<String> {
-    parse_pr_url(pr_url).ok().map(|(owner_repo, _)| owner_repo)
-}
-
 pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String> {
     let path = review_run_state_path(state.pr_number, &state.review_type)?;
     let home = apm2_home_dir()?;
@@ -764,6 +807,7 @@ pub fn write_review_run_termination_receipt_for_home(
     receipt: &ReviewRunTerminationReceipt,
 ) -> Result<PathBuf, String> {
     let mut receipt = receipt.clone();
+    receipt.schema = TERMINATION_RECEIPT_SCHEMA.to_string();
     bind_termination_receipt_integrity_for_home(home, &mut receipt)?;
     let path =
         review_run_termination_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
@@ -790,6 +834,7 @@ pub fn write_review_run_completion_receipt_for_home(
     receipt: &ReviewRunCompletionReceipt,
 ) -> Result<PathBuf, String> {
     let mut receipt = receipt.clone();
+    receipt.schema = COMPLETION_RECEIPT_SCHEMA.to_string();
     bind_completion_receipt_integrity_for_home(home, &mut receipt)?;
     let path =
         review_run_completion_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
@@ -841,6 +886,20 @@ pub fn load_review_run_completion_receipt_for_home(
             receipt.review_type
         ));
     }
+    if receipt.schema != COMPLETION_RECEIPT_SCHEMA {
+        return Err(format!(
+            "completion receipt schema mismatch at {}: expected {}, got {}",
+            path.display(),
+            COMPLETION_RECEIPT_SCHEMA,
+            receipt.schema
+        ));
+    }
+    validate_expected_head_sha(&receipt.head_sha).map_err(|err| {
+        format!(
+            "completion receipt head sha validation failed at {}: {err}",
+            path.display()
+        )
+    })?;
     verify_completion_receipt_integrity_for_home(home, &receipt).map_err(|err| {
         format!(
             "completion receipt integrity verification failed at {}: {err}",
@@ -856,6 +915,68 @@ pub fn load_review_run_completion_receipt(
 ) -> Result<Option<ReviewRunCompletionReceipt>, String> {
     let home = apm2_home_dir()?;
     load_review_run_completion_receipt_for_home(&home, pr_number, review_type)
+}
+
+pub fn load_review_run_termination_receipt_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunTerminationReceipt>, String> {
+    let path = review_run_termination_receipt_path_for_home(home, pr_number, review_type);
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read termination receipt {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let receipt: ReviewRunTerminationReceipt = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse termination receipt {}: {err}",
+            path.display()
+        )
+    })?;
+    if receipt.pr_number != pr_number || !receipt.review_type.eq_ignore_ascii_case(review_type) {
+        return Err(format!(
+            "termination receipt identity mismatch at {}: expected pr={pr_number} type={review_type}, got pr={} type={}",
+            path.display(),
+            receipt.pr_number,
+            receipt.review_type
+        ));
+    }
+    if receipt.schema != TERMINATION_RECEIPT_SCHEMA {
+        return Err(format!(
+            "termination receipt schema mismatch at {}: expected {}, got {}",
+            path.display(),
+            TERMINATION_RECEIPT_SCHEMA,
+            receipt.schema
+        ));
+    }
+    validate_expected_head_sha(&receipt.head_sha).map_err(|err| {
+        format!(
+            "termination receipt head sha validation failed at {}: {err}",
+            path.display()
+        )
+    })?;
+    verify_termination_receipt_integrity_for_home(home, &receipt).map_err(|err| {
+        format!(
+            "termination receipt integrity verification failed at {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(Some(receipt))
+}
+
+#[allow(dead_code)]
+pub fn load_review_run_termination_receipt(
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<ReviewRunTerminationReceipt>, String> {
+    let home = apm2_home_dir()?;
+    load_review_run_termination_receipt_for_home(&home, pr_number, review_type)
 }
 
 pub fn verify_review_run_state_integrity_binding(
@@ -1204,6 +1325,32 @@ pub fn read_pulse_file_from_path(path: &Path) -> Result<Option<PulseFile>, Strin
     Ok(Some(pulse))
 }
 
+pub fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
+    for review_type in ["security", "quality"] {
+        let Ok(state) = load_review_run_state(pr_number, review_type) else {
+            continue;
+        };
+        if let ReviewRunStateLoad::Present(entry) = state {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    for review_type in ["security", "quality"] {
+        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
+            continue;
+        };
+        if let Some(entry) = pulse {
+            if validate_expected_head_sha(&entry.head_sha).is_ok() {
+                return Some(entry.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    None
+}
+
 pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
     let file =
         File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
@@ -1223,7 +1370,7 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 mod tests {
     use super::{
         ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
-        extract_repo_from_pr_url, get_process_start_time, load_review_run_state_for_home,
+        get_process_start_time, load_review_run_state_for_home,
         load_review_run_state_strict_for_home, load_review_run_state_verified_for_home,
         next_review_sequence_number_for_home, parse_process_start_time, read_run_secret_for_home,
         review_lock_path_for_home, review_run_secret_path_for_home, review_run_state_path_for_home,
@@ -1241,7 +1388,7 @@ mod tests {
                 3,
                 "0123456789abcdef0123456789abcdef01234567",
             ),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number: 441,
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             review_type: "security".to_string(),
@@ -1359,25 +1506,11 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_repo_from_pr_url() {
-        assert_eq!(
-            extract_repo_from_pr_url("https://github.com/owner/repo/pull/123"),
-            Some("owner/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_from_pr_url("http://github.com/example/other/pull/999"),
-            Some("example/other".to_string())
-        );
-        assert!(extract_repo_from_pr_url("not-a-pr-url").is_none());
-    }
-
-    #[test]
     fn test_review_run_state_roundtrip() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
         let state = sample_state();
-        let path = review_run_state_path_for_home(home, 441, "security");
-        write_review_run_state_to_path(&path, &state).expect("write run-state");
+        write_review_run_state_for_home(home, &state).expect("write run-state");
         let loaded = load_review_run_state_for_home(home, 441, "security").expect("load run-state");
         match loaded {
             ReviewRunStateLoad::Present(found) => {
@@ -1472,8 +1605,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
         let state = sample_state();
-        let path = review_run_state_path_for_home(home, 441, "security");
-        write_review_run_state_to_path(&path, &state).expect("write run-state");
+        write_review_run_state_for_home(home, &state).expect("write run-state");
         let next =
             next_review_sequence_number_for_home(home, 441, "security").expect("next sequence");
         assert_eq!(next, 4);

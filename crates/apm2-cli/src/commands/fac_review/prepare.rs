@@ -31,11 +31,10 @@ struct PrepareSummary {
 pub fn run_prepare(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let repo_root = resolve_repo_root()?;
     let local_head = resolve_local_head_sha(&repo_root)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha, &local_head)?;

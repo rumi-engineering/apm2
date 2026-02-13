@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 // Re-export public API for use by `fac.rs`
 pub use comment::{ReviewCommentSeverityArg, ReviewCommentTypeArg};
-pub use decision::DecisionValueArg;
+pub use decision::VerdictValueArg;
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
@@ -62,13 +62,16 @@ use state::{
 };
 pub use types::ReviewRunType;
 use types::{
-    DispatchSummary, ProjectionStatus, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
-    validate_expected_head_sha,
+    DispatchSummary, ProjectionStatus, ReviewKind, TERMINATE_TIMEOUT, validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
 
 // ── Process management helpers (used by orchestrator) ───────────────────────
+
+pub fn derive_repo() -> Result<String, String> {
+    target::derive_repo_from_origin()
+}
 
 fn terminate_child(child: &mut Child) -> Result<(), String> {
     let pid = child.id();
@@ -167,7 +170,8 @@ fn emit_run_ndjson_since(
 // ── Public entry points ─────────────────────────────────────────────────────
 
 pub fn run_review(
-    pr_url: &str,
+    repo: &str,
+    pr_number: Option<u32>,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
     force: bool,
@@ -178,7 +182,33 @@ pub fn run_review(
         .and_then(|path| fs::metadata(path).ok().map(|meta| meta.len()))
         .unwrap_or(0);
 
-    match orchestrator::run_review_inner(pr_url, review_type, expected_head_sha, force) {
+    let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
+        Ok(value) => value,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_run_target_resolution_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    match orchestrator::run_review_inner(
+        &owner_repo,
+        resolved_pr,
+        review_type,
+        expected_head_sha,
+        force,
+    ) {
         Ok(summary) => {
             let success = summary.security.as_ref().is_none_or(|entry| entry.success)
                 && summary.quality.as_ref().is_none_or(|entry| entry.success);
@@ -273,13 +303,39 @@ pub fn run_review(
 }
 
 pub fn run_dispatch(
-    pr_url: &str,
+    repo: &str,
+    pr_number: Option<u32>,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
     force: bool,
     json_output: bool,
 ) -> u8 {
-    match run_dispatch_inner(pr_url, review_type, expected_head_sha, force) {
+    let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
+        Ok(value) => value,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_dispatch_target_resolution_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    match run_dispatch_inner(
+        &owner_repo,
+        resolved_pr,
+        review_type,
+        expected_head_sha,
+        force,
+    ) {
         Ok(summary) => {
             if json_output {
                 let payload = serde_json::json!({
@@ -333,11 +389,10 @@ pub fn run_dispatch(
 
 pub fn run_status(
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     review_type_filter: Option<&str>,
     json_output: bool,
 ) -> u8 {
-    match run_status_inner(pr_number, pr_url, review_type_filter, json_output) {
+    match run_status_inner(pr_number, review_type_filter, json_output) {
         Ok(fail_closed) => {
             if fail_closed {
                 exit_codes::GENERIC_ERROR
@@ -366,7 +421,6 @@ pub fn run_status(
 
 pub fn run_wait(
     pr_number: u32,
-    pr_url: Option<&str>,
     review_type_filter: Option<&str>,
     wait_for_sha: Option<&str>,
     timeout_seconds: Option<u64>,
@@ -377,7 +431,6 @@ pub fn run_wait(
     let poll_interval = Duration::from_secs(max_interval);
     match run_wait_inner(
         pr_number,
-        pr_url,
         review_type_filter,
         wait_for_sha,
         timeout_seconds.map(Duration::from_secs),
@@ -460,12 +513,11 @@ pub fn run_wait(
 pub fn run_findings(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     refresh: bool,
     json_output: bool,
 ) -> u8 {
-    match findings::run_findings(repo, pr_number, pr_url, sha, refresh, json_output) {
+    match findings::run_findings(repo, pr_number, sha, refresh, json_output) {
         Ok(code) => code,
         Err(err) => {
             if json_output {
@@ -486,14 +538,8 @@ pub fn run_findings(
     }
 }
 
-pub fn run_prepare(
-    repo: &str,
-    pr_number: Option<u32>,
-    pr_url: Option<&str>,
-    sha: Option<&str>,
-    json_output: bool,
-) -> u8 {
-    match prepare::run_prepare(repo, pr_number, pr_url, sha, json_output) {
+pub fn run_prepare(repo: &str, pr_number: Option<u32>, sha: Option<&str>, json_output: bool) -> u8 {
+    match prepare::run_prepare(repo, pr_number, sha, json_output) {
         Ok(code) => code,
         Err(err) => {
             if json_output {
@@ -517,21 +563,12 @@ pub fn run_prepare(
 pub fn run_publish(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     review_type: ReviewPublishTypeArg,
     body_file: &Path,
     json_output: bool,
 ) -> u8 {
-    match publish::run_publish(
-        repo,
-        pr_number,
-        pr_url,
-        sha,
-        review_type,
-        body_file,
-        json_output,
-    ) {
+    match publish::run_publish(repo, pr_number, sha, review_type, body_file, json_output) {
         Ok(code) => code,
         Err(err) => {
             if json_output {
@@ -556,7 +593,6 @@ pub fn run_publish(
 pub fn run_comment(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     severity: ReviewCommentSeverityArg,
     review_type: ReviewCommentTypeArg,
@@ -566,7 +602,6 @@ pub fn run_comment(
     match comment::run_comment(
         repo,
         pr_number,
-        pr_url,
         sha,
         severity,
         review_type,
@@ -594,24 +629,22 @@ pub fn run_comment(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_decision_set(
+pub fn run_verdict_set(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     dimension: &str,
-    decision: DecisionValueArg,
+    verdict: VerdictValueArg,
     reason: Option<&str>,
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> u8 {
-    match decision::run_decision_set(
+    match decision::run_verdict_set(
         repo,
         pr_number,
-        pr_url,
         sha,
         dimension,
-        decision,
+        verdict,
         reason,
         keep_prepared_inputs,
         json_output,
@@ -620,7 +653,7 @@ pub fn run_decision_set(
         Err(err) => {
             if json_output {
                 let payload = serde_json::json!({
-                    "error": "fac_review_decision_set_failed",
+                    "error": "fac_review_verdict_set_failed",
                     "message": err,
                 });
                 println!(
@@ -636,19 +669,18 @@ pub fn run_decision_set(
     }
 }
 
-pub fn run_decision_show(
+pub fn run_verdict_show(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     json_output: bool,
 ) -> u8 {
-    match decision::run_decision_show(repo, pr_number, pr_url, sha, json_output) {
+    match decision::run_verdict_show(repo, pr_number, sha, json_output) {
         Ok(code) => code,
         Err(err) => {
             if json_output {
                 let payload = serde_json::json!({
-                    "error": "fac_review_decision_show_failed",
+                    "error": "fac_review_verdict_show_failed",
                     "message": err,
                 });
                 println!(
@@ -740,21 +772,11 @@ fn review_type_filter_vec(review_type_filter: Option<&str>) -> Result<Vec<String
 
 fn run_wait_inner(
     pr_number: u32,
-    pr_url: Option<&str>,
     review_type_filter: Option<&str>,
     wait_for_sha: Option<&str>,
     timeout: Option<Duration>,
     poll_interval: Duration,
 ) -> Result<(ProjectionStatus, u64, Duration), String> {
-    if let Some(url) = pr_url {
-        let (_, url_pr_number) = parse_pr_url(url)?;
-        if url_pr_number != pr_number {
-            return Err(format!(
-                "wait filters disagree: --pr={pr_number} but --pr-url resolves to #{url_pr_number}"
-            ));
-        }
-    }
-
     if let Some(expected_sha) = wait_for_sha {
         validate_expected_head_sha(expected_sha)?;
     }
@@ -878,11 +900,10 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
 pub fn run_terminate(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     review_type: &str,
     json_output: bool,
 ) -> u8 {
-    match run_terminate_inner(repo, pr_number, pr_url, review_type, json_output) {
+    match run_terminate_inner(repo, pr_number, review_type, json_output) {
         Ok(()) => exit_codes::SUCCESS,
         Err(err) => {
             if json_output {
@@ -906,23 +927,21 @@ pub fn run_terminate(
 fn run_terminate_inner(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     review_type: &str,
     json_output: bool,
 ) -> Result<(), String> {
     let home = types::apm2_home_dir()?;
-    run_terminate_inner_for_home(&home, repo, pr_number, pr_url, review_type, json_output)
+    run_terminate_inner_for_home(&home, repo, pr_number, review_type, json_output)
 }
 
 fn run_terminate_inner_for_home(
     home: &Path,
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     review_type: &str,
     json_output: bool,
 ) -> Result<(), String> {
-    let (owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number)?;
     let state_opt =
         state::load_review_run_state_verified_strict_for_home(home, resolved_pr, review_type)?;
 
@@ -970,17 +989,13 @@ fn run_terminate_inner_for_home(
         return Ok(());
     }
 
-    let Some(state_repo) = state::extract_repo_from_pr_url(&run_state.pr_url) else {
+    if !run_state
+        .owner_repo
+        .eq_ignore_ascii_case(owner_repo.as_str())
+    {
         let msg = format!(
-            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: unable to parse owner/repo from run-state pr_url {}",
-            run_state.pr_url
-        );
-        eprintln!("WARNING: {msg}");
-        return Err(msg);
-    };
-    if !state_repo.eq_ignore_ascii_case(owner_repo.as_str()) {
-        let msg = format!(
-            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: run-state repo={state_repo} requested repo={owner_repo}"
+            "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: run-state repo={} requested repo={owner_repo}",
+            run_state.owner_repo
         );
         eprintln!("WARNING: {msg}");
         return Err(msg);
@@ -1040,6 +1055,7 @@ fn run_terminate_inner_for_home(
     state::write_review_run_state_for_home(home, &run_state)?;
 
     let receipt = state::ReviewRunTerminationReceipt {
+        schema: state::TERMINATION_RECEIPT_SCHEMA.to_string(),
         emitted_at: types::now_iso8601(),
         repo: owner_repo,
         pr_number: resolved_pr,
@@ -1061,6 +1077,12 @@ fn run_terminate_inner_for_home(
         )),
     };
     state::write_review_run_termination_receipt_for_home(home, &receipt)?;
+    let _ = state::load_review_run_termination_receipt_for_home(home, resolved_pr, review_type)?
+        .ok_or_else(|| {
+            format!(
+                "termination receipt missing after write for PR #{resolved_pr} type={review_type}"
+            )
+        })?;
 
     if json_output {
         println!(
@@ -1093,18 +1115,12 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
     push::run_push(repo, remote, branch, ticket)
 }
 
-pub fn run_restart(
-    repo: &str,
-    pr: Option<u32>,
-    pr_url: Option<&str>,
-    force: bool,
-    json_output: bool,
-) -> u8 {
-    restart::run_restart(repo, pr, pr_url, force, json_output)
+pub fn run_restart(repo: &str, pr: Option<u32>, force: bool, json_output: bool) -> u8 {
+    restart::run_restart(repo, pr, force, json_output)
 }
 
-pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
-    pipeline::run_pipeline(repo, pr_url, pr_number, sha)
+pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str) -> u8 {
+    pipeline::run_pipeline(repo, pr_number, sha)
 }
 
 pub fn run_logs(
@@ -1140,28 +1156,27 @@ pub fn run_gates(
 // ── Internal dispatch helper (shared with pipeline/restart) ─────────────────
 
 fn run_dispatch_inner(
-    pr_url: &str,
+    owner_repo: &str,
+    pr_number: u32,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
     force: bool,
 ) -> Result<DispatchSummary, String> {
-    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    let current_head_sha = if let Some(expected) = expected_head_sha {
-        validate_expected_head_sha(expected)?;
-        expected.to_ascii_lowercase()
-    } else if let Some(identity) = projection_store::load_pr_identity(&owner_repo, pr_number)? {
+    let current_head_sha = barrier::fetch_pr_head_sha_local(pr_number)?;
+    if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
-        identity.head_sha.to_ascii_lowercase()
-    } else {
-        return Err(format!(
-            "missing local head SHA for PR #{pr_number}; pass --head-sha or run local FAC push/dispatch first"
-        ));
-    };
+        if !identity.head_sha.eq_ignore_ascii_case(&current_head_sha) {
+            return Err(format!(
+                "local PR identity head {} is stale relative to authoritative PR head {current_head_sha}; refresh local FAC projection first",
+                identity.head_sha
+            ));
+        }
+    }
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
         if !expected.eq_ignore_ascii_case(&current_head_sha) {
             return Err(format!(
-                "PR head moved before review dispatch: expected {expected}, got {current_head_sha}"
+                "PR head mismatch before review dispatch: expected {expected}, authoritative {current_head_sha}"
             ));
         }
     }
@@ -1179,8 +1194,7 @@ fn run_dispatch_inner(
     let mut results = Vec::with_capacity(kinds.len());
     for kind in kinds {
         let result = dispatch_single_review_with_force(
-            pr_url,
-            &owner_repo,
+            owner_repo,
             pr_number,
             kind,
             &current_head_sha,
@@ -1191,7 +1205,7 @@ fn run_dispatch_inner(
     }
 
     Ok(DispatchSummary {
-        pr_url: pr_url.to_string(),
+        pr_url: format!("https://github.com/{owner_repo}/pull/{pr_number}"),
         pr_number,
         head_sha: current_head_sha,
         dispatch_epoch,
@@ -1203,7 +1217,6 @@ fn run_dispatch_inner(
 
 fn run_status_inner(
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     review_type_filter: Option<&str>,
     json_output: bool,
 ) -> Result<bool, String> {
@@ -1216,22 +1229,7 @@ fn run_status_inner(
         }
     }
 
-    let derived_pr = if let Some(url) = pr_url {
-        let (_, number) = parse_pr_url(url)?;
-        Some(number)
-    } else {
-        None
-    };
-    let filter_pr = match (pr_number, derived_pr) {
-        (Some(a), Some(b)) if a != b => {
-            return Err(format!(
-                "status filters disagree: --pr={a} but --pr-url resolves to #{b}"
-            ));
-        },
-        (Some(a), _) => Some(a),
-        (_, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    let filter_pr = pr_number;
 
     let target_prs = if let Some(number) = filter_pr {
         vec![number]
@@ -1255,7 +1253,7 @@ fn run_status_inner(
                         "state": state.status.as_str(),
                         "run_id": state.run_id,
                         "sequence_number": state.sequence_number,
-                        "pr_url": state.pr_url,
+                        "owner_repo": state.owner_repo,
                         "head_sha": state.head_sha,
                         "started_at": state.started_at,
                         "model_id": state.model_id,
@@ -1553,7 +1551,7 @@ mod tests {
     ) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s1-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             review_type: "security".to_string(),
@@ -1623,7 +1621,7 @@ mod tests {
             "security"
         };
         let decision_yaml = serde_yaml::to_string(&serde_json::json!({
-            "schema": "apm2.review.decision.v1",
+            "schema": "apm2.review.verdict.v1",
             "pr": pr_number,
             "sha": head_sha,
             "updated_at": "2026-02-13T00:00:00Z",
@@ -1637,7 +1635,7 @@ mod tests {
             }
         }))
         .expect("serialize decision yaml");
-        let body = format!("<!-- apm2-review-decision:v1 -->\n```yaml\n{decision_yaml}```\n");
+        let body = format!("<!-- apm2-review-verdict:v1 -->\n```yaml\n{decision_yaml}```\n");
         let issue_comments_payload = serde_json::json!({
             "schema": "apm2.fac.projection.issue_comments.v1",
             "owner_repo": owner_repo,
@@ -1971,7 +1969,6 @@ mod tests {
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
@@ -2011,7 +2008,6 @@ mod tests {
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
@@ -2039,7 +2035,6 @@ mod tests {
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
@@ -2070,14 +2065,13 @@ mod tests {
         let pid = child.id();
         let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
-        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        state.owner_repo = "example/other-repo".to_string();
         super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
         let result = super::run_terminate_inner_for_home(
             home,
             "owner/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
@@ -2102,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_terminate_inner_fails_when_repo_parse_failed() {
+    fn test_run_terminate_inner_skips_when_repo_mismatch_format() {
         let pr_number = next_test_pr();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -2112,23 +2106,22 @@ mod tests {
         let pid = child.id();
         let proc_start_time = super::state::get_process_start_time(pid).expect("read start time");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
-        state.pr_url = "https://github.com/not-a-repo-url".to_string();
+        state.owner_repo = "not-a-repo-url".to_string();
         super::state::write_review_run_state_for_home(home, &state).expect("write run state");
 
         let result = super::run_terminate_inner_for_home(
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
         assert!(
             result.is_err(),
-            "repo parse failure should now be treated as an error"
+            "repo mismatch should now be treated as an error"
         );
-        let error = result.expect_err("repo parse failure should be surfaced as an error");
-        assert!(error.contains("unable to parse owner/repo"));
+        let error = result.expect_err("repo mismatch should be surfaced as an error");
+        assert!(error.contains("repo mismatch"));
 
         kill_child(child);
         let _ = std::fs::remove_file(state_path);
@@ -2161,7 +2154,6 @@ mod tests {
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
@@ -2202,7 +2194,6 @@ mod tests {
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         )
@@ -2258,7 +2249,6 @@ mod tests {
             home,
             "example/repo",
             Some(pr_number),
-            None,
             "security",
             false,
         );
@@ -2331,7 +2321,7 @@ mod tests {
             "log_file": "/tmp/review.log",
             "prompt_file": "/tmp/prompt.md",
             "last_message_file": "/tmp/last.md",
-            "pr_url": "https://github.com/owner/repo/pull/1",
+            "owner_repo": "owner/repo",
             "head_sha": "0123456789abcdef0123456789abcdef01234567",
             "restart_count": 0,
             "temp_files": []
@@ -2459,7 +2449,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "security".to_string(),
                 pr_number: 42,
-                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
                 restart_count: 0,
                 model: default_model(),
@@ -2499,7 +2489,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "quality".to_string(),
                 pr_number: 17,
-                pr_url: "https://github.com/owner/repo/pull/17".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
                 restart_count: 0,
                 model: default_model(),
@@ -2656,7 +2646,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "security".to_string(),
                 pr_number: 42,
-                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "abc123def456".to_string(),
                 restart_count: 0,
                 model: "test-model".to_string(),
@@ -2693,7 +2683,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "security".to_string(),
                 pr_number: 42,
-                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "old_sha".to_string(),
                 restart_count: 0,
                 model: "test-model".to_string(),
@@ -2717,7 +2707,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "security".to_string(),
                 pr_number: 42,
-                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "new_sha".to_string(),
                 restart_count: 0,
                 model: "test-model".to_string(),
@@ -2752,7 +2742,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "quality".to_string(),
                 pr_number: 99,
-                pr_url: "https://github.com/owner/repo/pull/99".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "sha_for_99".to_string(),
                 restart_count: 0,
                 model: "test-model".to_string(),
@@ -2824,7 +2814,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "security".to_string(),
                 pr_number: 77777,
-                pr_url: "https://github.com/owner/repo/pull/77777".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "state_sha_wins".to_string(),
                 restart_count: 0,
                 model: "test-model".to_string(),
@@ -2868,7 +2858,7 @@ mod tests {
                 last_message_file: None,
                 review_type: "security".to_string(),
                 pr_number: 77777,
-                pr_url: "https://github.com/owner/repo/pull/77777".to_string(),
+                owner_repo: "owner/repo".to_string(),
                 head_sha: "state_sha_current".to_string(),
                 restart_count: 0,
                 model: "test-model".to_string(),

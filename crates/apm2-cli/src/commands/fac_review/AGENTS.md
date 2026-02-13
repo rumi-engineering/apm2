@@ -9,7 +9,7 @@ The `fac_review` module implements the `apm2 fac review *` command family, which
 ### Architecture
 
 ```
-apm2 fac review run --pr-url <URL> --type all
+apm2 fac review run --pr <N> --type all
        |
        +-- orchestrator.rs   (main loop: spawn, monitor, restart, collect)
        |      |
@@ -28,7 +28,7 @@ apm2 fac review run --pr-url <URL> --type all
        +-- events.rs         (NDJSON lifecycle telemetry)
        +-- barrier.rs        (GitHub helper primitives: auth/head/metadata rendering)
        +-- ci_status.rs      (CI check-suite status querying)
-       +-- decision.rs       (review decision set/show)
+       +-- decision.rs       (review verdict set/show)
        +-- detection.rs      (review detection from PR comments)
        +-- evidence.rs       (evidence artifact collection)
        +-- findings.rs       (review findings aggregation)
@@ -134,7 +134,7 @@ pub struct ReviewStateEntry {
     pub last_message_file: Option<PathBuf>,
     pub review_type: String,
     pub pr_number: u32,
-    pub pr_url: String,
+    pub owner_repo: String,
     pub head_sha: String,
     pub restart_count: u32,
     pub model: String,
@@ -166,7 +166,7 @@ pub struct ReviewStateFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewRunState {
     pub run_id: String,
-    pub pr_url: String,
+    pub owner_repo: String,
     pub pr_number: u32,
     pub head_sha: String,
     pub review_type: String,
@@ -230,7 +230,7 @@ pub struct ProjectionStatus { pub security: String, pub quality: String, pub ter
 ### Re-exports
 
 ```rust
-pub use decision::DecisionValueArg;
+pub use decision::VerdictValueArg;
 pub use publish::ReviewPublishTypeArg;
 pub use types::ReviewRunType;
 ```
@@ -250,15 +250,15 @@ pub use types::ReviewRunType;
 
 | Function | Description |
 |----------|-------------|
-| `run_review(pr_url, type, sha, force, json)` | Run security/quality reviews synchronously |
-| `run_dispatch(pr_url, type, sha, force, json)` | Dispatch reviews as detached processes |
-| `run_status(pr_number, pr_url, type_filter, json)` | Show review run status (optionally one reviewer lane) |
-| `run_findings(repo, pr, url, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
-| `run_comment(repo, pr, url, sha, severity, type, body, json)` | Publish a single SHA-bound finding comment |
-| `run_prepare(repo, pr, url, sha, json)` | Prepare review inputs |
-| `run_publish(repo, pr, url, sha, type, body, json)` | Publish review comment to GitHub |
-| `run_decision_set(repo, pr, url, sha, dim, dec, reason, keep, json)` | Set review decision |
-| `run_decision_show(repo, pr, url, sha, json)` | Show review decisions |
+| `run_review(repo, pr, type, sha, force, json)` | Run security/quality reviews synchronously |
+| `run_dispatch(repo, pr, type, sha, force, json)` | Dispatch reviews as detached processes |
+| `run_status(pr_number, type_filter, json)` | Show review run status (optionally one reviewer lane) |
+| `run_findings(repo, pr, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
+| `run_comment(repo, pr, sha, severity, type, body, json)` | Publish a single SHA-bound finding comment |
+| `run_prepare(repo, pr, sha, json)` | Prepare review inputs |
+| `run_publish(repo, pr, sha, type, body, json)` | Publish review comment to GitHub |
+| `run_verdict_set(repo, pr, sha, dim, verdict, reason, keep, json)` | Set review verdict |
+| `run_verdict_show(repo, pr, url, sha, json)` | Show review verdicts |
 | `run_project(pr, sha, since, after_seq, errors, fail_term, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
 | `run_tail(lines, follow)` | Tail review event log |
 | `run_push(repo, remote, branch, ticket)` | Push review branch with commit signing |

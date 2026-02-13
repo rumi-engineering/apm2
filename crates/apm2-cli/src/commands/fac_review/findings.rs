@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use super::projection_store;
 use super::selector::render_finding_selector;
-use super::state::{ReviewRunStateLoad, load_review_run_state, read_pulse_file};
+use super::state::resolve_local_review_head_sha;
 use super::target::resolve_pr_target;
 use super::types::validate_expected_head_sha;
 use crate::exit_codes::codes as exit_codes;
@@ -149,12 +149,11 @@ const DIMENSIONS: [DimensionSpec; 2] = [
 pub fn run_findings(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     refresh: bool,
     json_output: bool,
 ) -> Result<u8, String> {
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let resolved_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let initial_comments = fetch_issue_comments(&owner_repo, resolved_pr, refresh)?;
@@ -247,32 +246,6 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)
-}
-
-fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
-    for review_type in ["security", "quality"] {
-        let Ok(state) = load_review_run_state(pr_number, review_type) else {
-            continue;
-        };
-        if let ReviewRunStateLoad::Present(entry) = state {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
-            }
-        }
-    }
-
-    for review_type in ["security", "quality"] {
-        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
-            continue;
-        };
-        if let Some(entry) = pulse {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
-            }
-        }
-    }
-
-    None
 }
 
 fn build_findings_report(

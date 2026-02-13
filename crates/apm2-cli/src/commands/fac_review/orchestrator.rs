@@ -243,7 +243,8 @@ fn terminate_active_reviewer_if_alive(pr_number: u32, review_type: &str) -> Resu
 // ── run_review_inner ────────────────────────────────────────────────────────
 
 pub fn run_review_inner(
-    pr_url: &str,
+    owner_repo: &str,
+    pr_number: u32,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
     force: bool,
@@ -251,13 +252,16 @@ pub fn run_review_inner(
     if let Err(err) = cleanup_stale_fac_artifacts() {
         eprintln!("WARNING: failed to clean stale FAC artifacts: {err}");
     }
-    let (owner_repo, pr_number) = super::types::parse_pr_url(pr_url)?;
-    let current_head_sha = if let Some(expected) = expected_head_sha {
+    let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+    let current_head_sha = fetch_pr_head_sha_local(pr_number)?;
+    if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
-        expected.to_ascii_lowercase()
-    } else {
-        fetch_pr_head_sha_local(pr_number)?
-    };
+        if !expected.eq_ignore_ascii_case(&current_head_sha) {
+            return Err(format!(
+                "PR head mismatch before review run: expected {expected}, authoritative {current_head_sha}"
+            ));
+        }
+    }
     let initial_head_sha = current_head_sha.clone();
     let workspace_root = resolve_repo_root()?;
     let merge_report = check_merge_conflicts_against_main(&workspace_root, &initial_head_sha)?;
@@ -281,8 +285,8 @@ pub fn run_review_inner(
         ReviewRunType::Security => {
             let selected = select_review_model_random();
             let result = run_single_review(
-                pr_url,
-                &owner_repo,
+                &pr_url,
+                owner_repo,
                 pr_number,
                 ReviewKind::Security,
                 current_head_sha,
@@ -296,8 +300,8 @@ pub fn run_review_inner(
         ReviewRunType::Quality => {
             let selected = select_review_model_random();
             let result = run_single_review(
-                pr_url,
-                &owner_repo,
+                &pr_url,
+                owner_repo,
                 pr_number,
                 ReviewKind::Quality,
                 current_head_sha,
@@ -311,8 +315,8 @@ pub fn run_review_inner(
         ReviewRunType::All => {
             let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel::<(ReviewKind, bool)>();
 
-            let sec_pr_url = pr_url.to_string();
-            let sec_owner_repo = owner_repo.clone();
+            let sec_pr_url = pr_url.clone();
+            let sec_owner_repo = owner_repo.to_string();
             let sec_head = current_head_sha.clone();
             let sec_ctx = event_ctx.clone();
             let sec_model = select_review_model_random();
@@ -336,8 +340,8 @@ pub fn run_review_inner(
                 result
             });
 
-            let qual_pr_url = pr_url.to_string();
-            let qual_owner_repo = owner_repo;
+            let qual_pr_url = pr_url.clone();
+            let qual_owner_repo = owner_repo.to_string();
             let qual_head = current_head_sha;
             let qual_ctx = event_ctx.clone();
             let qual_model = select_review_model_random();
@@ -430,7 +434,7 @@ pub fn run_review_inner(
     )?;
 
     Ok(ReviewRunSummary {
-        pr_url: pr_url.to_string(),
+        pr_url,
         pr_number,
         initial_head_sha,
         final_head_sha: current_head_sha,
@@ -565,7 +569,7 @@ fn run_single_review(
     }
     let mut run_state = ReviewRunState {
         run_id: run_id.clone(),
-        pr_url: pr_url.to_string(),
+        owner_repo: owner_repo.to_string(),
         pr_number,
         head_sha: current_head_sha.clone(),
         review_type: review_type.to_string(),
@@ -803,7 +807,7 @@ fn run_single_review(
                 last_message_file: Some(last_message_path.clone()),
                 review_type: review_type.to_string(),
                 pr_number,
-                pr_url: pr_url.to_string(),
+                owner_repo: owner_repo.to_string(),
                 head_sha: current_head_sha.clone(),
                 restart_count,
                 model: current_model.model.clone(),

@@ -154,7 +154,6 @@ fn render_finding_comment(
 pub fn run_comment(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     severity: ReviewCommentSeverityArg,
     review_type: ReviewCommentTypeArg,
@@ -162,7 +161,7 @@ pub fn run_comment(
     json_output: bool,
 ) -> Result<u8, String> {
     ensure_gh_cli_ready()?;
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let reviewer_id = resolve_reviewer_id(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(sha)?;
     let resolved_body = resolve_comment_body(body)?;

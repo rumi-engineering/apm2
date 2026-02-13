@@ -16,6 +16,7 @@ pub const LIVENESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration::f
 pub const STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(90);
 pub const TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const LOOP_SLEEP: std::time::Duration = std::time::Duration::from_millis(1000);
+pub const LOCAL_COMMENT_ID_BASE_MULTIPLIER: u64 = 1_000_000_000;
 pub const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 pub const DISPATCH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 #[allow(dead_code)]
@@ -264,12 +265,10 @@ impl TerminationAuthority {
                 self.run_id, state.run_id
             ));
         }
-        let (state_repo, _state_pr) = parse_pr_url(&state.pr_url)
-            .map_err(|err| format!("invalid run-state pr_url: {err}"))?;
-        if !state_repo.eq_ignore_ascii_case(&self.repo) {
+        if !state.owner_repo.eq_ignore_ascii_case(&self.repo) {
             return Err(format!(
                 "authority repo mismatch: expected {} got {}",
-                self.repo, state_repo
+                self.repo, state.owner_repo
             ));
         }
         Ok(())
@@ -296,7 +295,7 @@ pub struct ReviewStateEntry {
     pub review_type: String,
     #[serde(default)]
     pub pr_number: u32,
-    pub pr_url: String,
+    pub owner_repo: String,
     pub head_sha: String,
     #[serde(default)]
     pub restart_count: u32,
@@ -339,7 +338,7 @@ pub struct PulseFile {
 #[serde(deny_unknown_fields)]
 pub struct ReviewRunState {
     pub run_id: String,
-    pub pr_url: String,
+    pub owner_repo: String,
     pub pr_number: u32,
     pub head_sha: String,
     pub review_type: String,
@@ -562,25 +561,6 @@ pub fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-pub fn parse_pr_url(pr_url: &str) -> Result<(String, u32), String> {
-    let trimmed = pr_url.trim();
-    let without_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .unwrap_or(trimmed);
-    let without_host = without_scheme
-        .strip_prefix("github.com/")
-        .ok_or_else(|| format!("invalid GitHub PR URL: {pr_url}"))?;
-    let parts = without_host.split('/').collect::<Vec<_>>();
-    if parts.len() < 4 || parts[2] != "pull" {
-        return Err(format!("invalid GitHub PR URL format: {pr_url}"));
-    }
-    let pr_number = parts[3]
-        .parse::<u32>()
-        .map_err(|err| format!("invalid PR number in URL {pr_url}: {err}"))?;
-    Ok((format!("{}/{}", parts[0], parts[1]), pr_number))
-}
-
 pub fn split_owner_repo(owner_repo: &str) -> Result<(&str, &str), String> {
     let mut parts = owner_repo.split('/');
     let owner = parts
@@ -602,6 +582,12 @@ pub fn validate_expected_head_sha(expected: &str) -> Result<(), String> {
     Err(format!(
         "invalid expected head sha (need 40-hex): {expected}"
     ))
+}
+
+pub fn allocate_local_comment_id(pr_number: u32, max_existing_comment_id: Option<u64>) -> u64 {
+    max_existing_comment_id
+        .unwrap_or_else(|| u64::from(pr_number).saturating_mul(LOCAL_COMMENT_ID_BASE_MULTIPLIER))
+        .saturating_add(1)
 }
 
 pub fn sh_quote(value: &str) -> String {
@@ -664,11 +650,11 @@ pub fn ensure_parent_dir(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to create parent dir {}: {err}", parent.display()))
 }
 
-pub fn entry_pr_number(entry: &ReviewStateEntry) -> Option<u32> {
+pub const fn entry_pr_number(entry: &ReviewStateEntry) -> Option<u32> {
     if entry.pr_number > 0 {
         Some(entry.pr_number)
     } else {
-        parse_pr_url(&entry.pr_url).ok().map(|(_, number)| number)
+        None
     }
 }
 

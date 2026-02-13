@@ -1,4 +1,4 @@
-//! FAC-native per-dimension decision projection (`approve` / `deny`).
+//! FAC-native per-dimension verdict projection (`approve` / `deny`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -9,14 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use super::target::resolve_pr_target;
 use super::types::{
-    ReviewRunStatus, TerminationAuthority, apm2_home_dir, now_iso8601, sanitize_for_path,
-    validate_expected_head_sha,
+    ReviewRunStatus, TerminationAuthority, allocate_local_comment_id, apm2_home_dir, now_iso8601,
+    sanitize_for_path, validate_expected_head_sha,
 };
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
-const DECISION_MARKER: &str = "apm2-review-decision:v1";
-const DECISION_SCHEMA: &str = "apm2.review.decision.v1";
+const DECISION_MARKER: &str = "apm2-review-verdict:v1";
+const DECISION_SCHEMA: &str = "apm2.review.verdict.v1";
 const PROJECTION_ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
 const PROJECTION_REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 
@@ -25,12 +25,12 @@ const CODE_QUALITY_DIMENSION: &str = "code-quality";
 const ACTIVE_DIMENSIONS: [&str; 2] = [SECURITY_DIMENSION, CODE_QUALITY_DIMENSION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum DecisionValueArg {
+pub enum VerdictValueArg {
     Approve,
     Deny,
 }
 
-impl DecisionValueArg {
+impl VerdictValueArg {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
@@ -127,14 +127,13 @@ struct DimensionDecisionView {
     sha: String,
 }
 
-pub fn run_decision_show(
+pub fn run_verdict_show(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
@@ -148,19 +147,18 @@ pub fn run_decision_show(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_decision_set(
+pub fn run_verdict_set(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     dimension: &str,
-    decision: DecisionValueArg,
+    verdict: VerdictValueArg,
     reason: Option<&str>,
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
     let normalized_dimension = normalize_dimension(dimension)?;
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let comments = match fetch_issue_comments(&owner_repo, resolved_pr) {
@@ -197,7 +195,7 @@ pub fn run_decision_set(
     payload.dimensions.insert(
         normalized_dimension.to_string(),
         DecisionEntry {
-            decision: decision.as_str().to_string(),
+            decision: verdict.as_str().to_string(),
             reason: reason.unwrap_or_default().trim().to_string(),
             set_by: actor,
             set_at: now_iso8601(),
@@ -205,7 +203,7 @@ pub fn run_decision_set(
     );
 
     let mut active_comment_id = latest_any.map_or_else(
-        || allocate_local_comment_id(&comments, resolved_pr),
+        || allocate_local_comment_id(resolved_pr, comments.iter().map(|comment| comment.id).max()),
         |existing| existing.comment.id,
     );
     let mut source_comment_url = Some(format!(
@@ -262,7 +260,7 @@ pub fn run_decision_set(
         &owner_repo,
         resolved_pr,
         &head_sha,
-        "decision.set",
+        "verdict.set",
     );
     let _ = projection_store::save_trusted_reviewer_id(
         &owner_repo,
@@ -300,14 +298,14 @@ pub fn run_decision_set(
     );
     let home = apm2_home_dir()?;
     let completion_receipt = super::state::ReviewRunCompletionReceipt {
-        schema: "apm2.review.completion_receipt.v1".to_string(),
+        schema: super::state::COMPLETION_RECEIPT_SCHEMA.to_string(),
         emitted_at: now_iso8601(),
         repo: owner_repo,
         pr_number: resolved_pr,
         review_type: review_state_type.to_string(),
         run_id,
         head_sha: head_sha.clone(),
-        decision: decision.as_str().to_string(),
+        decision: verdict.as_str().to_string(),
         decision_comment_id: active_comment_id,
         decision_author: expected_author_login,
         decision_summary: termination_authority.decision_signature.clone(),
@@ -315,35 +313,36 @@ pub fn run_decision_set(
     };
     super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
 
-    let exit_code = match terminate_review_agent(&termination_authority) {
-        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => exit_codes::SUCCESS,
+    match terminate_review_agent(&termination_authority) {
+        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => {},
         Ok(TerminationOutcome::SkippedMismatch) => {
             if termination_state_non_terminal_alive {
-                // enforce lifecycle gate: decision set should only terminate active matched
-                // runs
-                exit_codes::GENERIC_ERROR
-            } else {
-                exit_codes::SUCCESS
+                eprintln!(
+                    "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}, \
+                     but termination authority no longer matches active state"
+                );
             }
         },
         Ok(TerminationOutcome::IdentityFailure(reason)) => {
             eprintln!(
-                "ERROR: review termination failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
+                "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}; \
+                 reviewer termination failed: {reason}"
             );
-            exit_codes::GENERIC_ERROR
         },
         Ok(TerminationOutcome::IntegrityFailure(reason)) => {
             eprintln!(
-                "ERROR: review termination integrity check failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
+                "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}; \
+                 reviewer termination integrity check failed: {reason}"
             );
-            exit_codes::GENERIC_ERROR
         },
         Err(err) => {
-            eprintln!("WARNING: review termination step failed: {err}");
-            exit_codes::GENERIC_ERROR
+            eprintln!(
+                "WARNING: verdict persisted for PR #{resolved_pr} type={normalized_dimension}; \
+                 reviewer termination step failed: {err}"
+            );
         },
-    };
-    Ok(exit_code)
+    }
+    Ok(exit_codes::SUCCESS)
 }
 
 fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {
@@ -357,39 +356,13 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if let Some(value) = resolve_local_review_head_sha(pr_number) {
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
         return Ok(value);
     }
 
     Err(format!(
         "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run a local FAC flow that persists identity first"
     ))
-}
-
-fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
-    for review_type in ["security", "quality"] {
-        let Ok(state) = super::state::load_review_run_state(pr_number, review_type) else {
-            continue;
-        };
-        if let super::state::ReviewRunStateLoad::Present(entry) = state {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
-            }
-        }
-    }
-
-    for review_type in ["security", "quality"] {
-        let Ok(pulse) = super::state::read_pulse_file(pr_number, review_type) else {
-            continue;
-        };
-        if let Some(entry) = pulse {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
-            }
-        }
-    }
-
-    None
 }
 
 fn normalize_dimension(input: &str) -> Result<&'static str, String> {
@@ -420,15 +393,6 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)
-}
-
-fn allocate_local_comment_id(comments: &[IssueComment], pr_number: u32) -> u64 {
-    comments
-        .iter()
-        .map(|comment| comment.id)
-        .max()
-        .unwrap_or_else(|| u64::from(pr_number).saturating_mul(1_000_000_000))
-        .saturating_add(1)
 }
 
 fn parse_decision_comments_for_author(
@@ -507,7 +471,7 @@ fn build_show_report(
     let parsed = parse_decision_comments_for_author(comments, Some(expected_author_login));
     if parsed.is_empty() {
         return DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -516,7 +480,7 @@ fn build_show_report(
             source_comment_id: None,
             source_comment_url: None,
             errors: vec![format!(
-                "decision marker comment not found for trusted login `{expected_author_login}`"
+                "verdict marker comment not found for trusted login `{expected_author_login}`"
             )],
         };
     }
@@ -527,7 +491,7 @@ fn build_show_report(
         .collect::<Vec<_>>();
     if matching.is_empty() {
         return DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -536,7 +500,7 @@ fn build_show_report(
             source_comment_id: None,
             source_comment_url: None,
             errors: vec![format!(
-                "no decision projection bound to head sha {head_sha}"
+                "no verdict projection bound to head sha {head_sha}"
             )],
         };
     }
@@ -547,7 +511,7 @@ fn build_show_report(
     }
     if signatures.len() > 1 {
         return DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -556,7 +520,7 @@ fn build_show_report(
             source_comment_id: None,
             source_comment_url: None,
             errors: vec![
-                "multiple decision comments for the same sha disagree on effective state"
+                "multiple verdict comments for the same sha disagree on effective state"
                     .to_string(),
             ],
         };
@@ -567,7 +531,7 @@ fn build_show_report(
     });
     selected.map_or_else(
         || DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -622,7 +586,7 @@ fn build_report_from_payload(
             }
         } else {
             fail_closed = true;
-            errors.push(format!("dimension `{dimension}` decision is missing"));
+            errors.push(format!("dimension `{dimension}` verdict is missing"));
             DimensionDecisionView {
                 dimension: dimension.to_string(),
                 decision: "unknown".to_string(),
@@ -640,7 +604,7 @@ fn build_report_from_payload(
         fail_closed = true;
     }
     DecisionShowReport {
-        schema: "apm2.fac.review.decision.show.v1".to_string(),
+        schema: "apm2.fac.review.verdict.show.v1".to_string(),
         pr_number,
         head_sha: head_sha.to_string(),
         overall_decision: overall_decision.to_string(),
@@ -818,24 +782,24 @@ pub(super) fn resolve_termination_authority_for_home(
     let parsed = parse_decision_comments_for_author(&comments, Some(&trusted_reviewer));
     let latest = latest_for_sha(&parsed, head_sha).ok_or_else(|| {
         format!(
-            "missing decision projection for PR #{pr_number} sha {head_sha} (trusted reviewer: {trusted_reviewer})"
+            "missing verdict projection for PR #{pr_number} sha {head_sha} (trusted reviewer: {trusted_reviewer})"
         )
     })?;
     let decision_entry = latest.payload.dimensions.get(dimension).ok_or_else(|| {
         format!(
-            "decision projection for PR #{pr_number} sha {head_sha} is missing `{dimension}` dimension"
+            "verdict projection for PR #{pr_number} sha {head_sha} is missing `{dimension}` dimension"
         )
     })?;
     if normalize_decision_value(&decision_entry.decision).is_none() {
         return Err(format!(
-            "decision projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
+            "verdict projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
             decision_entry.decision
         ));
     }
     let signature = signature_for_payload(&latest.payload);
     if signature.trim().is_empty() {
         return Err(format!(
-            "decision projection for PR #{pr_number} sha {head_sha} produced empty signature"
+            "verdict projection for PR #{pr_number} sha {head_sha} produced empty signature"
         ));
     }
     Ok(TerminationAuthority::from_decision_persist(
@@ -991,17 +955,10 @@ fn terminate_review_agent_for_home(
             authority.pr_number, authority.run_id, state.run_id
         )));
     }
-    let Some(state_repo) = super::state::extract_repo_from_pr_url(&state.pr_url) else {
+    if !state.owner_repo.eq_ignore_ascii_case(&authority.repo) {
         eprintln!(
-            "WARNING: skipping agent termination: unable to parse repo from run-state pr_url {}",
-            state.pr_url
-        );
-        return Ok(TerminationOutcome::SkippedMismatch);
-    };
-    if !state_repo.eq_ignore_ascii_case(&authority.repo) {
-        eprintln!(
-            "WARNING: skipping agent termination: run-state repo {state_repo} does not match requested repo {}",
-            authority.repo
+            "WARNING: skipping agent termination: run-state repo {} does not match requested repo {}",
+            state.owner_repo, authority.repo
         );
         return Ok(TerminationOutcome::SkippedMismatch);
     }
@@ -1081,7 +1038,7 @@ fn terminate_review_agent_for_home(
         ));
     }
 
-    eprintln!("INFO: terminated review agent pid={pid} after decision set");
+    eprintln!("INFO: terminated review agent pid={pid} after verdict set");
     Ok(outcome)
 }
 
@@ -1098,6 +1055,7 @@ fn write_termination_receipt(
         TerminationOutcome::IntegrityFailure(reason) => ("integrity_failure", Some(reason.clone())),
     };
     let receipt = super::state::ReviewRunTerminationReceipt {
+        schema: super::state::TERMINATION_RECEIPT_SCHEMA.to_string(),
         emitted_at: now_iso8601(),
         repo: authority.repo.clone(),
         pr_number: authority.pr_number,
@@ -1112,6 +1070,17 @@ fn write_termination_receipt(
         outcome_reason,
     };
     super::state::write_review_run_termination_receipt_for_home(home, &receipt)?;
+    let _ = super::state::load_review_run_termination_receipt_for_home(
+        home,
+        authority.pr_number,
+        &authority.review_type,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "termination receipt missing after write for PR #{} type={}",
+            authority.pr_number, authority.review_type
+        )
+    })?;
     Ok(())
 }
 
@@ -1155,7 +1124,7 @@ mod tests {
     ) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s1-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             review_type: "security".to_string(),
@@ -1282,15 +1251,15 @@ mod tests {
             dimensions: BTreeMap::new(),
         };
         let body = render_decision_comment_body(&payload).expect("body");
-        assert!(body.contains("apm2-review-decision:v1"));
+        assert!(body.contains("apm2-review-verdict:v1"));
         assert!(body.contains("```yaml"));
     }
 
     #[test]
     fn test_parse_decision_comments_filters_untrusted_authors() {
-        let body = r#"<!-- apm2-review-decision:v1 -->
+        let body = r#"<!-- apm2-review-verdict:v1 -->
 ```yaml
-schema: apm2.review.decision.v1
+schema: apm2.review.verdict.v1
 pr: 441
 sha: 0123456789abcdef0123456789abcdef01234567
 updated_at: 2026-02-11T00:00:00Z
@@ -1358,7 +1327,7 @@ dimensions:
     }
 
     #[test]
-    fn test_terminate_review_agent_skips_when_proc_start_time_missing() {
+    fn test_terminate_review_agent_fails_closed_when_proc_start_time_missing() {
         let pr_number = next_test_pr();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -1373,11 +1342,11 @@ dimensions:
         state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("example/repo", &state, "abcdef1234567890");
 
-        let outcome = super::terminate_review_agent_for_home(home, &authority)
-            .expect("termination result expected");
+        let err = super::terminate_review_agent_for_home(home, &authority)
+            .expect_err("missing proc_start_time state should fail closed");
         assert!(
-            matches!(outcome, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("missing proc_start_time")),
-            "unexpected termination outcome"
+            err.contains("integrity verification failed") || err.contains("integrity_failure"),
+            "unexpected termination error: {err}"
         );
         assert!(state::is_process_alive(pid));
 
@@ -1401,7 +1370,7 @@ dimensions:
         let proc_start_time =
             state::get_process_start_time(pid).expect("start time should be available");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
-        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        state.owner_repo = "example/other-repo".to_string();
         state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("owner/repo", &state, "abcdef1234567890");
 
@@ -1443,7 +1412,7 @@ dimensions:
     }
 
     #[test]
-    fn test_terminate_review_agent_allows_missing_proc_start_when_process_is_dead() {
+    fn test_terminate_review_agent_fails_closed_when_proc_start_time_missing_even_if_dead() {
         let pr_number = next_test_pr();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -1461,11 +1430,11 @@ dimensions:
         let _ = child.kill();
         let _ = child.wait();
 
-        let outcome = super::terminate_review_agent_for_home(home, &authority)
-            .expect("termination result expected");
+        let err = super::terminate_review_agent_for_home(home, &authority)
+            .expect_err("missing proc_start_time state should fail closed");
         assert!(
-            matches!(outcome, super::TerminationOutcome::AlreadyDead),
-            "unexpected termination outcome"
+            err.contains("integrity verification failed") || err.contains("integrity_failure"),
+            "unexpected termination error: {err}"
         );
 
         let _ = std::fs::remove_file(state_path);

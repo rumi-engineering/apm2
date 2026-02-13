@@ -39,6 +39,10 @@ ticket_meta:
       - "Retain immediate GitHub comment projection attempts, but do not allow projection write failures to invalidate local decision authority when local projection artifacts exist."
       - "Define closure-complete contract as local approvals (FAC receipts) + local merge progression, independent of GitHub merged state."
       - "Update ticket notes to reflect local-main source-of-truth posture."
+      - "Promote verdict/finding terminology in FAC CLI surfaces (`apm2 fac review verdict ...`) and treat GitHub comments as projection artifacts."
+      - "Enforce run-state integrity verification by default in state loaders; unverified reads must be explicit opt-in."
+      - "Remove FAC CLI `--repo` inputs for fac_review/fac restart/fac logs/fac push surfaces and derive single authoritative repository from local git origin."
+      - "Treat persisted verdict artifacts as closure-authoritative even when reviewer termination is best-effort."
     out_of_scope:
       - "Replacing GitHub with a fully new external projection sink in this ticket."
       - "Large daemon-side projection architecture migration beyond fac_review-affecting paths."
@@ -62,4 +66,5 @@ ticket_meta:
     security: |
       GitHub is a projection sink, not an authority source. Local FAC state, receipts,
       and local merge progression define control-plane truth. Projection outages must
-      not mutate or roll back local truth.
+      not mutate or roll back local truth. Run-state integrity verification is default
+      for process-bearing state; missing/invalid HMAC fails closed.

@@ -364,14 +364,13 @@ fn run_blocking_evidence_gates(
 }
 
 fn dispatch_reviews_with<F>(
-    pr_url: &str,
     repo: &str,
     pr_number: u32,
     sha: &str,
     mut dispatch_fn: F,
 ) -> Result<(), String>
 where
-    F: FnMut(&str, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: FnMut(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let dispatch_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -379,7 +378,7 @@ where
         .unwrap_or(0);
 
     for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        let result = dispatch_fn(pr_url, repo, pr_number, kind, sha, dispatch_epoch)
+        let result = dispatch_fn(repo, pr_number, kind, sha, dispatch_epoch)
             .map_err(|err| format!("failed to dispatch {} review: {err}", kind.as_str()))?;
         eprintln!(
             "fac push: dispatched {} review (mode={}{})",
@@ -563,8 +562,7 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
     }
 
     // Step 5: dispatch reviews.
-    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
-    if let Err(e) = dispatch_reviews_with(&pr_url, repo, pr_number, &sha, dispatch_single_review) {
+    if let Err(e) = dispatch_reviews_with(repo, pr_number, &sha, dispatch_single_review) {
         eprintln!("ERROR: {e}");
         eprintln!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
         return exit_codes::GENERIC_ERROR;
@@ -880,11 +878,10 @@ mod tests {
     fn dispatch_reviews_with_dispatches_security_then_quality() {
         let mut dispatched = Vec::new();
         let result = dispatch_reviews_with(
-            "https://github.com/guardian-intelligence/apm2/pull/42",
             "guardian-intelligence/apm2",
             42,
             "a".repeat(40).as_str(),
-            |_, _, _, kind, _, _| {
+            |_, _, kind, _, _| {
                 dispatched.push(kind.as_str().to_string());
                 Ok(DispatchReviewResult {
                     review_type: kind.as_str().to_string(),
@@ -908,11 +905,10 @@ mod tests {
     fn dispatch_reviews_with_fails_closed_on_dispatch_error() {
         let mut calls = 0usize;
         let err = dispatch_reviews_with(
-            "https://github.com/guardian-intelligence/apm2/pull/42",
             "guardian-intelligence/apm2",
             42,
             "b".repeat(40).as_str(),
-            |_, _, _, kind, _, _| {
+            |_, _, kind, _, _| {
                 calls += 1;
                 if kind == ReviewKind::Security {
                     return Err("simulated failure".to_string());

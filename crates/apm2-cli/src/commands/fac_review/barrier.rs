@@ -420,24 +420,30 @@ pub fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, Str
 }
 
 pub fn fetch_pr_head_sha_local(pr_number: u32) -> Result<String, String> {
-    let pull_ref = format!("refs/pull/{pr_number}/head");
-    let output = Command::new("git")
-        .args(["ls-remote", "origin", &pull_ref])
-        .output()
-        .map_err(|err| format!("failed to execute git ls-remote for PR head SHA: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git ls-remote failed resolving PR head SHA: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let owner_repo = super::target::derive_repo_from_origin()?;
+
+    if let Some(identity) = super::projection_store::load_pr_identity(&owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let sha = stdout
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "git ls-remote returned empty PR head SHA".to_string())?;
-    validate_expected_head_sha(sha)?;
-    Ok(sha.to_ascii_lowercase())
+
+    if let Ok(branch) = super::target::current_branch() {
+        if let Some(identity) = super::projection_store::load_branch_identity(&owner_repo, &branch)?
+        {
+            if identity.pr_number == pr_number {
+                validate_expected_head_sha(&identity.head_sha)?;
+                return Ok(identity.head_sha.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
+    }
+
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; run local FAC push/dispatch first or pass --sha explicitly"
+    ))
 }
 
 pub fn ensure_gh_cli_ready() -> Result<(), String> {

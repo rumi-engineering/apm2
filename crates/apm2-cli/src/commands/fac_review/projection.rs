@@ -695,7 +695,7 @@ mod tests {
     fn sample_run_state(status: ReviewRunStatus, started_at: &str) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s2-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number: 441,
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             review_type: "security".to_string(),

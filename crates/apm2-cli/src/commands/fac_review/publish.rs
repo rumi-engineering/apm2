@@ -9,7 +9,9 @@ use super::barrier::{render_comment_with_generated_metadata, resolve_authenticat
 use super::github_projection::{self, IssueCommentResponse};
 use super::projection_store;
 use super::target::resolve_pr_target;
-use super::types::{QUALITY_MARKER, SECURITY_MARKER, validate_expected_head_sha};
+use super::types::{
+    QUALITY_MARKER, SECURITY_MARKER, allocate_local_comment_id, validate_expected_head_sha,
+};
 use crate::exit_codes::codes as exit_codes;
 
 const PUBLISH_SCHEMA: &str = "apm2.fac.review.publish.v1";
@@ -46,13 +48,12 @@ struct PublishSummary {
 pub fn run_publish(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     review_type: ReviewPublishTypeArg,
     body_file: &Path,
     json_output: bool,
 ) -> Result<u8, String> {
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let reviewer_id = resolve_reviewer_id(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
 
@@ -77,7 +78,7 @@ pub fn run_publish(
             eprintln!(
                 "WARNING: failed to project publish comment to GitHub for PR #{resolved_pr}: {err}"
             );
-            let fallback_id = allocate_local_comment_id(&owner_repo, resolved_pr)?;
+            let fallback_id = next_local_comment_id(&owner_repo, resolved_pr)?;
             let fallback_url = format!(
                 "local://fac_projection/{owner_repo}/pr-{resolved_pr}/issue_comments#{fallback_id}"
             );
@@ -169,16 +170,17 @@ fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, Strin
     Ok(reviewer_id)
 }
 
-fn allocate_local_comment_id(owner_repo: &str, pr_number: u32) -> Result<u64, String> {
+fn next_local_comment_id(owner_repo: &str, pr_number: u32) -> Result<u64, String> {
     let comments =
         projection_store::load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)?
             .unwrap_or_default();
-    Ok(comments
-        .iter()
-        .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
-        .max()
-        .unwrap_or_else(|| u64::from(pr_number).saturating_mul(1_000_000_000))
-        .saturating_add(1))
+    Ok(allocate_local_comment_id(
+        pr_number,
+        comments
+            .iter()
+            .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
+            .max(),
+    ))
 }
 
 pub(super) fn create_issue_comment(

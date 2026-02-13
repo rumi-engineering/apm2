@@ -1,15 +1,14 @@
-//! Intelligent pipeline restart: reads CI state and re-enters the DAG at the
-//! optimal point (evidence gates, review dispatch, or noop).
-
-use std::process::Command;
+//! Intelligent pipeline restart: uses local authoritative FAC artifacts to
+//! re-enter the DAG at the optimal point (evidence gates, review dispatch, or
+//! noop).
 
 use serde::Serialize;
 
-use super::ci_status::{CiStatus, find_status_comment};
+use super::barrier::fetch_pr_head_sha_local;
 use super::dispatch::dispatch_single_review;
 use super::evidence::run_evidence_gates_with_status;
 use super::projection_store;
-use super::state::{ReviewRunStateLoad, load_review_run_state, read_pulse_file};
+use super::state::load_review_run_completion_receipt;
 use super::target::resolve_pr_target;
 use super::types::{DispatchReviewResult, ReviewKind, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
@@ -24,8 +23,6 @@ pub enum RestartStrategy {
     /// Re-run evidence gates (some failed or still running), then dispatch
     /// reviews if gates pass.
     EvidenceRestart,
-    /// All evidence gates passed; only dispatch reviews.
-    ReviewsOnly,
     /// Everything already passed — nothing to do.
     Noop,
 }
@@ -35,7 +32,6 @@ impl RestartStrategy {
         match self {
             Self::FullRestart => "full_restart",
             Self::EvidenceRestart => "evidence_restart",
-            Self::ReviewsOnly => "reviews_only",
             Self::Noop => "noop",
         }
     }
@@ -59,82 +55,47 @@ pub struct RestartSummary {
 struct PrContext {
     owner_repo: String,
     pr_number: u32,
-    pr_url: String,
     head_sha: String,
 }
 
-fn resolve_pr_context(
-    repo: &str,
-    pr: Option<u32>,
-    pr_url: Option<&str>,
-) -> Result<PrContext, String> {
-    let (owner_repo, pr_number) = resolve_pr_target(repo, pr, pr_url)?;
-
-    let pr_url_resolved = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+fn resolve_pr_context(repo: &str, pr: Option<u32>) -> Result<PrContext, String> {
+    let (owner_repo, pr_number) = resolve_pr_target(repo, pr)?;
     let head_sha = resolve_head_sha_for_restart(&owner_repo, pr_number)?;
 
     Ok(PrContext {
         owner_repo,
         pr_number,
-        pr_url: pr_url_resolved,
         head_sha,
     })
 }
 
 fn resolve_head_sha_for_restart(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    let head_sha = fetch_pr_head_sha_local(pr_number)?;
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
-        return Ok(identity.head_sha.to_ascii_lowercase());
-    }
-
-    if let Some(value) = resolve_local_review_head_sha(pr_number) {
-        return Ok(value);
-    }
-
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|err| format!("failed to resolve local HEAD for restart: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "missing local head SHA for PR #{pr_number}; run local FAC dispatch/push first or pass explicit PR context ({})",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let head = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_ascii_lowercase();
-    validate_expected_head_sha(&head)?;
-    Ok(head)
-}
-
-fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
-    for review_type in ["security", "quality"] {
-        let Ok(state) = load_review_run_state(pr_number, review_type) else {
-            continue;
-        };
-        if let ReviewRunStateLoad::Present(entry) = state {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
-            }
+        if !identity.head_sha.eq_ignore_ascii_case(&head_sha) {
+            return Err(format!(
+                "local PR identity head {} is stale relative to authoritative PR head {head_sha}; refresh local FAC projection first",
+                identity.head_sha
+            ));
         }
     }
-
-    for review_type in ["security", "quality"] {
-        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
-            continue;
-        };
-        if let Some(entry) = pulse {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
-            }
-        }
-    }
-
-    None
+    validate_expected_head_sha(&head_sha)?;
+    Ok(head_sha.to_ascii_lowercase())
 }
 
-// ── Strategy determination ──────────────────────────────────────────────────
+fn receipt_approves_head(
+    receipt: Option<&super::state::ReviewRunCompletionReceipt>,
+    owner_repo: &str,
+    head_sha: &str,
+) -> bool {
+    let Some(receipt) = receipt else {
+        return false;
+    };
+    receipt.repo.eq_ignore_ascii_case(owner_repo)
+        && receipt.head_sha.eq_ignore_ascii_case(head_sha)
+        && receipt.decision.eq_ignore_ascii_case("approve")
+}
 
 fn determine_restart_strategy(
     owner_repo: &str,
@@ -146,80 +107,16 @@ fn determine_restart_strategy(
         return Ok(RestartStrategy::FullRestart);
     }
 
-    let expected_author_login = projection_store::load_trusted_reviewer_id(owner_repo, pr_number)?;
-    let status_opt = find_status_comment(
-        owner_repo,
-        pr_number,
-        head_sha,
-        expected_author_login.as_deref(),
-    )?;
-    let Some((_comment_id, status)) = status_opt else {
-        // No status comment for this SHA — either never ran or SHA changed.
-        return Ok(RestartStrategy::FullRestart);
-    };
+    let security_receipt = load_review_run_completion_receipt(pr_number, "security")?;
+    let quality_receipt = load_review_run_completion_receipt(pr_number, "quality")?;
 
-    Ok(analyze_ci_status(&status))
-}
-
-fn analyze_ci_status(status: &CiStatus) -> RestartStrategy {
-    if status.gates.is_empty() {
-        return RestartStrategy::FullRestart;
+    if receipt_approves_head(security_receipt.as_ref(), owner_repo, head_sha)
+        && receipt_approves_head(quality_receipt.as_ref(), owner_repo, head_sha)
+    {
+        return Ok(RestartStrategy::Noop);
     }
 
-    // Evidence gate names (must match evidence.rs gate definitions).
-    let evidence_gates = [
-        "merge_conflict_main",
-        "rustfmt",
-        "clippy",
-        "doc",
-        "test",
-        "test_safety_guard",
-        "workspace_integrity",
-        "review_artifact_lint",
-    ];
-
-    let mut all_evidence_pass = true;
-    let mut has_any_evidence = false;
-
-    for gate_name in &evidence_gates {
-        if let Some(gate) = status.gates.get(*gate_name) {
-            has_any_evidence = true;
-            if gate.status != "PASS" {
-                all_evidence_pass = false;
-                break;
-            }
-        }
-    }
-
-    if !has_any_evidence {
-        // Status comment exists but no evidence gates recorded — full restart.
-        return RestartStrategy::FullRestart;
-    }
-
-    if !all_evidence_pass {
-        return RestartStrategy::EvidenceRestart;
-    }
-
-    // All evidence gates passed. Check review status.
-    let review_gates = ["security_review", "quality_review"];
-    let mut all_reviews_pass = true;
-    let mut has_any_review = false;
-
-    for gate_name in &review_gates {
-        if let Some(gate) = status.gates.get(*gate_name) {
-            has_any_review = true;
-            if gate.status != "PASS" {
-                all_reviews_pass = false;
-            }
-        }
-    }
-
-    if has_any_review && all_reviews_pass {
-        return RestartStrategy::Noop;
-    }
-
-    // Evidence passed, reviews incomplete → dispatch reviews only.
-    RestartStrategy::ReviewsOnly
+    Ok(RestartStrategy::EvidenceRestart)
 }
 
 // ── Execution ───────────────────────────────────────────────────────────────
@@ -230,12 +127,6 @@ fn execute_strategy(
 ) -> Result<(Option<bool>, Option<Vec<DispatchReviewResult>>), String> {
     match strategy {
         RestartStrategy::Noop => Ok((None, None)),
-
-        RestartStrategy::ReviewsOnly => {
-            let reviews =
-                dispatch_reviews(&ctx.pr_url, &ctx.owner_repo, ctx.pr_number, &ctx.head_sha)?;
-            Ok((None, Some(reviews)))
-        },
 
         RestartStrategy::EvidenceRestart | RestartStrategy::FullRestart => {
             let workspace_root =
@@ -250,8 +141,7 @@ fn execute_strategy(
             )?;
 
             if passed {
-                let reviews =
-                    dispatch_reviews(&ctx.pr_url, &ctx.owner_repo, ctx.pr_number, &ctx.head_sha)?;
+                let reviews = dispatch_reviews(&ctx.owner_repo, ctx.pr_number, &ctx.head_sha)?;
                 Ok((Some(true), Some(reviews)))
             } else {
                 Ok((Some(false), None))
@@ -261,7 +151,6 @@ fn execute_strategy(
 }
 
 fn dispatch_reviews(
-    pr_url: &str,
     owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
@@ -273,14 +162,7 @@ fn dispatch_reviews(
 
     let mut results = Vec::with_capacity(2);
     for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        let result = dispatch_single_review(
-            pr_url,
-            owner_repo,
-            pr_number,
-            kind,
-            head_sha,
-            dispatch_epoch,
-        )?;
+        let result = dispatch_single_review(owner_repo, pr_number, kind, head_sha, dispatch_epoch)?;
         results.push(result);
     }
     Ok(results)
@@ -288,14 +170,8 @@ fn dispatch_reviews(
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
-pub fn run_restart(
-    repo: &str,
-    pr: Option<u32>,
-    pr_url: Option<&str>,
-    force: bool,
-    json_output: bool,
-) -> u8 {
-    match run_restart_inner(repo, pr, pr_url, force) {
+pub fn run_restart(repo: &str, pr: Option<u32>, force: bool, json_output: bool) -> u8 {
+    match run_restart_inner(repo, pr, force) {
         Ok(summary) => {
             if json_output {
                 println!(
@@ -352,13 +228,8 @@ pub fn run_restart(
     }
 }
 
-fn run_restart_inner(
-    repo: &str,
-    pr: Option<u32>,
-    pr_url: Option<&str>,
-    force: bool,
-) -> Result<RestartSummary, String> {
-    let ctx = resolve_pr_context(repo, pr, pr_url)?;
+fn run_restart_inner(repo: &str, pr: Option<u32>, force: bool) -> Result<RestartSummary, String> {
+    let ctx = resolve_pr_context(repo, pr)?;
 
     eprintln!(
         "fac restart: pr=#{} sha={} repo={}",
@@ -370,11 +241,15 @@ fn run_restart_inner(
     eprintln!("fac restart: strategy={}", strategy.label());
 
     let (evidence_passed, reviews_dispatched) = execute_strategy(strategy, &ctx)?;
+    let pr_url = format!(
+        "https://github.com/{}/pull/{}",
+        ctx.owner_repo, ctx.pr_number
+    );
 
     Ok(RestartSummary {
-        repo: ctx.owner_repo,
+        repo: ctx.owner_repo.clone(),
         pr_number: ctx.pr_number,
-        pr_url: ctx.pr_url,
+        pr_url,
         head_sha: ctx.head_sha,
         strategy,
         evidence_passed,
@@ -386,92 +261,50 @@ fn run_restart_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-    use crate::commands::fac_review::ci_status::GateStatus;
+    use crate::commands::fac_review::state::ReviewRunCompletionReceipt;
 
-    fn gate(status: &str) -> GateStatus {
-        GateStatus {
-            status: status.to_string(),
-            duration_secs: Some(10),
-            tokens_used: None,
-            model: None,
+    fn sample_completion(decision: &str, head_sha: &str) -> ReviewRunCompletionReceipt {
+        ReviewRunCompletionReceipt {
+            schema: super::super::state::COMPLETION_RECEIPT_SCHEMA.to_string(),
+            emitted_at: "2026-02-13T00:00:00Z".to_string(),
+            repo: "guardian-intelligence/apm2".to_string(),
+            pr_number: 1,
+            review_type: "security".to_string(),
+            run_id: "pr1-security-s1-01234567".to_string(),
+            head_sha: head_sha.to_string(),
+            decision: decision.to_string(),
+            decision_comment_id: 1,
+            decision_author: "reviewer".to_string(),
+            decision_summary: "security:approve|code-quality:approve".to_string(),
+            integrity_hmac: "abcd".to_string(),
         }
     }
 
     #[test]
-    fn test_analyze_empty_gates_returns_full_restart() {
-        let status = CiStatus {
-            sha: "abc".to_string(),
-            pr: 1,
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-            gates: BTreeMap::new(),
-        };
-        assert_eq!(analyze_ci_status(&status), RestartStrategy::FullRestart);
-    }
+    fn test_receipt_approves_head_requires_matching_sha_and_approve() {
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let approve = sample_completion("approve", head);
+        assert!(receipt_approves_head(
+            Some(&approve),
+            "guardian-intelligence/apm2",
+            head
+        ));
 
-    #[test]
-    fn test_analyze_all_evidence_pass_no_reviews_returns_reviews_only() {
-        let mut gates = BTreeMap::new();
-        gates.insert("rustfmt".to_string(), gate("PASS"));
-        gates.insert("clippy".to_string(), gate("PASS"));
-        gates.insert("doc".to_string(), gate("PASS"));
-        gates.insert("test".to_string(), gate("PASS"));
-        let status = CiStatus {
-            sha: "abc".to_string(),
-            pr: 1,
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-            gates,
-        };
-        assert_eq!(analyze_ci_status(&status), RestartStrategy::ReviewsOnly);
-    }
+        let deny = sample_completion("deny", head);
+        assert!(!receipt_approves_head(
+            Some(&deny),
+            "guardian-intelligence/apm2",
+            head
+        ));
 
-    #[test]
-    fn test_analyze_evidence_fail_returns_evidence_restart() {
-        let mut gates = BTreeMap::new();
-        gates.insert("rustfmt".to_string(), gate("PASS"));
-        gates.insert("clippy".to_string(), gate("FAIL"));
-        gates.insert("doc".to_string(), gate("PASS"));
-        gates.insert("test".to_string(), gate("PASS"));
-        let status = CiStatus {
-            sha: "abc".to_string(),
-            pr: 1,
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-            gates,
-        };
-        assert_eq!(analyze_ci_status(&status), RestartStrategy::EvidenceRestart);
-    }
+        let mismatch = sample_completion("approve", "fedcba9876543210fedcba9876543210fedcba98");
+        assert!(!receipt_approves_head(
+            Some(&mismatch),
+            "guardian-intelligence/apm2",
+            head
+        ));
 
-    #[test]
-    fn test_analyze_evidence_running_returns_evidence_restart() {
-        let mut gates = BTreeMap::new();
-        gates.insert("rustfmt".to_string(), gate("PASS"));
-        gates.insert("clippy".to_string(), gate("RUNNING"));
-        let status = CiStatus {
-            sha: "abc".to_string(),
-            pr: 1,
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-            gates,
-        };
-        assert_eq!(analyze_ci_status(&status), RestartStrategy::EvidenceRestart);
-    }
-
-    #[test]
-    fn test_analyze_all_pass_returns_noop() {
-        let mut gates = BTreeMap::new();
-        gates.insert("rustfmt".to_string(), gate("PASS"));
-        gates.insert("clippy".to_string(), gate("PASS"));
-        gates.insert("doc".to_string(), gate("PASS"));
-        gates.insert("test".to_string(), gate("PASS"));
-        gates.insert("security_review".to_string(), gate("PASS"));
-        gates.insert("quality_review".to_string(), gate("PASS"));
-        let status = CiStatus {
-            sha: "abc".to_string(),
-            pr: 1,
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
-            gates,
-        };
-        assert_eq!(analyze_ci_status(&status), RestartStrategy::Noop);
+        assert!(!receipt_approves_head(Some(&approve), "other/repo", head));
     }
 }
