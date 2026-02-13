@@ -40,6 +40,23 @@ const SYSTEMD_DISPATCH_ENV_ALLOWLIST: [&str; 11] = [
     "XDG_RUNTIME_DIR",
 ];
 
+fn present_systemd_dispatch_env_keys() -> Vec<&'static str> {
+    SYSTEMD_DISPATCH_ENV_ALLOWLIST
+        .iter()
+        .copied()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect()
+}
+
+fn build_systemd_setenv_args(keys: &[&str]) -> Vec<String> {
+    let mut args = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in keys {
+        args.push("--setenv".to_string());
+        args.push((*key).to_string());
+    }
+    args
+}
+
 // ── Path helpers ────────────────────────────────────────────────────────────
 
 fn review_dispatch_locks_dir_for_home(home: &Path) -> PathBuf {
@@ -1174,11 +1191,11 @@ fn spawn_detached_review(
             .arg("--property")
             .arg(format!("ReadOnlyPaths={}", workspace_root.display()));
 
-        for key in SYSTEMD_DISPATCH_ENV_ALLOWLIST {
-            if let Ok(value) = std::env::var(key) {
-                command.arg("--setenv").arg(format!("{key}={value}"));
-            }
-        }
+        // Preserve env-auth compatibility without placing secret values on the
+        // systemd-run argv surface. `--setenv NAME` copies from caller env.
+        command.args(build_systemd_setenv_args(
+            &present_systemd_dispatch_env_keys(),
+        ));
 
         let output = command
             .arg(&exe_path)
@@ -1273,7 +1290,7 @@ mod tests {
 
     use super::{
         DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
-        dispatch_single_review_for_home_with_spawn,
+        build_systemd_setenv_args, dispatch_single_review_for_home_with_spawn,
         dispatch_single_review_for_home_with_spawn_force, first_existing_dispatch_executable,
         review_dispatch_scope_lock_path_for_home, run_state_has_live_process,
         strip_deleted_executable_suffix, write_pending_dispatch_for_home,
@@ -1334,6 +1351,24 @@ mod tests {
         assert!(
             strip_deleted_executable_suffix(path).is_none(),
             "clean path should not change"
+        );
+    }
+
+    #[test]
+    fn systemd_setenv_args_do_not_embed_values() {
+        let args = build_systemd_setenv_args(&["GH_TOKEN", "OPENAI_API_KEY"]);
+        assert_eq!(
+            args,
+            vec![
+                "--setenv".to_string(),
+                "GH_TOKEN".to_string(),
+                "--setenv".to_string(),
+                "OPENAI_API_KEY".to_string()
+            ]
+        );
+        assert!(
+            args.iter().all(|arg| !arg.contains('=')),
+            "setenv args must not include KEY=VALUE pairs"
         );
     }
 
