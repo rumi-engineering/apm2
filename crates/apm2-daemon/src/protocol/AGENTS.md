@@ -82,7 +82,8 @@ Privileged endpoint dispatcher for RFC-0017 control-plane IPC. Routes privileged
 
 **Invariants:**
 
-- The health gate is NOT enforced at the `PrivilegedDispatcher` level. Health gate enforcement is solely the responsibility of `FacBroker` (see `crates/apm2-core/src/fac/AGENTS.md`). The `FacBroker` is created per-session and the session owns it mutably, so the broker-level `admission_health_gate_passed` boolean flag (set by `check_health()` / `evaluate_admission_health_gate()`, enforced by `issue_channel_context_token()`) is the canonical production gate (INV-BRK-HEALTH-GATE-001).
+- [INV-BRK-HEALTH-GATE-001] The `PrivilegedDispatcher` enforces a fail-closed admission health gate on all token issuance paths. The `admission_health_gate` (`AtomicBool`) starts `false` (fail-closed) and is opened by `set_admission_health_gate(true)` during daemon startup in `main.rs` after successful initialization. `validate_channel_boundary_and_issue_context_token_with_flow()` checks this gate before proceeding; if the gate is closed, it returns a `MissingChannelMetadata` defect citing `INV-BRK-HEALTH-GATE-001`. This is defense-in-depth alongside `FacBroker`'s per-session health gate.
+- The `channel_boundary_dispatcher()` function in `session_dispatch.rs` returns the `&'static PrivilegedDispatcher` singleton. The daemon opens its health gate during startup; the singleton is shared across all session dispatch calls.
 
 ### `SessionDispatcher`
 

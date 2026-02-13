@@ -1941,6 +1941,16 @@ async fn async_main(args: Args) -> Result<()> {
         dispatcher_state
     };
 
+    // INV-BRK-HEALTH-GATE-001: Open the health gate after daemon initialization.
+    // The broker health primitives validate TP001/TP002/TP003 invariants.
+    // The gate starts closed (fail-closed) and is opened here after successful
+    // daemon startup, indicating the system is in a healthy initial state.
+    // The static PrivilegedDispatcher singleton used by session dispatch for
+    // channel boundary token issuance is fail-closed until this gate opens.
+    apm2_daemon::protocol::session_dispatch::channel_boundary_dispatcher()
+        .set_admission_health_gate(true);
+    info!("Admission health gate opened (INV-BRK-HEALTH-GATE-001)");
+
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
     // DD-009.

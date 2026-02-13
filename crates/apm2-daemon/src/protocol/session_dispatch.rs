@@ -749,9 +749,23 @@ pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
 /// boundary validation and token issuance in session dispatch.
 ///
 /// The dispatcher is lazily initialized via `OnceLock` on first access.
-fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
+///
+/// # Visibility
+///
+/// Public so that `main.rs` (binary crate) can set the admission health
+/// gate on the static singleton after daemon initialization.
+pub fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
     static DISPATCHER: std::sync::OnceLock<PrivilegedDispatcher> = std::sync::OnceLock::new();
-    DISPATCHER.get_or_init(PrivilegedDispatcher::new)
+    DISPATCHER.get_or_init(|| {
+        let dispatcher = PrivilegedDispatcher::new();
+        // In test builds, open the health gate by default since there is no
+        // daemon startup sequence (main.rs) to open it. Production builds
+        // start with the gate closed (fail-closed) and main.rs explicitly
+        // opens it after initialization.
+        #[cfg(test)]
+        dispatcher.set_admission_health_gate(true);
+        dispatcher
+    })
 }
 
 const MAX_QUARANTINED_BOUNDARY_CHANNELS: usize = 512;
@@ -15084,6 +15098,9 @@ mod tests {
                 epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
+            // INV-BRK-HEALTH-GATE-001: Open the health gate for this test so
+            // the boundary validation path is reached (not short-circuited).
+            channel_boundary_dispatcher().set_admission_health_gate(true);
             let response = dispatcher
                 .dispatch(&frame, &make_session_ctx())
                 .expect("dispatch should complete");
@@ -15333,6 +15350,8 @@ mod tests {
         );
 
         let signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let first_result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
@@ -16166,6 +16185,8 @@ mod tests {
         );
 
         let signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
@@ -16396,6 +16417,8 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let token_signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &token_signer,
@@ -16461,6 +16484,8 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
@@ -16530,6 +16555,8 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &signer,
@@ -16730,6 +16757,8 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let validation_signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &validation_signer,
@@ -16800,6 +16829,8 @@ mod tests {
             .expect("boundary-flow runtime state should build");
 
         let validation_signer = apm2_core::crypto::Signer::generate();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         let result = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token_with_flow(
                 &validation_signer,
@@ -16928,6 +16959,10 @@ mod tests {
                 .with_preactuation_gate(gate)
                 .with_stop_authority(authority)
                 .with_pcac_lifecycle_gate(pcac_gate);
+
+            // INV-BRK-HEALTH-GATE-001: Open the health gate for this test so
+            // the boundary leakage validation path is reached.
+            channel_boundary_dispatcher().set_admission_health_gate(true);
 
             let leakage_overrun_prompt = "L".repeat(32_768);
             let leakage_overrun_request = RequestToolRequest {
@@ -17109,6 +17144,9 @@ mod tests {
                 .with_stop_authority(authority)
                 .with_pcac_lifecycle_gate(pcac_gate);
 
+            // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+            channel_boundary_dispatcher().set_admission_health_gate(true);
+
             let timing_overrun_prompt = "T".repeat(2_800);
             let timing_overrun_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
@@ -17288,6 +17326,9 @@ mod tests {
                 .with_stop_authority(authority)
                 .with_pcac_lifecycle_gate(pcac_gate)
                 .with_strict_boundary_authority_enforcement(false);
+
+            // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+            channel_boundary_dispatcher().set_admission_health_gate(true);
 
             let non_strict_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
@@ -17827,6 +17868,9 @@ mod tests {
                 Some(session_id),
             );
 
+            // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+            channel_boundary_dispatcher().set_admission_health_gate(true);
+
             let non_strict_request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).expect("token serialization"),
                 tool_id: "inference".to_string(),
@@ -18160,6 +18204,8 @@ mod tests {
             .elapsed()
             .expect("current time should be after unix epoch")
             .as_secs();
+        // INV-BRK-HEALTH-GATE-001: Open the health gate for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
         #[allow(deprecated)]
         let token = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token(
@@ -18190,6 +18236,104 @@ mod tests {
         assert!(
             decoded.channel_source_witness.is_some(),
             "decoded token should include witness"
+        );
+    }
+
+    /// INV-BRK-HEALTH-GATE-001: A fresh (non-static) dispatcher starts with
+    /// the health gate closed (fail-closed) and denies token issuance. After
+    /// the gate is opened, issuance succeeds. This test uses a non-static
+    /// dispatcher to avoid racing with other tests that share the static
+    /// singleton.
+    #[test]
+    fn test_dispatcher_health_gate_controls_token_issuance() {
+        use apm2_core::channel::ChannelViolationClass;
+
+        use crate::episode::ToolClass;
+        use crate::protocol::dispatch::PrivilegedDispatcher;
+
+        let dispatcher = PrivilegedDispatcher::new();
+        // Gate starts closed by default (fail-closed).
+        assert!(
+            !dispatcher.admission_health_gate_passed(),
+            "health gate must start closed"
+        );
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let issued_at_secs = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("current time should be after unix epoch")
+            .as_secs();
+        #[allow(deprecated)]
+        let deny_result = dispatcher.validate_channel_boundary_and_issue_context_token(
+            &signer,
+            "lease-gate-test",
+            "REQ-GATE-TEST",
+            issued_at_secs,
+            &ToolClass::Execute,
+            true,
+            true,
+            true,
+            true,
+        );
+        let defects = deny_result.expect_err("closed health gate must deny token issuance");
+        assert!(
+            defects.iter().any(|d| d.violation_class
+                == ChannelViolationClass::MissingChannelMetadata
+                && d.detail.contains("INV-BRK-HEALTH-GATE-001")),
+            "denial must cite INV-BRK-HEALTH-GATE-001: {defects:?}"
+        );
+
+        // Open the gate and verify token issuance succeeds.
+        dispatcher.set_admission_health_gate(true);
+        #[allow(deprecated)]
+        let allow_result = dispatcher.validate_channel_boundary_and_issue_context_token(
+            &signer,
+            "lease-gate-test",
+            "REQ-GATE-TEST-2",
+            issued_at_secs,
+            &ToolClass::Execute,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(
+            allow_result.is_ok(),
+            "open health gate must allow token issuance: {allow_result:?}"
+        );
+    }
+
+    /// INV-BRK-HEALTH-GATE-001: The static dispatcher's gate can be opened
+    /// and token issuance succeeds through the `channel_boundary_dispatcher()`
+    /// singleton.
+    #[test]
+    fn test_static_dispatcher_health_gate_open_allows_tokens() {
+        use crate::episode::ToolClass;
+
+        // Ensure the static dispatcher gate is open for this test.
+        channel_boundary_dispatcher().set_admission_health_gate(true);
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let issued_at_secs = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("current time should be after unix epoch")
+            .as_secs();
+        #[allow(deprecated)]
+        let result = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token(
+                &signer,
+                "lease-static-gate",
+                "REQ-STATIC-GATE",
+                issued_at_secs,
+                &ToolClass::Execute,
+                true,
+                true,
+                true,
+                true,
+            );
+        assert!(
+            result.is_ok(),
+            "static dispatcher with open health gate must issue token: {result:?}"
         );
     }
 
