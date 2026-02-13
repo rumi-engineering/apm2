@@ -717,15 +717,43 @@ const fn default_audit_max_size_bytes() -> u64 {
     1024 * 1024 * 1024 // 1 GB
 }
 
+/// Returns the default APM2 data directory.
+///
+/// Resolution order:
+/// 1. `APM2_DATA_DIR`
+/// 2. platform data dir from `directories::ProjectDirs`
+/// 3. `HOME` with fallback to `.local/share/apm2`
+///
+/// # Panics
+/// This function panics if none of the above resolution methods produce a
+/// directory path.
+#[must_use]
+pub fn default_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("APM2_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    directories::ProjectDirs::from("com", "apm2", "apm2")
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| PathBuf::from(home).join(".local/share/apm2"))
+        })
+        .expect("cannot determine data directory: set APM2_DATA_DIR or HOME")
+}
+
 fn default_pid_file() -> PathBuf {
-    PathBuf::from("/var/run/apm2/apm2.pid")
+    // Use XDG_RUNTIME_DIR for PID file (ephemeral runtime data)
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| default_data_dir().join("apm2.pid"),
+        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("apm2.pid"),
+    )
 }
 
 fn default_operator_socket() -> PathBuf {
     // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/operator.sock
-    // Falls back to /tmp/apm2/operator.sock if XDG_RUNTIME_DIR is not set
     std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| PathBuf::from("/tmp/apm2/operator.sock"),
+        |_| default_data_dir().join("operator.sock"),
         |runtime_dir| {
             PathBuf::from(runtime_dir)
                 .join("apm2")
@@ -736,19 +764,18 @@ fn default_operator_socket() -> PathBuf {
 
 fn default_session_socket() -> PathBuf {
     // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/session.sock
-    // Falls back to /tmp/apm2/session.sock if XDG_RUNTIME_DIR is not set
     std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| PathBuf::from("/tmp/apm2/session.sock"),
+        |_| default_data_dir().join("session.sock"),
         |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
     )
 }
 
 fn default_log_dir() -> PathBuf {
-    PathBuf::from("/var/log/apm2")
+    default_data_dir().join("logs")
 }
 
 fn default_state_file() -> PathBuf {
-    PathBuf::from("/var/lib/apm2/state.json")
+    default_data_dir().join("state.json")
 }
 
 /// Credential profile configuration (in ecosystem file).

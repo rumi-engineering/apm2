@@ -1,0 +1,21 @@
+[Unit]
+Description=APM2 Daemon — Forge Admission Cycle runtime
+Documentation=https://github.com/guardian-intelligence/apm2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=%h/.cargo/bin/apm2 daemon
+ExecStop=%h/.cargo/bin/apm2 kill
+PIDFile=%t/apm2/apm2.pid
+Restart=always
+RestartSec=5
+WatchdogSec=300
+# Environment passthrough — GITHUB_TOKEN must be set in user session
+# Do NOT put secrets in unit files. Use EnvironmentFile if needed.
+# EnvironmentFile=-%h/.config/apm2/env
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

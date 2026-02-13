@@ -864,6 +864,9 @@ fn main() -> Result<()> {
     // Parse command-line arguments (synchronous, no threads)
     let args = Args::parse();
 
+    // Detect GitHub owner/repo from git remote before daemonization changes CWD.
+    let detected_github_owner_repo = detect_github_owner_repo_from_remote();
+
     // Daemonize if requested - MUST happen before any async runtime!
     //
     // This is the critical fix for TCK-00282. By daemonizing here, we ensure
@@ -889,14 +892,17 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("failed to create Tokio runtime")?;
 
     // Run the async main on the runtime
-    runtime.block_on(async_main(args))
+    runtime.block_on(async_main(args, detected_github_owner_repo))
 }
 
 /// Async entry point - runs after daemonization is complete.
 ///
 /// All async initialization and the main event loop live here.
 /// This is safe because the Tokio runtime was created AFTER any `fork()` calls.
-async fn async_main(args: Args) -> Result<()> {
+async fn async_main(
+    args: Args,
+    detected_github_owner_repo: Option<(String, String)>,
+) -> Result<()> {
     // Initialize logging
     let filter = EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -1253,6 +1259,35 @@ async fn async_main(args: Args) -> Result<()> {
 
         let projection_conn = Arc::clone(conn);
         let projection_config = &daemon_config.config.daemon.projection;
+        let github_owner = if projection_config.github_owner.is_empty() {
+            detected_github_owner_repo
+                .as_ref()
+                .map(|(owner, _)| owner.clone())
+                .unwrap_or_default()
+        } else {
+            projection_config.github_owner.clone()
+        };
+        let github_repo = if projection_config.github_repo.is_empty() {
+            detected_github_owner_repo
+                .as_ref()
+                .map(|(_, repo)| repo.clone())
+                .unwrap_or_default()
+        } else {
+            projection_config.github_repo.clone()
+        };
+
+        if (projection_config.github_owner.is_empty() || projection_config.github_repo.is_empty())
+            && !github_owner.is_empty()
+            && !github_repo.is_empty()
+        {
+            tracing::warn!(
+                owner = %github_owner,
+                repo = %github_repo,
+                "projection target auto-detected from git remote; \
+                 set projection.github_owner and projection.github_repo in config \
+                 for explicit binding"
+            );
+        }
 
         // Build worker configuration from ecosystem config
         let mut config = ProjectionWorkerConfig::new()
@@ -1267,15 +1302,12 @@ async fn async_main(args: Args) -> Result<()> {
         let mut github_adapter: Option<GitHubProjectionAdapter> = None;
 
         // Enable GitHub projection if configured
-        if projection_config.enabled
-            && !projection_config.github_owner.is_empty()
-            && !projection_config.github_repo.is_empty()
-        {
+        if projection_config.enabled && !github_owner.is_empty() && !github_repo.is_empty() {
             // Build GitHub adapter config
             match GitHubAdapterConfig::new(
                 &projection_config.github_api_url,
-                &projection_config.github_owner,
-                &projection_config.github_repo,
+                &github_owner,
+                &github_repo,
             ) {
                 Ok(mut github_config) => {
                     // TCK-00322 MAJOR FIX: Fail-Open Mock Mode on Configuration Error
@@ -1367,8 +1399,8 @@ async fn async_main(args: Args) -> Result<()> {
                     match GitHubProjectionAdapter::new(signer, github_config, &cache_path) {
                         Ok(adapter) => {
                             info!(
-                                owner = %projection_config.github_owner,
-                                repo = %projection_config.github_repo,
+                                owner = %github_owner,
+                                repo = %github_repo,
                                 cache_path = %cache_path.display(),
                                 "GitHub projection adapter created"
                             );
@@ -2061,6 +2093,54 @@ async fn async_main(args: Args) -> Result<()> {
 /// BLAKE3 for CAS hashing.
 fn sha_to_32_bytes(hex_sha: &str) -> [u8; 32] {
     *blake3::hash(hex_sha.as_bytes()).as_bytes()
+}
+
+fn detect_github_owner_repo_from_remote() -> Option<(String, String)> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_github_owner_repo(&url)
+}
+
+fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    // ssh://git@github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    // git@github.com:owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    // https://github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    // http://github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("http://github.com/") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    None
 }
 
 /// Query the latest `MergeReceipt` HEAD from the ledger.
@@ -3079,5 +3159,65 @@ mod crash_recovery_integration_tests {
             0,
             "Sessions should be cleared after recovery even without ledger"
         );
+    }
+
+    #[test]
+    fn parse_github_ssh_url() {
+        let result = parse_github_owner_repo("git@github.com:guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_https_url() {
+        let result = parse_github_owner_repo("https://github.com/guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_https_no_suffix() {
+        let result = parse_github_owner_repo("https://github.com/guardian-intelligence/apm2");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_protocol_url() {
+        let result = parse_github_owner_repo("ssh://git@github.com/guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_http_url() {
+        let result = parse_github_owner_repo("http://github.com/guardian-intelligence/apm2");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_github_invalid_url() {
+        assert_eq!(parse_github_owner_repo("not-a-url"), None);
+    }
+
+    #[test]
+    fn parse_github_empty_owner() {
+        assert_eq!(parse_github_owner_repo("git@github.com:/repo.git"), None);
+    }
+
+    #[test]
+    fn parse_github_no_repo() {
+        assert_eq!(parse_github_owner_repo("git@github.com:owner"), None);
     }
 }

@@ -45,6 +45,10 @@ enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(long)]
         no_daemon: bool,
+
+        /// Daemon subcommands.
+        #[command(subcommand)]
+        command: Option<DaemonSubcommand>,
     },
 
     /// Stop the daemon (graceful shutdown)
@@ -157,6 +161,20 @@ enum Commands {
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
     Factory(FactoryCommands),
+}
+
+#[derive(Subcommand, Debug)]
+/// Daemon-level management subcommands.
+pub enum DaemonSubcommand {
+    /// Install and enable the apm2-daemon systemd user service.
+    Install,
+
+    /// Run daemon health checks and prerequisite validation.
+    Doctor {
+        /// Output in JSON format.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -302,7 +320,11 @@ fn main() -> Result<()> {
     let socket_path = operator_socket.clone();
 
     match cli.command {
-        Commands::Daemon { no_daemon } => commands::daemon::run(&cli.config, no_daemon),
+        Commands::Daemon { no_daemon, command } => match command {
+            Some(DaemonSubcommand::Install) => commands::daemon::install(),
+            Some(DaemonSubcommand::Doctor { json }) => commands::daemon::doctor(&socket_path, json),
+            None => commands::daemon::run(&cli.config, no_daemon),
+        },
         Commands::Kill => commands::daemon::kill(&socket_path),
         Commands::Start { name } => commands::process::start(&socket_path, &name),
         Commands::Stop { name } => commands::process::stop(&socket_path, &name),
