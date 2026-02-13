@@ -116,9 +116,13 @@ futures = "0.3"
 # File locking for durable consume index (TCK-00426)
 fs2 = "0.4"
 
+# Atomic file writes with restrictive permissions (TCK-00502: anti-rollback anchor persistence)
+tempfile.workspace = true
+
 [dev-dependencies]
 # Testing utilities
-tempfile.workspace = true
+# Note: tempfile is also used in production (anti-rollback anchor atomic writes)
+# and is listed above in [dependencies].
 # Benchmarking (TCK-00269)
 criterion.workspace = true
 rand.workspace = true

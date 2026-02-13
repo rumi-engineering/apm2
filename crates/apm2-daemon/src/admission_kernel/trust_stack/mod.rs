@@ -1319,6 +1319,770 @@ impl PolicyRootResolver for GovernancePolicyRootResolver {
 }
 
 // =============================================================================
+// Anti-Rollback Anchor Providers (RFC-0019 REQ-0030, TCK-00502)
+// =============================================================================
+
+/// Maximum length for the mechanism ID string in external anchor state.
+pub const MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH: usize = 128;
+
+/// Schema version for persisted external anchor state.
+const ANTI_ROLLBACK_ANCHOR_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum allowed serialized anchor state file size in bytes.
+///
+/// Prevents `DoS` via oversized state files. A valid anchor state serializes
+/// to ~500 bytes; 8 KiB provides ample headroom.
+const MAX_ANCHOR_STATE_FILE_SIZE: u64 = 8_192;
+
+/// File extension for the tamper-evident bootstrap receipt.
+///
+/// The bootstrap receipt is a small file written alongside the anchor state
+/// file after the first successful `commit()`. On subsequent daemon starts,
+/// if the anchor state file is missing but the bootstrap receipt exists, the
+/// anchor was lost post-genesis (not a fresh install) and the provider
+/// returns `ExternalAnchorUnavailable` instead of
+/// `ExternalAnchorNotInitialized`, denying fail-closed flows.
+const BOOTSTRAP_RECEIPT_EXTENSION: &str = ".bootstrapped";
+
+/// Persisted external anchor state for atomic file operations.
+///
+/// `deny_unknown_fields` prevents injection of unexpected fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAnchorStateV1 {
+    /// Schema version for forward compatibility.
+    schema_version: u32,
+    /// The committed ledger anchor.
+    anchor: LedgerAnchorV1,
+    /// Mechanism identifier.
+    mechanism_id: String,
+    /// Hash commitment to the external proof/receipt.
+    proof_hash: Hash,
+}
+
+/// Durable anti-rollback anchor provider (RFC-0019 REQ-0030, TCK-00502).
+///
+/// Persists the external anchor state to a file using atomic write protocol
+/// (temp + rename). On `verify_committed()`, compares the requested anchor
+/// against the persisted state: if the requested anchor would regress
+/// (lower height or different hash at same height), verification fails.
+/// On `commit()`, atomically updates the persisted anchor state.
+///
+/// # Fail-Closed Contract
+///
+/// - If the persisted state cannot be read (file missing, corrupt, schema
+///   mismatch), `latest()` and `verify_committed()` return
+///   `TrustError::ExternalAnchorUnavailable`.
+/// - If no anchor has ever been committed (fresh-install bootstrap), `latest()`
+///   and `verify_committed()` return
+///   `TrustError::ExternalAnchorNotInitialized`.
+/// - If the anchor state file is missing but a bootstrap receipt exists (anchor
+///   was lost post-genesis), `latest()` and `verify_committed()` return
+///   `TrustError::ExternalAnchorUnavailable` — NOT `NotInitialized` — denying
+///   fail-closed flows (TCK-00502 BLOCKER fix: bootstrap/outage distinction).
+/// - If the requested anchor regresses relative to persisted state,
+///   `verify_committed()` returns `TrustError::ExternalAnchorMismatch`.
+/// - If the anchor height matches but the event hash differs (fork),
+///   `verify_committed()` returns `TrustError::ExternalAnchorMismatch`.
+///
+/// # Synchronization
+///
+/// Internal state is protected by `RwLock<Option<PersistedAnchorStateV1>>`.
+/// - `commit()` acquires write lock and performs atomic file write.
+/// - `latest()` and `verify_committed()` acquire read lock.
+/// - The `RwLock` ensures happens-before ordering between commits and reads.
+///
+/// # Atomic Write Protocol
+///
+/// Writes use temp-file + atomic rename to prevent partial state on crash.
+pub struct DurableAntiRollbackAnchor {
+    /// Path to the persisted anchor state file.
+    state_path: std::path::PathBuf,
+    /// Path to the bootstrap receipt file (derived from `state_path`).
+    ///
+    /// Written once on the first successful `commit()`. Presence of this
+    /// file without the anchor state file indicates anchor loss (not fresh
+    /// install), triggering `ExternalAnchorUnavailable` instead of
+    /// `ExternalAnchorNotInitialized`.
+    bootstrap_receipt_path: std::path::PathBuf,
+    /// Mechanism identifier for this anchor provider.
+    mechanism_id: String,
+    /// Whether a bootstrap commit has ever occurred (receipt file exists or
+    /// commit has succeeded during this instance's lifetime).
+    ///
+    /// Synchronization protocol:
+    /// - Protected data: boolean flag.
+    /// - Writers: `commit()` sets to `true` after first successful persist.
+    /// - Readers: `latest()` and `verify_committed()` read to distinguish
+    ///   fresh-install from anchor loss.
+    /// - Happens-before: `RwLock` on `state` provides ordering; this flag is
+    ///   only read/written under `state` write lock or during construction.
+    bootstrapped: std::sync::atomic::AtomicBool,
+    /// Cached anchor state, synchronized via `RwLock`.
+    ///
+    /// Synchronization protocol:
+    /// - Protected data: the most recently committed external anchor state.
+    /// - Writers: `commit()` acquires write lock, validates, persists to file
+    ///   atomically, then updates in-memory cache.
+    /// - Readers: `latest()` and `verify_committed()` acquire read lock.
+    /// - Happens-before: write lock release happens-before subsequent read lock
+    ///   acquisitions via `RwLock` semantics.
+    state: RwLock<Option<PersistedAnchorStateV1>>,
+}
+
+impl std::fmt::Debug for DurableAntiRollbackAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableAntiRollbackAnchor")
+            .field("state_path", &self.state_path)
+            .field("mechanism_id", &self.mechanism_id)
+            .field(
+                "has_state",
+                &self.state.read().map(|g| g.is_some()).unwrap_or(false),
+            )
+            .field(
+                "bootstrapped",
+                &self.bootstrapped.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl DurableAntiRollbackAnchor {
+    /// Create a new durable anti-rollback anchor provider.
+    ///
+    /// If a persisted anchor state file exists at `state_path`, it is loaded
+    /// and validated. If the file does not exist, the provider starts with
+    /// no committed anchor (first `commit()` will establish the initial state).
+    ///
+    /// # Arguments
+    ///
+    /// * `state_path` - Path to the persisted anchor state file.
+    /// * `mechanism_id` - Mechanism identifier (e.g., `"file_anchor"`,
+    ///   `"remote_witness_log"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if:
+    /// - `mechanism_id` is empty or exceeds
+    ///   [`MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH`].
+    /// - An existing state file is corrupt, has a schema mismatch, or exceeds
+    ///   the maximum file size.
+    pub fn new(state_path: std::path::PathBuf, mechanism_id: String) -> Result<Self, TrustError> {
+        if mechanism_id.is_empty() || mechanism_id.len() > MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH {
+            return Err(TrustError::IntegrityFailure {
+                reason: format!(
+                    "mechanism_id length {} out of range 1..={MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH}",
+                    mechanism_id.len()
+                ),
+            });
+        }
+
+        // Derive the bootstrap receipt path from the state path by appending
+        // the bootstrap receipt extension.
+        let bootstrap_receipt_path = {
+            let mut p = state_path.as_os_str().to_owned();
+            p.push(BOOTSTRAP_RECEIPT_EXTENSION);
+            std::path::PathBuf::from(p)
+        };
+
+        let bootstrap_receipt_exists = bootstrap_receipt_path.exists();
+
+        let initial_state = if state_path.exists() {
+            Some(Self::load_state_from_file(&state_path, &mechanism_id)?)
+        } else if bootstrap_receipt_exists {
+            // TCK-00502 BLOCKER fix: the bootstrap receipt exists but the
+            // anchor state file is missing. This means the anchor was lost
+            // after initial genesis commit (e.g., file deletion, disk
+            // corruption). This is NOT a fresh install; it is an anchor
+            // loss event. Return ExternalAnchorUnavailable to deny
+            // fail-closed flows instead of allowing bootstrap bypass.
+            return Err(TrustError::ExternalAnchorUnavailable {
+                reason: "anti-rollback anchor state file missing but bootstrap receipt \
+                         exists — anchor was lost post-genesis (not fresh install); \
+                         restore anchor state or re-bootstrap with governance approval"
+                    .into(),
+            });
+        } else {
+            None
+        };
+
+        Ok(Self {
+            state_path,
+            bootstrap_receipt_path,
+            mechanism_id,
+            bootstrapped: std::sync::atomic::AtomicBool::new(
+                bootstrap_receipt_exists || initial_state.is_some(),
+            ),
+            state: RwLock::new(initial_state),
+        })
+    }
+
+    /// Commit a new anchor to the external anchor state.
+    ///
+    /// Validates that the new anchor does not regress relative to the current
+    /// committed state, then atomically persists the new state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if:
+    /// - The new anchor regresses relative to the current committed state.
+    /// - The anchor fails validation (zero fields).
+    /// - The atomic write fails.
+    pub fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        anchor
+            .validate()
+            .map_err(|field| TrustError::IntegrityFailure {
+                reason: format!("anchor field {field} is zero"),
+            })?;
+
+        let proof_hash = Self::compute_proof_hash(anchor, &self.mechanism_id);
+
+        let new_state = PersistedAnchorStateV1 {
+            schema_version: ANTI_ROLLBACK_ANCHOR_SCHEMA_VERSION,
+            anchor: anchor.clone(),
+            mechanism_id: self.mechanism_id.clone(),
+            proof_hash,
+        };
+
+        let mut guard = self
+            .state
+            .write()
+            .map_err(|_| TrustError::IntegrityFailure {
+                reason: "anti-rollback state lock poisoned".into(),
+            })?;
+
+        // Anti-rollback check: if we already have a committed state, the new
+        // anchor must not regress.
+        if let Some(ref current) = *guard {
+            Self::check_no_regression(&current.anchor, anchor)?;
+        }
+
+        // Atomic file write: serialize to temp, rename to final path.
+        Self::atomic_write_state(&self.state_path, &new_state)?;
+
+        // TCK-00502 BLOCKER fix: persist bootstrap receipt on first
+        // successful commit. This receipt marks that the anchor has been
+        // initialized at least once. If the anchor state file is later
+        // lost/deleted, the bootstrap receipt prevents the provider from
+        // returning `ExternalAnchorNotInitialized` (which would allow
+        // bypass). Instead, `new()` detects the discrepancy and returns
+        // `ExternalAnchorUnavailable`, denying fail-closed flows.
+        if !self.bootstrapped.load(std::sync::atomic::Ordering::Acquire) {
+            Self::persist_bootstrap_receipt(&self.bootstrap_receipt_path)?;
+            self.bootstrapped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // Update in-memory cache AFTER successful file write.
+        *guard = Some(new_state);
+
+        Ok(())
+    }
+
+    /// Load and validate persisted anchor state from a file.
+    fn load_state_from_file(
+        path: &std::path::Path,
+        expected_mechanism_id: &str,
+    ) -> Result<PersistedAnchorStateV1, TrustError> {
+        let metadata =
+            std::fs::metadata(path).map_err(|e| TrustError::ExternalAnchorUnavailable {
+                reason: truncate_reason(&format!(
+                    "failed to read anchor state file metadata at {}: {e}",
+                    path.display()
+                )),
+            })?;
+
+        if metadata.len() > MAX_ANCHOR_STATE_FILE_SIZE {
+            return Err(TrustError::ExternalAnchorUnavailable {
+                reason: truncate_reason(&format!(
+                    "anchor state file at {} exceeds maximum size: {} > {MAX_ANCHOR_STATE_FILE_SIZE}",
+                    path.display(),
+                    metadata.len()
+                )),
+            });
+        }
+
+        let bytes = std::fs::read(path).map_err(|e| TrustError::ExternalAnchorUnavailable {
+            reason: truncate_reason(&format!(
+                "failed to read anchor state file at {}: {e}",
+                path.display()
+            )),
+        })?;
+
+        let state: PersistedAnchorStateV1 =
+            serde_json::from_slice(&bytes).map_err(|e| TrustError::ExternalAnchorUnavailable {
+                reason: truncate_reason(&format!(
+                    "failed to parse anchor state file at {}: {e}",
+                    path.display()
+                )),
+            })?;
+
+        if state.schema_version != ANTI_ROLLBACK_ANCHOR_SCHEMA_VERSION {
+            return Err(TrustError::ExternalAnchorUnavailable {
+                reason: format!(
+                    "unsupported anchor state schema version: expected {ANTI_ROLLBACK_ANCHOR_SCHEMA_VERSION}, \
+                     got {}",
+                    state.schema_version
+                ),
+            });
+        }
+
+        if state.mechanism_id != expected_mechanism_id {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: format!(
+                    "persisted mechanism_id '{}' does not match expected '{expected_mechanism_id}'",
+                    state.mechanism_id
+                ),
+            });
+        }
+
+        state
+            .anchor
+            .validate()
+            .map_err(|field| TrustError::ExternalAnchorUnavailable {
+                reason: format!("persisted anchor field {field} is zero"),
+            })?;
+
+        Ok(state)
+    }
+
+    /// Atomically write state to a file using `tempfile::NamedTempFile`.
+    ///
+    /// # Security Properties
+    ///
+    /// - **Restrictive permissions**: `NamedTempFile` creates files with 0600
+    ///   permissions by default, preventing world-readable anchor state that a
+    ///   local attacker could modify to roll back height.
+    /// - **fsync before rename**: `sync_all()` is called before `persist()` to
+    ///   ensure data is durable on disk. Power loss cannot result in a
+    ///   zero-byte or partially-written file.
+    /// - **Atomic rename**: `persist()` performs an atomic rename on the same
+    ///   filesystem, ensuring readers always see either the old or new complete
+    ///   state.
+    fn atomic_write_state(
+        path: &std::path::Path,
+        state: &PersistedAnchorStateV1,
+    ) -> Result<(), TrustError> {
+        use std::io::Write;
+
+        // Write to temp file in the same directory (ensures same filesystem
+        // for atomic rename via persist()).
+        let parent = path.parent().ok_or_else(|| TrustError::IntegrityFailure {
+            reason: "anchor state path has no parent directory".into(),
+        })?;
+
+        // Ensure parent directory exists with restrictive permissions.
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to create parent directory for anchor state at {}: {e}",
+                    parent.display()
+                )),
+            })?;
+            // SEC: Restrict parent directory to owner-only access (0o700)
+            // to prevent local attackers from manipulating or deleting
+            // the anchor file. The anchor file itself has 0o600 from
+            // NamedTempFile; the parent directory must also be restricted.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o700);
+                std::fs::set_permissions(parent, perms).map_err(|e| {
+                    TrustError::IntegrityFailure {
+                        reason: truncate_reason(&format!(
+                            "failed to set 0o700 permissions on anchor parent directory {}: {e}",
+                            parent.display()
+                        )),
+                    }
+                })?;
+            }
+        }
+
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to create temp file for anchor state in {}: {e}",
+                    parent.display()
+                )),
+            })?;
+
+        serde_json::to_writer_pretty(&mut tmp, state).map_err(|e| {
+            TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to serialize anchor state: {e}")),
+            }
+        })?;
+
+        // Flush the write buffer to the OS before fsync.
+        tmp.flush().map_err(|e| TrustError::IntegrityFailure {
+            reason: truncate_reason(&format!("failed to flush anchor state temp file: {e}")),
+        })?;
+
+        // fsync: ensure data is durable on disk before atomic rename.
+        // Without this, power loss after rename could leave a zero-byte
+        // or partially-written file.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to fsync anchor state temp file: {e}")),
+            })?;
+
+        // Atomic rename with restrictive permissions (0600 by default from
+        // NamedTempFile). This replaces the manual write+rename pattern.
+        tmp.persist(path)
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to atomically persist anchor state file to {}: {e}",
+                    path.display()
+                )),
+            })?;
+
+        // Durability: fsync parent directory so the rename itself is durable.
+        if let Some(parent_dir) = path.parent() {
+            let dir =
+                std::fs::File::open(parent_dir).map_err(|e| TrustError::IntegrityFailure {
+                    reason: truncate_reason(&format!(
+                        "failed to open parent directory {} for fsync: {e}",
+                        parent_dir.display()
+                    )),
+                })?;
+            dir.sync_all().map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to fsync parent directory {}: {e}",
+                    parent_dir.display()
+                )),
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Persist a bootstrap receipt file after the first successful commit.
+    ///
+    /// The receipt is a simple marker file (empty content) that signals that
+    /// the anchor has been initialized at least once. Its presence is checked
+    /// in `new()` to distinguish fresh-install bootstrap from post-genesis
+    /// anchor loss.
+    ///
+    /// Uses atomic temp+rename for crash safety and restrictive permissions.
+    fn persist_bootstrap_receipt(path: &std::path::Path) -> Result<(), TrustError> {
+        use std::io::Write;
+
+        let parent = path.parent().ok_or_else(|| TrustError::IntegrityFailure {
+            reason: "bootstrap receipt path has no parent directory".into(),
+        })?;
+
+        // Parent directory should already exist from anchor state write.
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to create temp file for bootstrap receipt in {}: {e}",
+                    parent.display()
+                )),
+            })?;
+
+        // Write a minimal receipt payload for auditability.
+        tmp.write_all(b"{\"bootstrapped\":true}\n")
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to write bootstrap receipt: {e}")),
+            })?;
+
+        tmp.flush().map_err(|e| TrustError::IntegrityFailure {
+            reason: truncate_reason(&format!("failed to flush bootstrap receipt: {e}")),
+        })?;
+
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!("failed to fsync bootstrap receipt: {e}")),
+            })?;
+
+        tmp.persist(path)
+            .map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to atomically persist bootstrap receipt to {}: {e}",
+                    path.display()
+                )),
+            })?;
+
+        // fsync parent directory for durability.
+        if let Some(parent_dir) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent_dir) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check that `new_anchor` does not regress relative to `current_anchor`.
+    ///
+    /// Regression means:
+    /// - New height < current height (rollback to earlier state).
+    /// - Same height but different event hash (fork).
+    fn check_no_regression(
+        current: &LedgerAnchorV1,
+        new: &LedgerAnchorV1,
+    ) -> Result<(), TrustError> {
+        if new.height < current.height {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: truncate_reason(&format!(
+                    "anti-rollback regression detected: new anchor height {} < \
+                     committed anchor height {} (rollback denied)",
+                    new.height, current.height
+                )),
+            });
+        }
+
+        // At the same height, the event hash must match (fork detection).
+        if new.height == current.height && !bool::from(new.event_hash.ct_eq(&current.event_hash)) {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: truncate_reason(&format!(
+                    "anti-rollback fork detected: same height {} but different event hash \
+                     (committed: {}, requested: {})",
+                    new.height,
+                    hex::encode(current.event_hash),
+                    hex::encode(new.event_hash)
+                )),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Compute a deterministic proof hash for an anchor commitment.
+    ///
+    /// Field ordering follows conventional length-prefixed framing:
+    /// `domain_tag || anchor_hash || mechanism_id_len || mechanism_id_bytes`.
+    fn compute_proof_hash(anchor: &LedgerAnchorV1, mechanism_id: &str) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2-anti-rollback-proof-v1");
+        hasher.update(&anchor.content_hash());
+        #[allow(clippy::cast_possible_truncation)] // mechanism_id bounded by MAX constant
+        {
+            hasher.update(&(mechanism_id.len() as u32).to_le_bytes());
+        }
+        hasher.update(mechanism_id.as_bytes());
+        *hasher.finalize().as_bytes()
+    }
+}
+
+impl super::prerequisites::AntiRollbackAnchor for DurableAntiRollbackAnchor {
+    fn latest(&self) -> Result<super::prerequisites::ExternalAnchorStateV1, TrustError> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| TrustError::IntegrityFailure {
+                reason: "anti-rollback state lock poisoned".into(),
+            })?;
+
+        guard.as_ref().map_or_else(
+            || Err(TrustError::ExternalAnchorNotInitialized),
+            |state| {
+                Ok(super::prerequisites::ExternalAnchorStateV1 {
+                    anchor: state.anchor.clone(),
+                    mechanism_id: state.mechanism_id.clone(),
+                    proof_hash: state.proof_hash,
+                })
+            },
+        )
+    }
+
+    fn verify_committed(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| TrustError::IntegrityFailure {
+                reason: "anti-rollback state lock poisoned".into(),
+            })?;
+
+        let current = guard
+            .as_ref()
+            .ok_or(TrustError::ExternalAnchorNotInitialized)?;
+
+        // Verify the requested anchor is consistent with (not regressed from)
+        // the externally committed state. The committed anchor represents the
+        // most recently externally witnessed state; the requested anchor must
+        // be at or after the committed anchor.
+        //
+        // This is the inverse of the commit check: during commit we check that
+        // the NEW anchor doesn't regress past the OLD; during verify_committed
+        // we check that the anchor under verification is at or after the
+        // committed state (i.e., the committed state is not ahead of what the
+        // caller claims to verify).
+        if anchor.height < current.anchor.height {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: truncate_reason(&format!(
+                    "local anchor height {} is behind externally committed height {} \
+                     (rollback detected)",
+                    anchor.height, current.anchor.height
+                )),
+            });
+        }
+
+        // At the same height, the event hash must match.
+        if anchor.height == current.anchor.height
+            && !bool::from(anchor.event_hash.ct_eq(&current.anchor.event_hash))
+        {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: truncate_reason(&format!(
+                    "anchor at height {} has different event hash than externally committed \
+                     (fork detected: committed {}, local {})",
+                    anchor.height,
+                    hex::encode(current.anchor.event_hash),
+                    hex::encode(anchor.event_hash)
+                )),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        // Delegate to the inherent `commit()` method which handles
+        // validation, anti-rollback checks, and atomic file persistence.
+        Self::commit(self, anchor)
+    }
+}
+
+/// In-memory anti-rollback anchor provider for testing (TCK-00502).
+///
+/// Provides the same semantics as [`DurableAntiRollbackAnchor`] but without
+/// file-system persistence. Suitable for CI/integration testing.
+///
+/// # Synchronization
+///
+/// Internal state protected by `RwLock<Option<(LedgerAnchorV1, String,
+/// Hash)>>`.
+/// - Writers: `commit()` acquires write lock.
+/// - Readers: `latest()`, `verify_committed()` acquire read lock.
+/// - Happens-before ensured by `RwLock`.
+pub struct InMemoryAntiRollbackAnchor {
+    /// Committed anchor state.
+    ///
+    /// Synchronization protocol:
+    /// - Protected data: `(anchor, mechanism_id, proof_hash)`.
+    /// - Writers: `commit()` validates then updates under write lock.
+    /// - Readers: `latest()`, `verify_committed()` read under read lock.
+    /// - Happens-before: `RwLock` write release -> read acquire.
+    state: RwLock<Option<(LedgerAnchorV1, String, Hash)>>,
+    /// Mechanism identifier.
+    mechanism_id: String,
+}
+
+impl InMemoryAntiRollbackAnchor {
+    /// Create a new in-memory anti-rollback anchor provider.
+    #[must_use]
+    pub const fn new(mechanism_id: String) -> Self {
+        Self {
+            state: RwLock::new(None),
+            mechanism_id,
+        }
+    }
+
+    /// Create a new in-memory anti-rollback anchor pre-loaded with an initial
+    /// anchor. Useful for tests that need a committed state from the start.
+    #[must_use]
+    pub fn with_initial_anchor(mechanism_id: String, anchor: LedgerAnchorV1) -> Self {
+        let proof_hash = DurableAntiRollbackAnchor::compute_proof_hash(&anchor, &mechanism_id);
+        Self {
+            state: RwLock::new(Some((anchor, mechanism_id.clone(), proof_hash))),
+            mechanism_id,
+        }
+    }
+
+    /// Commit a new anchor (for test setup).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if the new anchor regresses.
+    pub fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        anchor
+            .validate()
+            .map_err(|field| TrustError::IntegrityFailure {
+                reason: format!("anchor field {field} is zero"),
+            })?;
+
+        let mut guard = self
+            .state
+            .write()
+            .map_err(|_| TrustError::IntegrityFailure {
+                reason: "anti-rollback state lock poisoned".into(),
+            })?;
+
+        if let Some((ref current_anchor, _, _)) = *guard {
+            DurableAntiRollbackAnchor::check_no_regression(current_anchor, anchor)?;
+        }
+
+        let proof_hash = DurableAntiRollbackAnchor::compute_proof_hash(anchor, &self.mechanism_id);
+        *guard = Some((anchor.clone(), self.mechanism_id.clone(), proof_hash));
+        Ok(())
+    }
+}
+
+impl super::prerequisites::AntiRollbackAnchor for InMemoryAntiRollbackAnchor {
+    fn latest(&self) -> Result<super::prerequisites::ExternalAnchorStateV1, TrustError> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| TrustError::IntegrityFailure {
+                reason: "anti-rollback state lock poisoned".into(),
+            })?;
+
+        match guard.as_ref() {
+            Some((anchor, mechanism_id, proof_hash)) => {
+                Ok(super::prerequisites::ExternalAnchorStateV1 {
+                    anchor: anchor.clone(),
+                    mechanism_id: mechanism_id.clone(),
+                    proof_hash: *proof_hash,
+                })
+            },
+            None => Err(TrustError::ExternalAnchorNotInitialized),
+        }
+    }
+
+    fn verify_committed(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| TrustError::IntegrityFailure {
+                reason: "anti-rollback state lock poisoned".into(),
+            })?;
+
+        let (current_anchor, _, _) = guard
+            .as_ref()
+            .ok_or(TrustError::ExternalAnchorNotInitialized)?;
+
+        if anchor.height < current_anchor.height {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: truncate_reason(&format!(
+                    "local anchor height {} is behind committed height {} (rollback detected)",
+                    anchor.height, current_anchor.height
+                )),
+            });
+        }
+
+        if anchor.height == current_anchor.height
+            && !bool::from(anchor.event_hash.ct_eq(&current_anchor.event_hash))
+        {
+            return Err(TrustError::ExternalAnchorMismatch {
+                reason: truncate_reason(&format!(
+                    "anchor at height {} has different event hash (fork detected)",
+                    anchor.height
+                )),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn commit(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        // Delegate to the inherent `commit()` method which handles
+        // validation and anti-rollback checks in memory.
+        Self::commit(self, anchor)
+    }
+}
+
+// =============================================================================
 // Helper functions
 // =============================================================================
 

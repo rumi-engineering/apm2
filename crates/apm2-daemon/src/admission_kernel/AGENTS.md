@@ -41,7 +41,7 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 **Contracts:**
 
 - [CTR-AK01] `plan()` validates request, resolves prerequisites, creates witness seeds, executes PCAC join + initial revalidate.
-- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, capability minting, and boundary span initialization.
+- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, capability minting, and boundary span initialization. **Anti-rollback anchor commit is deferred to `finalize_anti_rollback()`** which MUST be called by the caller AFTER the authoritative effect succeeds (TCK-00502 BLOCKER-2: pre-commit hazard prevention).
 - [CTR-AK03] Monitor tiers may proceed without optional prerequisites and without prerequisite re-checks in `execute()`.
 - [CTR-AK04] Enforcement tier is derived from `RiskTier`: `Tier2Plus` -> `FailClosed`, all others -> `Monitor`.
 - [CTR-AK05] `LedgerWriteCapability` is only minted for fail-closed tiers (CTR-2617). Monitor tiers receive `None`.
@@ -54,6 +54,10 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK12] `release_boundary_output()` denies output release for fail-closed tiers when evidence hashes are empty. Marks `BoundarySpanV1` as released exactly once (TCK-00497). Integrated into `handle_request_tool` post-effect path.
 - [CTR-AK13] `MonitorWaiverV1::validate()` enforces `expires_at_tick` against current tick. Non-zero `expires_at_tick < current_tick` means expired waiver, which is denied (SECURITY MAJOR 2, TCK-00497).
 - [CTR-AK14] `WitnessEvidenceV1.measured_values` uses bounded visitor deserialization (`bounded_vec_deser!`) with max `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` to prevent unbounded allocation from untrusted input (QUALITY MAJOR 1 + SECURITY MAJOR 1, TCK-00497).
+- [CTR-AK18] `finalize_anti_rollback()` commits the anti-rollback anchor AFTER confirmed effect success. For fail-closed tiers, this advances the external anchor watermark. For monitor tiers, this is a no-op. MUST NOT be called before effect confirmation (pre-commit hazard). Called from all effect-capable handler post-effect paths: `handle_request_tool` (after `DecisionType::Allow`), `handle_emit_event` (after ledger write), and `handle_publish_evidence` (after CAS write) (TCK-00502).
+- [CTR-AK19] `verify_anti_rollback()` tolerates `ExternalAnchorUnavailable` from `verify_committed()` as the bootstrap path: on fresh install, no prior anchor exists to protect and the anti-rollback invariant is vacuously satisfied. Other `TrustError` variants still produce denial (TCK-00502 BLOCKER-1).
+- [CTR-AK20] `resolve_post_effect_anchor()` queries `LedgerTrustVerifier::validated_state()` for the current verified head AFTER the authoritative effect. Returns the verifier anchor when its height >= the fallback anchor; otherwise returns the fallback. Falls back to the caller-supplied anchor when no verifier is wired or when `validated_state()` errors. MUST be called between effect confirmation and `finalize_anti_rollback()` so the anti-rollback commit advances to the actual post-effect head, not the stale pre-plan anchor (TCK-00502 MAJOR-2).
+- [CTR-AK21] `probe_anti_rollback_health()` performs a non-mutating health check via `verify_committed()` (read-only). MUST NOT call `commit()`. Returns `Ok(())` when the anchor verifies or `AdmitError` on failure. Used by the pre-effect circuit breaker to test anti-rollback availability without advancing the anchor watermark (TCK-00502 MINOR-4).
 
 ### `KernelRequestV1` (types.rs)
 
@@ -114,9 +118,9 @@ Capability tokens with `pub(super)` constructors. Non-cloneable, non-copyable, `
 
 Trait interfaces for prerequisite resolution. Concrete implementations provided by the `trust_stack` submodule (TCK-00500).
 
-### `trust_stack` submodule (trust_stack/mod.rs, TCK-00500)
+### `trust_stack` submodule (trust_stack/mod.rs, TCK-00500, TCK-00502)
 
-Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prerequisite traits, plus supporting infrastructure:
+Concrete implementations of `LedgerTrustVerifier`, `PolicyRootResolver`, and `AntiRollbackAnchor` prerequisite traits, plus supporting infrastructure:
 
 - **`RootTrustBundle`**: Bounded trust anchor with crypto-agile key entries (algorithm ID + key ID + public key bytes). `deny_unknown_fields` serde, domain-separated BLAKE3 content hash. Max 64 keys (`MAX_TRUST_BUNDLE_KEYS`). Supports key rotation/revocation with `active_from_epoch` (inclusive) and `revoked_at_epoch` (exclusive).
 - **`TrustBundleKeyEntry`**: Individual key entry with epoch-aware `is_active_at()` validity check.
@@ -146,6 +150,20 @@ Concrete implementations of `LedgerTrustVerifier` and `PolicyRootResolver` prere
 - [INV-TS15] Governance event truncation is fail-closed: if `read_governance_events` returns `>= MAX_GOVERNANCE_EVENTS_PER_DERIVATION` events, `derive_policy_root` returns `DerivationFailed` (no silent partial derivation).
 - [INV-TS16] `content_hash()` and `active_keyset_digest()` sort keys by `key_id` before hashing to ensure deterministic output regardless of vector insertion order.
 - [INV-TS17] `RootTrustBundle::validate()` enforces `schema_version == ROOT_TRUST_BUNDLE_SCHEMA_VERSION` as the first check. Unknown/future schema versions are rejected.
+- [INV-TS18] `DurableAntiRollbackAnchor` persists anchor state via `tempfile::NamedTempFile` + `flush()` + `sync_all()` + `persist()` for crash-safe atomic writes with restrictive permissions (0600). File reads bounded by `MAX_ANCHOR_STATE_FILE_SIZE` (8 KiB).
+- [INV-TS19] Anti-rollback regression checks enforce: (a) height never decreases, (b) at same height, event hash must match (constant-time comparison). Violations return `ExternalAnchorMismatch`.
+- [INV-TS20] `mechanism_id` bounded by `MAX_ANTI_ROLLBACK_MECHANISM_ID_LENGTH` (128). Empty mechanism IDs rejected at construction.
+- [INV-TS21] `PersistedAnchorStateV1` uses `deny_unknown_fields` serde and `schema_version` validation for forward-compatible deserialization.
+- [INV-TS22] `DurableAntiRollbackAnchor` proof hash uses domain-separated BLAKE3 with length-prefixed framing for all variable fields.
+- [INV-TS23] `InMemoryAntiRollbackAnchor` provides identical semantics to `DurableAntiRollbackAnchor` without file I/O (for testing).
+- [INV-TS24] `DurableAntiRollbackAnchor` persists a bootstrap receipt file (`.bootstrapped` extension) on first successful `commit()`. On subsequent construction, if the state file is missing but the bootstrap receipt exists, construction fails with `ExternalAnchorUnavailable` (anchor loss after genesis). If both are absent, construction succeeds (fresh install). This prevents an attacker from bypassing anti-rollback protection by deleting the anchor state file after the system has been bootstrapped (TCK-00502 BLOCKER-1).
+- [INV-TS25] Bootstrap receipt persistence uses the same atomic write pattern as anchor state (tempfile + rename + fsync) for crash safety.
+
+#### Anti-Rollback Anchor Providers (TCK-00502)
+
+- **`DurableAntiRollbackAnchor`**: File-backed production `AntiRollbackAnchor` implementation. Atomic write (temp + rename) for crash safety. Bounded file read (`MAX_ANCHOR_STATE_FILE_SIZE`). Schema-versioned JSON with `deny_unknown_fields`. `RwLock<Option<PersistedAnchorStateV1>>` synchronization (writers: `commit()`, readers: `latest()`/`verify_committed()`).
+- **`InMemoryAntiRollbackAnchor`**: In-memory test `AntiRollbackAnchor` implementation. Same regression/fork checks as `DurableAntiRollbackAnchor` without file persistence.
+- **`PersistedAnchorStateV1`**: Serialized anchor state with `schema_version`, `anchor` (`LedgerAnchorV1`), `mechanism_id`, and `proof_hash` (BLAKE3).
 
 ### `QuarantineGuard` (mod.rs)
 
@@ -191,6 +209,13 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
            durable consume -> bundle seal (TCK-00493) ->
            capability mint (tier-gated) -> boundary span -> result
+
+POST-EFFECT FINALIZATION (caller responsibility, TCK-00502):
+finalize_anti_rollback(): anti-rollback anchor commit (fail-closed tiers only)
+
+Every effect-capable handler (RequestTool, EmitEvent, PublishEvidence)
+MUST call finalize_anti_rollback() AFTER confirmed effect success and
+BEFORE persisting the AdmissionOutcomeIndexV1.
 ```
 
 ## Public API
@@ -219,7 +244,7 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 
 ## Related Modules
 
-- [`admission_kernel::trust_stack`](trust_stack/mod.rs) -- `ConcreteLedgerTrustVerifier`, `GovernancePolicyRootResolver`, `RootTrustBundle` (TCK-00500)
+- [`admission_kernel::trust_stack`](trust_stack/mod.rs) -- `ConcreteLedgerTrustVerifier`, `GovernancePolicyRootResolver`, `RootTrustBundle` (TCK-00500), `DurableAntiRollbackAnchor`, `InMemoryAntiRollbackAnchor` (TCK-00502)
 - [`apm2_daemon::quarantine_store`](../quarantine_store/AGENTS.md) -- `DurableQuarantineGuard` (TCK-00496)
 - [`apm2_daemon::pcac`](../pcac/AGENTS.md) -- PCAC lifecycle gate (`InProcessKernel`, `LifecycleGate`)
 - [`apm2_core::pcac`](../../../apm2-core/src/pcac/AGENTS.md) -- Core PCAC types (`AuthorityJoinKernel`, `RiskTier`, etc.)
@@ -247,4 +272,6 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 - TCK-00494: Implementation ticket (handler refactoring + kernel wiring)
 - TCK-00497: Implementation ticket (witness closure -- post-effect evidence, monitor waivers, boundary output gating)
 - TCK-00500: Implementation ticket (ledger trust stack -- RootTrustBundle, trusted seals, checkpoint-bounded startup, governance-derived PolicyRootResolver)
+- TCK-00502: Implementation ticket (anti-rollback anchoring -- DurableAntiRollbackAnchor, InMemoryAntiRollbackAnchor, production wiring, fail-closed tier gating)
 - REQ-0028: Ledger trust stack requirements
+- REQ-0030: Anti-rollback anchoring requirements

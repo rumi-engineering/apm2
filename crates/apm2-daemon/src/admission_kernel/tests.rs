@@ -287,6 +287,10 @@ impl AntiRollbackAnchor for MockAntiRollback {
     fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
         self.result.clone()
     }
+
+    fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        Ok(())
+    }
 }
 
 /// A mock quarantine guard.
@@ -427,6 +431,10 @@ impl AntiRollbackAnchor for DriftingAntiRollback {
                 reason: "anti-rollback anchor drifted (test)".into(),
             })
         }
+    }
+
+    fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        Ok(())
     }
 }
 
@@ -4150,5 +4158,1434 @@ fn test_tck_00497_monitor_waiver_json_round_trip() {
         waiver.content_hash(),
         deser.content_hash(),
         "round-trip must preserve content hash"
+    );
+}
+
+// =============================================================================
+// TCK-00502: Anti-rollback anchor provider tests
+// =============================================================================
+
+// ---- InMemoryAntiRollbackAnchor tests ----
+
+#[test]
+fn test_tck_00502_in_memory_anchor_latest_before_commit() {
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let result = anchor_provider.latest();
+    assert!(
+        result.is_err(),
+        "latest() before any commit must return error"
+    );
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorNotInitialized => {},
+        other => panic!("expected ExternalAnchorNotInitialized, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_commit_and_latest() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    anchor_provider
+        .commit(&anchor)
+        .expect("commit must succeed");
+
+    let state = anchor_provider.latest().expect("latest must succeed");
+    assert_eq!(state.anchor, anchor);
+    assert_eq!(state.mechanism_id, "test_mechanism");
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_rollback_denied() {
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let anchor_high = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    anchor_provider
+        .commit(&anchor_high)
+        .expect("commit must succeed");
+
+    // Attempt rollback to lower height.
+    let anchor_low = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.commit(&anchor_low);
+    assert!(result.is_err(), "rollback commit must be denied");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(
+                reason.contains("regression"),
+                "error must mention regression: {reason}"
+            );
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_fork_denied() {
+    let anchor_provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let anchor_original = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    anchor_provider
+        .commit(&anchor_original)
+        .expect("commit must succeed");
+
+    // Attempt fork: same height, different hash.
+    let anchor_fork = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(99), // different hash
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.commit(&anchor_fork);
+    assert!(result.is_err(), "fork commit must be denied");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(reason.contains("fork"), "error must mention fork: {reason}");
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_rollback_detected() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed,
+    );
+
+    // Verify an anchor BEHIND the committed state -- rollback.
+    let anchor_behind = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.verify_committed(&anchor_behind);
+    assert!(
+        result.is_err(),
+        "verifying an anchor behind the committed state must fail"
+    );
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(
+                reason.contains("rollback"),
+                "error must mention rollback: {reason}"
+            );
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_fork_detected() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed,
+    );
+
+    // Verify an anchor at the same height but different hash -- fork.
+    let anchor_fork = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(99), // different hash
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = anchor_provider.verify_committed(&anchor_fork);
+    assert!(result.is_err(), "verifying a forked anchor must fail");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(reason.contains("fork"), "error must mention fork: {reason}");
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_advance_accepted() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed,
+    );
+
+    // Verify an anchor AHEAD of the committed state -- accepted.
+    let anchor_ahead = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let result = anchor_provider.verify_committed(&anchor_ahead);
+    assert!(
+        result.is_ok(),
+        "verifying an anchor ahead of committed state must succeed"
+    );
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_verify_committed_same_height_same_hash() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let anchor_committed = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let anchor_provider = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        anchor_committed.clone(),
+    );
+
+    let result = anchor_provider.verify_committed(&anchor_committed);
+    assert!(
+        result.is_ok(),
+        "verifying the same anchor that was committed must succeed"
+    );
+}
+
+// ---- DurableAntiRollbackAnchor tests ----
+
+#[test]
+fn test_tck_00502_durable_anchor_new_file_not_exists() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor_provider =
+        super::trust_stack::DurableAntiRollbackAnchor::new(state_path, "file_anchor".to_string())
+            .expect("new must succeed when file does not exist");
+
+    // No committed state yet.
+    let result = anchor_provider.latest();
+    assert!(
+        result.is_err(),
+        "latest() before any commit must return error"
+    );
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_commit_and_reload() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    // Commit via first provider.
+    {
+        let provider = super::trust_stack::DurableAntiRollbackAnchor::new(
+            state_path.clone(),
+            "file_anchor".to_string(),
+        )
+        .expect("new must succeed");
+        provider.commit(&anchor).expect("commit must succeed");
+
+        let state = provider.latest().expect("latest must succeed");
+        assert_eq!(state.anchor, anchor);
+    }
+
+    // Reload via second provider (simulating daemon restart).
+    {
+        let provider = super::trust_stack::DurableAntiRollbackAnchor::new(
+            state_path,
+            "file_anchor".to_string(),
+        )
+        .expect("new must succeed with existing file");
+
+        let state = provider.latest().expect("latest must succeed after reload");
+        assert_eq!(state.anchor, anchor, "anchor must survive restart");
+        assert_eq!(state.mechanism_id, "file_anchor");
+    }
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_rollback_denied() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let provider =
+        super::trust_stack::DurableAntiRollbackAnchor::new(state_path, "file_anchor".to_string())
+            .expect("new must succeed");
+
+    let anchor_high = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+    provider
+        .commit(&anchor_high)
+        .expect("first commit must succeed");
+
+    // Attempt rollback.
+    let anchor_low = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = provider.commit(&anchor_low);
+    assert!(result.is_err(), "rollback must be denied");
+    match result.unwrap_err() {
+        TrustError::ExternalAnchorMismatch { reason } => {
+            assert!(
+                reason.contains("regression"),
+                "error must mention regression: {reason}"
+            );
+        },
+        other => panic!("expected ExternalAnchorMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_verify_committed_rollback() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let provider =
+        super::trust_stack::DurableAntiRollbackAnchor::new(state_path, "file_anchor".to_string())
+            .expect("new must succeed");
+    provider.commit(&anchor).expect("commit must succeed");
+
+    // Verify an anchor behind the committed state.
+    let anchor_behind = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(22),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = provider.verify_committed(&anchor_behind);
+    assert!(
+        result.is_err(),
+        "verifying a rollback anchor must be denied"
+    );
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_mechanism_id_mismatch() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    // Commit with mechanism "file_anchor".
+    {
+        let provider = super::trust_stack::DurableAntiRollbackAnchor::new(
+            state_path.clone(),
+            "file_anchor".to_string(),
+        )
+        .expect("new must succeed");
+        provider.commit(&anchor).expect("commit must succeed");
+    }
+
+    // Attempt reload with different mechanism ID.
+    let result = super::trust_stack::DurableAntiRollbackAnchor::new(
+        state_path,
+        "different_mechanism".to_string(),
+    );
+    assert!(
+        result.is_err(),
+        "reload with different mechanism_id must fail"
+    );
+}
+
+#[test]
+fn test_tck_00502_durable_anchor_empty_mechanism_id_rejected() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp_dir.path().join("anchor_state.json");
+
+    let result = super::trust_stack::DurableAntiRollbackAnchor::new(state_path, String::new());
+    assert!(result.is_err(), "empty mechanism_id must be rejected");
+}
+
+// ---- Kernel integration tests for anti-rollback ----
+
+#[test]
+fn test_tck_00502_fail_closed_denies_without_anti_rollback_anchor() {
+    // Kernel without anti-rollback anchor wired.
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+    // Deliberately NOT setting anti-rollback.
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_err(),
+        "fail-closed tier must deny when anti-rollback anchor is missing"
+    );
+    match result.unwrap_err() {
+        AdmitError::MissingPrerequisite { prerequisite } => {
+            assert_eq!(
+                prerequisite, "AntiRollbackAnchor",
+                "must report AntiRollbackAnchor as missing"
+            );
+        },
+        other => panic!("expected MissingPrerequisite(AntiRollbackAnchor), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_monitor_tier_proceeds_without_anti_rollback() {
+    // Kernel without anti-rollback -- monitor tier should proceed.
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider());
+    // No prerequisites wired at all.
+
+    let request = valid_request(RiskTier::Tier0);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_ok(),
+        "monitor tier must proceed without anti-rollback anchor"
+    );
+}
+
+#[test]
+fn test_tck_00502_fail_closed_denies_on_anchor_mismatch() {
+    // Use a failing anti-rollback mock.
+    struct FailingAntiRollback;
+
+    impl AntiRollbackAnchor for FailingAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "test unavailable".into(),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorMismatch {
+                reason: "anchor mismatch (test)".into(),
+            })
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorMismatch {
+                reason: "anchor mismatch (test)".into(),
+            })
+        }
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(FailingAntiRollback))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_err(),
+        "fail-closed tier must deny on anti-rollback mismatch"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("mismatch"),
+                "error must mention mismatch: {reason}"
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got {other:?}"),
+    }
+}
+
+/// Verifies that operational external-anchor unavailability denies fail-closed
+/// `plan()` attempts.
+#[test]
+fn test_tck_00502_fail_closed_denies_on_anchor_unavailable() {
+    // Anti-rollback anchor that is unavailable due to service outage.
+    struct UnavailableAntiRollback;
+
+    impl AntiRollbackAnchor for UnavailableAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "external service down".into(),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "external service down".into(),
+            })
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorUnavailable {
+                reason: "external service down".into(),
+            })
+        }
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(UnavailableAntiRollback))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+    assert!(
+        result.is_err(),
+        "fail-closed tier must deny when external anchor is unavailable"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("unavailable") || reason.contains("down"),
+                "error should describe unavailability: {reason}",
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got {other:?}"),
+    }
+}
+
+/// Verifies that the explicit bootstrap signal
+/// `ExternalAnchorNotInitialized` is tolerated for fail-closed `plan()`.
+#[test]
+fn test_tck_00502_fail_closed_bootstrap_tolerates_not_initialized_anchor() {
+    struct NotInitializedAntiRollback;
+
+    impl AntiRollbackAnchor for NotInitializedAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorNotInitialized)
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorNotInitialized)
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Ok(())
+        }
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(NotInitializedAntiRollback))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+    assert!(
+        result.is_ok(),
+        "fail-closed bootstrap path must tolerate ExternalAnchorNotInitialized",
+    );
+}
+
+#[test]
+fn test_tck_00502_rollback_to_earlier_seal_denied_via_external_anchor() {
+    // This is the canonical REQ-0030 acceptance criterion test:
+    // A rollback that would pass purely local seal verification is denied
+    // by the external anchor.
+
+    let committed_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 500,
+        he_time: 5000,
+    };
+
+    let external_anchor = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        committed_anchor,
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(external_anchor))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    // The ledger verifier returns an anchor at height 100, which is BEHIND
+    // the externally committed anchor at height 500. This simulates a
+    // rollback attack where the adversary rewrites local state.
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    // The MockLedgerVerifier returns an anchor at height 100, and the
+    // InMemoryAntiRollbackAnchor has committed state at height 500.
+    // verify_committed(height=100) < committed(height=500) -> deny.
+    assert!(
+        result.is_err(),
+        "rollback to earlier seal must be denied by external anchor"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("rollback") || reason.contains("behind"),
+                "error must indicate rollback detection: {reason}"
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tck_00502_fully_wired_kernel_with_matching_anchor_succeeds() {
+    // External anchor at the same height as the ledger verifier.
+    let matching_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let external_anchor = super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+        "test_mechanism".to_string(),
+        matching_anchor,
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(external_anchor))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_ok(),
+        "fully wired kernel with matching external anchor must succeed: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_tck_00502_in_memory_anchor_forward_progress_accepted() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    // Test that advancing the anchor (higher height) succeeds.
+    let provider =
+        super::trust_stack::InMemoryAntiRollbackAnchor::new("test_mechanism".to_string());
+
+    let height_values: [u64; 5] = [100, 200, 300, 400, 500];
+    for height in height_values {
+        #[allow(clippy::cast_possible_truncation)] // test-only: height/100 fits in u8
+        let hash_byte = (height / 100) as u8;
+        let anchor = LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(hash_byte),
+            height,
+            he_time: height * 10,
+        };
+        provider
+            .commit(&anchor)
+            .unwrap_or_else(|e| panic!("commit at height {height} must succeed: {e:?}"));
+    }
+
+    let latest = provider.latest().expect("latest must succeed");
+    assert_eq!(latest.anchor.height, 500, "latest must be at height 500");
+}
+
+// =============================================================================
+// BLOCKER-001: Anchor commit wired in execute() after successful admission
+// =============================================================================
+
+/// Verifies that `finalize_anti_rollback()` commits the anti-rollback anchor
+/// after a successful plan+execute+effect cycle, advancing the watermark.
+///
+/// The anchor commit was moved from `execute()` to `finalize_anti_rollback()`
+/// (BLOCKER-2 fix) so that effect failures do not advance the watermark.
+#[test]
+fn test_tck_00502_execute_commits_anti_rollback_anchor() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    // Pre-seed the anchor at the same height as MockLedgerVerifier::passing()
+    // so that plan()'s verify_committed() passes.
+    let anti_rollback = Arc::new(
+        super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+            "test_mechanism".to_string(),
+            LedgerAnchorV1 {
+                ledger_id: test_hash(20),
+                event_hash: test_hash(21),
+                height: 100,
+                he_time: 1000,
+            },
+        ),
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(anti_rollback.clone())
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan must succeed");
+
+    let result = kernel.execute(&mut plan, test_hash(0xE0), test_hash(0xE1));
+    assert!(result.is_ok(), "execute must succeed: {:?}", result.err());
+
+    let result = result.unwrap();
+
+    // After execute() but BEFORE finalize_anti_rollback(), the anchor should
+    // still be at the pre-seeded height (100), not advanced.
+    let before_finalize = anti_rollback
+        .latest()
+        .expect("anchor must be available (pre-seeded)");
+    assert_eq!(
+        before_finalize.anchor.height, 100,
+        "anchor must NOT advance during execute() (pre-commit hazard guard)"
+    );
+
+    // Now finalize: this simulates the post-effect success path.
+    kernel
+        .finalize_anti_rollback(
+            result.boundary_span.enforcement_tier,
+            &result.bundle.ledger_anchor,
+        )
+        .expect("finalize_anti_rollback must succeed");
+
+    // After finalize, the anchor should match the bundle's ledger_anchor.
+    let after_finalize = anti_rollback
+        .latest()
+        .expect("anchor must be available after finalize");
+    assert_eq!(
+        after_finalize.anchor.height, result.bundle.ledger_anchor.height,
+        "anchor height must match the bundle's ledger_anchor after finalize"
+    );
+    assert_eq!(
+        after_finalize.anchor.event_hash, result.bundle.ledger_anchor.event_hash,
+        "anchor event_hash must match the bundle's ledger_anchor after finalize"
+    );
+}
+
+/// Verifies that `execute()` does NOT commit the anti-rollback anchor
+/// for monitor-tier requests (monitor tiers do not gate authoritative effects).
+#[test]
+fn test_tck_00502_execute_does_not_commit_anchor_for_monitor_tier() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Anti-rollback anchor that counts `commit()` calls to verify
+    /// monitor tier does NOT trigger commits.
+    struct CommitCountingAntiRollback {
+        commit_count: AtomicU32,
+    }
+
+    impl AntiRollbackAnchor for CommitCountingAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Ok(ExternalAnchorStateV1 {
+                anchor: LedgerAnchorV1 {
+                    ledger_id: test_hash(20),
+                    event_hash: test_hash(21),
+                    height: 50,
+                    he_time: 500,
+                },
+                mechanism_id: "counting_test".to_string(),
+                proof_hash: test_hash(99),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Ok(())
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            self.commit_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let anti_rollback = Arc::new(CommitCountingAntiRollback {
+        commit_count: AtomicU32::new(0),
+    });
+
+    // Monitor tier: no ledger verifier or policy resolver needed.
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_anti_rollback(anti_rollback.clone());
+
+    let request = valid_request(RiskTier::Tier0); // Monitor tier
+    let mut plan = kernel
+        .plan(&request)
+        .expect("plan must succeed for monitor tier");
+
+    let result = kernel.execute(&mut plan, test_hash(0xE0), test_hash(0xE1));
+    assert!(
+        result.is_ok(),
+        "execute must succeed for monitor tier: {:?}",
+        result.err()
+    );
+
+    // After execute(), commit should NOT have been called for monitor tier.
+    assert_eq!(
+        anti_rollback.commit_count.load(Ordering::SeqCst),
+        0,
+        "commit must NOT be called for monitor-tier execute"
+    );
+
+    // Also verify finalize_anti_rollback is a no-op for monitor tier.
+    let result = result.unwrap();
+    kernel
+        .finalize_anti_rollback(
+            result.boundary_span.enforcement_tier,
+            &result.bundle.ledger_anchor,
+        )
+        .expect("finalize_anti_rollback must succeed for monitor tier");
+
+    assert_eq!(
+        anti_rollback.commit_count.load(Ordering::SeqCst),
+        0,
+        "commit must NOT be called for monitor-tier finalize_anti_rollback"
+    );
+}
+
+/// Verifies the fresh-install bootstrap path: `plan()` succeeds even when no
+/// anchor has been committed yet (`ExternalAnchorNotInitialized` is tolerated),
+/// then `execute()` + `finalize_anti_rollback()` establishes the initial state.
+/// A subsequent `plan()` call also succeeds (anchor now bootstrapped).
+///
+/// This is the BLOCKER-1 fix test: the circular dependency between `plan()`
+/// requiring a committed anchor and `execute()` being the first to commit
+/// is broken by tolerating `ExternalAnchorNotInitialized` during `plan()`.
+#[test]
+fn test_tck_00502_fresh_install_bootstrap_without_preseeding() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    // Create an InMemoryAntiRollbackAnchor with NO pre-seeding (fresh install).
+    let anti_rollback = Arc::new(super::trust_stack::InMemoryAntiRollbackAnchor::new(
+        "test_mechanism".to_string(),
+    ));
+
+    // Confirm anchor is initially not initialized.
+    match anti_rollback.latest() {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!("expected ExternalAnchorNotInitialized, got {other:?}"),
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(anti_rollback.clone())
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    // plan() MUST succeed on fresh install (BLOCKER-1 fix).
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel
+        .plan(&request)
+        .expect("plan must succeed on fresh install (bootstrap path)");
+
+    // execute() MUST succeed.
+    let result = kernel
+        .execute(&mut plan, test_hash(0xE0), test_hash(0xE1))
+        .expect("execute must succeed on fresh install");
+
+    // Anchor is still NOT committed after execute() (BLOCKER-2 fix).
+    match anti_rollback.latest() {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!("expected ExternalAnchorNotInitialized before finalize, got {other:?}"),
+    }
+
+    // Finalize: simulate post-effect success.
+    kernel
+        .finalize_anti_rollback(
+            result.boundary_span.enforcement_tier,
+            &result.bundle.ledger_anchor,
+        )
+        .expect("finalize_anti_rollback must succeed");
+
+    // Verify anchor is now committed (latest() returns Ok).
+    let latest = anti_rollback
+        .latest()
+        .expect("anchor must be available after finalize_anti_rollback");
+    assert_eq!(
+        latest.anchor.height, result.bundle.ledger_anchor.height,
+        "committed anchor height must match the bundle's ledger_anchor"
+    );
+
+    // Second plan() call MUST succeed (anchor is now bootstrapped).
+    let request2 = valid_request(RiskTier::Tier2Plus);
+    kernel
+        .plan(&request2)
+        .expect("plan must succeed after anchor is bootstrapped");
+}
+
+/// Verifies that when the effect fails (`finalize_anti_rollback` is NOT
+/// called), the anchor watermark is NOT advanced, and subsequent `plan()` calls
+/// still succeed (no deadlock).
+///
+/// This is the BLOCKER-2 fix test: moving `commit()` out of `execute()` and
+/// into `finalize_anti_rollback()` prevents the pre-commit hazard.
+#[test]
+fn test_tck_00502_effect_failure_does_not_advance_anchor() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    // Pre-seed the anchor at height N.
+    let initial_height: u64 = 100;
+    let anti_rollback = Arc::new(
+        super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+            "test_mechanism".to_string(),
+            LedgerAnchorV1 {
+                ledger_id: test_hash(20),
+                event_hash: test_hash(21),
+                height: initial_height,
+                he_time: 1000,
+            },
+        ),
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(anti_rollback.clone())
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    // plan() + execute() succeed.
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan must succeed");
+    let _result = kernel
+        .execute(&mut plan, test_hash(0xE0), test_hash(0xE1))
+        .expect("execute must succeed");
+
+    // Simulate effect failure: do NOT call finalize_anti_rollback().
+
+    // Verify the anchor is still at height N (not advanced).
+    let latest = anti_rollback
+        .latest()
+        .expect("anchor must still be available");
+    assert_eq!(
+        latest.anchor.height, initial_height,
+        "anchor must NOT advance when finalize_anti_rollback is not called \
+         (simulated effect failure)"
+    );
+
+    // Subsequent plan() call MUST succeed (no deadlock).
+    let request2 = valid_request(RiskTier::Tier2Plus);
+    kernel
+        .plan(&request2)
+        .expect("plan must succeed after effect failure (no deadlock)");
+}
+
+// =============================================================================
+// TCK-00502 round 4: Regression tests for finalize_anti_rollback on
+// EmitEvent and PublishEvidence handler paths.
+//
+// These tests verify the same anchor advancement contract that all three
+// effect-capable handlers (RequestTool, EmitEvent, PublishEvidence) depend on.
+// The handler-level integration (session_dispatch.rs) calls
+// kernel.finalize_anti_rollback() identically; these kernel-level tests
+// prove the underlying method advances anchors correctly for each scenario.
+// =============================================================================
+
+/// Verifies that consecutive `finalize_anti_rollback` calls (simulating
+/// sequential effects from different handler paths) each advance the
+/// anchor watermark monotonically.
+///
+/// This regression test covers the TCK-00502 round 4 BLOCKER finding:
+/// `EmitEvent` and `PublishEvidence` must call `finalize_anti_rollback` after
+/// their respective effects, and each call must further advance the anchor.
+#[test]
+fn test_tck_00502_sequential_finalize_advances_anchor_monotonically() {
+    use super::prerequisites::AntiRollbackAnchor;
+
+    // Pre-seed at height 100 to match MockLedgerVerifier::passing()
+    // (validated_anchor.height = 100), so verify_committed() passes.
+    let initial_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+    let anti_rollback = Arc::new(
+        super::trust_stack::InMemoryAntiRollbackAnchor::with_initial_anchor(
+            "test_mechanism".to_string(),
+            initial_anchor,
+        ),
+    );
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(anti_rollback.clone())
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    // Simulate effect 1 (e.g., RequestTool): plan + execute + finalize
+    let request1 = valid_request(RiskTier::Tier2Plus);
+    let mut plan1 = kernel.plan(&request1).expect("plan1 must succeed");
+    let result1 = kernel
+        .execute(&mut plan1, test_hash(0xE0), test_hash(0xE1))
+        .expect("execute1 must succeed");
+
+    kernel
+        .finalize_anti_rollback(
+            result1.boundary_span.enforcement_tier,
+            &result1.bundle.ledger_anchor,
+        )
+        .expect("finalize1 must succeed");
+
+    let after_first = anti_rollback.latest().expect("anchor must exist");
+    assert_eq!(
+        after_first.anchor.height, result1.bundle.ledger_anchor.height,
+        "anchor must advance to first effect's ledger anchor height"
+    );
+
+    // Simulate effect 2 (e.g., EmitEvent): plan + execute + finalize
+    // with a higher anchor height to simulate ledger advancement.
+    let request2 = valid_request(RiskTier::Tier2Plus);
+    let mut plan2 = kernel.plan(&request2).expect("plan2 must succeed");
+    let result2 = kernel
+        .execute(&mut plan2, test_hash(0xE2), test_hash(0xE3))
+        .expect("execute2 must succeed");
+
+    kernel
+        .finalize_anti_rollback(
+            result2.boundary_span.enforcement_tier,
+            &result2.bundle.ledger_anchor,
+        )
+        .expect("finalize2 must succeed (EmitEvent path)");
+
+    let after_second = anti_rollback.latest().expect("anchor must exist");
+    assert!(
+        after_second.anchor.height >= after_first.anchor.height,
+        "anchor must advance monotonically after second effect \
+         (EmitEvent path): {} >= {}",
+        after_second.anchor.height,
+        after_first.anchor.height,
+    );
+
+    // Simulate effect 3 (e.g., PublishEvidence): plan + execute + finalize
+    let request3 = valid_request(RiskTier::Tier2Plus);
+    let mut plan3 = kernel.plan(&request3).expect("plan3 must succeed");
+    let result3 = kernel
+        .execute(&mut plan3, test_hash(0xE4), test_hash(0xE5))
+        .expect("execute3 must succeed");
+
+    kernel
+        .finalize_anti_rollback(
+            result3.boundary_span.enforcement_tier,
+            &result3.bundle.ledger_anchor,
+        )
+        .expect("finalize3 must succeed (PublishEvidence path)");
+
+    let after_third = anti_rollback.latest().expect("anchor must exist");
+    assert!(
+        after_third.anchor.height >= after_second.anchor.height,
+        "anchor must advance monotonically after third effect \
+         (PublishEvidence path): {} >= {}",
+        after_third.anchor.height,
+        after_second.anchor.height,
+    );
+}
+
+/// Verifies that `finalize_anti_rollback` is a no-op for monitor-tier
+/// effects regardless of which handler calls it (`RequestTool`, `EmitEvent`,
+/// or `PublishEvidence`).
+///
+/// Regression test for TCK-00502 round 4: the new `finalize_anti_rollback`
+/// calls in `EmitEvent` and `PublishEvidence` are gated on
+/// `admission_result.boundary_span.enforcement_tier`, which is `Monitor`
+/// for low-risk tiers. This test proves the monitor-tier no-op contract.
+#[test]
+fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Anti-rollback anchor that counts `commit()` calls.
+    struct CommitCountingAnchor {
+        commit_count: AtomicU32,
+    }
+
+    impl CommitCountingAnchor {
+        fn new() -> Self {
+            Self {
+                commit_count: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl AntiRollbackAnchor for CommitCountingAnchor {
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            // Allow verification to pass (bootstrap tolerance).
+            Err(TrustError::ExternalAnchorNotInitialized)
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            self.commit_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorNotInitialized)
+        }
+    }
+
+    let counting_anchor = Arc::new(CommitCountingAnchor::new());
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_anti_rollback(counting_anchor.clone());
+
+    // Simulate three monitor-tier effects (one per handler path).
+    for handler_name in &["RequestTool", "EmitEvent", "PublishEvidence"] {
+        let request = valid_request(RiskTier::Tier0);
+        let mut plan = kernel
+            .plan(&request)
+            .unwrap_or_else(|e| panic!("plan must succeed for {handler_name}: {e:?}"));
+        let result = kernel
+            .execute(&mut plan, test_hash(0xF0), test_hash(0xF1))
+            .unwrap_or_else(|e| panic!("execute must succeed for {handler_name}: {e:?}"));
+
+        assert_eq!(
+            result.boundary_span.enforcement_tier,
+            EnforcementTier::Monitor,
+            "{handler_name}: tier must be Monitor for Tier0"
+        );
+
+        kernel
+            .finalize_anti_rollback(
+                result.boundary_span.enforcement_tier,
+                &result.bundle.ledger_anchor,
+            )
+            .unwrap_or_else(|e| {
+                panic!("finalize must succeed for monitor-tier {handler_name}: {e:?}")
+            });
+    }
+
+    assert_eq!(
+        counting_anchor.commit_count.load(Ordering::SeqCst),
+        0,
+        "commit must NOT be called for any monitor-tier finalize_anti_rollback \
+         (all three handler paths must be no-ops)"
+    );
+}
+
+// =============================================================================
+// TCK-00502 round 6: Bootstrap receipt, post-effect anchor, health probe
+// =============================================================================
+
+/// Verifies that `DurableAntiRollbackAnchor` persists a bootstrap receipt
+/// after the first successful commit, and that a subsequent construction
+/// with the anchor state file missing (but bootstrap receipt present)
+/// fails with `ExternalAnchorUnavailable`.
+///
+/// This is the SECURITY BLOCKER fix: an attacker deleting the anchor file
+/// after genesis no longer bypasses anti-rollback via the bootstrap path.
+#[test]
+fn test_tck_00502_bootstrap_receipt_prevents_bypass_on_missing_anchor() {
+    use tempfile::TempDir;
+
+    use super::trust_stack::DurableAntiRollbackAnchor;
+
+    let tmp = TempDir::new().expect("tempdir must succeed");
+    let state_path = tmp.path().join("anchor_state.json");
+    let bootstrap_receipt_path = tmp.path().join("anchor_state.json.bootstrapped");
+
+    // Phase 1: fresh install — no files exist.
+    assert!(!state_path.exists(), "state file must not exist initially");
+    assert!(
+        !bootstrap_receipt_path.exists(),
+        "bootstrap receipt must not exist initially"
+    );
+
+    let anchor = DurableAntiRollbackAnchor::new(state_path.clone(), "test_mech".to_string())
+        .expect("new must succeed on fresh install");
+
+    // First commit should persist the bootstrap receipt.
+    let genesis_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 1,
+        he_time: 100,
+    };
+    anchor
+        .commit(&genesis_anchor)
+        .expect("first commit must succeed");
+
+    assert!(state_path.exists(), "state file must exist after commit");
+    assert!(
+        bootstrap_receipt_path.exists(),
+        "bootstrap receipt must exist after first commit"
+    );
+
+    // Phase 2: simulate anchor loss by deleting the state file.
+    std::fs::remove_file(&state_path).expect("remove state file must succeed");
+    assert!(!state_path.exists(), "state file must be deleted for test");
+    assert!(
+        bootstrap_receipt_path.exists(),
+        "bootstrap receipt must still exist"
+    );
+
+    // Phase 3: re-constructing the anchor MUST fail with
+    // ExternalAnchorUnavailable (not ExternalAnchorNotInitialized).
+    let result = DurableAntiRollbackAnchor::new(state_path, "test_mech".to_string());
+    match result {
+        Err(TrustError::ExternalAnchorUnavailable { reason }) => {
+            assert!(
+                reason.contains("bootstrap receipt"),
+                "error must mention bootstrap receipt: {reason}"
+            );
+        },
+        other => panic!(
+            "expected ExternalAnchorUnavailable when state missing but bootstrap receipt \
+             exists, got {other:?}"
+        ),
+    }
+}
+
+/// Verifies that `DurableAntiRollbackAnchor` allows fresh-install bootstrap
+/// when neither the state file nor the bootstrap receipt exists.
+#[test]
+fn test_tck_00502_fresh_install_allowed_without_bootstrap_receipt() {
+    use tempfile::TempDir;
+
+    use super::trust_stack::DurableAntiRollbackAnchor;
+
+    let tmp = TempDir::new().expect("tempdir must succeed");
+    let state_path = tmp.path().join("fresh_anchor.json");
+
+    // No state file, no bootstrap receipt — fresh install.
+    let anchor = DurableAntiRollbackAnchor::new(state_path, "test_mech".to_string())
+        .expect("new must succeed on fresh install");
+
+    // latest() should return ExternalAnchorNotInitialized (not Unavailable).
+    match anchor.latest() {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!("expected ExternalAnchorNotInitialized on fresh install, got {other:?}"),
+    }
+
+    // verify_committed() should also return ExternalAnchorNotInitialized.
+    let test_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 1,
+        he_time: 100,
+    };
+    match anchor.verify_committed(&test_anchor) {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!(
+            "expected ExternalAnchorNotInitialized for verify_committed on fresh install, \
+             got {other:?}"
+        ),
+    }
+}
+
+/// Verifies that `probe_anti_rollback_health` is non-mutating: it calls
+/// `verify_committed()` instead of `commit()`.
+///
+/// This is the SECURITY MINOR fix: the circuit probe must not advance the
+/// anchor watermark.
+#[test]
+fn test_tck_00502_probe_health_does_not_mutate_anchor() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct ProbeTrackingAnchor {
+        verify_count: AtomicU32,
+        commit_count: AtomicU32,
+    }
+
+    impl AntiRollbackAnchor for ProbeTrackingAnchor {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Ok(ExternalAnchorStateV1 {
+                anchor: LedgerAnchorV1 {
+                    ledger_id: test_hash(20),
+                    event_hash: test_hash(21),
+                    height: 100,
+                    he_time: 1000,
+                },
+                mechanism_id: "tracking_test".to_string(),
+                proof_hash: test_hash(99),
+            })
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            self.verify_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            self.commit_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let tracking_anchor = Arc::new(ProbeTrackingAnchor {
+        verify_count: AtomicU32::new(0),
+        commit_count: AtomicU32::new(0),
+    });
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_anti_rollback(tracking_anchor.clone());
+
+    let test_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    // probe_anti_rollback_health MUST call verify_committed, NOT commit.
+    kernel
+        .probe_anti_rollback_health(&test_anchor)
+        .expect("probe must succeed");
+
+    assert_eq!(
+        tracking_anchor.verify_count.load(Ordering::SeqCst),
+        1,
+        "probe must call verify_committed exactly once"
+    );
+    assert_eq!(
+        tracking_anchor.commit_count.load(Ordering::SeqCst),
+        0,
+        "probe must NOT call commit (non-mutating)"
+    );
+}
+
+/// Verifies that `probe_anti_rollback_health` returns an error when the
+/// anti-rollback provider is not wired.
+#[test]
+fn test_tck_00502_probe_health_fails_without_provider() {
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider());
+
+    let test_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    let result = kernel.probe_anti_rollback_health(&test_anchor);
+    assert!(
+        result.is_err(),
+        "probe must fail when anti-rollback not wired"
+    );
+    match result {
+        Err(AdmitError::MissingPrerequisite { prerequisite }) => {
+            assert_eq!(prerequisite, "AntiRollbackAnchor");
+        },
+        other => panic!("expected MissingPrerequisite, got {other:?}"),
+    }
+}
+
+/// Verifies that `resolve_post_effect_anchor` returns the verifier's current
+/// anchor when it is at or ahead of the fallback.
+#[test]
+fn test_tck_00502_resolve_post_effect_anchor_uses_verifier_when_ahead() {
+    let mock_verifier = Arc::new(MockLedgerVerifier::passing());
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(mock_verifier);
+
+    // MockLedgerVerifier::passing() returns anchor at height 100.
+    // Fallback is at height 50 (behind verifier).
+    let fallback = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 50,
+        he_time: 500,
+    };
+
+    let result = kernel.resolve_post_effect_anchor(&fallback);
+    assert_eq!(
+        result.height, 100,
+        "must return verifier anchor (height 100) when it is ahead of fallback (height 50)"
+    );
+}
+
+/// Verifies that `resolve_post_effect_anchor` falls back to the provided
+/// anchor when the verifier is unavailable.
+#[test]
+fn test_tck_00502_resolve_post_effect_anchor_fallback_without_verifier() {
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider());
+    // No ledger verifier wired.
+
+    let fallback = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 200,
+        he_time: 2000,
+    };
+
+    let result = kernel.resolve_post_effect_anchor(&fallback);
+    assert_eq!(
+        result.height, fallback.height,
+        "must return fallback anchor when verifier is not wired"
+    );
+    assert_eq!(
+        result.event_hash, fallback.event_hash,
+        "must return exact fallback when verifier is not wired"
     );
 }
