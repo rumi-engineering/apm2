@@ -271,6 +271,11 @@ Commands surface daemon errors and exit non-zero on failure.
 
 ## Related Modules
 
+## TCK-00536 Security Posture Update
+
+- Added FAC root preflight validation (`run_fac`) to enforce `private/fac` hierarchy ownership and mode checks before executing FAC commands.
+- New `fac_permissions` helper module is now part of command-level security hardening for directory/file creation under FAC paths.
+
 - [`apm2_core::config`](../apm2-core/src/config/AGENTS.md) - `EcosystemConfig` for socket path resolution
 - [`apm2_daemon`](../apm2-daemon/AGENTS.md) - Server-side implementation
 

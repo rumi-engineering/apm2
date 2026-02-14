@@ -60,11 +60,11 @@ pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
-pub use types::ReviewRunType;
 use types::{
     DispatchSummary, ProjectionStatus, ReviewKind, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
     TERMINATE_TIMEOUT, is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
 };
+pub use types::{ReviewRunType, apm2_home_dir};
 
 use crate::exit_codes::codes as exit_codes;
 
@@ -1685,7 +1685,8 @@ mod tests {
         comment_id: u64,
     ) {
         let pr_dir = projection_pr_dir_for_home(home, owner_repo, pr_number);
-        std::fs::create_dir_all(&pr_dir).expect("create projection pr dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&pr_dir)
+            .expect("create projection pr dir");
         let dimension = if review_type.eq_ignore_ascii_case("quality") {
             "code-quality"
         } else {
@@ -2413,6 +2414,13 @@ mod tests {
     #[test]
     fn test_pulse_file_roundtrip() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("set temp pulse dir permissions");
+        }
         let path = temp_dir.path().join("review_pulse_security.json");
         write_pulse_file_to_path(&path, "0123456789abcdef").expect("write pulse");
         let pulse = read_pulse_file_from_path(&path)

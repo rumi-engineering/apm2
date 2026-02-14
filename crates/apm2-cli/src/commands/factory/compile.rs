@@ -635,7 +635,7 @@ impl CompilePipeline {
             .join("manifests");
 
         if !self.dry_run {
-            std::fs::create_dir_all(&manifest_dir)
+            crate::commands::fac_permissions::ensure_dir_with_mode(&manifest_dir)
                 .context("Failed to create manifest directory")?;
 
             // Write manifest atomically using temp file + persist

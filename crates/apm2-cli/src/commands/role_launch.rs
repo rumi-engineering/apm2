@@ -874,7 +874,7 @@ fn store_bytes_in_cas(
     let hash = *blake3::hash(bytes).as_bytes();
     let object_path = cas_object_path(cas_path, &hash);
     if let Some(parent) = object_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
+        crate::commands::fac_permissions::ensure_dir_with_mode(parent).map_err(|error| {
             RoleLaunchError::internal(format!(
                 "failed to create CAS object directory '{}': {error}",
                 parent.display()
@@ -1573,7 +1573,8 @@ mod tests {
     fn setup_test_env() -> TestEnv {
         let tempdir = tempfile::TempDir::new().expect("temp dir should create");
         let cas_path = tempdir.path().join("cas");
-        fs::create_dir_all(cas_path.join("objects")).expect("CAS objects dir should create");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&cas_path.join("objects"))
+            .expect("CAS objects dir should create");
 
         let ledger_path = tempdir.path().join("ledger.db");
         let ledger = Ledger::open(&ledger_path).expect("ledger should open");
