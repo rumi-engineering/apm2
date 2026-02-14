@@ -38,6 +38,31 @@ pub(super) struct ProjectionIdentityRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectionIdentitySnapshot {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub head_sha: String,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub source: String,
+    pub updated_at: String,
+}
+
+impl From<ProjectionIdentityRecord> for ProjectionIdentitySnapshot {
+    fn from(value: ProjectionIdentityRecord) -> Self {
+        Self {
+            owner_repo: value.owner_repo,
+            pr_number: value.pr_number,
+            head_sha: value.head_sha,
+            branch: value.branch,
+            worktree: value.worktree,
+            source: value.source,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BranchHintRecord {
@@ -218,6 +243,13 @@ pub(super) fn load_pr_identity(
     pr_number: u32,
 ) -> Result<Option<ProjectionIdentityRecord>, String> {
     read_json_optional(&identity_path(owner_repo, pr_number)?)
+}
+
+pub fn load_pr_identity_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<ProjectionIdentitySnapshot>, String> {
+    Ok(load_pr_identity(owner_repo, pr_number)?.map(ProjectionIdentitySnapshot::from))
 }
 
 pub(super) fn load_branch_identity(

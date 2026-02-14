@@ -130,6 +130,33 @@ struct DimensionDecisionView {
     sha: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VerdictProjectionDimensionSnapshot {
+    pub dimension: String,
+    pub decision: String,
+    pub reviewed_sha: String,
+    pub reason: String,
+    pub reviewed_by: String,
+    pub reviewed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VerdictProjectionSnapshot {
+    pub schema: String,
+    pub pr_number: u32,
+    pub head_sha: String,
+    pub overall_decision: String,
+    pub fail_closed: bool,
+    pub dimensions: Vec<VerdictProjectionDimensionSnapshot>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_comment_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_comment_url: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectionCompletionSignal {
     pub decision: String,
@@ -213,6 +240,76 @@ pub fn run_verdict_show(
     } else {
         Ok(exit_codes::SUCCESS)
     }
+}
+
+pub fn load_verdict_projection_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<Option<VerdictProjectionSnapshot>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let home = super::types::apm2_home_dir()?;
+    let Some(record) = load_decision_projection_for_home(&home, owner_repo, pr_number, head_sha)?
+    else {
+        return Ok(None);
+    };
+
+    let mut errors = Vec::new();
+    let mut dimensions = Vec::with_capacity(ACTIVE_DIMENSIONS.len());
+    for dimension in ACTIVE_DIMENSIONS {
+        let entry = record.dimensions.get(dimension);
+        let Some(entry) = entry else {
+            dimensions.push(VerdictProjectionDimensionSnapshot {
+                dimension: (*dimension).to_string(),
+                decision: "pending".to_string(),
+                reviewed_sha: record.head_sha.clone(),
+                reason: String::new(),
+                reviewed_by: String::new(),
+                reviewed_at: String::new(),
+            });
+            continue;
+        };
+        let decision = normalize_decision_value(&entry.decision).map_or_else(
+            || {
+                errors.push(format!(
+                    "invalid decision `{}` for dimension `{dimension}`",
+                    entry.decision
+                ));
+                "pending".to_string()
+            },
+            ToString::to_string,
+        );
+        dimensions.push(VerdictProjectionDimensionSnapshot {
+            dimension: dimension.to_string(),
+            decision,
+            reviewed_sha: record.head_sha.clone(),
+            reason: entry.reason.clone(),
+            reviewed_by: entry.set_by.clone(),
+            reviewed_at: entry.set_at.clone(),
+        });
+    }
+
+    let overall_decision = aggregate_verdict_projection_overall_decision(&dimensions).to_string();
+    Ok(Some(VerdictProjectionSnapshot {
+        schema: DECISION_SCHEMA.to_string(),
+        pr_number: record.pr_number,
+        head_sha: record.head_sha,
+        overall_decision,
+        fail_closed: !errors.is_empty(),
+        dimensions,
+        errors,
+        source_comment_id: if record.decision_comment_id == 0 {
+            None
+        } else {
+            Some(record.decision_comment_id)
+        },
+        source_comment_url: if record.decision_comment_url.trim().is_empty() {
+            None
+        } else {
+            Some(record.decision_comment_url.clone())
+        },
+        updated_at: record.updated_at,
+    }))
 }
 
 pub fn persist_verdict_projection(
@@ -916,6 +1013,25 @@ fn aggregate_overall_decision(dimensions: &[DimensionDecisionView]) -> &'static 
     if decisions.contains("deny") {
         "deny"
     } else if decisions.contains("unknown") {
+        "pending"
+    } else if decisions.contains("approve") && decisions.len() == 1 {
+        "approve"
+    } else {
+        "pending"
+    }
+}
+
+fn aggregate_verdict_projection_overall_decision(
+    dimensions: &[VerdictProjectionDimensionSnapshot],
+) -> &'static str {
+    let decisions = dimensions
+        .iter()
+        .map(|value| value.decision.as_str())
+        .collect::<BTreeSet<_>>();
+
+    if decisions.contains("deny") {
+        "deny"
+    } else if decisions.contains("pending") {
         "pending"
     } else if decisions.contains("approve") && decisions.len() == 1 {
         "approve"

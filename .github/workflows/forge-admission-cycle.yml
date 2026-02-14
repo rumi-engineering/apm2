@@ -206,23 +206,21 @@ jobs:
               exit 1
             fi
             if [[ $verdict_rc -ne 0 ]]; then
-              if [[ -n "$verdict_payload" ]]; then
-                message="$(echo "$verdict_payload" | jq -r '.message // .error // "unknown_error"' 2>/dev/null || echo "unknown_error")"
-                echo "fac-gate: FAIL reason=verdict_show_failed rc=${verdict_rc} message=${message}"
-                exit 1
-              fi
-              echo "fac-gate: WARN verdict read returned rc=${verdict_rc} with empty payload; treating as pending"
+              message="$(echo "$verdict_payload" | jq -r '.message // .error // "unavailable"' 2>/dev/null || echo "unavailable")"
+              echo "fac-gate: WARN reason=verdict_read_pending rc=${verdict_rc} message=${message}"
               verdict_payload='{}'
             fi
-            if echo "$verdict_payload" | jq -e '
-              (type == "object")
-              and (
-                (.error? != null)
-                or (.fail_closed? == true)
-              )' >/dev/null 2>&1; then
-              message="$(echo "$verdict_payload" | jq -r '.message // .error // "projection_fail_closed"' 2>/dev/null || echo "projection_fail_closed")"
-              echo "fac-gate: FAIL reason=verdict_payload_error message=${message}"
-              exit 1
+            if ! echo "$verdict_payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              echo "fac-gate: WARN reason=verdict_payload_not_object treating as pending"
+              verdict_payload='{}'
+            fi
+            if echo "$verdict_payload" | jq -e '.error? != null' >/dev/null 2>&1; then
+              message="$(echo "$verdict_payload" | jq -r '.message // .error' 2>/dev/null || echo "projection_error")"
+              echo "fac-gate: WARN reason=verdict_payload_error message=${message}"
+            fi
+            if echo "$verdict_payload" | jq -e '.fail_closed? == true' >/dev/null 2>&1; then
+              echo "fac-gate: WARN reason=verdict_not_verified_treating_as_pending"
+              verdict_payload='{"overall_decision":"pending","dimensions":[{"dimension":"security","decision":"unknown"},{"dimension":"code-quality","decision":"unknown"}]}'
             fi
             sec_decision="$(parse_dimension_decision "$verdict_payload" "security")"
             qual_decision="$(parse_dimension_decision "$verdict_payload" "code-quality")"

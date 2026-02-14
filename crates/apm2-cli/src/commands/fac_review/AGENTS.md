@@ -17,18 +17,16 @@ apm2 fac review run --pr <N> --type all
        |      +-- backend.rs      (model backend selection: Codex / Gemini / ClaudeCode)
        |      +-- model_pool.rs   (fallback model pool with priority)
        |      +-- liveness.rs     (stall detection via pulse files)
-       |      +-- selector.rs     (review model selection logic)
        |      +-- restart.rs      (CI-state-aware pipeline restart)
        |      +-- merge_conflicts.rs (merge conflict detection)
-       |      +-- worktree.rs     (SHA-to-worktree resolution for detached dispatch)
-       |      +-- timeout_policy.rs (uniform bounded test timeout policy)
+        |      +-- timeout_policy.rs (uniform bounded test timeout policy)
        |
        +-- state.rs          (ReviewStateFile persistence, pulse files, locking)
        +-- types.rs          (shared types, constants, utility functions)
        +-- events.rs         (NDJSON lifecycle telemetry)
        +-- barrier.rs        (GitHub helper primitives: auth/head/metadata rendering)
        +-- ci_status.rs      (CI check-suite status querying)
-       +-- decision.rs       (review verdict set/show)
+       +-- decision.rs       (legacy verdict set/show compatibility helpers)
        +-- detection.rs      (review detection from PR comments)
        +-- evidence.rs       (evidence artifact collection)
        +-- findings.rs       (review findings aggregation)
@@ -227,7 +225,7 @@ pub struct ProjectionStatus { pub security: String, pub quality: String, pub ter
 ### Re-exports
 
 ```rust
-pub use decision::VerdictValueArg;
+pub use lifecycle::VerdictValueArg;
 pub use types::ReviewRunType;
 ```
 

@@ -277,6 +277,10 @@ pub struct WorkArgs {
 /// Arguments for `apm2 fac doctor`.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    /// Target pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
     /// Output in JSON format.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -1475,13 +1479,21 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Doctor(args) => {
-            match crate::commands::daemon::doctor(
-                operator_socket,
-                config_path,
-                json_output || args.json,
-            ) {
-                Ok(()) => exit_codes::SUCCESS,
-                Err(_) => exit_codes::GENERIC_ERROR,
+            if let Some(pr) = args.pr {
+                let repo = match derive_fac_repo_or_exit(json_output || args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_doctor(&repo, pr, json_output || args.json)
+            } else {
+                match crate::commands::daemon::doctor(
+                    operator_socket,
+                    config_path,
+                    json_output || args.json,
+                ) {
+                    Ok(()) => exit_codes::SUCCESS,
+                    Err(_) => exit_codes::GENERIC_ERROR,
+                }
             }
         },
         FacSubcommand::Services(args) => match &args.subcommand {

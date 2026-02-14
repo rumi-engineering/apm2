@@ -70,7 +70,6 @@ pub enum PrLifecycleState {
     VerdictApprove,
     VerdictDeny,
     MergeReady,
-    Merged,
     Stuck,
     Stale,
     Recovering,
@@ -91,7 +90,6 @@ impl PrLifecycleState {
             Self::VerdictApprove => "verdict_approve",
             Self::VerdictDeny => "verdict_deny",
             Self::MergeReady => "merge_ready",
-            Self::Merged => "merged",
             Self::Stuck => "stuck",
             Self::Stale => "stale",
             Self::Recovering => "recovering",
@@ -152,6 +150,62 @@ impl TrackedAgentState {
     const fn is_active(self) -> bool {
         matches!(self, Self::Dispatched | Self::Running)
     }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispatched => "dispatched",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Crashed => "crashed",
+            Self::Reaped => "reaped",
+            Self::Stuck => "stuck",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrLifecycleSnapshot {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub current_sha: String,
+    pub pr_state: String,
+    pub updated_at: String,
+    pub time_in_state_seconds: i64,
+    pub error_budget_used: u32,
+    pub retry_budget_remaining: u32,
+    pub last_event_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRegistrySnapshotEntry {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub agent_type: String,
+    pub state: String,
+    pub run_id: String,
+    pub sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pid_alive: bool,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
+    pub completion_token_hash: String,
+    pub completion_token_expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRegistrySnapshot {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub max_active_agents_per_pr: usize,
+    pub active_agents: usize,
+    pub total_agents: usize,
+    pub entries: Vec<AgentRegistrySnapshotEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -647,6 +701,28 @@ fn bind_pr_lifecycle_record_integrity(state: &mut PrLifecycleRecord) -> Result<(
     Ok(())
 }
 
+fn verify_pr_lifecycle_record_integrity_without_rotation(
+    state: &PrLifecycleRecord,
+) -> Result<(), String> {
+    let Some(stored) = state.integrity_hmac.as_deref() else {
+        return Ok(());
+    };
+    let secret = read_secret_hex_bytes(&pr_state_secret_path(&state.owner_repo, state.pr_number)?)?
+        .ok_or_else(|| {
+            format!(
+                "missing lifecycle integrity secret for {} PR #{}",
+                state.owner_repo, state.pr_number
+            )
+        })?;
+    let payload = pr_state_binding_payload(state)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    let matches = verify_hmac(stored, &computed)?;
+    if !matches {
+        return Err("lifecycle state integrity check failed".to_string());
+    }
+    Ok(())
+}
+
 fn bind_registry_integrity(registry: &mut AgentRegistry) -> Result<(), String> {
     let secret = read_or_rotate_secret(&registry_secret_path()?)?;
     let payload = registry_binding_payload(registry)?;
@@ -659,6 +735,21 @@ fn bind_registry_integrity(registry: &mut AgentRegistry) -> Result<(), String> {
         return Ok(());
     }
     registry.integrity_hmac = Some(computed);
+    Ok(())
+}
+
+fn verify_registry_integrity_without_rotation(registry: &AgentRegistry) -> Result<(), String> {
+    let Some(stored) = registry.integrity_hmac.as_deref() else {
+        return Ok(());
+    };
+    let secret = read_secret_hex_bytes(&registry_secret_path()?)?
+        .ok_or_else(|| "missing agent registry integrity secret".to_string())?;
+    let payload = registry_binding_payload(registry)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    let matches = verify_hmac(stored, &computed)?;
+    if !matches {
+        return Err("agent registry integrity check failed".to_string());
+    }
     Ok(())
 }
 
@@ -959,6 +1050,79 @@ fn load_pr_state(owner_repo: &str, pr_number: u32, sha: &str) -> Result<PrLifecy
     load_pr_state_with_recovery(owner_repo, pr_number, sha, false)
 }
 
+fn load_pr_state_for_readonly(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<PrLifecycleRecord>, String> {
+    let path = pr_state_path(owner_repo, pr_number)?;
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read lifecycle state {}: {err}",
+                path.display()
+            ));
+        },
+    };
+
+    let record = serde_json::from_slice::<PrLifecycleRecord>(&bytes)
+        .map_err(|err| format!("failed to parse lifecycle state {}: {err}", path.display()))?;
+    if record.schema != PR_STATE_SCHEMA {
+        return Err(format!(
+            "unexpected lifecycle state schema {} at {}",
+            record.schema,
+            path.display()
+        ));
+    }
+    if !record.owner_repo.eq_ignore_ascii_case(owner_repo) {
+        return Err(format!(
+            "lifecycle state owner mismatch at {}: expected {owner_repo}, got {}",
+            path.display(),
+            record.owner_repo
+        ));
+    }
+    if record.pr_number != pr_number {
+        return Err(format!(
+            "lifecycle state PR mismatch at {}: expected #{pr_number}, got #{}",
+            path.display(),
+            record.pr_number
+        ));
+    }
+
+    validate_expected_head_sha(&record.current_sha)?;
+    verify_pr_lifecycle_record_integrity_without_rotation(&record)?;
+    Ok(Some(record))
+}
+
+pub fn load_pr_lifecycle_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<PrLifecycleSnapshot>, String> {
+    let Some(record) = load_pr_state_for_readonly(owner_repo, pr_number)? else {
+        return Ok(None);
+    };
+
+    let time_in_state_seconds = parse_utc(&record.updated_at).map_or(0, |updated_at| {
+        (Utc::now() - updated_at)
+            .to_std()
+            .ok()
+            .map_or(0, |duration| duration.as_secs().try_into().unwrap_or(0))
+    });
+
+    Ok(Some(PrLifecycleSnapshot {
+        owner_repo: record.owner_repo,
+        pr_number: record.pr_number,
+        current_sha: record.current_sha,
+        pr_state: record.pr_state.as_str().to_string(),
+        updated_at: record.updated_at,
+        time_in_state_seconds,
+        error_budget_used: record.error_budget_used,
+        retry_budget_remaining: record.retry_budget_remaining,
+        last_event_seq: record.last_event_seq,
+    }))
+}
+
 fn load_pr_state_for_recover(
     owner_repo: &str,
     pr_number: u32,
@@ -1021,6 +1185,77 @@ fn load_registry() -> Result<AgentRegistry, String> {
     apply_registry_retention(&mut parsed);
     parsed.updated_at = now_iso8601();
     Ok(parsed)
+}
+
+fn load_registry_without_integrity_mutation() -> Result<AgentRegistry, String> {
+    let path = registry_path()?;
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentRegistry::default());
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to read agent registry {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let parsed: AgentRegistry = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("failed to parse agent registry {}: {err}", path.display()))?;
+    if parsed.schema != AGENT_REGISTRY_SCHEMA {
+        return Err(format!(
+            "unexpected agent registry schema {} at {}",
+            parsed.schema,
+            path.display()
+        ));
+    }
+    verify_registry_integrity_without_rotation(&parsed)?;
+    Ok(parsed)
+}
+
+pub fn load_agent_registry_snapshot_for_pr(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<AgentRegistrySnapshot, String> {
+    let registry = load_registry_without_integrity_mutation()?;
+    let owner_repo = owner_repo.to_ascii_lowercase();
+
+    let mut entries = Vec::new();
+    let mut active_agents = 0usize;
+    for entry in registry.entries.iter().filter(|entry| {
+        entry.owner_repo.eq_ignore_ascii_case(&owner_repo) && entry.pr_number == pr_number
+    }) {
+        if entry.state.is_active() {
+            active_agents = active_agents.saturating_add(1);
+        }
+        let pid_alive = entry.pid.is_some_and(state::is_process_alive);
+        entries.push(AgentRegistrySnapshotEntry {
+            owner_repo: entry.owner_repo.clone(),
+            pr_number: entry.pr_number,
+            agent_type: entry.agent_type.as_str().to_string(),
+            state: entry.state.as_str().to_string(),
+            run_id: entry.run_id.clone(),
+            sha: entry.sha.clone(),
+            pid: entry.pid,
+            pid_alive,
+            started_at: entry.started_at.clone(),
+            completed_at: entry.completed_at.clone(),
+            completion_status: entry.completion_status.clone(),
+            completion_summary: entry.completion_summary.clone(),
+            completion_token_hash: entry.completion_token_hash.clone(),
+            completion_token_expires_at: entry.token_expires_at.clone(),
+        });
+    }
+
+    Ok(AgentRegistrySnapshot {
+        owner_repo,
+        pr_number,
+        max_active_agents_per_pr: MAX_ACTIVE_AGENTS_PER_PR,
+        active_agents,
+        total_agents: entries.len(),
+        entries,
+    })
 }
 
 fn apply_event_to_record(
@@ -1118,8 +1353,9 @@ fn save_registry(registry: &AgentRegistry) -> Result<PathBuf, String> {
 }
 
 fn token_ttl() -> Duration {
-    let secs = std::env::var("APM2_FAC_DONE_TOKEN_TTL_SECS")
+    let secs = std::env::var("APM2_FAC_AGENT_REGISTRY_TOKEN_TTL_SECS")
         .ok()
+        .or_else(|| std::env::var("APM2_FAC_DONE_TOKEN_TTL_SECS").ok())
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_TOKEN_TTL_SECS);
@@ -1251,7 +1487,7 @@ fn next_state_for_event(
             | S::Stuck
             | S::Stale
             | S::Recovering => Ok(S::Pushed),
-            _ => Err(format!(
+            S::Quarantined => Err(format!(
                 "illegal transition: {} + push_observed",
                 state.pr_state.as_str()
             )),
@@ -1407,7 +1643,7 @@ pub fn ensure_machine_artifact() -> Result<PathBuf, String> {
             "pr_lifecycle": [
                 "untracked","pushed","gates_running","gates_passed","gates_failed",
                 "reviews_dispatched","review_in_progress","verdict_pending",
-                "verdict_approve","verdict_deny","merge_ready","merged",
+                "verdict_approve","verdict_deny","merge_ready",
                 "stuck","stale","recovering","quarantined"
             ],
             "agent_lifecycle": [

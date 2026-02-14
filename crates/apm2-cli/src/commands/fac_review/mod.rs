@@ -50,6 +50,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 // Re-export public API for use by `fac.rs`
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
@@ -59,6 +60,7 @@ pub use finding::{
 };
 pub use lifecycle::VerdictValueArg;
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
+use serde::Serialize;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
@@ -70,6 +72,92 @@ use types::{
 };
 
 use crate::exit_codes::codes as exit_codes;
+
+const DOCTOR_SCHEMA: &str = "apm2.fac.review.doctor.v1";
+const DOCTOR_STALE_GATE_AGE_SECONDS: i64 = 6 * 60 * 60;
+
+#[derive(Debug, Serialize)]
+struct DoctorHealthItem {
+    severity: &'static str,
+    message: String,
+    remediation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorIdentitySnapshot {
+    pr_number: u32,
+    branch: Option<String>,
+    worktree: Option<String>,
+    source: Option<String>,
+    local_sha: Option<String>,
+    updated_at: Option<String>,
+    remote_head_sha: Option<String>,
+    stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorLifecycleSnapshot {
+    state: String,
+    time_in_state_seconds: i64,
+    error_budget_used: u32,
+    retry_budget_remaining: u32,
+    updated_at: String,
+    last_event_seq: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorGateSnapshot {
+    name: String,
+    status: String,
+    completed_at: Option<String>,
+    freshness_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReviewSnapshot {
+    dimension: String,
+    verdict: String,
+    reviewed_sha: String,
+    reviewed_by: String,
+    reviewed_at: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorAgentSnapshot {
+    agent_type: String,
+    state: String,
+    run_id: String,
+    sha: String,
+    pid: Option<u32>,
+    pid_alive: bool,
+    started_at: String,
+    completion_status: Option<String>,
+    completion_summary: Option<String>,
+    completion_token_hash: String,
+    completion_token_expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorAgentSection {
+    max_active_agents_per_pr: usize,
+    active_agents: usize,
+    total_agents: usize,
+    entries: Vec<DoctorAgentSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorPrSummary {
+    schema: String,
+    pr_number: u32,
+    owner_repo: String,
+    identity: DoctorIdentitySnapshot,
+    lifecycle: Option<DoctorLifecycleSnapshot>,
+    gates: Vec<DoctorGateSnapshot>,
+    reviews: Vec<DoctorReviewSnapshot>,
+    agents: Option<DoctorAgentSection>,
+    health: Vec<DoctorHealthItem>,
+}
 
 // ── Process management helpers (used by orchestrator) ───────────────────────
 
@@ -169,6 +257,665 @@ fn emit_run_ndjson_since(
         }
     }
     Ok(())
+}
+
+pub fn run_doctor(repo: &str, pr_number: u32, json_output: bool) -> u8 {
+    let summary = run_doctor_inner(repo, pr_number);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    } else {
+        emit_doctor_report(&summary);
+    }
+    exit_codes::SUCCESS
+}
+
+fn run_doctor_inner(owner_repo: &str, pr_number: u32) -> DoctorPrSummary {
+    let mut health = Vec::new();
+    let identity = match projection_store::load_pr_identity_snapshot(owner_repo, pr_number) {
+        Ok(value) => value,
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "high",
+                message: format!("failed to read local PR identity: {err}"),
+                remediation:
+                    "run `apm2 fac push --pr <PR_NUMBER>` to refresh local projection data"
+                        .to_string(),
+            });
+            None
+        },
+    };
+
+    let local_sha = identity.as_ref().map(|record| record.head_sha.clone());
+    let branch = identity.as_ref().and_then(|record| record.branch.clone());
+    let worktree = identity.as_ref().and_then(|record| record.worktree.clone());
+    let identity_source = identity.as_ref().map(|record| record.source.clone());
+    let identity_updated_at = identity.as_ref().map(|record| record.updated_at.clone());
+
+    let mut remote_head = None;
+    match github_reads::fetch_pr_head_sha(owner_repo, pr_number) {
+        Ok(value) => {
+            if let Err(err) = validate_expected_head_sha(&value) {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!("invalid remote PR head SHA from GitHub: {err}"),
+                    remediation:
+                        "retry later when GitHub API returns a valid SHA or refresh repo credentials"
+                            .to_string(),
+                });
+            } else {
+                remote_head = Some(value.to_ascii_lowercase());
+            }
+        },
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "medium",
+                message: format!("could not resolve remote PR head SHA: {err}"),
+                remediation: "retry doctor after GH API access is restored".to_string(),
+            });
+        },
+    }
+    let stale = match (&local_sha, remote_head.as_deref()) {
+        (Some(local), Some(remote)) => !local.eq_ignore_ascii_case(remote),
+        _ => false,
+    };
+
+    if stale {
+        health.push(DoctorHealthItem {
+            severity: "high",
+            message: format!(
+                "local SHA {} != remote SHA {}",
+                local_sha.as_deref().unwrap_or("unknown"),
+                remote_head.as_deref().unwrap_or("unknown")
+            ),
+            remediation: "fetch latest PR head and rerun the FAC pipeline for this SHA".to_string(),
+        });
+    } else if local_sha.is_none() {
+        health.push(DoctorHealthItem {
+            severity: "high",
+            message: "no local PR identity snapshot found for this PR".to_string(),
+            remediation: "run `apm2 fac push --pr <PR_NUMBER>` to create local identity"
+                .to_string(),
+        });
+    }
+
+    let lifecycle = match lifecycle::load_pr_lifecycle_snapshot(owner_repo, pr_number) {
+        Ok(Some(snapshot)) => {
+            match snapshot.pr_state.as_str() {
+                "stuck" => health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "lifecycle reducer is in STUCK state".to_string(),
+                    remediation: "run `apm2 fac restart --pr <PR_NUMBER>` to reconcile state".to_string(),
+                }),
+                "stale" => health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: "lifecycle reducer indicates STALE state".to_string(),
+                    remediation: "run `apm2 fac push --pr <PR_NUMBER> --force` to refresh lifecycle state".to_string(),
+                }),
+                "recovering" => health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: "lifecycle reducer indicates RECOVERING state".to_string(),
+                    remediation:
+                        "run `apm2 fac recover --pr <PR_NUMBER> --refresh-identity` if recovery stalls".to_string(),
+                }),
+                _ => {},
+            }
+            if snapshot.retry_budget_remaining == 0 {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "retry budget exhausted".to_string(),
+                    remediation:
+                        "manual investigation required; stop retries until state is repaired"
+                            .to_string(),
+                });
+            } else if snapshot.error_budget_used > 0 {
+                health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: format!(
+                        "error budget used: {}/{}",
+                        snapshot.error_budget_used,
+                        10
+                    ),
+                    remediation:
+                        "run `apm2 fac doctor --pr <PR_NUMBER>` after `apm2 fac restart` to verify trend".to_string(),
+                });
+            }
+            if snapshot.error_budget_used >= 8 {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "high lifecycle error budget usage".to_string(),
+                    remediation:
+                        "investigate repeating failures in lifecycle events and CI diagnostics"
+                            .to_string(),
+                });
+            }
+
+            if let Some(local_sha) = local_sha.as_deref()
+                && !snapshot.current_sha.eq_ignore_ascii_case(local_sha)
+            {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!(
+                        "lifecycle current SHA {} != local identity SHA {}",
+                        snapshot.current_sha, local_sha
+                    ),
+                    remediation:
+                        "run `apm2 fac push --pr <PR_NUMBER>` to align lifecycle with current local SHA".to_string(),
+                });
+            }
+
+            Some(DoctorLifecycleSnapshot {
+                state: snapshot.pr_state.clone(),
+                time_in_state_seconds: snapshot.time_in_state_seconds,
+                error_budget_used: snapshot.error_budget_used,
+                retry_budget_remaining: snapshot.retry_budget_remaining,
+                updated_at: snapshot.updated_at.clone(),
+                last_event_seq: snapshot.last_event_seq,
+            })
+        },
+        Ok(None) => {
+            health.push(DoctorHealthItem {
+                severity: "high",
+                message: "no lifecycle record found for this PR".to_string(),
+                remediation: "run `apm2 fac push --pr <PR_NUMBER>`".to_string(),
+            });
+            None
+        },
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "high",
+                message: format!("failed to read lifecycle snapshot: {err}"),
+                remediation:
+                    "run `apm2 fac push --pr <PR_NUMBER>` and re-run doctor after recovery"
+                        .to_string(),
+            });
+            None
+        },
+    };
+
+    let mut gates = Vec::new();
+    match local_sha.as_deref() {
+        Some(sha) => match gate_cache::GateCache::load(sha) {
+            Some(cache) => {
+                if cache.gates.is_empty() {
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message: "no cached gate results for current SHA".to_string(),
+                        remediation: "run `apm2 fac push --pr <PR_NUMBER>`".to_string(),
+                    });
+                }
+                for (name, result) in cache.gates {
+                    let freshness = gate_result_freshness_seconds(&result.completed_at);
+                    let status = verdict_from_gate_status(&result.status);
+                    if status == "FAIL" {
+                        health.push(DoctorHealthItem {
+                            severity: "high",
+                            message: format!("gate {name} failed"),
+                            remediation: format!(
+                                "rerun gate evidence stage with `apm2 fac push --pr {pr_number}`"
+                            ),
+                        });
+                    } else if status == "NOT_RUN" {
+                        health.push(DoctorHealthItem {
+                            severity: "medium",
+                            message: format!(
+                                "gate {name} has non-terminal status `{}`",
+                                result.status
+                            ),
+                            remediation: format!(
+                                "rerun evidence stage for PR #{pr_number} if stale"
+                            ),
+                        });
+                    } else if freshness.is_some_and(|age| age > DOCTOR_STALE_GATE_AGE_SECONDS) {
+                        health.push(DoctorHealthItem {
+                            severity: "low",
+                            message: format!(
+                                "gate {name} cache is stale ({})",
+                                format_freshness_age(freshness)
+                            ),
+                            remediation: "rerun gate evidence to refresh cache".to_string(),
+                        });
+                    }
+                    gates.push(DoctorGateSnapshot {
+                        name,
+                        status: status.to_string(),
+                        completed_at: if result.completed_at.trim().is_empty() {
+                            None
+                        } else {
+                            Some(result.completed_at.clone())
+                        },
+                        freshness_seconds: freshness,
+                    });
+                }
+            },
+            None => {
+                health.push(DoctorHealthItem {
+                    severity: "low",
+                    message: "no gate cache found for local SHA".to_string(),
+                    remediation: format!(
+                        "run `apm2 fac push --pr {pr_number}` to populate evidence cache"
+                    ),
+                });
+            },
+        },
+        None => health.push(DoctorHealthItem {
+            severity: "high",
+            message: "no local SHA resolved for gate review".to_string(),
+            remediation: "establish local identity via `apm2 fac push --pr <PR_NUMBER>`"
+                .to_string(),
+        }),
+    }
+
+    let reviews = if let Some(sha) = local_sha.as_deref() {
+        match verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, sha) {
+            Ok(Some(snapshot)) => {
+                if !snapshot.errors.is_empty() {
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message: snapshot.errors.join("; "),
+                        remediation:
+                            "rerun review verdict emission paths for missing or corrupted entries"
+                                .to_string(),
+                    });
+                }
+                collect_review_dimension_snapshots(&snapshot)
+            },
+            Ok(None) => {
+                health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: "no verdict projection for local SHA".to_string(),
+                    remediation:
+                        "run both `fac review run --pr` and `fac review verdict show --pr --sha`"
+                            .to_string(),
+                });
+                collect_default_review_dimension_snapshots(sha)
+            },
+            Err(err) => {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!("failed to load verdict projection: {err}"),
+                    remediation:
+                        "re-run review verdict flow (`fac review set`) after integrity check"
+                            .to_string(),
+                });
+                collect_default_review_dimension_snapshots(sha)
+            },
+        }
+    } else {
+        health.push(DoctorHealthItem {
+            severity: "high",
+            message: "no local SHA resolved for verdict lookup".to_string(),
+            remediation: "establish local PR identity before reading verdicts".to_string(),
+        });
+        Vec::new()
+    };
+
+    let agents = match lifecycle::load_agent_registry_snapshot_for_pr(owner_repo, pr_number) {
+        Ok(snapshot) => {
+            let max_active = snapshot.max_active_agents_per_pr;
+            let active_agents = snapshot.active_agents;
+            if active_agents > max_active {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!(
+                        "active agent entries ({active_agents}) exceed configured max ({max_active})"
+                    ),
+                    remediation:
+                        "run `apm2 fac recover --pr <PR_NUMBER>` to prune stale/invalid registry entries"
+                            .to_string(),
+                });
+            }
+
+            for entry in &snapshot.entries {
+                if entry.pid.is_some()
+                    && matches!(entry.state.as_str(), "running" | "dispatched")
+                    && !entry.pid_alive
+                {
+                    health.push(DoctorHealthItem {
+                        severity: "high",
+                        message: format!(
+                            "{} lane pid={} is no longer alive",
+                            entry.agent_type,
+                            entry.pid.unwrap_or(0)
+                        ),
+                        remediation:
+                            "run `apm2 fac restart --pr <PR_NUMBER>` to reclaim lane state"
+                                .to_string(),
+                    });
+                }
+                if entry.pid.is_none()
+                    && matches!(entry.state.as_str(), "running" | "dispatched" | "stuck")
+                {
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message: format!(
+                            "{} lane for PR #{} has missing PID in state {}",
+                            entry.agent_type, pr_number, entry.state
+                        ),
+                        remediation:
+                            "rerun `apm2 fac restart --pr <PR_NUMBER>` and watch for slot reapage"
+                                .to_string(),
+                    });
+                }
+            }
+            if let Some(lifecycle) = lifecycle.as_ref()
+                && lifecycle.state == "review_in_progress"
+                && active_agents == 0
+            {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "review_in_progress lifecycle state with zero active agents"
+                        .to_string(),
+                    remediation: "run `apm2 fac restart --pr <PR_NUMBER>` to resume reviews"
+                        .to_string(),
+                });
+            }
+
+            let mut entries = Vec::with_capacity(snapshot.entries.len());
+            for entry in snapshot.entries {
+                entries.push(DoctorAgentSnapshot {
+                    agent_type: entry.agent_type,
+                    state: entry.state,
+                    run_id: entry.run_id,
+                    sha: entry.sha,
+                    pid: entry.pid,
+                    pid_alive: entry.pid_alive,
+                    started_at: entry.started_at,
+                    completion_status: entry.completion_status,
+                    completion_summary: entry.completion_summary,
+                    completion_token_hash: entry.completion_token_hash,
+                    completion_token_expires_at: entry.completion_token_expires_at,
+                });
+            }
+            Some(DoctorAgentSection {
+                max_active_agents_per_pr: max_active,
+                active_agents,
+                total_agents: entries.len(),
+                entries,
+            })
+        },
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "medium",
+                message: format!("failed to load agent registry snapshot: {err}"),
+                remediation: "run `apm2 fac recover --pr <PR_NUMBER>`".to_string(),
+            });
+            None
+        },
+    };
+
+    DoctorPrSummary {
+        schema: DOCTOR_SCHEMA.to_string(),
+        pr_number,
+        owner_repo: owner_repo.to_ascii_lowercase(),
+        identity: DoctorIdentitySnapshot {
+            pr_number,
+            branch,
+            worktree,
+            source: identity_source,
+            local_sha,
+            updated_at: identity_updated_at,
+            remote_head_sha: remote_head,
+            stale,
+        },
+        lifecycle,
+        gates,
+        reviews,
+        agents,
+        health,
+    }
+}
+
+fn collect_default_review_dimension_snapshots(local_sha: &str) -> Vec<DoctorReviewSnapshot> {
+    vec![
+        DoctorReviewSnapshot {
+            dimension: "security".to_string(),
+            verdict: "pending".to_string(),
+            reviewed_sha: local_sha.to_string(),
+            reviewed_by: String::new(),
+            reviewed_at: String::new(),
+            reason: "no verified projection loaded".to_string(),
+        },
+        DoctorReviewSnapshot {
+            dimension: "code-quality".to_string(),
+            verdict: "pending".to_string(),
+            reviewed_sha: local_sha.to_string(),
+            reviewed_by: String::new(),
+            reviewed_at: String::new(),
+            reason: "no verified projection loaded".to_string(),
+        },
+    ]
+}
+
+fn collect_review_dimension_snapshots(
+    snapshot: &verdict_projection::VerdictProjectionSnapshot,
+) -> Vec<DoctorReviewSnapshot> {
+    let mut mapped = std::collections::BTreeMap::<
+        String,
+        &verdict_projection::VerdictProjectionDimensionSnapshot,
+    >::new();
+    for entry in &snapshot.dimensions {
+        mapped.insert(entry.dimension.clone(), entry);
+    }
+    ["security", "code-quality"]
+        .into_iter()
+        .map(|dimension| {
+            let Some(entry) = mapped.get(dimension) else {
+                return DoctorReviewSnapshot {
+                    dimension: (*dimension).to_string(),
+                    verdict: "pending".to_string(),
+                    reviewed_sha: snapshot.head_sha.clone(),
+                    reviewed_by: String::new(),
+                    reviewed_at: String::new(),
+                    reason: "missing dimension in projection".to_string(),
+                };
+            };
+            DoctorReviewSnapshot {
+                dimension: entry.dimension.clone(),
+                verdict: entry.decision.clone(),
+                reviewed_sha: entry.reviewed_sha.clone(),
+                reviewed_by: entry.reviewed_by.clone(),
+                reviewed_at: entry.reviewed_at.clone(),
+                reason: entry.reason.clone(),
+            }
+        })
+        .collect()
+}
+
+fn verdict_from_gate_status(status: &str) -> &'static str {
+    match status.to_ascii_uppercase().as_str() {
+        "PASS" => "PASS",
+        "FAIL" => "FAIL",
+        _ => "NOT_RUN",
+    }
+}
+
+fn gate_result_freshness_seconds(completed_at: &str) -> Option<i64> {
+    if completed_at.trim().is_empty() {
+        return None;
+    }
+    let Ok(parsed) = DateTime::parse_from_rfc3339(completed_at) else {
+        return None;
+    };
+    let age = Utc::now() - parsed.with_timezone(&Utc);
+    let Ok(duration) = age.to_std() else {
+        return None;
+    };
+    Some(
+        i64::try_from(duration.as_secs())
+            .unwrap_or(i64::MAX)
+            .clamp(0, i64::MAX),
+    )
+}
+
+fn format_freshness_age(seconds: Option<i64>) -> String {
+    let Some(seconds) = seconds else {
+        return "unknown".to_string();
+    };
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / (60 * 60))
+    }
+}
+
+fn emit_doctor_report(summary: &DoctorPrSummary) {
+    println!("FAC Doctor");
+    println!("  PR:         #{}", summary.pr_number);
+    println!("  Repo:       {}", summary.owner_repo);
+    println!(
+        "  Identity SHA local={} remote={}",
+        summary.identity.local_sha.as_deref().unwrap_or("-"),
+        summary.identity.remote_head_sha.as_deref().unwrap_or("-")
+    );
+    if summary.identity.stale {
+        println!("  Identity:   STALE");
+    }
+    println!(
+        "  Branch:     {}",
+        summary.identity.branch.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  Worktree:   {}",
+        summary.identity.worktree.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  Identity source: {}",
+        summary.identity.source.as_deref().unwrap_or("-")
+    );
+
+    println!("IDENTITY");
+    println!(
+        "  local_sha:  {}{}",
+        summary.identity.local_sha.as_deref().unwrap_or("unknown"),
+        if summary.identity.stale {
+            " [STALE]"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  remote_sha: {}",
+        summary
+            .identity
+            .remote_head_sha
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    println!(
+        "  branch:     {}",
+        summary.identity.branch.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  worktree:   {}",
+        summary.identity.worktree.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  updated_at: {}",
+        summary.identity.updated_at.as_deref().unwrap_or("n/a")
+    );
+
+    println!("LIFECYCLE");
+    if let Some(lifecycle) = &summary.lifecycle {
+        println!("  state:           {}", lifecycle.state);
+        println!("  time_in_state:   {}s", lifecycle.time_in_state_seconds);
+        println!("  error_budget:    {}", lifecycle.error_budget_used);
+        println!("  retry_budget:    {}", lifecycle.retry_budget_remaining);
+        println!("  updated_at:      {}", lifecycle.updated_at);
+        println!("  last_event_seq:  {}", lifecycle.last_event_seq);
+    } else {
+        println!("  unavailable");
+    }
+
+    println!("GATES");
+    if summary.gates.is_empty() {
+        println!("  no gate cache entries found");
+    } else {
+        for gate in &summary.gates {
+            println!(
+                "  {}: {} (freshness={})",
+                gate.name,
+                gate.status,
+                format_freshness_age(gate.freshness_seconds)
+            );
+            if let Some(completed_at) = gate.completed_at.as_deref() {
+                println!("    completed_at: {completed_at}");
+            }
+        }
+    }
+
+    println!("REVIEWS");
+    if summary.reviews.is_empty() {
+        println!("  no review projection found");
+    } else {
+        for review in &summary.reviews {
+            println!("  {}: {}", review.dimension, review.verdict);
+            println!(
+                "    reviewed_sha: {}  reviewed_by: {}",
+                if review.reviewed_sha.is_empty() {
+                    "-"
+                } else {
+                    &review.reviewed_sha
+                },
+                if review.reviewed_by.is_empty() {
+                    "-"
+                } else {
+                    &review.reviewed_by
+                }
+            );
+            if !review.reason.is_empty() {
+                println!("    reason: {}", review.reason);
+            }
+            if !review.reviewed_at.is_empty() {
+                println!("    reviewed_at: {}", review.reviewed_at);
+            }
+        }
+    }
+
+    println!("AGENTS");
+    if let Some(agents) = &summary.agents {
+        println!(
+            "  active_slots: {}/{}",
+            agents.active_agents, agents.max_active_agents_per_pr
+        );
+        println!("  total_entries: {}", agents.total_agents);
+        if agents.entries.is_empty() {
+            println!("  no entries");
+        } else {
+            for entry in &agents.entries {
+                println!(
+                    "  {} {} pid={:?} alive={} sha={} run_id={}",
+                    entry.agent_type,
+                    entry.state,
+                    entry.pid,
+                    entry.pid_alive,
+                    entry.sha,
+                    entry.run_id
+                );
+            }
+        }
+    } else {
+        println!("  unavailable");
+    }
+
+    println!("HEALTH");
+    if summary.health.is_empty() {
+        println!("  PASS: no blockers");
+    } else {
+        for item in &summary.health {
+            println!(
+                "  [{}] {}",
+                item.severity.to_ascii_uppercase(),
+                item.message
+            );
+            println!("      remediation: {}", item.remediation);
+        }
+    }
 }
 
 // ── Public entry points ─────────────────────────────────────────────────────
