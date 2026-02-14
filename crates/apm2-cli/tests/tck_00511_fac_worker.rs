@@ -54,7 +54,7 @@ fn setup_queue_env() -> (tempfile::TempDir, PathBuf) {
         "claimed",
         "completed",
         "denied",
-        "quarantined",
+        "quarantine",
         "receipts",
     ] {
         fs::create_dir_all(queue_root.join(sub)).expect("create queue dir");
