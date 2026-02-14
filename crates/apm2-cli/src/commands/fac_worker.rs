@@ -1048,6 +1048,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            None,
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
