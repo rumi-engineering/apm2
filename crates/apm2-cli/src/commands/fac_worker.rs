@@ -714,9 +714,8 @@ fn process_job(
         },
     };
 
-    let admitted_policy_root_digest = if let Some(binding) = boundary_check
-        .boundary_flow_policy_binding
-        .as_ref()
+    let admitted_policy_root_digest = if let Some(binding) =
+        boundary_check.boundary_flow_policy_binding.as_ref()
     {
         if !bool::from(
             binding
@@ -736,9 +735,7 @@ fn process_job(
                 None,
                 policy_hash,
             ) {
-                eprintln!(
-                    "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
-                );
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
 
             return JobOutcome::Denied { reason };
