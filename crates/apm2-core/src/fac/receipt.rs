@@ -240,7 +240,7 @@ pub enum DenialReasonCode {
 }
 
 /// Trace of the RFC-0028 channel boundary check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelBoundaryTrace {
     /// Whether the boundary check passed.
@@ -252,7 +252,7 @@ pub struct ChannelBoundaryTrace {
 }
 
 /// Trace of the RFC-0029 queue admission decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueAdmissionTrace {
     /// The admission verdict.
@@ -264,7 +264,7 @@ pub struct QueueAdmissionTrace {
 }
 
 /// Placeholder trace for RFC-0029 budget admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetAdmissionTrace {
     /// Budget admission verdict.
@@ -274,7 +274,7 @@ pub struct BudgetAdmissionTrace {
 }
 
 /// Unified worker receipt for FAC job outcomes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FacJobReceiptV1 {
     /// Schema identifier.
@@ -553,7 +553,7 @@ fn serialize_job_receipt_body_without_content_hash(
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut receipt = receipt.clone();
     receipt.content_hash.clear();
-    serde_json::to_vec_pretty(&receipt)
+    serde_json::to_vec(&receipt)
 }
 
 fn compute_job_receipt_content_hash(bytes: &[u8]) -> String {
@@ -1267,15 +1267,18 @@ pub mod tests {
     }
 
     #[test]
-    fn test_fac_job_receipt_round_trip_json() {
-        let receipt =
+    fn test_fac_job_receipt_body_serialization_uses_compact_json() {
+        let mut receipt =
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
 
-        let serialized = serde_json::to_vec_pretty(&receipt).expect("serialize fac job receipt");
-        let decoded: FacJobReceiptV1 =
-            serde_json::from_slice(&serialized).expect("deserialize fac job receipt");
+        let body = serialize_job_receipt_body_without_content_hash(&receipt)
+            .expect("serialize receipt body");
+        receipt.content_hash.clear();
+        let expected = serde_json::to_vec(&receipt).expect("serialize canonical receipt body");
 
-        assert_eq!(receipt, decoded);
+        assert!(!body.contains(&b'\n'));
+        assert!(!body.contains(&b'\r'));
+        assert_eq!(body, expected);
     }
 
     #[test]
