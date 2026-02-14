@@ -52,6 +52,7 @@ use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
 use apm2_core::crypto::Signer;
+use apm2_core::github::resolve_apm2_home;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
@@ -969,6 +970,19 @@ async fn async_main(args: Args) -> Result<()> {
 
     // Load configuration and initialize
     let daemon_config = DaemonConfig::new(&args)?;
+    let apm2_home = resolve_apm2_home().ok_or_else(|| {
+        anyhow::anyhow!("failed to resolve APM2 home from $APM2_HOME or home directory")
+    })?;
+    let node_fingerprint = apm2_core::fac::load_or_derive_node_fingerprint(&apm2_home)
+        .context("failed to load or derive node fingerprint")?;
+    let boundary_id = apm2_core::fac::load_or_default_boundary_id(&apm2_home)
+        .context("failed to load boundary id")?;
+    info!(
+        apm2_home = %apm2_home.display(),
+        node_fingerprint = %node_fingerprint,
+        boundary_id = %boundary_id,
+        "Loaded FAC node identity"
+    );
 
     // Log config file status
     if !args.config.exists() {
@@ -1218,6 +1232,7 @@ async fn async_main(args: Args) -> Result<()> {
         )
         .expect("default BrokerState is always valid");
         let mut health_checker = apm2_core::fac::BrokerHealthChecker::new();
+        let boundary_id = boundary_id.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -1298,7 +1313,7 @@ async fn async_main(args: Args) -> Result<()> {
                 // ---------------------------------------------------------------
                 let broker_tick = health_broker.advance_tick();
                 let eval_window = apm2_core::economics::queue_admission::HtfEvaluationWindow {
-                    boundary_id: "daemon-health-poller".to_string(),
+                    boundary_id: boundary_id.clone(),
                     authority_clock: "daemon-lifecycle".to_string(),
                     tick_start: broker_tick.saturating_sub(1),
                     tick_end: broker_tick,
@@ -1307,7 +1322,7 @@ async fn async_main(args: Args) -> Result<()> {
                 // Issue a self-signed envelope covering the evaluation window.
                 // Fail-closed: if envelope issuance fails, close the gate.
                 let envelope_result = health_broker.issue_time_authority_envelope(
-                    "daemon-health-poller",
+                    &boundary_id,
                     "daemon-lifecycle",
                     eval_window.tick_start,
                     eval_window.tick_end,

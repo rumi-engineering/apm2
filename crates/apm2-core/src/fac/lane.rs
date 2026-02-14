@@ -323,6 +323,9 @@ pub struct LaneProfileV1 {
     pub lane_id: String,
     /// Node fingerprint (b3-256 hex).
     pub node_fingerprint: String,
+    /// Boundary identifier for evaluation context routing.
+    #[serde(default)]
+    pub boundary_id: String,
     /// Resource limits.
     pub resource_profile: ResourceProfile,
     /// Timeout configuration.
@@ -337,14 +340,20 @@ impl LaneProfileV1 {
     /// # Errors
     ///
     /// Returns `LaneError::StringTooLong` if `lane_id` exceeds
-    /// `MAX_LANE_ID_LENGTH`.
-    pub fn new(lane_id: &str, node_fingerprint: &str) -> Result<Self, LaneError> {
+    /// `MAX_LANE_ID_LENGTH`, and `boundary_id` exceeds its allowed length.
+    pub fn new(
+        lane_id: &str,
+        node_fingerprint: &str,
+        boundary_id: &str,
+    ) -> Result<Self, LaneError> {
         validate_lane_id(lane_id)?;
         validate_string_field("node_fingerprint", node_fingerprint, MAX_STRING_LENGTH)?;
+        validate_boundary_id(lane_id, boundary_id)?;
         Ok(Self {
             schema: LANE_PROFILE_V1_SCHEMA.to_string(),
             lane_id: lane_id.to_string(),
             node_fingerprint: node_fingerprint.to_string(),
+            boundary_id: boundary_id.to_string(),
             resource_profile: ResourceProfile::default(),
             timeouts: LaneTimeouts::default(),
             policy: LanePolicy::default(),
@@ -395,13 +404,16 @@ impl LaneProfileV1 {
     pub fn load(lane_dir: &Path) -> Result<Self, LaneError> {
         let profile_path = lane_dir.join("profile.v1.json");
         let bytes = bounded_read_file(&profile_path, MAX_PROFILE_FILE_SIZE)?;
-        let profile: Self = serde_json::from_slice(&bytes).map_err(|e| {
+        let mut profile: Self = serde_json::from_slice(&bytes).map_err(|e| {
             LaneError::Serialization(format!(
                 "failed to parse profile at {}: {e}",
                 profile_path.display()
             ))
         })?;
         let expected_lane_id = lane_dir_lane_id(lane_dir)?;
+        if profile.boundary_id.is_empty() {
+            profile.boundary_id = legacy_boundary_id_fallback(&profile.node_fingerprint);
+        }
         if profile.schema != LANE_PROFILE_V1_SCHEMA {
             return Err(LaneError::InvalidRecord {
                 lane_id: expected_lane_id.to_string(),
@@ -420,9 +432,55 @@ impl LaneProfileV1 {
                 ),
             });
         }
+        validate_string_field(
+            "node_fingerprint",
+            &profile.node_fingerprint,
+            MAX_STRING_LENGTH,
+        )?;
+        if profile.node_fingerprint.is_empty() {
+            return Err(LaneError::InvalidRecord {
+                lane_id: expected_lane_id.to_string(),
+                reason: "node_fingerprint must not be empty".to_string(),
+            });
+        }
+        validate_boundary_id(expected_lane_id, &profile.boundary_id)?;
         validate_lane_id(&profile.lane_id)?;
         Ok(profile)
     }
+}
+
+fn legacy_boundary_id_fallback(node_fingerprint: &str) -> String {
+    if node_fingerprint.is_empty() {
+        "unknown".to_string()
+    } else {
+        node_fingerprint.to_string()
+    }
+}
+
+fn validate_boundary_id(lane_id: &str, boundary_id: &str) -> Result<(), LaneError> {
+    if boundary_id.is_empty() {
+        return Err(LaneError::InvalidRecord {
+            lane_id: lane_id.to_string(),
+            reason: "boundary_id must not be empty".to_string(),
+        });
+    }
+    if !boundary_id.is_ascii() {
+        return Err(LaneError::InvalidRecord {
+            lane_id: lane_id.to_string(),
+            reason: "boundary_id must be ASCII".to_string(),
+        });
+    }
+    if boundary_id.len() > super::node_identity::MAX_BOUNDARY_ID_LENGTH {
+        return Err(LaneError::InvalidRecord {
+            lane_id: lane_id.to_string(),
+            reason: format!(
+                "boundary_id length {} exceeds max {}",
+                boundary_id.len(),
+                super::node_identity::MAX_BOUNDARY_ID_LENGTH
+            ),
+        });
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1404,9 +1462,11 @@ mod tests {
 
     #[test]
     fn lane_profile_creation_and_hash() {
-        let profile = LaneProfileV1::new("lane-00", "b3-256:abc123").expect("create profile");
+        let profile =
+            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
         assert_eq!(profile.schema, LANE_PROFILE_V1_SCHEMA);
         assert_eq!(profile.lane_id, "lane-00");
+        assert_eq!(profile.boundary_id, "boundary-00");
         let hash = profile.compute_hash().expect("compute hash");
         assert!(
             hash.starts_with("b3-256:"),
@@ -1417,8 +1477,8 @@ mod tests {
 
     #[test]
     fn lane_profile_hash_is_deterministic() {
-        let p1 = LaneProfileV1::new("lane-00", "b3-256:abc").expect("p1");
-        let p2 = LaneProfileV1::new("lane-00", "b3-256:abc").expect("p2");
+        let p1 = LaneProfileV1::new("lane-00", "b3-256:abc", "boundary-00").expect("p1");
+        let p2 = LaneProfileV1::new("lane-00", "b3-256:abc", "boundary-00").expect("p2");
         assert_eq!(
             p1.compute_hash().expect("h1"),
             p2.compute_hash().expect("h2"),
@@ -1428,8 +1488,8 @@ mod tests {
 
     #[test]
     fn lane_profile_hash_changes_with_input() {
-        let p1 = LaneProfileV1::new("lane-00", "b3-256:aaa").expect("p1");
-        let p2 = LaneProfileV1::new("lane-01", "b3-256:aaa").expect("p2");
+        let p1 = LaneProfileV1::new("lane-00", "b3-256:aaa", "boundary-01").expect("p1");
+        let p2 = LaneProfileV1::new("lane-01", "b3-256:aaa", "boundary-01").expect("p2");
         assert_ne!(
             p1.compute_hash().expect("h1"),
             p2.compute_hash().expect("h2"),
@@ -1439,7 +1499,8 @@ mod tests {
 
     #[test]
     fn lane_profile_serde_round_trip() {
-        let profile = LaneProfileV1::new("lane-00", "b3-256:abc123").expect("create profile");
+        let profile =
+            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
         let json = serde_json::to_string_pretty(&profile).expect("serialize");
         let parsed: LaneProfileV1 = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(profile, parsed);
@@ -1447,7 +1508,7 @@ mod tests {
 
     #[test]
     fn lane_profile_rejects_unknown_fields() {
-        let json = r#"{"schema":"apm2.fac.lane_profile.v1","lane_id":"lane-00","node_fingerprint":"x","resource_profile":{"cpu_quota_percent":200,"memory_max_bytes":100,"pids_max":1536,"io_weight":100},"timeouts":{"test_timeout_seconds":240,"job_runtime_max_seconds":1800},"policy":{"fac_policy_hash":"","nextest_profile":"ci","deny_ambient_cargo_home":true},"extra_field":"evil"}"#;
+        let json = r#"{"schema":"apm2.fac.lane_profile.v1","lane_id":"lane-00","node_fingerprint":"x","boundary_id":"boundary-00","resource_profile":{"cpu_quota_percent":200,"memory_max_bytes":100,"pids_max":1536,"io_weight":100},"timeouts":{"test_timeout_seconds":240,"job_runtime_max_seconds":1800},"policy":{"fac_policy_hash":"","nextest_profile":"ci","deny_ambient_cargo_home":true},"extra_field":"evil"}"#;
         let result: Result<LaneProfileV1, _> = serde_json::from_str(json);
         assert!(result.is_err(), "must reject unknown fields (CTR-1604)");
     }
@@ -1457,10 +1518,35 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let lane_dir = dir.path().join("lane-00");
         fs::create_dir_all(&lane_dir).expect("create lane dir");
-        let profile = LaneProfileV1::new("lane-00", "b3-256:abc123").expect("create profile");
+        let profile =
+            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
         profile.persist(&lane_dir).expect("persist");
         let loaded = LaneProfileV1::load(&lane_dir).expect("load");
         assert_eq!(profile, loaded);
+    }
+
+    #[test]
+    fn lane_profile_load_assigns_legacy_default_boundary_id_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let node_fingerprint = "b3-256:legacy-fingerprint";
+        let profile =
+            LaneProfileV1::new("lane-00", node_fingerprint, "boundary-00").expect("create profile");
+        let mut payload = serde_json::to_value(profile).expect("serialize");
+        payload
+            .as_object_mut()
+            .expect("profile object")
+            .remove("boundary_id");
+        std::fs::write(
+            lane_dir.join("profile.v1.json"),
+            serde_json::to_vec_pretty(&payload).expect("serialize legacy profile"),
+        )
+        .expect("write legacy profile");
+
+        let loaded = LaneProfileV1::load(&lane_dir).expect("load");
+        assert_eq!(loaded.boundary_id, node_fingerprint);
     }
 
     // ── LaneLeaseV1 ────────────────────────────────────────────────────
@@ -1566,7 +1652,7 @@ mod tests {
         let lane_dir = dir.path().join("lane-00");
         fs::create_dir_all(&lane_dir).expect("create lane dir");
 
-        let profile = LaneProfileV1::new("lane-00", "fp").expect("create profile");
+        let profile = LaneProfileV1::new("lane-00", "fp", "boundary-00").expect("create profile");
         let mut value = serde_json::to_value(profile).expect("to value");
         value["schema"] = serde_json::Value::String("apm2.fac.lane_profile.wrong".to_string());
         fs::write(
@@ -1594,7 +1680,7 @@ mod tests {
         let lane_dir = dir.path().join("lane-00");
         fs::create_dir_all(&lane_dir).expect("create lane dir");
 
-        let profile = LaneProfileV1::new("lane-00", "fp").expect("create profile");
+        let profile = LaneProfileV1::new("lane-00", "fp", "boundary-00").expect("create profile");
         let mut value = serde_json::to_value(profile).expect("to value");
         value["lane_id"] = serde_json::Value::String("lane-99".to_string());
         fs::write(
@@ -1753,7 +1839,7 @@ mod tests {
     #[test]
     fn lane_profile_rejects_oversized_lane_id() {
         let long_id = "x".repeat(MAX_LANE_ID_LENGTH + 1);
-        let result = LaneProfileV1::new(&long_id, "fp");
+        let result = LaneProfileV1::new(&long_id, "fp", "boundary-long");
         assert!(result.is_err());
     }
 

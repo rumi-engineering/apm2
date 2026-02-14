@@ -90,6 +90,7 @@ mod key_policy;
 pub mod lane;
 mod lease;
 pub mod merge_receipt;
+mod node_identity;
 pub mod policy_inheritance;
 mod policy_resolution;
 pub mod projection;
@@ -513,4 +514,10 @@ pub use lane::{
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
     MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_PROFILE_FILE_SIZE,
     MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, ResourceProfile,
+};
+// Re-export node identity types (TCK-00556).
+pub use node_identity::{
+    DEFAULT_BOUNDARY_ID, MAX_BOUNDARY_ID_LENGTH as NODE_IDENTITY_MAX_BOUNDARY_ID_LENGTH,
+    NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
+    load_or_default_boundary_id, load_or_derive_node_fingerprint,
 };
