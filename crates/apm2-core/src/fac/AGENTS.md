@@ -263,3 +263,41 @@ projection surfaces.
   `subtle::ConstantTimeEq::ct_eq()` to prevent timing side-channel leakage.
   Variable-time `==`/`!=` on `[u8; 32]` hash values is prohibited in this
   module.
+
+## safe_rmtree Submodule (TCK-00516)
+
+The `safe_rmtree` submodule implements a symlink-safe recursive tree
+deletion primitive for lane cleanup and reset operations.
+
+### Key Types
+
+- `SafeRmtreeError`: Fail-closed error taxonomy covering symlink detection,
+  boundary violations, filesystem crossing, unexpected file types, permission
+  errors, TOCTOU race detection, depth limits, and I/O failures.
+- `SafeRmtreeOutcome`: Success outcome enum (`Deleted` with file/dir counts,
+  or `AlreadyAbsent` for no-op on nonexistent roots).
+- `RefusedDeleteReceipt`: Machine-readable evidence for audit trails when
+  lane cleanup is refused and the lane should be marked CORRUPT.
+
+### Core Capabilities
+
+- `safe_rmtree_v1(root, allowed_parent)`: Primary entry point. Validates
+  absolute paths, component-wise boundary enforcement, symlink detection at
+  every depth, filesystem boundary checks (`st_dev`), parent ownership
+  validation (uid + mode 0o700), and depth-bounded bottom-up deletion.
+- Used by `apm2 fac lane reset` CLI command to safely delete workspace,
+  target, and logs subdirectories.
+
+### Security Invariants (TCK-00516)
+
+- [INV-RMTREE-001] Symlink detected at any depth causes immediate abort.
+- [INV-RMTREE-002] `root` must be strictly under `allowed_parent` by
+  component-wise validation (NOT string prefix).
+- [INV-RMTREE-003] Cross-filesystem deletion refused by `st_dev` comparison.
+- [INV-RMTREE-004] Unexpected file types (sockets, FIFOs, devices) abort.
+- [INV-RMTREE-005] Both paths must be absolute.
+- [INV-RMTREE-006] `allowed_parent` must be owned by current user with
+  mode 0o700 (no group/other access).
+- [INV-RMTREE-007] Non-existent root is a successful no-op.
+- [INV-RMTREE-008] Traversal depth bounded by `MAX_TRAVERSAL_DEPTH=128`.
+- [INV-RMTREE-009] Directory entries bounded by `MAX_DIR_ENTRIES=100000`.

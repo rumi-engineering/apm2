@@ -54,9 +54,10 @@
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::{
-    LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, SUMMARY_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
+    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -384,6 +385,13 @@ pub enum LaneSubcommand {
     /// Reports each lane's state derived from lock state, lease records,
     /// and PID liveness checks. Detects stale leases from crashed jobs.
     Status(LaneStatusArgs),
+    /// Reset a lane by deleting its workspace, target, and logs.
+    ///
+    /// Refuses to reset a RUNNING lane unless `--force` is provided.
+    /// With `--force`, attempts to kill the lane's process before
+    /// cleaning up. Uses `safe_rmtree_v1` which refuses symlink
+    /// traversal and crossing filesystem boundaries.
+    Reset(LaneResetArgs),
 }
 
 /// Arguments for `apm2 fac lane status`.
@@ -393,6 +401,17 @@ pub struct LaneStatusArgs {
     /// CORRUPT).
     #[arg(long)]
     pub state: Option<String>,
+}
+
+/// Arguments for `apm2 fac lane reset`.
+#[derive(Debug, Args)]
+pub struct LaneResetArgs {
+    /// Lane identifier to reset (e.g., `lane-00`).
+    pub lane_id: String,
+
+    /// Force reset even if lane is RUNNING. Kills the lane's process first.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -1076,6 +1095,7 @@ pub fn run_fac(
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
         FacSubcommand::Lane(args) => match &args.subcommand {
             LaneSubcommand::Status(status_args) => run_lane_status(status_args, json_output),
+            LaneSubcommand::Reset(reset_args) => run_lane_reset(reset_args, json_output),
         },
         FacSubcommand::Push(args) => {
             let repo = match derive_fac_repo_or_exit(json_output) {
@@ -2559,6 +2579,261 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
     }
 
     exit_codes::SUCCESS
+}
+
+// =============================================================================
+// Lane Reset Command (TCK-00516)
+// =============================================================================
+
+/// Execute `apm2 fac lane reset <lane_id>`.
+///
+/// Resets a lane by deleting its workspace, target, and logs subdirectories
+/// using `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
+///
+/// # State Machine
+///
+/// - IDLE: resets workspace/target/logs, removes lease, remains IDLE.
+/// - CORRUPT: resets workspace/target/logs, removes lease, transitions to IDLE.
+/// - LEASED/CLEANUP: resets workspace/target/logs, removes lease, transitions
+///   to IDLE.
+/// - RUNNING: refuses unless `--force` is provided. With `--force`, kills the
+///   process first, then resets.
+///
+/// # Security
+///
+/// Deletion is performed via `safe_rmtree_v1` which refuses:
+/// - Symlink traversal at any depth
+/// - Crossing filesystem boundaries
+/// - Unexpected file types (FIFOs, sockets, devices)
+/// - Deletion outside the allowed parent boundary
+fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
+    let manager = match LaneManager::from_default_home() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to initialize lane manager: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Ensure directories exist
+    if let Err(e) = manager.ensure_directories() {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!("Failed to ensure lane directories: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Get current lane status
+    let status = match manager.lane_status(&args.lane_id) {
+        Ok(s) => s,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to query lane status: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Check if lane is RUNNING and refuse without --force
+    if status.state == LaneState::Running && !args.force {
+        return output_error(
+            json_output,
+            "lane_running",
+            &format!(
+                "Lane {} is RUNNING (pid={}). Use --force to kill the process and reset.",
+                args.lane_id,
+                status.pid.unwrap_or(0)
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // With --force on a RUNNING lane, attempt to kill the process
+    if status.state == LaneState::Running && args.force {
+        if let Some(pid) = status.pid {
+            if !json_output {
+                println!("Force-killing process {} for lane {}...", pid, args.lane_id);
+            }
+            kill_process_best_effort(pid);
+        }
+    }
+
+    // Perform safe deletion of workspace, target, and logs
+    let lane_dir = manager.lane_dir(&args.lane_id);
+    let lanes_root = lane_dir
+        .parent()
+        .expect("lane_dir has parent (lanes/ directory)");
+
+    let subdirs = ["workspace", "target", "logs"];
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 0;
+    let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
+
+    for subdir in &subdirs {
+        let subdir_path = lane_dir.join(subdir);
+        match safe_rmtree_v1(&subdir_path, lanes_root) {
+            Ok(SafeRmtreeOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => {
+                total_files = total_files.saturating_add(files_deleted);
+                total_dirs = total_dirs.saturating_add(dirs_deleted);
+                if !json_output {
+                    println!(
+                        "  Deleted {}/{}: {} files, {} dirs",
+                        args.lane_id, subdir, files_deleted, dirs_deleted
+                    );
+                }
+            },
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {
+                if !json_output {
+                    println!("  {}/{}: already absent", args.lane_id, subdir);
+                }
+            },
+            Err(e) => {
+                let receipt = RefusedDeleteReceipt {
+                    root: subdir_path.clone(),
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: e.to_string(),
+                    mark_corrupt: true,
+                };
+                refused_receipts.push(receipt);
+
+                if !json_output {
+                    eprintln!("  ERROR deleting {}/{}: {e}", args.lane_id, subdir);
+                }
+            },
+        }
+    }
+
+    // If any deletions were refused, mark lane as CORRUPT
+    if !refused_receipts.is_empty() {
+        // Attempt to write a CORRUPT lease
+        let corrupt_reason = refused_receipts
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        if json_output {
+            let response = serde_json::json!({
+                "lane_id": args.lane_id,
+                "status": "CORRUPT",
+                "reason": corrupt_reason,
+                "refused_receipts": refused_receipts.iter().map(|r| {
+                    serde_json::json!({
+                        "root": r.root.display().to_string(),
+                        "allowed_parent": r.allowed_parent.display().to_string(),
+                        "reason": r.reason,
+                        "mark_corrupt": r.mark_corrupt,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response).unwrap_or_default()
+            );
+        } else {
+            eprintln!("Lane {} marked CORRUPT: {corrupt_reason}", args.lane_id);
+        }
+
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    // Remove the lease file to transition lane to IDLE
+    let lane_dir_owned = manager.lane_dir(&args.lane_id);
+    if let Err(e) = LaneLeaseV1::remove(&lane_dir_owned) {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!("Failed to remove lease for lane {}: {e}", args.lane_id),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Re-create the empty subdirectories so the lane is ready for reuse
+    if let Err(e) = manager.ensure_directories() {
+        if !json_output {
+            eprintln!("Warning: failed to re-create lane directories: {e}");
+        }
+    }
+
+    if json_output {
+        let response = serde_json::json!({
+            "lane_id": args.lane_id,
+            "status": "IDLE",
+            "files_deleted": total_files,
+            "dirs_deleted": total_dirs,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "Lane {} reset to IDLE ({} files, {} dirs deleted)",
+            args.lane_id, total_files, total_dirs
+        );
+    }
+
+    exit_codes::SUCCESS
+}
+
+/// Best-effort process kill using SIGTERM then SIGKILL.
+///
+/// Sends SIGTERM, waits briefly, then sends SIGKILL if the process is
+/// still alive. This is best-effort; failures are logged but not fatal.
+fn kill_process_best_effort(pid: u32) {
+    #[cfg(unix)]
+    {
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return;
+        };
+
+        // Send SIGTERM first (graceful)
+        // SAFETY: kill() is a standard POSIX syscall. We validated `pid_i32`
+        // is representable. SIGTERM is a safe signal to send.
+        #[allow(unsafe_code)]
+        let term_result = unsafe { libc::kill(pid_i32, libc::SIGTERM) };
+
+        if term_result != 0 {
+            // Process may already be dead -- that's fine
+            return;
+        }
+
+        // Wait briefly for graceful shutdown (up to 5 seconds)
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Check if process is still alive
+            // SAFETY: kill(pid, 0) checks existence without signaling.
+            #[allow(unsafe_code)]
+            let alive = unsafe { libc::kill(pid_i32, 0) };
+            if alive != 0 {
+                return; // Process exited
+            }
+        }
+
+        // Process still alive after 5s -- send SIGKILL
+        // SAFETY: kill() with SIGKILL is a standard POSIX call.
+        #[allow(unsafe_code)]
+        let _ = unsafe { libc::kill(pid_i32, libc::SIGKILL) };
+
+        // Brief wait for SIGKILL to take effect
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 // =============================================================================
