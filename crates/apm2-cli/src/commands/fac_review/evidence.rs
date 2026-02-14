@@ -1,6 +1,6 @@
 //! Evidence gates (fmt, clippy, doc, test, CI scripts) for FAC push pipeline.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -191,7 +191,7 @@ fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize)
         return;
     }
 
-    let Ok(mut file) = OpenOptions::new().append(true).open(log_path) else {
+    let Ok(mut file) = crate::commands::fac_permissions::append_fac_file_with_mode(log_path) else {
         return;
     };
 
@@ -226,7 +226,10 @@ fn run_merge_conflict_gate(
         Ok(report) => {
             let duration = started.elapsed().as_secs();
             let passed = !report.has_conflicts();
-            let _ = fs::write(&log_path, render_merge_conflict_log(&report));
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+                &log_path,
+                render_merge_conflict_log(&report).as_bytes(),
+            );
             if !passed {
                 eprintln!("{}", render_merge_conflict_summary(&report));
             }
@@ -244,9 +247,9 @@ fn run_merge_conflict_gate(
         },
         Err(err) => {
             let duration = started.elapsed().as_secs();
-            let _ = fs::write(
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
                 &log_path,
-                format!("merge conflict gate execution error: {err}\n"),
+                format!("merge conflict gate execution error: {err}\n").as_bytes(),
             );
             emit_evidence_line(sha, gate_name, "FAIL", duration, &log_path, None);
             eprintln!("merge_conflict_main: FAIL reason={err}");
@@ -280,13 +283,14 @@ pub fn run_single_evidence_gate(
     match output {
         Ok(out) => {
             let combined_output_bytes = out.stdout.len() + out.stderr.len();
-            let _ = fs::write(
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
                 log_path,
                 format!(
                     "=== stdout ===\n{}\n=== stderr ===\n{}\n",
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
-                ),
+                )
+                .as_bytes(),
             );
             let passed = out.status.success();
             if !passed && gate_name == "test" {
@@ -297,7 +301,10 @@ pub fn run_single_evidence_gate(
             passed
         },
         Err(e) => {
-            let _ = fs::write(log_path, format!("execution error: {e}\n"));
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+                log_path,
+                format!("execution error: {e}\n").as_bytes(),
+            );
             emit_evidence_line(sha, gate_name, "FAIL", duration, log_path, None);
             false
         },
@@ -348,7 +355,10 @@ fn verify_workspace_integrity_gate(
         } else {
             "workspace_integrity_guard.sh not found — skipped"
         };
-        let _ = fs::write(&log_path, format!("{msg}\n"));
+        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+            &log_path,
+            format!("{msg}\n").as_bytes(),
+        );
         let ts = now_iso8601();
         let line = format!(
             "ts={ts} sha={sha} gate={gate_name} status=PASS log={}",
@@ -447,7 +457,8 @@ pub fn run_evidence_gates(
     opts: Option<&EvidenceGateOptions>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let evidence_dir = apm2_home_dir()?.join("private/fac/evidence");
-    fs::create_dir_all(&evidence_dir)
+    // TCK-00536: create evidence directory with mode 0700 at create-time.
+    crate::commands::fac_permissions::ensure_dir_with_mode(&evidence_dir)
         .map_err(|e| format!("failed to create evidence directory: {e}"))?;
 
     let gates: &[(&str, &[&str])] = &[
@@ -572,9 +583,9 @@ pub fn run_evidence_gates(
     let skip_test_gate = opts.is_some_and(|o| o.skip_test_gate);
     let test_log = evidence_dir.join("test.log");
     if skip_test_gate {
-        let _ = fs::write(
+        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
             &test_log,
-            "quick mode enabled: skipped heavyweight test gate\n",
+            b"quick mode enabled: skipped heavyweight test gate\n",
         );
         let ts = now_iso8601();
         eprintln!(
@@ -694,7 +705,8 @@ pub fn run_evidence_gates_with_status(
     projection_log: Option<&mut File>,
 ) -> Result<bool, String> {
     let evidence_dir = apm2_home_dir()?.join("private/fac/evidence");
-    fs::create_dir_all(&evidence_dir)
+    // TCK-00536: create evidence directory with mode 0700 at create-time.
+    crate::commands::fac_permissions::ensure_dir_with_mode(&evidence_dir)
         .map_err(|e| format!("failed to create evidence directory: {e}"))?;
 
     let mut status = CiStatus::new(sha, pr_number);
@@ -1246,7 +1258,14 @@ mod tests {
             "apm2-evidence-tests-{test_name}-{}-{nonce}",
             std::process::id()
         ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&dir).expect("create temp dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .expect("set temp dir permissions");
+        }
         dir.join("test.log")
     }
 
@@ -1254,6 +1273,13 @@ mod tests {
     fn short_test_failure_hint_is_appended() {
         let log_path = temp_log_path("short");
         fs::write(&log_path, "=== stdout ===\n\n=== stderr ===\n\n").expect("write seed log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+                .expect("set log file mode");
+        }
 
         append_short_test_failure_hint(&log_path, 128);
 
@@ -1266,6 +1292,13 @@ mod tests {
     fn short_test_failure_hint_is_skipped_for_large_output() {
         let log_path = temp_log_path("large");
         fs::write(&log_path, "=== stdout ===\n\n=== stderr ===\n\n").expect("write seed log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+                .expect("set log file mode");
+        }
 
         append_short_test_failure_hint(&log_path, SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES);
 

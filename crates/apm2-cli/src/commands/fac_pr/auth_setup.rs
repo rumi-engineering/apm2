@@ -1,8 +1,6 @@
 //! `apm2 fac pr auth-setup` — bootstrap GitHub App credentials.
 
 use std::fmt::Write as _;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use apm2_core::github::resolve_apm2_home;
@@ -163,7 +161,7 @@ fn write_persistent_config(
     let apm2_home = resolve_apm2_home()
         .ok_or_else(|| "cannot determine home directory for ~/.apm2".to_string())?;
 
-    std::fs::create_dir_all(&apm2_home)
+    crate::commands::fac_permissions::ensure_dir_with_mode(&apm2_home)
         .map_err(|e| format!("failed to create {}: {e}", apm2_home.display()))?;
 
     let fallback_private_key_file = if args.allow_private_key_file_fallback {
@@ -174,7 +172,11 @@ fn write_persistent_config(
             Some(canonical)
         } else {
             let dest = apm2_home.join(format!("app-{}.pem", args.app_id));
-            write_file_mode_0600(&dest, private_key_content.expose_secret())?;
+            crate::commands::fac_permissions::write_fac_file_with_mode(
+                &dest,
+                private_key_content.expose_secret().as_bytes(),
+            )
+            .map_err(|error| format!("failed to create {}: {error}", dest.display()))?;
             Some(dest)
         }
     } else {
@@ -199,7 +201,11 @@ fn write_persistent_config(
         )
         .expect("infallible String write");
     }
-    write_file_mode_0600(&config_path, &toml_content)?;
+    crate::commands::fac_permissions::write_fac_file_with_mode(
+        &config_path,
+        toml_content.as_bytes(),
+    )
+    .map_err(|error| format!("failed to create {}: {error}", config_path.display()))?;
 
     Ok(PersistedConfigResult {
         config_path,
@@ -208,34 +214,6 @@ fn write_persistent_config(
 }
 
 /// Writes `content` to `path` with Unix file mode 0600.
-fn write_file_mode_0600(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    if path.exists() {
-        ensure_regular_file_no_symlink(path)?;
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    file.sync_all()
-        .map_err(|e| format!("failed to sync {}: {e}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("failed to enforce mode 0600 on {}: {e}", path.display()))?;
-
-    Ok(())
-}
-
 fn ensure_regular_file_no_symlink(path: &Path) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
@@ -257,34 +235,23 @@ fn ensure_regular_file_no_symlink(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
-    use super::write_file_mode_0600;
+    use super::ensure_regular_file_no_symlink;
 
-    #[test]
-    fn write_file_mode_0600_enforces_mode_on_existing_file() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("secret.pem");
-        fs::write(&path, "old").expect("seed file");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set weak mode");
-
-        write_file_mode_0600(&path, "new").expect("secure rewrite");
-
-        let content = fs::read_to_string(&path).expect("read file");
-        assert_eq!(content, "new");
-        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
+    #[cfg(unix)]
     #[test]
     fn write_file_mode_0600_rejects_symlink_target() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o700))
+            .expect("harden temp dir");
         let target = tmp.path().join("target.pem");
         fs::write(&target, "target").expect("seed target");
         let link = tmp.path().join("link.pem");
-        symlink(&target, &link).expect("create symlink");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
 
-        let err = write_file_mode_0600(&link, "new").expect_err("symlink must fail");
+        let err = ensure_regular_file_no_symlink(&link).expect_err("symlink must fail");
         assert!(err.contains("symlink"), "unexpected error: {err}");
     }
 }

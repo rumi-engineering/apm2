@@ -174,3 +174,10 @@ pub enum EventSubcommand {
 - CWE-214: Invocation of Process Using Visible Sensitive Information
 - DD-009: ProtocolServer-only control plane
 - `documents/security/SECRETS_MANAGEMENT.cac.json`: Secrets handling policy
+
+## Security / Permission Invariants (Updated for TCK-00536)
+
+- FAC command entry (`run_fac`) now enforces strict ownership and 0700-mode validation on
+  `$APM2_HOME` critical subdirectories (`private`, `private/fac`, and related cache/evidence roots).
+- Command modules now use shared helpers in `fac_permissions` when creating FAC directories/files so
+  sensitive artifacts are created with safe modes (`0700` for directories, `0600` for files).

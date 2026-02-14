@@ -129,17 +129,21 @@ Credential management subcommands.
 | `apm2 status <name>` | Show process details |
 | `apm2 logs <name>` | Tail process logs |
 
-### FAC Lane Management (TCK-00515)
+### FAC Lane Management (TCK-00515, TCK-00516)
 
 | Command | Description |
 |---------|-------------|
 | `apm2 fac lane status` | Show all lane states (lock + lease + PID liveness) |
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
+| `apm2 fac lane reset <lane_id>` | Reset lane: delete workspace/target/logs, remove lease |
+| `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
 
 **Invariants:**
 - [INV-LANE-001] At most one job executes in a lane at a time (enforced via `flock(LOCK_EX)`).
 - [INV-LANE-004] Stale lease detection is fail-closed: ambiguous PID state reports CORRUPT.
 - Lane commands operate directly on filesystem (no daemon required).
+- [INV-RMTREE-001] Lane reset refuses symlink traversal at any depth.
+- [INV-RMTREE-002] Lane reset cannot delete outside allowed parent boundary.
 
 ### Credential Management
 
@@ -270,6 +274,11 @@ Commands surface daemon errors and exit non-zero on failure.
 - [CTR-CLI-107] Connection errors suggest checking if daemon is running.
 
 ## Related Modules
+
+## TCK-00536 Security Posture Update
+
+- Added FAC root preflight validation (`run_fac`) to enforce `private/fac` hierarchy ownership and mode checks before executing FAC commands.
+- New `fac_permissions` helper module is now part of command-level security hardening for directory/file creation under FAC paths.
 
 - [`apm2_core::config`](../apm2-core/src/config/AGENTS.md) - `EcosystemConfig` for socket path resolution
 - [`apm2_daemon`](../apm2-daemon/AGENTS.md) - Server-side implementation

@@ -90,6 +90,7 @@ mod key_policy;
 pub mod lane;
 mod lease;
 pub mod merge_receipt;
+mod node_identity;
 pub mod policy_inheritance;
 mod policy_resolution;
 pub mod projection;
@@ -104,6 +105,7 @@ pub mod risk_tier;
 pub mod role_conformance;
 mod role_spec;
 mod role_spec_v2;
+pub mod safe_rmtree;
 pub mod selection_policy;
 pub mod serde_helpers;
 pub mod taint;
@@ -291,10 +293,14 @@ pub use quarantine::{
     QuarantineError, QuarantineEvent, QuarantineProjection, RunnerPoolQuarantined,
     RunnerPoolQuarantinedProto,
 };
+pub use receipt::persist_content_addressed_receipt;
 // Re-export receipt types
 pub use receipt::{
-    GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
-    SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
+    FacJobReceiptError, FacJobReceiptV1, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
+    GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
+    SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+    deserialize_job_receipt,
 };
 // Re-export retry manager types
 pub use retry_manager::{
@@ -513,4 +519,15 @@ pub use lane::{
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
     MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_PROFILE_FILE_SIZE,
     MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, ResourceProfile,
+};
+// Re-export node identity types (TCK-00556).
+pub use node_identity::{
+    DEFAULT_BOUNDARY_ID, MAX_BOUNDARY_ID_LENGTH as NODE_IDENTITY_MAX_BOUNDARY_ID_LENGTH,
+    NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
+    load_or_default_boundary_id, load_or_derive_node_fingerprint,
+};
+// Re-export safe rmtree types (TCK-00516)
+pub use safe_rmtree::{
+    MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
+    safe_rmtree_v1,
 };
