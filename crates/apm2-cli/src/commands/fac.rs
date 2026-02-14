@@ -28,6 +28,7 @@
 //! - `apm2 fac review comment` - Publish one SHA-bound finding comment
 //! - `apm2 fac review verdict` - Show/set SHA-bound approve/deny verdicts per
 //!   review dimension
+//! - `apm2 fac services status` - Inspect daemon/worker managed service health
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
 //!   optimal point
 //! - `apm2 fac review project` - Render one projection status line
@@ -52,6 +53,7 @@
 //! - RFC-0019: FAC v0 requirements
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use apm2_core::fac::{
     LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
@@ -88,6 +90,16 @@ const DEFAULT_LEDGER_FILENAME: &str = "ledger.db";
 
 /// Default CAS path relative to data directory.
 const DEFAULT_CAS_DIRNAME: &str = "cas";
+
+const SERVICES_UNIT_NAMES: [&str; 2] = ["apm2-daemon.service", "apm2-worker.service"];
+const SERVICE_STATUS_PROPERTIES: [&str; 6] = [
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "UnitFileState",
+    "MainPID",
+    "ActiveEnterTimestampMonotonic",
+];
 
 // =============================================================================
 // Command Types
@@ -130,6 +142,9 @@ pub enum FacSubcommand {
 
     /// Check daemon health and prerequisites.
     Doctor(DoctorArgs),
+
+    /// Report daemon and worker managed service health.
+    Services(ServicesArgs),
 
     /// Launch a FAC role with explicit hash-bound admission checks.
     ///
@@ -254,6 +269,28 @@ pub struct WorkArgs {
 /// Arguments for `apm2 fac doctor`.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    /// Output in JSON format.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac services`.
+#[derive(Debug, Args)]
+pub struct ServicesArgs {
+    /// services status
+    #[command(subcommand)]
+    pub subcommand: ServicesSubcommand,
+}
+
+/// Arguments for `apm2 fac services status`.
+#[derive(Debug, Subcommand)]
+pub enum ServicesSubcommand {
+    /// Report daemon and worker managed service health.
+    Status(ServicesStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServicesStatusArgs {
     /// Output in JSON format.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -1009,6 +1046,301 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceStatusResponse {
+    /// Unit name.
+    pub unit: String,
+    /// Scope used for query.
+    pub scope: String,
+    /// Unit load state.
+    pub load_state: String,
+    /// Unit active state.
+    pub active_state: String,
+    /// Unit sub-state.
+    pub sub_state: String,
+    /// Whether unit is enabled in unit files.
+    pub enabled: String,
+    /// Main PID from systemd.
+    pub main_pid: u32,
+    /// Unit uptime in seconds.
+    pub uptime_seconds: u64,
+    /// Error encountered while checking the unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServicesStatusResponse {
+    /// List of managed services.
+    pub services: Vec<ServiceStatusResponse>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServiceScope {
+    /// User systemd scope.
+    User,
+    /// System systemd scope.
+    System,
+}
+
+impl ServiceScope {
+    const fn scope_flag(self) -> Option<&'static str> {
+        match self {
+            Self::User => Some("--user"),
+            Self::System => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::System => "system",
+        }
+    }
+}
+
+const SERVICE_SCOPES: [ServiceScope; 2] = [ServiceScope::User, ServiceScope::System];
+
+fn run_services_status(json_output: bool) -> u8 {
+    let current_boot_micros = read_boot_time_micros();
+    let mut services = Vec::with_capacity(SERVICES_UNIT_NAMES.len());
+    let mut degraded = false;
+
+    for unit_name in SERVICES_UNIT_NAMES {
+        let status = match query_unit_status_with_scopes(unit_name, current_boot_micros) {
+            Ok(status) => status,
+            Err(message) => {
+                degraded = true;
+                ServiceStatusResponse {
+                    unit: unit_name.to_string(),
+                    scope: "none".to_string(),
+                    load_state: "unknown".to_string(),
+                    active_state: "unknown".to_string(),
+                    sub_state: "unknown".to_string(),
+                    enabled: "unknown".to_string(),
+                    main_pid: 0,
+                    uptime_seconds: 0,
+                    error: Some(message),
+                }
+            },
+        };
+
+        let healthy = status.error.is_none()
+            && status.load_state == "loaded"
+            && status.active_state == "active"
+            && status.enabled == "enabled";
+        if !healthy {
+            degraded = true;
+        }
+
+        if json_output {
+            services.push(status.clone());
+        } else {
+            print_services_status_line(&status, healthy);
+            services.push(status);
+        }
+    }
+
+    if json_output {
+        let response = ServicesStatusResponse {
+            services: services.clone(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&response) {
+            println!("{json}");
+        } else {
+            println!("{{\"services\":[]}}");
+            degraded = true;
+        }
+    } else if services.is_empty() {
+        println!("No managed FAC services configured");
+        degraded = true;
+    } else {
+        println!();
+        println!(
+            "Summary: {}/{} service entries healthy",
+            services
+                .iter()
+                .filter(|svc| {
+                    svc.error.is_none()
+                        && svc.load_state == "loaded"
+                        && svc.active_state == "active"
+                        && svc.enabled == "enabled"
+                })
+                .count(),
+            services.len()
+        );
+    }
+
+    if degraded {
+        exit_codes::GENERIC_ERROR
+    } else {
+        exit_codes::SUCCESS
+    }
+}
+
+fn query_unit_status_with_scopes(
+    unit_name: &'static str,
+    current_boot_micros: Option<u128>,
+) -> Result<ServiceStatusResponse, String> {
+    let mut last_error: Option<String> = None;
+
+    for scope in SERVICE_SCOPES {
+        match query_unit_status(scope, unit_name, current_boot_micros) {
+            Ok(service_status) => return Ok(service_status),
+            Err(error) => last_error = Some(format!("{} ({} scope)", error, scope.label())),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| format!("unit {unit_name} not found in user or system scope")))
+}
+
+fn query_unit_status(
+    scope: ServiceScope,
+    unit_name: &'static str,
+    current_boot_micros: Option<u128>,
+) -> Result<ServiceStatusResponse, String> {
+    let mut cmd = Command::new("systemctl");
+    if let Some(flag) = scope.scope_flag() {
+        cmd.arg(flag);
+    }
+    cmd.arg("show");
+    cmd.args(SERVICE_STATUS_PROPERTIES.map(|property| format!("--property={property}")));
+    cmd.arg(unit_name);
+
+    let output = cmd.output().map_err(|error| {
+        format!(
+            "failed to run systemctl for {unit_name} in {} scope: {error}",
+            scope.label()
+        )
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "systemctl status check failed for {unit_name} in {} scope: {}",
+            scope.label(),
+            stderr.trim()
+        ));
+    }
+
+    parse_systemctl_show_output(unit_name, scope, current_boot_micros, &output.stdout)
+}
+
+fn parse_systemctl_show_output(
+    unit_name: &'static str,
+    scope: ServiceScope,
+    current_boot_micros: Option<u128>,
+    raw_output: &[u8],
+) -> Result<ServiceStatusResponse, String> {
+    let output = String::from_utf8_lossy(raw_output);
+    let mut load_state = String::new();
+    let mut active_state = String::new();
+    let mut sub_state = String::new();
+    let mut enabled = String::new();
+    let mut main_pid = String::new();
+    let mut active_enter_timestamp = String::new();
+
+    for line in output.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "LoadState" => load_state = value.to_string(),
+                "ActiveState" => active_state = value.to_string(),
+                "SubState" => sub_state = value.to_string(),
+                "UnitFileState" => enabled = value.to_string(),
+                "MainPID" => main_pid = value.to_string(),
+                "ActiveEnterTimestampMonotonic" => active_enter_timestamp = value.to_string(),
+                _ => {},
+            }
+        }
+    }
+
+    if load_state.is_empty() || active_state.is_empty() || sub_state.is_empty() {
+        return Err(format!(
+            "systemctl output for {unit_name} ({}) is missing expected fields",
+            scope.label()
+        ));
+    }
+
+    let main_pid: u32 = main_pid.parse().unwrap_or(0);
+    let active_enter: Option<u128> = if active_enter_timestamp.is_empty() {
+        None
+    } else {
+        active_enter_timestamp.parse().ok()
+    };
+    let uptime_seconds = compute_service_uptime(current_boot_micros, active_enter);
+
+    Ok(ServiceStatusResponse {
+        unit: unit_name.to_string(),
+        scope: scope.label().to_string(),
+        load_state,
+        active_state,
+        sub_state,
+        enabled,
+        main_pid,
+        uptime_seconds,
+        error: None,
+    })
+}
+
+fn compute_service_uptime(
+    current_boot_micros: Option<u128>,
+    active_enter_micros: Option<u128>,
+) -> u64 {
+    match (current_boot_micros, active_enter_micros) {
+        (Some(boot), Some(enter)) if boot >= enter => {
+            let elapsed_micros = boot.saturating_sub(enter);
+            u64::try_from(elapsed_micros / 1_000_000).unwrap_or_default()
+        },
+        _ => 0,
+    }
+}
+
+fn read_boot_time_micros() -> Option<u128> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let raw_seconds = uptime.split_whitespace().next()?;
+    parse_uptime_microseconds(raw_seconds)
+}
+
+fn parse_uptime_microseconds(raw_seconds: &str) -> Option<u128> {
+    let (whole_seconds, fractional_seconds) =
+        raw_seconds.split_once('.').unwrap_or((raw_seconds, "0"));
+    let seconds = whole_seconds.parse::<u128>().ok()?;
+
+    let mut microseconds = 0_u128;
+    let mut scale = 6_u32;
+    for ch in fractional_seconds.chars().take(6) {
+        let digit = ch.to_digit(10)?;
+        scale = scale.saturating_sub(1);
+        microseconds =
+            microseconds.saturating_add(u128::from(digit) * 10_u128.saturating_pow(scale));
+    }
+
+    Some(
+        seconds
+            .saturating_mul(1_000_000)
+            .saturating_add(microseconds),
+    )
+}
+
+fn print_services_status_line(status: &ServiceStatusResponse, healthy: bool) {
+    if let Some(error) = status.error.as_deref() {
+        println!("● {}/{}: degraded", status.unit, status.scope);
+        println!("  error:      {error}");
+        return;
+    }
+
+    let health_status = if healthy { "healthy" } else { "degraded" };
+    println!("● {} ({}) {}", status.unit, status.scope, health_status);
+    println!("  LoadState:  {}", status.load_state);
+    println!("  ActiveState:{}", status.active_state);
+    println!("  SubState:   {}", status.sub_state);
+    println!("  Enabled:    {}", status.enabled);
+    println!("  PID:        {}", status.main_pid);
+    println!("  Uptime:     {}s", status.uptime_seconds);
+}
+
 // =============================================================================
 // Command Execution
 // =============================================================================
@@ -1043,6 +1375,7 @@ pub fn run_fac(
         FacSubcommand::Gates(_)
             | FacSubcommand::Doctor(_)
             | FacSubcommand::Lane(_)
+            | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
@@ -1078,6 +1411,11 @@ pub fn run_fac(
                 Ok(()) => exit_codes::SUCCESS,
                 Err(_) => exit_codes::GENERIC_ERROR,
             }
+        },
+        FacSubcommand::Services(args) => match &args.subcommand {
+            ServicesSubcommand::Status(status_args) => {
+                run_services_status(json_output || status_args.json)
+            },
         },
         FacSubcommand::RoleLaunch(args) => {
             match role_launch::handle_role_launch(
@@ -3715,5 +4053,36 @@ mod tests {
             "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
             "--json",
         ]);
+    }
+
+    #[test]
+    fn test_services_status_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "services", "status", "--json"])
+            .expect("services status should parse");
+
+        match parsed.subcommand {
+            FacSubcommand::Services(args) => match args.subcommand {
+                ServicesSubcommand::Status(status_args) => {
+                    assert!(status_args.json);
+                },
+            },
+            other => panic!("expected services subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_services_global_json_flag_parses_with_status() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "services", "status"])
+            .expect("global json with services status should parse");
+
+        assert!(parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Services(args) => match args.subcommand {
+                ServicesSubcommand::Status(status_args) => {
+                    assert!(!status_args.json);
+                },
+            },
+            other => panic!("expected services subcommand, got {other:?}"),
+        }
     }
 }

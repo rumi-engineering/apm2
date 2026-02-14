@@ -137,6 +137,7 @@ Credential management subcommands.
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
 | `apm2 fac lane reset <lane_id>` | Reset lane: delete workspace/target/logs, remove lease |
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
+| `apm2 fac services status` | Check daemon/worker service status |
 
 **Invariants:**
 - [INV-LANE-001] At most one job executes in a lane at a time (enforced via `flock(LOCK_EX)`).

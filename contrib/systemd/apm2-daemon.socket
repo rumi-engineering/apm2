@@ -1,0 +1,13 @@
+[Unit]
+Description=APM2 Daemon Operator Socket
+Documentation=https://github.com/guardian-intelligence/apm2
+
+[Socket]
+ListenStream=%t/apm2/operator.sock
+SocketMode=0600
+RemoveOnStop=yes
+Service=apm2-daemon.service
+RuntimeDirectory=apm2
+
+[Install]
+WantedBy=sockets.target

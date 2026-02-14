@@ -1,15 +1,14 @@
 [Unit]
-Description=APM2 Daemon — Forge Admission Cycle broker
+Description=APM2 FAC Worker
 Documentation=https://github.com/guardian-intelligence/apm2
-After=network-online.target
-Wants=network-online.target
-Requires=apm2-daemon.socket
+After=network-online.target apm2-daemon.service
+Wants=apm2-daemon.service
+Requires=apm2-daemon.service
 
 [Service]
 Type=simple
 # Adjust this path to match your deployment layout if different.
-ExecStart=%h/.cargo/bin/apm2 daemon --no-daemon
-ExecStop=%h/.cargo/bin/apm2 kill
+ExecStart=%h/.cargo/bin/apm2 fac worker --poll-interval 10
 Restart=always
 RestartSec=5
 WatchdogSec=300
@@ -24,7 +23,6 @@ WorkingDirectory=/var/lib/apm2
 Environment=APM2_HOME=/var/lib/apm2
 Environment=RUST_LOG=info
 LoadCredential=gh-token:/var/lib/apm2/private/creds/gh-token
-Sockets=apm2-daemon.socket
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/apm2
