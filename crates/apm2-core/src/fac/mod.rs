@@ -105,6 +105,7 @@ pub mod risk_tier;
 pub mod role_conformance;
 mod role_spec;
 mod role_spec_v2;
+pub mod safe_rmtree;
 pub mod selection_policy;
 pub mod serde_helpers;
 pub mod taint;
@@ -520,4 +521,9 @@ pub use node_identity::{
     DEFAULT_BOUNDARY_ID, MAX_BOUNDARY_ID_LENGTH as NODE_IDENTITY_MAX_BOUNDARY_ID_LENGTH,
     NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
     load_or_default_boundary_id, load_or_derive_node_fingerprint,
+};
+// Re-export safe rmtree types (TCK-00516)
+pub use safe_rmtree::{
+    MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
+    safe_rmtree_v1,
 };
