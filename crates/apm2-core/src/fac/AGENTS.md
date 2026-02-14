@@ -442,3 +442,18 @@ default worker flow and future system-mode execution backends.
   defaults.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
+
+## Receipt Versioning (TCK-00518)
+
+The `FacJobReceiptV1` type supports two canonical byte representations:
+
+- **v1** (`canonical_bytes()`): Excludes `unsafe_direct`. Used by existing worker
+  receipts and `persist_content_addressed_receipt()`. Domain separator:
+  `apm2.fac.job_receipt.content_hash.v1\0`.
+- **v2** (`canonical_bytes_v2()`): Includes `unsafe_direct` as a boolean byte.
+  Used by CLI gate receipts (`try_build_v2()`) and
+  `persist_content_addressed_receipt_v2()`. Domain separator:
+  `apm2.fac.job_receipt.content_hash.v2\0`.
+
+Both representations are length-prefixed. The distinct domain separators ensure
+no hash collision between v1 and v2 hashes for identical receipt content.

@@ -262,9 +262,18 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub quick: bool,
 
+    /// Run gates locally without broker/worker (unsafe: bypasses admission
+    /// control).
+    #[arg(long)]
+    pub direct: bool,
+
     /// Wall timeout for bounded test execution (seconds).
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 240)]
     pub timeout_seconds: u64,
+
+    /// Maximum seconds to wait for worker completion in default mode.
+    #[arg(long, default_value = "300")]
+    pub wait_timeout: u64,
 
     /// Memory ceiling for bounded test execution.
     #[arg(long, default_value = "24G")]
@@ -1523,6 +1532,8 @@ pub fn run_fac(
             args.pids_max,
             &args.cpu_quota,
             json_output,
+            args.direct,
+            args.wait_timeout,
         ),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
@@ -4455,6 +4466,26 @@ mod tests {
                 },
             },
             other => panic!("expected services subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gates_direct_and_wait_timeout_parse() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "gates",
+            "--direct",
+            "--wait-timeout",
+            "120",
+        ])
+        .expect("gates direct mode should parse");
+
+        match parsed.subcommand {
+            FacSubcommand::Gates(args) => {
+                assert!(args.direct);
+                assert_eq!(args.wait_timeout, 120);
+            },
+            other => panic!("expected gates subcommand, got {other:?}"),
         }
     }
 }

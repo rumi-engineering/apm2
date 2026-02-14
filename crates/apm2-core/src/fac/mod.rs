@@ -319,15 +319,15 @@ pub use quarantine::{
     QuarantineError, QuarantineEvent, QuarantineProjection, RunnerPoolQuarantined,
     RunnerPoolQuarantinedProto,
 };
-pub use receipt::persist_content_addressed_receipt;
 // Re-export receipt types
 pub use receipt::{
     BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
     FacJobReceiptError, FacJobReceiptV1, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
     GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
     SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
-    deserialize_job_receipt,
+    compute_job_receipt_content_hash, compute_job_receipt_content_hash_v2, deserialize_job_receipt,
 };
+pub use receipt::{persist_content_addressed_receipt, persist_content_addressed_receipt_v2};
 pub use repo_mirror::{
     CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,
     RepoMirrorError, RepoMirrorManager,

@@ -50,7 +50,7 @@ apm2 fac review run --pr <N> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
-- **Uniform bounded tests**: Test gate uses a fixed 600s timeout for all workspaces.
+- **Uniform bounded tests**: Test gate uses a fixed 240s timeout for all workspaces.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.
@@ -258,7 +258,7 @@ pub use types::ReviewRunType;
 | `run_restart(repo, pr, force, json)` | CI-aware pipeline restart |
 | `run_pipeline(repo, pr_number, sha)` | End-to-end: dispatch + project |
 | `run_logs(pr, repo, selector_type, selector, json)` | Retrieve review logs |
-| `run_gates(force, quick, timeout, mem, pids, cpu, json)` | Run pre-review gate checks |
+| `run_gates(force, quick, timeout, mem, pids, cpu, json, direct, wait_timeout)` | Run pre-review gate checks |
 
 ## Related Modules
 
@@ -284,3 +284,21 @@ pub use types::ReviewRunType;
   - Added `rustfmt --version` to environment digest inputs.
   - Optionally captured `sccache --version` (with fallback when unavailable).
   - Extended command env allowlist with `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `RUSTC_WRAPPER`, and `SCCACHE_*`.
+- TCK-00518: Default-mode gates enqueue+wait with `--direct` unsafe bypass.
+  - Default `apm2 fac gates` creates job spec, obtains broker token, enqueues, and waits for worker receipt.
+  - `--direct` flag runs gates locally without broker/worker (unsafe bypass; marks receipt `unsafe_direct: true`).
+  - `--wait-timeout` bounds the wait for worker completion (default 300s); fails fast with remediation hints.
+  - Timeout default aligned to 240s to match `MAX_MANUAL_TIMEOUT_SECONDS`.
+  - Broker state persistence uses atomic `write_fac_file_with_mode` (temp+rename with 0600).
+  - Receipt polling uses seen-file set to amortize I/O to O(new_files) per iteration.
+  - Queue/key/pending directories use `fac_permissions::ensure_dir_with_mode` (0700 at create-time).
+  - Signing key and job spec writes use `fac_permissions::write_fac_file_with_mode` (0600 at create-time).
+  - Policy loaded from `$FAC_ROOT/policy/fac_policy.v1.json` with documented default fallback.
+  - **Round 2 hardening**:
+    - Job IDs use UUIDv7 for high-entropy, non-predictable, collision-free identifiers.
+    - Receipt matching verifies `job_spec_digest` and recomputes v2 content hash to detect forgery/tampering.
+    - Broker state deserialization errors propagate as hard failures (fail-closed); default state only on first run.
+    - `--pids-max` and `--cpu-quota` rejected with error in queued mode (worker uses lane defaults).
+    - Worker liveness precheck before entering receipt poll loop; fails fast with remediation guidance.
+    - `--force` flag wired: bypasses clean-tree requirement (re-run against committed SHA with unrelated modifications).
+    - `canonical_bytes_v2()` and `compute_job_receipt_content_hash_v2()` include `unsafe_direct` in integrity binding.

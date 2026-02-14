@@ -306,6 +306,10 @@ pub struct FacJobReceiptV1 {
     /// Stable denial reason for non-completed outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<DenialReasonCode>,
+    /// If true, this receipt came from direct-mode execution without
+    /// admission control.
+    #[serde(default)]
+    pub unsafe_direct: bool,
     /// Human-readable reason (bounded).
     pub reason: String,
     /// RFC-0028 boundary trace.
@@ -360,6 +364,117 @@ impl FacJobReceiptV1 {
         } else {
             bytes.push(0u8);
         }
+
+        // NOTE: `unsafe_direct` is intentionally excluded from canonical bytes.
+        // Including it would change the content hash for all existing receipts,
+        // breaking content-addressed storage and ledger references. The field
+        // is still present in the struct and in serde (de)serialization.
+
+        bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.reason.as_bytes());
+
+        if let Some(trace) = &self.rfc0028_channel_boundary {
+            bytes.push(1u8);
+            bytes.push(u8::from(trace.passed));
+            bytes.extend_from_slice(&trace.defect_count.to_be_bytes());
+            bytes.extend_from_slice(&(trace.defect_classes.len() as u32).to_be_bytes());
+            for class in &trace.defect_classes {
+                bytes.extend_from_slice(&(class.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(class.as_bytes());
+            }
+        } else {
+            bytes.push(0u8);
+        }
+
+        if let Some(trace) = &self.eio29_queue_admission {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(trace.verdict.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.verdict.as_bytes());
+            bytes.extend_from_slice(&(trace.queue_lane.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.queue_lane.as_bytes());
+            if let Some(reason) = &trace.defect_reason {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(reason.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(reason.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
+        } else {
+            bytes.push(0u8);
+        }
+
+        if let Some(trace) = &self.eio29_budget_admission {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(trace.verdict.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.verdict.as_bytes());
+            if let Some(reason) = &trace.reason {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(reason.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(reason.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
+        } else {
+            bytes.push(0u8);
+        }
+
+        if let Some(digest) = &self.patch_digest {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(digest.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
+
+        bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
+
+        bytes
+    }
+
+    /// Returns v2 canonical bytes that include `unsafe_direct` in the
+    /// preimage.
+    ///
+    /// V2 hashing includes `unsafe_direct` as a boolean byte (0/1) after
+    /// the `denial_reason` block and before the reason field.  This ensures
+    /// that the direct-mode flag is integrity-bound in new receipts while
+    /// keeping v1 `canonical_bytes()` unchanged for existing receipt
+    /// verification.
+    ///
+    /// New receipts should use v2. Existing v1 receipts remain verifiable
+    /// via `canonical_bytes()`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn canonical_bytes_v2(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512);
+
+        bytes.extend_from_slice(&(self.schema.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.schema.as_bytes());
+
+        bytes.extend_from_slice(&(self.receipt_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.receipt_id.as_bytes());
+
+        bytes.extend_from_slice(&(self.job_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.job_id.as_bytes());
+
+        bytes.extend_from_slice(&(self.job_spec_digest.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.job_spec_digest.as_bytes());
+
+        let outcome_str = serde_json::to_string(&self.outcome).unwrap_or_default();
+        bytes.extend_from_slice(&(outcome_str.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(outcome_str.as_bytes());
+
+        if let Some(reason_code) = &self.denial_reason {
+            bytes.push(1u8);
+            let reason_str = serde_json::to_string(reason_code).unwrap_or_default();
+            bytes.extend_from_slice(&(reason_str.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(reason_str.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
+
+        // V2: Include `unsafe_direct` in canonical bytes for integrity
+        // binding (MAJOR-3).
+        bytes.push(u8::from(self.unsafe_direct));
 
         bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.reason.as_bytes());
@@ -608,6 +723,7 @@ pub struct FacJobReceiptV1Builder {
     outcome: Option<FacJobOutcome>,
     denial_reason: Option<DenialReasonCode>,
     reason: Option<String>,
+    unsafe_direct: bool,
     policy_hash: Option<String>,
     patch_digest: Option<String>,
     canonicalizer_tuple_digest: Option<String>,
@@ -651,6 +767,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Marks whether this receipt was produced by unsafe direct mode.
+    #[must_use]
+    pub const fn unsafe_direct(mut self, unsafe_direct: bool) -> Self {
+        self.unsafe_direct = unsafe_direct;
         self
     }
 
@@ -868,6 +991,7 @@ impl FacJobReceiptV1Builder {
             canonicalizer_tuple_digest,
             outcome,
             denial_reason: self.denial_reason,
+            unsafe_direct: self.unsafe_direct,
             reason,
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
@@ -878,6 +1002,24 @@ impl FacJobReceiptV1Builder {
 
         let mut receipt = candidate;
         receipt.content_hash = compute_job_receipt_content_hash(&receipt);
+        Ok(receipt)
+    }
+
+    /// Builds a receipt and computes the **v2** content hash which
+    /// includes `unsafe_direct` in the canonical preimage.
+    ///
+    /// Use this for new receipts created by the CLI (gates, direct mode)
+    /// where `unsafe_direct` integrity binding is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacJobReceiptError`] if required fields are missing or
+    /// validation fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn try_build_v2(self) -> Result<FacJobReceiptV1, FacJobReceiptError> {
+        // Reuse all validation from try_build, then override the hash.
+        let mut receipt = self.try_build()?;
+        receipt.content_hash = compute_job_receipt_content_hash_v2(&receipt);
         Ok(receipt)
     }
 }
@@ -907,10 +1049,31 @@ pub fn deserialize_job_receipt(bytes: &[u8]) -> Result<FacJobReceiptV1, FacJobRe
     Ok(receipt)
 }
 
+/// Compute the v1 content hash (does **not** include `unsafe_direct`).
+///
+/// Use [`compute_job_receipt_content_hash_v2`] for new receipts. This
+/// function exists for backwards-compatible verification of receipts
+/// produced by workers using `FacJobReceiptV1Builder::try_build`.
+#[must_use]
 pub fn compute_job_receipt_content_hash(receipt: &FacJobReceiptV1) -> String {
     let canonical = receipt.canonical_bytes();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.fac.job_receipt.content_hash.v1\0");
+    hasher.update(&canonical);
+    format!("b3-256:{}", hasher.finalize().to_hex())
+}
+
+/// Compute the v2 content hash that includes `unsafe_direct` in the
+/// canonical preimage.
+///
+/// New receipts should use this function. Existing v1 receipts can still
+/// be verified via `compute_job_receipt_content_hash` (v1, crate-internal).
+#[must_use]
+pub fn compute_job_receipt_content_hash_v2(receipt: &FacJobReceiptV1) -> String {
+    let canonical = receipt.canonical_bytes_v2();
+    let mut hasher = blake3::Hasher::new();
+    // Distinct domain separator so v1 and v2 hashes never collide.
+    hasher.update(b"apm2.fac.job_receipt.content_hash.v2\0");
     hasher.update(&canonical);
     format!("b3-256:{}", hasher.finalize().to_hex())
 }
@@ -940,6 +1103,39 @@ pub fn persist_content_addressed_receipt(
     if !receipt.content_hash.is_empty() && receipt.content_hash != expected_hash {
         return Err("receipt content_hash does not match serialized body".to_string());
     }
+
+    fs::create_dir_all(fac_receipts_dir)
+        .map_err(|e| format!("cannot create receipt directory: {e}"))?;
+
+    let canonical_receipt = FacJobReceiptV1 {
+        content_hash: expected_hash.clone(),
+        ..receipt.clone()
+    };
+    let body = serde_json::to_vec_pretty(&canonical_receipt)
+        .map_err(|e| format!("cannot serialize receipt: {e}"))?;
+
+    let final_path = fac_receipts_dir.join(format!("{expected_hash}.json"));
+    let temp_path = fac_receipts_dir.join(format!("{expected_hash}.tmp"));
+    fs::write(&temp_path, body).map_err(|e| format!("cannot write temp receipt file: {e}"))?;
+    fs::rename(&temp_path, &final_path)
+        .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
+
+    Ok(final_path)
+}
+
+/// Persist a content-addressed job receipt using v2 hashing
+/// (includes `unsafe_direct` in canonical bytes).
+///
+/// New receipts should use this function for full integrity binding.
+///
+/// # Errors
+///
+/// Returns an error string if serialization, hashing, or persistence fails.
+pub fn persist_content_addressed_receipt_v2(
+    fac_receipts_dir: &Path,
+    receipt: &FacJobReceiptV1,
+) -> Result<PathBuf, String> {
+    let expected_hash = compute_job_receipt_content_hash_v2(receipt);
 
     fs::create_dir_all(fac_receipts_dir)
         .map_err(|e| format!("cannot create receipt directory: {e}"))?;
@@ -1654,6 +1850,76 @@ pub mod tests {
         let restored = deserialize_job_receipt(&bytes).expect("deserialize receipt");
 
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_unsafe_direct_roundtrip() {
+        let mut original =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        original.unsafe_direct = true;
+
+        let bytes = serde_json::to_vec(&original).expect("serialize unsafe_direct receipt");
+        let restored = deserialize_job_receipt(&bytes).expect("deserialize unsafe_direct receipt");
+
+        assert!(restored.unsafe_direct);
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_unsafe_direct_does_not_affect_canonical_bytes() {
+        let base =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        let mut direct = base.clone();
+        direct.unsafe_direct = true;
+
+        // `unsafe_direct` is excluded from v1 canonical bytes so that
+        // existing v1 content hashes remain stable.
+        assert_eq!(
+            base.canonical_bytes(),
+            direct.canonical_bytes(),
+            "v1 canonical_bytes must be identical regardless of unsafe_direct"
+        );
+    }
+
+    #[test]
+    fn test_fac_job_receipt_unsafe_direct_affects_v2_canonical_bytes() {
+        let base =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        let mut direct = base.clone();
+        direct.unsafe_direct = true;
+
+        // V2 canonical bytes include `unsafe_direct` for integrity binding.
+        assert_ne!(
+            base.canonical_bytes_v2(),
+            direct.canonical_bytes_v2(),
+            "v2 canonical_bytes must differ when unsafe_direct differs"
+        );
+    }
+
+    #[test]
+    fn test_fac_job_receipt_v2_content_hash_differs_from_v1() {
+        let receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+
+        let v1_hash = compute_job_receipt_content_hash(&receipt);
+        let v2_hash = compute_job_receipt_content_hash_v2(&receipt);
+
+        // Different domain separators → different hashes even for
+        // identical `unsafe_direct=false` content.
+        assert_ne!(
+            v1_hash, v2_hash,
+            "v1 and v2 hashes must differ due to domain separation"
+        );
+    }
+
+    #[test]
+    fn test_fac_job_receipt_v2_canonical_bytes_deterministic() {
+        let first =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        let second =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+
+        assert_eq!(first.canonical_bytes_v2(), second.canonical_bytes_v2());
     }
 
     #[test]
