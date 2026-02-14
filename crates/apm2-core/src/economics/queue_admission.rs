@@ -41,6 +41,9 @@ use thiserror::Error;
 
 use crate::crypto::Hash;
 use crate::determinism::canonicalize_json;
+use crate::fac::scheduler_state::{
+    LaneSnapshot, SCHEDULER_STATE_SCHEMA, SchedulerStateV1, lane_from_str,
+};
 use crate::pcac::temporal_arbitration::TemporalPredicateId;
 
 // ============================================================================
@@ -974,6 +977,57 @@ impl QueueSchedulerState {
         let lane_state = &mut self.lanes[lane as usize];
         lane_state.backlog = lane_state.backlog.saturating_sub(1);
         self.total_items = self.total_items.saturating_sub(1);
+    }
+
+    /// Converts the in-memory state to a persistable scheduler snapshot.
+    #[must_use]
+    pub fn to_scheduler_state_v1(&self, current_tick: u64) -> SchedulerStateV1 {
+        let mut lane_snapshots = Vec::with_capacity(QueueLane::all().len());
+        for lane in QueueLane::all() {
+            let lane_state = self.lane(lane);
+            lane_snapshots.push(LaneSnapshot {
+                lane: lane.to_string(),
+                backlog: lane_state.backlog,
+                max_wait_ticks: lane_state.max_wait_ticks,
+            });
+        }
+
+        SchedulerStateV1 {
+            schema: SCHEDULER_STATE_SCHEMA.to_string(),
+            lane_snapshots,
+            last_evaluation_tick: current_tick,
+            persisted_at_secs: 0,
+            content_hash: String::new(),
+        }
+    }
+
+    /// Restores scheduler state from persisted snapshots, conservatively.
+    #[must_use]
+    pub fn from_persisted(saved: &SchedulerStateV1) -> Self {
+        let mut scheduler = Self::new();
+        let mut seen = [false; 6];
+
+        for snapshot in &saved.lane_snapshots {
+            let Some(lane) = lane_from_str(&snapshot.lane) else {
+                continue;
+            };
+
+            let idx = lane as usize;
+            if seen[idx] {
+                continue;
+            }
+            seen[idx] = true;
+
+            if snapshot.backlog > MAX_LANE_BACKLOG {
+                continue;
+            }
+
+            scheduler.lanes[idx].backlog = snapshot.backlog;
+            scheduler.lanes[idx].max_wait_ticks = snapshot.max_wait_ticks;
+            scheduler.total_items = scheduler.total_items.saturating_add(snapshot.backlog);
+        }
+
+        scheduler
     }
 
     /// Updates the maximum wait ticks for a lane.

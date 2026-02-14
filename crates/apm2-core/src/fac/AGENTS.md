@@ -93,6 +93,38 @@ default mode.
   do not follow PCAC lifecycle. They are control-plane safety predicates, not
   authority-bearing effects. Documented inline.
 
+## scheduler_state Submodule (TCK-00531)
+
+The `scheduler_state` submodule stores RFC-0029 anti-starvation continuity state.
+Snapshots are persisted under `$APM2_HOME/private/fac/scheduler/state.v1.json`.
+
+### Key Types
+
+- `SchedulerStateV1`: Versioned, schema-checked snapshot of scheduler backlog and
+  anti-starvation metadata.
+- `LaneSnapshot`: Per-lane backlog and wait-time snapshot (`lane`, `backlog`,
+  `max_wait_ticks`).
+- `SCHEDULER_STATE_SCHEMA`: Canonical schema identifier for persisted state.
+
+### Core Capabilities
+
+- Atomic persistence with temp-file write + rename for crash safety.
+- Bounded reads with metadata checks before deserialization (`1 MiB` max payload).
+- Symlink-safe path handling for load and persist helpers.
+- BLAKE3 content-hash computation and verification (`b3-256`).
+- Conversion between in-memory `QueueSchedulerState` and persisted snapshots.
+
+### Security Invariants (TCK-00531)
+
+- [INV-SCH-001] Corrupt, oversize, or schema-mismatched scheduler state does
+  not crash the worker and is treated as reconstruction required.
+- [INV-SCH-002] Persisted scheduler state uses atomic durability guarantees
+  (temp-file + rename).
+- [INV-SCH-003] Unknown lane names, duplicates, and invalid backlog values are
+  rejected during load.
+- [INV-SCH-004] Restarted workers preserve anti-starvation continuity for
+  `max_wait_ticks` via snapshot restoration.
+
 ## broker_health Submodule (TCK-00585)
 
 The `broker_health` submodule implements RFC-0029 invariant health monitoring for
