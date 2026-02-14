@@ -75,6 +75,12 @@ pub const MAX_LEASE_FILE_SIZE: u64 = 1024 * 1024;
 /// Maximum profile file size to read (1 MiB, CTR-1603).
 pub const MAX_PROFILE_FILE_SIZE: u64 = 1024 * 1024;
 
+/// Maximum allowed test timeout in seconds for FAC execution paths.
+pub const MAX_TEST_TIMEOUT_SECONDS: u64 = 240;
+
+/// Maximum allowed memory cap in bytes for FAC execution paths (24 GiB).
+pub const MAX_MEMORY_MAX_BYTES: u64 = 25_769_803_776;
+
 /// Poll interval for lane lock acquisition.
 pub const LANE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -349,7 +355,7 @@ impl LaneProfileV1 {
         validate_lane_id(lane_id)?;
         validate_string_field("node_fingerprint", node_fingerprint, MAX_STRING_LENGTH)?;
         validate_boundary_id(lane_id, boundary_id)?;
-        Ok(Self {
+        let profile = Self {
             schema: LANE_PROFILE_V1_SCHEMA.to_string(),
             lane_id: lane_id.to_string(),
             node_fingerprint: node_fingerprint.to_string(),
@@ -357,7 +363,39 @@ impl LaneProfileV1 {
             resource_profile: ResourceProfile::default(),
             timeouts: LaneTimeouts::default(),
             policy: LanePolicy::default(),
-        })
+        };
+        profile.validate_fac_test_caps(false)?;
+        Ok(profile)
+    }
+
+    /// Validate FAC default caps for test command construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaneError::InvalidRecord`] if either timeout or memory cap
+    /// exceeds FAC caps and `allow_unsafe` is false.
+    pub fn validate_fac_test_caps(&self, allow_unsafe: bool) -> Result<(), LaneError> {
+        if !allow_unsafe && self.timeouts.test_timeout_seconds > MAX_TEST_TIMEOUT_SECONDS {
+            return Err(LaneError::InvalidRecord {
+                lane_id: self.lane_id.clone(),
+                reason: format!(
+                    "test_timeout_seconds {} exceeds FAC cap {}",
+                    self.timeouts.test_timeout_seconds, MAX_TEST_TIMEOUT_SECONDS
+                ),
+            });
+        }
+
+        if !allow_unsafe && self.resource_profile.memory_max_bytes > MAX_MEMORY_MAX_BYTES {
+            return Err(LaneError::InvalidRecord {
+                lane_id: self.lane_id.clone(),
+                reason: format!(
+                    "memory_max_bytes {} exceeds FAC cap {}",
+                    self.resource_profile.memory_max_bytes, MAX_MEMORY_MAX_BYTES
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     /// Compute the BLAKE3-256 hash of this profile (canonical JSON).
@@ -445,8 +483,25 @@ impl LaneProfileV1 {
         }
         validate_boundary_id(expected_lane_id, &profile.boundary_id)?;
         validate_lane_id(&profile.lane_id)?;
+        profile.validate_fac_test_caps(false)?;
         Ok(profile)
     }
+}
+
+/// Compute the test runner environment for a lane profile.
+///
+/// Derives:
+/// - `NEXTEST_TEST_THREADS`
+/// - `CARGO_BUILD_JOBS`
+///
+/// `cpu_quota_percent` values lower than 100 still produce one test thread.
+#[must_use]
+pub fn compute_test_env(profile: &LaneProfileV1) -> Vec<(String, String)> {
+    let cpu_count = std::cmp::max(1, profile.resource_profile.cpu_quota_percent / 100);
+    vec![
+        ("NEXTEST_TEST_THREADS".to_string(), cpu_count.to_string()),
+        ("CARGO_BUILD_JOBS".to_string(), cpu_count.to_string()),
+    ]
 }
 
 fn legacy_boundary_id_fallback(node_fingerprint: &str) -> String {
@@ -1553,6 +1608,38 @@ mod tests {
 
         let loaded = LaneProfileV1::load(&lane_dir).expect("load");
         assert_eq!(loaded.boundary_id, node_fingerprint);
+    }
+
+    #[test]
+    fn lane_profile_compute_test_env_uses_cpu_quota() {
+        let mut profile =
+            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
+        profile.resource_profile.cpu_quota_percent = 250;
+        let env = compute_test_env(&profile);
+        assert_eq!(env.len(), 2);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "NEXTEST_TEST_THREADS" && v == "2")
+        );
+        assert!(env.iter().any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == "2"));
+    }
+
+    #[test]
+    fn lane_profile_enforces_test_timeout_cap_by_default() {
+        let mut profile =
+            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
+        profile.timeouts.test_timeout_seconds = MAX_TEST_TIMEOUT_SECONDS + 1;
+        assert!(profile.validate_fac_test_caps(false).is_err());
+        assert!(profile.validate_fac_test_caps(true).is_ok());
+    }
+
+    #[test]
+    fn lane_profile_enforces_memory_cap_by_default() {
+        let mut profile =
+            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
+        profile.resource_profile.memory_max_bytes = MAX_MEMORY_MAX_BYTES + 1;
+        assert!(profile.validate_fac_test_caps(false).is_err());
+        assert!(profile.validate_fac_test_caps(true).is_ok());
     }
 
     // ── LaneLeaseV1 ────────────────────────────────────────────────────

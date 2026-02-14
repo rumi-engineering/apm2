@@ -327,6 +327,22 @@ pub fn compute_gate_attestation(
     })
 }
 
+/// Build the shared nextest test command (without resource wrapper/boundary
+/// args).
+pub fn build_nextest_command() -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+        "--workspace".to_string(),
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        "ci".to_string(),
+    ]
+}
+
 pub fn gate_command_for_attestation(
     workspace_root: &Path,
     gate_name: &str,
@@ -355,16 +371,7 @@ pub fn gate_command_for_attestation(
             "--workspace".to_string(),
             "--no-deps".to_string(),
         ]),
-        "test" => test_command_override.map_or_else(
-            || {
-                Some(vec![
-                    "cargo".to_string(),
-                    "test".to_string(),
-                    "--workspace".to_string(),
-                ])
-            },
-            |value| Some(value.to_vec()),
-        ),
+        "test" => Some(test_command_override.map_or_else(build_nextest_command, <[_]>::to_vec)),
         "test_safety_guard" => {
             let path = workspace_root.join("scripts/ci/test_safety_guard.sh");
             path.exists()

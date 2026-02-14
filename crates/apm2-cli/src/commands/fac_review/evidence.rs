@@ -7,27 +7,32 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::{LaneProfileV1, compute_test_env};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use sha2::{Digest, Sha256};
 
 use super::ci_status::{CiStatus, ThrottledUpdater};
 use super::gate_attestation::{
-    GateResourcePolicy, compute_gate_attestation, gate_command_for_attestation, short_digest,
+    GateResourcePolicy, build_nextest_command, compute_gate_attestation,
+    gate_command_for_attestation, short_digest,
 };
 use super::gate_cache::{GateCache, ReuseDecision};
 use super::merge_conflicts::{
     check_merge_conflicts_against_main, render_merge_conflict_log, render_merge_conflict_summary,
 };
 use super::timeout_policy::{
-    DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, resolve_bounded_test_timeout,
+    DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS, DEFAULT_TEST_MEMORY_MAX, TEST_TIMEOUT_SLA_MESSAGE,
+    max_memory_bytes, parse_memory_limit, resolve_bounded_test_timeout,
 };
 use super::types::{apm2_home_dir, now_iso8601};
 
 /// Options for customizing evidence gate execution.
 pub struct EvidenceGateOptions {
     /// Override command for the test phase. When `Some`, the test gate uses
-    /// this command instead of `cargo test --workspace`.
+    /// this command instead of `cargo nextest run ...`.
     pub test_command: Option<Vec<String>>,
+    /// Extra environment variables applied when invoking a bounded test runner.
+    pub test_command_environment: Vec<(String, String)>,
     /// Skip the heavyweight test gate for quick inner-loop validation.
     pub skip_test_gate: bool,
     /// Skip merge-conflict gate when caller already pre-validated it.
@@ -47,7 +52,6 @@ const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
 const MONOTONIC_HEARTBEAT_TICK_SECS: u64 = 10;
 const GATE_WAIT_POLL_MILLIS: u64 = 250;
 const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
-const DEFAULT_TEST_MEMORY_MAX: &str = "48G";
 const DEFAULT_TEST_PIDS_MAX: u64 = 1536;
 const DEFAULT_TEST_CPU_QUOTA: &str = "200%";
 const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
@@ -97,13 +101,22 @@ fn run_gate_command_with_heartbeat(
     gate_name: &str,
     cmd: &str,
     args: &[&str],
+    extra_env: Option<&[(String, String)]>,
 ) -> std::io::Result<GateCommandOutput> {
-    let mut child = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .current_dir(workspace_root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    if let Some(envs) = extra_env {
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+    }
+
+    let mut child = command.spawn()?;
 
     let stdout = child
         .stdout
@@ -209,7 +222,7 @@ fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize)
     );
     let _ = writeln!(
         file,
-        "  apm2 fac gates --memory-max 48G  # default is 48G; increase if needed"
+        "  apm2 fac gates --memory-max 24G  # default is 24G; increase if needed"
     );
 }
 
@@ -277,8 +290,20 @@ pub fn run_single_evidence_gate(
     args: &[&str],
     log_path: &Path,
 ) -> bool {
+    run_single_evidence_gate_with_env(workspace_root, sha, gate_name, cmd, args, log_path, None)
+}
+
+fn run_single_evidence_gate_with_env(
+    workspace_root: &Path,
+    sha: &str,
+    gate_name: &str,
+    cmd: &str,
+    args: &[&str],
+    log_path: &Path,
+    extra_env: Option<&[(String, String)]>,
+) -> bool {
     let started = Instant::now();
-    let output = run_gate_command_with_heartbeat(workspace_root, gate_name, cmd, args);
+    let output = run_gate_command_with_heartbeat(workspace_root, gate_name, cmd, args, extra_env);
     let duration = started.elapsed().as_secs();
     match output {
         Ok(out) => {
@@ -390,58 +415,74 @@ fn verify_workspace_integrity_gate(
     (passed, line)
 }
 
+#[derive(Debug)]
 struct PipelineTestCommand {
     command: Vec<String>,
     bounded_runner: bool,
     effective_timeout_seconds: u64,
+    test_env: Vec<(String, String)>,
 }
 
-fn build_pipeline_test_command(workspace_root: &Path) -> PipelineTestCommand {
+fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestCommand, String> {
     let bounded_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
     let bounded_runner = bounded_script.is_file() && is_cgroup_v2_available();
-    if bounded_runner {
-        let timeout_decision =
-            resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
-        return PipelineTestCommand {
-            command: vec![
-                bounded_script.display().to_string(),
-                "--timeout-seconds".to_string(),
-                timeout_decision.effective_seconds.to_string(),
-                "--kill-after-seconds".to_string(),
-                DEFAULT_TEST_KILL_AFTER_SECONDS.to_string(),
-                "--heartbeat-seconds".to_string(),
-                MONOTONIC_HEARTBEAT_TICK_SECS.to_string(),
-                "--memory-max".to_string(),
-                DEFAULT_TEST_MEMORY_MAX.to_string(),
-                "--pids-max".to_string(),
-                DEFAULT_TEST_PIDS_MAX.to_string(),
-                "--cpu-quota".to_string(),
-                DEFAULT_TEST_CPU_QUOTA.to_string(),
-                "--".to_string(),
-                "cargo".to_string(),
-                "nextest".to_string(),
-                "run".to_string(),
-                "--workspace".to_string(),
-                "--all-features".to_string(),
-                "--config-file".to_string(),
-                ".config/nextest.toml".to_string(),
-                "--profile".to_string(),
-                "ci".to_string(),
-            ],
-            bounded_runner: true,
-            effective_timeout_seconds: timeout_decision.effective_seconds,
-        };
+    if !bounded_runner {
+        return Err(
+            "nextest is required for FAC evidence gates; bounded runner script not found"
+                .to_string(),
+        );
     }
 
-    PipelineTestCommand {
-        command: vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "--workspace".to_string(),
-        ],
-        bounded_runner: false,
-        effective_timeout_seconds: DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS,
+    let memory_max_bytes = parse_memory_limit(DEFAULT_TEST_MEMORY_MAX)?;
+    if memory_max_bytes > max_memory_bytes() {
+        return Err(format!(
+            "--memory-max {} exceeds FAC cap {}",
+            DEFAULT_TEST_MEMORY_MAX,
+            max_memory_bytes()
+        ));
     }
+
+    let timeout_decision =
+        resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
+    let profile = LaneProfileV1::new("lane-00", "b3-256:fac-review", "boundary-00")
+        .map_err(|err| format!("failed to construct FAC pipeline lane profile: {err}"))?;
+    let test_env = compute_test_env(&profile);
+    let mut command = vec![
+        bounded_script.display().to_string(),
+        "--timeout-seconds".to_string(),
+        timeout_decision.effective_seconds.to_string(),
+        "--kill-after-seconds".to_string(),
+        DEFAULT_TEST_KILL_AFTER_SECONDS.to_string(),
+        "--heartbeat-seconds".to_string(),
+        MONOTONIC_HEARTBEAT_TICK_SECS.to_string(),
+        "--memory-max".to_string(),
+        DEFAULT_TEST_MEMORY_MAX.to_string(),
+        "--pids-max".to_string(),
+        DEFAULT_TEST_PIDS_MAX.to_string(),
+        "--cpu-quota".to_string(),
+        DEFAULT_TEST_CPU_QUOTA.to_string(),
+        "--".to_string(),
+    ];
+    command.extend(build_nextest_command());
+
+    Ok(PipelineTestCommand {
+        command,
+        bounded_runner: true,
+        effective_timeout_seconds: timeout_decision.effective_seconds,
+        test_env,
+    })
+}
+
+fn resolve_evidence_test_command_override(test_command_override: Option<&[String]>) -> Vec<String> {
+    test_command_override.map_or_else(build_nextest_command, <[_]>::to_vec)
+}
+
+fn resolve_evidence_test_command_environment(
+    opts: Option<&EvidenceGateOptions>,
+) -> Option<&[(String, String)]> {
+    opts.and_then(|o| {
+        (!o.test_command_environment.is_empty()).then_some(o.test_command_environment.as_slice())
+    })
 }
 
 /// Run evidence gates (cargo fmt check, clippy, doc, test, CI scripts).
@@ -449,7 +490,7 @@ fn build_pipeline_test_command(workspace_root: &Path) -> PipelineTestCommand {
 /// Fail-closed: any error running a gate counts as failure.
 ///
 /// When `opts` is provided, `test_command` overrides the default
-/// `cargo test --workspace` invocation (e.g., to use a bounded runner).
+/// `cargo nextest run --workspace` invocation (e.g., to use a bounded runner).
 pub fn run_evidence_gates(
     workspace_root: &Path,
     sha: &str,
@@ -598,39 +639,32 @@ pub fn run_evidence_gates(
         ));
     } else {
         let test_started = Instant::now();
-        let test_passed = opts.and_then(|o| o.test_command.as_ref()).map_or_else(
-            || {
-                run_single_evidence_gate(
-                    workspace_root,
-                    sha,
-                    "test",
-                    "cargo",
-                    &["test", "--workspace"],
-                    &test_log,
-                )
-            },
-            |cmd| {
-                run_single_evidence_gate(
-                    workspace_root,
-                    sha,
-                    "test",
-                    &cmd[0],
-                    &cmd[1..].iter().map(String::as_str).collect::<Vec<_>>(),
-                    &test_log,
-                )
-            },
+        let test_command =
+            resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
+        let test_env = resolve_evidence_test_command_environment(opts);
+        let (test_cmd, test_args) = test_command
+            .split_first()
+            .ok_or_else(|| "test command is empty".to_string())?;
+        let passed = run_single_evidence_gate_with_env(
+            workspace_root,
+            sha,
+            "test",
+            test_cmd,
+            &test_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &test_log,
+            test_env,
         );
         let test_duration = test_started.elapsed().as_secs();
         gate_results.push(EvidenceGateResult {
             gate_name: "test".to_string(),
-            passed: test_passed,
+            passed,
             duration_secs: test_duration,
         });
-        if !test_passed {
+        if !passed {
             all_passed = false;
         }
         let ts = now_iso8601();
-        let status = if test_passed { "PASS" } else { "FAIL" };
+        let status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={ts} sha={sha} gate=test status={status} log={}",
             test_log.display()
@@ -715,7 +749,7 @@ pub fn run_evidence_gates_with_status(
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
-    let pipeline_test_command = build_pipeline_test_command(workspace_root);
+    let pipeline_test_command = build_pipeline_test_command(workspace_root)?;
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,
@@ -977,7 +1011,7 @@ pub fn run_evidence_gates_with_status(
         ));
     }
 
-    // Phase 3: workspace integrity snapshot → cargo test → verify.
+    // Phase 3: workspace integrity snapshot → test → verify.
     snapshot_workspace_integrity(workspace_root);
 
     {
@@ -1041,13 +1075,14 @@ pub fn run_evidence_gates_with_status(
                 .command
                 .split_first()
                 .ok_or_else(|| "pipeline test command is empty".to_string())?;
-            let passed = run_single_evidence_gate(
+            let passed = run_single_evidence_gate_with_env(
                 workspace_root,
                 sha,
                 gate_name,
                 test_cmd,
                 &test_args.iter().map(String::as_str).collect::<Vec<_>>(),
                 &log_path,
+                Some(&pipeline_test_command.test_env),
             );
             let duration = started.elapsed().as_secs();
 
@@ -1304,5 +1339,20 @@ mod tests {
 
         let content = fs::read_to_string(&log_path).expect("read updated log");
         assert!(!content.contains("--- fac diagnostic ---"));
+    }
+
+    #[test]
+    fn default_evidence_test_command_uses_nextest() {
+        let command = resolve_evidence_test_command_override(None);
+        let joined = command.join(" ");
+        assert!(joined.contains("cargo nextest run --workspace"));
+        assert!(!joined.contains("cargo test --workspace"));
+    }
+
+    #[test]
+    fn pipeline_test_command_fails_without_bounded_runner_script() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let err = build_pipeline_test_command(temp_dir.path()).expect_err("bounded script missing");
+        assert!(err.contains("bounded runner script not found"));
     }
 }

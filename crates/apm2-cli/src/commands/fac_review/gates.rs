@@ -8,17 +8,20 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+use apm2_core::fac::{LaneProfileV1, compute_test_env};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use sha2::{Digest, Sha256};
 
 use super::evidence::{EvidenceGateOptions, run_evidence_gates};
 use super::gate_attestation::{
-    GateResourcePolicy, compute_gate_attestation, gate_command_for_attestation,
+    GateResourcePolicy, build_nextest_command, compute_gate_attestation,
+    gate_command_for_attestation,
 };
 use super::gate_cache::GateCache;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::timeout_policy::{
-    MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, resolve_bounded_test_timeout,
+    MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, max_memory_bytes, parse_memory_limit,
+    resolve_bounded_test_timeout,
 };
 use super::types::apm2_home_dir;
 use crate::exit_codes::codes as exit_codes;
@@ -142,6 +145,13 @@ fn run_gates_inner(
     cpu_quota: &str,
 ) -> Result<GatesSummary, String> {
     validate_timeout_seconds(timeout_seconds)?;
+    let memory_max_bytes = parse_memory_limit(memory_max)?;
+    if memory_max_bytes > max_memory_bytes() {
+        return Err(format!(
+            "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
+            max_bytes = max_memory_bytes()
+        ));
+    }
 
     let workspace_root =
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
@@ -181,10 +191,12 @@ fn run_gates_inner(
         });
     }
 
-    // 4. Build test command override for bounded execution.
+    // 4. Build test command override for test execution.
     let bounded_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
     let cgroup_available = is_cgroup_v2_available();
     let bounded = bounded_script.is_file() && cgroup_available;
+    let default_nextest_command = build_nextest_command();
+    let test_command_environment = compute_nextest_test_environment()?;
 
     let test_command = if quick {
         None
@@ -195,13 +207,15 @@ fn run_gates_inner(
             memory_max,
             pids_max,
             cpu_quota,
+            &default_nextest_command,
         ))
     } else {
-        None
+        Some(default_nextest_command)
     };
 
     let opts = EvidenceGateOptions {
         test_command,
+        test_command_environment,
         skip_test_gate: quick,
         skip_merge_conflict_gate: true,
     };
@@ -348,8 +362,9 @@ fn build_bounded_test_command(
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    nextest_command: &[String],
 ) -> Vec<String> {
-    vec![
+    let mut command = vec![
         bounded_script.display().to_string(),
         "--timeout-seconds".to_string(),
         timeout_seconds.to_string(),
@@ -364,16 +379,15 @@ fn build_bounded_test_command(
         "--cpu-quota".to_string(),
         cpu_quota.to_string(),
         "--".to_string(),
-        "cargo".to_string(),
-        "nextest".to_string(),
-        "run".to_string(),
-        "--workspace".to_string(),
-        "--all-features".to_string(),
-        "--config-file".to_string(),
-        ".config/nextest.toml".to_string(),
-        "--profile".to_string(),
-        "ci".to_string(),
-    ]
+    ];
+    command.extend(nextest_command.iter().cloned());
+    command
+}
+
+fn compute_nextest_test_environment() -> Result<Vec<(String, String)>, String> {
+    let profile = LaneProfileV1::new("lane-00", "b3-256:fac-gates", "boundary-00")
+        .map_err(|err| format!("failed to construct FAC gate lane profile: {err}"))?;
+    Ok(compute_test_env(&profile))
 }
 
 fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), String> {
@@ -434,6 +448,7 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
 
     use super::*;
@@ -481,6 +496,21 @@ mod tests {
 
         let err = ensure_clean_working_tree(repo, false).expect_err("untracked tree should fail");
         assert!(err.contains("working tree has untracked files"));
+    }
+
+    #[test]
+    fn bounded_test_command_uses_nextest() {
+        let command = build_bounded_test_command(
+            Path::new("/tmp/run_bounded_tests.sh"),
+            120,
+            "24G",
+            1536,
+            "200%",
+            &build_nextest_command(),
+        );
+        let joined = command.join(" ");
+        assert!(joined.contains("cargo nextest run --workspace"));
+        assert!(!joined.contains("cargo test --workspace"));
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
