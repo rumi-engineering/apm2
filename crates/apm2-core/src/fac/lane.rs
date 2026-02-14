@@ -766,6 +766,12 @@ impl LaneManager {
         self.fac_root.join("lanes").join(lane_id)
     }
 
+    /// Return the FAC root directory used by this manager.
+    #[must_use]
+    pub fn fac_root(&self) -> &Path {
+        &self.fac_root
+    }
+
     /// Get the path to a lane's lock file.
     #[must_use]
     pub fn lock_path(&self, lane_id: &str) -> PathBuf {
