@@ -298,6 +298,9 @@ pub struct FacJobReceiptV1 {
     /// Optional patch digest for patch-injected jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch_digest: Option<String>,
+    /// Canonicalizer tuple digest for audit trail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonicalizer_tuple_digest: Option<String>,
     /// Outcome.
     pub outcome: FacJobOutcome,
     /// Stable denial reason for non-completed outcomes.
@@ -414,6 +417,14 @@ impl FacJobReceiptV1 {
             bytes.push(0u8);
         }
 
+        if let Some(digest) = &self.canonicalizer_tuple_digest {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(digest.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
+
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
 
         bytes
@@ -481,6 +492,14 @@ impl FacJobReceiptV1 {
             if !is_strict_b3_256_digest(patch_digest) {
                 return Err(FacJobReceiptError::InvalidData(
                     "patch_digest must be exactly 71 chars in b3-256:<64hex> format".to_string(),
+                ));
+            }
+        }
+        if let Some(tuple_digest) = &self.canonicalizer_tuple_digest {
+            if !is_strict_b3_256_digest(tuple_digest) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "canonicalizer_tuple_digest must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
                 ));
             }
         }
@@ -590,6 +609,7 @@ pub struct FacJobReceiptV1Builder {
     reason: Option<String>,
     policy_hash: Option<String>,
     patch_digest: Option<String>,
+    canonicalizer_tuple_digest: Option<String>,
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
@@ -647,6 +667,13 @@ impl FacJobReceiptV1Builder {
         self
     }
 
+    /// Sets the canonicalizer tuple digest.
+    #[must_use]
+    pub fn canonicalizer_tuple_digest(mut self, tuple_digest: impl Into<String>) -> Self {
+        self.canonicalizer_tuple_digest = Some(tuple_digest.into());
+        self
+    }
+
     /// Sets the boundary trace.
     #[must_use]
     pub fn rfc0028_channel_boundary(mut self, trace: ChannelBoundaryTrace) -> Self {
@@ -694,6 +721,7 @@ impl FacJobReceiptV1Builder {
         let reason = self.reason.unwrap_or_else(|| "unspecified".to_string());
         let timestamp_secs = self.timestamp_secs.unwrap_or(0);
         let patch_digest = self.patch_digest;
+        let canonicalizer_tuple_digest = self.canonicalizer_tuple_digest;
 
         if receipt_id.len() > MAX_STRING_LENGTH {
             return Err(FacJobReceiptError::StringTooLong {
@@ -720,6 +748,14 @@ impl FacJobReceiptV1Builder {
             if !is_strict_b3_256_digest(policy_hash) {
                 return Err(FacJobReceiptError::InvalidData(
                     "policy_hash must be exactly 71 chars in b3-256:<64hex> format".to_string(),
+                ));
+            }
+        }
+        if let Some(canonicalizer_tuple_digest) = &canonicalizer_tuple_digest {
+            if !is_strict_b3_256_digest(canonicalizer_tuple_digest) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "canonicalizer_tuple_digest must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
                 ));
             }
         }
@@ -828,6 +864,7 @@ impl FacJobReceiptV1Builder {
             job_spec_digest,
             policy_hash: self.policy_hash,
             patch_digest,
+            canonicalizer_tuple_digest,
             outcome,
             denial_reason: self.denial_reason,
             reason,

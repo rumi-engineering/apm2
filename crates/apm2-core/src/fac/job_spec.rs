@@ -711,7 +711,7 @@ impl FacJobSpecV1Builder {
 /// Computes the raw BLAKE3 digest bytes with domain separation.
 ///
 /// `BLAKE3(schema_id || "\0" || data)`
-fn compute_digest_bytes(schema_id: &str, data: &[u8]) -> [u8; 32] {
+pub(crate) fn compute_digest_bytes(schema_id: &str, data: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(schema_id.as_bytes());
     hasher.update(b"\0");
@@ -719,7 +719,7 @@ fn compute_digest_bytes(schema_id: &str, data: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn format_b3_256_digest(hash: &[u8; 32]) -> String {
+pub(crate) fn format_b3_256_digest(hash: &[u8; 32]) -> String {
     let mut s = String::with_capacity(B3_256_PREFIX.len() + 64);
     s.push_str(B3_256_PREFIX);
     for byte in hash {

@@ -38,3 +38,9 @@ Each ticket YAML contains:
 - RFC: `documents/rfcs/RFC-0001/`
 - Standards: `standards/`
 - Template: `documents/work/templates/ENGINEERING_TICKET_TEMPLATE.yaml`
+
+## Ticket Work Notes
+
+- TCK-00563 introduces canonicalizer tuple pinning for FAC admission/receipt
+  integrity. Ensure worker startup verifies the admitted tuple digest and all
+  receipts persist the selected tuple digest for audit trails.

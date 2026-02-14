@@ -56,10 +56,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    safe_rmtree_v1,
+    CanonicalizerTupleV1, FacBroker, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
+    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -177,6 +177,11 @@ pub enum FacSubcommand {
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
 
+    /// Generic info view.
+    ///
+    /// Use `--canonicalizer` to show the current canonicalizer tuple.
+    Info(InfoArgs),
+
     /// Manage FAC execution lanes.
     ///
     /// Shows lane states derived from lock state, lease records, and PID
@@ -219,6 +224,13 @@ pub enum FacSubcommand {
     /// atomically claims and executes valid jobs.
     Worker(WorkerArgs),
 
+    /// Show current canonicalizer tuple and digest used for deterministic
+    /// signing.
+    ///
+    /// Useful for auditing canonical serialization and digest compatibility
+    /// across FAC brokers/workers.
+    Canonicalizer(CanonicalizerArgs),
+
     /// GitHub App credential management and PR operations.
     ///
     /// Provides `auth-setup` for bootstrapping credentials and
@@ -259,6 +271,22 @@ pub struct GatesArgs {
     /// CPU quota for bounded test execution.
     #[arg(long, default_value = "200%")]
     pub cpu_quota: String,
+}
+
+/// Arguments for `apm2 fac canonicalizer`.
+#[derive(Debug, Args)]
+pub struct CanonicalizerArgs {
+    /// Emit canonicalizer tuple metadata as JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac info`.
+#[derive(Debug, Args)]
+pub struct InfoArgs {
+    /// Show canonicalizer tuple metadata.
+    #[arg(long, default_value_t = false)]
+    pub canonicalizer: bool,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -1383,6 +1411,8 @@ pub fn run_fac(
             | FacSubcommand::Lane(_)
             | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
+            | FacSubcommand::Canonicalizer(_)
+            | FacSubcommand::Info(_)
             | FacSubcommand::Gc(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
@@ -1666,9 +1696,69 @@ pub fn run_fac(
             json_output,
             args.print_unit,
         ),
+        FacSubcommand::Canonicalizer(args) => run_canonicalizer_info(args.json || json_output),
+        FacSubcommand::Info(args) => {
+            if args.canonicalizer {
+                run_canonicalizer_info(json_output)
+            } else {
+                output_error(
+                    json_output,
+                    "unsupported_info_option",
+                    "use --canonicalizer with fac info",
+                    exit_codes::VALIDATION_ERROR,
+                )
+            }
+        },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
     }
+}
+
+fn run_canonicalizer_info(json_output: bool) -> u8 {
+    let fac_root = match resolve_fac_root() {
+        Ok(path) => path,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_root_unavailable",
+                &e,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let current_tuple = CanonicalizerTupleV1::from_current();
+    let tuple = match FacBroker::load_admitted_tuple(&fac_root) {
+        Ok(tuple) => tuple,
+        Err(error) => {
+            eprintln!("WARNING: using current canonicalizer tuple: {error}");
+            current_tuple
+        },
+    };
+
+    let digest = tuple.compute_digest();
+
+    if json_output {
+        let payload = serde_json::json!({
+            "tuple": tuple,
+            "digest": digest,
+        });
+        let output = serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "{\"error\":\"cannot serialize canonicalizer tuple\"}".to_string());
+        println!("{output}");
+        return exit_codes::SUCCESS;
+    }
+
+    println!("Canonicalizer Tuple:");
+    println!("  ID:      {}", tuple.canonicalizer_id);
+    println!("  Version: {}", tuple.canonicalizer_version);
+    println!(
+        "  Hash:    {} ({})",
+        tuple.hash_algorithm, tuple.digest_format
+    );
+    println!("  Depth:   {}", tuple.max_depth);
+    println!("  Digest:  {digest}");
+    exit_codes::SUCCESS
 }
 
 /// Resolves the ledger path from explicit path, env var, or default.
@@ -1688,6 +1778,11 @@ fn resolve_ledger_path(explicit: Option<&Path>) -> PathBuf {
     )
 }
 
+/// Resolves FAC root directory (`$APM2_HOME/private/fac`).
+fn resolve_fac_root() -> Result<PathBuf, String> {
+    resolve_apm2_home().map(|home| home.join("private").join("fac"))
+}
+
 /// Resolves the CAS path from explicit path, env var, or default.
 fn resolve_cas_path(explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
@@ -1703,6 +1798,19 @@ fn resolve_cas_path(explicit: Option<&Path>) -> PathBuf {
         || PathBuf::from("/var/lib/apm2").join(DEFAULT_CAS_DIRNAME),
         |dirs| dirs.data_dir().join(DEFAULT_CAS_DIRNAME),
     )
+}
+
+/// Resolves the `$APM2_HOME` directory from environment or default.
+fn resolve_apm2_home() -> Result<PathBuf, String> {
+    if let Some(override_dir) = std::env::var_os("APM2_HOME") {
+        let path = PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return Ok(path);
+        }
+    }
+    let base_dirs = directories::BaseDirs::new()
+        .ok_or_else(|| "could not resolve home directory".to_string())?;
+    Ok(base_dirs.home_dir().join(".apm2"))
 }
 
 /// Opens the ledger at the given path.
@@ -4062,6 +4170,33 @@ mod tests {
             "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
             "--json",
         ]);
+    }
+
+    #[test]
+    fn test_canonicalizer_subcommand_parses() {
+        assert_fac_command_parses(&["fac", "canonicalizer"]);
+        assert_fac_command_parses(&["fac", "canonicalizer", "--json"]);
+    }
+
+    #[test]
+    fn test_canonicalizer_subcommand_global_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "canonicalizer"])
+            .expect("canonicalizer should accept global json flag");
+        assert!(parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Canonicalizer(_) => {},
+            other => panic!("expected canonicalizer subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_info_subcommand_with_canonicalizer_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "info", "--canonicalizer"])
+            .expect("info --canonicalizer should parse");
+        match parsed.subcommand {
+            FacSubcommand::Info(info_args) => assert!(info_args.canonicalizer),
+            other => panic!("expected info subcommand, got {other:?}"),
+        }
     }
 
     #[test]

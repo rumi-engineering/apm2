@@ -77,6 +77,8 @@ pub mod broker;
 pub mod broker_health;
 pub mod builtin_profiles;
 pub mod builtin_roles;
+/// Canonicalizer tuple commitment schema and helper functions.
+pub mod canonicalizer_tuple;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
@@ -186,6 +188,7 @@ pub use builtin_profiles::{
     LOCAL_INFERENCE_PROFILE_ID, all_builtin_profiles, claude_code_profile, codex_cli_profile,
     gemini_cli_profile, get_builtin_profile, local_inference_profile,
 };
+pub use canonicalizer_tuple::{CANONICALIZER_TUPLE_SCHEMA, CanonicalizerTupleV1};
 // Re-export changeset bundle types
 pub use changeset_bundle::{
     ChangeKind, ChangeSetBundleError, ChangeSetBundleV1, ChangeSetBundleV1Builder,
