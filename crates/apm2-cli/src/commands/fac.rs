@@ -2704,13 +2704,27 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     }
 
-    // With --force on a RUNNING lane, attempt to kill the process (under lock)
+    // With --force on a RUNNING lane, attempt to kill the process (under lock).
+    // If kill fails (EPERM, PID reuse, etc.), abort the reset and mark CORRUPT
+    // to prevent deleting directories of a still-running process.
     if status.state == LaneState::Running && args.force {
         if let Some(pid) = status.pid {
             if !json_output {
                 println!("Force-killing process {} for lane {}...", pid, args.lane_id);
             }
-            kill_process_best_effort(pid);
+            if !kill_process_best_effort(pid) {
+                let corrupt_reason = format!(
+                    "failed to kill process {} for lane {} -- process may still be running or PID was reused",
+                    pid, args.lane_id
+                );
+                persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason, json_output);
+                return output_error(
+                    json_output,
+                    "kill_failed",
+                    &corrupt_reason,
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
         }
     }
 
@@ -2900,8 +2914,17 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, jso
 
 /// Best-effort process kill using SIGTERM then SIGKILL.
 ///
-/// Sends SIGTERM, waits briefly, then sends SIGKILL if the process is
-/// still alive. This is best-effort; failures are logged but not fatal.
+/// Returns `true` if the process is confirmed dead (ESRCH) or was
+/// successfully killed, `false` if the process could not be signaled
+/// (EPERM or other errors). The caller MUST abort the reset and mark
+/// the lane CORRUPT if this returns `false`.
+///
+/// # PID Reuse Safety
+///
+/// Stale lease PIDs may have been reused by a different process. We
+/// verify the process exists via `/proc/<pid>/comm` before sending
+/// signals. If `/proc/<pid>/comm` does not exist, the PID is dead and
+/// we return `true` (success).
 ///
 /// # Blocking Wait (intentional)
 ///
@@ -2912,43 +2935,60 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, jso
 /// expects synchronous completion before proceeding with directory deletion.
 /// The blocking wait ensures the process has actually exited before we
 /// attempt to delete its workspace.
-fn kill_process_best_effort(pid: u32) {
+fn kill_process_best_effort(pid: u32) -> bool {
     #[cfg(unix)]
     {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
 
         let Ok(pid_i32) = i32::try_from(pid) else {
-            return;
+            return false;
         };
         let nix_pid = Pid::from_raw(pid_i32);
 
+        // Verify PID is alive via /proc/<pid>/comm. If the procfs entry
+        // does not exist, the process is already dead -- success.
+        let proc_comm = format!("/proc/{pid}/comm");
+        if std::fs::read_to_string(&proc_comm).is_err() {
+            return true; // Process doesn't exist
+        }
+
         // Send SIGTERM first (graceful shutdown request).
-        if signal::kill(nix_pid, Signal::SIGTERM).is_err() {
-            // Process may already be dead -- that's fine.
-            return;
+        match signal::kill(nix_pid, Signal::SIGTERM) {
+            Ok(()) => {},
+            Err(nix::errno::Errno::ESRCH) => return true, // already gone
+            Err(_) => return false,                       /* EPERM or other: can't signal, don't
+                                                            * proceed */
         }
 
         // Wait for graceful shutdown (up to 5 seconds, polling every 100ms).
         // See doc comment above for why this blocking wait is intentional.
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            // kill(pid, None) checks existence without sending a signal.
-            if signal::kill(nix_pid, None).is_err() {
-                return; // Process exited
+            // kill(pid, signal 0) checks existence without sending a signal.
+            match signal::kill(nix_pid, None) {
+                Err(nix::errno::Errno::ESRCH) => return true, // gone
+                Ok(()) => {},                                 // still alive
+                Err(_) => return false,                       // can't determine, don't proceed
             }
         }
 
         // Process still alive after 5s -- send SIGKILL (uncatchable).
-        let _ = signal::kill(nix_pid, Signal::SIGKILL);
+        match signal::kill(nix_pid, Signal::SIGKILL) {
+            Err(nix::errno::Errno::ESRCH) => return true,
+            Err(_) => return false,
+            Ok(()) => {},
+        }
 
-        // Brief wait for SIGKILL to take effect.
+        // Final wait for SIGKILL to take effect.
         std::thread::sleep(std::time::Duration::from_millis(200));
+        matches!(signal::kill(nix_pid, None), Err(nix::errno::Errno::ESRCH))
     }
 
     #[cfg(not(unix))]
     {
         let _ = pid;
+        false
     }
 }
 

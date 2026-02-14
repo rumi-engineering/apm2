@@ -7,20 +7,26 @@
 //!
 //! # Security Model
 //!
-//! - **Symlink refusal (fd-relative)**: On Unix, the ONLY place a full path is
-//!   opened is the initial `Dir::open(root, ...)` in `safe_rmtree_v1`. All
-//!   recursive directory traversal uses `Dir::openat(parent_fd, name,
-//!   O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)` so the kernel refuses to follow
-//!   symlinks. File deletion uses `unlinkat(parent_fd, name, NoRemoveDir)` and
-//!   directory deletion uses `unlinkat(parent_fd, name, RemoveDir)`. No
-//!   `std::fs::read_dir`, `std::fs::remove_dir`, `std::fs::remove_file`, or
-//!   path-based `Dir::open` is used in the recursive delete path.
+//! - **Symlink refusal (fd-relative + ancestor chain)**: On Unix, the initial
+//!   open walks from `allowed_parent` to `root` component-by-component using
+//!   `Dir::openat(parent_fd, component, O_NOFOLLOW | O_DIRECTORY)`. This
+//!   eliminates the TOCTOU gap between symlink validation and root open: every
+//!   `openat` with `O_NOFOLLOW` atomically refuses symlinks at the kernel
+//!   level. All recursive directory traversal likewise uses fd-relative
+//!   `Dir::openat`/`unlinkat`/`fstatat`. File deletion uses
+//!   `unlinkat(parent_fd, name, NoRemoveDir)` and directory deletion uses
+//!   `unlinkat(parent_fd, name, RemoveDir)`. No `std::fs::read_dir`,
+//!   `std::fs::remove_dir`, `std::fs::remove_file`, or path-based `Dir::open`
+//!   is used in the recursive delete path.
+//! - **Streaming iteration**: Directory entries are processed one-by-one in a
+//!   streaming fashion to prevent unbounded memory growth. No `Vec` of entries
+//!   is collected.
 //! - **Path traversal rejection**: Any path containing `.` or `..` components
 //!   is rejected immediately (not filtered -- rejected).
 //! - **Parent boundary enforcement**: `root` must be strictly under
 //!   `allowed_parent` by path component analysis (NOT string prefix).
 //! - **Filesystem boundary**: Cross-device deletion is refused by comparing
-//!   `st_dev` of `allowed_parent` and `root`.
+//!   `st_dev` via `fstat` on opened directory fds (TOCTOU-safe).
 //! - **Unexpected file types**: Sockets, FIFOs, devices, and unknown file types
 //!   cause immediate abort with `UnexpectedFileType`.
 //! - **Fail-closed**: On ANY ambiguity or error during walking, the operation
@@ -65,8 +71,9 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 128;
 /// Maximum number of entries per directory read (INV-RMTREE-009).
 ///
 /// Prevents unbounded memory allocation from adversarially crafted
-/// directories.
-pub const MAX_DIR_ENTRIES: usize = 100_000;
+/// directories. No lane workspace should have 10,000 files in a single
+/// directory; this is a hard safety cap, not a performance tuning knob.
+pub const MAX_DIR_ENTRIES: usize = 10_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error Types
@@ -295,13 +302,210 @@ pub fn safe_rmtree_v1(
     // (INV-RMTREE-006)
     validate_parent_ownership(allowed_parent)?;
 
-    // ── Step 4: Walk ancestors of root to detect symlinks ────────────
-    // (INV-RMTREE-001) Check every component from allowed_parent down
-    // to root for symlinks.
-    validate_path_no_symlinks(root, allowed_parent)?;
+    // ── Step 4+5+6+7: Open root via ancestor chain + delete ─────────
+    // On Unix, walk from allowed_parent to root component-by-component
+    // using openat(O_NOFOLLOW) which inherently refuses symlinks at
+    // every component, eliminating the TOCTOU gap between symlink
+    // validation and root open.
+    //
+    // On non-Unix, fall back to path-based validation and deletion.
+    #[cfg(unix)]
+    {
+        safe_rmtree_v1_unix(root, allowed_parent)
+    }
 
-    // ── Step 5: Check root existence ─────────────────────────────────
-    // (INV-RMTREE-007)
+    #[cfg(not(unix))]
+    {
+        safe_rmtree_v1_non_unix(root, allowed_parent)
+    }
+}
+
+/// Unix implementation of safe recursive tree deletion using fd-relative
+/// operations. Walks from `allowed_parent` to `root` via `openat(O_NOFOLLOW)`
+/// at each component, then performs fd-relative deletion.
+#[cfg(unix)]
+fn safe_rmtree_v1_unix(
+    root: &Path,
+    allowed_parent: &Path,
+) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
+    use nix::fcntl::OFlag;
+
+    // Compute relative path from allowed_parent to root.
+    let relative =
+        root.strip_prefix(allowed_parent)
+            .map_err(|_| SafeRmtreeError::OutsideAllowedParent {
+                root: root.to_path_buf(),
+                allowed_parent: allowed_parent.to_path_buf(),
+            })?;
+
+    let components: Vec<&std::ffi::OsStr> = relative
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    if components.is_empty() {
+        return Err(SafeRmtreeError::OutsideAllowedParent {
+            root: root.to_path_buf(),
+            allowed_parent: allowed_parent.to_path_buf(),
+        });
+    }
+
+    let open_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let parent_of_root = open_path_via_ancestor_chain(
+        allowed_parent,
+        &components[..components.len() - 1],
+        open_flags,
+    )?;
+
+    let root_name = components[components.len() - 1];
+
+    // fstatat the root entry via the parent fd to check existence/type.
+    let root_stat = match nix::sys::stat::fstatat(
+        &parent_of_root,
+        root_name,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(s) => s,
+        Err(nix::errno::Errno::ENOENT) => {
+            return Ok(SafeRmtreeOutcome::AlreadyAbsent);
+        },
+        Err(e) => {
+            return Err(SafeRmtreeError::io(
+                format!("fstatat root {}", root.display()),
+                io::Error::from(e),
+            ));
+        },
+    };
+
+    // Root itself must not be a symlink.
+    let file_type = root_stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        return Err(SafeRmtreeError::SymlinkDetected {
+            path: root.to_path_buf(),
+        });
+    }
+
+    // Check filesystem boundary (INV-RMTREE-003) via fstat on opened fds.
+    let parent_stat = nix::sys::stat::fstat(&parent_of_root).map_err(|e| {
+        SafeRmtreeError::io(
+            format!("fstat parent of root {}", root.display()),
+            io::Error::from(e),
+        )
+    })?;
+    #[allow(clippy::cast_sign_loss)]
+    let parent_dev = parent_stat.st_dev as u64;
+    #[allow(clippy::cast_sign_loss)]
+    let root_dev = root_stat.st_dev as u64;
+    if root_dev != parent_dev {
+        return Err(SafeRmtreeError::CrossesFilesystemBoundary {
+            root_dev,
+            parent_dev,
+        });
+    }
+
+    delete_root_entry_via_parent_fd(
+        &parent_of_root,
+        root_name,
+        root,
+        file_type,
+        root_dev,
+        open_flags,
+    )
+}
+
+/// Delete the root entry (directory or file) using fd-relative operations
+/// on the already-opened parent directory fd.
+#[cfg(unix)]
+fn delete_root_entry_via_parent_fd(
+    parent_of_root: &nix::dir::Dir,
+    root_name: &std::ffi::OsStr,
+    root: &Path,
+    file_type: libc::mode_t,
+    root_dev: u64,
+    open_flags: nix::fcntl::OFlag,
+) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
+    if file_type == libc::S_IFDIR {
+        let mut stats = DeleteStats::default();
+
+        let root_dir = nix::dir::Dir::openat(
+            parent_of_root,
+            root_name,
+            open_flags,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|e| {
+            let io_err = io::Error::from(e);
+            if io_err.raw_os_error() == Some(libc::ELOOP)
+                || io_err.raw_os_error() == Some(libc::ENOTDIR)
+            {
+                SafeRmtreeError::SymlinkDetected {
+                    path: root.to_path_buf(),
+                }
+            } else {
+                SafeRmtreeError::io(format!("openat root directory {}", root.display()), io_err)
+            }
+        })?;
+
+        fd_relative_recursive_delete(&root_dir, root, &mut stats, 0, root_dev)?;
+        drop(root_dir);
+
+        nix::unistd::unlinkat(
+            parent_of_root,
+            root_name,
+            nix::unistd::UnlinkatFlags::RemoveDir,
+        )
+        .map_err(|e| {
+            SafeRmtreeError::io(
+                format!("removing root directory {}", root.display()),
+                io::Error::from(e),
+            )
+        })?;
+        stats.dirs_deleted = stats.dirs_deleted.saturating_add(1);
+
+        Ok(SafeRmtreeOutcome::Deleted {
+            files_deleted: stats.files_deleted,
+            dirs_deleted: stats.dirs_deleted,
+        })
+    } else if file_type == libc::S_IFREG {
+        nix::unistd::unlinkat(
+            parent_of_root,
+            root_name,
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(|e| {
+            SafeRmtreeError::io(
+                format!("removing file {}", root.display()),
+                io::Error::from(e),
+            )
+        })?;
+        Ok(SafeRmtreeOutcome::Deleted {
+            files_deleted: 1,
+            dirs_deleted: 0,
+        })
+    } else {
+        let type_desc = match file_type {
+            libc::S_IFIFO => "FIFO/named pipe",
+            libc::S_IFSOCK => "Unix socket",
+            libc::S_IFBLK => "block device",
+            libc::S_IFCHR => "character device",
+            _ => "unknown",
+        };
+        Err(SafeRmtreeError::UnexpectedFileType {
+            path: root.to_path_buf(),
+            file_type: type_desc.to_string(),
+        })
+    }
+}
+
+/// Non-Unix fallback: path-based validation and deletion.
+#[cfg(not(unix))]
+fn safe_rmtree_v1_non_unix(
+    root: &Path,
+    allowed_parent: &Path,
+) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
     let root_meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -315,83 +519,27 @@ pub fn safe_rmtree_v1(
         },
     };
 
-    // Root itself must not be a symlink
     if root_meta.file_type().is_symlink() {
         return Err(SafeRmtreeError::SymlinkDetected {
             path: root.to_path_buf(),
         });
     }
 
-    // ── Step 6: Check filesystem boundary (INV-RMTREE-003) ──────────
-    #[cfg(unix)]
-    {
-        validate_same_filesystem(root, allowed_parent)?;
-    }
-
-    // ── Step 7: Recursively delete bottom-up ─────────────────────────
-    // On Unix, use fd-relative operations for TOCTOU safety.
-    // On non-Unix, fall back to path-based operations.
     if root_meta.is_dir() {
         let mut stats = DeleteStats::default();
-        #[cfg(unix)]
-        {
-            use nix::fcntl::OFlag;
-
-            // The ONLY place a full path is opened is here at the root.
-            // All recursive operations use fd-relative openat/unlinkat/fstatat.
-            let open_flags =
-                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-            let root_dir = open_dir_nofollow(root, open_flags)?;
-
-            // Get root device for cross-device checks inside recursion.
-            let root_stat = nix::sys::stat::fstat(&root_dir).map_err(|e| {
-                SafeRmtreeError::io(format!("fstat root {}", root.display()), io::Error::from(e))
-            })?;
-            #[allow(clippy::cast_sign_loss)]
-            let root_dev = root_stat.st_dev as u64;
-
-            fd_relative_recursive_delete(&root_dir, root, &mut stats, 0, root_dev)?;
-
-            // Drop the Dir handle to release the fd before removing the
-            // root directory itself.
-            drop(root_dir);
-
-            // Remove the now-empty root directory. The root itself must
-            // be removed by its parent. Since the root was opened by full
-            // path (the only such open), we use unlinkat relative to the
-            // root's parent directory opened by path. For the root
-            // specifically, we open its parent with O_NOFOLLOW and
-            // unlinkat the last component.
-            remove_root_dir_via_parent(root)?;
-            stats.dirs_deleted = stats.dirs_deleted.saturating_add(1);
-        }
-        #[cfg(not(unix))]
-        {
-            path_based_recursive_delete(root, allowed_parent, 0, &mut stats)?;
-        }
+        path_based_recursive_delete(root, allowed_parent, 0, &mut stats)?;
         Ok(SafeRmtreeOutcome::Deleted {
             files_deleted: stats.files_deleted,
             dirs_deleted: stats.dirs_deleted,
         })
     } else if root_meta.is_file() {
-        // Single regular file under allowed_parent -- delete it.
-        // For a single file at root level, use unlinkat via the parent dir fd
-        // on Unix for TOCTOU safety.
-        #[cfg(unix)]
-        {
-            remove_root_file_via_parent(root)?;
-        }
-        #[cfg(not(unix))]
-        {
-            fs::remove_file(root)
-                .map_err(|e| SafeRmtreeError::io(format!("removing file {}", root.display()), e))?;
-        }
+        fs::remove_file(root)
+            .map_err(|e| SafeRmtreeError::io(format!("removing file {}", root.display()), e))?;
         Ok(SafeRmtreeOutcome::Deleted {
             files_deleted: 1,
             dirs_deleted: 0,
         })
     } else {
-        // Unexpected file type at root level
         Err(SafeRmtreeError::UnexpectedFileType {
             path: root.to_path_buf(),
             file_type: describe_file_type(&root_meta),
@@ -495,9 +643,9 @@ fn fd_relative_recursive_delete(
     depth: usize,
     root_dev: u64,
 ) -> Result<(), SafeRmtreeError> {
+    use std::os::fd::AsFd;
+
     use nix::fcntl::OFlag;
-    use nix::sys::stat::Mode;
-    use nix::unistd::UnlinkatFlags;
 
     // Depth check (INV-RMTREE-008)
     if depth >= MAX_TRAVERSAL_DEPTH {
@@ -507,192 +655,221 @@ fn fd_relative_recursive_delete(
         });
     }
 
-    // Scan directory entries with bounded count, collecting type hints.
-    // We need a mutable clone of the Dir fd for iteration. We re-open via
-    // /proc/self/fd to get a mutable Dir for iteration without consuming
-    // the parent reference. Instead, we collect entries by iterating a
-    // freshly opened dup of the fd.
-    let raw_entries = scan_dir_entries_from_fd(parent_dir, parent_path)?;
+    // Streaming iteration: dup the parent fd so we get an independent Dir
+    // for iteration while keeping the original fd usable for fstatat/openat/
+    // unlinkat. Process each entry immediately without collecting into a Vec
+    // to prevent unbounded memory growth (BLOCKER #1 fix).
+    let dup_fd = nix::unistd::dup(parent_dir.as_fd()).map_err(|e| {
+        SafeRmtreeError::io(
+            format!("dup fd for {}", parent_path.display()),
+            io::Error::from(e),
+        )
+    })?;
+    let mut iter_dir = nix::dir::Dir::from_fd(dup_fd).map_err(|e| {
+        SafeRmtreeError::io(
+            format!("Dir::from_fd for {}", parent_path.display()),
+            io::Error::from(e),
+        )
+    })?;
 
-    // Resolve unknown entry types via fstatat(AT_SYMLINK_NOFOLLOW) relative
-    // to the parent_dir fd.
-    let entry_names = resolve_entry_types(parent_dir, parent_path, raw_entries)?;
-
-    // Process entries: recurse into directories, then delete files.
-    // Directories are recursed first so they are empty when we unlinkat them.
     let open_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let mut entry_count: usize = 0;
 
-    for (name, kind) in &entry_names {
-        let entry_display_path = parent_path.join(name);
+    for entry_result in iter_dir.iter() {
+        let entry = entry_result.map_err(|e| {
+            SafeRmtreeError::io(
+                format!("reading entry in {}", parent_path.display()),
+                io::Error::from(e),
+            )
+        })?;
 
-        match kind {
-            EntryKind::Directory => {
-                // Open child directory fd-relative to parent_dir fd.
-                // O_NOFOLLOW ensures the kernel refuses symlinks.
-                let child_dir =
-                    nix::dir::Dir::openat(parent_dir, name.as_os_str(), open_flags, Mode::empty())
-                        .map_err(|e| {
-                            let io_err = io::Error::from(e);
-                            if io_err.raw_os_error() == Some(libc::ELOOP)
-                                || io_err.raw_os_error() == Some(libc::ENOTDIR)
-                            {
-                                // A symlink was swapped in between d_type
-                                // classification and openat -- TOCTOU race
-                                // detected.
-                                SafeRmtreeError::TocTouRace {
-                                    reason: format!(
-                                        "entry {} was directory at scan time but symlink/non-dir \
-                                         at openat time",
-                                        entry_display_path.display()
-                                    ),
-                                }
-                            } else {
-                                SafeRmtreeError::io(
-                                    format!("openat directory {}", entry_display_path.display()),
-                                    io_err,
-                                )
-                            }
-                        })?;
+        let name_cstr = entry.file_name();
+        let name_bytes = name_cstr.to_bytes();
 
-                // Verify child is on the same filesystem (INV-RMTREE-003)
-                verify_same_dev_via_fd(&child_dir, &entry_display_path, root_dev)?;
-
-                // Recurse with the OPEN FD, not a path.
-                fd_relative_recursive_delete(
-                    &child_dir,
-                    &entry_display_path,
-                    stats,
-                    depth + 1,
-                    root_dev,
-                )?;
-
-                // Drop child fd before unlinkat so the directory can be removed.
-                drop(child_dir);
-
-                // Remove the now-empty child directory via unlinkat with
-                // AT_REMOVEDIR, relative to the parent fd.
-                nix::unistd::unlinkat(parent_dir, name.as_os_str(), UnlinkatFlags::RemoveDir)
-                    .map_err(|e| {
-                        SafeRmtreeError::io(
-                            format!("removing directory {}", entry_display_path.display()),
-                            io::Error::from(e),
-                        )
-                    })?;
-                stats.dirs_deleted = stats.dirs_deleted.saturating_add(1);
-            },
-            EntryKind::RegularFile => {
-                // Delete regular file via unlinkat relative to parent dir fd.
-                nix::unistd::unlinkat(parent_dir, name.as_os_str(), UnlinkatFlags::NoRemoveDir)
-                    .map_err(|e| {
-                        SafeRmtreeError::io(
-                            format!("removing file {}", entry_display_path.display()),
-                            io::Error::from(e),
-                        )
-                    })?;
-                stats.files_deleted = stats.files_deleted.saturating_add(1);
-            },
+        // Skip "." and ".."
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
         }
+
+        entry_count += 1;
+        if entry_count > MAX_DIR_ENTRIES {
+            return Err(SafeRmtreeError::TooManyEntries {
+                path: parent_path.to_path_buf(),
+                max: MAX_DIR_ENTRIES,
+            });
+        }
+
+        let name = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name_bytes))
+        };
+        let entry_display_path = parent_path.join(&name);
+
+        // Classify entry type from d_type hint first, fall back to fstatat.
+        let kind = if let Some(k) = classify_dirent_type(entry.file_type(), parent_path, &name)? {
+            k
+        } else {
+            // Unknown d_type: resolve via fstatat(AT_SYMLINK_NOFOLLOW)
+            // relative to the parent_dir fd.
+            resolve_entry_kind_via_fstatat(parent_dir, parent_path, &name, &entry_display_path)?
+        };
+
+        process_entry(
+            parent_dir,
+            &name,
+            kind,
+            &entry_display_path,
+            open_flags,
+            root_dev,
+            stats,
+            depth,
+        )?;
     }
 
     Ok(())
 }
 
-/// Open a directory by full path with `O_NOFOLLOW`, mapping
-/// `ELOOP`/`ENOTDIR` to `SymlinkDetected`.
-///
-/// This is used ONLY for the initial root directory open in
-/// `safe_rmtree_v1`. All recursive operations use `Dir::openat`.
+/// Process a single directory entry: recurse into directories (then remove
+/// them), or unlink regular files. All operations are fd-relative.
 #[cfg(unix)]
-fn open_dir_nofollow(
-    dir: &Path,
+#[allow(clippy::too_many_arguments)]
+fn process_entry(
+    parent_dir: &nix::dir::Dir,
+    name: &std::ffi::OsString,
+    kind: EntryKind,
+    entry_display_path: &Path,
+    open_flags: nix::fcntl::OFlag,
+    root_dev: u64,
+    stats: &mut DeleteStats,
+    depth: usize,
+) -> Result<(), SafeRmtreeError> {
+    use nix::sys::stat::Mode;
+    use nix::unistd::UnlinkatFlags;
+
+    match kind {
+        EntryKind::Directory => {
+            // Open child directory fd-relative to parent_dir fd.
+            // O_NOFOLLOW ensures the kernel refuses symlinks.
+            let child_dir =
+                nix::dir::Dir::openat(parent_dir, name.as_os_str(), open_flags, Mode::empty())
+                    .map_err(|e| {
+                        let io_err = io::Error::from(e);
+                        if io_err.raw_os_error() == Some(libc::ELOOP)
+                            || io_err.raw_os_error() == Some(libc::ENOTDIR)
+                        {
+                            SafeRmtreeError::TocTouRace {
+                                reason: format!(
+                                    "entry {} was directory at scan time but symlink/non-dir \
+                                     at openat time",
+                                    entry_display_path.display()
+                                ),
+                            }
+                        } else {
+                            SafeRmtreeError::io(
+                                format!("openat directory {}", entry_display_path.display()),
+                                io_err,
+                            )
+                        }
+                    })?;
+
+            // Verify child is on the same filesystem (INV-RMTREE-003)
+            verify_same_dev_via_fd(&child_dir, entry_display_path, root_dev)?;
+
+            // Recurse with the OPEN FD, not a path.
+            fd_relative_recursive_delete(
+                &child_dir,
+                entry_display_path,
+                stats,
+                depth + 1,
+                root_dev,
+            )?;
+
+            // Drop child fd before unlinkat so the directory can be removed.
+            drop(child_dir);
+
+            nix::unistd::unlinkat(parent_dir, name.as_os_str(), UnlinkatFlags::RemoveDir).map_err(
+                |e| {
+                    SafeRmtreeError::io(
+                        format!("removing directory {}", entry_display_path.display()),
+                        io::Error::from(e),
+                    )
+                },
+            )?;
+            stats.dirs_deleted = stats.dirs_deleted.saturating_add(1);
+        },
+        EntryKind::RegularFile => {
+            nix::unistd::unlinkat(parent_dir, name.as_os_str(), UnlinkatFlags::NoRemoveDir)
+                .map_err(|e| {
+                    SafeRmtreeError::io(
+                        format!("removing file {}", entry_display_path.display()),
+                        io::Error::from(e),
+                    )
+                })?;
+            stats.files_deleted = stats.files_deleted.saturating_add(1);
+        },
+    }
+
+    Ok(())
+}
+
+/// Walk from `base` through `components` using `openat(O_NOFOLLOW)` at each
+/// step, returning the final directory fd. This eliminates the TOCTOU gap
+/// between symlink validation and directory open: every `openat` with
+/// `O_NOFOLLOW` atomically refuses symlinks at the kernel level.
+///
+/// # Arguments
+///
+/// * `base` - The starting directory (opened by full path). This MUST be the
+///   `allowed_parent` which was validated for ownership/mode.
+/// * `components` - The relative path components to walk from `base`.
+/// * `flags` - Open flags (must include `O_NOFOLLOW | O_DIRECTORY`).
+///
+/// # Errors
+///
+/// Returns `SymlinkDetected` if any component is a symlink (ELOOP/ENOTDIR
+/// from `openat`). Returns `Io` for other I/O errors.
+#[cfg(unix)]
+fn open_path_via_ancestor_chain(
+    base: &Path,
+    components: &[&std::ffi::OsStr],
     flags: nix::fcntl::OFlag,
 ) -> Result<nix::dir::Dir, SafeRmtreeError> {
-    use nix::dir::Dir;
     use nix::sys::stat::Mode;
 
-    Dir::open(dir, flags, Mode::empty()).map_err(|e| {
+    // Open the base (allowed_parent) by full path with O_NOFOLLOW.
+    let mut current_dir = nix::dir::Dir::open(base, flags, Mode::empty()).map_err(|e| {
         let io_err = io::Error::from(e);
         if io_err.raw_os_error() == Some(libc::ELOOP)
             || io_err.raw_os_error() == Some(libc::ENOTDIR)
         {
             SafeRmtreeError::SymlinkDetected {
-                path: dir.to_path_buf(),
+                path: base.to_path_buf(),
             }
         } else {
-            SafeRmtreeError::io(format!("open directory {}", dir.display()), io_err)
+            SafeRmtreeError::io(format!("open base directory {}", base.display()), io_err)
         }
-    })
-}
-
-/// Remove the root directory by opening its parent with `O_NOFOLLOW` and
-/// using `unlinkat` with `AT_REMOVEDIR`. This avoids `std::fs::remove_dir`
-/// on the full path.
-#[cfg(unix)]
-fn remove_root_dir_via_parent(root: &Path) -> Result<(), SafeRmtreeError> {
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::Mode;
-    use nix::unistd::UnlinkatFlags;
-
-    let parent = root.parent().ok_or_else(|| SafeRmtreeError::Io {
-        context: format!("root {} has no parent", root.display()),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"),
-    })?;
-    let file_name = root.file_name().ok_or_else(|| SafeRmtreeError::Io {
-        context: format!("root {} has no file name", root.display()),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "no file name"),
     })?;
 
-    let open_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-    let parent_dir = nix::dir::Dir::open(parent, open_flags, Mode::empty()).map_err(|e| {
-        SafeRmtreeError::io(
-            format!("open parent directory {}", parent.display()),
-            io::Error::from(e),
-        )
-    })?;
+    // Walk each intermediate component using openat(O_NOFOLLOW).
+    let mut walked = base.to_path_buf();
+    for component in components {
+        walked.push(component);
+        current_dir = nix::dir::Dir::openat(&current_dir, *component, flags, Mode::empty())
+            .map_err(|e| {
+                let io_err = io::Error::from(e);
+                if io_err.raw_os_error() == Some(libc::ELOOP)
+                    || io_err.raw_os_error() == Some(libc::ENOTDIR)
+                {
+                    SafeRmtreeError::SymlinkDetected {
+                        path: walked.clone(),
+                    }
+                } else {
+                    SafeRmtreeError::io(format!("openat component {}", walked.display()), io_err)
+                }
+            })?;
+    }
 
-    nix::unistd::unlinkat(&parent_dir, file_name, UnlinkatFlags::RemoveDir).map_err(|e| {
-        SafeRmtreeError::io(
-            format!("removing root directory {}", root.display()),
-            io::Error::from(e),
-        )
-    })?;
-
-    Ok(())
-}
-
-/// Remove a single root-level file by opening its parent with `O_NOFOLLOW`
-/// and using `unlinkat`. This avoids `std::fs::remove_file` on the full path.
-#[cfg(unix)]
-fn remove_root_file_via_parent(root: &Path) -> Result<(), SafeRmtreeError> {
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::Mode;
-    use nix::unistd::UnlinkatFlags;
-
-    let parent = root.parent().ok_or_else(|| SafeRmtreeError::Io {
-        context: format!("root {} has no parent", root.display()),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"),
-    })?;
-    let file_name = root.file_name().ok_or_else(|| SafeRmtreeError::Io {
-        context: format!("root {} has no file name", root.display()),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "no file name"),
-    })?;
-
-    let open_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-    let parent_dir = nix::dir::Dir::open(parent, open_flags, Mode::empty()).map_err(|e| {
-        SafeRmtreeError::io(
-            format!("open parent directory {}", parent.display()),
-            io::Error::from(e),
-        )
-    })?;
-
-    nix::unistd::unlinkat(&parent_dir, file_name, UnlinkatFlags::NoRemoveDir).map_err(|e| {
-        SafeRmtreeError::io(
-            format!("removing file {}", root.display()),
-            io::Error::from(e),
-        )
-    })?;
-
-    Ok(())
+    Ok(current_dir)
 }
 
 /// Verify that the opened directory fd is on the same filesystem as the root
@@ -721,74 +898,6 @@ fn verify_same_dev_via_fd(
     }
 
     Ok(())
-}
-
-/// Scan directory entries from an open `Dir` fd by dup-ing the fd, collecting
-/// entry names and `d_type` hints with bounded count (INV-RMTREE-009).
-///
-/// Returns a vec of `(name, Option<EntryKind>)`. Entries where `d_type` is
-/// unknown have `None` and must be resolved via `fstatat`.
-///
-/// We dup the fd and open a new `Dir` from it to avoid requiring `&mut`
-/// on the parent `Dir` (which we still need for `fstatat`/`unlinkat`).
-#[cfg(unix)]
-fn scan_dir_entries_from_fd(
-    dir_handle: &nix::dir::Dir,
-    dir_display_path: &Path,
-) -> Result<Vec<(std::ffi::OsString, Option<EntryKind>)>, SafeRmtreeError> {
-    use std::os::fd::AsFd;
-
-    // Dup the fd so we get an independent Dir for iteration. The dup'd fd
-    // will have its own seek position, leaving the original usable.
-    // nix::unistd::dup returns OwnedFd in nix 0.30.
-    let dup_fd = nix::unistd::dup(dir_handle.as_fd()).map_err(|e| {
-        SafeRmtreeError::io(
-            format!("dup fd for {}", dir_display_path.display()),
-            io::Error::from(e),
-        )
-    })?;
-
-    // Dir::from_fd takes ownership of the OwnedFd. It will close the fd
-    // on drop. No unsafe needed in nix 0.30.
-    let mut iter_dir = nix::dir::Dir::from_fd(dup_fd).map_err(|e| {
-        SafeRmtreeError::io(
-            format!("Dir::from_fd for {}", dir_display_path.display()),
-            io::Error::from(e),
-        )
-    })?;
-
-    let mut raw_entries: Vec<(std::ffi::OsString, Option<EntryKind>)> = Vec::new();
-    for entry_result in iter_dir.iter() {
-        if raw_entries.len() >= MAX_DIR_ENTRIES {
-            return Err(SafeRmtreeError::TooManyEntries {
-                path: dir_display_path.to_path_buf(),
-                max: MAX_DIR_ENTRIES,
-            });
-        }
-        let entry = entry_result.map_err(|e| {
-            SafeRmtreeError::io(
-                format!("reading entry in {}", dir_display_path.display()),
-                io::Error::from(e),
-            )
-        })?;
-
-        let name_cstr = entry.file_name();
-        let name_bytes = name_cstr.to_bytes();
-        // Skip "." and ".."
-        if name_bytes == b"." || name_bytes == b".." {
-            continue;
-        }
-
-        let name = {
-            use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name_bytes))
-        };
-
-        // Determine entry type from d_type if available.
-        let kind = classify_dirent_type(entry.file_type(), dir_display_path, &name)?;
-        raw_entries.push((name, kind));
-    }
-    Ok(raw_entries)
 }
 
 /// Classify a `nix::dir::Type` from a directory entry's `d_type` field.
@@ -828,51 +937,39 @@ fn classify_dirent_type(
     }
 }
 
-/// Resolve unknown entry types via `fstatat(AT_SYMLINK_NOFOLLOW)`.
-///
-/// Takes raw entries with optional type hints and returns fully resolved
-/// entries. Entries already classified keep their type; entries with `None`
-/// are resolved by stat-ing relative to the dir fd.
-#[cfg(unix)]
-fn resolve_entry_types(
-    dir_handle: &nix::dir::Dir,
-    dir_display_path: &Path,
-    raw_entries: Vec<(std::ffi::OsString, Option<EntryKind>)>,
-) -> Result<Vec<(std::ffi::OsString, EntryKind)>, SafeRmtreeError> {
-    let mut entry_names: Vec<(std::ffi::OsString, EntryKind)> =
-        Vec::with_capacity(raw_entries.len());
-    for (name, maybe_kind) in raw_entries {
-        let kind = if let Some(k) = maybe_kind {
-            k
-        } else {
-            let entry_stat = nix::sys::stat::fstatat(
-                dir_handle,
-                name.as_os_str(),
-                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-            )
-            .map_err(|e| {
-                SafeRmtreeError::io(
-                    format!(
-                        "fstatat entry {} in {}",
-                        name.to_string_lossy(),
-                        dir_display_path.display()
-                    ),
-                    io::Error::from(e),
-                )
-            })?;
-            classify_stat_mode(entry_stat.st_mode, &dir_display_path.join(&name))?
-        };
-        entry_names.push((name, kind));
-    }
-    Ok(entry_names)
-}
-
 /// Entry kind determined during directory scanning.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     Directory,
     RegularFile,
+}
+
+/// Resolve an entry with unknown `d_type` via `fstatat(AT_SYMLINK_NOFOLLOW)`
+/// relative to the parent dir fd.
+#[cfg(unix)]
+fn resolve_entry_kind_via_fstatat(
+    parent_dir: &nix::dir::Dir,
+    parent_path: &Path,
+    name: &std::ffi::OsString,
+    entry_display_path: &Path,
+) -> Result<EntryKind, SafeRmtreeError> {
+    let entry_stat = nix::sys::stat::fstatat(
+        parent_dir,
+        name.as_os_str(),
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    )
+    .map_err(|e| {
+        SafeRmtreeError::io(
+            format!(
+                "fstatat entry {} in {}",
+                name.to_string_lossy(),
+                parent_path.display()
+            ),
+            io::Error::from(e),
+        )
+    })?;
+    classify_stat_mode(entry_stat.st_mode, entry_display_path)
 }
 
 /// Classify an `st_mode` value into an `EntryKind` or return an error for
@@ -1037,41 +1134,6 @@ fn validate_strictly_under(child: &Path, parent: &Path) -> Result<(), SafeRmtree
     Ok(())
 }
 
-/// Validate that all path components from `allowed_parent` to `target`
-/// are not symlinks.
-///
-/// Walks the path from `allowed_parent` downward, checking each component
-/// via `symlink_metadata()` (lstat, which does NOT follow symlinks).
-fn validate_path_no_symlinks(target: &Path, _allowed_parent: &Path) -> Result<(), SafeRmtreeError> {
-    // Walk from root (/) to target, checking each existing component
-    let mut current = PathBuf::new();
-    for component in target.components() {
-        current.push(component);
-
-        // Only check components that exist
-        match fs::symlink_metadata(&current) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(SafeRmtreeError::SymlinkDetected { path: current });
-                }
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Component doesn't exist yet -- ok for intermediate
-                // checks
-                break;
-            },
-            Err(e) => {
-                return Err(SafeRmtreeError::io(
-                    format!("validating path component {}", current.display()),
-                    e,
-                ));
-            },
-        }
-    }
-
-    Ok(())
-}
-
 /// Validate that `allowed_parent` is owned by the current user and has
 /// mode 0o700.
 #[cfg(unix)]
@@ -1103,9 +1165,7 @@ fn validate_parent_ownership(allowed_parent: &Path) -> Result<(), SafeRmtreeErro
     }
 
     // Must be owned by current user
-    // SAFETY: getuid() is a standard POSIX call with no safety requirements.
-    #[allow(unsafe_code)]
-    let current_uid = unsafe { libc::getuid() };
+    let current_uid = nix::unistd::getuid().as_raw();
     if meta.uid() != current_uid {
         return Err(SafeRmtreeError::PermissionDenied {
             reason: format!(
@@ -1154,27 +1214,8 @@ fn validate_parent_ownership(allowed_parent: &Path) -> Result<(), SafeRmtreeErro
     Ok(())
 }
 
-/// Validate that `path` and `reference` are on the same filesystem.
-#[cfg(unix)]
-fn validate_same_filesystem(path: &Path, reference: &Path) -> Result<(), SafeRmtreeError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let path_meta = fs::symlink_metadata(path)
-        .map_err(|e| SafeRmtreeError::io(format!("stat {}", path.display()), e))?;
-    let ref_meta = fs::symlink_metadata(reference)
-        .map_err(|e| SafeRmtreeError::io(format!("stat {}", reference.display()), e))?;
-
-    if path_meta.dev() != ref_meta.dev() {
-        return Err(SafeRmtreeError::CrossesFilesystemBoundary {
-            root_dev: path_meta.dev(),
-            parent_dev: ref_meta.dev(),
-        });
-    }
-
-    Ok(())
-}
-
 /// Describe the file type for error messages.
+#[cfg(not(unix))]
 fn describe_file_type(meta: &fs::Metadata) -> String {
     let ft = meta.file_type();
     if ft.is_symlink() {

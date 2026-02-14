@@ -286,12 +286,14 @@ deletion primitive for lane cleanup and reset operations.
 
 - `safe_rmtree_v1(root, allowed_parent)`: Primary entry point. Validates
   absolute paths, dot-segment rejection (`.` and `..` components),
-  component-wise boundary enforcement, symlink detection at every depth,
-  filesystem boundary checks (`st_dev`), parent ownership validation
+  component-wise boundary enforcement, parent ownership validation
   (uid + mode 0o700), and depth-bounded bottom-up deletion.
-- On Unix, uses fully fd-relative directory traversal. The ONLY place a full
-  path is opened is the initial `Dir::open(root, O_NOFOLLOW | O_DIRECTORY |
-  O_CLOEXEC)` in `safe_rmtree_v1` itself. All recursive operations use:
+- On Unix, walks from `allowed_parent` to `root` component-by-component
+  using `Dir::openat(O_NOFOLLOW)` at each step (ancestor chain walk). This
+  eliminates the TOCTOU gap between symlink validation and root open: every
+  `openat` with `O_NOFOLLOW` atomically refuses symlinks at the kernel level.
+  The root entry is then operated on via the parent fd (fstatat/openat/
+  unlinkat). All recursive operations use:
   - `Dir::openat(parent_fd, name, O_NOFOLLOW | O_DIRECTORY)` for child dirs
   - `unlinkat(parent_fd, name, NoRemoveDir)` for file deletion
   - `unlinkat(parent_fd, name, RemoveDir)` for directory deletion
@@ -299,26 +301,25 @@ deletion primitive for lane cleanup and reset operations.
   No `std::fs::read_dir`, `std::fs::remove_dir`, `std::fs::remove_file`, or
   path-based `Dir::open` is used in the recursive delete path.
 - `fd_relative_recursive_delete(parent_dir, parent_path, stats, depth,
-  root_dev)`: Takes an already-open `&nix::dir::Dir` fd. The `parent_path`
-  argument is used ONLY for error messages, never for opens or deletes.
+  root_dev)`: Streaming iteration -- processes entries one-by-one without
+  collecting into a Vec, preventing unbounded memory growth. Takes an
+  already-open `&nix::dir::Dir` fd. The `parent_path` argument is used ONLY
+  for error messages, never for opens or deletes.
+- `open_path_via_ancestor_chain(base, components, flags)`: Walks from `base`
+  through `components` using `openat(O_NOFOLLOW)` at each step, returning
+  the final directory fd. Eliminates TOCTOU between symlink validation and
+  directory open.
+- `process_entry()`: Processes a single directory entry (recurse into dirs,
+  unlink files) via fd-relative operations.
 - `reject_dot_segments()`: Rejects (not filters) any path containing `.` or
   `..` components. On Unix, also checks raw path bytes for `/./` and trailing
   `/.` patterns that `Path::components()` silently normalizes away.
-- `open_dir_nofollow()`: Opens a directory by full path with `O_NOFOLLOW`,
-  mapping `ELOOP`/`ENOTDIR` to `SymlinkDetected`. Used ONLY for the initial
-  root open; all recursive operations use `Dir::openat`.
-- `remove_root_dir_via_parent()` / `remove_root_file_via_parent()`: Remove
-  the root entry by opening its parent dir and using `unlinkat`, avoiding
-  `std::fs::remove_dir`/`std::fs::remove_file` on the full path.
 - `verify_same_dev_via_fd()`: Compares `st_dev` via `fstat` on the fd (not
   the path) against the root device ID to avoid TOCTOU in filesystem boundary
   checks.
-- `scan_dir_entries_from_fd()`: Bounded directory entry collection from a
-  dup'd `Dir` fd, collecting `d_type` hints with deferred `fstatat`
-  resolution.
 - `classify_dirent_type()`: Classifies `nix::dir::Type` into `EntryKind`,
   returning errors for symlinks and unexpected file types.
-- `resolve_entry_types()`: Resolves unknown entry types via
+- `resolve_entry_kind_via_fstatat()`: Resolves unknown entry types via
   `fstatat(AT_SYMLINK_NOFOLLOW)` relative to the parent dir fd.
 - Used by `apm2 fac lane reset` CLI command to safely delete workspace,
   target, and logs subdirectories. The lane reset command acquires an
@@ -326,6 +327,10 @@ deletion primitive for lane cleanup and reset operations.
   the entire operation. On safety violations, the CLI persists a
   `LaneLeaseV1` with `state: Corrupt` to the lane directory for durable
   corruption marking.
+- `kill_process_best_effort(pid)`: Returns `bool` indicating success. Verifies
+  PID existence via `/proc/<pid>/comm` before signaling (PID reuse safety).
+  Handles EPERM and other errors by returning `false` (fail-closed). If kill
+  fails, `run_lane_reset` aborts and marks the lane CORRUPT.
 
 ### Security Invariants (TCK-00516)
 
@@ -341,7 +346,7 @@ deletion primitive for lane cleanup and reset operations.
   mode 0o700 (no group/other access).
 - [INV-RMTREE-007] Non-existent root is a successful no-op.
 - [INV-RMTREE-008] Traversal depth bounded by `MAX_TRAVERSAL_DEPTH=128`.
-- [INV-RMTREE-009] Directory entries bounded by `MAX_DIR_ENTRIES=100000`.
+- [INV-RMTREE-009] Directory entries bounded by `MAX_DIR_ENTRIES=10000`.
 - [INV-RMTREE-010] Paths containing `.` or `..` components are rejected
   immediately (not filtered). On Unix, raw byte scanning catches `.`
   segments that `Path::components()` silently normalizes away.
