@@ -79,6 +79,7 @@ use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
 };
 use apm2_core::fac::lane::LaneManager;
+use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BudgetAdmissionTrace, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES, DenialReasonCode,
     FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, MAX_POLICY_SIZE,
@@ -116,6 +117,7 @@ const MAX_POLL_INTERVAL_SECS: u64 = 3600;
 
 /// Max number of boundary defect classes retained in a trace.
 const MAX_BOUNDARY_DEFECT_CLASSES: usize = 32;
+const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
@@ -158,6 +160,16 @@ struct WorkerSummary {
     jobs_quarantined: usize,
     /// Number of jobs skipped.
     jobs_skipped: usize,
+}
+
+#[derive(Debug)]
+struct SchedulerRecoveryReceipt {
+    /// Scheduler recovery receipt schema.
+    schema: String,
+    /// Recovery reason for reconstructing scheduler state.
+    reason: String,
+    /// Recovery timestamp in epoch seconds.
+    timestamp_secs: u64,
 }
 
 /// A candidate pending job for sorting and processing.
@@ -259,6 +271,36 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         },
     );
 
+    let mut queue_state = match load_scheduler_state(&fac_root) {
+        Ok(Some(saved)) => QueueSchedulerState::from_persisted(&saved),
+        Ok(None) => {
+            let recovery = SchedulerRecoveryReceipt {
+                schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
+                reason: "scheduler state missing, reconstructing conservatively".to_string(),
+                timestamp_secs: current_timestamp_epoch_secs(),
+            };
+            eprintln!(
+                "INFO: scheduler state reconstructed: {} ({}, {})",
+                recovery.schema, recovery.reason, recovery.timestamp_secs
+            );
+            QueueSchedulerState::new()
+        },
+        Err(e) => {
+            let recovery = SchedulerRecoveryReceipt {
+                schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
+                reason: "scheduler state missing or corrupt, reconstructing conservatively"
+                    .to_string(),
+                timestamp_secs: current_timestamp_epoch_secs(),
+            };
+            eprintln!("WARNING: failed to load scheduler state: {e}, starting fresh");
+            eprintln!(
+                "INFO: scheduler state reconstructed: {} ({}, {})",
+                recovery.schema, recovery.reason, recovery.timestamp_secs
+            );
+            QueueSchedulerState::new()
+        },
+    };
+
     // Perform admission health gate check so the broker can issue tokens.
     // In default (local) mode we use minimal health check inputs.
     let mut checker = apm2_core::fac::broker_health::BrokerHealthChecker::new();
@@ -331,6 +373,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
                 if once {
+                    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
                     return exit_codes::GENERIC_ERROR;
                 }
                 sleep_remaining(cycle_start, poll_interval_secs);
@@ -338,8 +381,11 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             },
         };
 
+        let mut cycle_scheduler = queue_state.clone();
+
         if candidates.is_empty() {
             if once {
+                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
                 let _ = save_broker_state(&broker);
                 if json_output {
                     print_json(&summary);
@@ -352,24 +398,32 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             continue;
         }
 
-        let scheduler = build_scheduler_state(&candidates);
         for candidate in &candidates {
             if max_jobs > 0 && total_processed >= max_jobs {
                 break;
             }
 
-            let outcome = process_job(
-                candidate,
-                &queue_root,
-                &fac_root,
-                &verifying_key,
-                &scheduler,
-                &mut broker,
-                &signer,
-                &policy_hash,
-                &policy_digest,
-                candidates.len(),
-            );
+            let lane = parse_queue_lane(&candidate.spec.queue_lane);
+            let outcome = if let Err(e) = cycle_scheduler.record_admission(lane) {
+                JobOutcome::Denied {
+                    reason: format!("scheduler admission reservation failed: {e}"),
+                }
+            } else {
+                let outcome = process_job(
+                    candidate,
+                    &queue_root,
+                    &fac_root,
+                    &verifying_key,
+                    &cycle_scheduler,
+                    lane,
+                    &mut broker,
+                    &signer,
+                    &policy_hash,
+                    &policy_digest,
+                );
+                cycle_scheduler.record_completion(lane);
+                outcome
+            };
 
             match &outcome {
                 JobOutcome::Quarantined { reason } => {
@@ -407,6 +461,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             }
 
             if once {
+                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
                 let _ = save_broker_state(&broker);
                 if json_output {
                     print_json(&summary);
@@ -414,6 +469,9 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
                 return exit_codes::SUCCESS;
             }
         }
+
+        persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+        queue_state = cycle_scheduler;
 
         if max_jobs > 0 && total_processed >= max_jobs {
             break;
@@ -430,8 +488,21 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         print_json(&summary);
     }
 
+    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
     let _ = save_broker_state(&broker);
     exit_codes::SUCCESS
+}
+
+fn persist_queue_scheduler_state(
+    fac_root: &Path,
+    queue_state: &QueueSchedulerState,
+    current_tick: u64,
+) {
+    let mut state = queue_state.to_scheduler_state_v1(current_tick);
+    state.persisted_at_secs = current_timestamp_epoch_secs();
+    if let Err(e) = persist_scheduler_state(fac_root, &state) {
+        eprintln!("WARNING: failed to persist scheduler state: {e}");
+    }
 }
 
 // =============================================================================
@@ -564,19 +635,6 @@ fn parse_queue_lane(lane_str: &str) -> QueueLane {
     }
 }
 
-/// Builds queue scheduler state from the observed pending candidates.
-///
-/// This keeps admission checks aligned with live queue depth during a single
-/// scan cycle and avoids admitting every job through an empty scheduler.
-fn build_scheduler_state(candidates: &[PendingCandidate]) -> QueueSchedulerState {
-    let mut scheduler = QueueSchedulerState::new();
-    for candidate in candidates {
-        let lane = parse_queue_lane(&candidate.spec.queue_lane);
-        let _ = scheduler.record_admission(lane);
-    }
-    scheduler
-}
-
 // =============================================================================
 // Job processing
 // =============================================================================
@@ -591,11 +649,11 @@ fn process_job(
     fac_root: &Path,
     verifying_key: &apm2_core::crypto::VerifyingKey,
     scheduler: &QueueSchedulerState,
+    lane: QueueLane,
     broker: &mut FacBroker,
     signer: &Signer,
     policy_hash: &str,
     policy_digest: &[u8; 32],
-    _candidates_count: usize,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -848,10 +906,6 @@ fn process_job(
         }
         return JobOutcome::Denied { reason };
     }
-
-    // Parse the spec's queue_lane to determine the correct lane, rather than
-    // hard-coding Bulk (MAJOR-3 fix).
-    let lane = parse_queue_lane(&spec.queue_lane);
 
     let verifier = BrokerSignatureVerifier::new(*verifying_key);
 
