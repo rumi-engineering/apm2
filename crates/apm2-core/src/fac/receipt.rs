@@ -299,6 +299,9 @@ pub struct FacJobReceiptV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_queue_admission: Option<QueueAdmissionTrace>,
     /// RFC-0029 budget admission trace.
+    ///
+    /// This field is a placeholder for future RFC-0029 budget economics.
+    /// It is intentionally optional and currently not populated by the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
     /// Epoch timestamp.
@@ -455,6 +458,8 @@ impl FacJobReceiptV1Builder {
                 if self.eio29_queue_admission.is_none() {
                     return Err(FacJobReceiptError::MissingField("eio29_queue_admission"));
                 }
+                // RFC-0029 budget admission is currently deferred and optional
+                // for completed outcomes.
             },
             FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
                 if self.denial_reason.is_none() {
@@ -1335,6 +1340,34 @@ pub mod tests {
             result,
             Err(FacJobReceiptError::MissingField("eio29_queue_admission"))
         ));
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_allows_missing_budget_admission_trace_for_completed() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-006",
+            "job-006",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("ok")
+        .timestamp_secs(1_700_000_003)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .try_build();
+
+        assert!(
+            result.is_ok(),
+            "budget admission should be optional for completed outcomes"
+        );
     }
 
     #[test]

@@ -600,7 +600,7 @@ fn process_job(
         if is_digest_error {
             let reason = format!("digest validation failed: {e}");
             let _ = move_to_dir_safe(path, &queue_root.join(QUARANTINED_DIR), &file_name);
-            let _ = emit_job_receipt(
+            if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
                 FacJobOutcome::Quarantined,
@@ -609,7 +609,11 @@ fn process_job(
                 None,
                 None,
                 None,
-            );
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
+                );
+            }
             return JobOutcome::Quarantined { reason };
         }
         // Other validation errors (missing token, schema, etc.) -> deny.
@@ -620,7 +624,7 @@ fn process_job(
             JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
             _ => DenialReasonCode::ValidationFailed,
         };
-        let _ = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
             FacJobOutcome::Denied,
@@ -629,7 +633,9 @@ fn process_job(
             None,
             None,
             None,
-        );
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -639,7 +645,7 @@ fn process_job(
         _ => {
             let reason = "missing channel_context_token".to_string();
             let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-            let _ = emit_job_receipt(
+            if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
                 FacJobOutcome::Denied,
@@ -648,7 +654,9 @@ fn process_job(
                 None,
                 None,
                 None,
-            );
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -667,7 +675,7 @@ fn process_job(
         Err(e) => {
             let reason = format!("token decode failed: {e}");
             let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-            let _ = emit_job_receipt(
+            if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
                 FacJobOutcome::Denied,
@@ -676,7 +684,9 @@ fn process_job(
                 None,
                 None,
                 None,
-            );
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -694,7 +704,7 @@ fn process_job(
                 .join(", ")
         );
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        let _ = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
             FacJobOutcome::Denied,
@@ -703,7 +713,9 @@ fn process_job(
             Some(&boundary_trace),
             None,
             None,
-        );
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -717,7 +729,7 @@ fn process_job(
             defect_reason: Some("admission health gate not passed".to_string()),
         };
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        let _ = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
             FacJobOutcome::Denied,
@@ -726,7 +738,9 @@ fn process_job(
             Some(&boundary_trace),
             Some(&admission_trace),
             None,
-        );
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -794,7 +808,7 @@ fn process_job(
             |defect| format!("admission denied: {}", defect.reason),
         );
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        let _ = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
             FacJobOutcome::Denied,
@@ -803,7 +817,9 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
-        );
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -811,7 +827,7 @@ fn process_job(
     if is_authority_consumed(queue_root, &spec.job_id) {
         let reason = format!("authority already consumed for job {}", spec.job_id);
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        let _ = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
             FacJobOutcome::Denied,
@@ -820,7 +836,9 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
-        );
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -828,7 +846,7 @@ fn process_job(
     if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
         let reason = format!("PCAC consume failed: {e}");
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        let _ = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
             FacJobOutcome::Denied,
@@ -837,7 +855,9 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
-        );
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -932,7 +952,7 @@ fn process_job(
             .passed(false)
             .build_and_sign(signer);
 
-    let _ = emit_job_receipt(
+    if let Err(receipt_err) = emit_job_receipt(
         fac_root,
         spec,
         FacJobOutcome::Completed,
@@ -941,7 +961,17 @@ fn process_job(
         Some(&boundary_trace),
         Some(&queue_trace),
         None,
-    );
+    ) {
+        eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
+        if let Err(move_err) =
+            move_to_dir_safe(&claimed_path, &queue_root.join(PENDING_DIR), &file_name)
+        {
+            eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
+        }
+        return JobOutcome::Skipped {
+            reason: "receipt emission failed".to_string(),
+        };
+    }
 
     // Persist the gate receipt alongside the completed job.
     write_gate_receipt(queue_root, &file_name, &gate_receipt);
