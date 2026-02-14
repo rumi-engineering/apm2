@@ -38,10 +38,10 @@ Usage:
   ./scripts/ci/run_bounded_tests.sh [options] [-- command args...]
 
 Options:
-  --timeout-seconds N         Hard wall timeout (default: 600, max: 600)
+  --timeout-seconds N         Hard wall timeout (default: 240, max: 240)
   --kill-after-seconds N      SIGTERM -> SIGKILL escalation delay (default: 20)
   --heartbeat-seconds N       Heartbeat interval while command runs (default: 10)
-  --memory-max VALUE          systemd MemoryMax (default: 48G)
+  --memory-max VALUE          systemd MemoryMax (default: 24G)
   --pids-max N                systemd TasksMax (default: 1536)
   --cpu-quota VALUE           systemd CPUQuota (default: 200%)
   --allow-timeout-fallback    Break-glass: skip systemd-run and use timeout only
@@ -54,13 +54,13 @@ Environment:
 USAGE
 }
 
-MAX_TIMEOUT_SECONDS=600
-TEST_TIMEOUT_SLA_MESSAGE="Bounded FAC test timeout is fixed at 600s for all runs."
+MAX_TIMEOUT_SECONDS=240
+TEST_TIMEOUT_SLA_MESSAGE="Bounded FAC test timeout is fixed at 240s for all runs."
 
-TIMEOUT_SECONDS=600
+TIMEOUT_SECONDS=240
 KILL_AFTER_SECONDS=20
 HEARTBEAT_SECONDS=10
-MEMORY_MAX='48G'
+MEMORY_MAX='24G'
 PIDS_MAX=1536
 CPU_QUOTA='200%'
 ALLOW_TIMEOUT_FALLBACK="${APM2_CI_ALLOW_TIMEOUT_FALLBACK:-0}"
@@ -264,7 +264,12 @@ for var_name in \
     CARGO_TERM_COLOR \
     CARGO_INCREMENTAL \
     RUSTFLAGS \
-    RUST_BACKTRACE; do
+    RUST_BACKTRACE \
+    CARGO_TARGET_DIR \
+    CARGO_BUILD_JOBS \
+    NEXTEST_TEST_THREADS \
+    CARGO_HOME \
+    RUSTUP_TOOLCHAIN; do
     if [[ -n "${!var_name:-}" ]]; then
         SETENV_ARGS+=(--setenv "${var_name}=${!var_name}")
     fi

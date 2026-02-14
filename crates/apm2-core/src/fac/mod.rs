@@ -542,8 +542,9 @@ pub use lane::{
     DEFAULT_LANE_COUNT, LANE_COUNT_ENV_VAR, LANE_ID_PREFIX, LANE_LEASE_V1_SCHEMA,
     LANE_LOCK_TIMEOUT, LANE_PROFILE_V1_SCHEMA, LaneError, LaneLeaseV1, LaneLockGuard, LaneManager,
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
-    MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_PROFILE_FILE_SIZE,
-    MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, ResourceProfile,
+    MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE,
+    MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, MAX_TEST_TIMEOUT_SECONDS, ResourceProfile,
+    compute_test_env,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{
