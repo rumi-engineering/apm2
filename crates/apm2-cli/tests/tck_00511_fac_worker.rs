@@ -14,6 +14,16 @@
 //! - Collision-safe file movement
 //! - Receipt generation for all outcomes
 
+mod exit_codes {
+    pub mod codes {
+        pub const SUCCESS: u8 = 0;
+        pub const GENERIC_ERROR: u8 = 1;
+    }
+}
+
+#[path = "../src/commands/fac_worker.rs"]
+mod fac_worker;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -747,6 +757,49 @@ fn test_collision_safe_file_movement() {
     assert!(safe_dest.exists(), "collision-safe file should exist");
     let new_data = fs::read_to_string(&safe_dest).expect("read new");
     assert_eq!(new_data, "new data");
+}
+
+#[allow(unsafe_code)]
+#[test]
+fn test_fac_worker_e2e_once_mode_processes_job() {
+    let (tmp, queue_root) = setup_queue_env();
+
+    let apm2_home = tmp.path().to_path_buf();
+    let previous_apm2_home = std::env::var_os("APM2_HOME");
+    unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+
+    let signer = Signer::generate();
+    let fac_root = apm2_home.join("private").join("fac");
+    fs::create_dir_all(&fac_root).expect("create fac root");
+    fs::write(
+        fac_root.join("signing_key"),
+        signer.secret_key_bytes().as_ref(),
+    )
+    .expect("write signing key");
+
+    let lease_id = "lease-e2e-once";
+    let spec = build_valid_spec_with_token(&signer, lease_id);
+    let file_name = format!("{}.json", spec.job_id);
+
+    write_spec_to_pending(&queue_root, &spec);
+
+    let exit_code = fac_worker::run_fac_worker(true, 1, 1, true);
+    assert_eq!(exit_code, exit_codes::codes::SUCCESS);
+
+    let pending_path = queue_root.join("pending").join(&file_name);
+    let completed_path = queue_root.join("completed").join(&file_name);
+    let denied_path = queue_root.join("denied").join(&file_name);
+
+    assert!(!pending_path.exists(), "job should be removed from pending");
+    assert!(
+        completed_path.exists() || denied_path.exists(),
+        "job should be moved to completed or denied after processing"
+    );
+
+    match previous_apm2_home {
+        Some(value) => unsafe { std::env::set_var("APM2_HOME", value) },
+        None => unsafe { std::env::remove_var("APM2_HOME") },
+    }
 }
 
 /// Test 13: Gate receipt is properly constructed with all required fields.

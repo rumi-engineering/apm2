@@ -98,6 +98,7 @@ const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
 const DENIED_DIR: &str = "denied";
 const QUARANTINED_DIR: &str = "quarantined";
+const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 
 /// Maximum poll interval to prevent misconfiguration (1 hour).
 const MAX_POLL_INTERVAL_SECS: u64 = 3600;
@@ -245,16 +246,30 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
     // has valid TP-EIO29-001 authority. Without this, admission always denies
     // fail-closed due to missing envelope.
     let current_tick = broker.current_tick();
+    let tick_end = current_tick.saturating_add(1);
     let eval_window = broker
         .build_evaluation_window(
             DEFAULT_BOUNDARY_ID,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
-            current_tick.saturating_add(1),
+            tick_end,
         )
         .unwrap_or_else(|_| make_default_eval_window());
 
-    let _health = broker.check_health(None, &eval_window, &[], &mut checker);
+    // Advance freshness to keep startup checks in sync with the first
+    // admission window.
+    broker.advance_freshness_horizon(tick_end);
+
+    let startup_envelope = broker
+        .issue_time_authority_envelope_default_ttl(
+            DEFAULT_BOUNDARY_ID,
+            DEFAULT_AUTHORITY_CLOCK,
+            current_tick,
+            tick_end,
+        )
+        .ok();
+
+    let _health = broker.check_health(startup_envelope.as_ref(), &eval_window, &[], &mut checker);
     if let Err(e) =
         broker.evaluate_admission_health_gate(&checker, &eval_window, WorkerHealthPolicy::default())
     {
@@ -689,6 +704,21 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
+    // PCAC lifecycle: check if authority was already consumed (replay protection).
+    if is_authority_consumed(queue_root, &spec.job_id) {
+        return JobOutcome::Skipped {
+            reason: format!("authority already consumed for job {}", spec.job_id),
+        };
+    }
+
+    // PCAC lifecycle: durable consume before any authority-bearing side effect.
+    if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
+        let reason = format!("PCAC consume failed: {e}");
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        return JobOutcome::Denied { reason };
+    }
+
     // Step 5: Atomic claim via rename (INV-WRK-003).
     let claimed_dir = queue_root.join(CLAIMED_DIR);
     if let Err(e) = move_to_dir_safe(path, &claimed_dir, &file_name) {
@@ -706,11 +736,13 @@ fn process_job(
         Ok(root) => root,
         Err(e) => {
             // Cannot resolve FAC root -> move back to pending.
-            let _ = move_to_dir_safe(
+            if let Err(move_err) = move_to_dir_safe(
                 &claimed_dir.join(&file_name),
                 &queue_root.join(PENDING_DIR),
                 &file_name,
-            );
+            ) {
+                eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
+            }
             return JobOutcome::Skipped {
                 reason: format!("cannot resolve FAC root for lane management: {e}"),
             };
@@ -720,11 +752,13 @@ fn process_job(
     let lane_mgr = match LaneManager::new(fac_root) {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = move_to_dir_safe(
+            if let Err(move_err) = move_to_dir_safe(
                 &claimed_dir.join(&file_name),
                 &queue_root.join(PENDING_DIR),
                 &file_name,
-            );
+            ) {
+                eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
+            }
             return JobOutcome::Skipped {
                 reason: format!("lane manager init failed: {e}"),
             };
@@ -748,11 +782,13 @@ fn process_job(
 
     let Some(_lane_guard) = acquired_guard else {
         // No lane available -> move back to pending for retry.
-        let _ = move_to_dir_safe(
+        if let Err(move_err) = move_to_dir_safe(
             &claimed_dir.join(&file_name),
             &queue_root.join(PENDING_DIR),
             &file_name,
-        );
+        ) {
+            eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
+        }
         return JobOutcome::Skipped {
             reason: "no lane available, returning to pending".to_string(),
         };
@@ -775,19 +811,19 @@ fn process_job(
     }
 
     // Step 8: Write authoritative GateReceipt and move to completed.
-    let evidence_hash = compute_evidence_hash(spec.job_id.as_bytes());
+    let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
     let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
     let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
     let receipt = GateReceiptBuilder::new(&receipt_id, "fac-worker-exec", &spec.actuation.lease_id)
         .changeset_digest(changeset_digest)
         .executor_actor_id("fac-worker")
         .receipt_version(1)
-        .payload_kind("quality")
+        .payload_kind("validation-only")
         .payload_schema_version(1)
         .payload_hash(evidence_hash)
         .evidence_bundle_hash(evidence_hash)
         .job_spec_digest(&spec.job_spec_digest)
-        .passed(true)
+        .passed(false)
         .build_and_sign(signer);
 
     // Persist the gate receipt alongside the completed job.
@@ -845,6 +881,7 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
         COMPLETED_DIR,
         DENIED_DIR,
         QUARANTINED_DIR,
+        CONSUME_RECEIPTS_DIR,
     ] {
         let path = queue_root.join(dir);
         if !path.exists() {
@@ -852,6 +889,55 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
                 .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
         }
     }
+    Ok(())
+}
+
+/// Checks if a PCAC authority token has already been consumed for this job.
+///
+/// Returns true if a consume receipt exists for the given `job_id`, indicating
+/// the authority was already consumed and the job should be skipped.
+fn is_authority_consumed(queue_root: &Path, job_id: &str) -> bool {
+    let consume_dir = queue_root.join(CONSUME_RECEIPTS_DIR);
+    let receipt_path = consume_dir.join(format!("{job_id}.consumed"));
+    receipt_path.exists()
+}
+
+/// Durably records PCAC authority consumption BEFORE any side effect.
+///
+/// This implements the essential property of the PCAC lifecycle:
+/// a single-use, durable authorization record must exist before the
+/// authority-bearing effect (job claim + receipt emission).
+///
+/// The consume receipt commits to: `job_id`, `claim timestamp`, and
+/// `spec_digest` for binding integrity.
+fn consume_authority(queue_root: &Path, job_id: &str, spec_digest: &str) -> Result<(), String> {
+    let consume_dir = queue_root.join(CONSUME_RECEIPTS_DIR);
+    fs::create_dir_all(&consume_dir)
+        .map_err(|e| format!("cannot create consume receipt dir: {e}"))?;
+
+    let receipt_path = consume_dir.join(format!("{job_id}.consumed"));
+
+    // Fail-closed: if the receipt already exists, authority was already
+    // consumed.
+    if receipt_path.exists() {
+        return Err(format!("authority already consumed for job {job_id}"));
+    }
+
+    let receipt = serde_json::json!({
+        "schema": "apm2.fac.pcac_consume.v1",
+        "job_id": job_id,
+        "spec_digest": spec_digest,
+        "consumed_at_epoch_secs": current_timestamp_epoch_secs(),
+    });
+
+    let bytes = serde_json::to_vec_pretty(&receipt)
+        .map_err(|e| format!("cannot serialize consume receipt: {e}"))?;
+    fs::write(&receipt_path, bytes).map_err(|e| format!("cannot write consume receipt: {e}"))?;
+
+    if let Ok(dir) = fs::File::open(&consume_dir) {
+        let _ = dir.sync_all();
+    }
+
     Ok(())
 }
 
@@ -1154,6 +1240,7 @@ mod tests {
             COMPLETED_DIR,
             DENIED_DIR,
             QUARANTINED_DIR,
+            CONSUME_RECEIPTS_DIR,
         ] {
             assert!(queue_root.join(sub).is_dir(), "missing {sub}");
         }
