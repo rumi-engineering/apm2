@@ -4104,12 +4104,12 @@ mod tests {
         });
         assert!(!subcommand_requests_machine_output(&restart));
 
-    let worker = FacSubcommand::Worker(WorkerArgs {
-        once: true,
-        poll_interval_secs: 1,
-        max_jobs: 1,
-        print_unit: false,
-    });
+        let worker = FacSubcommand::Worker(WorkerArgs {
+            once: true,
+            poll_interval_secs: 1,
+            max_jobs: 1,
+            print_unit: false,
+        });
         assert!(!subcommand_requests_machine_output(&worker));
     }
 
