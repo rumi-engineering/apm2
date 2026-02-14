@@ -65,11 +65,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use apm2_core::channel::{decode_channel_context_token, validate_channel_boundary};
+use apm2_core::channel::{
+    ChannelBoundaryDefect, decode_channel_context_token, validate_channel_boundary,
+};
 use apm2_core::crypto::Signer;
 use apm2_core::economics::queue_admission::{
-    HtfEvaluationWindow, QueueAdmissionRequest, QueueAdmissionVerdict, QueueLane,
-    QueueSchedulerState, evaluate_queue_admission,
+    HtfEvaluationWindow, QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionVerdict,
+    QueueLane, QueueSchedulerState, evaluate_queue_admission,
 };
 use apm2_core::fac::broker::{BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
@@ -77,7 +79,11 @@ use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
 };
 use apm2_core::fac::lane::LaneManager;
-use apm2_core::fac::{GateReceipt, GateReceiptBuilder};
+use apm2_core::fac::{
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
+    FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, persist_content_addressed_receipt,
+};
 use serde::Serialize;
 
 use crate::exit_codes::codes as exit_codes;
@@ -103,8 +109,11 @@ const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 /// Maximum poll interval to prevent misconfiguration (1 hour).
 const MAX_POLL_INTERVAL_SECS: u64 = 3600;
 
-/// Schema identifier for worker receipt traces.
-const WORKER_RECEIPT_SCHEMA: &str = "apm2.fac.worker_receipt.v1";
+/// Max number of boundary defect classes retained in a trace.
+const MAX_BOUNDARY_DEFECT_CLASSES: usize = 32;
+
+/// FAC receipt directory under `$APM2_HOME/private/fac`.
+const FAC_RECEIPTS_DIR: &str = "receipts";
 
 /// Default boundary ID for local-mode evaluation windows.
 const DEFAULT_BOUNDARY_ID: &str = "local";
@@ -182,6 +191,13 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         Ok(root) => root,
         Err(e) => {
             output_worker_error(json_output, &format!("cannot resolve queue root: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    let fac_root = match resolve_fac_root() {
+        Ok(root) => root,
+        Err(e) => {
+            output_worker_error(json_output, &format!("cannot resolve FAC root: {e}"));
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -292,7 +308,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         let cycle_start = Instant::now();
 
         // Scan pending directory (quarantines malformed files inline).
-        let candidates = match scan_pending(&queue_root) {
+        let candidates = match scan_pending(&queue_root, &fac_root) {
             Ok(c) => c,
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
@@ -327,6 +343,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             let outcome = process_job(
                 candidate,
                 &queue_root,
+                &fac_root,
                 &verifying_key,
                 &scheduler,
                 &mut broker,
@@ -409,7 +426,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
 ///
 /// Malformed, unreadable, or oversize files are quarantined with receipts
 /// (INV-WRK-007) rather than silently dropped.
-fn scan_pending(queue_root: &Path) -> Result<Vec<PendingCandidate>, String> {
+fn scan_pending(queue_root: &Path, fac_root: &Path) -> Result<Vec<PendingCandidate>, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     if !pending_dir.is_dir() {
         return Ok(Vec::new());
@@ -447,7 +464,16 @@ fn scan_pending(queue_root: &Path) -> Result<Vec<PendingCandidate>, String> {
             Err(e) => {
                 let reason = format!("read failure: {e}");
                 let _ = move_to_dir_safe(&path, &queue_root.join(QUARANTINED_DIR), &file_name);
-                write_receipt(queue_root, &file_name, "quarantine", &reason, None);
+                let job_id = file_name.trim_end_matches(".json").to_string();
+                let _ = emit_scan_receipt(
+                    fac_root,
+                    &file_name,
+                    &job_id,
+                    &compute_job_spec_digest_preview(&[]),
+                    FacJobOutcome::Quarantined,
+                    DenialReasonCode::MalformedSpec,
+                    &reason,
+                );
                 continue;
             },
         };
@@ -459,7 +485,16 @@ fn scan_pending(queue_root: &Path) -> Result<Vec<PendingCandidate>, String> {
             Err(e) => {
                 let reason = format!("deserialization failed: {e}");
                 let _ = move_to_dir_safe(&path, &queue_root.join(QUARANTINED_DIR), &file_name);
-                write_receipt(queue_root, &file_name, "quarantine", &reason, None);
+                let job_id = file_name.trim_end_matches(".json").to_string();
+                let _ = emit_scan_receipt(
+                    fac_root,
+                    &file_name,
+                    &job_id,
+                    &compute_job_spec_digest_preview(&bytes),
+                    FacJobOutcome::Quarantined,
+                    DenialReasonCode::MalformedSpec,
+                    &reason,
+                );
                 continue;
             },
         };
@@ -529,9 +564,11 @@ fn build_scheduler_state(candidates: &[PendingCandidate]) -> QueueSchedulerState
 /// Processes a single pending job through the validation pipeline.
 ///
 /// Returns the outcome (quarantine, deny, complete, or skip).
+#[allow(clippy::too_many_arguments)]
 fn process_job(
     candidate: &PendingCandidate,
     queue_root: &Path,
+    fac_root: &Path,
     verifying_key: &apm2_core::crypto::VerifyingKey,
     scheduler: &QueueSchedulerState,
     broker: &mut FacBroker,
@@ -563,19 +600,42 @@ fn process_job(
         if is_digest_error {
             let reason = format!("digest validation failed: {e}");
             let _ = move_to_dir_safe(path, &queue_root.join(QUARANTINED_DIR), &file_name);
-            write_receipt(
-                queue_root,
-                &file_name,
-                "quarantine",
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Quarantined,
+                Some(DenialReasonCode::DigestMismatch),
                 &reason,
-                Some(&spec.job_id),
-            );
+                None,
+                None,
+                None,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
+                );
+            }
             return JobOutcome::Quarantined { reason };
         }
         // Other validation errors (missing token, schema, etc.) -> deny.
         let reason = format!("validation failed: {e}");
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        let reason_code = match e {
+            JobSpecError::MissingToken { .. } => DenialReasonCode::MissingChannelToken,
+            JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
+            _ => DenialReasonCode::ValidationFailed,
+        };
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(reason_code),
+            &reason,
+            None,
+            None,
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -585,7 +645,18 @@ fn process_job(
         _ => {
             let reason = "missing channel_context_token".to_string();
             let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-            write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::MissingChannelToken),
+                &reason,
+                None,
+                None,
+                None,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -604,24 +675,47 @@ fn process_job(
         Err(e) => {
             let reason = format!("token decode failed: {e}");
             let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-            write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::TokenDecodeFailed),
+                &reason,
+                None,
+                None,
+                None,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
             return JobOutcome::Denied { reason };
         },
     };
 
     // Validate boundary check defects.
     let defects = validate_channel_boundary(&boundary_check);
+    let boundary_trace = build_channel_boundary_trace(&defects);
     if !defects.is_empty() {
         let reason = format!(
             "channel boundary violations: {}",
             defects
                 .iter()
-                .map(|d| format!("{:?}", d.violation_class))
+                .map(|d| strip_json_string_quotes(&serialize_to_json_string(&d.violation_class)))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            &reason,
+            Some(&boundary_trace),
+            None,
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -629,8 +723,24 @@ fn process_job(
     //
     if !broker.is_admission_health_gate_passed() {
         let reason = "broker admission health gate not passed (INV-BH-003)".to_string();
+        let admission_trace = JobQueueAdmissionTrace {
+            verdict: "deny".to_string(),
+            queue_lane: spec.queue_lane.clone(),
+            defect_reason: Some("admission health gate not passed".to_string()),
+        };
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::AdmissionHealthGateFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&admission_trace),
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -691,31 +801,63 @@ fn process_job(
     };
 
     let decision = evaluate_queue_admission(&admission_request, scheduler, Some(&verifier));
-
+    let queue_trace = build_queue_admission_trace(&decision);
     if decision.verdict != QueueAdmissionVerdict::Allow {
         let reason = decision.defect().map_or_else(
             || "admission denied (no defect detail)".to_string(),
             |defect| format!("admission denied: {}", defect.reason),
         );
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-
-        // Write admission trace to receipt.
-        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::QueueAdmissionDenied),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
     // PCAC lifecycle: check if authority was already consumed (replay protection).
     if is_authority_consumed(queue_root, &spec.job_id) {
-        return JobOutcome::Skipped {
-            reason: format!("authority already consumed for job {}", spec.job_id),
-        };
+        let reason = format!("authority already consumed for job {}", spec.job_id);
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::AuthorityAlreadyConsumed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
     }
 
     // PCAC lifecycle: durable consume before any authority-bearing side effect.
     if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
         let reason = format!("PCAC consume failed: {e}");
         let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::PcacConsumeFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -732,24 +874,7 @@ fn process_job(
     //
     // Try to acquire a lane lock. If no lane is available, move the job
     // back to pending for retry in a future cycle.
-    let fac_root = match resolve_fac_root() {
-        Ok(root) => root,
-        Err(e) => {
-            // Cannot resolve FAC root -> move back to pending.
-            if let Err(move_err) = move_to_dir_safe(
-                &claimed_dir.join(&file_name),
-                &queue_root.join(PENDING_DIR),
-                &file_name,
-            ) {
-                eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
-            }
-            return JobOutcome::Skipped {
-                reason: format!("cannot resolve FAC root for lane management: {e}"),
-            };
-        },
-    };
-
-    let lane_mgr = match LaneManager::new(fac_root) {
+    let lane_mgr = match LaneManager::new(fac_root.to_path_buf()) {
         Ok(mgr) => mgr,
         Err(e) => {
             if let Err(move_err) = move_to_dir_safe(
@@ -814,20 +939,42 @@ fn process_job(
     let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
     let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
     let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
-    let receipt = GateReceiptBuilder::new(&receipt_id, "fac-worker-exec", &spec.actuation.lease_id)
-        .changeset_digest(changeset_digest)
-        .executor_actor_id("fac-worker")
-        .receipt_version(1)
-        .payload_kind("validation-only")
-        .payload_schema_version(1)
-        .payload_hash(evidence_hash)
-        .evidence_bundle_hash(evidence_hash)
-        .job_spec_digest(&spec.job_spec_digest)
-        .passed(false)
-        .build_and_sign(signer);
+    let gate_receipt =
+        GateReceiptBuilder::new(&receipt_id, "fac-worker-exec", &spec.actuation.lease_id)
+            .changeset_digest(changeset_digest)
+            .executor_actor_id("fac-worker")
+            .receipt_version(1)
+            .payload_kind("validation-only")
+            .payload_schema_version(1)
+            .payload_hash(evidence_hash)
+            .evidence_bundle_hash(evidence_hash)
+            .job_spec_digest(&spec.job_spec_digest)
+            .passed(false)
+            .build_and_sign(signer);
+
+    if let Err(receipt_err) = emit_job_receipt(
+        fac_root,
+        spec,
+        FacJobOutcome::Completed,
+        None,
+        "completed",
+        Some(&boundary_trace),
+        Some(&queue_trace),
+        None,
+    ) {
+        eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
+        if let Err(move_err) =
+            move_to_dir_safe(&claimed_path, &queue_root.join(PENDING_DIR), &file_name)
+        {
+            eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
+        }
+        return JobOutcome::Skipped {
+            reason: "receipt emission failed".to_string(),
+        };
+    }
 
     // Persist the gate receipt alongside the completed job.
-    write_gate_receipt(queue_root, &file_name, &receipt);
+    write_gate_receipt(queue_root, &file_name, &gate_receipt);
 
     // Move to completed.
     if let Err(e) = move_to_dir_safe(&claimed_path, &queue_root.join(COMPLETED_DIR), &file_name) {
@@ -1066,42 +1213,113 @@ fn move_to_dir_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<(), 
         .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dest.display()))
 }
 
-/// Writes a receipt file to `queue/receipts/` (or alongside the moved file).
-///
-/// Receipt is a minimal JSON trace with no secrets (INV-WRK-004).
-fn write_receipt(
-    queue_root: &Path,
+/// Emit a structured job receipt for scan failures (typically malformed input).
+fn emit_scan_receipt(
+    fac_root: &Path,
     file_name: &str,
-    outcome: &str,
+    job_id: &str,
+    job_spec_digest: &str,
+    outcome: FacJobOutcome,
+    denial_reason: DenialReasonCode,
     reason: &str,
-    job_id: Option<&str>,
-) {
-    let receipts_dir = queue_root.join("receipts");
-    let _ = fs::create_dir_all(&receipts_dir);
+) -> Result<PathBuf, String> {
+    let receipt = FacJobReceiptV1Builder::new(
+        format!("wkr-scan-{}-{}", file_name, current_timestamp_epoch_secs()),
+        job_id,
+        job_spec_digest,
+    )
+    .outcome(outcome)
+    .denial_reason(denial_reason)
+    .reason(reason)
+    .timestamp_secs(current_timestamp_epoch_secs())
+    .try_build()
+    .map_err(|e| format!("cannot build scan receipt: {e}"))?;
 
-    // Truncate reason to prevent unbounded receipt size.
-    let bounded_reason: String = reason.chars().take(512).collect();
+    persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+}
 
-    let receipt = serde_json::json!({
-        "schema": WORKER_RECEIPT_SCHEMA,
-        "source_file": file_name,
-        "outcome": outcome,
-        "reason": bounded_reason,
-        "job_id": job_id.unwrap_or("unknown"),
-        "timestamp_secs": current_timestamp_epoch_secs(),
-    });
+/// Emit a unified `FacJobReceiptV1` and persist under
+/// `$APM2_HOME/private/fac/receipts`.
+#[allow(clippy::too_many_arguments)]
+fn emit_job_receipt(
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&BudgetAdmissionTrace>,
+) -> Result<PathBuf, String> {
+    let mut builder = FacJobReceiptV1Builder::new(
+        format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
+        &spec.job_id,
+        &spec.job_spec_digest,
+    )
+    .outcome(outcome)
+    .reason(reason)
+    .timestamp_secs(current_timestamp_epoch_secs());
 
-    let receipt_name = format!(
-        "{}-{}.receipt.json",
-        file_name.trim_end_matches(".json"),
-        outcome
-    );
-    let receipt_path = receipts_dir.join(receipt_name);
-
-    // Best-effort write; worker should not fail due to receipt I/O.
-    if let Ok(bytes) = serde_json::to_vec_pretty(&receipt) {
-        let _ = fs::write(&receipt_path, bytes);
+    if let Some(denial_reason) = denial_reason {
+        builder = builder.denial_reason(denial_reason);
     }
+
+    if let Some(boundary_trace) = rfc0028_channel_boundary {
+        builder = builder.rfc0028_channel_boundary(boundary_trace.clone());
+    }
+    if let Some(queue_admission_trace) = eio29_queue_admission {
+        builder = builder.eio29_queue_admission(queue_admission_trace.clone());
+    }
+    if let Some(budget_admission_trace) = eio29_budget_admission {
+        builder = builder.eio29_budget_admission(budget_admission_trace.clone());
+    }
+
+    let receipt = builder
+        .try_build()
+        .map_err(|e| format!("cannot build job receipt: {e}"))?;
+    persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+}
+
+fn compute_job_spec_digest_preview(bytes: &[u8]) -> String {
+    let hash = blake3::hash(bytes);
+    format!("b3-256:{}", hash.to_hex())
+}
+
+fn build_channel_boundary_trace(defects: &[ChannelBoundaryDefect]) -> ChannelBoundaryTrace {
+    let mut defect_classes = Vec::new();
+    for defect in defects.iter().take(MAX_BOUNDARY_DEFECT_CLASSES) {
+        defect_classes.push(strip_json_string_quotes(&serialize_to_json_string(
+            &defect.violation_class,
+        )));
+    }
+
+    let defect_count = u32::try_from(defects.len()).unwrap_or(u32::MAX);
+    ChannelBoundaryTrace {
+        passed: defects.is_empty(),
+        defect_count,
+        defect_classes,
+    }
+}
+
+fn build_queue_admission_trace(decision: &QueueAdmissionDecision) -> JobQueueAdmissionTrace {
+    let lane = decision.trace.lane.as_ref().map_or_else(
+        || "unknown".to_string(),
+        |v| strip_json_string_quotes(&serialize_to_json_string(v)),
+    );
+
+    JobQueueAdmissionTrace {
+        verdict: strip_json_string_quotes(&serialize_to_json_string(&decision.trace.verdict)),
+        queue_lane: lane,
+        defect_reason: decision.trace.defect.as_ref().map(|d| d.reason.clone()),
+    }
+}
+
+fn serialize_to_json_string<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"unknown\"".to_string())
+}
+
+fn strip_json_string_quotes(value: &str) -> String {
+    value.trim_matches('\"').to_string()
 }
 
 /// Persists a `GateReceipt` alongside the completed job.
@@ -1298,23 +1516,25 @@ mod tests {
     }
 
     #[test]
-    fn test_write_receipt_bounded_reason() {
+    fn test_emit_scan_receipt_bounded_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let queue_root = dir.path();
+        let fac_root = dir.path().join("private").join("fac");
+        ensure_queue_dirs(&dir.path().join("queue")).expect("create dirs");
 
         let long_reason = "x".repeat(1024);
-        write_receipt(queue_root, "test.json", "deny", &long_reason, Some("job1"));
+        let result = emit_scan_receipt(
+            &fac_root,
+            "test.json",
+            "job1",
+            &compute_job_spec_digest_preview(&[]),
+            FacJobOutcome::Quarantined,
+            DenialReasonCode::MalformedSpec,
+            &long_reason,
+        );
 
-        let receipt_path = queue_root.join("receipts").join("test-deny.receipt.json");
-        assert!(receipt_path.exists(), "receipt should be written");
-
-        let content = fs::read_to_string(&receipt_path).expect("read receipt");
-        let parsed: serde_json::Value = serde_json::from_str(&content).expect("parse receipt");
-        let reason = parsed["reason"].as_str().expect("reason field");
         assert!(
-            reason.len() <= 512,
-            "reason should be truncated to 512 chars, got {}",
-            reason.len()
+            result.is_err(),
+            "receipt emit should reject oversized reason with 512-char bound"
         );
     }
 
@@ -1353,7 +1573,8 @@ mod tests {
         let malformed_path = queue_root.join("pending").join("bad.json");
         fs::write(&malformed_path, b"not valid json {{{").expect("write malformed");
 
-        let candidates = scan_pending(&queue_root).expect("scan");
+        let fac_root = dir.path().join("private").join("fac");
+        let candidates = scan_pending(&queue_root, &fac_root).expect("scan");
 
         // Malformed file should have been quarantined, not included in candidates.
         assert!(
@@ -1373,7 +1594,7 @@ mod tests {
         );
 
         // Check receipt was written.
-        let receipts_dir = queue_root.join("receipts");
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
         let receipt_files: Vec<_> = fs::read_dir(&receipts_dir)
             .expect("read receipts")
             .flatten()
@@ -1395,7 +1616,8 @@ mod tests {
         let data = vec![b'x'; MAX_JOB_SPEC_SIZE + 1];
         fs::write(&oversize_path, &data).expect("write oversize");
 
-        let candidates = scan_pending(&queue_root).expect("scan");
+        let fac_root = dir.path().join("private").join("fac");
+        let candidates = scan_pending(&queue_root, &fac_root).expect("scan");
 
         assert!(
             candidates.is_empty(),
