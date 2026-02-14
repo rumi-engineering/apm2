@@ -24,10 +24,12 @@
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
-use tempfile::Builder;
 use thiserror::Error;
 
 use super::safe_rmtree::{SafeRmtreeError, safe_rmtree_v1};
@@ -38,6 +40,8 @@ pub const REPO_MIRROR_SCHEMA: &str = "apm2.fac.repo_mirror.v1";
 pub const MAX_REPO_ID_LENGTH: usize = 256;
 /// Maximum allowed mirror directory name length.
 pub const MAX_MIRROR_DIR_NAME: usize = 280;
+/// Maximum number of bare mirrors to retain before eviction.
+pub const MAX_MIRROR_COUNT: usize = 64;
 /// Maximum patch size in bytes.
 pub const MAX_PATCH_SIZE: usize = 10_485_760;
 
@@ -100,6 +104,20 @@ pub enum RepoMirrorError {
         /// Why the repo id was rejected.
         reason: String,
     },
+
+    #[error("mirror not found for repo_id {repo_id}: {reason}")]
+    MirrorNotFound {
+        /// Repository identifier.
+        repo_id: String,
+        /// Why lookup failed.
+        reason: String,
+    },
+
+    #[error("invalid remote URL: {reason}")]
+    InvalidRemoteUrl {
+        /// Why the remote URL was rejected.
+        reason: String,
+    },
 }
 
 impl RepoMirrorManager {
@@ -144,6 +162,7 @@ impl RepoMirrorManager {
 
             match remote_url {
                 Some(url) => {
+                    validate_remote_url(url)?;
                     set_or_replace_remote(&mirror_path, url)?;
                     git_fetch(&mirror_path)?;
                 },
@@ -157,21 +176,59 @@ impl RepoMirrorManager {
             return Ok(mirror_path);
         }
 
+        let remote_url = remote_url.ok_or_else(|| RepoMirrorError::MirrorNotFound {
+            repo_id: repo_id.to_string(),
+            reason: "mirror does not exist and no remote_url provided for bootstrap".to_string(),
+        })?;
+        validate_remote_url(remote_url)?;
+
+        self.evict_if_needed()?;
+
         // Create a new bare mirror.
         git_command(
-            &["init", "--bare", mirror_path.to_string_lossy().as_ref()],
+            &[
+                "clone",
+                "--bare",
+                "--",
+                remote_url,
+                mirror_path.to_string_lossy().as_ref(),
+            ],
             None,
             |reason| RepoMirrorError::MirrorInitFailed {
                 reason: reason.to_string(),
             },
         )?;
 
-        if let Some(url) = remote_url {
-            set_or_replace_remote(&mirror_path, url)?;
-            git_fetch(&mirror_path)?;
+        Ok(mirror_path)
+    }
+
+    fn evict_if_needed(&self) -> Result<(), RepoMirrorError> {
+        let mut with_time: Vec<(PathBuf, SystemTime)> = std::fs::read_dir(&self.mirror_root)
+            .map_err(RepoMirrorError::Io)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("git") {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                let modified = metadata.modified().ok()?;
+                Some((path, modified))
+            })
+            .collect();
+
+        if with_time.len() <= MAX_MIRROR_COUNT {
+            return Ok(());
         }
 
-        Ok(mirror_path)
+        with_time.sort_by_key(|(_, t)| *t);
+        let to_remove = with_time.len() - MAX_MIRROR_COUNT;
+
+        for (path, _) in with_time.into_iter().take(to_remove) {
+            safe_rmtree_v1(&path, &self.mirror_root).map_err(RepoMirrorError::SafeRmtreeError)?;
+        }
+
+        Ok(())
     }
 
     /// Clone mirror state to a lane workspace and ensure checkout on
@@ -199,7 +256,11 @@ impl RepoMirrorManager {
         git_command(
             &[
                 "clone",
+                "-c",
+                "core.symlinks=false",
+                "--no-hardlinks",
                 "--no-checkout",
+                "--",
                 mirror_path.to_string_lossy().as_ref(),
                 lane_workspace.to_string_lossy().as_ref(),
             ],
@@ -267,32 +328,44 @@ impl RepoMirrorManager {
             });
         }
 
-        let mut patch_file = Builder::new()
-            .prefix(".apm2-patch-")
-            .suffix(".patch")
-            .tempfile_in(lane_workspace)
-            .map_err(RepoMirrorError::Io)?;
-        let patch_path = patch_file.path().to_path_buf();
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(lane_workspace)
+            .arg("apply")
+            .arg("--stat")
+            .arg("--apply")
+            .arg("-")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
+        let mut child = command.spawn().map_err(RepoMirrorError::Io)?;
         {
-            patch_file
+            let Some(mut child_stdin) = child.stdin.take() else {
+                return Err(RepoMirrorError::PatchApplyFailed {
+                    reason: "failed to open stdin for git apply".to_string(),
+                });
+            };
+            child_stdin
                 .write_all(patch_bytes)
                 .map_err(RepoMirrorError::Io)?;
-            patch_file.flush().map_err(RepoMirrorError::Io)?;
+            child_stdin.flush().map_err(RepoMirrorError::Io)?;
         }
 
-        git_command(
-            &[
-                "apply",
-                "--stat",
-                "--apply",
-                patch_path.to_string_lossy().as_ref(),
-            ],
-            Some(lane_workspace),
-            |reason| RepoMirrorError::PatchApplyFailed {
-                reason: reason.to_string(),
-            },
-        )?;
+        let output = child.wait_with_output().map_err(RepoMirrorError::Io)?;
+        if !output.status.success() {
+            let mut reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if reason.is_empty() {
+                reason = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
+            if reason.is_empty() {
+                reason = "git apply failed with no output".to_string();
+            }
+            return Err(RepoMirrorError::PatchApplyFailed { reason });
+        }
 
         let changed = git_command(
             &[
@@ -326,6 +399,8 @@ impl RepoMirrorManager {
 #[cfg(unix)]
 fn ensure_dir_mode_0700(path: &Path) -> Result<(), RepoMirrorError> {
     if path.exists() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(RepoMirrorError::Io)?;
         return Ok(());
     }
     std::fs::DirBuilder::new()
@@ -473,6 +548,8 @@ fn mirror_has_remote(mirror_path: &Path) -> Result<bool, RepoMirrorError> {
 }
 
 fn set_or_replace_remote(mirror_path: &Path, remote_url: &str) -> Result<(), RepoMirrorError> {
+    validate_remote_url(remote_url)?;
+
     if mirror_has_remote(mirror_path)? {
         git_command(
             &[
@@ -480,6 +557,7 @@ fn set_or_replace_remote(mirror_path: &Path, remote_url: &str) -> Result<(), Rep
                 mirror_path.to_string_lossy().as_ref(),
                 "remote",
                 "set-url",
+                "--",
                 "origin",
                 remote_url,
             ],
@@ -496,6 +574,7 @@ fn set_or_replace_remote(mirror_path: &Path, remote_url: &str) -> Result<(), Rep
                         mirror_path.to_string_lossy().as_ref(),
                         "remote",
                         "add",
+                        "--",
                         "origin",
                         remote_url,
                     ],
@@ -517,6 +596,7 @@ fn set_or_replace_remote(mirror_path: &Path, remote_url: &str) -> Result<(), Rep
             mirror_path.to_string_lossy().as_ref(),
             "remote",
             "add",
+            "--",
             "origin",
             remote_url,
         ],
@@ -545,12 +625,30 @@ fn git_fetch(mirror_path: &Path) -> Result<(), RepoMirrorError> {
     .map(|_| ())
 }
 
+fn validate_remote_url(remote_url: &str) -> Result<(), RepoMirrorError> {
+    if remote_url.is_empty() {
+        return Err(RepoMirrorError::InvalidRemoteUrl {
+            reason: "remote URL must not be empty".to_string(),
+        });
+    }
+    if remote_url.starts_with('-') {
+        return Err(RepoMirrorError::InvalidRemoteUrl {
+            reason: "remote URL must not start with hyphen".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::process::Command;
+    use std::time::Duration;
 
     use super::*;
 
@@ -664,6 +762,66 @@ mod tests {
             mgr.ensure_mirror(&"x".repeat(MAX_REPO_ID_LENGTH + 1), None),
             Err(RepoMirrorError::InvalidRepoId { .. })
         ));
+    }
+
+    #[test]
+    fn test_ensure_mirror_requires_remote_when_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mgr = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        assert!(matches!(
+            mgr.ensure_mirror("sample", None),
+            Err(RepoMirrorError::MirrorNotFound { repo_id: _, .. })
+        ));
+    }
+
+    #[test]
+    fn test_ensure_mirror_rejects_injected_remote_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mgr = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        assert!(matches!(
+            mgr.ensure_mirror("sample", Some("-attacker")),
+            Err(RepoMirrorError::InvalidRemoteUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn test_ensure_mirror_evicts_oldest_when_exceeding_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+        #[cfg(unix)]
+        {
+            let fac_root = temp.path().join("private").join("fac");
+            std::fs::create_dir_all(&fac_root).expect("create fac root");
+            std::fs::set_permissions(fac_root, std::fs::Permissions::from_mode(0o700))
+                .expect("set fac root mode");
+        }
+
+        for i in 0..=MAX_MIRROR_COUNT {
+            let path = manager.mirror_path(&format!("repo-{i}"));
+            std::fs::create_dir_all(&path).expect("create mirror entry");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let source_repo = temp.path().join("source_repo");
+        let head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
+
+        let _ = manager
+            .ensure_mirror("new", Some(source_repo.to_string_lossy().as_ref()))
+            .expect("ensure mirror after eviction");
+        assert!(manager.mirror_path("new").exists());
+        assert!(!manager.mirror_path("repo-0").exists());
+
+        let mirror_root = manager.mirror_root;
+        let count = std::fs::read_dir(mirror_root)
+            .expect("read mirror root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("git"))
+            .count();
+
+        assert_eq!(count, MAX_MIRROR_COUNT + 1);
+        assert_eq!(head_sha.len(), 40);
     }
 
     #[test]
@@ -864,5 +1022,112 @@ mod tests {
         let err = manager.checkout_to_lane("sample", "zzz", &workspace, &lanes_dir);
 
         assert!(matches!(err, Err(RepoMirrorError::CheckoutFailed { .. })));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_checkout_does_not_create_symlinks_from_mirror() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_repo = temp.path().join("source_repo");
+        #[cfg(unix)]
+        {
+            let fac_root = temp.path().join("private").join("fac");
+            std::fs::create_dir_all(&fac_root).expect("create fac root");
+            std::fs::set_permissions(fac_root, std::fs::Permissions::from_mode(0o700))
+                .expect("set fac root mode");
+        }
+
+        let output = Command::new("git")
+            .arg("init")
+            .arg(&source_repo)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("init repo");
+        assert!(output.status.success());
+
+        fs::write(source_repo.join("payload.txt"), b"payload").expect("write payload");
+        symlink("payload.txt", source_repo.join("payload-link.txt")).expect("create symlink");
+
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(&source_repo)
+            .args(["add", "payload.txt", "payload-link.txt"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git add");
+        assert!(add.status.success());
+
+        let config_name = Command::new("git")
+            .arg("-C")
+            .arg(&source_repo)
+            .args(["config", "user.name", "Test"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set user.name");
+        assert!(config_name.status.success());
+
+        let config_email = Command::new("git")
+            .arg("-C")
+            .arg(&source_repo)
+            .args(["config", "user.email", "test@example.com"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set user.email");
+        assert!(config_email.status.success());
+
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&source_repo)
+            .args(["commit", "-m", "symlink baseline"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git commit");
+        assert!(commit.status.success());
+
+        let head_sha = Command::new("git")
+            .arg("-C")
+            .arg(&source_repo)
+            .args(["rev-parse", "HEAD"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("rev-parse");
+        assert!(head_sha.status.success());
+
+        let head_sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
+
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+        let mirror_path = manager
+            .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
+            .expect("ensure mirror");
+        assert!(mirror_path.ends_with("sample.git"));
+
+        let lanes_root = temp.path().join("lanes");
+        std::fs::create_dir_all(&lanes_root).expect("create lanes");
+        #[cfg(unix)]
+        std::fs::set_permissions(&lanes_root, std::fs::Permissions::from_mode(0o700))
+            .expect("set lanes mode");
+        let workspace = lanes_root.join("lane-a").join("workspace");
+        fs::create_dir_all(workspace.parent().expect("lane parent")).expect("create lane parent");
+
+        let outcome = manager
+            .checkout_to_lane("sample", &head_sha, &workspace, &lanes_root)
+            .expect("checkout");
+
+        let checked_link = outcome.workspace_path.join("payload-link.txt");
+        let metadata = fs::symlink_metadata(&checked_link).expect("read checked out link metadata");
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "symlink was restored despite core.symlinks=false"
+        );
+        assert_eq!(
+            fs::read_to_string(&checked_link).expect("read checked out link"),
+            "payload.txt"
+        );
     }
 }

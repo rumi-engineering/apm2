@@ -85,6 +85,8 @@ use apm2_core::fac::{
     QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, compute_policy_hash,
     deserialize_policy, parse_policy_hash, persist_content_addressed_receipt, persist_policy,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -1093,68 +1095,17 @@ fn process_job(
     }
 
     if spec.source.kind == "patch_injection" {
-        if let Some(patch_value) = &spec.source.patch {
-            let patch_bytes = match serde_json::to_vec(patch_value) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    let reason = format!("patch serialization failed: {e}");
-                    let _ =
-                        move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
-                    if let Err(receipt_err) = emit_job_receipt(
-                        fac_root,
-                        spec,
-                        FacJobOutcome::Denied,
-                        Some(DenialReasonCode::ValidationFailed),
-                        &reason,
-                        Some(&boundary_trace),
-                        Some(&queue_trace),
-                        None,
-                        None,
-                        policy_hash,
-                    ) {
-                        eprintln!(
-                            "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
-                        );
-                    }
-                    return JobOutcome::Denied { reason };
-                },
-            };
-            match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
-                Ok(outcome) => {
-                    patch_digest = Some(outcome.patch_digest);
-                },
-                Err(e) => {
-                    let reason = format!("patch apply failed: {e}");
-                    let _ =
-                        move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
-                    if let Err(receipt_err) = emit_job_receipt(
-                        fac_root,
-                        spec,
-                        FacJobOutcome::Denied,
-                        Some(DenialReasonCode::ValidationFailed),
-                        &reason,
-                        Some(&boundary_trace),
-                        Some(&queue_trace),
-                        None,
-                        None,
-                        policy_hash,
-                    ) {
-                        eprintln!(
-                            "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
-                        );
-                    }
-                    return JobOutcome::Denied { reason };
-                },
-            }
-        } else {
-            let reason = "missing patch payload for patch_injection source kind".to_string();
+        let inline_patch_error =
+            "patch_injection requires inline patch bytes (CAS backend not yet implemented)";
+
+        let deny_with_reason = |reason: &str| -> JobOutcome {
             let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
-                &reason,
+                reason,
                 Some(&boundary_trace),
                 Some(&queue_trace),
                 None,
@@ -1163,8 +1114,43 @@ fn process_job(
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
-            return JobOutcome::Denied { reason };
+            JobOutcome::Denied {
+                reason: reason.to_string(),
+            }
+        };
+
+        let Some(patch_value) = &spec.source.patch else {
+            return deny_with_reason(inline_patch_error);
+        };
+        let Some(patch_obj) = patch_value.as_object() else {
+            return deny_with_reason(inline_patch_error);
+        };
+        let Some(bytes_b64) = patch_obj.get("bytes").and_then(|value| value.as_str()) else {
+            return deny_with_reason(inline_patch_error);
+        };
+        let patch_bytes = match STANDARD.decode(bytes_b64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return deny_with_reason(&format!("invalid base64 in patch.bytes: {err}"));
+            },
+        };
+
+        if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
+            let actual_digest = format!("b3-256:{}", blake3::hash(&patch_bytes).to_hex());
+            if expected_digest != actual_digest {
+                return deny_with_reason(&format!(
+                    "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
+                ));
+            }
         }
+
+        let patch_outcome = match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
+            Ok(patch_outcome) => patch_outcome,
+            Err(err) => {
+                return deny_with_reason(&format!("patch apply failed: {err}"));
+            },
+        };
+        patch_digest = Some(patch_outcome.patch_digest);
     } else if spec.source.kind != "mirror_commit" {
         let reason = format!("unsupported source kind: {}", spec.source.kind);
         let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);

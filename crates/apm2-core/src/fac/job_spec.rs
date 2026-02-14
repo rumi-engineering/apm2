@@ -164,6 +164,20 @@ pub enum JobSpecError {
         /// Field that is missing.
         field: &'static str,
     },
+
+    /// The source patch field is missing.
+    #[error("missing required patch field: {field}")]
+    MissingPatchField {
+        /// Field that is missing.
+        field: &'static str,
+    },
+
+    /// The patch descriptor is invalid or unsupported.
+    #[error("invalid patch descriptor: {reason}")]
+    InvalidPatchFormat {
+        /// Patch descriptor validation failure reason.
+        reason: String,
+    },
 }
 
 // Actuation block
@@ -322,6 +336,7 @@ impl FacJobSpecV1 {
     /// # Errors
     ///
     /// Returns `JobSpecError` for schema, field, and bound violations.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_structure(&self) -> Result<(), JobSpecError> {
         if self.schema != JOB_SPEC_SCHEMA_ID {
             return Err(JobSpecError::SchemaMismatch {
@@ -354,10 +369,50 @@ impl FacJobSpecV1 {
         }
         validate_repo_id(&self.source.repo_id)?;
         validate_head_sha(&self.source.head_sha)?;
-        if self.source.kind == "patch_injection" && self.source.patch.is_none() {
-            return Err(JobSpecError::EmptyField {
-                field: "source.patch (required for patch_injection)",
-            });
+        if self.source.kind == "patch_injection" {
+            let patch = self
+                .source
+                .patch
+                .as_ref()
+                .ok_or(JobSpecError::MissingPatchField {
+                    field: "source.patch",
+                })?;
+            let patch_obj = patch
+                .as_object()
+                .ok_or_else(|| JobSpecError::InvalidPatchFormat {
+                    reason: "patch must be a JSON object".to_string(),
+                })?;
+            if !patch_obj.contains_key("bytes") {
+                return Err(JobSpecError::InvalidPatchFormat {
+                    reason: "patch descriptor must contain 'bytes' field for inline patch data"
+                        .to_string(),
+                });
+            }
+            if patch_obj
+                .get("bytes")
+                .is_some_and(|bytes| !bytes.is_string())
+            {
+                return Err(JobSpecError::InvalidPatchFormat {
+                    reason: "patch bytes must be a string".to_string(),
+                });
+            }
+            if let Some(digest) = patch_obj.get("digest").and_then(|value| value.as_str()) {
+                if !digest.starts_with(B3_256_PREFIX) || digest.len() != 71 {
+                    return Err(JobSpecError::InvalidPatchFormat {
+                        reason: "patch digest must be b3-256:<64hex>".to_string(),
+                    });
+                }
+                if !digest
+                    .as_bytes()
+                    .iter()
+                    .skip(B3_256_PREFIX.len())
+                    .all(u8::is_ascii_hexdigit)
+                {
+                    return Err(JobSpecError::InvalidPatchFormat {
+                        reason: "patch digest must be b3-256:<64hex>".to_string(),
+                    });
+                }
+            }
         }
         if let Some(patch) = &self.source.patch {
             let patch_bytes =
@@ -722,6 +777,12 @@ fn validate_repo_id(repo_id: &str) -> Result<(), JobSpecError> {
             value: repo_id.to_string(),
         });
     }
+    if repo_id.contains(char::from(0)) {
+        return Err(JobSpecError::InvalidFormat {
+            field: "source.repo_id",
+            value: repo_id.to_string(),
+        });
+    }
     for segment in repo_id.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
             return Err(JobSpecError::InvalidFormat {
@@ -927,9 +988,27 @@ mod tests {
                 spec.source.kind = "patch_injection".to_string();
                 spec.validate_structure()
             },
-            Err(JobSpecError::EmptyField {
-                field: "source.patch (required for patch_injection)"
-            })
+            Err(JobSpecError::MissingPatchField { .. })
+        ));
+        assert!(matches!(
+            {
+                let mut spec = build_valid_spec();
+                spec.source.kind = "patch_injection".to_string();
+                spec.source.patch = Some(serde_json::json!("bad"));
+                spec.validate_structure()
+            },
+            Err(JobSpecError::InvalidPatchFormat { .. })
+        ));
+        assert!(matches!(
+            {
+                let mut spec = build_valid_spec();
+                spec.source.kind = "patch_injection".to_string();
+                spec.source.patch = Some(
+                    serde_json::json!({"bytes": 1, "digest":"b3-256:0000000000000000000000000000000000000000000000000000000000000000"}),
+                );
+                spec.validate_structure()
+            },
+            Err(JobSpecError::InvalidPatchFormat { .. })
         ));
     }
 
@@ -944,8 +1023,57 @@ mod tests {
 
         assert!(matches!(
             validate_job_spec(&spec),
-            Err(JobSpecError::EmptyField {
-                field: "source.patch (required for patch_injection)"
+            Err(JobSpecError::MissingPatchField {
+                field: "source.patch"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_inline_patch_without_bytes() {
+        let mut spec = build_with_ids("job-patch", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid base spec");
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({"format":"git_diff_v1"}));
+
+        assert!(matches!(
+            validate_job_spec(&spec),
+            Err(JobSpecError::InvalidPatchFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_patch_injection_rejects_invalid_digest_format() {
+        let mut spec = build_with_ids("job-patch", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid base spec");
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "bytes": "aGVsbG8=",
+            "digest": "invalid"
+        }));
+
+        assert!(matches!(
+            validate_job_spec(&spec),
+            Err(JobSpecError::InvalidPatchFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_source_repo_id_with_nul() {
+        let mut spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid base spec");
+        spec.source.repo_id = "org\u{0000}repo".to_string();
+        assert!(matches!(
+            validate_job_spec(&spec),
+            Err(JobSpecError::InvalidFormat {
+                field: "source.repo_id",
+                ..
             })
         ));
     }
