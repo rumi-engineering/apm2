@@ -81,10 +81,12 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::{
     BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
-    FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, persist_content_addressed_receipt,
+    FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, MAX_POLICY_SIZE,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, compute_policy_hash, deserialize_policy,
+    parse_policy_hash, persist_content_addressed_receipt, persist_policy,
 };
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use crate::exit_codes::codes as exit_codes;
 
@@ -293,6 +295,19 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         return exit_codes::GENERIC_ERROR;
     }
 
+    let (policy_hash, policy_digest) = match load_or_create_policy(&fac_root) {
+        Ok(policy) => policy,
+        Err(e) => {
+            output_worker_error(json_output, &format!("cannot load fac policy: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    if let Err(e) = broker.admit_policy_digest(policy_digest) {
+        output_worker_error(json_output, &format!("cannot admit fac policy digest: {e}"));
+        return exit_codes::GENERIC_ERROR;
+    }
+
     let verifying_key = broker.verifying_key();
 
     let mut total_processed: u64 = 0;
@@ -348,6 +363,8 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
                 &scheduler,
                 &mut broker,
                 &signer,
+                &policy_hash,
+                &policy_digest,
                 candidates.len(),
             );
 
@@ -573,6 +590,8 @@ fn process_job(
     scheduler: &QueueSchedulerState,
     broker: &mut FacBroker,
     signer: &Signer,
+    policy_hash: &str,
+    policy_digest: &[u8; 32],
     _candidates_count: usize,
 ) -> JobOutcome {
     let path = &candidate.path;
@@ -609,6 +628,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                policy_hash,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
@@ -633,6 +653,7 @@ fn process_job(
             None,
             None,
             None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -654,6 +675,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -661,8 +683,8 @@ fn process_job(
         },
     };
 
-    // Use broker tick for temporal checks to avoid wall-clock rollback.
-    let current_time_secs = broker.current_tick();
+    // Use monotonic wall-clock seconds for token temporal validation.
+    let current_time_secs = current_timestamp_epoch_secs();
 
     let boundary_check = match decode_channel_context_token(
         token,
@@ -684,12 +706,81 @@ fn process_job(
                 None,
                 None,
                 None,
+                policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
             return JobOutcome::Denied { reason };
         },
     };
+
+    let admitted_policy_root_digest = if let Some(binding) =
+        boundary_check.boundary_flow_policy_binding.as_ref()
+    {
+        if !bool::from(
+            binding
+                .policy_digest
+                .ct_eq(&binding.admitted_policy_root_digest),
+        ) {
+            let reason = "policy digest mismatch within channel boundary binding".to_string();
+            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ChannelBoundaryViolation),
+                &reason,
+                None,
+                None,
+                None,
+                policy_hash,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+
+            return JobOutcome::Denied { reason };
+        }
+
+        binding.admitted_policy_root_digest
+    } else {
+        let reason = "missing boundary-flow policy binding".to_string();
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            &reason,
+            None,
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    };
+
+    if !broker.is_policy_digest_admitted(&admitted_policy_root_digest)
+        || !bool::from(admitted_policy_root_digest.ct_eq(policy_digest))
+    {
+        let reason = "policy digest mismatch with admitted fac policy".to_string();
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            &reason,
+            None,
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
 
     // Validate boundary check defects.
     let defects = validate_channel_boundary(&boundary_check);
@@ -713,6 +804,7 @@ fn process_job(
             Some(&boundary_trace),
             None,
             None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -738,6 +830,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&admission_trace),
             None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -817,6 +910,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -836,6 +930,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -855,6 +950,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -961,6 +1057,7 @@ fn process_job(
         Some(&boundary_trace),
         Some(&queue_trace),
         None,
+        policy_hash,
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
         if let Err(move_err) =
@@ -1238,6 +1335,28 @@ fn emit_scan_receipt(
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
 }
 
+fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32]), String> {
+    let policy_dir = fac_root.join("policy");
+    let policy_path = policy_dir.join("fac_policy.v1.json");
+
+    let policy = if policy_path.exists() {
+        let bytes = read_bounded(&policy_path, MAX_POLICY_SIZE)?;
+        deserialize_policy(&bytes).map_err(|e| format!("cannot load fac policy: {e}"))?
+    } else {
+        let default_policy = apm2_core::fac::FacPolicyV1::default_policy();
+        persist_policy(fac_root, &default_policy)
+            .map_err(|e| format!("cannot persist default fac policy: {e}"))?;
+        default_policy
+    };
+
+    let policy_hash =
+        compute_policy_hash(&policy).map_err(|e| format!("cannot compute policy hash: {e}"))?;
+    let policy_digest =
+        parse_policy_hash(&policy_hash).ok_or_else(|| "invalid policy hash".to_string())?;
+
+    Ok((policy_hash, policy_digest))
+}
+
 /// Emit a unified `FacJobReceiptV1` and persist under
 /// `$APM2_HOME/private/fac/receipts`.
 #[allow(clippy::too_many_arguments)]
@@ -1250,12 +1369,14 @@ fn emit_job_receipt(
     rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
     eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
     eio29_budget_admission: Option<&BudgetAdmissionTrace>,
+    policy_hash: &str,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
         &spec.job_id,
         &spec.job_spec_digest,
     )
+    .policy_hash(policy_hash)
     .outcome(outcome)
     .reason(reason)
     .timestamp_secs(current_timestamp_epoch_secs());

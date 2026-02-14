@@ -91,6 +91,7 @@ pub mod lane;
 mod lease;
 pub mod merge_receipt;
 mod node_identity;
+pub mod policy;
 pub mod policy_inheritance;
 mod policy_resolution;
 pub mod projection;
@@ -248,6 +249,10 @@ pub use lease::{
 pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
+};
+pub use policy::{
+    EnvSetEntry, FacPolicyError, FacPolicyV1, POLICY_SCHEMA_ID, compute_policy_hash,
+    deserialize_policy, parse_policy_hash, persist_policy,
 };
 // Re-export policy inheritance types (TCK-00340)
 pub use policy_inheritance::{
