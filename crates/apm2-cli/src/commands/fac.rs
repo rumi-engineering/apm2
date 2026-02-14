@@ -2661,7 +2661,23 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     }
 
-    // Get current lane status
+    // Acquire exclusive lock for the lane BEFORE any status reads or
+    // mutations. The lock is held across the entire reset operation
+    // (status check + force-kill + deletion + lease cleanup) to prevent
+    // concurrent writers from racing the reset.
+    let _lock_guard = match manager.acquire_lock(&args.lane_id) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to acquire lock for lane {}: {e}", args.lane_id),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Get current lane status (under lock)
     let status = match manager.lane_status(&args.lane_id) {
         Ok(s) => s,
         Err(e) => {
@@ -2688,7 +2704,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     }
 
-    // With --force on a RUNNING lane, attempt to kill the process
+    // With --force on a RUNNING lane, attempt to kill the process (under lock)
     if status.state == LaneState::Running && args.force {
         if let Some(pid) = status.pid {
             if !json_output {
@@ -2698,7 +2714,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         }
     }
 
-    // Perform safe deletion of workspace, target, and logs
+    // Perform safe deletion of workspace, target, and logs (under lock)
     let lane_dir = manager.lane_dir(&args.lane_id);
     let Some(lanes_root) = lane_dir.parent() else {
         return output_error(
@@ -2754,7 +2770,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         }
     }
 
-    // If any deletions were refused, mark lane as CORRUPT
+    // If any deletions were refused, mark lane as CORRUPT (under lock)
     if !refused_receipts.is_empty() {
         let corrupt_reason = refused_receipts
             .iter()
@@ -2791,7 +2807,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         return exit_codes::GENERIC_ERROR;
     }
 
-    // Remove the lease file to transition lane to IDLE
+    // Remove the lease file to transition lane to IDLE (under lock)
     let lane_dir_owned = manager.lane_dir(&args.lane_id);
     if let Err(e) = LaneLeaseV1::remove(&lane_dir_owned) {
         return output_error(
@@ -2802,12 +2818,18 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     }
 
-    // Re-create the empty subdirectories so the lane is ready for reuse
+    // Re-create the empty subdirectories for the reset lane so it is
+    // ready for reuse. This calls ensure_directories() which re-inits
+    // all lanes, not just the reset lane. This is acceptable because
+    // ensure_directories is idempotent (mkdir -p semantics) and only
+    // creates directories that don't already exist.
     if let Err(e) = manager.ensure_directories() {
         if !json_output {
             eprintln!("Warning: failed to re-create lane directories: {e}");
         }
     }
+
+    // Lock is released here when _lock_guard drops.
 
     if json_output {
         let response = serde_json::json!({
@@ -2839,8 +2861,15 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
 fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, json_output: bool) {
     let lane_dir = manager.lane_dir(lane_id);
     // Truncate reason to avoid exceeding string length limits.
+    // Use char_indices to find a safe UTF-8 boundary instead of byte
+    // slicing, which would panic on multi-byte characters.
     let truncated_reason = if reason.len() > 200 {
-        format!("{}...", &reason[..197])
+        let truncated: String = reason
+            .char_indices()
+            .take_while(|&(i, _)| i < 197)
+            .map(|(_, c)| c)
+            .collect();
+        format!("{truncated}...")
     } else {
         reason.to_string()
     };
@@ -2873,42 +2902,47 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, jso
 ///
 /// Sends SIGTERM, waits briefly, then sends SIGKILL if the process is
 /// still alive. This is best-effort; failures are logged but not fatal.
+///
+/// # Blocking Wait (intentional)
+///
+/// This function blocks the calling thread for up to ~5.2 seconds while
+/// waiting for the process to exit after SIGTERM. This is acceptable because
+/// `kill_process_best_effort` is called exclusively from the `apm2 fac lane
+/// reset --force` CLI command, which is an interactive operator action that
+/// expects synchronous completion before proceeding with directory deletion.
+/// The blocking wait ensures the process has actually exited before we
+/// attempt to delete its workspace.
 fn kill_process_best_effort(pid: u32) {
     #[cfg(unix)]
     {
+        use nix::sys::signal::{self, Signal};
+        use nix::unistd::Pid;
+
         let Ok(pid_i32) = i32::try_from(pid) else {
             return;
         };
+        let nix_pid = Pid::from_raw(pid_i32);
 
-        // Send SIGTERM first (graceful)
-        // SAFETY: kill() is a standard POSIX syscall. We validated `pid_i32`
-        // is representable. SIGTERM is a safe signal to send.
-        #[allow(unsafe_code)]
-        let term_result = unsafe { libc::kill(pid_i32, libc::SIGTERM) };
-
-        if term_result != 0 {
-            // Process may already be dead -- that's fine
+        // Send SIGTERM first (graceful shutdown request).
+        if signal::kill(nix_pid, Signal::SIGTERM).is_err() {
+            // Process may already be dead -- that's fine.
             return;
         }
 
-        // Wait briefly for graceful shutdown (up to 5 seconds)
+        // Wait for graceful shutdown (up to 5 seconds, polling every 100ms).
+        // See doc comment above for why this blocking wait is intentional.
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            // Check if process is still alive
-            // SAFETY: kill(pid, 0) checks existence without signaling.
-            #[allow(unsafe_code)]
-            let alive = unsafe { libc::kill(pid_i32, 0) };
-            if alive != 0 {
+            // kill(pid, None) checks existence without sending a signal.
+            if signal::kill(nix_pid, None).is_err() {
                 return; // Process exited
             }
         }
 
-        // Process still alive after 5s -- send SIGKILL
-        // SAFETY: kill() with SIGKILL is a standard POSIX call.
-        #[allow(unsafe_code)]
-        let _ = unsafe { libc::kill(pid_i32, libc::SIGKILL) };
+        // Process still alive after 5s -- send SIGKILL (uncatchable).
+        let _ = signal::kill(nix_pid, Signal::SIGKILL);
 
-        // Brief wait for SIGKILL to take effect
+        // Brief wait for SIGKILL to take effect.
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 

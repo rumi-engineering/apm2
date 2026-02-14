@@ -289,26 +289,41 @@ deletion primitive for lane cleanup and reset operations.
   component-wise boundary enforcement, symlink detection at every depth,
   filesystem boundary checks (`st_dev`), parent ownership validation
   (uid + mode 0o700), and depth-bounded bottom-up deletion.
-- On Unix, uses fd-relative directory traversal via `nix::dir::Dir::open()`
-  with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC`, `openat`/`unlinkat`/`fstatat`
-  for TOCTOU-safe recursive deletion. No `std::fs::read_dir` is used in the
-  recursive delete path.
+- On Unix, uses fully fd-relative directory traversal. The ONLY place a full
+  path is opened is the initial `Dir::open(root, O_NOFOLLOW | O_DIRECTORY |
+  O_CLOEXEC)` in `safe_rmtree_v1` itself. All recursive operations use:
+  - `Dir::openat(parent_fd, name, O_NOFOLLOW | O_DIRECTORY)` for child dirs
+  - `unlinkat(parent_fd, name, NoRemoveDir)` for file deletion
+  - `unlinkat(parent_fd, name, RemoveDir)` for directory deletion
+  - `fstatat(parent_fd, name, AT_SYMLINK_NOFOLLOW)` for type classification
+  No `std::fs::read_dir`, `std::fs::remove_dir`, `std::fs::remove_file`, or
+  path-based `Dir::open` is used in the recursive delete path.
+- `fd_relative_recursive_delete(parent_dir, parent_path, stats, depth,
+  root_dev)`: Takes an already-open `&nix::dir::Dir` fd. The `parent_path`
+  argument is used ONLY for error messages, never for opens or deletes.
 - `reject_dot_segments()`: Rejects (not filters) any path containing `.` or
   `..` components. On Unix, also checks raw path bytes for `/./` and trailing
   `/.` patterns that `Path::components()` silently normalizes away.
-- `open_dir_nofollow()`: Opens a directory with `O_NOFOLLOW`, mapping
-  `ELOOP`/`ENOTDIR` to `SymlinkDetected` for TOCTOU-safe symlink swap
-  detection.
+- `open_dir_nofollow()`: Opens a directory by full path with `O_NOFOLLOW`,
+  mapping `ELOOP`/`ENOTDIR` to `SymlinkDetected`. Used ONLY for the initial
+  root open; all recursive operations use `Dir::openat`.
+- `remove_root_dir_via_parent()` / `remove_root_file_via_parent()`: Remove
+  the root entry by opening its parent dir and using `unlinkat`, avoiding
+  `std::fs::remove_dir`/`std::fs::remove_file` on the full path.
 - `verify_same_dev_via_fd()`: Compares `st_dev` via `fstat` on the fd (not
-  the path) to avoid TOCTOU in filesystem boundary checks.
-- `scan_dir_entries()`: Bounded directory entry collection from an open `Dir`
-  handle, collecting `d_type` hints with deferred `fstatat` resolution.
+  the path) against the root device ID to avoid TOCTOU in filesystem boundary
+  checks.
+- `scan_dir_entries_from_fd()`: Bounded directory entry collection from a
+  dup'd `Dir` fd, collecting `d_type` hints with deferred `fstatat`
+  resolution.
 - `classify_dirent_type()`: Classifies `nix::dir::Type` into `EntryKind`,
   returning errors for symlinks and unexpected file types.
 - `resolve_entry_types()`: Resolves unknown entry types via
-  `fstatat(AT_SYMLINK_NOFOLLOW)` after the directory iterator is dropped.
+  `fstatat(AT_SYMLINK_NOFOLLOW)` relative to the parent dir fd.
 - Used by `apm2 fac lane reset` CLI command to safely delete workspace,
-  target, and logs subdirectories. On safety violations, the CLI persists a
+  target, and logs subdirectories. The lane reset command acquires an
+  exclusive lane lock before any status reads or mutations, holding it across
+  the entire operation. On safety violations, the CLI persists a
   `LaneLeaseV1` with `state: Corrupt` to the lane directory for durable
   corruption marking.
 
