@@ -2487,17 +2487,47 @@ mod tests {
         let canonical = envelope_signature_canonical_bytes(&envelope);
         assert!(verifier.verify_broker_signature(&canonical, &sig.signer_id, &sig.signature,));
 
-        // 5. Check horizons are non-zero and resolved
+        // 5. Add a convergence receipt and check refs are replay-stable.
+        broker
+            .add_convergence_receipt([0x11; 32], [0x22; 32])
+            .expect("convergence receipt should be added");
+
+        // 6. Check horizons are non-zero, resolved, and stable across re-read.
         let fh = broker.freshness_horizon();
+        assert_eq!(fh, broker.freshness_horizon());
         assert!(fh.resolved);
         assert_ne!(fh.horizon_hash, [0u8; 32]);
 
         let rf = broker.revocation_frontier();
+        assert_eq!(rf, broker.revocation_frontier());
         assert!(rf.current);
         assert_ne!(rf.frontier_hash, [0u8; 32]);
 
         let ch = broker.convergence_horizon();
+        assert_eq!(ch, broker.convergence_horizon());
         assert!(ch.resolved);
         assert_ne!(ch.horizon_hash, [0u8; 32]);
+
+        // 7. Persist/restore state and confirm replay-stable hashes/receipts.
+        let bytes = broker
+            .serialize_state()
+            .expect("broker state should serialize for replay stability check");
+        let restored_state =
+            FacBroker::deserialize_state(&bytes).expect("restored state should deserialize");
+        let restored = FacBroker::from_signer_and_state(Signer::generate(), restored_state)
+            .expect("restored broker should construct");
+
+        assert_eq!(restored.freshness_horizon().horizon_hash, fh.horizon_hash);
+        assert_eq!(
+            restored.revocation_frontier().frontier_hash,
+            rf.frontier_hash
+        );
+        assert_eq!(restored.convergence_horizon().horizon_hash, ch.horizon_hash);
+        assert_eq!(restored.convergence_receipts().len(), 1);
+        assert_eq!(
+            restored.convergence_receipts()[0].authority_set_hash,
+            [0x11; 32]
+        );
+        assert_eq!(restored.convergence_receipts()[0].proof_hash, [0x22; 32]);
     }
 }

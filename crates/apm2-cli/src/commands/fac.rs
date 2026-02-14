@@ -69,8 +69,9 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
+pub use crate::commands::fac_broker::{BrokerArgs, BrokerSubcommand};
 use crate::commands::role_launch::{self, RoleLaunchArgs};
-use crate::commands::{fac_gc, fac_pr, fac_review};
+use crate::commands::{fac_broker, fac_gc, fac_pr, fac_review};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -242,6 +243,8 @@ pub enum FacSubcommand {
     /// Provides `auth-setup` for bootstrapping credentials and
     /// `auth-check` for verifying they are accessible.
     Pr(fac_pr::PrArgs),
+    /// Inspect FAC broker state and health.
+    Broker(BrokerArgs),
     /// Garbage collect stale FAC artifacts under `~/.apm2/private/fac`.
     Gc(fac_gc::GcArgs),
 }
@@ -1512,6 +1515,7 @@ pub fn run_fac(
             | FacSubcommand::Worker(_)
             | FacSubcommand::Canonicalizer(_)
             | FacSubcommand::Info(_)
+            | FacSubcommand::Broker(_)
             | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
     ) {
@@ -1850,6 +1854,7 @@ pub fn run_fac(
             }
         },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
+        FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
     }
 }
@@ -1972,6 +1977,9 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         FacSubcommand::Canonicalizer(args) => match &args.subcommand {
             CanonicalizerSubcommand::Info(info_args) => info_args.json,
             CanonicalizerSubcommand::Admit(admit_args) => admit_args.json,
+        },
+        FacSubcommand::Broker(args) => match &args.subcommand {
+            BrokerSubcommand::Status(status_args) => status_args.json,
         },
         FacSubcommand::Gates(_)
         | FacSubcommand::Work(_)
@@ -4410,6 +4418,34 @@ mod tests {
                 },
             },
             other => panic!("expected canonicalizer subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_broker_status_subcommand_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "broker", "status"])
+            .expect("broker status should parse");
+        match parsed.subcommand {
+            FacSubcommand::Broker(args) => match args.subcommand {
+                BrokerSubcommand::Status(status_args) => {
+                    assert!(!status_args.json);
+                },
+            },
+            other => panic!("expected broker subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_broker_status_global_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "broker", "status"])
+            .expect("global json flag should be accepted for broker status");
+
+        assert!(parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Broker(args) => match args.subcommand {
+                BrokerSubcommand::Status(_) => {},
+            },
+            other => panic!("expected broker subcommand, got {other:?}"),
         }
     }
 

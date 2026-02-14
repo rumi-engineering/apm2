@@ -47,6 +47,7 @@ pub mod event;
 pub mod evidence;
 pub mod export;
 pub mod fac;
+pub mod fac_broker;
 pub mod fac_gc;
 pub mod fac_permissions;
 pub mod fac_pr;
