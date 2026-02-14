@@ -50,6 +50,7 @@ pub mod fac;
 pub mod fac_permissions;
 pub mod fac_pr;
 pub mod fac_review;
+pub mod fac_worker;
 pub mod factory;
 pub mod pack;
 pub mod process;
