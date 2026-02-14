@@ -20,7 +20,6 @@ pub fn resolve_pr_target(repo: &str, pr_number: Option<u32>) -> Result<(String, 
         ));
     };
 
-    let _ = persist_identity_hint(&resolved.0, resolved.1);
     Ok(resolved)
 }
 
@@ -92,11 +91,6 @@ pub(super) fn current_head_sha() -> Result<String, String> {
         .to_ascii_lowercase();
     validate_expected_head_sha(&sha)?;
     Ok(sha)
-}
-
-fn persist_identity_hint(owner_repo: &str, pr_number: u32) -> Result<(), String> {
-    let head_sha = current_head_sha()?;
-    projection_store::save_identity_with_context(owner_repo, pr_number, &head_sha, "target")
 }
 
 #[cfg(test)]
