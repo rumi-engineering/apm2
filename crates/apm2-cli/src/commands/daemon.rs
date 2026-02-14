@@ -9,11 +9,134 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use apm2_core::config::default_data_dir;
+use apm2_core::github::resolve_apm2_home;
 use tracing::info;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::commands::fac_permissions::{ensure_dir_exists_standard, ensure_dir_with_mode};
+
+const FAC_RUNTIME_SUBDIRS: [&str; 13] = [
+    "private",
+    "private/creds",
+    "private/fac/lanes",
+    "private/fac/locks",
+    "private/fac/receipts",
+    "private/fac/policy",
+    "private/fac/queue",
+    "private/fac/queue/pending",
+    "private/fac/queue/claimed",
+    "private/fac/queue/completed",
+    "private/fac/queue/denied",
+    "private/fac/queue/quarantined",
+    "private/fac/queue/authority_consumed",
+];
+
+const USER_SYSTEMD_DIR: &str = ".config/systemd/user";
+
+const DAEMON_SERVICE: &str = "\
+[Unit]\n\
+Description=APM2 Daemon — Forge Admission Cycle broker\n\
+Documentation=https://github.com/guardian-intelligence/apm2\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+Requires=apm2-daemon.socket\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/local/bin/apm2 daemon --no-daemon\n\
+ExecStop=/usr/local/bin/apm2 kill\n\
+Restart=always\n\
+RestartSec=5\n\
+WatchdogSec=300\n\
+WorkingDirectory=%h\n\
+Environment=APM2_HOME=%h/.apm2\n\
+Environment=RUST_LOG=info\n\
+Environment=XDG_RUNTIME_DIR=%t\n\
+LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
+Sockets=apm2-daemon.socket\n\
+ProtectSystem=strict\n\
+ProtectHome=read-only\n\
+ReadWritePaths=%h/.apm2\n\
+NoNewPrivileges=yes\n\
+PrivateTmp=yes\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n\
+";
+
+const WORKER_SERVICE: &str = "\
+[Unit]\n\
+Description=APM2 FAC Worker\n\
+Documentation=https://github.com/guardian-intelligence/apm2\n\
+After=network-online.target apm2-daemon.service\n\
+Wants=apm2-daemon.service\n\
+Requires=apm2-daemon.service\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/local/bin/apm2 fac worker --poll-interval 10\n\
+Restart=always\n\
+RestartSec=5\n\
+WatchdogSec=300\n\
+WorkingDirectory=%h\n\
+Environment=APM2_HOME=%h/.apm2\n\
+Environment=RUST_LOG=info\n\
+LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
+ProtectSystem=strict\n\
+ProtectHome=read-only\n\
+ReadWritePaths=%h/.apm2\n\
+NoNewPrivileges=yes\n\
+PrivateTmp=yes\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n\
+";
+
+const WORKER_TEMPLATE_SERVICE: &str = "\
+[Unit]\n\
+Description=APM2 FAC Worker (%i)\n\
+Documentation=https://github.com/guardian-intelligence/apm2\n\
+After=network-online.target apm2-daemon.service\n\
+Wants=apm2-daemon.service\n\
+Requires=apm2-daemon.service\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/local/bin/apm2 fac worker --poll-interval 10\n\
+Restart=always\n\
+RestartSec=5\n\
+WatchdogSec=300\n\
+WorkingDirectory=%h\n\
+Environment=APM2_HOME=%h/.apm2\n\
+Environment=RUST_LOG=info\n\
+LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
+ProtectSystem=strict\n\
+ProtectHome=read-only\n\
+ReadWritePaths=%h/.apm2\n\
+NoNewPrivileges=yes\n\
+PrivateTmp=yes\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n\
+";
+
+const DAEMON_SOCKET: &str = "\
+[Unit]\n\
+Description=APM2 Daemon Operator Socket\n\
+Documentation=https://github.com/guardian-intelligence/apm2\n\
+\n\
+[Socket]\n\
+ListenStream=%t/apm2/operator.sock\n\
+SocketMode=0600\n\
+RemoveOnStop=yes\n\
+Service=apm2-daemon.service\n\
+RuntimeDirectory=apm2\n\
+\n\
+[Install]\n\
+WantedBy=sockets.target\n\
+";
 
 /// Start the daemon.
 pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
@@ -43,71 +166,42 @@ pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
 
 /// Install the systemd user service for apm2-daemon.
 pub fn install() -> Result<()> {
-    let exe_path = std::env::current_exe()
-        .context("failed to determine current executable path")?
-        .canonicalize()
-        .context("failed to canonicalize current executable path")?;
-    let exe_str = exe_path.display().to_string();
-
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
-    let unit_path = std::path::Path::new(&home)
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join("apm2-daemon.service");
+    let systemd_user_dir = Path::new(&home).join(USER_SYSTEMD_DIR);
+    ensure_dir_exists_standard(&systemd_user_dir)
+        .context("failed to create user systemd unit directory")?;
 
-    if let Some(parent) = unit_path.parent() {
-        crate::commands::fac_permissions::ensure_dir_exists_standard(parent)
-            .context("failed to create systemd unit directory")?;
+    let apm2_home = resolve_apm2_home().ok_or_else(|| {
+        anyhow!("cannot resolve APM2_HOME; set APM2_HOME or HOME to a valid directory")
+    })?;
+    ensure_fac_runtime_dirs(&apm2_home)?;
+
+    let unit_files = [
+        ("apm2-daemon.service", DAEMON_SERVICE),
+        ("apm2-worker.service", WORKER_SERVICE),
+        ("apm2-worker@.service", WORKER_TEMPLATE_SERVICE),
+        ("apm2-daemon.socket", DAEMON_SOCKET),
+    ];
+    for (filename, content) in unit_files {
+        let unit_path = systemd_user_dir.join(filename);
+        std::fs::write(&unit_path, content).with_context(|| {
+            format!(
+                "failed to write user systemd unit file {}",
+                unit_path.display()
+            )
+        })?;
     }
 
-    let unit_content = format!(
-        "\
-[Unit]
-Description=APM2 Daemon — Forge Admission Cycle runtime
-Documentation=https://github.com/guardian-intelligence/apm2
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-ExecStart={exe_str} daemon
-ExecStop={exe_str} kill
-PIDFile=%t/apm2/apm2.pid
-Restart=always
-RestartSec=5
-WatchdogSec=300
-# Environment passthrough — GITHUB_TOKEN must be set in user session
-# Do NOT put secrets in unit files. Use EnvironmentFile if needed.
-# EnvironmentFile=-%h/.config/apm2/env
-#
-# IMPORTANT: For projection to work under systemd, configure
-# [daemon.projection] with github_owner and github_repo in ecosystem.toml.
-# The daemon does NOT auto-detect from git remote (TCK-00595 MAJOR-1).
-Environment=RUST_LOG=info
-
-[Install]
-WantedBy=default.target
-"
-    );
-
-    std::fs::write(&unit_path, &unit_content).context("failed to write systemd unit file")?;
-
-    let daemon_reload_status = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .context("failed to run `systemctl --user daemon-reload`")?;
-    if !daemon_reload_status.success() {
-        bail!("`systemctl --user daemon-reload` failed with status: {daemon_reload_status}");
+    run_user_systemctl(&["daemon-reload"])?;
+    for unit in [
+        "apm2-daemon.service",
+        "apm2-daemon.socket",
+        "apm2-worker.service",
+    ] {
+        run_user_systemctl(&["enable", unit])?;
     }
-
-    let enable_status = Command::new("systemctl")
-        .args(["--user", "enable", "apm2-daemon.service"])
-        .status()
-        .context("failed to run `systemctl --user enable apm2-daemon.service`")?;
-    if !enable_status.success() {
-        bail!("`systemctl --user enable apm2-daemon.service` failed with status: {enable_status}");
-    }
+    run_user_systemctl(&["start", "apm2-daemon.socket"])?;
+    run_user_systemctl(&["start", "apm2-daemon.service"])?;
 
     if let Ok(user) = std::env::var("USER") {
         match Command::new("loginctl")
@@ -126,22 +220,51 @@ WantedBy=default.target
         }
     }
 
-    let start_status = Command::new("systemctl")
-        .args(["--user", "start", "apm2-daemon.service"])
-        .status()
-        .context("failed to run `systemctl --user start apm2-daemon.service`")?;
-    if !start_status.success() {
-        bail!("`systemctl --user start apm2-daemon.service` failed with status: {start_status}");
-    }
-
-    println!("Installed apm2 daemon service at {}", unit_path.display());
-    println!("Hint: ensure GITHUB_TOKEN is set in your user session.");
     println!(
-        "Hint: for projection, configure [daemon.projection] in ecosystem.toml \
-         with github_owner and github_repo. The daemon does not auto-detect \
-         from git remote when running under systemd."
+        "Installed FAC systemd units under {}",
+        systemd_user_dir.display()
+    );
+    println!(
+        "Configured runtime directories under {}/private/fac",
+        apm2_home.display()
+    );
+    println!(
+        "Configured credential source at {}/private/creds/gh-token",
+        apm2_home.display()
+    );
+    println!(
+        "Run `systemctl --user status apm2-daemon.service apm2-worker.service` to verify service health."
     );
 
+    Ok(())
+}
+
+fn ensure_fac_runtime_dirs(apm2_home: &Path) -> Result<()> {
+    for rel in FAC_RUNTIME_SUBDIRS {
+        let path = apm2_home.join(rel);
+        ensure_dir_with_mode(&path).with_context(|| {
+            format!(
+                "failed to create or validate FAC runtime directory {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn run_user_systemctl(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .context("failed to run `systemctl --user`")?;
+    if !status.success() {
+        bail!(
+            "`systemctl --user {}` failed with status {}",
+            args.join(" "),
+            status
+        );
+    }
     Ok(())
 }
 

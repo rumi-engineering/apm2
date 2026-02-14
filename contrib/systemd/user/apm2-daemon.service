@@ -15,6 +15,7 @@ WatchdogSec=300
 WorkingDirectory=%h
 Environment=APM2_HOME=%h/.apm2
 Environment=RUST_LOG=info
+Environment=XDG_RUNTIME_DIR=%t
 LoadCredential=gh-token:%h/.apm2/private/creds/gh-token
 Sockets=apm2-daemon.socket
 ProtectSystem=strict
@@ -24,4 +25,4 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
