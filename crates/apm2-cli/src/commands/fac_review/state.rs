@@ -1636,8 +1636,7 @@ mod tests {
     }
 
     fn dead_pid_for_test() -> u32 {
-        let mut child = std::process::Command::new("sh")
-            .args(["-lc", "exit 0"])
+        let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn short-lived child");
         let pid = child.id();

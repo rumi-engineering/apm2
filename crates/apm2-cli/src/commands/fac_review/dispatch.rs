@@ -358,10 +358,16 @@ fn terminate_pending_dispatch_entry(entry: &PendingDispatchEntry) -> Result<(), 
 // ── Tool availability ───────────────────────────────────────────────────────
 
 fn command_available(command: &str) -> bool {
-    Command::new("sh")
-        .args(["-lc", &format!("command -v {command} >/dev/null 2>&1")])
+    // Probe for the binary by attempting to run it with `--version`.
+    // If the OS cannot locate the executable, the error kind is NotFound.
+    // This avoids passing untrusted strings through `sh -lc`.
+    Command::new(command)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok()
 }
 
 fn strip_deleted_executable_suffix(path: &Path) -> Option<PathBuf> {
@@ -1305,8 +1311,7 @@ mod tests {
     }
 
     fn dead_pid_for_test() -> u32 {
-        let mut child = std::process::Command::new("sh")
-            .args(["-lc", "exit 0"])
+        let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn short-lived child");
         let pid = child.id();
@@ -1363,8 +1368,12 @@ mod tests {
     }
 
     fn spawn_long_lived_pid() -> u32 {
+        // Spawn a background sleep process via sh -c so that the sleep
+        // is reparented to init and will not become a zombie when killed.
+        // This is a test-only helper with fully hardcoded arguments—no
+        // user-controlled data is passed through the shell.
         let output = std::process::Command::new("sh")
-            .args(["-lc", "sleep 120 >/dev/null 2>&1 & echo $!"])
+            .args(["-c", "sleep 120 >/dev/null 2>&1 & echo $!"])
             .output()
             .expect("spawn long-lived pid");
         assert!(

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use super::backend::{
-    build_prompt_content, build_resume_script_command_for_backend,
-    build_script_command_for_backend, build_sha_update_message,
+    build_prompt_content, build_resume_spawn_command_for_backend, build_sha_update_message,
+    build_spawn_command_for_backend,
 };
 use super::barrier::fetch_pr_head_sha_local;
 use super::decision::resolve_completion_signal_from_projection_for_home;
@@ -778,15 +778,15 @@ fn run_single_review(
                 .map_err(|err| format!("failed to write prompt file: {err}"))?;
         }
 
-        let command = match &spawn_mode {
-            SpawnMode::Initial => build_script_command_for_backend(
+        let spawn_cmd = match &spawn_mode {
+            SpawnMode::Initial => build_spawn_command_for_backend(
                 current_model.backend,
                 &prompt_path,
                 &log_path,
                 &current_model.model,
                 Some(&last_message_path),
-            ),
-            SpawnMode::Resume { message } => build_resume_script_command_for_backend(
+            )?,
+            SpawnMode::Resume { message } => build_resume_spawn_command_for_backend(
                 current_model.backend,
                 &log_path,
                 &current_model.model,
@@ -809,7 +809,7 @@ fn run_single_review(
                 return Err(err);
             },
         };
-        let mut child = match Command::new("sh").args(["-lc", &command]).spawn() {
+        let mut child = match spawn_cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 persist_review_run_state(

@@ -598,6 +598,12 @@ pub fn allocate_local_comment_id(pr_number: u32, max_existing_comment_id: Option
         .saturating_add(1)
 }
 
+/// Wrap a value in single quotes for shell interpolation.
+///
+/// **Deprecated**: prefer structured `SpawnCommand` argv to avoid shell parsing
+/// entirely. This function is retained only for any remaining shell-based
+/// callers outside the review orchestrator.
+#[allow(dead_code)]
 pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

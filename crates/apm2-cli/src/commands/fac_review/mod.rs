@@ -1584,7 +1584,7 @@ mod tests {
 
     use chrono::Utc;
 
-    use super::backend::{build_gemini_script_command, build_script_command_for_backend};
+    use super::backend::build_spawn_command_for_backend;
     use super::barrier::{
         build_barrier_decision_event, is_allowed_author_association, read_event_payload_bounded,
     };
@@ -1656,8 +1656,7 @@ mod tests {
     }
 
     fn dead_pid_for_test() -> u32 {
-        let mut child = std::process::Command::new("sh")
-            .args(["-lc", "exit 0"])
+        let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn short-lived child");
         let pid = child.id();
@@ -1865,53 +1864,64 @@ mod tests {
     }
 
     #[test]
-    fn test_build_gemini_script_command_syntax() {
-        let prompt = std::path::Path::new("/tmp/prompt.md");
-        let log = std::path::Path::new("/tmp/review.log");
-        let cmd = build_gemini_script_command(prompt, log, "gemini-3-flash-preview");
-        assert!(cmd.contains("script -q"));
-        assert!(cmd.contains("gemini -m"));
-        assert!(cmd.contains("-o stream-json"));
-    }
-
-    #[test]
-    fn test_build_script_command_for_backend_dispatch() {
+    fn test_build_spawn_command_for_backend_codex() {
         let prompt = std::path::Path::new("/tmp/prompt.md");
         let log = std::path::Path::new("/tmp/review.log");
         let capture = std::path::Path::new("/tmp/capture.md");
 
-        let codex = build_script_command_for_backend(
+        let codex = build_spawn_command_for_backend(
             ReviewBackend::Codex,
             prompt,
             log,
             "gpt-5.3-codex",
             Some(capture),
-        );
-        assert!(codex.contains("codex exec"));
-        assert!(codex.contains("--json"));
-        assert!(codex.contains("--output-last-message"));
+        )
+        .expect("build codex command");
+        assert_eq!(codex.program, "codex");
+        assert!(codex.args.contains(&"exec".to_string()));
+        assert!(codex.args.contains(&"--json".to_string()));
+        assert!(codex.args.contains(&"--output-last-message".to_string()));
+        assert_eq!(codex.stdin_file, Some(prompt.to_path_buf()));
+    }
 
-        let gemini = build_script_command_for_backend(
+    #[test]
+    fn test_build_spawn_command_for_backend_gemini() {
+        let temp = tempfile::NamedTempFile::new().expect("tempfile");
+        let prompt = temp.path();
+        std::fs::write(prompt, "test prompt").expect("write prompt");
+        let log = std::path::Path::new("/tmp/review.log");
+
+        let gemini = build_spawn_command_for_backend(
             ReviewBackend::Gemini,
             prompt,
             log,
             "gemini-3-flash-preview",
             None,
-        );
-        assert!(gemini.contains("gemini -m"));
-        assert!(gemini.contains("stream-json"));
+        )
+        .expect("build gemini command");
+        assert_eq!(gemini.program, "gemini");
+        assert!(gemini.args.contains(&"-m".to_string()));
+        assert!(gemini.args.contains(&"stream-json".to_string()));
+    }
 
-        let claude = build_script_command_for_backend(
+    #[test]
+    fn test_build_spawn_command_for_backend_claude() {
+        let prompt = std::path::Path::new("/tmp/prompt.md");
+        let log = std::path::Path::new("/tmp/review.log");
+
+        let claude = build_spawn_command_for_backend(
             ReviewBackend::ClaudeCode,
             prompt,
             log,
             "claude-3-7-sonnet",
             None,
-        );
-        assert!(claude.contains("claude"));
-        assert!(claude.contains("--output-format json"));
-        assert!(claude.contains("--permission-mode plan"));
-        assert!(!claude.contains("-p \"$(cat"));
+        )
+        .expect("build claude command");
+        assert_eq!(claude.program, "claude");
+        assert!(claude.args.contains(&"--output-format".to_string()));
+        assert!(claude.args.contains(&"json".to_string()));
+        assert!(claude.args.contains(&"--permission-mode".to_string()));
+        assert!(claude.args.contains(&"plan".to_string()));
     }
 
     #[test]
