@@ -6,14 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::gate_attestation::MERGE_CONFLICT_GATE_NAME;
 use super::types::{apm2_home_dir, now_iso8601};
+use crate::commands::fac_permissions;
 
 const CACHE_SCHEMA_V2: &str = "apm2.fac.gate_result_receipt.v2";
 const MAX_CACHE_READ_BYTES: usize = 1_048_576;
@@ -125,34 +124,6 @@ fn read_bounded(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    if file_is_symlink(path)? {
-        return Err(format!(
-            "refusing to write cache via symlink path {}",
-            path.display()
-        ));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-    }
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|err| format!("failed to open {}: {err}", tmp.display()))?;
-    file.write_all(content.as_bytes())
-        .map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
-    file.sync_all()
-        .map_err(|err| format!("failed to sync {}: {err}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .map_err(|err| format!("failed to atomically rename {}: {err}", path.display()))?;
-    Ok(())
-}
-
 impl GateCache {
     /// Create a new empty cache for the given SHA.
     pub fn new(sha: &str) -> Self {
@@ -218,7 +189,7 @@ impl GateCache {
     /// Write cache to disk using v2 per-gate files.
     pub fn save(&self) -> Result<(), String> {
         let dir = cache_sha_dir_v2(&self.sha)?;
-        fs::create_dir_all(&dir)
+        fac_permissions::ensure_dir_with_mode(&dir)
             .map_err(|err| format!("failed to create gate cache dir: {err}"))?;
 
         for (gate_name, result) in &self.gates {
@@ -231,7 +202,8 @@ impl GateCache {
             let content = serde_yaml::to_string(&entry)
                 .map_err(|err| format!("failed to serialize gate cache entry: {err}"))?;
             let path = cache_gate_path_v2(&self.sha, gate_name)?;
-            atomic_write(&path, &content)?;
+            fac_permissions::write_fac_file_with_mode(path.as_path(), content.as_bytes())
+                .map_err(|err| format!("failed to write cache entry {}: {err}", path.display()))?;
         }
         Ok(())
     }

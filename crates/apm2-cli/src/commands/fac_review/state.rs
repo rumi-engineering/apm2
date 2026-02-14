@@ -1705,7 +1705,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
         let path = review_run_secret_path_for_home(home, 441, "security");
-        std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(
+            path.parent().expect("run secret parent"),
+        )
+        .expect("create dir");
         std::fs::write(&path, "a".repeat(129)).expect("write oversized run secret");
 
         let err = read_run_secret_for_home(home, 441, "security")
@@ -1721,7 +1724,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
         let path = review_run_secret_path_for_home(home, 441, "security");
-        std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(
+            path.parent().expect("run secret parent"),
+        )
+        .expect("create dir");
         std::fs::write(&path, hex::encode([0u8; 16])).expect("write short run secret");
 
         let err = read_run_secret_for_home(home, 441, "security")
@@ -1784,6 +1790,12 @@ mod tests {
         let home = temp.path();
         let path = review_run_state_path_for_home(home, 441, "security");
         std::fs::create_dir_all(path.parent().expect("path parent")).expect("create dir");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            path.parent().expect("path parent"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("harden test path");
 
         let legacy = serde_json::json!({
             "run_id": "pr441-security-s3-01234567",
@@ -1886,7 +1898,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
         let path = review_run_state_path_for_home(home, 77, "security");
-        std::fs::create_dir_all(path.parent().expect("path parent")).expect("create dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(path.parent().expect("path parent"))
+            .expect("create dir");
         std::fs::write(&path, "{not-json").expect("write corrupt json");
         let loaded = load_review_run_state_for_home(home, 77, "security").expect("load run-state");
         match loaded {
@@ -1975,7 +1988,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
         let path = review_run_state_path_for_home(home, 441, "quality");
-        std::fs::create_dir_all(path.parent().expect("path parent")).expect("create dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(path.parent().expect("path parent"))
+            .expect("create dir");
         std::fs::write(&path, "{\"run_id\":").expect("write corrupt json");
         let error = load_review_run_state_strict_for_home(home, 441, "quality")
             .expect_err("must fail closed");

@@ -57,19 +57,8 @@ pub fn install() -> Result<()> {
         .join("apm2-daemon.service");
 
     if let Some(parent) = unit_path.parent() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(parent)
-                .context("failed to create systemd unit directory")?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(parent).context("failed to create systemd unit directory")?;
-        }
+        crate::commands::fac_permissions::ensure_dir_exists_standard(parent)
+            .context("failed to create systemd unit directory")?;
     }
 
     let unit_content = format!(
@@ -551,19 +540,8 @@ fn check_socket_reachable(rt: &tokio::runtime::Runtime, path: &Path) -> Result<(
 
 fn available_space_bytes(path: &std::path::Path) -> Result<u64> {
     if !path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(path)
-                .context("failed to create data directory")?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(path).context("failed to create data directory")?;
-        }
+        crate::commands::fac_permissions::ensure_dir_exists_standard(path)
+            .context("failed to create data directory")?;
     }
     fs2::available_space(path).context("failed to read available space")
 }
