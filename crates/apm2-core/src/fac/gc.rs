@@ -112,7 +112,7 @@ pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, Gc
         });
     }
 
-    let quarantine_root = queue_root.join("quarantined");
+    let quarantine_root = queue_root.join("quarantine");
     if let Ok(entries) = std::fs::read_dir(&quarantine_root) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -120,6 +120,22 @@ pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, Gc
                 targets.push(GcTarget {
                     path: path.clone(),
                     allowed_parent: quarantine_root.clone(),
+                    kind: crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
+                    estimated_bytes: estimate_dir_size(&path),
+                });
+            }
+        }
+    }
+
+    // Legacy directory name — scan for backward compatibility during transition.
+    let legacy_quarantine_root = queue_root.join("quarantined");
+    if let Ok(entries) = std::fs::read_dir(&legacy_quarantine_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_stale_by_mtime(&path, QUARANTINE_RETENTION_SECS) {
+                targets.push(GcTarget {
+                    path: path.clone(),
+                    allowed_parent: legacy_quarantine_root.clone(),
                     kind: crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
                     estimated_bytes: estimate_dir_size(&path),
                 });

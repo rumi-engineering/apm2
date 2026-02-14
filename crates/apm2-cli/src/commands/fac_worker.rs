@@ -93,6 +93,17 @@ use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
+#[cfg(test)]
+mod fac_permissions {
+    use std::path::Path;
+    use std::{fs, io};
+
+    pub fn ensure_dir_with_mode(path: &Path) -> Result<(), io::Error> {
+        fs::create_dir_all(path)
+    }
+}
+#[cfg(not(test))]
+use crate::commands::fac_permissions;
 use crate::exit_codes::codes as exit_codes;
 
 // =============================================================================
@@ -110,7 +121,7 @@ const PENDING_DIR: &str = "pending";
 const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
 const DENIED_DIR: &str = "denied";
-const QUARANTINED_DIR: &str = "quarantined";
+const QUARANTINE_DIR: &str = "quarantine";
 const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 
 /// Maximum poll interval to prevent misconfiguration (1 hour).
@@ -640,7 +651,15 @@ fn scan_pending(
             Ok(b) => b,
             Err(e) => {
                 let reason = format!("read failure: {e}");
-                let _ = move_to_dir_safe(&path, &queue_root.join(QUARANTINED_DIR), &file_name);
+                let moved_path =
+                    move_to_dir_safe(&path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
                 let job_id = file_name.trim_end_matches(".json").to_string();
                 let _ = emit_scan_receipt(
                     fac_root,
@@ -649,6 +668,7 @@ fn scan_pending(
                     &compute_job_spec_digest_preview(&[]),
                     FacJobOutcome::Quarantined,
                     DenialReasonCode::MalformedSpec,
+                    moved_path.as_deref(),
                     &reason,
                     canonicalizer_tuple_digest,
                 );
@@ -662,7 +682,15 @@ fn scan_pending(
             Ok(s) => s,
             Err(e) => {
                 let reason = format!("deserialization failed: {e}");
-                let _ = move_to_dir_safe(&path, &queue_root.join(QUARANTINED_DIR), &file_name);
+                let moved_path =
+                    move_to_dir_safe(&path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
                 let job_id = file_name.trim_end_matches(".json").to_string();
                 let _ = emit_scan_receipt(
                     fac_root,
@@ -671,6 +699,7 @@ fn scan_pending(
                     &compute_job_spec_digest_preview(&bytes),
                     FacJobOutcome::Quarantined,
                     DenialReasonCode::MalformedSpec,
+                    moved_path.as_deref(),
                     &reason,
                     canonicalizer_tuple_digest,
                 );
@@ -770,7 +799,14 @@ fn process_job(
         );
         if is_digest_error {
             let reason = format!("digest validation failed: {e}");
-            let _ = move_to_dir_safe(path, &queue_root.join(QUARANTINED_DIR), &file_name);
+            let moved_path = move_to_dir_safe(path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -782,6 +818,7 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
                 policy_hash,
             ) {
                 eprintln!(
@@ -792,7 +829,14 @@ fn process_job(
         }
         // Other validation errors (missing token, schema, etc.) -> deny.
         let reason = format!("validation failed: {e}");
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         let reason_code = match e {
             JobSpecError::MissingToken { .. } => DenialReasonCode::MissingChannelToken,
             JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
@@ -809,6 +853,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -821,7 +866,14 @@ fn process_job(
         Some(t) if !t.is_empty() => t.as_str(),
         _ => {
             let reason = "missing channel_context_token".to_string();
-            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -833,6 +885,7 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -854,7 +907,14 @@ fn process_job(
         Ok(check) => check,
         Err(e) => {
             let reason = format!("token decode failed: {e}");
-            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -866,6 +926,7 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -883,7 +944,14 @@ fn process_job(
                 .ct_eq(&binding.admitted_policy_root_digest),
         ) {
             let reason = "policy digest mismatch within channel boundary binding".to_string();
-            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -895,6 +963,7 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -906,7 +975,14 @@ fn process_job(
         binding.admitted_policy_root_digest
     } else {
         let reason = "missing boundary-flow policy binding".to_string();
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -918,6 +994,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -929,7 +1006,14 @@ fn process_job(
         || !bool::from(admitted_policy_root_digest.ct_eq(policy_digest))
     {
         let reason = "policy digest mismatch with admitted fac policy".to_string();
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -941,6 +1025,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -960,7 +1045,14 @@ fn process_job(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -972,6 +1064,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -988,7 +1081,14 @@ fn process_job(
             queue_lane: spec.queue_lane.clone(),
             defect_reason: Some("admission health gate not passed".to_string()),
         };
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1000,6 +1100,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1066,7 +1167,14 @@ fn process_job(
             || "admission denied (no defect detail)".to_string(),
             |defect| format!("admission denied: {}", defect.reason),
         );
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1078,6 +1186,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1088,7 +1197,14 @@ fn process_job(
     // PCAC lifecycle: check if authority was already consumed (replay protection).
     if is_authority_consumed(queue_root, &spec.job_id) {
         let reason = format!("authority already consumed for job {}", spec.job_id);
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1100,6 +1216,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1107,10 +1224,38 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    // PCAC lifecycle: durable consume before any authority-bearing side effect.
+    // Step 5: Atomic claim via rename (INV-WRK-003).
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    let claimed_path = match move_to_dir_safe(path, &claimed_dir, &file_name) {
+        Ok(p) => p,
+        Err(e) => {
+            // If rename fails (e.g., already claimed by another worker), skip.
+            return JobOutcome::Skipped {
+                reason: format!("atomic claim failed: {e}"),
+            };
+        },
+    };
+
+    let claimed_file_name = claimed_path
+        .file_name()
+        .map_or_else(|| file_name.clone(), |n| n.to_string_lossy().to_string());
+
+    // PCAC lifecycle: durable consume after atomic claim; if this fails the claimed
+    // job is moved to denied/.
     if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
         let reason = format!("PCAC consume failed: {e}");
-        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1122,20 +1267,12 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
         return JobOutcome::Denied { reason };
-    }
-
-    // Step 5: Atomic claim via rename (INV-WRK-003).
-    let claimed_dir = queue_root.join(CLAIMED_DIR);
-    if let Err(e) = move_to_dir_safe(path, &claimed_dir, &file_name) {
-        // If rename fails (e.g., already claimed by another worker), skip.
-        return JobOutcome::Skipped {
-            reason: format!("atomic claim failed: {e}"),
-        };
     }
 
     // Step 6: Acquire lane lease (INV-WRK-008, BLOCKER-3 fix).
@@ -1146,9 +1283,9 @@ fn process_job(
         Ok(mgr) => mgr,
         Err(e) => {
             if let Err(move_err) = move_to_dir_safe(
-                &claimed_dir.join(&file_name),
+                &claimed_path,
                 &queue_root.join(PENDING_DIR),
-                &file_name,
+                &claimed_file_name,
             ) {
                 eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
             }
@@ -1176,9 +1313,9 @@ fn process_job(
     let Some(_lane_guard) = acquired_guard else {
         // No lane available -> move back to pending for retry.
         if let Err(move_err) = move_to_dir_safe(
-            &claimed_dir.join(&file_name),
+            &claimed_path,
             &queue_root.join(PENDING_DIR),
-            &file_name,
+            &claimed_file_name,
         ) {
             eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
         }
@@ -1187,13 +1324,21 @@ fn process_job(
         };
     };
 
-    let claimed_path = claimed_dir.join(&file_name);
-
     if let Err(error) = run_preflight(fac_root, &lane_mgr, DEFAULT_MIN_FREE_BYTES) {
-        if let Err(move_err) =
-            move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name)
-        {
-            eprintln!("worker: WARNING: failed to move job to denied: {move_err}");
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
+        if moved_path.is_none() {
+            eprintln!("worker: WARNING: failed to move job to denied");
         }
         let reason = format!("preflight failed: {error:?}");
         if let Err(receipt_err) = emit_job_receipt(
@@ -1207,6 +1352,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1224,7 +1370,18 @@ fn process_job(
         Ok(profile) => profile,
         Err(e) => {
             let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
-            let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+            let moved_path = move_to_dir_safe(
+                &claimed_path,
+                &queue_root.join(DENIED_DIR),
+                &claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -1236,6 +1393,7 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1279,7 +1437,18 @@ fn process_job(
     let mirror_manager = RepoMirrorManager::new(fac_root);
     if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
         let reason = format!("mirror ensure failed: {e}");
-        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1291,6 +1460,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1307,7 +1477,18 @@ fn process_job(
         &lanes_root,
     ) {
         let reason = format!("lane workspace checkout failed: {e}");
-        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1319,6 +1500,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1331,7 +1513,18 @@ fn process_job(
             "patch_injection requires inline patch bytes (CAS backend not yet implemented)";
 
         let deny_with_reason = |reason: &str| -> JobOutcome {
-            let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+            let moved_path = move_to_dir_safe(
+                &claimed_path,
+                &queue_root.join(DENIED_DIR),
+                &claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -1343,6 +1536,7 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1390,7 +1584,18 @@ fn process_job(
         patch_digest = Some(patch_outcome.patch_digest);
     } else if spec.source.kind != "mirror_commit" {
         let reason = format!("unsupported source kind: {}", spec.source.kind);
-        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1402,6 +1607,7 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1437,12 +1643,15 @@ fn process_job(
         None,
         patch_digest.as_deref(),
         Some(canonicalizer_tuple_digest),
+        None,
         policy_hash,
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
-        if let Err(move_err) =
-            move_to_dir_safe(&claimed_path, &queue_root.join(PENDING_DIR), &file_name)
-        {
+        if let Err(move_err) = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(PENDING_DIR),
+            &claimed_file_name,
+        ) {
             eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
         }
         return JobOutcome::Skipped {
@@ -1451,10 +1660,14 @@ fn process_job(
     }
 
     // Persist the gate receipt alongside the completed job.
-    write_gate_receipt(queue_root, &file_name, &gate_receipt);
+    write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
 
     // Move to completed.
-    if let Err(e) = move_to_dir_safe(&claimed_path, &queue_root.join(COMPLETED_DIR), &file_name) {
+    if let Err(e) = move_to_dir_safe(
+        &claimed_path,
+        &queue_root.join(COMPLETED_DIR),
+        &claimed_file_name,
+    ) {
         return JobOutcome::Skipped {
             reason: format!("move to completed failed: {e}"),
         };
@@ -1491,7 +1704,7 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
         CLAIMED_DIR,
         COMPLETED_DIR,
         DENIED_DIR,
-        QUARANTINED_DIR,
+        QUARANTINE_DIR,
         CONSUME_RECEIPTS_DIR,
     ] {
         let path = queue_root.join(dir);
@@ -1653,28 +1866,94 @@ fn save_broker_state(broker: &FacBroker) -> Result<(), String> {
 /// If the target file already exists (duplicate job ID from a concurrent
 /// worker or replay), the file name is suffixed with a nanosecond timestamp
 /// to prevent clobbering (MAJOR-2 fix).
-fn move_to_dir_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<(), String> {
-    if !dest_dir.exists() {
-        fs::create_dir_all(dest_dir)
-            .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
-    }
-    let dest = dest_dir.join(file_name);
+fn move_to_dir_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
+    let do_move = || -> Result<PathBuf, String> {
+        if !dest_dir.exists() {
+            fac_permissions::ensure_dir_with_mode(dest_dir)
+                .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+        }
+        let dest = dest_dir.join(file_name);
 
-    // Check for collision and generate a unique name if needed.
-    if dest.exists() {
+        // Attempt atomic no-replace rename (RENAME_NOREPLACE).
+        // On collision (EEXIST / ENOTEMPTY), generate a unique timestamped name.
+        match rename_noreplace(src, &dest) {
+            Ok(()) => return Ok(dest),
+            Err(e)
+                if e.raw_os_error() == Some(libc::EEXIST)
+                    || e.raw_os_error() == Some(libc::ENOTEMPTY)
+                    || e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => {
+                return Err(format!(
+                    "rename {} -> {}: {e}",
+                    src.display(),
+                    dest.display()
+                ));
+            },
+        }
+
+        // Generate a unique timestamped filename for the collision case.
         let ts_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let stem = file_name.trim_end_matches(".json");
         let safe_name = format!("{stem}-{ts_nanos}.json");
-        let safe_dest = dest_dir.join(safe_name);
-        return fs::rename(src, &safe_dest)
-            .map_err(|e| format!("rename {} -> {}: {e}", src.display(), safe_dest.display()));
-    }
+        let safe_dest = dest_dir.join(&safe_name);
+        rename_noreplace(src, &safe_dest)
+            .map_err(|e| format!("rename {} -> {}: {e}", src.display(), safe_dest.display()))?;
+        Ok(safe_dest)
+    };
 
-    fs::rename(src, &dest)
-        .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dest.display()))
+    let result = do_move();
+    if let Err(ref e) = result {
+        eprintln!("worker: WARNING: move_to_dir_safe failed: {e}");
+    }
+    result
+}
+
+/// Atomic rename that fails (instead of overwriting) when the destination
+/// already exists.  Uses Linux `renameat2(RENAME_NOREPLACE)`.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dest_c = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    // SAFETY: paths are valid C strings, AT_FDCWD means use current directory
+    // for relative paths.
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dest_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Best-effort fallback for non-Linux: check + rename with inherent TOCTOU
+/// window.  Acceptable because the nanosecond-timestamped collision path in
+/// `move_to_dir_safe` provides a secondary safety net.
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        ));
+    }
+    fs::rename(src, dest)
 }
 
 /// Emit a structured job receipt for scan failures (typically malformed input).
@@ -1686,10 +1965,11 @@ fn emit_scan_receipt(
     job_spec_digest: &str,
     outcome: FacJobOutcome,
     denial_reason: DenialReasonCode,
+    moved_job_path: Option<&str>,
     reason: &str,
     canonicalizer_tuple_digest: &str,
 ) -> Result<PathBuf, String> {
-    let receipt = FacJobReceiptV1Builder::new(
+    let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-scan-{}-{}", file_name, current_timestamp_epoch_secs()),
         job_id,
         job_spec_digest,
@@ -1698,9 +1978,15 @@ fn emit_scan_receipt(
     .denial_reason(denial_reason)
     .canonicalizer_tuple_digest(canonicalizer_tuple_digest)
     .reason(reason)
-    .timestamp_secs(current_timestamp_epoch_secs())
-    .try_build()
-    .map_err(|e| format!("cannot build scan receipt: {e}"))?;
+    .timestamp_secs(current_timestamp_epoch_secs());
+
+    if let Some(path) = moved_job_path {
+        builder = builder.moved_job_path(path);
+    }
+
+    let receipt = builder
+        .try_build()
+        .map_err(|e| format!("cannot build scan receipt: {e}"))?;
 
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
 }
@@ -1741,6 +2027,7 @@ fn emit_job_receipt(
     eio29_budget_admission: Option<&BudgetAdmissionTrace>,
     patch_digest: Option<&str>,
     canonicalizer_tuple_digest: Option<&str>,
+    moved_job_path: Option<&str>,
     policy_hash: &str,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
@@ -1771,6 +2058,9 @@ fn emit_job_receipt(
     }
     if let Some(canonicalizer_tuple_digest) = canonicalizer_tuple_digest {
         builder = builder.canonicalizer_tuple_digest(canonicalizer_tuple_digest);
+    }
+    if let Some(path) = moved_job_path {
+        builder = builder.moved_job_path(path);
     }
 
     let receipt = builder
@@ -1956,7 +2246,7 @@ mod tests {
             CLAIMED_DIR,
             COMPLETED_DIR,
             DENIED_DIR,
-            QUARANTINED_DIR,
+            QUARANTINE_DIR,
             CONSUME_RECEIPTS_DIR,
         ] {
             assert!(queue_root.join(sub).is_dir(), "missing {sub}");
@@ -2028,6 +2318,7 @@ mod tests {
             &compute_job_spec_digest_preview(&[]),
             FacJobOutcome::Quarantined,
             DenialReasonCode::MalformedSpec,
+            None,
             &long_reason,
             &CanonicalizerTupleV1::from_current().compute_digest(),
         );
@@ -2189,6 +2480,7 @@ mod tests {
             None,
             None,
             Some(&tuple_digest),
+            None,
             &spec.job_spec_digest,
         )
         .expect("emit receipt");
@@ -2227,6 +2519,7 @@ mod tests {
             None,
             None,
             Some(&canonicalizer_tuple_digest),
+            None,
             &spec.job_spec_digest,
         )
         .expect("emit receipt");
@@ -2272,7 +2565,7 @@ mod tests {
         );
 
         // Check it was quarantined.
-        let quarantine_dir = queue_root.join("quarantined");
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
         let quarantined_files: Vec<_> = fs::read_dir(&quarantine_dir)
             .expect("read quarantine")
             .flatten()
@@ -2319,7 +2612,7 @@ mod tests {
         );
 
         // Check it was quarantined.
-        let quarantine_dir = queue_root.join("quarantined");
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
         let quarantined_files: Vec<_> = fs::read_dir(&quarantine_dir)
             .expect("read quarantine")
             .flatten()

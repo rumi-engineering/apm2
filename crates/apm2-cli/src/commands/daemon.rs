@@ -17,7 +17,7 @@ use tracing::info;
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::fac_permissions::{ensure_dir_exists_standard, ensure_dir_with_mode};
 
-const FAC_RUNTIME_SUBDIRS: [&str; 13] = [
+const FAC_RUNTIME_SUBDIRS: [&str; 14] = [
     "private",
     "private/creds",
     "private/fac/lanes",
@@ -29,6 +29,7 @@ const FAC_RUNTIME_SUBDIRS: [&str; 13] = [
     "private/fac/queue/claimed",
     "private/fac/queue/completed",
     "private/fac/queue/denied",
+    "private/fac/queue/quarantine",
     "private/fac/queue/quarantined",
     "private/fac/queue/authority_consumed",
 ];

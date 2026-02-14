@@ -203,11 +203,12 @@ pub enum FacJobReceiptError {
 }
 
 /// Receipt outcome for a worker job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum FacJobOutcome {
     /// The job was completed successfully.
+    #[default]
     Completed,
     /// The job was denied.
     Denied,
@@ -281,7 +282,7 @@ pub struct BudgetAdmissionTrace {
 }
 
 /// Unified worker receipt for FAC job outcomes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FacJobReceiptV1 {
     /// Schema identifier.
@@ -312,6 +313,9 @@ pub struct FacJobReceiptV1 {
     pub unsafe_direct: bool,
     /// Human-readable reason (bounded).
     pub reason: String,
+    /// Optional canonical destination path after a move operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_job_path: Option<String>,
     /// RFC-0028 boundary trace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
@@ -335,6 +339,12 @@ impl FacJobReceiptV1 {
     ///
     /// Encodes all fields except `content_hash` in deterministic order with
     /// length-prefixing to prevent canonicalization collisions.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serde serialization for internal enum variants fails.
+    /// These variants are statically constrained to serializable values, so
+    /// this path is not expected under normal operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -352,13 +362,13 @@ impl FacJobReceiptV1 {
         bytes.extend_from_slice(&(self.job_spec_digest.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.job_spec_digest.as_bytes());
 
-        let outcome_str = serde_json::to_string(&self.outcome).unwrap_or_default();
+        let outcome_str = serde_json::to_string(&self.outcome).expect("outcome serialization");
         bytes.extend_from_slice(&(outcome_str.len() as u32).to_be_bytes());
         bytes.extend_from_slice(outcome_str.as_bytes());
 
         if let Some(reason_code) = &self.denial_reason {
             bytes.push(1u8);
-            let reason_str = serde_json::to_string(reason_code).unwrap_or_default();
+            let reason_str = serde_json::to_string(reason_code).expect("reason_code serialization");
             bytes.extend_from_slice(&(reason_str.len() as u32).to_be_bytes());
             bytes.extend_from_slice(reason_str.as_bytes());
         } else {
@@ -427,6 +437,16 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
+        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
+        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
+        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
+        // because older receipts encoded without this optional field at all and
+        // adding a trailing `0u8` would change their content hash.
+        if let Some(path) = &self.moved_job_path {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+        }
 
         bytes
     }
@@ -542,6 +562,16 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
+        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
+        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
+        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
+        // because older receipts encoded without this optional field at all and
+        // adding a trailing `0u8` would change their content hash.
+        if let Some(path) = &self.moved_job_path {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+        }
 
         bytes
     }
@@ -591,6 +621,30 @@ impl FacJobReceiptV1 {
                 actual: self.job_spec_digest.len(),
                 max: MAX_STRING_LENGTH,
             });
+        }
+        if let Some(path) = &self.moved_job_path {
+            if path.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "moved_job_path",
+                    actual: path.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if path.chars().any(char::is_control) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "moved_job_path contains control characters".to_string(),
+                ));
+            }
+            if path.contains("..") {
+                return Err(FacJobReceiptError::InvalidData(
+                    "moved_job_path contains path traversal sequence".to_string(),
+                ));
+            }
+            if std::path::Path::new(path).is_absolute() {
+                return Err(FacJobReceiptError::InvalidData(
+                    "moved_job_path must be a relative path".to_string(),
+                ));
+            }
         }
         if !is_valid_b3_256_digest(&self.job_spec_digest) {
             return Err(FacJobReceiptError::InvalidData(
@@ -725,6 +779,7 @@ pub struct FacJobReceiptV1Builder {
     reason: Option<String>,
     unsafe_direct: bool,
     policy_hash: Option<String>,
+    moved_job_path: Option<String>,
     patch_digest: Option<String>,
     canonicalizer_tuple_digest: Option<String>,
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
@@ -781,6 +836,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn policy_hash(mut self, policy_hash: impl Into<String>) -> Self {
         self.policy_hash = Some(policy_hash.into());
+        self
+    }
+
+    /// Sets the moved job path.
+    #[must_use]
+    pub fn moved_job_path(mut self, moved_job_path: impl Into<String>) -> Self {
+        self.moved_job_path = Some(moved_job_path.into());
         self
     }
 
@@ -846,6 +908,7 @@ impl FacJobReceiptV1Builder {
         let timestamp_secs = self.timestamp_secs.unwrap_or(0);
         let patch_digest = self.patch_digest;
         let canonicalizer_tuple_digest = self.canonicalizer_tuple_digest;
+        let moved_job_path = self.moved_job_path;
 
         if receipt_id.len() > MAX_STRING_LENGTH {
             return Err(FacJobReceiptError::StringTooLong {
@@ -899,6 +962,30 @@ impl FacJobReceiptV1Builder {
                 actual: reason_len,
                 max: MAX_FAC_JOB_REASON_LENGTH,
             });
+        }
+        if let Some(path) = &moved_job_path {
+            if path.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "moved_job_path",
+                    actual: path.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if path.chars().any(char::is_control) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "moved_job_path contains control characters".to_string(),
+                ));
+            }
+            if path.contains("..") {
+                return Err(FacJobReceiptError::InvalidData(
+                    "moved_job_path contains path traversal sequence".to_string(),
+                ));
+            }
+            if std::path::Path::new(path).is_absolute() {
+                return Err(FacJobReceiptError::InvalidData(
+                    "moved_job_path must be a relative path".to_string(),
+                ));
+            }
         }
 
         match outcome {
@@ -996,6 +1083,7 @@ impl FacJobReceiptV1Builder {
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
+            moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
         };
@@ -1820,6 +1908,10 @@ pub mod tests {
         builder.try_build()
     }
 
+    fn make_valid_receipt() -> FacJobReceiptV1 {
+        sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample fac receipt")
+    }
+
     #[test]
     fn test_fac_job_receipt_canonical_bytes_deterministic() {
         let first =
@@ -1897,6 +1989,29 @@ pub mod tests {
     }
 
     #[test]
+    fn test_canonical_bytes_v2_includes_moved_job_path() {
+        let mut r = make_valid_receipt();
+        r.moved_job_path = None;
+        let hash_none = r.canonical_bytes_v2();
+
+        r.moved_job_path = Some("quarantine/job-001.json".to_string());
+        let hash_some = r.canonical_bytes_v2();
+
+        assert_ne!(
+            hash_none, hash_some,
+            "v2 hash must change when moved_job_path is set"
+        );
+
+        r.moved_job_path = Some("quarantine/job-002.json".to_string());
+        let hash_different = r.canonical_bytes_v2();
+
+        assert_ne!(
+            hash_some, hash_different,
+            "v2 hash must change when moved_job_path value changes"
+        );
+    }
+
+    #[test]
     fn test_fac_job_receipt_v2_content_hash_differs_from_v1() {
         let receipt =
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
@@ -1932,6 +2047,21 @@ pub mod tests {
             receipt.validate(),
             Err(FacJobReceiptError::StringTooLong {
                 field: "schema",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_moved_job_path() {
+        let mut receipt = make_valid_receipt();
+        receipt.moved_job_path = Some("x".repeat(MAX_STRING_LENGTH + 1));
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::StringTooLong {
+                field: "moved_job_path",
                 ..
             })
         ));
@@ -2032,6 +2162,42 @@ pub mod tests {
         assert!(
             result.is_ok(),
             "budget admission should be optional for completed outcomes"
+        );
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_includes_moved_job_path() {
+        let moved_job_path = "queue/quarantine/job-007.json";
+        let receipt = FacJobReceiptV1Builder::new(
+            "receipt-job-007",
+            "job-007",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Denied)
+        .denial_reason(DenialReasonCode::MalformedSpec)
+        .reason("test moved")
+        .moved_job_path(moved_job_path)
+        .timestamp_secs(1_700_000_005)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: false,
+            defect_count: 1,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "deny".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: Some("quarantine required".to_string()),
+        })
+        .try_build()
+        .expect("receipt with moved_job_path");
+
+        assert_eq!(receipt.moved_job_path.as_deref(), Some(moved_job_path));
+        let bytes = receipt.canonical_bytes();
+        assert!(
+            bytes
+                .windows(moved_job_path.len())
+                .any(|window| window == moved_job_path.as_bytes()),
+            "moved path should be encoded in canonical bytes"
         );
     }
 
