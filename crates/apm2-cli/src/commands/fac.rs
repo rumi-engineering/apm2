@@ -196,6 +196,13 @@ pub enum FacSubcommand {
     /// NDJSON telemetry under `~/.apm2`.
     Review(ReviewArgs),
 
+    /// Queue consumer with RFC-0028 authorization + RFC-0029 admission gating.
+    ///
+    /// Scans `$APM2_HOME/queue/pending/` for job specs, validates against
+    /// RFC-0028 channel context tokens and RFC-0029 admission, then
+    /// atomically claims and executes valid jobs.
+    Worker(WorkerArgs),
+
     /// GitHub App credential management and PR operations.
     ///
     /// Provides `auth-setup` for bootstrapping credentials and
@@ -393,6 +400,22 @@ pub struct LaneStatusArgs {
     /// CORRUPT).
     #[arg(long)]
     pub state: Option<String>,
+}
+
+/// Arguments for `apm2 fac worker`.
+#[derive(Debug, Args)]
+pub struct WorkerArgs {
+    /// Process exactly one job and exit.
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+
+    /// Seconds between queue scans in continuous mode.
+    #[arg(long, default_value_t = 5)]
+    pub poll_interval_secs: u64,
+
+    /// Maximum total jobs to process before exiting (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    pub max_jobs: u64,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -998,7 +1021,10 @@ pub fn run_fac(
 
     if !matches!(
         cmd.subcommand,
-        FacSubcommand::Gates(_) | FacSubcommand::Doctor(_) | FacSubcommand::Lane(_)
+        FacSubcommand::Gates(_)
+            | FacSubcommand::Doctor(_)
+            | FacSubcommand::Lane(_)
+            | FacSubcommand::Worker(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -1268,6 +1294,12 @@ pub fn run_fac(
                 )
             },
         },
+        FacSubcommand::Worker(args) => crate::commands::fac_worker::run_fac_worker(
+            args.once,
+            args.poll_interval_secs,
+            args.max_jobs,
+            json_output,
+        ),
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
     }
 }
