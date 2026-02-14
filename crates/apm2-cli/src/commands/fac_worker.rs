@@ -683,8 +683,8 @@ fn process_job(
         },
     };
 
-    // Use broker tick for temporal checks to avoid wall-clock rollback.
-    let current_time_secs = broker.current_tick();
+    // Use monotonic wall-clock seconds for token temporal validation.
+    let current_time_secs = current_timestamp_epoch_secs();
 
     let boundary_check = match decode_channel_context_token(
         token,
@@ -1349,7 +1349,8 @@ fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32]), String> 
         default_policy
     };
 
-    let policy_hash = compute_policy_hash(&policy);
+    let policy_hash =
+        compute_policy_hash(&policy).map_err(|e| format!("cannot compute policy hash: {e}"))?;
     let policy_digest =
         parse_policy_hash(&policy_hash).ok_or_else(|| "invalid policy hash".to_string())?;
 

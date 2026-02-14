@@ -7,12 +7,17 @@
 //! in RFC-0028 boundary bindings.
 
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::job_spec::parse_b3_256_digest;
+use super::policy_resolution::{DeterminismClass, RiskTier};
+use crate::determinism::canonicalize_json;
 
 /// Schema identifier for `FacPolicyV1`.
 pub const POLICY_SCHEMA_ID: &str = "apm2.fac.policy.v1";
@@ -168,10 +173,10 @@ pub struct FacPolicyV1 {
     pub cargo_home: Option<String>,
 
     /// Risk tier for this policy.
-    pub risk_tier: String,
+    pub risk_tier: RiskTier,
 
     /// Determinism class for this policy.
-    pub determinism_class: String,
+    pub determinism_class: DeterminismClass,
 }
 
 impl Default for FacPolicyV1 {
@@ -219,74 +224,9 @@ impl FacPolicyV1 {
             deny_ambient_cargo_home: true,
             cargo_target_dir: Some("target".to_string()),
             cargo_home: None,
-            risk_tier: "Tier2".to_string(),
-            determinism_class: "SoftDeterministic".to_string(),
+            risk_tier: RiskTier::Tier2,
+            determinism_class: DeterminismClass::SoftDeterministic,
         }
-    }
-
-    /// Returns the canonical policy bytes for hashing.
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-
-        push_len_u32(&mut bytes, self.schema.len());
-        bytes.extend_from_slice(self.schema.as_bytes());
-
-        bytes.extend_from_slice(&self.version.to_be_bytes());
-
-        push_len_u32(&mut bytes, self.env_clear.len());
-        for value in &self.env_clear {
-            push_len_u32(&mut bytes, value.len());
-            bytes.extend_from_slice(value.as_bytes());
-        }
-
-        push_len_u32(&mut bytes, self.env_allowlist_prefixes.len());
-        for value in &self.env_allowlist_prefixes {
-            push_len_u32(&mut bytes, value.len());
-            bytes.extend_from_slice(value.as_bytes());
-        }
-
-        push_len_u32(&mut bytes, self.env_denylist_prefixes.len());
-        for value in &self.env_denylist_prefixes {
-            push_len_u32(&mut bytes, value.len());
-            bytes.extend_from_slice(value.as_bytes());
-        }
-
-        push_len_u32(&mut bytes, self.env_set.len());
-        for entry in &self.env_set {
-            push_len_u32(&mut bytes, entry.key.len());
-            bytes.extend_from_slice(entry.key.as_bytes());
-            push_len_u32(&mut bytes, entry.value.len());
-            bytes.extend_from_slice(entry.value.as_bytes());
-        }
-
-        bytes.push(u8::from(self.deny_ambient_cargo_home));
-
-        match &self.cargo_target_dir {
-            Some(value) => {
-                bytes.push(1);
-                push_len_u32(&mut bytes, value.len());
-                bytes.extend_from_slice(value.as_bytes());
-            },
-            None => bytes.push(0),
-        }
-
-        match &self.cargo_home {
-            Some(value) => {
-                bytes.push(1);
-                push_len_u32(&mut bytes, value.len());
-                bytes.extend_from_slice(value.as_bytes());
-            },
-            None => bytes.push(0),
-        }
-
-        push_len_u32(&mut bytes, self.risk_tier.len());
-        bytes.extend_from_slice(self.risk_tier.as_bytes());
-
-        push_len_u32(&mut bytes, self.determinism_class.len());
-        bytes.extend_from_slice(self.determinism_class.as_bytes());
-
-        bytes
     }
 
     /// Validates policy fields and returns an error when constraints are
@@ -312,14 +252,14 @@ impl FacPolicyV1 {
         }
 
         validate_string_field("schema", &self.schema)?;
-        validate_string_field("risk_tier", &self.risk_tier)?;
-        validate_string_field("determinism_class", &self.determinism_class)?;
         validate_string_field_opt("cargo_target_dir", self.cargo_target_dir.as_deref())?;
         validate_string_field_opt("cargo_home", self.cargo_home.as_deref())?;
 
         validate_env_vector("env_clear", &self.env_clear)?;
         validate_env_vector("env_allowlist_prefixes", &self.env_allowlist_prefixes)?;
+        validate_empty_policy_prefixes("env_allowlist_prefixes", &self.env_allowlist_prefixes)?;
         validate_env_vector("env_denylist_prefixes", &self.env_denylist_prefixes)?;
+        validate_empty_policy_prefixes("env_denylist_prefixes", &self.env_denylist_prefixes)?;
 
         if self.env_set.len() > MAX_ENV_ENTRIES {
             return Err(FacPolicyError::VectorTooLarge {
@@ -337,38 +277,20 @@ impl FacPolicyV1 {
             validate_string_field_len("env_set.value", entry.value.len(), MAX_ENV_VALUE_LENGTH)?;
         }
 
-        let supported_risk_tiers = ["Tier0", "Tier1", "Tier2", "Tier3", "Tier4"];
-        if !supported_risk_tiers.contains(&self.risk_tier.as_str()) {
-            return Err(FacPolicyError::InvalidFieldValue {
-                field: "risk_tier",
-                value: self.risk_tier.clone(),
-            });
-        }
-
-        let supported_determinism_classes = [
-            "NonDeterministic",
-            "SoftDeterministic",
-            "FullyDeterministic",
-        ];
-        if !supported_determinism_classes.contains(&self.determinism_class.as_str()) {
-            return Err(FacPolicyError::InvalidFieldValue {
-                field: "determinism_class",
-                value: self.determinism_class.clone(),
-            });
-        }
-
         Ok(())
     }
 }
 
 /// Computes the deterministic policy hash using domain-separated BLAKE3.
-#[must_use]
-pub fn compute_policy_hash(policy: &FacPolicyV1) -> String {
-    let canonical = policy.canonical_bytes();
+///
+/// # Errors
+/// Returns `Err` if canonicalization or serialization fails.
+pub fn compute_policy_hash(policy: &FacPolicyV1) -> Result<String, String> {
+    let canonical = policy_as_canonical_json(policy)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(POLICY_HASH_DOMAIN);
-    hasher.update(&canonical);
-    format!("b3-256:{}", hasher.finalize().to_hex())
+    hasher.update(canonical.as_bytes());
+    Ok(format!("b3-256:{}", hasher.finalize().to_hex()))
 }
 
 /// Parses and validates a policy hash string.
@@ -414,10 +336,42 @@ pub fn persist_policy(fac_root: &Path, policy: &FacPolicyV1) -> Result<PathBuf, 
     let temp_path = policy_dir.join(".fac_policy.v1.json.tmp");
     let bytes =
         serde_json::to_vec_pretty(policy).map_err(|e| format!("cannot serialize policy: {e}"))?;
-    fs::write(&temp_path, bytes).map_err(|e| format!("cannot write policy file: {e}"))?;
+    let mut file = fs::File::create(&temp_path)
+        .map_err(|e| format!("cannot create temporary policy file: {e}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot set temporary policy permissions: {e}"))?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("cannot write policy file: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot sync temporary policy file: {e}"))?;
     fs::rename(&temp_path, &path).map_err(|e| format!("cannot persist policy: {e}"))?;
+    let dir = fs::File::open(&policy_dir).map_err(|e| {
+        format!("cannot open policy directory for durability sync after write: {e}")
+    })?;
+    dir.sync_all()
+        .map_err(|e| format!("cannot sync policy directory after write: {e}"))?;
 
     Ok(path)
+}
+
+fn sort_env_vectors_for_policy_hash(policy: &FacPolicyV1) -> FacPolicyV1 {
+    let mut normalized = policy.clone();
+    normalized.env_clear.sort();
+    normalized.env_allowlist_prefixes.sort();
+    normalized.env_denylist_prefixes.sort();
+    normalized.env_set.sort_by(|a, b| match a.key.cmp(&b.key) {
+        std::cmp::Ordering::Equal => a.value.cmp(&b.value),
+        ordering => ordering,
+    });
+    normalized
+}
+
+fn policy_as_canonical_json(policy: &FacPolicyV1) -> Result<String, String> {
+    let normalized_policy = sort_env_vectors_for_policy_hash(policy);
+    let json = serde_json::to_string(&normalized_policy)
+        .map_err(|e| format!("cannot serialize policy: {e}"))?;
+    canonicalize_json(&json).map_err(|e| format!("cannot canonicalize policy: {e}"))
 }
 
 const fn validate_string_field_len(
@@ -429,11 +383,6 @@ const fn validate_string_field_len(
         return Err(FacPolicyError::StringTooLong { field, actual, max });
     }
     Ok(())
-}
-
-fn push_len_u32(bytes: &mut Vec<u8>, value: usize) {
-    let value = u32::try_from(value).unwrap_or(u32::MAX);
-    bytes.extend_from_slice(&value.to_be_bytes());
 }
 
 const fn validate_string_field(field: &'static str, value: &str) -> Result<(), FacPolicyError> {
@@ -473,6 +422,20 @@ fn validate_env_vector(field: &'static str, values: &[String]) -> Result<(), Fac
     Ok(())
 }
 
+fn validate_empty_policy_prefixes(
+    field: &'static str,
+    values: &[String],
+) -> Result<(), FacPolicyError> {
+    if values.iter().any(String::is_empty) {
+        return Err(FacPolicyError::InvalidFieldValue {
+            field,
+            value: "empty prefix strings are not allowed".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -488,29 +451,32 @@ mod tests {
     #[test]
     fn test_policy_hash_is_deterministic() {
         let policy = FacPolicyV1::default_policy();
-        let a = compute_policy_hash(&policy);
-        let b = compute_policy_hash(&policy);
+        let a = compute_policy_hash(&policy).expect("compute policy hash");
+        let b = compute_policy_hash(&policy).expect("compute policy hash");
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_policy_hash_changes_on_mutation() {
         let mut policy = FacPolicyV1::default_policy();
-        let a = compute_policy_hash(&policy);
+        let a = compute_policy_hash(&policy).expect("compute policy hash");
         policy.deny_ambient_cargo_home = false;
-        let b = compute_policy_hash(&policy);
+        let b = compute_policy_hash(&policy).expect("compute policy hash");
         assert_ne!(a, b);
     }
 
     #[test]
-    fn test_canonical_bytes_collision_resistance() {
+    fn test_policy_hash_collision_resistance() {
         let mut policy1 = FacPolicyV1::default_policy();
         let policy2 = FacPolicyV1::default_policy();
 
-        assert_eq!(policy1.canonical_bytes(), policy2.canonical_bytes());
+        let hash1 = compute_policy_hash(&policy1).expect("compute policy hash");
+        let hash2 = compute_policy_hash(&policy2).expect("compute policy hash");
+        assert_eq!(hash1, hash2);
 
-        policy1.risk_tier = "Tier3".to_string();
-        assert_ne!(policy1.canonical_bytes(), policy2.canonical_bytes());
+        policy1.risk_tier = RiskTier::Tier3;
+        let hash3 = compute_policy_hash(&policy1).expect("compute policy hash");
+        assert_ne!(hash1, hash3);
     }
 
     #[test]
@@ -543,15 +509,49 @@ mod tests {
     #[test]
     fn test_validate_rejects_oversized_strings() {
         let mut policy = FacPolicyV1::default_policy();
-        policy.risk_tier = "x".repeat(MAX_STRING_LENGTH + 1);
+        policy.cargo_target_dir = Some("x".repeat(MAX_STRING_LENGTH + 1));
 
         assert!(matches!(
             policy.validate(),
             Err(FacPolicyError::StringTooLong {
-                field: "risk_tier",
+                field: "cargo_target_dir",
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_prefixes() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.env_allowlist_prefixes.push(String::new());
+        assert!(matches!(
+            policy.validate(),
+            Err(FacPolicyError::InvalidFieldValue {
+                field: "env_allowlist_prefixes",
+                ..
+            })
+        ));
+
+        let mut policy = FacPolicyV1::default_policy();
+        policy.env_denylist_prefixes.push(String::new());
+        assert!(matches!(
+            policy.validate(),
+            Err(FacPolicyError::InvalidFieldValue {
+                field: "env_denylist_prefixes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_policy_hash_is_deterministic_with_sorted_env_vectors() {
+        let policy1 = FacPolicyV1::default_policy();
+        let mut policy2 = policy1.clone();
+        policy2.env_allowlist_prefixes.reverse();
+
+        let hash1 = compute_policy_hash(&policy1).expect("compute policy hash");
+        let hash2 = compute_policy_hash(&policy2).expect("compute policy hash");
+        assert_eq!(hash1, hash2);
     }
 
     #[test]

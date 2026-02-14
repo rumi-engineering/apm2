@@ -340,14 +340,6 @@ impl FacJobReceiptV1 {
         bytes.extend_from_slice(&(self.job_spec_digest.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.job_spec_digest.as_bytes());
 
-        if let Some(policy_hash) = &self.policy_hash {
-            bytes.push(1u8);
-            bytes.extend_from_slice(&(policy_hash.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(policy_hash.as_bytes());
-        } else {
-            bytes.push(0u8);
-        }
-
         let outcome_str = serde_json::to_string(&self.outcome).unwrap_or_default();
         bytes.extend_from_slice(&(outcome_str.len() as u32).to_be_bytes());
         bytes.extend_from_slice(outcome_str.as_bytes());
@@ -466,16 +458,9 @@ impl FacJobReceiptV1 {
             ));
         }
         if let Some(policy_hash) = &self.policy_hash {
-            if policy_hash.len() > MAX_STRING_LENGTH {
-                return Err(FacJobReceiptError::StringTooLong {
-                    field: "policy_hash",
-                    actual: policy_hash.len(),
-                    max: MAX_STRING_LENGTH,
-                });
-            }
-            if !is_valid_b3_256_digest(policy_hash) {
+            if !is_strict_b3_256_digest(policy_hash) {
                 return Err(FacJobReceiptError::InvalidData(
-                    "policy_hash must be 'b3-256:<64 hex>'".to_string(),
+                    "policy_hash must be exactly 71 chars in b3-256:<64hex> format".to_string(),
                 ));
             }
         }
@@ -703,16 +688,9 @@ impl FacJobReceiptV1Builder {
         }
 
         if let Some(policy_hash) = &self.policy_hash {
-            if policy_hash.len() > MAX_STRING_LENGTH {
-                return Err(FacJobReceiptError::StringTooLong {
-                    field: "policy_hash",
-                    actual: policy_hash.len(),
-                    max: MAX_STRING_LENGTH,
-                });
-            }
-            if !is_valid_b3_256_digest(policy_hash) {
+            if !is_strict_b3_256_digest(policy_hash) {
                 return Err(FacJobReceiptError::InvalidData(
-                    "policy_hash must be 'b3-256:<64 hex>'".to_string(),
+                    "policy_hash must be exactly 71 chars in b3-256:<64hex> format".to_string(),
                 ));
             }
         }
@@ -871,6 +849,10 @@ pub fn compute_job_receipt_content_hash(receipt: &FacJobReceiptV1) -> String {
 
 fn is_valid_b3_256_digest(value: &str) -> bool {
     parse_b3_256_digest(value).is_some()
+}
+
+fn is_strict_b3_256_digest(value: &str) -> bool {
+    value.len() == 71 && value.starts_with("b3-256:") && is_valid_b3_256_digest(value)
 }
 
 /// Persist a content-addressed job receipt.
@@ -1622,6 +1604,18 @@ pub mod tests {
     }
 
     #[test]
+    fn test_fac_job_receipt_validate_rejects_invalid_policy_hash() {
+        let mut receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        receipt.policy_hash = Some("not-a-digest".to_string());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::InvalidData { .. })
+        ));
+    }
+
+    #[test]
     fn test_fac_job_receipt_validate_rejects_missing_boundary_for_completed() {
         let mut receipt =
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
@@ -1731,6 +1725,35 @@ pub mod tests {
         assert!(matches!(
             result,
             Err(FacJobReceiptError::MissingField("denial_reason"))
+        ));
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_rejects_invalid_policy_hash() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-007",
+            "job-007",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .policy_hash("x")
+        .outcome(FacJobOutcome::Completed)
+        .reason("ok")
+        .timestamp_secs(1_700_000_004)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .try_build();
+
+        assert!(matches!(
+            result,
+            Err(FacJobReceiptError::InvalidData { .. })
         ));
     }
 
