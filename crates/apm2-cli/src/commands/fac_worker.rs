@@ -80,10 +80,11 @@ use apm2_core::fac::job_spec::{
 };
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::{
-    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
-    FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, MAX_POLICY_SIZE,
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES, DenialReasonCode,
+    FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, MAX_POLICY_SIZE,
     QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, compute_policy_hash,
     deserialize_policy, parse_policy_hash, persist_content_addressed_receipt, persist_policy,
+    run_preflight,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -1028,6 +1029,33 @@ fn process_job(
             reason: "no lane available, returning to pending".to_string(),
         };
     };
+
+    if let Err(error) = run_preflight(fac_root, &lane_mgr, DEFAULT_MIN_FREE_BYTES) {
+        if let Err(move_err) = move_to_dir_safe(
+            &claimed_dir.join(&file_name),
+            &queue_root.join(DENIED_DIR),
+            &file_name,
+        ) {
+            eprintln!("worker: WARNING: failed to move job to denied: {move_err}");
+        }
+        let reason = format!("preflight failed: {error:?}");
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::InsufficientDiskSpace),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied {
+            reason: format!("preflight failed: {error:?}"),
+        };
+    }
 
     // Step 7: Execute job under containment.
     //

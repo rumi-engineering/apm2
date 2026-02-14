@@ -242,6 +242,8 @@ pub enum DenialReasonCode {
     LaneAcquisitionFailed,
     /// General validation failure.
     ValidationFailed,
+    /// Disk pressure preflight rejected job due to insufficient free space.
+    InsufficientDiskSpace,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -1836,6 +1838,10 @@ pub mod tests {
                 "\"lane_acquisition_failed\"",
             ),
             (DenialReasonCode::ValidationFailed, "\"validation_failed\""),
+            (
+                DenialReasonCode::InsufficientDiskSpace,
+                "\"insufficient_disk_space\"",
+            ),
         ];
 
         for (variant, expected) in map {

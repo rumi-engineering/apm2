@@ -84,6 +84,12 @@ pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
 pub mod flake_class;
+/// Garbage-collection planner and execution primitives.
+#[allow(missing_docs)]
+pub mod gc;
+/// Garbage-collection receipt schema and persistence helpers.
+#[allow(missing_docs)]
+pub mod gc_receipt;
 pub mod harness_sandbox;
 pub mod job_spec;
 mod key_policy;
@@ -94,6 +100,9 @@ mod node_identity;
 pub mod policy;
 pub mod policy_inheritance;
 mod policy_resolution;
+/// Disk preflight and auto-GC escalation policy.
+#[allow(missing_docs)]
+pub mod preflight;
 pub mod projection;
 pub mod projection_compromise;
 pub mod projection_receipt_recorded;
@@ -221,6 +230,11 @@ pub use echo_trap::{
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
+pub use gc::{GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc};
+pub use gc_receipt::{
+    DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
+    MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,
+};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
@@ -536,6 +550,7 @@ pub use node_identity::{
     NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
     load_or_default_boundary_id, load_or_derive_node_fingerprint,
 };
+pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
 // Re-export safe rmtree types (TCK-00516)
 pub use safe_rmtree::{
     MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,

@@ -69,7 +69,7 @@ use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::role_launch::{self, RoleLaunchArgs};
-use crate::commands::{fac_pr, fac_review};
+use crate::commands::{fac_gc, fac_pr, fac_review};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -224,6 +224,8 @@ pub enum FacSubcommand {
     /// Provides `auth-setup` for bootstrapping credentials and
     /// `auth-check` for verifying they are accessible.
     Pr(fac_pr::PrArgs),
+    /// Garbage collect stale FAC artifacts under `~/.apm2/private/fac`.
+    Gc(fac_gc::GcArgs),
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -1377,6 +1379,7 @@ pub fn run_fac(
             | FacSubcommand::Lane(_)
             | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
+            | FacSubcommand::Gc(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -1659,6 +1662,7 @@ pub fn run_fac(
             json_output,
         ),
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
+        FacSubcommand::Gc(args) => fac_gc::run_gc(args),
     }
 }
 
