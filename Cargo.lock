@@ -109,6 +109,7 @@ dependencies = [
  "anyhow",
  "apm2-core",
  "apm2-daemon",
+ "base64",
  "blake3",
  "bytes",
  "chrono",

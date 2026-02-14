@@ -350,3 +350,23 @@ deletion primitive for lane cleanup and reset operations.
 - [INV-RMTREE-010] Paths containing `.` or `..` components are rejected
   immediately (not filtered). On Unix, raw byte scanning catches `.`
   segments that `Path::components()` silently normalizes away.
+
+### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
+
+**Core type**: `RepoMirrorManager`
+- Manages bare git mirrors under `$APM2_HOME/private/fac/repo_mirror/<repo_id>.git`
+- Bounded mirror count: MAX_MIRROR_COUNT (64), LRU eviction
+- Symlink-safe: uses `core.symlinks=false` for all checkouts
+- Command injection prevention: URL protocol allowlist, `--` separators
+
+**Key methods**:
+- `ensure_mirror(repo_id, remote_url)` — Initialize or update bare mirror
+- `checkout_to_lane(repo_id, head_sha, workspace, allowed_parent)` — Checkout specific SHA to lane workspace
+- `apply_patch(workspace, patch_bytes)` — Apply patch via stdin to git apply, returns BLAKE3 digest
+
+**Security invariants**:
+- All git commands use `std::process::Command` (no shell expansion)
+- `GIT_TERMINAL_PROMPT=0` prevents interactive prompts
+- `core.symlinks=false` prevents symlink creation in workspaces
+- `--no-hardlinks` prevents object sharing between mirror and workspace
+- Path traversal prevention delegated to `git apply` (standard git safety)
