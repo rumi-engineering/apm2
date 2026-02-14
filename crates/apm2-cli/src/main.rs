@@ -167,7 +167,11 @@ enum Commands {
 /// Daemon-level management subcommands.
 pub enum DaemonSubcommand {
     /// Install and enable the apm2-daemon systemd user service.
-    Install,
+    Install {
+        /// Enable linger for user services after logout
+        #[arg(long)]
+        enable_linger: bool,
+    },
 
     /// Run daemon health checks and prerequisite validation.
     Doctor {
@@ -321,7 +325,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon { no_daemon, command } => match command {
-            Some(DaemonSubcommand::Install) => commands::daemon::install(),
+            Some(DaemonSubcommand::Install { enable_linger }) => {
+                commands::daemon::install(enable_linger)
+            },
             Some(DaemonSubcommand::Doctor { json }) => {
                 commands::daemon::doctor(&socket_path, &cli.config, json)
             },
