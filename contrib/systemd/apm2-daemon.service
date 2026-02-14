@@ -7,20 +7,27 @@ Requires=apm2-daemon.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/apm2 daemon --no-daemon
-ExecStop=/usr/local/bin/apm2 kill
+# Adjust this path to match your deployment layout if different.
+ExecStart=%h/.cargo/bin/apm2 daemon --no-daemon
+ExecStop=%h/.cargo/bin/apm2 kill
 Restart=always
 RestartSec=5
 WatchdogSec=300
-WorkingDirectory=%h
-Environment=APM2_HOME=%h/.apm2
+DynamicUser=yes
+StateDirectory=apm2
+CacheDirectory=apm2
+LogsDirectory=apm2
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+WorkingDirectory=/var/lib/apm2
+Environment=APM2_HOME=/var/lib/apm2
 Environment=RUST_LOG=info
-LoadCredential=gh-token:%h/.apm2/private/creds/gh-token
+LoadCredential=gh-token:/var/lib/apm2/private/creds/gh-token
 Sockets=apm2-daemon.socket
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.apm2
-NoNewPrivileges=yes
+ProtectHome=yes
+ReadWritePaths=/var/lib/apm2
 PrivateTmp=yes
 
 [Install]

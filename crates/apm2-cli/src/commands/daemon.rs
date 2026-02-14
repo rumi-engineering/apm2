@@ -35,7 +35,7 @@ const FAC_RUNTIME_SUBDIRS: [&str; 13] = [
 
 const USER_SYSTEMD_DIR: &str = ".config/systemd/user";
 
-const DAEMON_SERVICE: &str = "\
+const DAEMON_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 Daemon — Forge Admission Cycle broker\n\
 Documentation=https://github.com/guardian-intelligence/apm2\n\
@@ -45,12 +45,12 @@ Requires=apm2-daemon.socket\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/bin/apm2 daemon --no-daemon\n\
-ExecStop=/usr/local/bin/apm2 kill\n\
+ExecStart=%exe_path% daemon --no-daemon\n\
+ExecStop=%exe_path% kill\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
-WorkingDirectory=%h\n\
+WorkingDirectory=%h/.apm2\n\
 Environment=APM2_HOME=%h/.apm2\n\
 Environment=RUST_LOG=info\n\
 Environment=XDG_RUNTIME_DIR=%t\n\
@@ -66,7 +66,7 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
-const WORKER_SERVICE: &str = "\
+const WORKER_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker\n\
 Documentation=https://github.com/guardian-intelligence/apm2\n\
@@ -76,11 +76,11 @@ Requires=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/bin/apm2 fac worker --poll-interval 10\n\
+ExecStart=%exe_path% fac worker --poll-interval 10\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
-WorkingDirectory=%h\n\
+WorkingDirectory=%h/.apm2\n\
 Environment=APM2_HOME=%h/.apm2\n\
 Environment=RUST_LOG=info\n\
 LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
@@ -94,7 +94,7 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
-const WORKER_TEMPLATE_SERVICE: &str = "\
+const WORKER_TEMPLATE_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker (%i)\n\
 Documentation=https://github.com/guardian-intelligence/apm2\n\
@@ -104,11 +104,11 @@ Requires=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/bin/apm2 fac worker --poll-interval 10\n\
+ExecStart=%exe_path% fac worker --poll-interval 10\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
-WorkingDirectory=%h\n\
+WorkingDirectory=%h/.apm2\n\
 Environment=APM2_HOME=%h/.apm2\n\
 Environment=RUST_LOG=info\n\
 LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
@@ -165,7 +165,14 @@ pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
 }
 
 /// Install the systemd user service for apm2-daemon.
-pub fn install() -> Result<()> {
+pub fn install(enable_linger: bool) -> Result<()> {
+    let exe_path = std::env::current_exe()
+        .map_err(|e| anyhow!("failed to resolve current executable: {e}"))?;
+    let exe_path = exe_path
+        .canonicalize()
+        .map_err(|e| anyhow!("failed to canonicalize exe path: {e}"))?;
+    let exe_path = exe_path.display().to_string();
+
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
     let systemd_user_dir = Path::new(&home).join(USER_SYSTEMD_DIR);
     ensure_dir_exists_standard(&systemd_user_dir)
@@ -176,11 +183,15 @@ pub fn install() -> Result<()> {
     })?;
     ensure_fac_runtime_dirs(&apm2_home)?;
 
+    let daemon_service = DAEMON_SERVICE_TEMPLATE.replace("%exe_path%", &exe_path);
+    let worker_service = WORKER_SERVICE_TEMPLATE.replace("%exe_path%", &exe_path);
+    let worker_template_service = WORKER_TEMPLATE_SERVICE_TEMPLATE.replace("%exe_path%", &exe_path);
+
     let unit_files = [
-        ("apm2-daemon.service", DAEMON_SERVICE),
-        ("apm2-worker.service", WORKER_SERVICE),
-        ("apm2-worker@.service", WORKER_TEMPLATE_SERVICE),
-        ("apm2-daemon.socket", DAEMON_SOCKET),
+        ("apm2-daemon.service", daemon_service),
+        ("apm2-worker.service", worker_service),
+        ("apm2-worker@.service", worker_template_service),
+        ("apm2-daemon.socket", DAEMON_SOCKET.to_string()),
     ];
     for (filename, content) in unit_files {
         let unit_path = systemd_user_dir.join(filename);
@@ -203,21 +214,27 @@ pub fn install() -> Result<()> {
     run_user_systemctl(&["start", "apm2-daemon.socket"])?;
     run_user_systemctl(&["start", "apm2-daemon.service"])?;
 
-    if let Ok(user) = std::env::var("USER") {
-        match Command::new("loginctl")
-            .args(["enable-linger", "--", &user])
-            .status()
-        {
-            Ok(status) if !status.success() => {
-                eprintln!(
-                    "WARNING: loginctl enable-linger {user} failed with status {status}; continuing without linger"
-                );
-            },
-            Err(error) => {
-                eprintln!("WARNING: loginctl enable-linger failed: {error}");
-            },
-            _ => {},
+    if enable_linger {
+        if let Ok(user) = std::env::var("USER") {
+            match Command::new("loginctl")
+                .args(["enable-linger", "--", &user])
+                .status()
+            {
+                Ok(status) if !status.success() => {
+                    eprintln!(
+                        "WARNING: loginctl enable-linger {user} failed with status {status}; continuing without linger"
+                    );
+                },
+                Err(error) => {
+                    eprintln!("WARNING: loginctl enable-linger failed: {error}");
+                },
+                _ => {},
+            }
         }
+    } else {
+        eprintln!(
+            "info: linger not enabled. To keep services running after logout: apm2 daemon install --enable-linger"
+        );
     }
 
     println!(
