@@ -84,6 +84,7 @@ pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
 pub mod flake_class;
+mod flock_util;
 /// Garbage-collection planner and execution primitives.
 #[allow(missing_docs)]
 pub mod gc;

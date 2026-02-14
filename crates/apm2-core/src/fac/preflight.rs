@@ -1,11 +1,11 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::fs::OpenOptions;
-use std::io;
 use std::path::Path;
 
 use nix::sys::statvfs::statvfs;
 
+use crate::fac::flock_util::try_acquire_exclusive_nonblocking;
 use crate::fac::gc_receipt::{DEFAULT_MIN_FREE_BYTES, persist_gc_receipt};
 use crate::fac::lane::LaneManager;
 use crate::fac::{GC_RECEIPT_SCHEMA, execute_gc, plan_gc};
@@ -80,7 +80,7 @@ pub fn run_preflight(
                 gc_lock_path.display()
             ))
         })?;
-    let locked = flock_exclusive_nonblocking(&gc_lock_file).map_err(|error| {
+    let locked = try_acquire_exclusive_nonblocking(&gc_lock_file).map_err(|error| {
         PreflightError::Io(format!(
             "failed to acquire GC lock {}: {error}",
             gc_lock_path.display()
@@ -132,30 +132,6 @@ pub fn run_preflight(
             "insufficient disk space after gc: {after_preflight} < {threshold}"
         )))
     }
-}
-
-#[cfg(unix)]
-fn flock_exclusive_nonblocking(file: &std::fs::File) -> io::Result<bool> {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = file.as_raw_fd();
-    // SAFETY: flock is a standard POSIX call. fd is a valid file descriptor
-    // owned by `file`. LOCK_EX | LOCK_NB is non-blocking exclusive lock.
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(false);
-    }
-    Err(err)
-}
-
-#[cfg(not(unix))]
-fn flock_exclusive_nonblocking(_: &std::fs::File) -> io::Result<bool> {
-    Ok(true)
 }
 
 #[cfg(test)]

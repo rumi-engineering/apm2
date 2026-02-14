@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)]
-
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -130,17 +128,11 @@ pub fn persist_gc_receipt(
         receipt.schema = GC_RECEIPT_SCHEMA.to_string();
     }
     if receipt.receipt_id.trim().is_empty() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("clock error while generating receipt id: {error}"))?
-            .as_nanos();
+        let now = current_wall_clock_secs();
         receipt.receipt_id = now.to_string();
     }
     if receipt.timestamp_secs == 0 {
-        receipt.timestamp_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("clock error while generating timestamp: {error}"))?
-            .as_secs();
+        receipt.timestamp_secs = current_wall_clock_secs();
     }
     let content_hash = receipt.compute_content_hash()?;
     receipt.content_hash.clone_from(&content_hash);
@@ -167,6 +159,17 @@ pub fn persist_gc_receipt(
     std::fs::write(&tmp, &bytes).map_err(|error| format!("failed to write receipt: {error}"))?;
     std::fs::rename(&tmp, &path).map_err(|error| format!("failed to persist receipt: {error}"))?;
     Ok(path)
+}
+
+// SECURITY JUSTIFICATION (CTR-2501): GC receipt timestamps use wall-clock
+// time because receipt creation is an operational maintenance task, not a
+// coordinated consensus operation.
+#[allow(clippy::disallowed_methods)]
+fn current_wall_clock_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

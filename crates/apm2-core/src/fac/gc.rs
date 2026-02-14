@@ -1,24 +1,22 @@
-#![allow(clippy::disallowed_methods)]
-
 use std::fs::OpenOptions;
-use std::io;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::fac::GcReceiptV1;
+use crate::fac::flock_util::try_acquire_exclusive_nonblocking;
 use crate::fac::lane::{LaneManager, LaneState};
-use crate::fac::safe_rmtree::{SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1};
+use crate::fac::safe_rmtree::{
+    MAX_DIR_ENTRIES, SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1,
+};
 
 pub const GATE_CACHE_TTL_SECS: u64 = 2_592_000;
 pub const QUARANTINE_RETENTION_SECS: u64 = 2_592_000;
+const CARGO_HOME_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const FAC_CARGO_HOME_DIR: &str = "cargo_home";
 const FAC_LEGACY_EVIDENCE_DIR: &str = "evidence";
 /// Maximum recursion depth for directory-size estimation.
 const MAX_TRAVERSAL_DEPTH: usize = 64;
-/// Maximum number of directory entries processed during size estimation.
-const MAX_DIR_ENTRIES: usize = 100_000;
+// Must not exceed safe_rmtree::MAX_DIR_ENTRIES.
 
 #[derive(Debug, Clone)]
 pub struct GcPlan {
@@ -96,7 +94,7 @@ pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, Gc
     let cargo_home_root = fac_root.join(FAC_CARGO_HOME_DIR);
     let legacy_evidence_root = fac_root.join(FAC_LEGACY_EVIDENCE_DIR);
 
-    if cargo_home_root.exists() {
+    if cargo_home_root.exists() && is_stale_by_mtime(&cargo_home_root, CARGO_HOME_RETENTION_SECS) {
         targets.push(GcTarget {
             path: cargo_home_root.clone(),
             allowed_parent: fac_root.to_path_buf(),
@@ -141,39 +139,45 @@ pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, Gc
 /// abort early.
 #[must_use]
 pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
-    #[allow(clippy::disallowed_methods)]
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = current_wall_clock_secs();
 
     let mut actions = Vec::new();
     let mut errors = Vec::new();
 
     for target in &plan.targets {
-        match is_lane_path_locked(target) {
-            Ok(true) => {
-                errors.push(crate::fac::gc_receipt::GcError {
-                    target_path: target.path.display().to_string(),
-                    reason: "lane is not idle".to_string(),
-                });
-                continue;
-            },
-            Ok(false) => (),
-            Err(error) => {
-                eprintln!(
-                    "WARNING: lock check failed for {}: {error}, skipping",
-                    target.path.display()
-                );
-                errors.push(crate::fac::gc_receipt::GcError {
-                    target_path: target.path.display().to_string(),
-                    reason: format!("lock check failed: {error}"),
-                });
-                continue;
-            },
-        }
+        let result = if matches!(
+            target.kind,
+            crate::fac::gc_receipt::GcActionKind::LaneTarget
+                | crate::fac::gc_receipt::GcActionKind::LaneLog
+        ) {
+            let _lock_guard = match try_acquire_lane_lock(&target.path) {
+                Ok(Some(lock_guard)) => lock_guard,
+                Ok(None) => {
+                    errors.push(crate::fac::gc_receipt::GcError {
+                        target_path: target.path.display().to_string(),
+                        reason: "lane is busy or lock is unavailable".to_string(),
+                    });
+                    continue;
+                },
+                Err(error) => {
+                    eprintln!(
+                        "WARNING: lock check failed for {}: {error}, skipping",
+                        target.path.display()
+                    );
+                    errors.push(crate::fac::gc_receipt::GcError {
+                        target_path: target.path.display().to_string(),
+                        reason: format!("lock check failed: {error}"),
+                    });
+                    continue;
+                },
+            };
+            // `_lock_guard` remains alive for the scope of this deletion.
+            safe_rmtree_v1(&target.path, &target.allowed_parent)
+        } else {
+            safe_rmtree_v1(&target.path, &target.allowed_parent)
+        };
 
-        match safe_rmtree_v1(&target.path, &target.allowed_parent) {
+        match result {
             Ok(outcome) => {
                 let (files_deleted, dirs_deleted) = match outcome {
                     SafeRmtreeOutcome::Deleted {
@@ -246,6 +250,21 @@ fn safe_rmtree_error_to_string(error: SafeRmtreeError) -> String {
     }
 }
 
+// SECURITY JUSTIFICATION (CTR-2501): GC staleness and receipt timestamps use
+// wall-clock time because GC is an operational maintenance task, not a
+// coordinated consensus operation. GC decisions are local-only and do not
+// participate in HTF temporal ordering.
+//
+// The disallowed_methods lint is narrowly bypassed only for this maintenance
+// path.
+#[allow(clippy::disallowed_methods)]
+fn current_wall_clock_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn estimate_dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = Vec::from([(path.to_path_buf(), 0usize)]);
@@ -294,11 +313,11 @@ fn is_stale_by_mtime(path: &Path, ttl_seconds: u64) -> bool {
     }) else {
         return false;
     };
-    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+    let now = current_wall_clock_secs();
+    if now == 0 {
         return false;
-    };
-    now.checked_sub(Duration::from_secs(ttl_seconds))
-        .is_some_and(|cutoff| mtime < cutoff)
+    }
+    mtime.as_secs().saturating_add(ttl_seconds) <= now
 }
 
 fn infer_queue_root(fac_root: &Path) -> PathBuf {
@@ -308,16 +327,16 @@ fn infer_queue_root(fac_root: &Path) -> PathBuf {
     )
 }
 
-fn is_lane_path_locked(target: &GcTarget) -> Result<bool, std::io::Error> {
-    let lane_root = match target.path.file_name().and_then(|name| name.to_str()) {
-        Some("target" | "logs") => target.path.parent(),
+fn try_acquire_lane_lock(path: &Path) -> Result<Option<std::fs::File>, std::io::Error> {
+    let lane_root = match path.file_name().and_then(|name| name.to_str()) {
+        Some("target" | "logs") => path.parent(),
         _ => None,
     };
     let Some(lane_root) = lane_root else {
-        return Ok(false);
+        return Ok(None);
     };
     if !lane_root.exists() {
-        return Ok(false);
+        return Ok(None);
     }
     let fac_root = lane_root.parent().and_then(Path::parent).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cannot locate FAC root")
@@ -330,50 +349,20 @@ fn is_lane_path_locked(target: &GcTarget) -> Result<bool, std::io::Error> {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid lane path")
         })?;
     let lock_path = locks_dir.join(format!("{lane_name}.lock"));
+    if !lock_path.exists() {
+        return Ok(None);
+    }
     let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    match flock_exclusive_nonblocking(&lock_file) {
-        Ok(true) => {
-            #[cfg(unix)]
-            {
-                let fd = lock_file.as_raw_fd();
-                #[allow(unsafe_code)]
-                let rc = unsafe { libc::flock(fd, libc::LOCK_UN) };
-                if rc != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(false)
-        },
-        Ok(false) => Ok(true),
-        Err(error) => Err(error),
+    if try_acquire_exclusive_nonblocking(&lock_file)? {
+        Ok(Some(lock_file))
+    } else {
+        Ok(None)
     }
-}
-
-#[cfg(unix)]
-fn flock_exclusive_nonblocking(file: &std::fs::File) -> io::Result<bool> {
-    let fd = file.as_raw_fd();
-    // SAFETY: flock is a standard POSIX call. fd is a valid file descriptor
-    // owned by `file`. LOCK_EX | LOCK_NB is non-blocking exclusive lock.
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(false);
-    }
-    Err(err)
-}
-
-#[cfg(not(unix))]
-fn flock_exclusive_nonblocking(_: &std::fs::File) -> io::Result<bool> {
-    Ok(true)
 }
 
 #[cfg(test)]
