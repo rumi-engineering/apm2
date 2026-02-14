@@ -1919,6 +1919,7 @@ pub fn run_logs(
     logs::run_logs(pr_number, repo, selector_type, selector, json_output)
 }
 
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn run_gates(
     force: bool,
     quick: bool,
@@ -1927,6 +1928,8 @@ pub fn run_gates(
     pids_max: u64,
     cpu_quota: &str,
     json_output: bool,
+    direct: bool,
+    wait_timeout: u64,
 ) -> u8 {
     gates::run_gates(
         force,
@@ -1936,6 +1939,8 @@ pub fn run_gates(
         pids_max,
         cpu_quota,
         json_output,
+        direct,
+        wait_timeout,
     )
 }
 
