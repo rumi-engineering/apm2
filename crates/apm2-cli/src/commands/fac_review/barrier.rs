@@ -8,8 +8,8 @@ use std::process::Command;
 
 use super::events::emit_review_event;
 use super::types::{
-    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, QUALITY_MARKER, SECURITY_MARKER, now_iso8601_millis,
-    split_owner_repo, validate_expected_head_sha,
+    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, now_iso8601_millis, split_owner_repo,
+    validate_expected_head_sha,
 };
 
 // ── Event context resolution ────────────────────────────────────────────────
@@ -419,6 +419,37 @@ pub fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, Str
     Ok(sha)
 }
 
+pub fn fetch_pr_head_sha_local(pr_number: u32) -> Result<String, String> {
+    let owner_repo = super::target::derive_repo_from_origin()?;
+
+    // When on a branch associated with this PR, git rev-parse HEAD is authoritative
+    if let Ok(branch) = super::target::current_branch() {
+        if let Some(identity) = super::projection_store::load_branch_identity(&owner_repo, &branch)?
+        {
+            if identity.pr_number == pr_number {
+                if let Ok(workspace_sha) = super::target::current_head_sha() {
+                    validate_expected_head_sha(&workspace_sha)?;
+                    return Ok(workspace_sha.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    // Cross-branch fallback: trust projection store cache
+    if let Some(identity) = super::projection_store::load_pr_identity(&owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
+    }
+
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; run local FAC push/dispatch first or pass --sha explicitly"
+    ))
+}
+
 pub fn ensure_gh_cli_ready() -> Result<(), String> {
     let output = Command::new("gh")
         .args(["auth", "status"])
@@ -438,6 +469,12 @@ pub fn ensure_gh_cli_ready() -> Result<(), String> {
     }
 }
 
+pub fn resolve_local_reviewer_identity() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown_local_user".to_string())
+}
+
 pub fn resolve_authenticated_gh_login() -> Option<String> {
     let output = Command::new("gh")
         .args(["api", "user", "--jq", ".login"])
@@ -448,27 +485,6 @@ pub fn resolve_authenticated_gh_login() -> Option<String> {
     }
     let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if login.is_empty() { None } else { Some(login) }
-}
-
-fn review_type_for_marker(marker: &str) -> Option<&'static str> {
-    if marker == SECURITY_MARKER {
-        Some("security")
-    } else if marker == QUALITY_MARKER {
-        Some("code-quality")
-    } else {
-        None
-    }
-}
-
-fn comment_matches_review_dimension(body_lower: &str, review_type: &str) -> bool {
-    match review_type {
-        "security" => body_lower.contains("## security review:"),
-        "code-quality" => {
-            body_lower.contains("## code quality review:")
-                || body_lower.contains("## quality review:")
-        },
-        _ => false,
-    }
 }
 
 fn strip_existing_metadata_block(body: &str, marker: &str) -> String {
@@ -563,142 +579,10 @@ fn patch_issue_comment_body(owner_repo: &str, comment_id: u64, body: &str) -> Re
     Ok(())
 }
 
-pub fn confirm_review_posted(
-    owner_repo: &str,
-    pr_number: u32,
-    marker: &str,
-    head_sha: &str,
-    expected_author_login: Option<&str>,
-) -> Result<Option<super::types::PostedReview>, String> {
-    let marker_lower = marker.to_ascii_lowercase();
-    let head_sha_lower = head_sha.to_ascii_lowercase();
-    let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
-    let review_type = review_type_for_marker(marker);
-
-    for page in 1..=super::types::COMMENT_CONFIRM_MAX_PAGES {
-        let endpoint =
-            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
-        let output = Command::new("gh")
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-
-        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| format!("failed to parse comments response: {err}"))?;
-        let comments = payload
-            .as_array()
-            .ok_or_else(|| "comments response was not an array".to_string())?;
-        if comments.is_empty() {
-            break;
-        }
-
-        for comment in comments.iter().rev() {
-            let body = comment
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let body_lower = body.to_ascii_lowercase();
-            let has_marker_and_sha =
-                body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower);
-
-            let author_login = comment
-                .get("user")
-                .and_then(|value| value.get("login"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let author_lower = author_login.to_ascii_lowercase();
-
-            if let Some(expected_author) = expected_author_lower.as_deref() {
-                if author_lower != expected_author {
-                    continue;
-                }
-            }
-
-            let id = comment
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if has_marker_and_sha && id != 0 {
-                return Ok(Some(super::types::PostedReview {
-                    id,
-                    verdict: super::detection::extract_verdict_from_comment_body(body),
-                }));
-            }
-
-            let should_generate = review_type.is_some_and(|kind| {
-                id != 0
-                    && comment_matches_review_dimension(&body_lower, kind)
-                    && body_lower.contains(&head_sha_lower)
-            });
-            if !should_generate {
-                continue;
-            }
-
-            let reviewer_id = if author_login.is_empty() {
-                expected_author_login.unwrap_or("unknown")
-            } else {
-                author_login
-            };
-            let generated = render_comment_with_generated_metadata(
-                body,
-                marker,
-                review_type.unwrap_or(""),
-                pr_number,
-                head_sha,
-                reviewer_id,
-            )?;
-            if generated == body {
-                continue;
-            }
-            patch_issue_comment_body(owner_repo, id, &generated)?;
-            return Ok(Some(super::types::PostedReview {
-                id,
-                verdict: super::detection::extract_verdict_from_comment_body(&generated),
-            }));
-        }
-    }
-    Ok(None)
-}
-
-pub fn confirm_review_posted_with_retry(
-    owner_repo: &str,
-    pr_number: u32,
-    marker: &str,
-    head_sha: &str,
-    expected_author_login: Option<&str>,
-) -> Result<Option<super::types::PostedReview>, String> {
-    for attempt in 0..super::types::COMMENT_CONFIRM_MAX_ATTEMPTS {
-        let maybe_review = confirm_review_posted(
-            owner_repo,
-            pr_number,
-            marker,
-            head_sha,
-            expected_author_login,
-        )?;
-        if maybe_review.is_some() {
-            return Ok(maybe_review);
-        }
-        if attempt + 1 < super::types::COMMENT_CONFIRM_MAX_ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{render_comment_with_generated_metadata, review_type_for_marker};
+    use super::render_comment_with_generated_metadata;
     use crate::commands::fac_review::types::{QUALITY_MARKER, SECURITY_MARKER};
-
-    #[test]
-    fn review_type_for_marker_maps_known_markers() {
-        assert_eq!(review_type_for_marker(SECURITY_MARKER), Some("security"));
-        assert_eq!(review_type_for_marker(QUALITY_MARKER), Some("code-quality"));
-        assert_eq!(review_type_for_marker("<!-- unknown -->"), None);
-    }
 
     #[test]
     fn render_comment_with_generated_metadata_appends_block() {

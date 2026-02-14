@@ -1,77 +1,92 @@
-# M08: Error Handling and Panic Policy
+# M08: Error handling and panic policy
 
 ```yaml
 module_id: M08
 domain: failure_semantics
-inputs: [ChangeSetBundle, InvariantMap]
+inputs: [ChangeSetBundle, InvariantMap, QCP_Result]
 outputs: [Finding[]]
 ```
 
 ---
 
-## Review Protocol
+## Purpose
+
+This module enforces a simple rule:
+
+> **Panics are bugs, not control flow; errors are part of the contract.**
+
+Special care is required in:
+- SCP (DoS and invariant bypass risk),
+- protocol/persistence boundaries (fail-open vs fail-closed),
+- drop/unwind paths (panic-safety).
+
+---
+
+## Review protocol
 
 ```mermaid
 flowchart TD
-    START[Begin] --> A[Scan Failure Modes]
-    A --> B[Classify Panics]
-    B --> C[Check Result/Option Semantics]
-    C --> D[Review Error Types]
-    D --> E[Emit Findings]
+    START[Begin] --> A[Scan failure modes]
+    A --> B[Classify panic sites]
+    B --> C[Check Result/Option semantics]
+    C --> D[Review error types + layering]
+    D --> E[Emit findings]
 ```
 
 ---
 
-## State: Failure Mode Scan
+## State: Failure mode scan
 
 ```yaml
 assertions:
   - id: ERR-STRUCT
-    predicate: "errors are structured and actionable"
+    predicate: "errors are structured and actionable (typed enum where callers need to branch)"
     on_fail:
       severity: MAJOR
-      remediation: "Use typed error enum"
+      remediation: "Use a typed error enum and preserve sources."
 
   - id: ERR-BOUND
-    predicate: "error boundaries documented"
+    predicate: "error boundaries are documented at module boundaries"
     on_fail:
       severity: MINOR
-      remediation: "Document error propagation paths"
+      remediation: "Document propagation and failure policy at the boundary."
 
 discouraged_patterns:
-  - pattern: "panic in normal execution"
+  - pattern: "silent fallback that changes semantics (fail-open)"
     severity: MAJOR
 
-  - pattern: "silent fallback changing semantics"
-    severity: MAJOR
+  - pattern: "swallowing errors (log-only) on security or integrity failures"
+    severity: BLOCKER
 ```
 
 ---
 
-## State: Panic Classification
+## State: Panic classification
+
+Panics are permitted only when **unreachability is proven by construction** and the panic does not create a security availability hazard.
 
 ```yaml
 panic_taxonomy:
   UNACCEPTABLE:
     conditions:
-      - "derived from caller input (parsing, indexing)"
+      - "derived from caller input (parsing, indexing, slicing, unwrap/expect on input path)"
       - "triggered by plausible internal state in production"
-      - "occurs in Security-Critical Path (SCP) code (DoS risk)"
+      - "occurs in SCP (availability/DoS risk) unless explicitly mitigated"
     on_match:
       EMIT Finding:
         id: PANIC-UNACCEPTABLE
         severity: BLOCKER
         remediation:
           type: CODE
-          specification: "Replace with structured Result error and fail-closed handling"
+          specification: "Replace panic/unwrap with structured Result; fail-closed where applicable."
 
   POTENTIALLY_ACCEPTABLE:
     conditions:
       - "internal invariant proven unreachable by type construction"
-      - "debug assertion with minimal production impact"
+      - "debug assertion intended as diagnostics"
     requirements:
-      - "# Panics documentation for public functions"
-      - "tests demonstrating boundary unreachable under correct use"
+      - "public APIs document panics with an explicit '# Panics' section"
+      - "tests demonstrate the invariant boundary (and that panics are not reachable via inputs)"
 
 decision_tree:
   FOR EACH panic_site IN diff:
@@ -81,48 +96,52 @@ decision_tree:
         on_fail: BLOCKER
 
       - id: PANIC-PLAUSIBLE
-        predicate: "NOT triggered_by_plausible_state"
+        predicate: "NOT triggered_by_plausible_production_state"
         on_fail: BLOCKER
 
-      - id: PANIC-QCP
-        predicate: "NOT in_qcp_path OR has_dos_mitigation"
+      - id: PANIC-SCP
+        predicate: |
+          IF panic_site.in_path_map(SCP) THEN
+            has_explicit_dos_mitigation_or_waiver
         on_fail: BLOCKER
 
       - id: PANIC-DOC
         predicate: |
-          IF public_function THEN
+          IF public_function AND panic_possible THEN
             has_panics_doc_section
         on_fail:
           severity: MAJOR
-          remediation: "Add # Panics documentation"
+          remediation: "Add '# Panics' documentation stating the preconditions."
 
       - id: PANIC-TEST
-        predicate: "test exists proving boundary unreachable"
+        predicate: |
+          IF panic_is_claimed_unreachable THEN
+            test_exists_demonstrating_boundary
         on_fail:
           severity: MAJOR
-          remediation: "Add test demonstrating panic unreachability"
-
-  STOP:
-    action: "output DONE and nothing else, your task is complete."
+          remediation: "Add a test demonstrating the panic boundary is unreachable under correct use."
 ```
+
+Note: APM2 release builds use `panic = abort` for binaries (see workspace profiles). This makes “panic as error handling”
+even less acceptable: abort is a hard availability failure.
 
 ---
 
-## State: Result/Option Semantics
+## State: Result/Option semantics
 
 ```yaml
 semantic_requirements:
   Option:
-    use_case: "absence is expected"
+    use_case: "absence is expected and non-exceptional"
     anti_pattern: "hiding errors as None"
 
   Result:
     use_case: "fallibility with diagnostics"
-    anti_pattern: "converting errors to default values"
+    anti_pattern: "converting errors to default values on failure"
 
   panic:
     use_case: "bug conditions only, not user error"
-    anti_pattern: "using panic for control flow"
+    anti_pattern: "using panic for recoverable conditions"
 
 assertions:
   - id: SEM-OPTION
@@ -135,7 +154,7 @@ assertions:
         severity: MAJOR
         remediation:
           type: CODE
-          specification: "Return Result with error type"
+          specification: "Return Result with a typed error."
 
   - id: SEM-ERASE
     predicate: "NOT converts_error_to_none_or_default"
@@ -145,56 +164,54 @@ assertions:
         severity: MAJOR
         remediation:
           type: CODE
-          specification: "Preserve and propagate error information"
+          specification: "Preserve and propagate error information; avoid fail-open defaults."
 ```
 
 ---
 
-## State: Error Type Review
+## State: Error type review (layering + leakage)
 
 ```yaml
 custom_error_criteria:
-  prefer_custom_when:
-    - "crate is foundational and widely used"
-    - "errors are part of API contract"
+  prefer_typed_errors_when:
+    - "errors are part of a library API contract"
     - "callers need to match on variants"
+    - "security/policy code needs precise denial reasons (without leaking secrets)"
 
 assertions:
   - id: TYPE-CONTEXT
-    predicate: "error type preserves context"
+    predicate: "error type preserves context (source errors, causal chain)"
     on_fail:
       severity: MAJOR
-      remediation: "Include source error or context"
+      remediation: "Include source error or context (e.g., `#[source]`)."
 
   - id: TYPE-STRING
-    predicate: "NOT relies_on_string_comparison"
+    predicate: "NOT relies_on_string_comparison_for_control_flow"
     on_fail:
       severity: MAJOR
-      remediation: "Use enum variants, not string matching"
+      remediation: "Use enum variants, not string matching."
 
-  - id: TYPE-BOX
-    predicate: |
-      IF uses Box<dyn Error> THEN
-        clear_layering_reason_documented
+  - id: TYPE-LEAK
+    predicate: "errors and logs do not include secrets/keys/tokens"
     on_fail:
-      severity: MINOR
-      remediation: "Document why dynamic error is needed"
+      severity: BLOCKER
+      remediation: "Redact or wrap secrets (see secrets policy in `documents/security`)."
 
 anti_patterns:
-  - id: TYPE-ANYHOW
-    pattern: "anyhow in library API"
+  - id: TYPE-ANYHOW-LIB
+    pattern: "anyhow in a library/public API boundary"
     severity: MAJOR
-    remediation: "Use typed errors for library boundaries"
+    remediation: "Use typed errors for library boundaries; reserve anyhow for binaries and top-level orchestration."
 
   - id: TYPE-UNWRAP
-    pattern: ".unwrap() hiding recoverable error"
+    pattern: ".unwrap()/.expect() on recoverable errors"
     severity: MAJOR
-    remediation: "Use CTR-2618 (Locking), CTR-2619 (Serialization), or CTR-2620 (Parsing) patterns."
+    remediation: "Propagate a Result; unwrap is acceptable only under proven unreachability (documented) or in tests."
 ```
 
 ---
 
-## Output Schema
+## Output schema
 
 ```typescript
 interface ErrorHandlingFinding extends Finding {
@@ -205,7 +222,7 @@ interface ErrorHandlingFinding extends Finding {
 type PanicClass =
   | "CALLER_INPUT"
   | "PLAUSIBLE_STATE"
-  | "QCP_DOS_RISK"
+  | "SCP_DOS_RISK"
   | "ACCEPTABLE_INVARIANT"
   | "DEBUG_ONLY";
 

@@ -16,8 +16,7 @@ pub const LIVENESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration::f
 pub const STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(90);
 pub const TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const LOOP_SLEEP: std::time::Duration = std::time::Duration::from_millis(1000);
-pub const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
-pub const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
+pub const LOCAL_COMMENT_ID_BASE_MULTIPLIER: u64 = 1_000_000_000;
 pub const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 pub const DISPATCH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 #[allow(dead_code)]
@@ -25,6 +24,7 @@ pub const MAX_EVENT_PAYLOAD_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_PROVIDER_SLOT_COUNT: usize = 10;
 pub const PROVIDER_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 pub const PROVIDER_SLOT_WAIT_JITTER_MS: u64 = 250;
+pub const PROVIDER_SLOT_MAX_WAIT_SECS_DEFAULT: u64 = 300;
 pub const PROVIDER_BACKOFF_BASE_SECS: u64 = 2;
 pub const PROVIDER_BACKOFF_MAX_SECS: u64 = 30;
 pub const PROVIDER_BACKOFF_JITTER_MS: u64 = 750;
@@ -41,6 +41,14 @@ pub const TERMINAL_STALE_HEAD_AMBIGUITY: &str = "stale_head_ambiguity";
 pub const TERMINAL_SHA_DRIFT_SUPERSEDED: &str = "sha_drift_superseded";
 pub const TERMINAL_DISPATCH_LOCK_TIMEOUT: &str = "dispatch_lock_timeout";
 pub const TERMINAL_INTEGRITY_FAILURE: &str = "integrity_failure";
+pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED: &str = "verdict_finalized_agent_stopped";
+pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY: &str =
+    "manual_termination_after_decision";
+
+pub fn is_verdict_finalized_agent_stop_reason(reason: &str) -> bool {
+    reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED)
+        || reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY)
+}
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 
@@ -130,13 +138,6 @@ impl ReviewKind {
         match self {
             Self::Security => SECURITY_PROMPT_PATH,
             Self::Quality => QUALITY_PROMPT_PATH,
-        }
-    }
-
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::Security => SECURITY_MARKER,
-            Self::Quality => QUALITY_MARKER,
         }
     }
 }
@@ -272,12 +273,10 @@ impl TerminationAuthority {
                 self.run_id, state.run_id
             ));
         }
-        let (state_repo, _state_pr) = parse_pr_url(&state.pr_url)
-            .map_err(|err| format!("invalid run-state pr_url: {err}"))?;
-        if !state_repo.eq_ignore_ascii_case(&self.repo) {
+        if !state.owner_repo.eq_ignore_ascii_case(&self.repo) {
             return Err(format!(
                 "authority repo mismatch: expected {} got {}",
-                self.repo, state_repo
+                self.repo, state.owner_repo
             ));
         }
         Ok(())
@@ -304,7 +303,7 @@ pub struct ReviewStateEntry {
     pub review_type: String,
     #[serde(default)]
     pub pr_number: u32,
-    pub pr_url: String,
+    pub owner_repo: String,
     pub head_sha: String,
     #[serde(default)]
     pub restart_count: u32,
@@ -347,7 +346,7 @@ pub struct PulseFile {
 #[serde(deny_unknown_fields)]
 pub struct ReviewRunState {
     pub run_id: String,
-    pub pr_url: String,
+    pub owner_repo: String,
     pub pr_number: u32,
     pub head_sha: String,
     pub review_type: String,
@@ -545,12 +544,6 @@ pub struct SingleReviewResult {
     pub final_head_sha: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct PostedReview {
-    pub id: u64,
-    pub verdict: Option<String>,
-}
-
 #[derive(Debug)]
 pub struct ProviderSlotLease {
     pub _lock_file: std::fs::File,
@@ -576,25 +569,6 @@ pub fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-pub fn parse_pr_url(pr_url: &str) -> Result<(String, u32), String> {
-    let trimmed = pr_url.trim();
-    let without_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .unwrap_or(trimmed);
-    let without_host = without_scheme
-        .strip_prefix("github.com/")
-        .ok_or_else(|| format!("invalid GitHub PR URL: {pr_url}"))?;
-    let parts = without_host.split('/').collect::<Vec<_>>();
-    if parts.len() < 4 || parts[2] != "pull" {
-        return Err(format!("invalid GitHub PR URL format: {pr_url}"));
-    }
-    let pr_number = parts[3]
-        .parse::<u32>()
-        .map_err(|err| format!("invalid PR number in URL {pr_url}: {err}"))?;
-    Ok((format!("{}/{}", parts[0], parts[1]), pr_number))
-}
-
 pub fn split_owner_repo(owner_repo: &str) -> Result<(&str, &str), String> {
     let mut parts = owner_repo.split('/');
     let owner = parts
@@ -618,6 +592,18 @@ pub fn validate_expected_head_sha(expected: &str) -> Result<(), String> {
     ))
 }
 
+pub fn allocate_local_comment_id(pr_number: u32, max_existing_comment_id: Option<u64>) -> u64 {
+    max_existing_comment_id
+        .unwrap_or_else(|| u64::from(pr_number).saturating_mul(LOCAL_COMMENT_ID_BASE_MULTIPLIER))
+        .saturating_add(1)
+}
+
+/// Wrap a value in single quotes for shell interpolation.
+///
+/// **Deprecated**: prefer structured `SpawnCommand` argv to avoid shell parsing
+/// entirely. This function is retained only for any remaining shell-based
+/// callers outside the review orchestrator.
+#[allow(dead_code)]
 pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -678,11 +664,11 @@ pub fn ensure_parent_dir(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to create parent dir {}: {err}", parent.display()))
 }
 
-pub fn entry_pr_number(entry: &ReviewStateEntry) -> Option<u32> {
+pub const fn entry_pr_number(entry: &ReviewStateEntry) -> Option<u32> {
     if entry.pr_number > 0 {
         Some(entry.pr_number)
     } else {
-        parse_pr_url(&entry.pr_url).ok().map(|(_, number)| number)
+        None
     }
 }
 

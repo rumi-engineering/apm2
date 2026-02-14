@@ -1,4 +1,4 @@
-# M10: Testing Evidence and CI
+# M10: Testing evidence and CI (Proof surface)
 
 ```yaml
 module_id: M10
@@ -9,244 +9,172 @@ outputs: [Finding[]]
 
 ---
 
-## Review Protocol
+## Purpose
+
+This module answers a single question:
+
+> **Is there enough independent evidence to believe the change is correct under the supported matrix?**
+
+Where evidence is missing, this module fails closed for QCP.
+
+---
+
+## Review protocol
 
 ```mermaid
 flowchart TD
-    START[Begin] --> A[Test Expectations Check]
-    A --> B[Anti-Pattern Scan]
-    B --> C[Property/Model Test Review]
-    C --> D[Specialized Tool Check]
-    D --> E[Feature Matrix Validation]
-    E --> F[Doc Test Validation]
-    F --> G[CI Evidence Review]
-    G --> H[Emit Findings]
+    START[Begin] --> A[Baseline CI gate check]
+    A --> B[Regression test expectations]
+    B --> C[Negative / rejection-path tests]
+    C --> D[Tool-backed evidence by QCP category]
+    D --> E[Build matrix / cfg coverage]
+    E --> F[Emit findings]
 ```
 
 ---
 
-## State: Test Expectations Check
+## Baseline CI gate check (APM2 reality)
+
+APM2 has a canonical “single entrypoint” for local CI: `scripts/ci/run_local_ci_orchestrator.sh`.
+
+```yaml
+baseline_expected_gates_for_rust_changes:
+  - rustfmt: "cargo fmt --check"
+  - clippy: "cargo clippy ... -D warnings"
+  - docs: "cargo doc -D warnings"
+  - unit_integration: "cargo nextest run (or cargo test) with workspace defaults"
+  - doctests: "cargo test --doc"
+  - msrv: "cargo +<MSRV> check --workspace --all-features (if rust-version is set)"
+  - supply_chain:
+      - "cargo deny check all"
+      - "cargo audit (with explicit ignores documented)"
+
+assertions:
+  - id: CI-BASELINE-001
+    predicate: |
+      IF diff.touches_rust_code THEN
+        ci_evidence.includes_all(baseline_expected_gates_for_rust_changes)
+    on_fail:
+      EMIT Finding:
+        id: CI-BASELINE-001
+        severity: MAJOR
+        remediation:
+          type: CI
+          specification: "Run/attach the canonical CI suite (or equivalent checks) and include logs/artifacts."
+```
+
+Escalation rule:
+
+- If `qcp.qcp == true` and baseline gates are missing → severity becomes **BLOCKER**.
+
+---
+
+## Regression test expectations
 
 ```yaml
 for_new_behavior:
   requirements:
-    - id: TEST-FAIL
-      predicate: "test exists that fails without change"
+    - id: TEST-REGRESSION-001
+      predicate: "a regression test exists that fails without the change"
       on_fail:
         severity: MAJOR
-        remediation: "Add regression test"
+        remediation: "Add a regression test that fails on the previous behavior."
 
-    - id: TEST-REGRESS
-      predicate: "test catches likely regression"
+    - id: TEST-REGRESSION-002
+      predicate: "tests cover likely regression axes (boundaries + error paths)"
       on_fail:
         severity: MAJOR
-        remediation: "Add regression prevention test"
+        remediation: "Add boundary + error-case tests."
 
-for_allocator_changes:
-  requirements:
-    - boundary_sizes: true
-    - alloc_free_cycles: true
-    - stale_handle_behavior: true
-    - drop_discipline: true
-    - out_of_range_handling: true
-```
-
----
-
-## State: Anti-Pattern Detection
-
-```yaml
-reject_tests_that:
+anti_patterns:
   - id: ANTITEST-PANIC
-    pattern: "only asserts code does not panic"
+    pattern: "test only asserts code does not panic"
     on_match:
       severity: MAJOR
-      remediation: "Assert specific behavior, not absence of panic"
-
-  - id: ANTITEST-HAPPY
-    pattern: "tests only happy path"
-    on_match:
-      severity: MAJOR
-      remediation: "Add error case and edge case tests"
-
-  - id: ANTITEST-SNAPSHOT
-    pattern: "snapshot without behavioral meaning"
-    on_match:
-      severity: MINOR
-      remediation: "Assert behavioral properties, not just output shape"
+      remediation: "Assert observable behavior and invariants, not the absence of panic."
 
   - id: ANTITEST-TAUTOLOGY
-    pattern: "duplicates implementation logic"
+    pattern: "test duplicates implementation logic"
     on_match:
       severity: MAJOR
-      remediation: "Test against specification, not implementation"
-
-  - id: ANTITEST-SIM-E2E
-    pattern: "E2E test simulates required runtime path (mock/stub/log-only)"
-    on_match:
-      severity: MAJOR
-      remediation: "Exercise real runtime path or add explicit waiver"
+      remediation: "Test against a spec/reference model, not a copy of the code."
 ```
 
 ---
 
-## State: Runtime-Path Evidence Requirements
-
-```yaml
-requirements:
-  - id: TEST-RUNTIME-001
-    predicate: |
-      IF requirement_claims.runtime_path THEN
-        test_executes_real_runtime_path
-    on_fail:
-      severity: MAJOR
-      remediation: "Exercise real runtime path; mocks only with explicit waiver"
-
-  - id: TEST-LEDGER-001
-    predicate: |
-      IF requirement_claims.ledger_anchored THEN
-        test.appends_via_append_verified AND
-        test.reads_back AND
-        test.verifies_signature
-    on_fail:
-      severity: MAJOR
-      remediation: "Append via append_verified, read back, and verify signature"
-
-  - id: TEST-CAS-001
-    predicate: |
-      IF requirement_claims.cas_artifact THEN
-        test.stores_to_cas AND
-        test.retrieves_and_validates_hash
-    on_fail:
-      severity: MAJOR
-      remediation: "Store artifact in CAS and verify retrieval + hash match"
-```
-
----
-
-## State: Evidence Traceability
-
-```yaml
-requirements:
-  - id: TEST-TRACE-001
-    predicate: |
-      FOR EACH bound_requirement:
-        test_matrix.references(requirement) AND
-        evidence_artifact.references(test)
-    on_fail:
-      severity: MAJOR
-      remediation: "Add requirement->test->evidence mapping (table or artifact)"
-```
-
----
-
-## State: Property/Model Test Review
-
-```yaml
-for_allocators_and_state_machines:
-  strong_recommendation:
-    - "generate random operation sequences"
-    - "compare against reference model"
-    - "enforce invariants after every step"
-
-  reference_models:
-    slab: "Vec<Option<T>>"
-    bump_arena: "no-reuse Vec"
-    pool: "HashSet of allocated"
-
-assertions:
-  - id: PROP-ALLOC
-    predicate: |
-      IF changes_core_allocator_invariants THEN
-        property_tests_exist
-    on_fail:
-      severity: MAJOR_OR_BLOCKER  # depends on risk/history
-      remediation: "Add property-based tests with reference model"
-```
-
----
-
-## State: Specialized Tool Requirements
-
-```yaml
-miri_coverage:
-  trigger: "QCP touches unsafe memory behavior"
-  requirement: "Miri CI job exists and covers path"
-  on_missing:
-    severity: MAJOR
-    remediation: "Add Miri coverage for unsafe paths"
-
-fuzz_harness:
-  trigger: "QCP touches parser/decoder"
-  requirement: "Fuzz harness exists"
-  on_missing:
-    severity: MAJOR
-    remediation: "Add fuzz harness for parser"
-
-loom_tests:
-  trigger: "QCP touches concurrency"
-  requirement: "Loom tests exist"
-  on_missing:
-    severity: MAJOR
-    remediation: "Add loom-based concurrency tests"
-
-proposal_rule:
-  IF tools_not_in_ci AND risk_justifies:
-    action: "Propose as follow-on gate"
-```
-
----
-
-## State: Security Negative Tests
+## Security negative tests (fail-closed)
 
 ```yaml
 requirements:
   - id: TEST-SEC-NEG-001
     predicate: |
-      IF requirement_claims.security_invariant THEN
+      IF qcp.categories contains SECURITY_CRITICAL_PATH OR PROTOCOL_PERSISTENCE THEN
         negative_test_exists_for_rejection_path
     on_fail:
       severity: MAJOR
-      remediation: "Add negative test proving rejection of invalid input"
+      remediation: "Add a negative test proving rejection of invalid inputs / invalid authority."
+
+escalation:
+  IF qcp.qcp == true AND requirement TEST-SEC-NEG-001 fails:
+    severity: BLOCKER
 ```
 
 ---
 
-## State: Feature Matrix Validation
+## Tool-backed evidence by QCP category
+
+### SOUNDNESS_MEMORY
 
 ```yaml
-minimum_required_ci_sets:
-  - "--no-default-features"
-  - "--all-features"
-  - "default (implicit)"
-  - "minimal supported set (if defaults heavy)"
-
-complex_feature_rules:
-  - id: FEAT-POWERSET
+requirements:
+  - id: TOOL-MIRI-001
     predicate: |
-      IF feature_count <= 8 THEN
-        powerset_testing OR justification_documented
+      IF qcp.categories contains SOUNDNESS_MEMORY THEN
+        tool_evidence.includes("miri") OR approved_waiver_exists
     on_fail:
-      severity: MAJOR
-      remediation: "Add cargo-hack --feature-powerset or document why not"
+      EMIT Finding:
+        id: TOOL-MIRI-001
+        severity: BLOCKER
+        remediation:
+          type: TEST
+          specification: "Add Miri coverage for the unsafe/memory-critical paths (or document an approved waiver)."
+```
 
-  - id: FEAT-PAIRWISE
+### CONCURRENCY_ASYNC
+
+```yaml
+requirements:
+  - id: TOOL-LOOM-001
     predicate: |
-      IF feature_count > 8 THEN
-        pairwise_testing AND problematic_combos_tested
+      IF qcp.categories contains CONCURRENCY_ASYNC AND change_introduces_custom_sync THEN
+        loom_tests_exist OR approved_waiver_exists
     on_fail:
       severity: MAJOR
-      remediation: "Add pairwise testing with known problematic combos"
+      remediation: "Add Loom model tests for concurrency primitives (or document why not applicable)."
+```
 
-additivity_check:
-  - id: FEAT-ADDITIVE
-    predicate: "features do not silently change semantics"
+Escalation: if QCP and custom synchronization is introduced → missing Loom is **BLOCKER**.
+
+### PROTOCOL_PERSISTENCE
+
+```yaml
+requirements:
+  - id: TOOL-FUZZ-001
+    predicate: |
+      IF qcp.categories contains PROTOCOL_PERSISTENCE AND parses_untrusted_bytes THEN
+        (fuzz_harness_exists OR property_tests_exist) OR approved_waiver_exists
     on_fail:
       severity: MAJOR
-      remediation: "Document semantic changes or add feature-specific tests"
+      remediation: "Add fuzzing and/or property tests for parser/decoder; enforce size/depth caps."
+```
 
-dark_code_rule:
-  - id: CFG-COVERAGE
+---
+
+## Build matrix / cfg coverage
+
+```yaml
+assertions:
+  - id: CI-CFG-001
     predicate: |
       FOR EACH new cfg(...) branch:
         ci_builds_at_least_once
@@ -256,103 +184,31 @@ dark_code_rule:
         severity: BLOCKER
         remediation:
           type: CI
-          specification: "Add CI job exercising new cfg branch"
+          specification: "Add CI coverage for new cfg/feature branches (no dark code)."
 ```
 
 ---
 
-## State: Doc Test Validation
-
-```yaml
-required_checks:
-  - command: "cargo test --doc"
-    status: must_pass
-
-  - command: "cargo doc --deny warnings"
-    status: should_pass
-
-  - feature_gated_examples:
-      predicate: "compile under relevant feature sets"
-
-edge_cases:
-  - id: DOC-COMPILE-FAIL
-    predicate: "compile_fail doctests used intentionally and minimally"
-    on_fail:
-      severity: MINOR
-      remediation: "Prefer explicit negative tests over compile_fail"
-
-  - id: DOC-IGNORE
-    predicate: |
-      cfg OR ignore annotations have justification in doc comment
-    on_fail:
-      severity: MINOR
-      remediation: "Document why example is ignored"
-
-severity_rules:
-  doctest_failures:
-    default: MAJOR
-    foundational_public_api: BLOCKER
-```
-
----
-
-## State: CI Evidence Review
-
-```yaml
-verification_checklist:
-  - formatting_checks: passed
-  - clippy_warnings_as_errors: enforced
-  - tests_relevant_targets: covered
-  - tests_relevant_features: covered
-  - doc_builds: clean
-
-ci_locations:
-  github_actions: ".github/workflows/*.yml"
-  gitlab_ci: ".gitlab-ci.yml"
-  common_names: ["ci.yml", "ci.yaml", "test.yml", "rust.yml"]
-
-assertions:
-  - id: CI-COVERAGE
-    predicate: |
-      FOR EACH changed_code_path:
-        ci_builds_and_tests_path
-    on_fail:
-      EMIT Finding:
-        id: CI-COVERAGE-001
-        severity: BLOCKER
-        remediation:
-          type: CI
-          specification: "Add CI coverage for changed code paths"
-
-  - id: CI-QCP
-    predicate: |
-      IF qcp_change THEN
-        specialized_gates_exist (bench/fuzz/miri/loom)
-    on_fail:
-      severity: MAJOR
-      remediation: "Add specialized CI gates for QCP changes"
-```
-
----
-
-## Output Schema
+## Output schema
 
 ```typescript
 interface TestingFinding extends Finding {
   test_issue?: TestIssue;
   ci_gap?: CIGap;
-  feature_matrix_issue?: FeatureMatrixIssue;
+  tool_gap?: ToolGap;
 }
 
 type TestIssue =
   | "MISSING_REGRESSION"
   | "ANTI_PATTERN"
-  | "MISSING_PROPERTY_TEST"
-  | "MISSING_SPECIALIZED_TOOL";
+  | "MISSING_NEGATIVE_TEST";
+
+type ToolGap =
+  | "MISSING_MIRI"
+  | "MISSING_LOOM"
+  | "MISSING_FUZZ_OR_PROPERTY";
 
 type CIGap =
   | "CFG_UNCOVERED"
-  | "FEATURE_UNCOVERED"
-  | "QCP_UNVERIFIED"
-  | "DOCTEST_FAILING";
+  | "BASELINE_GATES_MISSING";
 ```

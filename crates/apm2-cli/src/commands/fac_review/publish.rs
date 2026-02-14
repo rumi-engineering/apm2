@@ -5,14 +5,13 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::Serialize;
 
-use super::barrier::{
-    ensure_gh_cli_ready, fetch_pr_head_sha, render_comment_with_generated_metadata,
-    resolve_authenticated_gh_login,
-};
+use super::barrier::render_comment_with_generated_metadata;
 use super::github_projection::{self, IssueCommentResponse};
 use super::projection_store;
 use super::target::resolve_pr_target;
-use super::types::{QUALITY_MARKER, SECURITY_MARKER, validate_expected_head_sha};
+use super::types::{
+    QUALITY_MARKER, SECURITY_MARKER, allocate_local_comment_id, validate_expected_head_sha,
+};
 use crate::exit_codes::codes as exit_codes;
 
 const PUBLISH_SCHEMA: &str = "apm2.fac.review.publish.v1";
@@ -49,15 +48,12 @@ struct PublishSummary {
 pub fn run_publish(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     review_type: ReviewPublishTypeArg,
     body_file: &Path,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let reviewer_id = resolve_reviewer_id(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
 
@@ -72,8 +68,23 @@ pub fn run_publish(
         &head_sha,
         &reviewer_id,
     )?;
-    let response =
-        github_projection::create_issue_comment(&owner_repo, resolved_pr, &enriched_body)?;
+    let (comment_id, comment_url) = match github_projection::create_issue_comment(
+        &owner_repo,
+        resolved_pr,
+        &enriched_body,
+    ) {
+        Ok(response) => (response.id, response.html_url),
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to project publish comment to GitHub for PR #{resolved_pr}: {err}"
+            );
+            let fallback_id = next_local_comment_id(&owner_repo, resolved_pr)?;
+            let fallback_url = format!(
+                "local://fac_projection/{owner_repo}/pr-{resolved_pr}/issue_comments#{fallback_id}"
+            );
+            (fallback_id, fallback_url)
+        },
+    };
 
     let summary = PublishSummary {
         schema: PUBLISH_SCHEMA.to_string(),
@@ -83,8 +94,8 @@ pub fn run_publish(
         head_sha,
         review_type: review_type_label.to_string(),
         body_file: body_file.display().to_string(),
-        comment_id: response.id,
-        comment_url: response.html_url,
+        comment_id,
+        comment_url,
     };
 
     let _ = projection_store::save_trusted_reviewer_id(&owner_repo, resolved_pr, &reviewer_id);
@@ -134,24 +145,13 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "publish.resolve_head_sha",
-        ));
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
     }
 
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    let value = value.to_ascii_lowercase();
-    let _ =
-        projection_store::record_fallback_read(owner_repo, pr_number, "publish.resolve_head_sha");
-    let _ = projection_store::save_identity_with_context(
-        owner_repo,
-        pr_number,
-        &value,
-        "gh-fallback:publish.resolve_head_sha",
-    );
-    Ok(value)
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run local FAC review first"
+    ))
 }
 
 fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, String> {
@@ -159,22 +159,22 @@ fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, Strin
         return Ok(cached);
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "publish.resolve_reviewer_id",
-        ));
-    }
-
-    let reviewer_id = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for metadata reviewer_id".to_string()
-    })?;
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "publish.resolve_reviewer_id",
-    );
+    let reviewer_id = super::barrier::resolve_local_reviewer_identity();
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &reviewer_id);
     Ok(reviewer_id)
+}
+
+fn next_local_comment_id(owner_repo: &str, pr_number: u32) -> Result<u64, String> {
+    let comments =
+        projection_store::load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)?
+            .unwrap_or_default();
+    Ok(allocate_local_comment_id(
+        pr_number,
+        comments
+            .iter()
+            .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
+            .max(),
+    ))
 }
 
 pub(super) fn create_issue_comment(

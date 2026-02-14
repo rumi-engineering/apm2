@@ -13,8 +13,8 @@ use crate::exit_codes::codes as exit_codes;
 ///
 /// Returns an exit code: 0 on success, 1 if evidence gates fail or an error
 /// occurs.
-pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
-    match run_pipeline_inner(repo, pr_url, pr_number, sha) {
+pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str) -> u8 {
+    match run_pipeline_inner(repo, pr_number, sha) {
         Ok(passed) => {
             if passed {
                 exit_codes::SUCCESS
@@ -29,7 +29,7 @@ pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
     }
 }
 
-fn run_pipeline_inner(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result<bool, String> {
+fn run_pipeline_inner(repo: &str, pr_number: u32, sha: &str) -> Result<bool, String> {
     let workspace_root =
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
 
@@ -50,7 +50,7 @@ fn run_pipeline_inner(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Re
         .unwrap_or(0);
 
     for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        match dispatch_single_review(pr_url, repo, pr_number, kind, sha, dispatch_epoch) {
+        match dispatch_single_review(repo, pr_number, kind, sha, dispatch_epoch) {
             Ok(result) => {
                 eprintln!(
                     "pipeline: dispatched {} review (mode={}{})",

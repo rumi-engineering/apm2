@@ -15,6 +15,7 @@ use super::state::{
 use super::types::ReviewKind;
 use super::types::{
     MAX_RESTART_ATTEMPTS, ProjectionError, ProjectionStatus, ReviewStateFile, entry_pr_number,
+    is_verdict_finalized_agent_stop_reason,
 };
 
 // ── Projection state predicates ─────────────────────────────────────────────
@@ -405,6 +406,16 @@ fn render_state_code_from_run_state(
                     }
                 },
                 "failed" | "crashed" => {
+                    if state
+                        .terminal_reason
+                        .as_deref()
+                        .is_some_and(is_verdict_finalized_agent_stop_reason)
+                    {
+                        return format!(
+                            "done:{model}/{backend}:r{}:{head_short}",
+                            state.restart_count
+                        );
+                    }
                     let reason = state
                         .terminal_reason
                         .clone()
@@ -695,7 +706,7 @@ mod tests {
     fn sample_run_state(status: ReviewRunStatus, started_at: &str) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s2-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number: 441,
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             review_type: "security".to_string(),

@@ -1,24 +1,23 @@
-//! FAC-native per-dimension decision projection (`approve` / `deny`).
+//! FAC-native per-dimension verdict projection (`approve` / `deny`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::target::resolve_pr_target;
 use super::types::{
-    COMMENT_CONFIRM_MAX_PAGES, ReviewRunStatus, TerminationAuthority, apm2_home_dir, now_iso8601,
-    sanitize_for_path, validate_expected_head_sha,
+    ReviewRunStatus, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, TerminationAuthority,
+    allocate_local_comment_id, apm2_home_dir, now_iso8601, sanitize_for_path,
+    validate_expected_head_sha,
 };
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
-const DECISION_MARKER: &str = "apm2-review-decision:v1";
-const DECISION_SCHEMA: &str = "apm2.review.decision.v1";
+const DECISION_MARKER: &str = "apm2-review-verdict:v1";
+const DECISION_SCHEMA: &str = "apm2.review.verdict.v1";
 const PROJECTION_ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
 const PROJECTION_REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 
@@ -27,12 +26,12 @@ const CODE_QUALITY_DIMENSION: &str = "code-quality";
 const ACTIVE_DIMENSIONS: [&str; 2] = [SECURITY_DIMENSION, CODE_QUALITY_DIMENSION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum DecisionValueArg {
+pub enum VerdictValueArg {
     Approve,
     Deny,
 }
 
-impl DecisionValueArg {
+impl VerdictValueArg {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
@@ -85,6 +84,15 @@ struct ParsedDecisionComment {
     payload: DecisionComment,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ProjectionCompletionSignal {
+    pub decision: String,
+    pub verdict: String,
+    pub decision_comment_id: u64,
+    pub decision_author: String,
+    pub decision_summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectionIssueCommentsCache {
@@ -129,14 +137,13 @@ struct DimensionDecisionView {
     sha: String,
 }
 
-pub fn run_decision_show(
+pub fn run_verdict_show(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
@@ -150,20 +157,18 @@ pub fn run_decision_show(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_decision_set(
+pub fn run_verdict_set(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     dimension: &str,
-    decision: DecisionValueArg,
+    verdict: VerdictValueArg,
     reason: Option<&str>,
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
     let normalized_dimension = normalize_dimension(dimension)?;
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let comments = match fetch_issue_comments(&owner_repo, resolved_pr) {
@@ -200,28 +205,56 @@ pub fn run_decision_set(
     payload.dimensions.insert(
         normalized_dimension.to_string(),
         DecisionEntry {
-            decision: decision.as_str().to_string(),
+            decision: verdict.as_str().to_string(),
             reason: reason.unwrap_or_default().trim().to_string(),
             set_by: actor,
             set_at: now_iso8601(),
         },
     );
 
-    let active_comment_id = if let Some(existing) = latest_any {
-        update_decision_comment(&owner_repo, existing.comment.id, &payload)?;
-        existing.comment.id
+    let mut active_comment_id = latest_any.map_or_else(
+        || allocate_local_comment_id(resolved_pr, comments.iter().map(|comment| comment.id).max()),
+        |existing| existing.comment.id,
+    );
+    let mut source_comment_url = Some(format!(
+        "local://fac_projection/{owner_repo}/pr-{resolved_pr}/issue_comments#{active_comment_id}"
+    ));
+    if let Some(existing) = latest_any {
+        match update_decision_comment(&owner_repo, existing.comment.id, &payload) {
+            Ok(()) => {
+                source_comment_url = Some(format!(
+                    "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{}",
+                    existing.comment.id
+                ));
+            },
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to project decision comment update to GitHub for PR #{resolved_pr}: {err}"
+                );
+            },
+        }
     } else {
-        create_decision_comment(&owner_repo, resolved_pr, &payload)?
-    };
+        match create_decision_comment(&owner_repo, resolved_pr, &payload) {
+            Ok(comment_id) => {
+                active_comment_id = comment_id;
+                source_comment_url = Some(format!(
+                    "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{active_comment_id}"
+                ));
+            },
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to project decision comment create to GitHub for PR #{resolved_pr}: {err}"
+                );
+            },
+        }
+    }
 
     let report = build_report_from_payload(
         resolved_pr,
         &head_sha,
         &payload,
         Some(active_comment_id),
-        Some(format!(
-            "https://github.com/{owner_repo}/pull/{resolved_pr}#issuecomment-{active_comment_id}"
-        )),
+        source_comment_url.clone(),
         false,
         Vec::new(),
     );
@@ -229,6 +262,7 @@ pub fn run_decision_set(
         &owner_repo,
         resolved_pr,
         active_comment_id,
+        source_comment_url.as_deref(),
         &payload,
         &expected_author_login,
     );
@@ -236,7 +270,7 @@ pub fn run_decision_set(
         &owner_repo,
         resolved_pr,
         &head_sha,
-        "decision.set",
+        "verdict.set",
     );
     let _ = projection_store::save_trusted_reviewer_id(
         &owner_repo,
@@ -272,36 +306,51 @@ pub fn run_decision_set(
         &expected_author_login,
         &signature_for_payload(&payload),
     );
+    let home = apm2_home_dir()?;
+    let completion_receipt = super::state::ReviewRunCompletionReceipt {
+        schema: super::state::COMPLETION_RECEIPT_SCHEMA.to_string(),
+        emitted_at: now_iso8601(),
+        repo: owner_repo,
+        pr_number: resolved_pr,
+        review_type: review_state_type.to_string(),
+        run_id,
+        head_sha: head_sha.clone(),
+        decision: verdict.as_str().to_string(),
+        decision_comment_id: active_comment_id,
+        decision_author: expected_author_login,
+        decision_summary: termination_authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
+    };
 
-    let exit_code = match terminate_review_agent(&termination_authority) {
-        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => exit_codes::SUCCESS,
+    match terminate_review_agent(&termination_authority) {
+        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => {
+            super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
+            Ok(exit_codes::SUCCESS)
+        },
         Ok(TerminationOutcome::SkippedMismatch) => {
             if termination_state_non_terminal_alive {
-                // enforce lifecycle gate: decision set should only terminate active matched
-                // runs
-                exit_codes::GENERIC_ERROR
-            } else {
-                exit_codes::SUCCESS
+                return Err(format!(
+                    "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+                     termination authority mismatch while lane was alive"
+                ));
             }
+            // State has drifted but process is not confirmed alive — persist receipt
+            super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
+            Ok(exit_codes::SUCCESS)
         },
-        Ok(TerminationOutcome::IdentityFailure(reason)) => {
-            eprintln!(
-                "ERROR: review termination failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
-            );
-            exit_codes::GENERIC_ERROR
-        },
-        Ok(TerminationOutcome::IntegrityFailure(reason)) => {
-            eprintln!(
-                "ERROR: review termination integrity check failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
-            );
-            exit_codes::GENERIC_ERROR
-        },
-        Err(err) => {
-            eprintln!("WARNING: review termination step failed: {err}");
-            exit_codes::GENERIC_ERROR
-        },
-    };
-    Ok(exit_code)
+        Ok(TerminationOutcome::IdentityFailure(reason)) => Err(format!(
+            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+             reviewer termination failed (identity): {reason}"
+        )),
+        Ok(TerminationOutcome::IntegrityFailure(reason)) => Err(format!(
+            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+             reviewer termination integrity check failed: {reason}"
+        )),
+        Err(err) => Err(format!(
+            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+             reviewer termination step failed: {err}"
+        )),
+    }
 }
 
 fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Result<String, String> {
@@ -315,25 +364,13 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "decision.resolve_head_sha",
-        ));
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
     }
 
-    ensure_gh_cli_ready()?;
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    let value = value.to_ascii_lowercase();
-    let _ =
-        projection_store::record_fallback_read(owner_repo, pr_number, "decision.resolve_head_sha");
-    let _ = projection_store::save_identity_with_context(
-        owner_repo,
-        pr_number,
-        &value,
-        "gh-fallback:decision.resolve_head_sha",
-    );
-    Ok(value)
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run a local FAC flow that persists identity first"
+    ))
 }
 
 fn normalize_dimension(input: &str) -> Result<&'static str, String> {
@@ -348,47 +385,10 @@ fn normalize_dimension(input: &str) -> Result<&'static str, String> {
 }
 
 fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueComment>, String> {
-    if let Some(cached) =
+    Ok(
         projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
-    {
-        return Ok(cached);
-    }
-
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "decision.fetch_issue_comments",
-        ));
-    }
-
-    ensure_gh_cli_ready()?;
-    let mut collected = Vec::new();
-    for page in 1..=COMMENT_CONFIRM_MAX_PAGES {
-        let endpoint =
-            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
-        let output = Command::new("gh")
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "gh api failed fetching comments: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let page_comments: Vec<IssueComment> = serde_json::from_slice(&output.stdout)
-            .map_err(|err| format!("failed to parse comments response: {err}"))?;
-        if page_comments.is_empty() {
-            break;
-        }
-        collected.extend(page_comments);
-    }
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "decision.fetch_issue_comments",
-    );
-    let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &collected);
-    Ok(collected)
+            .unwrap_or_default(),
+    )
 }
 
 fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
@@ -396,22 +396,7 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         return Ok(cached);
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "decision.resolve_expected_author_login",
-        ));
-    }
-
-    ensure_gh_cli_ready()?;
-    let login = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for trusted projection comment filtering"
-            .to_string()
-    })?;
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "decision.resolve_expected_author_login",
-    );
+    let login = super::barrier::resolve_local_reviewer_identity();
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)
 }
@@ -492,7 +477,7 @@ fn build_show_report(
     let parsed = parse_decision_comments_for_author(comments, Some(expected_author_login));
     if parsed.is_empty() {
         return DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -501,7 +486,7 @@ fn build_show_report(
             source_comment_id: None,
             source_comment_url: None,
             errors: vec![format!(
-                "decision marker comment not found for trusted login `{expected_author_login}`"
+                "verdict marker comment not found for trusted login `{expected_author_login}`"
             )],
         };
     }
@@ -512,7 +497,7 @@ fn build_show_report(
         .collect::<Vec<_>>();
     if matching.is_empty() {
         return DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -521,7 +506,7 @@ fn build_show_report(
             source_comment_id: None,
             source_comment_url: None,
             errors: vec![format!(
-                "no decision projection bound to head sha {head_sha}"
+                "no verdict projection bound to head sha {head_sha}"
             )],
         };
     }
@@ -532,7 +517,7 @@ fn build_show_report(
     }
     if signatures.len() > 1 {
         return DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -541,7 +526,7 @@ fn build_show_report(
             source_comment_id: None,
             source_comment_url: None,
             errors: vec![
-                "multiple decision comments for the same sha disagree on effective state"
+                "multiple verdict comments for the same sha disagree on effective state"
                     .to_string(),
             ],
         };
@@ -552,7 +537,7 @@ fn build_show_report(
     });
     selected.map_or_else(
         || DecisionShowReport {
-            schema: "apm2.fac.review.decision.show.v1".to_string(),
+            schema: "apm2.fac.review.verdict.show.v1".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             overall_decision: "unknown".to_string(),
@@ -607,7 +592,7 @@ fn build_report_from_payload(
             }
         } else {
             fail_closed = true;
-            errors.push(format!("dimension `{dimension}` decision is missing"));
+            errors.push(format!("dimension `{dimension}` verdict is missing"));
             DimensionDecisionView {
                 dimension: dimension.to_string(),
                 decision: "unknown".to_string(),
@@ -625,7 +610,7 @@ fn build_report_from_payload(
         fail_closed = true;
     }
     DecisionShowReport {
-        schema: "apm2.fac.review.decision.show.v1".to_string(),
+        schema: "apm2.fac.review.verdict.show.v1".to_string(),
         pr_number,
         head_sha: head_sha.to_string(),
         overall_decision: overall_decision.to_string(),
@@ -803,24 +788,24 @@ pub(super) fn resolve_termination_authority_for_home(
     let parsed = parse_decision_comments_for_author(&comments, Some(&trusted_reviewer));
     let latest = latest_for_sha(&parsed, head_sha).ok_or_else(|| {
         format!(
-            "missing decision projection for PR #{pr_number} sha {head_sha} (trusted reviewer: {trusted_reviewer})"
+            "missing verdict projection for PR #{pr_number} sha {head_sha} (trusted reviewer: {trusted_reviewer})"
         )
     })?;
     let decision_entry = latest.payload.dimensions.get(dimension).ok_or_else(|| {
         format!(
-            "decision projection for PR #{pr_number} sha {head_sha} is missing `{dimension}` dimension"
+            "verdict projection for PR #{pr_number} sha {head_sha} is missing `{dimension}` dimension"
         )
     })?;
     if normalize_decision_value(&decision_entry.decision).is_none() {
         return Err(format!(
-            "decision projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
+            "verdict projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
             decision_entry.decision
         ));
     }
     let signature = signature_for_payload(&latest.payload);
     if signature.trim().is_empty() {
         return Err(format!(
-            "decision projection for PR #{pr_number} sha {head_sha} produced empty signature"
+            "verdict projection for PR #{pr_number} sha {head_sha} produced empty signature"
         ));
     }
     Ok(TerminationAuthority::from_decision_persist(
@@ -833,6 +818,55 @@ pub(super) fn resolve_termination_authority_for_home(
         &trusted_reviewer,
         &signature,
     ))
+}
+
+pub(super) fn resolve_completion_signal_from_projection_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+) -> Result<Option<ProjectionCompletionSignal>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let dimension = review_type_to_dimension(review_type)?;
+    let Ok(trusted_reviewer) = load_projection_reviewer_for_home(home, owner_repo, pr_number)
+    else {
+        return Ok(None);
+    };
+    let Ok(comments) = load_projection_issue_comments_for_home(home, owner_repo, pr_number) else {
+        return Ok(None);
+    };
+    let parsed = parse_decision_comments_for_author(&comments, Some(&trusted_reviewer));
+    let Some(latest) = latest_for_sha(&parsed, head_sha) else {
+        return Ok(None);
+    };
+    let Some(decision_entry) = latest.payload.dimensions.get(dimension) else {
+        return Ok(None);
+    };
+    let Some(decision) = normalize_decision_value(&decision_entry.decision) else {
+        return Err(format!(
+            "verdict projection for PR #{pr_number} sha {head_sha} has unsupported `{dimension}` value: {}",
+            decision_entry.decision
+        ));
+    };
+    let verdict = match decision {
+        "approve" => "PASS",
+        "deny" => "FAIL",
+        _ => unreachable!("normalize_decision_value only returns approve|deny"),
+    };
+    let signature = signature_for_payload(&latest.payload);
+    if signature.trim().is_empty() {
+        return Err(format!(
+            "verdict projection for PR #{pr_number} sha {head_sha} produced empty signature"
+        ));
+    }
+    Ok(Some(ProjectionCompletionSignal {
+        decision: decision.to_string(),
+        verdict: verdict.to_string(),
+        decision_comment_id: latest.comment.id,
+        decision_author: trusted_reviewer,
+        decision_summary: signature,
+    }))
 }
 
 fn render_decision_comment_body(payload: &DecisionComment) -> Result<String, String> {
@@ -865,34 +899,27 @@ fn cache_written_decision_comment(
     owner_repo: &str,
     pr_number: u32,
     comment_id: u64,
+    comment_url: Option<&str>,
     payload: &DecisionComment,
     trusted_login: &str,
 ) -> Result<(), String> {
     let body = render_decision_comment_body(payload)?;
-    let mut comments =
-        projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
-            .unwrap_or_default();
-
-    if let Some(existing) = comments.iter_mut().find(|comment| comment.id == comment_id) {
-        existing.body = body;
-        existing.user = Some(IssueUser {
-            login: trusted_login.to_string(),
-        });
-    } else {
-        comments.push(IssueComment {
-            id: comment_id,
-            body,
-            html_url: format!(
-                "https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"
-            ),
-            created_at: now_iso8601(),
-            user: Some(IssueUser {
-                login: trusted_login.to_string(),
-            }),
-        });
-    }
-
-    projection_store::save_issue_comments_cache(owner_repo, pr_number, &comments)
+    let comment_url = comment_url.map_or_else(
+        || {
+            format!(
+                "local://fac_projection/{owner_repo}/pr-{pr_number}/issue_comments#{comment_id}"
+            )
+        },
+        ToString::to_string,
+    );
+    projection_store::upsert_issue_comment_cache_entry(
+        owner_repo,
+        pr_number,
+        comment_id,
+        &comment_url,
+        &body,
+        trusted_login,
+    )
 }
 
 fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<(), String> {
@@ -983,17 +1010,10 @@ fn terminate_review_agent_for_home(
             authority.pr_number, authority.run_id, state.run_id
         )));
     }
-    let Some(state_repo) = super::state::extract_repo_from_pr_url(&state.pr_url) else {
+    if !state.owner_repo.eq_ignore_ascii_case(&authority.repo) {
         eprintln!(
-            "WARNING: skipping agent termination: unable to parse repo from run-state pr_url {}",
-            state.pr_url
-        );
-        return Ok(TerminationOutcome::SkippedMismatch);
-    };
-    if !state_repo.eq_ignore_ascii_case(&authority.repo) {
-        eprintln!(
-            "WARNING: skipping agent termination: run-state repo {state_repo} does not match requested repo {}",
-            authority.repo
+            "WARNING: skipping agent termination: run-state repo {} does not match requested repo {}",
+            state.owner_repo, authority.repo
         );
         return Ok(TerminationOutcome::SkippedMismatch);
     }
@@ -1055,8 +1075,8 @@ fn terminate_review_agent_for_home(
     }
 
     let mut outcome = TerminationOutcome::Killed;
-    state.status = ReviewRunStatus::Failed;
-    state.terminal_reason = Some("manual_termination_after_decision".to_string());
+    state.status = ReviewRunStatus::Done;
+    state.terminal_reason = Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED.to_string());
     if let Err(err) = super::state::write_review_run_state_for_home(home, &state).map_err(|err| {
         format!(
             "failed to persist terminal review state for PR #{}: {err}",
@@ -1073,7 +1093,7 @@ fn terminate_review_agent_for_home(
         ));
     }
 
-    eprintln!("INFO: terminated review agent pid={pid} after decision set");
+    eprintln!("INFO: terminated review agent pid={pid} after verdict finalized");
     Ok(outcome)
 }
 
@@ -1090,6 +1110,7 @@ fn write_termination_receipt(
         TerminationOutcome::IntegrityFailure(reason) => ("integrity_failure", Some(reason.clone())),
     };
     let receipt = super::state::ReviewRunTerminationReceipt {
+        schema: super::state::TERMINATION_RECEIPT_SCHEMA.to_string(),
         emitted_at: now_iso8601(),
         repo: authority.repo.clone(),
         pr_number: authority.pr_number,
@@ -1098,11 +1119,23 @@ fn write_termination_receipt(
         head_sha: authority.head_sha.clone(),
         decision_comment_id: authority.decision_comment_id,
         decision_author: authority.decision_author.clone(),
-        decision_signature: authority.decision_signature.clone(),
+        decision_summary: authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
         outcome: outcome_label.to_string(),
         outcome_reason,
     };
-    super::state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
+    super::state::write_review_run_termination_receipt_for_home(home, &receipt)?;
+    let _ = super::state::load_review_run_termination_receipt_for_home(
+        home,
+        authority.pr_number,
+        &authority.review_type,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "termination receipt missing after write for PR #{} type={}",
+            authority.pr_number, authority.review_type
+        )
+    })?;
     Ok(())
 }
 
@@ -1118,6 +1151,7 @@ enum TerminationOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1146,7 +1180,7 @@ mod tests {
     ) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s1-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number,
             head_sha: head_sha.to_string(),
             review_type: "security".to_string(),
@@ -1273,15 +1307,15 @@ mod tests {
             dimensions: BTreeMap::new(),
         };
         let body = render_decision_comment_body(&payload).expect("body");
-        assert!(body.contains("apm2-review-decision:v1"));
+        assert!(body.contains("apm2-review-verdict:v1"));
         assert!(body.contains("```yaml"));
     }
 
     #[test]
     fn test_parse_decision_comments_filters_untrusted_authors() {
-        let body = r#"<!-- apm2-review-decision:v1 -->
+        let body = r#"<!-- apm2-review-verdict:v1 -->
 ```yaml
-schema: apm2.review.decision.v1
+schema: apm2.review.verdict.v1
 pr: 441
 sha: 0123456789abcdef0123456789abcdef01234567
 updated_at: 2026-02-11T00:00:00Z
@@ -1318,6 +1352,82 @@ dimensions:
     }
 
     #[test]
+    fn test_resolve_completion_signal_from_projection_for_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let owner_repo = "example/repo";
+        let pr_number = 441;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let pr_dir = super::projection_pr_dir_for_home(home, owner_repo, pr_number);
+        fs::create_dir_all(&pr_dir).expect("create projection dir");
+
+        let reviewer_projection = serde_json::json!({
+            "schema": "apm2.fac.projection.reviewer.v1",
+            "reviewer_id": "fac-bot",
+            "updated_at": "2026-02-13T00:00:00Z"
+        });
+        fs::write(
+            pr_dir.join("reviewer.json"),
+            serde_json::to_vec_pretty(&reviewer_projection).expect("serialize reviewer"),
+        )
+        .expect("write reviewer projection");
+
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-13T00:00:00Z".to_string(),
+            dimensions,
+        };
+        let comment_body = render_decision_comment_body(&payload).expect("render comment body");
+        let issue_comment = IssueComment {
+            id: 88,
+            body: comment_body,
+            html_url: "local://fac_projection/example/repo/pr-441/issue_comments#88".to_string(),
+            created_at: "2026-02-13T00:00:00Z".to_string(),
+            user: Some(IssueUser {
+                login: "fac-bot".to_string(),
+            }),
+        };
+        let issue_comments_projection = serde_json::json!({
+            "schema": "apm2.fac.projection.issue_comments.v1",
+            "owner_repo": owner_repo,
+            "pr_number": pr_number,
+            "updated_at": "2026-02-13T00:00:00Z",
+            "comments": [issue_comment]
+        });
+        fs::write(
+            pr_dir.join("issue_comments.json"),
+            serde_json::to_vec_pretty(&issue_comments_projection).expect("serialize comments"),
+        )
+        .expect("write issue comments projection");
+
+        let resolved = super::resolve_completion_signal_from_projection_for_home(
+            home, owner_repo, pr_number, "security", head_sha,
+        )
+        .expect("resolve completion signal")
+        .expect("signal should resolve");
+        assert_eq!(resolved.decision, "approve");
+        assert_eq!(resolved.verdict, "PASS");
+        assert_eq!(resolved.decision_comment_id, 88);
+        assert_eq!(resolved.decision_author, "fac-bot");
+        assert_eq!(
+            resolved.decision_summary,
+            "security:approve|code-quality:missing"
+        );
+    }
+
+    #[test]
     fn test_terminate_review_agent_skips_when_sha_mismatch() {
         let pr_number = next_test_pr();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1349,7 +1459,7 @@ dimensions:
     }
 
     #[test]
-    fn test_terminate_review_agent_skips_when_proc_start_time_missing() {
+    fn test_terminate_review_agent_fails_closed_when_proc_start_time_missing() {
         let pr_number = next_test_pr();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -1367,8 +1477,8 @@ dimensions:
         let outcome = super::terminate_review_agent_for_home(home, &authority)
             .expect("termination result expected");
         assert!(
-            matches!(outcome, super::TerminationOutcome::IdentityFailure(msg) if msg.contains("missing proc_start_time")),
-            "unexpected termination outcome"
+            matches!(outcome, super::TerminationOutcome::IdentityFailure(ref msg) if msg.contains("missing proc_start_time")),
+            "unexpected termination outcome: {outcome:?}"
         );
         assert!(state::is_process_alive(pid));
 
@@ -1392,7 +1502,7 @@ dimensions:
         let proc_start_time =
             state::get_process_start_time(pid).expect("start time should be available");
         let mut state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
-        state.pr_url = "https://github.com/example/other-repo/pull/441".to_string();
+        state.owner_repo = "example/other-repo".to_string();
         state::write_review_run_state_for_home(home, &state).expect("write run state");
         let authority = termination_authority_for_run("owner/repo", &state, "abcdef1234567890");
 
@@ -1434,7 +1544,7 @@ dimensions:
     }
 
     #[test]
-    fn test_terminate_review_agent_allows_missing_proc_start_when_process_is_dead() {
+    fn test_terminate_review_agent_fails_closed_when_proc_start_time_missing_even_if_dead() {
         let pr_number = next_test_pr();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -1456,7 +1566,7 @@ dimensions:
             .expect("termination result expected");
         assert!(
             matches!(outcome, super::TerminationOutcome::AlreadyDead),
-            "unexpected termination outcome"
+            "dead process with missing proc_start_time should be already dead: {outcome:?}"
         );
 
         let _ = std::fs::remove_file(state_path);

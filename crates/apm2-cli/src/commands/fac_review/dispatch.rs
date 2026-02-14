@@ -11,6 +11,7 @@ use chrono::Utc;
 use fs2::FileExt;
 
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
+use super::projection_store;
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
     load_review_run_state_for_home, load_review_run_state_verified_for_home,
@@ -357,10 +358,16 @@ fn terminate_pending_dispatch_entry(entry: &PendingDispatchEntry) -> Result<(), 
 // ── Tool availability ───────────────────────────────────────────────────────
 
 fn command_available(command: &str) -> bool {
-    Command::new("sh")
-        .args(["-lc", &format!("command -v {command} >/dev/null 2>&1")])
+    // Check if the binary is locatable via `which`. This avoids passing
+    // untrusted strings through `sh -lc` while remaining portable across
+    // tools that may not implement `--version`.
+    Command::new("which")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|s| s.success())
 }
 
 fn strip_deleted_executable_suffix(path: &Path) -> Option<PathBuf> {
@@ -452,7 +459,6 @@ fn attach_run_state_contract_for_home(
 
 fn write_fail_closed_state_for_dispatch(
     home: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     terminal_reason: &str,
     sequence_hint: Option<u32>,
@@ -471,7 +477,7 @@ fn write_fail_closed_state_for_dispatch(
             sequence_number,
             &key.head_sha,
         ),
-        pr_url: pr_url.to_string(),
+        owner_repo: key.owner_repo.clone(),
         pr_number: key.pr_number,
         head_sha: key.head_sha.clone(),
         review_type: key.review_type.clone(),
@@ -495,15 +501,13 @@ fn write_fail_closed_state_for_dispatch(
 
 fn fail_closed_dispatch(
     home: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     terminal_reason: &str,
     detail: &str,
     sequence_hint: Option<u32>,
 ) -> Result<DispatchReviewResult, String> {
     let state_write_error =
-        write_fail_closed_state_for_dispatch(home, pr_url, key, terminal_reason, sequence_hint)
-            .err();
+        write_fail_closed_state_for_dispatch(home, key, terminal_reason, sequence_hint).err();
     let mut message = format!("dispatch denied: reason={terminal_reason} detail={detail}");
     if let Some(err) = state_write_error {
         use std::fmt::Write as _;
@@ -548,7 +552,6 @@ fn drift_lineage_from_state(state: &ReviewRunState, key: &DispatchIdempotencyKey
 fn resume_dispatch_after_head_drift_for_home<F>(
     home: &Path,
     workspace_root: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
@@ -556,7 +559,7 @@ fn resume_dispatch_after_head_drift_for_home<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let mut superseded = state.clone();
     superseded.status = ReviewRunStatus::Failed;
@@ -565,12 +568,17 @@ where
     superseded.proc_start_time = None;
     write_review_run_state_for_home(home, &superseded)?;
 
+    let _ = projection_store::save_identity_with_context(
+        &key.owner_repo,
+        key.pr_number,
+        &key.head_sha,
+        "dispatch_drift",
+    );
+
     let lineage = drift_lineage_from_state(state, key);
-    let mut seeded =
-        seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, Some(&lineage))?;
+    let mut seeded = seed_pending_run_state_for_dispatch_for_home(home, key, Some(&lineage))?;
     let started = match spawn_review(
         workspace_root,
-        pr_url,
         key.pr_number,
         review_kind,
         &key.head_sha,
@@ -605,7 +613,6 @@ where
 
 fn seed_pending_run_state_for_dispatch_for_home(
     home: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     lineage: Option<&DriftLineage>,
 ) -> Result<ReviewRunState, String> {
@@ -618,7 +625,7 @@ fn seed_pending_run_state_for_dispatch_for_home(
             sequence_number,
             &key.head_sha,
         ),
-        pr_url: pr_url.to_string(),
+        owner_repo: key.owner_repo.clone(),
         pr_number: key.pr_number,
         head_sha: key.head_sha.clone(),
         review_type: key.review_type.clone(),
@@ -651,7 +658,6 @@ fn next_sequence_hint_from_state(load: &ReviewRunStateLoad) -> Option<u32> {
 fn dispatch_single_review_locked_for_home<F>(
     home: &Path,
     workspace_root: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
@@ -659,7 +665,7 @@ fn dispatch_single_review_locked_for_home<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let run_state_load =
         load_review_run_state_verified_for_home(home, key.pr_number, &key.review_type)?;
@@ -673,7 +679,6 @@ where
                 .join(",");
             return fail_closed_dispatch(
                 home,
-                pr_url,
                 key,
                 TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
                 &format!(
@@ -686,7 +691,6 @@ where
         ReviewRunStateLoad::Corrupt { path, error } => {
             return fail_closed_dispatch(
                 home,
-                pr_url,
                 key,
                 TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
                 &format!("corrupt-state path={} detail={error}", path.display()),
@@ -750,7 +754,6 @@ where
                     }
                     return fail_closed_dispatch(
                         home,
-                        pr_url,
                         key,
                         TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
                         "matching run-state has no pid and no live pending marker",
@@ -765,7 +768,6 @@ where
                         if let Err(err) = verify_process_identity(pid, state.proc_start_time) {
                             return fail_closed_dispatch(
                                 home,
-                                pr_url,
                                 key,
                                 TERMINAL_STALE_HEAD_AMBIGUITY,
                                 &format!(
@@ -778,7 +780,6 @@ where
                         if let Err(err) = terminate_process_with_timeout(pid) {
                             return fail_closed_dispatch(
                                 home,
-                                pr_url,
                                 key,
                                 TERMINAL_STALE_HEAD_AMBIGUITY,
                                 &format!(
@@ -791,7 +792,6 @@ where
                         return resume_dispatch_after_head_drift_for_home(
                             home,
                             workspace_root,
-                            pr_url,
                             key,
                             review_kind,
                             dispatch_epoch,
@@ -809,7 +809,6 @@ where
                         if let Err(err) = stale_key.validate() {
                             return fail_closed_dispatch(
                                 home,
-                                pr_url,
                                 key,
                                 TERMINAL_STALE_HEAD_AMBIGUITY,
                                 &format!(
@@ -825,7 +824,6 @@ where
                             if let Err(err) = terminate_pending_dispatch_entry(&pending) {
                                 return fail_closed_dispatch(
                                     home,
-                                    pr_url,
                                     key,
                                     TERMINAL_STALE_HEAD_AMBIGUITY,
                                     &format!(
@@ -838,7 +836,6 @@ where
                             return resume_dispatch_after_head_drift_for_home(
                                 home,
                                 workspace_root,
-                                pr_url,
                                 key,
                                 review_kind,
                                 dispatch_epoch,
@@ -858,7 +855,6 @@ where
                         };
                         return fail_closed_dispatch(
                             home,
-                            pr_url,
                             key,
                             TERMINAL_STALE_HEAD_AMBIGUITY,
                             &detail,
@@ -937,10 +933,9 @@ where
         );
     }
 
-    let mut seeded = seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, None)?;
+    let mut seeded = seed_pending_run_state_for_dispatch_for_home(home, key, None)?;
     let started = match spawn_review(
         workspace_root,
-        pr_url,
         key.pr_number,
         review_kind,
         &key.head_sha,
@@ -963,7 +958,6 @@ where
 fn dispatch_single_review_for_home_with_spawn_force_workspace<F>(
     home: &Path,
     workspace_root: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
@@ -971,7 +965,7 @@ fn dispatch_single_review_for_home_with_spawn_force_workspace<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     key.validate()?;
     if !key.review_type.eq_ignore_ascii_case(review_kind.as_str()) {
@@ -1013,7 +1007,6 @@ where
     dispatch_single_review_locked_for_home(
         home,
         workspace_root,
-        pr_url,
         key,
         review_kind,
         dispatch_epoch,
@@ -1025,28 +1018,25 @@ where
 #[cfg(test)]
 fn dispatch_single_review_for_home_with_spawn<F>(
     home: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let adapter = |_: &Path,
-                   url: &str,
                    pr_number: u32,
                    kind: ReviewKind,
                    expected_head_sha: &str,
                    epoch: u64|
      -> Result<DispatchReviewResult, String> {
-        spawn_review(url, pr_number, kind, expected_head_sha, epoch)
+        spawn_review(pr_number, kind, expected_head_sha, epoch)
     };
     dispatch_single_review_for_home_with_spawn_force_workspace(
         home,
         Path::new("."),
-        pr_url,
         key,
         review_kind,
         dispatch_epoch,
@@ -1058,7 +1048,6 @@ where
 #[cfg(test)]
 fn dispatch_single_review_for_home_with_spawn_force<F>(
     home: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
@@ -1066,21 +1055,19 @@ fn dispatch_single_review_for_home_with_spawn_force<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let adapter = |_: &Path,
-                   url: &str,
                    pr_number: u32,
                    kind: ReviewKind,
                    expected_head_sha: &str,
                    epoch: u64|
      -> Result<DispatchReviewResult, String> {
-        spawn_review(url, pr_number, kind, expected_head_sha, epoch)
+        spawn_review(pr_number, kind, expected_head_sha, epoch)
     };
     dispatch_single_review_for_home_with_spawn_force_workspace(
         home,
         Path::new("."),
-        pr_url,
         key,
         review_kind,
         dispatch_epoch,
@@ -1092,7 +1079,6 @@ where
 fn dispatch_single_review_for_home(
     home: &Path,
     workspace_root: &Path,
-    pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
@@ -1101,7 +1087,6 @@ fn dispatch_single_review_for_home(
     dispatch_single_review_for_home_with_spawn_force_workspace(
         home,
         workspace_root,
-        pr_url,
         key,
         review_kind,
         dispatch_epoch,
@@ -1113,7 +1098,6 @@ fn dispatch_single_review_for_home(
 // ── Single review dispatch ──────────────────────────────────────────────────
 
 pub fn dispatch_single_review(
-    pr_url: &str,
     owner_repo: &str,
     pr_number: u32,
     review_kind: ReviewKind,
@@ -1121,7 +1105,6 @@ pub fn dispatch_single_review(
     dispatch_epoch: u64,
 ) -> Result<DispatchReviewResult, String> {
     dispatch_single_review_with_force(
-        pr_url,
         owner_repo,
         pr_number,
         review_kind,
@@ -1132,7 +1115,6 @@ pub fn dispatch_single_review(
 }
 
 pub fn dispatch_single_review_with_force(
-    pr_url: &str,
     owner_repo: &str,
     pr_number: u32,
     review_kind: ReviewKind,
@@ -1154,7 +1136,6 @@ pub fn dispatch_single_review_with_force(
     dispatch_single_review_for_home(
         &home,
         &workspace_root,
-        pr_url,
         &key,
         review_kind,
         dispatch_epoch,
@@ -1164,7 +1145,6 @@ pub fn dispatch_single_review_with_force(
 
 fn spawn_detached_review(
     workspace_root: &Path,
-    pr_url: &str,
     pr_number: u32,
     review_kind: ReviewKind,
     expected_head_sha: &str,
@@ -1202,7 +1182,8 @@ fn spawn_detached_review(
             .arg("fac")
             .arg("review")
             .arg("run")
-            .arg(pr_url)
+            .arg("--pr")
+            .arg(pr_number.to_string())
             .arg("--type")
             .arg(review_kind.as_str())
             .arg("--expected-head-sha")
@@ -1256,7 +1237,8 @@ fn spawn_detached_review(
         .arg("fac")
         .arg("review")
         .arg("run")
-        .arg(pr_url)
+        .arg("--pr")
+        .arg(pr_number.to_string())
         .arg("--type")
         .arg(review_kind.as_str())
         .arg("--expected-head-sha")
@@ -1308,7 +1290,7 @@ mod tests {
     fn sample_run_state(pid: Option<u32>) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s1-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number: 441,
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             review_type: "security".to_string(),
@@ -1329,8 +1311,7 @@ mod tests {
     }
 
     fn dead_pid_for_test() -> u32 {
-        let mut child = std::process::Command::new("sh")
-            .args(["-lc", "exit 0"])
+        let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn short-lived child");
         let pid = child.id();
@@ -1387,8 +1368,12 @@ mod tests {
     }
 
     fn spawn_long_lived_pid() -> u32 {
+        // Spawn a background sleep process via sh -c so that the sleep
+        // is reparented to init and will not become a zombie when killed.
+        // This is a test-only helper with fully hardcoded arguments—no
+        // user-controlled data is passed through the shell.
         let output = std::process::Command::new("sh")
-            .args(["-lc", "sleep 120 >/dev/null 2>&1 & echo $!"])
+            .args(["-c", "sleep 120 >/dev/null 2>&1 & echo $!"])
             .output()
             .expect("spawn long-lived pid");
         assert!(
@@ -1424,10 +1409,6 @@ mod tests {
         DispatchIdempotencyKey::new(owner_repo, 441, "security", head_sha)
     }
 
-    fn pr_url() -> &'static str {
-        "https://github.com/example/repo/pull/441"
-    }
-
     #[test]
     fn run_state_liveness_requires_pid() {
         assert!(!run_state_has_live_process(&sample_run_state(None)));
@@ -1453,46 +1434,30 @@ mod tests {
 
         let spawn_count_ref = Arc::clone(&spawn_count);
         let children_ref = Arc::clone(&spawned_children);
-        let spawn = move |_: &str,
-                          _: u32,
-                          _: ReviewKind,
-                          _: &str,
-                          _: u64|
-              -> Result<DispatchReviewResult, String> {
-            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
-            let pid = spawn_long_lived_pid();
-            children_ref.lock().expect("children lock").push(pid);
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(pid),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                let pid = spawn_long_lived_pid();
+                children_ref.lock().expect("children lock").push(pid);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(pid),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
-        let first = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            1,
-            &spawn,
-        )
-        .expect("first dispatch");
-        let second = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            1,
-            &spawn,
-        )
-        .expect("second dispatch");
+        let first =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 1, &spawn)
+                .expect("first dispatch");
+        let second =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 1, &spawn)
+                .expect("second dispatch");
 
         assert_eq!(first.mode, "started");
         assert_eq!(second.mode, "joined");
@@ -1513,38 +1478,28 @@ mod tests {
         stale.status = ReviewRunStatus::Done;
         write_review_run_state_for_home(home, &stale).expect("seed stale state");
 
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key_with_owner(
             "Example/Repo-DifferentSha",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         );
-        let result = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            2,
-            &spawn,
-        )
-        .expect("dispatch with new sha");
+        let result =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 2, &spawn)
+                .expect("dispatch with new sha");
 
         assert_eq!(result.mode, "started");
     }
@@ -1564,18 +1519,13 @@ mod tests {
             "Example/Repo-Force",
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            panic!("spawn must not be called when same SHA is terminal");
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                panic!("spawn must not be called when same SHA is terminal");
+            };
 
         let result = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             100,
@@ -1600,25 +1550,21 @@ mod tests {
 
         let spawn_count = Arc::new(AtomicUsize::new(0));
         let spawn_count_ref = Arc::clone(&spawn_count);
-        let spawn = move |_: &str,
-                          _: u32,
-                          _: ReviewKind,
-                          _: &str,
-                          _: u64|
-              -> Result<DispatchReviewResult, String> {
-            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key_with_owner(
             "Example/Repo-TerminalMissingPid",
@@ -1626,7 +1572,6 @@ mod tests {
         );
         let result = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             100,
@@ -1650,25 +1595,21 @@ mod tests {
 
         let spawn_count = Arc::new(AtomicUsize::new(0));
         let spawn_count_ref = Arc::clone(&spawn_count);
-        let spawn = move |_: &str,
-                          _: u32,
-                          _: ReviewKind,
-                          _: &str,
-                          _: u64|
-              -> Result<DispatchReviewResult, String> {
-            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key_with_owner(
             "Example/Repo-Force-Spawn",
@@ -1676,7 +1617,6 @@ mod tests {
         );
         let result = dispatch_single_review_for_home_with_spawn_force(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             101,
@@ -1701,18 +1641,13 @@ mod tests {
         write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
 
         let key = dispatch_key("2222222222222222222222222222222222222222");
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            panic!("spawn must not be called for unresolved stale-head ownership");
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                panic!("spawn must not be called for unresolved stale-head ownership");
+            };
 
         let err = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             42,
@@ -1750,18 +1685,13 @@ mod tests {
         write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
 
         let key = dispatch_key("4444444444444444444444444444444444444444");
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            panic!("spawn must not be called for stale dead-pid ambiguity");
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                panic!("spawn must not be called for stale dead-pid ambiguity");
+            };
 
         let err = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             43,
@@ -1802,18 +1732,13 @@ mod tests {
         write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
 
         let key = dispatch_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            panic!("spawn must not be called when stale-head identity is ambiguous");
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                panic!("spawn must not be called when stale-head identity is ambiguous");
+            };
 
         let err = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             44,
@@ -1853,29 +1778,24 @@ mod tests {
         );
         write_review_run_state_for_home(home, &old_state).expect("seed old state");
 
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key("dddddddddddddddddddddddddddddddddddddddd");
         let result = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             45,
@@ -1905,37 +1825,27 @@ mod tests {
 
         let spawned_children = Arc::new(Mutex::new(Vec::new()));
         let children_ref = Arc::clone(&spawned_children);
-        let spawn = move |_: &str,
-                          _: u32,
-                          _: ReviewKind,
-                          _: &str,
-                          _: u64|
-              -> Result<DispatchReviewResult, String> {
-            let pid = spawn_long_lived_pid();
-            children_ref.lock().expect("children lock").push(pid);
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(pid),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                let pid = spawn_long_lived_pid();
+                children_ref.lock().expect("children lock").push(pid);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(pid),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let result = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            3,
-            &spawn,
-        )
-        .expect("dispatch with drift");
+        let result =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 3, &spawn)
+                .expect("dispatch with drift");
 
         assert_eq!(result.mode, "drift_resumed");
         assert!(
@@ -2002,31 +1912,26 @@ mod tests {
 
         let spawned_children = Arc::new(Mutex::new(Vec::new()));
         let children_ref = Arc::clone(&spawned_children);
-        let spawn = move |_: &str,
-                          _: u32,
-                          _: ReviewKind,
-                          _: &str,
-                          _: u64|
-              -> Result<DispatchReviewResult, String> {
-            let pid = spawn_long_lived_pid();
-            children_ref.lock().expect("children lock").push(pid);
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(pid),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                let pid = spawn_long_lived_pid();
+                children_ref.lock().expect("children lock").push(pid);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(pid),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key("2222222222222222222222222222222222222222");
         let result = dispatch_single_review_for_home_with_spawn(
             home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             42,
@@ -2086,23 +1991,13 @@ mod tests {
         .expect("write alternate state");
 
         let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            panic!("spawn must not be called for ambiguous state");
-        };
-        let err = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            4,
-            &spawn,
-        )
-        .expect_err("ambiguous state must fail closed");
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                panic!("spawn must not be called for ambiguous state");
+            };
+        let err =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 4, &spawn)
+                .expect_err("ambiguous state must fail closed");
         assert!(
             err.contains(TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP),
             "unexpected error: {err}"
@@ -2129,39 +2024,29 @@ mod tests {
 
         let spawn_count = Arc::new(AtomicUsize::new(0));
         let spawn_count_ref = Arc::clone(&spawn_count);
-        let spawn = move |_: &str,
-                          _: u32,
-                          _: ReviewKind,
-                          _: &str,
-                          _: u64|
-              -> Result<DispatchReviewResult, String> {
-            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key_with_owner(
             "Example/Repo-StalePidNotJoined",
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let result = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            5,
-            &spawn,
-        )
-        .expect("dispatch after stale pid");
+        let result =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 5, &spawn)
+                .expect("dispatch after stale pid");
 
         assert_eq!(result.mode, "started");
         assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
@@ -2184,8 +2069,7 @@ mod tests {
             let spawned_children = Arc::clone(&spawned_children);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let spawn = |_: &str,
-                             _: u32,
+                let spawn = |_: u32,
                              _: ReviewKind,
                              _: &str,
                              _: u64|
@@ -2209,7 +2093,6 @@ mod tests {
                 barrier.wait();
                 dispatch_single_review_for_home_with_spawn(
                     &home,
-                    pr_url(),
                     &key,
                     ReviewKind::Security,
                     6,
@@ -2223,8 +2106,7 @@ mod tests {
             let spawned_children = Arc::clone(&spawned_children);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let spawn = |_: &str,
-                             _: u32,
+                let spawn = |_: u32,
                              _: ReviewKind,
                              _: &str,
                              _: u64|
@@ -2247,7 +2129,6 @@ mod tests {
                 barrier.wait();
                 dispatch_single_review_for_home_with_spawn(
                     &home,
-                    pr_url(),
                     &key,
                     ReviewKind::Security,
                     6,
@@ -2300,18 +2181,13 @@ mod tests {
 
         barrier.wait();
 
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            panic!("spawn should not execute when lock acquisition times out");
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                panic!("spawn should not execute when lock acquisition times out");
+            };
 
         let err = dispatch_single_review_for_home_with_spawn(
             &home,
-            pr_url(),
             &key,
             ReviewKind::Security,
             99,
@@ -2366,35 +2242,25 @@ mod tests {
         old_state.sequence_number = 7;
         write_review_run_state_for_home(home, &old_state).expect("seed old state");
 
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key("dddddddddddddddddddddddddddddddddddddddd");
-        let result = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            7,
-            &spawn,
-        )
-        .expect("drift dispatch for lineage");
+        let result =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 7, &spawn)
+                .expect("drift dispatch for lineage");
 
         assert_eq!(result.mode, "drift_resumed");
         match load_review_run_state_for_home(home, 441, "security").expect("load state") {
@@ -2434,35 +2300,25 @@ mod tests {
         old_state.sequence_number = 9;
         write_review_run_state_for_home(home, &old_state).expect("seed old state");
 
-        let spawn = |_: &str,
-                     _: u32,
-                     _: ReviewKind,
-                     _: &str,
-                     _: u64|
-         -> Result<DispatchReviewResult, String> {
-            Ok(DispatchReviewResult {
-                review_type: "security".to_string(),
-                mode: "started".to_string(),
-                run_state: "pending".to_string(),
-                run_id: None,
-                sequence_number: None,
-                terminal_reason: None,
-                pid: Some(dead_pid_for_test()),
-                unit: None,
-                log_file: None,
-            })
-        };
+        let spawn =
+            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    unit: None,
+                    log_file: None,
+                })
+            };
 
         let key = dispatch_key("ffffffffffffffffffffffffffffffffffffffff");
-        let _ = dispatch_single_review_for_home_with_spawn(
-            home,
-            pr_url(),
-            &key,
-            ReviewKind::Security,
-            8,
-            &spawn,
-        )
-        .expect("drift dispatch");
+        let _ =
+            dispatch_single_review_for_home_with_spawn(home, &key, ReviewKind::Security, 8, &spawn)
+                .expect("drift dispatch");
 
         assert!(
             !crate::commands::fac_review::state::is_process_alive(old_pid),

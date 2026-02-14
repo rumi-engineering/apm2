@@ -1,264 +1,223 @@
-# M06: Rust Soundness and Unsafe
+# M06: Rust soundness and unsafe
 
 ```yaml
 module_id: M06
 domain: memory_safety
-inputs: [ChangeSetBundle, InvariantMap]
+inputs: [ChangeSetBundle, InvariantMap, QCP_Result]
 outputs: [Finding[]]
 ```
 
+This module is a review adapter over the normative unsafe rules in:
+- `references/19_unsafe_rust_obligations.md` (CTR-0901..0904, INV-0902, INV-0903)
+
 ---
 
-## Review Protocol
+## Review protocol
 
 ```mermaid
 flowchart TD
-    START[Begin] --> A[Safe Rust Quality Scan]
-    A --> B{unsafe blocks in diff?}
-    B -->|YES| C[FOR EACH unsafe_block]
-    B -->|NO| Z[Emit Findings]
-    C --> D[Check SAFETY comment]
-    D --> E[Run Proof Obligations]
-    E --> F[Check UB Footguns]
-    F --> G[Check Send/Sync]
-    G --> H[Next unsafe_block]
+    START[Begin] --> A[Safe Rust quality scan]
+    A --> B{unsafe changes in diff?}
+    B -->|NO| Z[Emit findings]
+    B -->|YES| C[For each unsafe site]
+    C --> D[Check unsafe policy + SAFETY comment]
+    D --> E[Run obligation checklist (INV-0902)]
+    E --> F[Scan for UB footguns]
+    F --> G[Check Send/Sync and cross-thread invariants]
+    G --> H[Next unsafe site]
     H --> C
     H --> Z
 ```
 
 ---
 
-## State: Safe Rust Quality Scan
+## State: Safe Rust quality scan
 
 ```yaml
 assertions:
   - id: SAFE-OWN
-    predicate: "ownership boundaries obvious and type-enforced"
+    predicate: "ownership boundaries are obvious and type-enforced"
     on_fail:
       severity: MAJOR
-      remediation: "Clarify ownership with types"
+      remediation: "Clarify ownership with types (newtypes, lifetimes, RAII guards)."
 
   - id: SAFE-LIFE
     predicate: "lifetimes prevent use-after-free by construction"
     on_fail:
       severity: MAJOR
-      remediation: "Tighten lifetime bounds"
+      remediation: "Tighten lifetime bounds; avoid 'static unless required."
 
   - id: SAFE-INV
-    predicate: "invariants as types, not comments"
+    predicate: "invariants encoded as types, not only comments"
     on_fail:
       severity: MINOR
-      remediation: "Consider newtype wrappers"
+      remediation: "Prefer constructors that validate; hide invalid states."
 
 red_flags:
   - id: SAFE-LEAK
-    pattern: "leaky lifetimes encouraging unsafe downstream"
+    pattern: "leaky lifetimes that force unsafe downstream"
     severity: MAJOR
 
-  - id: SAFE-CLONE
-    pattern: "excessive cloning as borrow-checker workaround"
-    severity: MINOR
-
   - id: SAFE-INTERIOR
-    pattern: "hidden interior mutability causing aliasing/reentrancy"
+    pattern: "interior mutability without a reentrancy/thread-safety story"
     severity: MAJOR
 ```
 
 ---
 
-## State: Unsafe Block Structure Check
+## State: Unsafe site structure checks
+
+Definitions:
+- **unsafe site**: `unsafe { ... }`, `unsafe fn`, `unsafe trait`, `unsafe impl`.
 
 ```yaml
-FOR EACH unsafe_block IN diff:
+FOR EACH unsafe_site IN diff:
 
-  assertion_1:
-    id: UNSAFE-SCOPE
-    predicate: "unsafe isolated to smallest scope"
+  - id: UNSAFE-SCOPE
+    predicate: "unsafe isolated to the smallest possible expression/block"
     on_fail:
       EMIT Finding:
         id: RUST-UNSAFE-SCOPE
         severity: MAJOR
-        location: {unsafe_block.location}
+        location: {unsafe_site.location}
         remediation:
           type: CODE
-          specification: "Reduce unsafe scope to minimal necessary"
+          specification: "Reduce the unsafe scope to wrap only the unsafe operation."
 
-  assertion_2:
-    id: UNSAFE-COMMENT
-    predicate: "// SAFETY: comment exists adjacent to unsafe"
+  - id: UNSAFE-COMMENT
+    predicate: "// SAFETY: comment exists adjacent to the unsafe block/op (CTR-0902)"
     on_fail:
       EMIT Finding:
         id: RUST-UNSAFE-001
         severity: BLOCKER
-        location: {unsafe_block.location}
+        location: {unsafe_site.location}
         remediation:
           type: DOC
           specification: |
-            Add // SAFETY: comment stating:
-            1. The invariant(s)
-            2. Why the invariant holds at this callsite
-            3. What would make it unsound
+            Add a local `// SAFETY:` comment that states:
+            - required preconditions (validity, alignment, provenance, aliasing)
+            - why the preconditions hold at this callsite
+            - what would break the proof (regression risks)
 
-  assertion_3:
-    id: UNSAFE-QUALITY
+  - id: UNSAFE-COMMENT-QUALITY
     predicate: |
-      safety_comment.mentions(aliasing OR lifetimes OR validity)
+      safety_comment.mentions(aliasing OR lifetimes OR validity OR provenance)
       AND NOT safety_comment.is_trivial("because it works")
     on_fail:
       EMIT Finding:
         id: RUST-UNSAFE-002
         severity: BLOCKER
-        location: {unsafe_block.location}
+        location: {unsafe_site.location}
         remediation:
           type: DOC
-          specification: "Safety comment must address aliasing, lifetimes, or validity"
+          specification: "Safety comment must address concrete obligations, not restate the code."
 
-  assertion_4:
-    id: UNSAFE-SCP
+  - id: UNSAFE-LINT-DISCIPLINE
     predicate: |
-      IF is_scp_path THEN
-        justification.is_extraordinary() AND tested_with_miri
+      IF workspace_lints.unsafe_code == "warn" THEN
+        unsafe_site.has_local_allow_with_justification
+    on_fail:
+      EMIT Finding:
+        id: RUST-UNSAFE-LINT-001
+        severity: MAJOR
+        location: {unsafe_site.location}
+        remediation:
+          type: DOC
+          specification: |
+            Add `#[allow(unsafe_code)]` with a justification comment explaining:
+            - why unsafe is necessary here
+            - what invariant defends it
+            - where tool evidence exists (tests/Miri)
+
+  - id: UNSAFE-SCP-DCP
+    predicate: |
+      IF unsafe_site.in_path_map(SCP_OR_DCP) THEN
+        justification.is_extraordinary AND tool_evidence.includes_miri
     on_fail:
       EMIT Finding:
         id: RUST-UNSAFE-SCP
-        severity: CRITICAL
-        location: {unsafe_block.location}
+        severity: BLOCKER
+        location: {unsafe_site.location}
         remediation:
-          type: CODE
-          specification: "Unsafe in SCP must be proven necessary and defended by Miri/Fuzz tests"
+          type: TEST
+          specification: |
+            Unsafe in SCP/DCP is presumptively merge-blocking unless defended by:
+            - a strong local SAFETY proof, and
+            - Miri coverage (or an explicitly approved, equivalent tool justification).
 ```
 
 ---
 
-## State: Proof Obligations Checklist
+## State: Proof obligations checklist (INV-0902)
 
 ```yaml
-FOR EACH unsafe_block:
-  RUN proof_obligations:
+FOR EACH unsafe_site:
+  REQUIRE answers to all relevant checklist items:
 
-  - id: PROOF-PTR-VALID
-    question: "Is pointer non-null?"
-    check: "explicit null check OR NonNull type"
-    on_fail: BLOCKER
-
-  - id: PROOF-PTR-INIT
-    question: "Points to initialized memory?"
-    check: "initialization proof OR MaybeUninit discipline"
-    on_fail: BLOCKER
-
-  - id: PROOF-PTR-ALIVE
-    question: "Pointed object alive for access duration?"
-    check: "lifetime bound OR documented scope"
-    on_fail: BLOCKER
-
-  - id: PROOF-ALIGN
-    question: "Pointer aligned for T?"
-    check: "alignment guarantee OR packed handling"
-    on_fail: BLOCKER
-
-  - id: PROOF-ALIAS
-    question: "No simultaneous mutable aliases?"
-    check: "exclusive access proof"
-    on_fail: BLOCKER
-
-  - id: PROOF-SHARED
-    question: "No shared refs during mutation?"
-    check: "borrow discipline"
-    on_fail: BLOCKER
-
-  - id: PROOF-PROV
-    question: "Pointer from valid allocation?"
-    check: "provenance chain documented"
-    on_fail: BLOCKER
-
-  - id: PROOF-CAST
-    question: "Integer casts preserve provenance?"
-    check: "no ptr->int->ptr roundtrip OR strict provenance"
-    on_fail: MAJOR
-
-  - id: PROOF-BOUNDS
-    question: "Slice length correct, no overflow?"
-    check: "checked arithmetic for len * size_of::<T>()"
-    on_fail: BLOCKER
-
-  - id: PROOF-DROP
-    question: "Drop invoked exactly once?"
-    check: "drop discipline documented"
-    on_fail: BLOCKER
-
-  - id: PROOF-PARTIAL
-    question: "Partial init handled?"
-    check: "partial init states documented"
-    on_fail: MAJOR
-
-  - id: PROOF-UNWIND
-    question: "Panic preserves invariants?"
-    check: "unwind safety analysis"
-    on_fail: MAJOR
-
-  - id: PROOF-LEAK
-    question: "Memory leaked safely, not corrupted?"
-    check: "leak-on-panic acceptable"
-    on_fail: MAJOR
+  - PTR_VALID: "non-null / non-dangling / dereferenceable"
+  - PTR_INIT: "initialized before typed read"
+  - PTR_ALIVE: "object lives for access duration"
+  - ALIGN: "typed access is aligned (or uses unaligned ops)"
+  - ALIAS: "no mutable aliasing violations"
+  - SHARED: "no shared refs during mutation (unless interior mutability rules apply)"
+  - PROV: "pointer provenance preserved (no invalid int roundtrips)"
+  - BOUNDS: "bounds + size math checked (len * size_of)"
+  - DROP: "drop/init occurs exactly-once"
+  - UNWIND: "panic/unwind cannot expose later UB"
 
 qcp_rule:
-  IF qcp == YES AND any_proof_unanswered:
-    severity: BLOCKER
+  IF qcp.qcp == true AND any_required_answer_missing:
+    EMIT Finding(severity=BLOCKER, id=RUST-UNSAFE-PROOF-001)
 ```
 
 ---
 
-## State: UB Footgun Detection
+## State: UB footgun detection
 
 ```yaml
 high_suspicion_patterns:
   - id: UB-TRANSMUTE
     pattern: "mem::transmute"
     severity: BLOCKER
-    justification_required: "Explain why explicit conversion insufficient"
-    remediation: "Use explicit conversion or bytemuck"
+    remediation: |
+      Prefer explicit conversions.
+      If proposing a helper crate (e.g., bytemuck) this is a supply-chain change
+      and must pass `M12` dependency review + have an explicit safety proof.
 
   - id: UB-ZEROED
-    pattern: "mem::zeroed for non-zeroable"
+    pattern: "mem::zeroed"
     severity: BLOCKER
-    remediation: "Use MaybeUninit or explicit initialization"
+    remediation: "Use `MaybeUninit` or explicit initialization; most types are not safely zeroable."
 
   - id: UB-PACKED
     pattern: "repr(packed)"
     severity: BLOCKER
-    justification_required: "Creates unaligned reference hazards"
-    remediation: "Use raw pointers or copy to aligned buffer"
+    remediation: "Avoid creating references to packed fields; use raw reads/copies to an aligned buffer."
 
   - id: UB-SETLEN
     pattern: "Vec::set_len"
     severity: BLOCKER
-    proof_required: "Rigorous initialization proof"
-    remediation: "Document initialization of all elements"
+    remediation: "Requires rigorous initialization proof for all elements; prefer safe constructors."
 
   - id: UB-ASSUME
     pattern: "MaybeUninit::assume_init"
     severity: BLOCKER
-    proof_required: "Exhaustive initialization proof"
+    remediation: "Requires exhaustive initialization proof; defend with tests + Miri when applicable."
 
   - id: UB-RAWOPS
     pattern: "ptr::read|ptr::write|copy_nonoverlapping"
     severity: BLOCKER
-    proof_required: "Aliasing and bounds proof"
-
-  - id: UB-MANUAL
-    pattern: "ManuallyDrop"
-    severity: MAJOR
-    proof_required: "Single-drop discipline"
+    remediation: "Requires aliasing + bounds proof; avoid references until validity holds."
 
   - id: UB-STATIC
     pattern: "static mut"
     severity: BLOCKER
-    remediation: "Use atomic or Mutex; static mut almost never acceptable"
+    remediation: "Almost never acceptable; use atomics or a lock. Any exception must be narrowly scoped and justified."
 ```
 
 ---
 
-## State: Send/Sync Correctness
+## State: Send/Sync correctness
 
 ```yaml
 assertions:
@@ -272,7 +231,7 @@ assertions:
         severity: BLOCKER
         remediation:
           type: DOC
-          specification: "Add concurrency safety invariant comment"
+          specification: "Add a concurrency safety invariant comment + tests (Loom if non-trivial)."
 
   - id: SYNC-IMPL
     predicate: |
@@ -284,38 +243,12 @@ assertions:
         severity: BLOCKER
         remediation:
           type: DOC
-          specification: "Add concurrency safety invariant comment"
-
-  - id: THREAD-MUT
-    predicate: "NOT exposes &mut T or *mut T across threads without sync"
-    on_fail:
-      EMIT Finding:
-        id: RUST-THREAD-001
-        severity: BLOCKER
-        remediation:
-          type: CODE
-          specification: "Add synchronization primitive"
-
-  - id: INTERIOR-MT
-    predicate: |
-      IF interior_mutability AND multi_threaded_context THEN
-        atomic_or_lock_discipline EXISTS
-    on_fail:
-      EMIT Finding:
-        id: RUST-INTERIOR-001
-        severity: BLOCKER
-        remediation:
-          type: CODE
-          specification: "Use Atomic* or Mutex for thread-safe interior mutability"
-
-test_requirements:
-  IF concurrency_invariants.non_trivial:
-    require: "loom tests OR explicit thread-safety documentation"
+          specification: "Add a concurrency safety invariant comment + tests (Loom if non-trivial)."
 ```
 
 ---
 
-## Output Schema
+## Output schema
 
 ```typescript
 interface SoundnessFinding extends Finding {
@@ -342,25 +275,19 @@ type UBPattern =
   | "SET_LEN"
   | "ASSUME_INIT"
   | "RAW_OPS"
-  | "MANUAL_DROP"
   | "STATIC_MUT";
 ```
 
 ---
 
-## Unsafe Block Review Template
+## Unsafe review template (copy/paste)
 
-```yaml
-FOR EACH unsafe_block:
-  document:
-    location: "file:line"
-    operation: "what unsafe operation is performed"
-    invariants_required: "list of preconditions"
-    invariants_hold_because: "proof reasoning"
-    defended_by: "test name OR doc location"
-    regression_risks: "what changes would break this"
-
-  rule:
-    IF any_field_unanswered AND qcp == YES:
-      severity: BLOCKER
+```text
+Unsafe site: <file:line>
+Operation: <what unsafe operation is performed>
+Preconditions: <validity/alignment/provenance/aliasing/etc>
+Why they hold here: <local reasoning>
+Postcondition: <what is now safe/true>
+Defended by: <test name(s), Miri, Loom, fuzz, etc>
+Regression risks: <what future refactor could break this proof>
 ```

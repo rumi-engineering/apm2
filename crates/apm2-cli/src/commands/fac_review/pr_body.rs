@@ -50,19 +50,7 @@ pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, 
         return Ok(snapshot);
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Ok(String::new());
-    }
-
-    let body = github_projection::fetch_pr_body(owner_repo, pr_number)?;
-    let _ = projection_store::record_fallback_read(owner_repo, pr_number, "pr_body.fetch_pr_body");
-    let _ = projection_store::save_pr_body_snapshot(
-        owner_repo,
-        pr_number,
-        &body,
-        "gh-fallback:pr_body.fetch_pr_body",
-    );
-    Ok(body)
+    Ok(String::new())
 }
 
 fn parse_gate_statuses(section: &str) -> Vec<ShaGateStatus> {

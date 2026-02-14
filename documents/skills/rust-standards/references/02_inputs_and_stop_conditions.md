@@ -1,155 +1,181 @@
-# M01: Inputs and Stop Conditions
+# M01: Inputs and stop conditions (Fail-Closed)
 
 ```yaml
 module_id: M01
 domain: input_validation
-inputs: [PR_URL, HEAD_SHA]
+inputs: [ChangeSetBundle]
 outputs: [ChangeSetBundle, StopCondition[]]
 ```
 
 ---
 
-## Input Collection Protocol
+## Input validation protocol
+
+This module blocks reviews that would otherwise proceed with missing identity, missing plan-of-record, or missing baseline evidence.
 
 ```mermaid
 flowchart TD
-    START[Begin] --> A[Collect PR Identity]
-    A --> B[Collect Binding Work Items]
-    B --> C[Collect CI Evidence]
-    C --> D{All inputs valid?}
-    D -->|YES| E[Emit ChangeSetBundle]
-    D -->|NO| F[Emit StopCondition]
+    START[Begin] --> A[Validate ChangeSet identity]
+    A --> B[Validate plan-of-record binding]
+    B --> C[Validate baseline CI evidence]
+    C --> D{Stop condition triggered?}
+    D -->|YES| E[Emit StopCondition(s) + BLOCK]
+    D -->|NO| F[Emit normalized ChangeSetBundle]
 ```
 
 ---
 
-## State: Collect PR Identity
+## State: Validate ChangeSet identity
 
 ```yaml
-operation: gh_pr_view
-command: |
-  gh pr view $PR_URL --json title,number,author,baseRefName,headRefName,commits,files,additions,deletions
-
-required_fields:
+required_one_of:
   - pr_url: string
-  - pr_number: int
-  - branch_name: string
-  - merge_base: string
-  - commit_set: CommitSHA[]
+  - base_sha: string
+    head_sha: string
+
+required_always:
+  - diff_chunks: DiffChunk[]
+  - repo_root: FilePath
 
 assertions:
-  - id: INPUT-001
-    predicate: "pr_url IS_VALID_URL"
+  - id: INPUT-IDENTITY-001
+    predicate: "repo_root EXISTS"
     on_fail:
-      EMIT Finding:
-        id: INPUT-001
+      EMIT StopCondition:
+        id: STOP-MISSING-REPO
         severity: BLOCKER
+        message: "Missing repo_root; cannot validate workspace context."
         remediation:
           type: DOC
-          specification: "Provide valid PR URL"
+          specification: "Provide a checked-out repo path or an extracted workspace snapshot."
+
+  - id: INPUT-IDENTITY-002
+    predicate: "diff_chunks.length > 0"
+    on_fail:
+      EMIT StopCondition:
+        id: STOP-MISSING-DIFF
+        severity: BLOCKER
+        message: "Missing diff hunks; review cannot proceed."
+        remediation:
+          type: DOC
+          specification: "Provide changed files + hunks (or a git range)."
+
+  - id: INPUT-IDENTITY-003
+    predicate: |
+      IF head_sha PROVIDED THEN
+        head_sha MATCHES /^[a-f0-9]{40}$/
+    on_fail:
+      EMIT StopCondition:
+        id: STOP-INVALID-SHA
+        severity: BLOCKER
+        message: "Invalid head_sha."
+        remediation:
+          type: DOC
+          specification: "Provide a 40-hex git commit SHA."
 ```
 
 ---
 
-## State: Collect Binding Work Items
+## State: Validate plan-of-record binding
 
 ```yaml
-required_fields:
-  - ticket_ids: TicketRef[]
-  - spec_files: FilePath[]
-  - acceptance_criteria: Criterion[]
-  - evidence_artifacts: ArtifactRef[]
+definition:
+  non_trivial_change:
+    # "Non-trivial" means: behavior, safety, security, policy, CI, or dependency posture.
+    triggers:
+      - touches_rust_code: "**/*.rs"
+      - touches_policy_or_security: "documents/security/** or documents/rfcs/**"
+      - touches_ci_or_guardrails: ".github/** or scripts/ci/** or deny.toml or rust-toolchain.toml"
 
 assertions:
-  - id: INPUT-002
+  - id: INPUT-BINDING-001
     predicate: |
-      IF diff.is_non_trivial THEN
-        binding_requirements.length > 0
+      IF non_trivial_change THEN
+        plan_of_record IS_NOT_NULL
     on_fail:
       EMIT StopCondition:
         id: STOP-NO-BINDING
         severity: BLOCKER
-        message: "Non-trivial changes require binding ticket/spec"
+        message: "Non-trivial changes require a binding plan-of-record (ticket/spec/RFC) with acceptance criteria."
         remediation:
           type: DOC
-          specification: "Link PR to ticket or spec with acceptance criteria"
+          specification: "Link the change to a PRD/RFC/ticket; include acceptance criteria and security notes when relevant."
 ```
 
 ---
 
-## State: Collect CI Evidence
+## State: Validate baseline CI evidence
+
+This module does **not** decide QCP; it only ensures evidence exists to make review meaningful.
+QCP-specific evidence requirements are evaluated later once QCP is computed (see `references/20_testing_evidence_and_ci.md`).
 
 ```yaml
-sources:
-  - ci_status_checks
-  - ci_logs
-  - ci_artifacts:
-      - test_results
-      - doc_builds
-      - clippy_output
-      - benchmark_results  # if required
-      - fuzz_results       # if required
-      - miri_results       # if required
-      - loom_results       # if required
+baseline_ci_definition:
+  acceptable_evidence:
+    - "A passing run of ./scripts/ci/run_local_ci_orchestrator.sh"
+    - "Equivalent CI checks with logs/artifacts attached"
+
+  minimum_expected_signals_for_rust_changes:
+    - rustfmt
+    - clippy (warnings denied)
+    - unit/integration tests (bounded runner if configured)
+    - doc build / doctests
+    - msrv check (if workspace declares rust-version)
+    - dependency audit (cargo-deny and/or cargo-audit)
 
 assertions:
-  - id: INPUT-003
+  - id: INPUT-CI-001
     predicate: |
-      IF qcp_change_exists THEN
-        ci_evidence.sufficient_for(qcp_change)
+      IF diff.touches_rust_code THEN
+        ci_evidence IS_NOT_NULL
     on_fail:
       EMIT StopCondition:
-        id: STOP-CI-INSUFFICIENT
+        id: STOP-NO-CI
         severity: BLOCKER
-        message: "QCP change lacks sufficient CI evidence"
+        message: "Rust code changed but CI evidence is missing."
         remediation:
           type: CI
-          specification: "Add CI coverage for QCP paths"
+          specification: "Attach CI logs/artifacts (or run the local CI orchestrator) before requesting review."
 
-  - id: INPUT-004
+  - id: INPUT-CI-002
     predicate: |
-      IF evidence_claims.runtime_path THEN
-        ci_evidence.executes_real_runtime_path AND
-        NOT ci_evidence.simulated_runtime_path
+      IF diff.touches_rust_code AND ci_evidence PROVIDED THEN
+        ci_evidence.indicates_failure == false
     on_fail:
       EMIT StopCondition:
-        id: STOP-EVIDENCE-SIMULATION
+        id: STOP-CI-FAILING
         severity: BLOCKER
-        message: "Evidence claims runtime path but tests simulate it"
+        message: "CI evidence indicates failing checks."
         remediation:
-          type: TEST
-          specification: "Exercise real runtime path or add explicit waiver"
+          type: CI
+          specification: "Fix failing CI or document an approved, scoped waiver."
 ```
 
 ---
 
-## Output Schema
+## Output schema
 
 ```typescript
-interface ChangeSetBundle {
-  pr_identity: PRIdentity;
-  binding_requirements: BindingRequirement[];
-  ci_evidence: CIEvidence;
-  diff_chunks: DiffChunk[];
-  crate_manifest: CargoToml;
-}
-
 interface StopCondition {
   id: string;
   severity: "BLOCKER";
   message: string;
   remediation: RemediationConstraint;
 }
+
+interface ChangeSetBundle {
+  // intentionally abstract; actual shape is owned by the reviewing pipeline
+  // and should include diff + manifests + evidence.
+}
 ```
 
 ---
 
-## Exit Criteria
+## Exit criteria
 
 ```yaml
 exit_criteria:
   success:
-    - changeset_bundle.complete == true
     - stop_conditions.length == 0
 
   blocked:

@@ -6,7 +6,8 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha};
+use super::barrier::fetch_pr_head_sha;
+use super::projection_store;
 use super::target::resolve_pr_target;
 use super::types::{sanitize_for_path, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
@@ -30,20 +31,25 @@ struct PrepareSummary {
 pub fn run_prepare(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
-    let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
-
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let repo_root = resolve_repo_root()?;
     let local_head = resolve_local_head_sha(&repo_root)?;
+    let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     if !local_head.eq_ignore_ascii_case(&head_sha) {
         return Err(format!(
             "local HEAD {local_head} does not match PR head {head_sha}; sync your branch and retry `apm2 fac review prepare`"
         ));
+    }
+    if pr_number.is_some() {
+        let _ = projection_store::save_identity_with_context(
+            &owner_repo,
+            resolved_pr,
+            &head_sha,
+            "prepare",
+        );
     }
 
     let base_ref = resolve_main_base_ref(&repo_root)?;
@@ -174,9 +180,9 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         validate_expected_head_sha(value)?;
         return Ok(value.to_ascii_lowercase());
     }
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    Ok(value.to_ascii_lowercase())
+    let remote_head_sha = fetch_pr_head_sha(owner_repo, pr_number)?;
+    validate_expected_head_sha(&remote_head_sha)?;
+    Ok(remote_head_sha)
 }
 
 fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {
@@ -184,9 +190,9 @@ fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {
     let remote_status = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", remote_main])
         .current_dir(repo_root)
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve base ref: {err}"))?;
-    if remote_status.success() {
+    if remote_status.status.success() {
         return Ok("origin/main".to_string());
     }
 
@@ -194,9 +200,9 @@ fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {
     let local_status = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", local_main])
         .current_dir(repo_root)
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve base ref: {err}"))?;
-    if local_status.success() {
+    if local_status.status.success() {
         return Ok("main".to_string());
     }
 

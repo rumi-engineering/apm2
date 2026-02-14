@@ -1,4 +1,4 @@
-# M02: QCP Classification
+# M02: QCP classification (Escalation gate)
 
 ```yaml
 module_id: M02
@@ -9,23 +9,34 @@ outputs: [QCP_Result]
 
 ---
 
-## QCP Decision Tree
+## Purpose
+
+QCP is an **escalation decision**, not a moral judgement.
+
+- False positives are acceptable (review is stricter).
+- False negatives are not acceptable (review misses a high-impact failure mode).
+
+QCP MUST be set to **YES** if any trigger matches.
+
+---
+
+## Decision procedure
 
 ```mermaid
 flowchart TD
-    START[Scan ChangeSet] --> A{Touches unsafe/memory?}
+    START[Scan ChangeSet] --> A{Touches SCP/DCP path map?}
     A -->|YES| QCP_YES
-    A -->|NO| B{Touches concurrency?}
+    A -->|NO| B{Touches unsafe/memory/provenance?}
     B -->|YES| QCP_YES
-    B -->|NO| C{Touches public API?}
+    B -->|NO| C{Touches concurrency/async cancellation?}
     C -->|YES| QCP_YES
-    C -->|NO| D{Touches hot paths?}
+    C -->|NO| D{Touches protocol/persistence/canonicalization?}
     D -->|YES| QCP_YES
-    D -->|NO| E{Touches gates/policy?}
+    D -->|NO| E{Touches public API or feature/cfg matrix?}
     E -->|YES| QCP_YES
-    E -->|NO| F{Touches evidence/ledger/enforcement?}
+    E -->|NO| F{Touches build-time execution / supply chain?}
     F -->|YES| QCP_YES
-    F -->|NO| G{Touches platform contract?}
+    F -->|NO| G{Touches CI/policy gates?}
     G -->|YES| QCP_YES
     G -->|NO| QCP_NO
 
@@ -35,186 +46,143 @@ flowchart TD
 
 ---
 
-## QCP Trigger Patterns
+## Trigger groups
 
-### 1.1 Soundness and Memory Correctness
+### 1) SCP/DCP path map (APM2-specific)
+
+Source of truth: `references/43_apm2_scp_dcp_map.md`.
 
 ```yaml
 patterns:
-  - regex: "\\bunsafe\\b"
-  - regex: "\\bunsafe\\s+fn\\b"
-  - regex: "\\bunsafe\\s+impl\\b"
-  - symbols: [NonNull, UnsafeCell, MaybeUninit, ManuallyDrop]
-  - symbols: ["mem::forget", "mem::transmute", "mem::zeroed"]
-  - keywords: [arena, pool, freelist, slab, allocator]
-  - symbols: [Pin]
-
+  - changed_path_matches_scp: true
+  - changed_path_matches_dcp: true
 on_match:
   qcp: true
-  category: SOUNDNESS_MEMORY
+  categories: [SECURITY_CRITICAL_PATH, DETERMINISM_CRITICAL_PATH]
+  justification: "Change touches SCP/DCP mapped code."
 ```
 
-### 1.2 Concurrency Correctness
+### 2) Soundness and memory correctness
+
+```yaml
+patterns:
+  - regex: "\bunsafe\b"
+  - regex: "\bunsafe\s+(fn|impl|trait)\b"
+  - symbols: [NonNull, UnsafeCell, MaybeUninit, ManuallyDrop, Pin]
+  - symbols: ["mem::transmute", "mem::zeroed", "mem::forget"]
+  - keywords: [arena, pool, freelist, slab, allocator]
+on_match:
+  qcp: true
+  categories: [SOUNDNESS_MEMORY]
+```
+
+### 3) Concurrency and cancellation
 
 ```yaml
 patterns:
   - traits: [Send, Sync]
-  - regex: "\\bunsafe\\s+impl\\s+(Send|Sync)\\b"
-  - symbols: [Atomic*, Ordering, fence]
-  - keywords: [lock-free, lockfree]
-  - context: "async cancellation"
-  - context: "locks in async"
-
+  - regex: "\bunsafe\s+impl\s+(Send|Sync)\b"
+  - symbols: ["Atomic*", Ordering, fence]
+  - symbols: ["tokio::select!", "futures::select!"]
+  - keywords: ["lock-free", "lockfree", "epoch", "hazard pointer"]
 on_match:
   qcp: true
-  category: CONCURRENCY
+  categories: [CONCURRENCY_ASYNC]
 ```
 
-### 1.3 Public API Contract
+### 4) Protocol, persistence, canonicalization
 
 ```yaml
 patterns:
-  - visibility: pub
-  - change_type: [added, modified, removed]
-  - scope: [type, trait, function, const, static]
+  - path_contains: [protocol, codec, parser, frame, wire]
+  - path_contains: [ledger, evidence, cas]
+  - symbols: [append_verified, verify_signature, canonicalize]
+  - serde_boundary: ["serde::Deserialize", "serde_json", "prost::Message"]
+on_match:
+  qcp: true
+  categories: [PROTOCOL_PERSISTENCE]
+```
+
+### 5) Public API / cfg / feature matrix
+
+```yaml
+patterns:
+  - public_item_changed: true        # pub fn/struct/trait/const/static
+  - semver_relevant_change: true
   - feature_flag_changes: true
-  - serialization_format_changes: true
-
+  - cfg_changes: true
 on_match:
   qcp: true
-  category: PUBLIC_API
+  categories: [PUBLIC_API, BUILD_MATRIX]
 ```
 
-### 1.4 Performance-Critical Surfaces
+### 6) Build-time execution and supply chain
 
 ```yaml
 patterns:
-  - annotation: "#[inline]"
-  - annotation: "#[cold]"
-  - annotation: "#[hot]"
-  - path_contains: [alloc, dealloc, index, iter, traverse]
-  - complexity_change: true
-  - allocation_pattern_change: true
-
+  - modifies: [deny.toml, Cargo.toml, Cargo.lock, rust-toolchain.toml]
+  - adds_or_modifies: [build.rs]
+  - adds_or_modifies_proc_macro: true
+  - adds_git_dependency: true
+  - spawns_process: ["std::process::Command", "nix::unistd::exec*"]
 on_match:
   qcp: true
-  category: PERFORMANCE
+  categories: [SUPPLY_CHAIN, BUILD_TIME_EXECUTION]
 ```
 
-### 1.5 Gate and Policy Surfaces
+### 7) CI / policy gates
 
 ```yaml
 patterns:
-  - path_contains: [.github/workflows, ci.yml, ci.yaml]
-  - path_contains: [clippy.toml, rustfmt.toml, deny.toml]
-  - cfg_change: "feature gate"
-  - lint_suppression: true
-
+  - path_contains: [.github/workflows, scripts/ci]
+  - modifies_lint_policy: true
+  - modifies_security_guardrails: true
 on_match:
   qcp: true
-  category: GATE_POLICY
-```
-
-### 1.6 Platform / `no_std` Contract
-
-```yaml
-contract_promises:
-  - no_std_support: "#![no_std]"
-  - alloc_only: "extern crate alloc"
-  - target_families: [embedded, wasm, "target_os = none"]
-  - pointer_width_portable: ["target_pointer_width = 32", "target_pointer_width = 64"]
-  - endianness_portable: true
-
-trigger_patterns:
-  - new_std_usage: "std::"
-  - uncovered_cfg: "cfg(...) without CI"
-  - pointer_width_assumption: ["usize as u64", "usize as u32"]
-  - endianness_assumption: "repr(C) + byte manipulation"
-
-assertions:
-  - id: QCP-NOSTD-001
-    predicate: |
-      IF contract.no_std_support THEN
-        NOT diff.contains_unconditional_std_usage
-    on_fail:
-      EMIT Finding:
-        id: QCP-NOSTD-001
-        severity: BLOCKER
-        location: {first_std_usage}
-        remediation:
-          type: CODE
-          specification: "Gate std usage with cfg(feature = \"std\")"
-
-  - id: QCP-PTR-001
-    predicate: |
-      IF contract.pointer_width_portable THEN
-        NOT diff.contains_unguarded_pointer_width_cast
-    on_fail:
-      EMIT Finding:
-        id: QCP-PTR-001
-        severity: BLOCKER
-        location: {cast_location}
-        remediation:
-          type: CODE
-          specification: "Add cfg(target_pointer_width) guards"
-
-  - id: QCP-LAYOUT-001
-    predicate: |
-      IF diff.modifies_repr_c THEN
-        endianness_documented AND tests_exist
-    on_fail:
-      EMIT Finding:
-        id: QCP-LAYOUT-001
-        severity: BLOCKER
-        location: {repr_location}
-        remediation:
-          type: TEST
-          specification: "Add endianness tests for layout-sensitive code"
-
-### 1.7 Evidence and Enforcement Surfaces
-
-```yaml
-patterns:
-  - path_contains: [evidence, ledger, cas, workspace]
-  - path_contains: [tool_executor, tool_broker, tool_protocol]
-  - symbols: [ToolExecutor, ToolBroker, WorkspaceManager, append_verified]
-  - keywords: [allowlist, denylist, enforcement, signature, anchoring]
-
-on_match:
-  qcp: true
-  category: EVIDENCE_ENFORCEMENT
-```
+  categories: [GATE_POLICY]
 ```
 
 ---
 
-## Output Schema
+## Output schema
 
 ```typescript
 interface QCP_Result {
   qcp: boolean;
   categories: QCPCategory[];
-  justification: string;
-  threshold_multiplier: number;  // 1.0 for NO, 2.0 for YES
+  justification: string;          // short, human-readable rationale
+  threshold_multiplier: number;   // 1.0 for NO, 2.0 for YES (conservative default)
+  touched_paths: string[];        // normalized file paths (optional but recommended)
+  touched_types?: string[];       // type symbols when available
 }
 
 type QCPCategory =
+  | "SECURITY_CRITICAL_PATH"
+  | "DETERMINISM_CRITICAL_PATH"
   | "SOUNDNESS_MEMORY"
-  | "CONCURRENCY"
+  | "CONCURRENCY_ASYNC"
+  | "PROTOCOL_PERSISTENCE"
   | "PUBLIC_API"
-  | "PERFORMANCE"
-  | "GATE_POLICY"
-  | "PLATFORM_CONTRACT"
-  | "EVIDENCE_ENFORCEMENT";
+  | "BUILD_MATRIX"
+  | "SUPPLY_CHAIN"
+  | "BUILD_TIME_EXECUTION"
+  | "GATE_POLICY";
 ```
 
 ---
 
-## QCP Implications
+## QCP implications
 
 ```yaml
 if_qcp_yes:
   proof_burden: ELEVATED
-  severity_threshold: STRICT  # MAJOR -> presumptive BLOCKER
-  re_audit: MANDATORY_AFTER_FIXES
+  default_threshold_multiplier: 2.0
+  evidence_expectations:
+    - "CI must cover the changed paths under relevant feature sets"
+    - "Unsafe/concurrency/protocol changes require tool-backed evidence (Miri/Loom/fuzz) where applicable"
+  re_audit: "mandatory after fixes to QCP findings"
+
+if_qcp_no:
+  proof_burden: BASELINE
+  default_threshold_multiplier: 1.0
 ```

@@ -3,20 +3,16 @@
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use super::backend::{
-    build_prompt_content, build_resume_script_command_for_backend,
-    build_script_command_for_backend, build_sha_update_message,
+    build_prompt_content, build_resume_spawn_command_for_backend, build_sha_update_message,
+    build_spawn_command_for_backend,
 };
-use super::barrier::{
-    confirm_review_posted, confirm_review_posted_with_retry, fetch_pr_head_sha,
-    resolve_authenticated_gh_login,
-};
-use super::detection::{
-    detect_comment_permission_denied, detect_http_400_or_rate_limit, infer_verdict,
-};
+use super::barrier::fetch_pr_head_sha_local;
+use super::decision::resolve_completion_signal_from_projection_for_home;
+use super::detection::{detect_comment_permission_denied, detect_http_400_or_rate_limit};
 use super::events::emit_event;
 use super::liveness::scan_log_liveness;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
@@ -25,16 +21,34 @@ use super::model_pool::{
     select_cross_family_fallback, select_fallback_model, select_review_model_random,
 };
 use super::state::{
-    build_review_run_id, build_run_key, find_active_review_entry, get_process_start_time,
+    COMPLETION_RECEIPT_SCHEMA, ReviewRunCompletionReceipt, build_review_run_id, build_run_key,
+    find_active_review_entry, get_process_start_time, load_review_run_completion_receipt,
     load_review_run_state_strict, next_review_sequence_number, remove_review_state_entry,
-    try_acquire_review_lease, upsert_review_state_entry, write_pulse_file, write_review_run_state,
+    try_acquire_review_lease, upsert_review_state_entry, write_pulse_file,
+    write_review_run_completion_receipt_for_home, write_review_run_state,
 };
 use super::types::{
     ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP, MAX_RESTART_ATTEMPTS,
     PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunState, ReviewRunStatus,
     ReviewRunSummary, ReviewRunType, ReviewStateEntry, STALL_THRESHOLD, SingleReviewResult,
-    SingleReviewSummary, SpawnMode, split_owner_repo, validate_expected_head_sha,
+    SingleReviewSummary, SpawnMode, apm2_home_dir, is_verdict_finalized_agent_stop_reason,
+    now_iso8601, split_owner_repo, validate_expected_head_sha,
 };
+
+const STALE_ARTIFACT_TTL_SECS_DEFAULT: u64 = 24 * 60 * 60;
+const PREPARED_REVIEW_ROOT: &str = "/tmp/apm2-fac-review";
+const STALE_TEMP_FILE_PREFIXES: [&str; 3] = [
+    "apm2_fac_review_",
+    "apm2_fac_prompt_",
+    "apm2_fac_last_message_",
+];
+
+#[derive(Debug, Clone)]
+struct CompletionSignal {
+    verdict: String,
+    decision: String,
+    decision_comment_id: u64,
+}
 
 // ── Token usage extraction ───────────────────────────────────────────────────
 
@@ -76,25 +90,216 @@ fn resolve_repo_root() -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(root))
 }
 
+fn stale_artifact_ttl() -> Duration {
+    Duration::from_secs(
+        std::env::var("APM2_FAC_STALE_ARTIFACT_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(STALE_ARTIFACT_TTL_SECS_DEFAULT),
+    )
+}
+
+fn path_is_stale(path: &std::path::Path, ttl: Duration) -> bool {
+    path.metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed >= ttl)
+}
+
+fn cleanup_stale_temp_files(ttl: Duration) -> Result<(), String> {
+    let temp_root = std::env::temp_dir();
+    let entries = match fs::read_dir(&temp_root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return Err(format!(
+                "failed to read temp dir {}: {err}",
+                temp_root.display()
+            ));
+        },
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !STALE_TEMP_FILE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        if !path_is_stale(&path, ttl) {
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+fn cleanup_stale_prepared_inputs(ttl: Duration) -> Result<(), String> {
+    let root = std::path::Path::new(PREPARED_REVIEW_ROOT);
+    if !root.exists() {
+        return Ok(());
+    }
+    let repo_dirs =
+        fs::read_dir(root).map_err(|err| format!("failed to read {}: {err}", root.display()))?;
+    for repo_dir in repo_dirs.filter_map(Result::ok) {
+        let repo_path = repo_dir.path();
+        if !repo_path.is_dir() {
+            continue;
+        }
+        let Ok(pr_dirs) = fs::read_dir(&repo_path) else {
+            continue;
+        };
+        for pr_dir in pr_dirs.filter_map(Result::ok) {
+            let pr_path = pr_dir.path();
+            if !pr_path.is_dir() {
+                continue;
+            }
+            let Ok(sha_dirs) = fs::read_dir(&pr_path) else {
+                continue;
+            };
+            for sha_dir in sha_dirs.filter_map(Result::ok) {
+                let sha_path = sha_dir.path();
+                if !sha_path.is_dir() || !path_is_stale(&sha_path, ttl) {
+                    continue;
+                }
+                let _ = fs::remove_dir_all(&sha_path);
+            }
+            if fs::read_dir(&pr_path)
+                .ok()
+                .is_some_and(|mut entries| entries.next().is_none())
+            {
+                let _ = fs::remove_dir(&pr_path);
+            }
+        }
+        if fs::read_dir(&repo_path)
+            .ok()
+            .is_some_and(|mut entries| entries.next().is_none())
+        {
+            let _ = fs::remove_dir(&repo_path);
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_stale_fac_artifacts() -> Result<(), String> {
+    let ttl = stale_artifact_ttl();
+    cleanup_stale_temp_files(ttl)?;
+    cleanup_stale_prepared_inputs(ttl)?;
+    Ok(())
+}
+
+fn decision_to_verdict(decision: &str) -> Option<String> {
+    match decision.trim().to_ascii_lowercase().as_str() {
+        "approve" => Some("PASS".to_string()),
+        "deny" => Some("FAIL".to_string()),
+        _ => None,
+    }
+}
+
+fn load_completion_signal(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    run_id: &str,
+    head_sha: &str,
+) -> Result<Option<CompletionSignal>, String> {
+    let Some(receipt) = load_review_run_completion_receipt(pr_number, review_type)? else {
+        let Some(state) = load_review_run_state_strict(pr_number, review_type)? else {
+            return Ok(None);
+        };
+        if !state.owner_repo.eq_ignore_ascii_case(owner_repo)
+            || !state.run_id.eq_ignore_ascii_case(run_id)
+            || !state.head_sha.eq_ignore_ascii_case(head_sha)
+            || state.status != ReviewRunStatus::Done
+            || !state
+                .terminal_reason
+                .as_deref()
+                .is_some_and(is_verdict_finalized_agent_stop_reason)
+        {
+            return Ok(None);
+        }
+        let home = apm2_home_dir()?;
+        let Some(signal) = resolve_completion_signal_from_projection_for_home(
+            &home,
+            owner_repo,
+            pr_number,
+            review_type,
+            head_sha,
+        )?
+        else {
+            return Ok(None);
+        };
+        let receipt = ReviewRunCompletionReceipt {
+            schema: COMPLETION_RECEIPT_SCHEMA.to_string(),
+            emitted_at: now_iso8601(),
+            repo: owner_repo.to_string(),
+            pr_number,
+            review_type: review_type.to_string(),
+            run_id: run_id.to_string(),
+            head_sha: head_sha.to_string(),
+            decision: signal.decision.clone(),
+            decision_comment_id: signal.decision_comment_id,
+            decision_author: signal.decision_author,
+            decision_summary: signal.decision_summary,
+            integrity_hmac: String::new(),
+        };
+        if let Err(err) = write_review_run_completion_receipt_for_home(&home, &receipt) {
+            eprintln!(
+                "WARNING: failed to repair completion receipt for PR #{pr_number} type={review_type}: {err}"
+            );
+        }
+        return Ok(Some(CompletionSignal {
+            verdict: signal.verdict,
+            decision: signal.decision,
+            decision_comment_id: signal.decision_comment_id,
+        }));
+    };
+    if !receipt.repo.eq_ignore_ascii_case(owner_repo)
+        || !receipt.run_id.eq_ignore_ascii_case(run_id)
+        || !receipt.head_sha.eq_ignore_ascii_case(head_sha)
+    {
+        return Ok(None);
+    }
+    if receipt.decision_summary.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(verdict) = decision_to_verdict(&receipt.decision) else {
+        return Ok(None);
+    };
+    Ok(Some(CompletionSignal {
+        verdict,
+        decision: receipt.decision,
+        decision_comment_id: receipt.decision_comment_id,
+    }))
+}
+
 // ── run_review_inner ────────────────────────────────────────────────────────
 
 pub fn run_review_inner(
-    pr_url: &str,
+    owner_repo: &str,
+    pr_number: u32,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
     force: bool,
 ) -> Result<ReviewRunSummary, String> {
-    let (owner_repo, pr_number) = super::types::parse_pr_url(pr_url)?;
-    let current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
-    let initial_head_sha = current_head_sha.clone();
+    if let Err(err) = cleanup_stale_fac_artifacts() {
+        eprintln!("WARNING: failed to clean stale FAC artifacts: {err}");
+    }
+    let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+    let current_head_sha = fetch_pr_head_sha_local(pr_number)?;
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
         if !expected.eq_ignore_ascii_case(&current_head_sha) {
             return Err(format!(
-                "PR head moved before review start: expected {expected}, got {current_head_sha}"
+                "PR head mismatch before review run: expected {expected}, authoritative {current_head_sha}"
             ));
         }
     }
+    let initial_head_sha = current_head_sha.clone();
     let workspace_root = resolve_repo_root()?;
     let merge_report = check_merge_conflicts_against_main(&workspace_root, &initial_head_sha)?;
     if merge_report.has_conflicts() {
@@ -117,8 +322,8 @@ pub fn run_review_inner(
         ReviewRunType::Security => {
             let selected = select_review_model_random();
             let result = run_single_review(
-                pr_url,
-                &owner_repo,
+                &pr_url,
+                owner_repo,
                 pr_number,
                 ReviewKind::Security,
                 current_head_sha,
@@ -132,8 +337,8 @@ pub fn run_review_inner(
         ReviewRunType::Quality => {
             let selected = select_review_model_random();
             let result = run_single_review(
-                pr_url,
-                &owner_repo,
+                &pr_url,
+                owner_repo,
                 pr_number,
                 ReviewKind::Quality,
                 current_head_sha,
@@ -145,58 +350,90 @@ pub fn run_review_inner(
             quality_summary = Some(result.summary);
         },
         ReviewRunType::All => {
-            let sec_pr_url = pr_url.to_string();
-            let sec_owner_repo = owner_repo.clone();
+            let sec_pr_url = pr_url.clone();
+            let sec_owner_repo = owner_repo.to_string();
             let sec_head = current_head_sha.clone();
             let sec_ctx = event_ctx.clone();
             let sec_model = select_review_model_random();
             let sec_handle = thread::spawn(move || {
-                run_single_review(
-                    &sec_pr_url,
-                    &sec_owner_repo,
-                    pr_number,
-                    ReviewKind::Security,
-                    sec_head,
-                    sec_model,
-                    &sec_ctx,
-                    force,
-                )
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_single_review(
+                        &sec_pr_url,
+                        &sec_owner_repo,
+                        pr_number,
+                        ReviewKind::Security,
+                        sec_head,
+                        sec_model,
+                        &sec_ctx,
+                        force,
+                    )
+                }))
+                .map_err(|_| "security review worker panicked".to_string())
+                .and_then(|value| value)
             });
 
-            let qual_pr_url = pr_url.to_string();
-            let qual_owner_repo = owner_repo.clone();
+            let qual_pr_url = pr_url.clone();
+            let qual_owner_repo = owner_repo.to_string();
             let qual_head = current_head_sha;
             let qual_ctx = event_ctx.clone();
             let qual_model = select_review_model_random();
             let qual_handle = thread::spawn(move || {
-                run_single_review(
-                    &qual_pr_url,
-                    &qual_owner_repo,
-                    pr_number,
-                    ReviewKind::Quality,
-                    qual_head,
-                    qual_model,
-                    &qual_ctx,
-                    force,
-                )
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_single_review(
+                        &qual_pr_url,
+                        &qual_owner_repo,
+                        pr_number,
+                        ReviewKind::Quality,
+                        qual_head,
+                        qual_model,
+                        &qual_ctx,
+                        force,
+                    )
+                }))
+                .map_err(|_| "quality review worker panicked".to_string())
+                .and_then(|value| value)
             });
 
-            let sec_result = sec_handle
+            let sec_joined = sec_handle
                 .join()
-                .map_err(|_| "security review worker panicked".to_string())??;
-            let qual_result = qual_handle
+                .map_err(|_| "security review worker panicked".to_string())?;
+            let qual_joined = qual_handle
                 .join()
-                .map_err(|_| "quality review worker panicked".to_string())??;
-            final_heads.push(sec_result.final_head_sha.clone());
-            final_heads.push(qual_result.final_head_sha.clone());
-            security_summary = Some(sec_result.summary);
-            quality_summary = Some(qual_result.summary);
+                .map_err(|_| "quality review worker panicked".to_string())?;
+            let security_outcome = match &sec_joined {
+                Ok(result) => format!(
+                    "ok(run_id={},state={},verdict={})",
+                    result.summary.run_id, result.summary.state, result.summary.verdict
+                ),
+                Err(err) => format!("error({err})"),
+            };
+            let quality_outcome = match &qual_joined {
+                Ok(result) => format!(
+                    "ok(run_id={},state={},verdict={})",
+                    result.summary.run_id, result.summary.state, result.summary.verdict
+                ),
+                Err(err) => format!("error({err})"),
+            };
+
+            match (sec_joined, qual_joined) {
+                (Ok(sec_result), Ok(qual_result)) => {
+                    final_heads.push(sec_result.final_head_sha.clone());
+                    final_heads.push(qual_result.final_head_sha.clone());
+                    security_summary = Some(sec_result.summary);
+                    quality_summary = Some(qual_result.summary);
+                },
+                _ => {
+                    return Err(format!(
+                        "parallel review aggregate failure for PR #{pr_number}: security={security_outcome}; quality={quality_outcome}"
+                    ));
+                },
+            }
         },
     }
 
-    let current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)
-        .ok()
-        .or_else(|| final_heads.into_iter().last())
+    let current_head_sha = final_heads
+        .last()
+        .cloned()
         .unwrap_or_else(|| initial_head_sha.clone());
 
     emit_event(
@@ -228,7 +465,7 @@ pub fn run_review_inner(
     )?;
 
     Ok(ReviewRunSummary {
-        pr_url: pr_url.to_string(),
+        pr_url,
         pr_number,
         initial_head_sha,
         final_head_sha: current_head_sha,
@@ -346,7 +583,6 @@ fn run_single_review(
     let mut restart_count: u32 = 0;
     let review_started = Instant::now();
     let review_type = review_kind.as_str();
-    let expected_comment_author = resolve_authenticated_gh_login();
     let sequence_number = next_review_sequence_number(pr_number, review_type)?;
     let run_id = build_review_run_id(pr_number, review_type, sequence_number, &current_head_sha);
     if let Some(previous) = load_review_run_state_strict(pr_number, review_type)? {
@@ -364,7 +600,7 @@ fn run_single_review(
     }
     let mut run_state = ReviewRunState {
         run_id: run_id.clone(),
-        pr_url: pr_url.to_string(),
+        owner_repo: owner_repo.to_string(),
         pr_number,
         head_sha: current_head_sha.clone(),
         review_type: review_type.to_string(),
@@ -459,30 +695,57 @@ fn run_single_review(
     )?;
 
     'restart_loop: loop {
-        if let Some(posted_review) = confirm_review_posted(
+        if let Some(signal) = load_completion_signal(
             owner_repo,
             pr_number,
-            review_kind.marker(),
+            review_type,
+            &run_id,
             &current_head_sha,
-            expected_comment_author.as_deref(),
         )? {
-            let completion_verdict = posted_review
-                .verdict
-                .clone()
-                .unwrap_or_else(|| "UNKNOWN".to_string());
+            let latest_head = fetch_pr_head_sha_local(pr_number)?;
+            if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
+                let old_sha = current_head_sha.clone();
+                emit_run_event(
+                    "sha_update",
+                    &old_sha,
+                    serde_json::json!({
+                        "old_sha": old_sha,
+                        "new_sha": latest_head,
+                    }),
+                )?;
+                current_head_sha.clone_from(&latest_head);
+                write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                persist_review_run_state(
+                    &mut run_state,
+                    ReviewRunStatus::Pending,
+                    Some("sha_update".to_string()),
+                    &current_head_sha,
+                    &current_model,
+                    restart_count,
+                    None,
+                )?;
+                spawn_mode = SpawnMode::Resume {
+                    message: build_sha_update_message(pr_number, &old_sha, &latest_head),
+                };
+                continue 'restart_loop;
+            }
+
             emit_run_event(
                 "run_deduplicated",
                 &current_head_sha,
                 serde_json::json!({
-                    "reason": "review_comment_already_present",
-                    "comment_id": posted_review.id,
-                    "verdict": completion_verdict,
+                    "reason": "completion_receipt_already_present",
+                    "decision": signal.decision,
+                    "verdict": signal.verdict,
+                    "decision_comment_id": signal.decision_comment_id,
                 }),
             )?;
+            remove_review_state_entry(&run_key)?;
+            let completion_reason = signal.decision.to_ascii_lowercase();
             persist_review_run_state(
                 &mut run_state,
                 ReviewRunStatus::Done,
-                Some("review_comment_already_present".to_string()),
+                Some(completion_reason.clone()),
                 &current_head_sha,
                 &current_model,
                 restart_count,
@@ -494,9 +757,9 @@ fn run_single_review(
                     sequence_number,
                     ReviewRunStatus::Done,
                     review_type,
-                    completion_verdict != "UNKNOWN",
-                    completion_verdict,
-                    Some("review_comment_already_present".to_string()),
+                    true,
+                    signal.verdict,
+                    Some(completion_reason),
                     &current_model.model,
                     current_model.backend.as_str(),
                     review_started.elapsed().as_secs(),
@@ -515,15 +778,15 @@ fn run_single_review(
                 .map_err(|err| format!("failed to write prompt file: {err}"))?;
         }
 
-        let command = match &spawn_mode {
-            SpawnMode::Initial => build_script_command_for_backend(
+        let spawn_cmd = match &spawn_mode {
+            SpawnMode::Initial => build_spawn_command_for_backend(
                 current_model.backend,
                 &prompt_path,
                 &log_path,
                 &current_model.model,
                 Some(&last_message_path),
-            ),
-            SpawnMode::Resume { message } => build_resume_script_command_for_backend(
+            )?,
+            SpawnMode::Resume { message } => build_resume_spawn_command_for_backend(
                 current_model.backend,
                 &log_path,
                 &current_model.model,
@@ -546,7 +809,7 @@ fn run_single_review(
                 return Err(err);
             },
         };
-        let mut child = match Command::new("sh").args(["-lc", &command]).spawn() {
+        let mut child = match spawn_cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 persist_review_run_state(
@@ -575,7 +838,7 @@ fn run_single_review(
                 last_message_file: Some(last_message_path.clone()),
                 review_type: review_type.to_string(),
                 pr_number,
-                pr_url: pr_url.to_string(),
+                owner_repo: owner_repo.to_string(),
                 head_sha: current_head_sha.clone(),
                 restart_count,
                 model: current_model.model.clone(),
@@ -619,28 +882,125 @@ fn run_single_review(
         let run_started = Instant::now();
 
         loop {
+            if let Some(signal) = load_completion_signal(
+                owner_repo,
+                pr_number,
+                review_type,
+                &run_id,
+                &current_head_sha,
+            )? {
+                emit_run_event(
+                    "completion_signal_detected",
+                    &current_head_sha,
+                    serde_json::json!({
+                        "decision": signal.decision,
+                        "verdict": signal.verdict,
+                        "decision_comment_id": signal.decision_comment_id,
+                    }),
+                )?;
+                super::terminate_child(&mut child)?;
+                let latest_head = fetch_pr_head_sha_local(pr_number)?;
+                emit_run_event(
+                    "pulse_check",
+                    &current_head_sha,
+                    serde_json::json!({
+                        "pulse_sha": latest_head,
+                        "match": latest_head.eq_ignore_ascii_case(&current_head_sha),
+                    }),
+                )?;
+                if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
+                    let old_sha = current_head_sha.clone();
+                    emit_run_event(
+                        "sha_update",
+                        &old_sha,
+                        serde_json::json!({
+                            "old_sha": old_sha,
+                            "new_sha": latest_head,
+                        }),
+                    )?;
+                    current_head_sha.clone_from(&latest_head);
+                    write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                    persist_review_run_state(
+                        &mut run_state,
+                        ReviewRunStatus::Pending,
+                        Some("sha_update".to_string()),
+                        &current_head_sha,
+                        &current_model,
+                        restart_count,
+                        None,
+                    )?;
+                    spawn_mode = SpawnMode::Resume {
+                        message: build_sha_update_message(pr_number, &old_sha, &latest_head),
+                    };
+                    continue 'restart_loop;
+                }
+
+                let tokens = extract_token_usage(&log_path);
+                emit_run_event(
+                    "run_complete",
+                    &current_head_sha,
+                    serde_json::json!({
+                        "exit_code": 0,
+                        "duration_secs": run_started.elapsed().as_secs(),
+                        "decision": signal.decision,
+                        "verdict": signal.verdict,
+                        "tokens_used": tokens,
+                    }),
+                )?;
+                if signal.decision_comment_id > 0 {
+                    emit_run_event(
+                        "review_posted",
+                        &current_head_sha,
+                        serde_json::json!({
+                            "comment_id": signal.decision_comment_id,
+                            "verdict": signal.verdict,
+                        }),
+                    )?;
+                }
+
+                remove_review_state_entry(&run_key)?;
+                let completion_reason = signal.decision.to_ascii_lowercase();
+                persist_review_run_state(
+                    &mut run_state,
+                    ReviewRunStatus::Done,
+                    Some(completion_reason.clone()),
+                    &current_head_sha,
+                    &current_model,
+                    restart_count,
+                    None,
+                )?;
+                return Ok(SingleReviewResult {
+                    summary: build_single_review_summary(
+                        &run_id,
+                        sequence_number,
+                        ReviewRunStatus::Done,
+                        review_type,
+                        true,
+                        signal.verdict,
+                        Some(completion_reason),
+                        &current_model.model,
+                        current_model.backend.as_str(),
+                        review_started.elapsed().as_secs(),
+                        restart_count,
+                        tokens,
+                    ),
+                    final_head_sha: current_head_sha,
+                });
+            }
+
             if let Some(status) = child
                 .try_wait()
                 .map_err(|err| format!("failed to poll reviewer process: {err}"))?
             {
                 let exit_code = status.code();
                 if status.success() {
-                    let verdict = infer_verdict(review_kind, &last_message_path, &log_path)?;
-                    let posted_review = confirm_review_posted_with_retry(
+                    if let Some(signal) = load_completion_signal(
                         owner_repo,
                         pr_number,
-                        review_kind.marker(),
+                        review_type,
+                        &run_id,
                         &current_head_sha,
-                        expected_comment_author.as_deref(),
-                    )?;
-                    let comment_id = posted_review.as_ref().map(|review| review.id);
-                    let completion_verdict = posted_review
-                        .as_ref()
-                        .and_then(|review| review.verdict.clone())
-                        .unwrap_or_else(|| verdict.clone());
-                    let is_valid_completion = comment_id.is_some();
-
-                    if is_valid_completion {
+                    )? {
                         let tokens = extract_token_usage(&log_path);
                         emit_run_event(
                             "run_complete",
@@ -648,23 +1008,24 @@ fn run_single_review(
                             serde_json::json!({
                                 "exit_code": exit_code.unwrap_or(0),
                                 "duration_secs": run_started.elapsed().as_secs(),
-                                "verdict": completion_verdict,
+                                "decision": signal.decision,
+                                "verdict": signal.verdict,
                                 "tokens_used": tokens,
                             }),
                         )?;
 
-                        if let Some(comment_id) = comment_id {
+                        if signal.decision_comment_id > 0 {
                             emit_run_event(
                                 "review_posted",
                                 &current_head_sha,
                                 serde_json::json!({
-                                    "comment_id": comment_id,
-                                    "verdict": completion_verdict,
+                                    "comment_id": signal.decision_comment_id,
+                                    "verdict": signal.verdict,
                                 }),
                             )?;
                         }
 
-                        let latest_head = fetch_pr_head_sha(owner_repo, pr_number)?;
+                        let latest_head = fetch_pr_head_sha_local(pr_number)?;
                         emit_run_event(
                             "pulse_check",
                             &current_head_sha,
@@ -705,8 +1066,7 @@ fn run_single_review(
                         }
 
                         remove_review_state_entry(&run_key)?;
-                        let tokens = extract_token_usage(&log_path);
-                        let completion_reason = completion_verdict.to_ascii_lowercase();
+                        let completion_reason = signal.decision.to_ascii_lowercase();
                         persist_review_run_state(
                             &mut run_state,
                             ReviewRunStatus::Done,
@@ -724,7 +1084,7 @@ fn run_single_review(
                                 ReviewRunStatus::Done,
                                 review_type,
                                 true,
-                                completion_verdict,
+                                signal.verdict,
                                 Some(completion_reason),
                                 &current_model.model,
                                 current_model.backend.as_str(),
@@ -745,8 +1105,7 @@ fn run_single_review(
                             "signal": if comment_permission_denied { "auth_permission_denied" } else { "invalid_completion" },
                             "duration_secs": run_started.elapsed().as_secs(),
                             "restart_count": restart_count,
-                            "completion_issue": "comment_not_posted",
-                            "verdict": completion_verdict,
+                            "completion_issue": "decision_receipt_missing",
                             "reason": if comment_permission_denied { "comment_post_permission_denied" } else { "invalid_completion" },
                         }),
                     )?;
@@ -927,12 +1286,8 @@ fn run_single_review(
                 if reason_is_http {
                     backoff_before_cross_family_fallback(restart_count);
                 }
-                let fallback = if reason_is_http {
-                    select_cross_family_fallback(&current_model.model)
-                } else {
-                    select_fallback_model(&current_model.model)
-                }
-                .ok_or_else(|| "no fallback model available".to_string())?;
+                let fallback = select_cross_family_fallback(&current_model.model)
+                    .ok_or_else(|| "no fallback model available".to_string())?;
 
                 emit_run_event(
                     "model_fallback",
@@ -965,7 +1320,7 @@ fn run_single_review(
             thread::sleep(LOOP_SLEEP);
 
             if last_pulse_check.elapsed() >= PULSE_POLL_INTERVAL {
-                let latest_head = fetch_pr_head_sha(owner_repo, pr_number)?;
+                let latest_head = fetch_pr_head_sha_local(pr_number)?;
                 emit_run_event(
                     "pulse_check",
                     &current_head_sha,
@@ -1023,71 +1378,6 @@ fn run_single_review(
                     }),
                 )?;
                 last_liveness_report = Instant::now();
-
-                if let Some(posted_review) = confirm_review_posted(
-                    owner_repo,
-                    pr_number,
-                    review_kind.marker(),
-                    &current_head_sha,
-                    expected_comment_author.as_deref(),
-                )? {
-                    super::terminate_child(&mut child)?;
-                    let completion_verdict = posted_review.verdict.unwrap_or_else(|| {
-                        infer_verdict(review_kind, &last_message_path, &log_path)
-                            .unwrap_or_else(|_| "UNKNOWN".to_string())
-                    });
-                    if completion_verdict != "UNKNOWN" {
-                        let tokens = extract_token_usage(&log_path);
-                        emit_run_event(
-                            "run_complete",
-                            &current_head_sha,
-                            serde_json::json!({
-                                "exit_code": 0,
-                                "duration_secs": run_started.elapsed().as_secs(),
-                                "verdict": completion_verdict,
-                                "completion_mode": "live_comment_detected",
-                                "tokens_used": tokens,
-                            }),
-                        )?;
-                        emit_run_event(
-                            "review_posted",
-                            &current_head_sha,
-                            serde_json::json!({
-                                "comment_id": posted_review.id,
-                                "verdict": completion_verdict,
-                                "completion_mode": "live_comment_detected",
-                            }),
-                        )?;
-                        remove_review_state_entry(&run_key)?;
-                        let completion_reason = completion_verdict.to_ascii_lowercase();
-                        persist_review_run_state(
-                            &mut run_state,
-                            ReviewRunStatus::Done,
-                            Some(completion_reason.clone()),
-                            &current_head_sha,
-                            &current_model,
-                            restart_count,
-                            None,
-                        )?;
-                        return Ok(SingleReviewResult {
-                            summary: build_single_review_summary(
-                                &run_id,
-                                sequence_number,
-                                ReviewRunStatus::Done,
-                                review_type,
-                                true,
-                                completion_verdict,
-                                Some(completion_reason),
-                                &current_model.model,
-                                current_model.backend.as_str(),
-                                review_started.elapsed().as_secs(),
-                                restart_count,
-                                extract_token_usage(&log_path),
-                            ),
-                            final_head_sha: current_head_sha,
-                        });
-                    }
-                }
 
                 if detect_comment_permission_denied(&log_path) {
                     emit_run_event(
