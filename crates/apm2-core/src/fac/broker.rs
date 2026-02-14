@@ -26,6 +26,10 @@
 //! - [INV-BRK-006] Horizon hashes are replay-stable (non-zero) in local-only
 //!   mode.
 
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -34,11 +38,14 @@ use crate::channel::{
     derive_channel_source_witness, issue_channel_context_token,
 };
 use crate::crypto::{Signer, VerifyingKey};
+use crate::determinism::write_atomic;
 use crate::economics::queue_admission::{
     ConvergenceHorizonRef, ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef,
     HtfEvaluationWindow, RevocationFrontierSnapshot, TimeAuthorityEnvelopeV1,
     envelope_signature_canonical_bytes,
 };
+use crate::fac::canonicalizer_tuple::CanonicalizerTupleV1;
+use crate::fac::job_spec::parse_b3_256_digest;
 use crate::schema_registry::fac_schemas::{BoundedDeserializeError, bounded_from_slice_with_limit};
 
 // ---------------------------------------------------------------------------
@@ -62,6 +69,12 @@ pub const MAX_AUTHORITY_CLOCK_LENGTH: usize = 256;
 /// Rejects state files larger than 1 MiB before JSON parsing to prevent
 /// OOM via a crafted state file with unbounded `Vec` payloads (RSK-1601).
 pub const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
+
+/// Maximum size in bytes for the persisted canonicalizer tuple file.
+const MAX_CANONICALIZER_TUPLE_FILE_SIZE: usize = 4_096;
+
+/// Canonical path segment for the persisted admitted canonicalizer tuple.
+const ADMITTED_CANONICALIZER_TUPLE_FILE: &str = "admitted_canonicalizer_tuple.v1.json";
 
 /// Maximum TTL for time authority envelopes (in ticks).
 pub const MAX_ENVELOPE_TTL_TICKS: u64 = 10_000;
@@ -521,6 +534,131 @@ impl FacBroker {
         self.state.current_tick
     }
 
+    /// Persist the current canonicalizer tuple and returns its digest.
+    ///
+    /// The digest is computed using the same canonicalization and digest
+    /// function used for admission binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Persistence`] when tuple directory creation,
+    /// serialization, or atomic write fails.
+    pub fn admit_canonicalizer_tuple(&mut self, fac_root: &Path) -> Result<String, BrokerError> {
+        let tuple = CanonicalizerTupleV1::from_current();
+        let digest = tuple.compute_digest();
+        let tuple_path = fac_root
+            .join("broker")
+            .join(ADMITTED_CANONICALIZER_TUPLE_FILE);
+
+        let parent = tuple_path.parent();
+        if let Some(parent) = parent {
+            if !parent.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)
+                        .map_err(|e| BrokerError::Persistence {
+                            detail: format!(
+                                "cannot create tuple directory {}: {e}",
+                                parent.display()
+                            ),
+                        })?;
+                }
+
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir_all(parent).map_err(|e| BrokerError::Persistence {
+                        detail: format!("cannot create tuple directory {}: {e}", parent.display()),
+                    })?;
+                }
+            }
+        }
+
+        let bytes = serde_json::to_vec_pretty(&tuple).map_err(|e| BrokerError::Persistence {
+            detail: format!("cannot serialize canonicalizer tuple: {e}"),
+        })?;
+
+        write_atomic(&tuple_path, &bytes).map_err(|e| BrokerError::Persistence {
+            detail: format!(
+                "cannot atomically write tuple to {}: {e}",
+                tuple_path.display()
+            ),
+        })?;
+
+        Ok(digest)
+    }
+
+    /// Loads the admitted canonicalizer tuple from the broker admission
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Persistence`] when reading the file fails and
+    /// [`BrokerError::Deserialization`] when parse/validation fails.
+    pub fn load_admitted_tuple(fac_root: &Path) -> Result<CanonicalizerTupleV1, BrokerError> {
+        let tuple_path = fac_root
+            .join("broker")
+            .join(ADMITTED_CANONICALIZER_TUPLE_FILE);
+
+        let bytes = Self::read_canonicalizer_tuple_file(&tuple_path)?;
+
+        let tuple: CanonicalizerTupleV1 =
+            bounded_from_slice_with_limit(&bytes, MAX_CANONICALIZER_TUPLE_FILE_SIZE).map_err(
+                |e| match e {
+                    BoundedDeserializeError::PayloadTooLarge { size, max } => {
+                        BrokerError::StateTooLarge { size, max }
+                    },
+                    _ => BrokerError::Deserialization {
+                        detail: e.to_string(),
+                    },
+                },
+            )?;
+        tuple
+            .validate()
+            .map_err(|detail| BrokerError::Deserialization { detail })?;
+
+        Ok(tuple)
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn read_canonicalizer_tuple_file(tuple_path: &Path) -> Result<Vec<u8>, BrokerError> {
+        let file = File::open(tuple_path).map_err(|e| BrokerError::Persistence {
+            detail: format!(
+                "cannot open admitted canonicalizer tuple {}: {}",
+                tuple_path.display(),
+                e
+            ),
+        })?;
+        let max_size = MAX_CANONICALIZER_TUPLE_FILE_SIZE as u64;
+
+        let mut bytes = Vec::new();
+        let mut bounded_reader = file.take(max_size + 1);
+        bounded_reader
+            .read_to_end(&mut bytes)
+            .map_err(|e| BrokerError::Persistence {
+                detail: format!(
+                    "cannot read admitted canonicalizer tuple {}: {}",
+                    tuple_path.display(),
+                    e
+                ),
+            })?;
+
+        if bytes.len() > MAX_CANONICALIZER_TUPLE_FILE_SIZE {
+            return Err(BrokerError::StateTooLarge {
+                size: bytes.len(),
+                max: MAX_CANONICALIZER_TUPLE_FILE_SIZE,
+            });
+        }
+
+        Ok(bytes)
+    }
+
     // -----------------------------------------------------------------------
     // RFC-0028: ChannelContextToken issuance
     // -----------------------------------------------------------------------
@@ -584,7 +722,11 @@ impl FacBroker {
         };
 
         let policy_ledger_verified = true;
-        let canonicalizer_tuple_digest = compute_canonicalizer_tuple_digest(&policy_root_digest);
+        let canonicalizer_tuple_digest =
+            parse_b3_256_digest(&CanonicalizerTupleV1::from_current().compute_digest())
+                .ok_or_else(|| BrokerError::Deserialization {
+                    detail: "invalid canonicalizer tuple digest".to_string(),
+                })?;
         let disclosure_policy_digest = compute_disclosure_policy_digest(&policy_root_digest);
 
         // Build a fully-verified boundary check (broker is the authority).
@@ -1320,13 +1462,6 @@ fn is_zero_hash(hash: &Hash) -> bool {
     bool::from(hash.ct_eq(&[0u8; 32]))
 }
 
-fn compute_canonicalizer_tuple_digest(job_spec_digest: &Hash) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"apm2.fac_broker.canonicalizer.v1");
-    hasher.update(job_spec_digest);
-    *hasher.finalize().as_bytes()
-}
-
 fn compute_disclosure_policy_digest(job_spec_digest: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.fac_broker.disclosure_policy_digest.v1");
@@ -1408,6 +1543,68 @@ mod tests {
         assert!(
             defects.is_empty(),
             "broker-issued token should pass all boundary checks, got {defects:?}"
+        );
+
+        let expected_tuple_digest =
+            parse_b3_256_digest(&CanonicalizerTupleV1::from_current().compute_digest())
+                .expect("canonicalizer tuple digest must parse");
+        let boundary_binding = decoded
+            .boundary_flow_policy_binding
+            .expect("token should include boundary flow policy binding");
+        assert_eq!(
+            boundary_binding.canonicalizer_tuple_digest, expected_tuple_digest,
+            "token should embed current canonicalizer tuple digest"
+        );
+        assert_eq!(
+            boundary_binding.admitted_canonicalizer_tuple_digest, expected_tuple_digest,
+            "token should embed current canonicalizer tuple digest"
+        );
+    }
+
+    #[test]
+    fn admit_canonicalizer_tuple_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut broker = FacBroker::new();
+        let tuple_digest = broker
+            .admit_canonicalizer_tuple(tmp.path())
+            .expect("admit canonicalizer tuple should write file");
+        let loaded =
+            FacBroker::load_admitted_tuple(tmp.path()).expect("should load admitted tuple");
+
+        assert_eq!(loaded, CanonicalizerTupleV1::from_current());
+        assert_eq!(loaded.compute_digest(), tuple_digest);
+    }
+
+    #[test]
+    fn load_admitted_tuple_fails_when_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(FacBroker::load_admitted_tuple(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn load_admitted_tuple_rejects_oversize_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tuple_path = tmp
+            .path()
+            .join("broker")
+            .join(ADMITTED_CANONICALIZER_TUPLE_FILE);
+        std::fs::create_dir_all(
+            tuple_path
+                .parent()
+                .expect("tuple directory parent should exist"),
+        )
+        .expect("create tuple directory");
+        let oversized_payload = vec![b'{'; MAX_CANONICALIZER_TUPLE_FILE_SIZE + 1];
+        std::fs::write(&tuple_path, oversized_payload).expect("write oversized tuple file");
+
+        let err = FacBroker::load_admitted_tuple(tmp.path())
+            .expect_err("oversized tuple file should be rejected");
+        assert_eq!(
+            err,
+            BrokerError::StateTooLarge {
+                size: MAX_CANONICALIZER_TUPLE_FILE_SIZE + 1,
+                max: MAX_CANONICALIZER_TUPLE_FILE_SIZE,
+            }
         );
     }
 

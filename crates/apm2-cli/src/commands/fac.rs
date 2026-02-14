@@ -56,11 +56,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    safe_rmtree_v1,
+    CanonicalizerTupleV1, FacBroker, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
+    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
 };
+use apm2_core::github::resolve_apm2_home;
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
 use clap::{Args, Subcommand};
@@ -177,6 +178,11 @@ pub enum FacSubcommand {
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
 
+    /// Generic info view.
+    ///
+    /// Use `--canonicalizer` to show the current canonicalizer tuple.
+    Info(InfoArgs),
+
     /// Manage FAC execution lanes.
     ///
     /// Shows lane states derived from lock state, lease records, and PID
@@ -224,6 +230,12 @@ pub enum FacSubcommand {
     /// RFC-0028 channel context tokens and RFC-0029 admission, then
     /// atomically claims and executes valid jobs.
     Worker(WorkerArgs),
+
+    /// Interact with the current canonicalizer tuple.
+    ///
+    /// Use `info` to display tuple metadata and `admit` to explicitly admit
+    /// the current tuple.
+    Canonicalizer(CanonicalizerArgs),
 
     /// GitHub App credential management and PR operations.
     ///
@@ -274,6 +286,46 @@ pub struct GatesArgs {
     /// CPU quota for bounded test execution.
     #[arg(long, default_value = "200%")]
     pub cpu_quota: String,
+}
+
+/// Arguments for `apm2 fac canonicalizer`.
+#[derive(Debug, Args)]
+pub struct CanonicalizerArgs {
+    #[command(subcommand)]
+    pub subcommand: CanonicalizerSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CanonicalizerSubcommand {
+    /// Show current canonicalizer tuple metadata.
+    Info(CanonicalizerInfoArgs),
+    /// Explicitly admit the current binary's canonicalizer tuple.
+    ///
+    /// Required for first-run bootstrap; worker and daemon will refuse
+    /// to start without an admitted tuple.
+    Admit(CanonicalizerAdmitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CanonicalizerInfoArgs {
+    /// Emit canonicalizer tuple metadata as JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CanonicalizerAdmitArgs {
+    /// Emit canonicalizer admit result as JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac info`.
+#[derive(Debug, Args)]
+pub struct InfoArgs {
+    /// Show canonicalizer tuple metadata.
+    #[arg(long, default_value_t = false)]
+    pub canonicalizer: bool,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -1458,6 +1510,8 @@ pub fn run_fac(
             | FacSubcommand::Lane(_)
             | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
+            | FacSubcommand::Canonicalizer(_)
+            | FacSubcommand::Info(_)
             | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
     ) {
@@ -1775,9 +1829,120 @@ pub fn run_fac(
             json_output,
             args.print_unit,
         ),
+        FacSubcommand::Canonicalizer(args) => match &args.subcommand {
+            CanonicalizerSubcommand::Info(info_args) => {
+                run_canonicalizer_info(info_args.json || json_output)
+            },
+            CanonicalizerSubcommand::Admit(admit_args) => {
+                run_canonicalizer_admit(admit_args.json || json_output)
+            },
+        },
+        FacSubcommand::Info(args) => {
+            if args.canonicalizer {
+                run_canonicalizer_info(json_output)
+            } else {
+                output_error(
+                    json_output,
+                    "unsupported_info_option",
+                    "use --canonicalizer with fac info",
+                    exit_codes::VALIDATION_ERROR,
+                )
+            }
+        },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
     }
+}
+
+fn run_canonicalizer_info(json_output: bool) -> u8 {
+    let fac_root = match resolve_fac_root() {
+        Ok(path) => path,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_root_unavailable",
+                &e,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let current_tuple = CanonicalizerTupleV1::from_current();
+    let tuple = match FacBroker::load_admitted_tuple(&fac_root) {
+        Ok(tuple) => tuple,
+        Err(error) => {
+            eprintln!("WARNING: using current canonicalizer tuple: {error}");
+            current_tuple
+        },
+    };
+
+    let digest = tuple.compute_digest();
+
+    if json_output {
+        let payload = serde_json::json!({
+            "tuple": tuple,
+            "digest": digest,
+        });
+        let output = serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "{\"error\":\"cannot serialize canonicalizer tuple\"}".to_string());
+        println!("{output}");
+        return exit_codes::SUCCESS;
+    }
+
+    println!("Canonicalizer Tuple:");
+    println!("  ID:      {}", tuple.canonicalizer_id);
+    println!("  Version: {}", tuple.canonicalizer_version);
+    println!(
+        "  Hash:    {} ({})",
+        tuple.hash_algorithm, tuple.digest_format
+    );
+    println!("  Depth:   {}", tuple.max_depth);
+    println!("  Digest:  {digest}");
+    exit_codes::SUCCESS
+}
+
+fn run_canonicalizer_admit(json_output: bool) -> u8 {
+    let fac_root = match resolve_fac_root() {
+        Ok(path) => path,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_root_unavailable",
+                &e,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let mut broker = FacBroker::new();
+    let digest = match broker.admit_canonicalizer_tuple(&fac_root) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return output_error(
+                json_output,
+                "canonicalizer_tuple_admit_failed",
+                &format!("failed to admit canonicalizer tuple: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if json_output {
+        let payload = serde_json::json!({
+            "status": "admitted",
+            "tuple": CanonicalizerTupleV1::from_current(),
+            "digest": digest,
+        });
+        let output = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+            "{\"error\":\"cannot serialize tuple admission result\"}".to_string()
+        });
+        println!("{output}");
+    } else {
+        println!("Canonicalizer tuple admitted successfully.");
+        println!("Digest: {digest}");
+    }
+
+    exit_codes::SUCCESS
 }
 
 const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool {
@@ -1804,8 +1969,13 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
             | ReviewSubcommand::Dispatch(_)
             | ReviewSubcommand::Tail(_) => false,
         },
+        FacSubcommand::Canonicalizer(args) => match &args.subcommand {
+            CanonicalizerSubcommand::Info(info_args) => info_args.json,
+            CanonicalizerSubcommand::Admit(admit_args) => admit_args.json,
+        },
         FacSubcommand::Gates(_)
         | FacSubcommand::Work(_)
+        | FacSubcommand::Info(_)
         | FacSubcommand::Services(_)
         | FacSubcommand::Gc(_)
         | FacSubcommand::RoleLaunch(_)
@@ -1837,6 +2007,13 @@ fn resolve_ledger_path(explicit: Option<&Path>) -> PathBuf {
         || PathBuf::from("/var/lib/apm2").join(DEFAULT_LEDGER_FILENAME),
         |dirs| dirs.data_dir().join(DEFAULT_LEDGER_FILENAME),
     )
+}
+
+/// Resolves FAC root directory (`$APM2_HOME/private/fac`).
+fn resolve_fac_root() -> Result<PathBuf, String> {
+    resolve_apm2_home()
+        .map(|home| home.join("private").join("fac"))
+        .ok_or_else(|| "could not resolve APM2 home".to_string())
 }
 
 /// Resolves the CAS path from explicit path, env var, or default.
@@ -4210,6 +4387,40 @@ mod tests {
             "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
             "--json",
         ]);
+    }
+
+    #[test]
+    fn test_canonicalizer_subcommand_parses() {
+        assert_fac_command_parses(&["fac", "canonicalizer", "info"]);
+        assert_fac_command_parses(&["fac", "canonicalizer", "info", "--json"]);
+        assert_fac_command_parses(&["fac", "canonicalizer", "admit"]);
+        assert_fac_command_parses(&["fac", "canonicalizer", "admit", "--json"]);
+    }
+
+    #[test]
+    fn test_canonicalizer_subcommand_global_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "canonicalizer", "info"])
+            .expect("canonicalizer should accept global json flag");
+        assert!(parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Canonicalizer(args) => match args.subcommand {
+                CanonicalizerSubcommand::Info(_) => {},
+                CanonicalizerSubcommand::Admit(_) => {
+                    panic!("expected canonicalizer info subcommand, got {args:?}")
+                },
+            },
+            other => panic!("expected canonicalizer subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_info_subcommand_with_canonicalizer_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "info", "--canonicalizer"])
+            .expect("info --canonicalizer should parse");
+        match parsed.subcommand {
+            FacSubcommand::Info(info_args) => assert!(info_args.canonicalizer),
+            other => panic!("expected info subcommand, got {other:?}"),
+        }
     }
 
     #[test]

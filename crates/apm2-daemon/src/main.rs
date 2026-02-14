@@ -44,7 +44,7 @@
 // mod state; // Use library crate
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -905,6 +905,40 @@ fn main() -> Result<()> {
     runtime.block_on(async_main(args))
 }
 
+fn ensure_canonicalizer_tuple_admitted(
+    fac_root: &Path,
+    current_tuple: &apm2_core::fac::CanonicalizerTupleV1,
+    _tuple_broker: &mut apm2_core::fac::FacBroker,
+) -> Result<()> {
+    use apm2_core::fac::FacBroker;
+
+    let tuple_path = fac_root
+        .join("broker")
+        .join("admitted_canonicalizer_tuple.v1.json");
+    if !tuple_path.exists() {
+        return Err(anyhow::anyhow!(
+            "No admitted canonicalizer tuple found. Run 'apm2 fac canonicalizer admit' to bootstrap."
+        ));
+    }
+
+    let admitted_tuple = FacBroker::load_admitted_tuple(fac_root).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load admitted canonicalizer tuple {}: {error}",
+            tuple_path.display()
+        )
+    })?;
+
+    if admitted_tuple != *current_tuple {
+        return Err(anyhow::anyhow!(
+            "FATAL: canonicalizer tuple mismatch in broker: admitted={} current={}",
+            admitted_tuple.compute_digest(),
+            current_tuple.compute_digest()
+        ));
+    }
+
+    Ok(())
+}
+
 /// Async entry point - runs after daemonization is complete.
 ///
 /// All async initialization and the main event loop live here.
@@ -973,10 +1007,15 @@ async fn async_main(args: Args) -> Result<()> {
     let apm2_home = resolve_apm2_home().ok_or_else(|| {
         anyhow::anyhow!("failed to resolve APM2 home from $APM2_HOME or home directory")
     })?;
+    let fac_root = apm2_home.join("private").join("fac");
     let node_fingerprint = apm2_core::fac::load_or_derive_node_fingerprint(&apm2_home)
         .context("failed to load or derive node fingerprint")?;
     let boundary_id = apm2_core::fac::load_or_default_boundary_id(&apm2_home)
         .context("failed to load boundary id")?;
+    let current_tuple = apm2_core::fac::CanonicalizerTupleV1::from_current();
+    let mut tuple_broker = apm2_core::fac::FacBroker::new();
+    ensure_canonicalizer_tuple_admitted(&fac_root, &current_tuple, &mut tuple_broker)
+        .context("canonicalizer tuple admission check failed")?;
     info!(
         apm2_home = %apm2_home.display(),
         node_fingerprint = %node_fingerprint,
@@ -3303,6 +3342,49 @@ mod crash_recovery_integration_tests {
         assert_eq!(
             result,
             Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_ensure_canonicalizer_tuple_admitted_rejects_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fac_root = dir.path().join("private").join("fac");
+        let current_tuple = apm2_core::fac::CanonicalizerTupleV1::from_current();
+        let mut tuple_broker = apm2_core::fac::FacBroker::new();
+
+        let err = ensure_canonicalizer_tuple_admitted(&fac_root, &current_tuple, &mut tuple_broker)
+            .expect_err("first-run without tuple should fail");
+        assert!(
+            err.to_string()
+                .contains("No admitted canonicalizer tuple found."),
+            "expected missing tuple failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_canonicalizer_tuple_admitted_rejects_corrupted_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fac_root = dir.path().join("private").join("fac");
+        let tuple_path = fac_root
+            .join("broker")
+            .join("admitted_canonicalizer_tuple.v1.json");
+        std::fs::create_dir_all(
+            tuple_path
+                .parent()
+                .expect("tuple directory parent should exist"),
+        )
+        .unwrap();
+        std::fs::write(&tuple_path, b"{bad").unwrap();
+
+        let current_tuple = apm2_core::fac::CanonicalizerTupleV1::from_current();
+        let mut tuple_broker = apm2_core::fac::FacBroker::new();
+
+        let err = ensure_canonicalizer_tuple_admitted(&fac_root, &current_tuple, &mut tuple_broker)
+            .expect_err("corrupted tuple should fail startup");
+        assert!(
+            err.to_string()
+                .contains("failed to load admitted canonicalizer tuple"),
+            "expected failure to load admitted tuple, got: {err}"
         );
     }
 

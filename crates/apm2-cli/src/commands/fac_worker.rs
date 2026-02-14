@@ -73,7 +73,7 @@ use apm2_core::economics::queue_admission::{
     HtfEvaluationWindow, QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionVerdict,
     QueueLane, QueueSchedulerState, evaluate_queue_admission,
 };
-use apm2_core::fac::broker::{BrokerSignatureVerifier, FacBroker};
+use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
@@ -81,12 +81,13 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
-    BudgetAdmissionTrace, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES, DenialReasonCode,
-    FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, LaneProfileV1,
-    MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager,
-    SystemdUnitProperties, compute_policy_hash, deserialize_policy, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, run_preflight,
+    BudgetAdmissionTrace, CanonicalizerTupleV1, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES,
+    DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
+    LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
+    RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
+    parse_policy_hash, persist_content_addressed_receipt, persist_policy, run_preflight,
 };
+use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
@@ -160,6 +161,13 @@ struct WorkerSummary {
     jobs_quarantined: usize,
     /// Number of jobs skipped.
     jobs_skipped: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CanonicalizerTupleCheck {
+    Matched,
+    Missing,
+    Mismatch(CanonicalizerTupleV1),
 }
 
 #[derive(Debug)]
@@ -361,6 +369,38 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
+    let current_tuple = CanonicalizerTupleV1::from_current();
+    let current_tuple_digest = compute_canonicalizer_tuple_digest();
+    match check_or_admit_canonicalizer_tuple(&fac_root) {
+        Ok(CanonicalizerTupleCheck::Matched) => {},
+        Ok(CanonicalizerTupleCheck::Missing) => {
+            eprintln!(
+                "FATAL: no admitted canonicalizer tuple found. Run 'apm2 fac canonicalizer admit' to bootstrap."
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+        Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple)) => {
+            eprintln!("FATAL: canonicalizer tuple mismatch");
+            eprintln!(
+                "  current: {}/{}",
+                current_tuple.canonicalizer_id, current_tuple.canonicalizer_version
+            );
+            eprintln!(
+                "  admitted: {}/{}",
+                admitted_tuple.canonicalizer_id, admitted_tuple.canonicalizer_version
+            );
+            eprintln!("  remedy: re-run broker admission or update binary");
+            return exit_codes::GENERIC_ERROR;
+        },
+        Err(e) => {
+            output_worker_error(
+                json_output,
+                &format!("cannot initialize canonicalizer tuple: {e}"),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    }
+
     let verifying_key = broker.verifying_key();
 
     let mut total_processed: u64 = 0;
@@ -376,7 +416,7 @@ pub fn run_fac_worker(
         let cycle_start = Instant::now();
 
         // Scan pending directory (quarantines malformed files inline).
-        let candidates = match scan_pending(&queue_root, &fac_root) {
+        let candidates = match scan_pending(&queue_root, &fac_root, &current_tuple_digest) {
             Ok(c) => c,
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
@@ -430,6 +470,7 @@ pub fn run_fac_worker(
                     &policy_digest,
                     candidates.len(),
                     print_unit,
+                    &current_tuple_digest,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -515,6 +556,37 @@ fn persist_queue_scheduler_state(
     }
 }
 
+fn check_or_admit_canonicalizer_tuple(fac_root: &Path) -> Result<CanonicalizerTupleCheck, String> {
+    let tuple = CanonicalizerTupleV1::from_current();
+    let tuple_path = fac_root
+        .join("broker")
+        .join("admitted_canonicalizer_tuple.v1.json");
+
+    if !tuple_path.exists() {
+        return Ok(CanonicalizerTupleCheck::Missing);
+    }
+
+    match FacBroker::load_admitted_tuple(fac_root) {
+        Ok(admitted_tuple) => {
+            if admitted_tuple == tuple {
+                Ok(CanonicalizerTupleCheck::Matched)
+            } else {
+                Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple))
+            }
+        },
+        Err(BrokerError::Deserialization { detail }) => {
+            Err(format!("canonicalizer tuple is corrupted: {detail}"))
+        },
+        Err(err) => Err(format!("failed to load canonicalizer tuple: {err}")),
+    }
+}
+
+// Used by tests to avoid computing digest twice.
+// Used by startup checks to avoid duplicated digest logic.
+fn compute_canonicalizer_tuple_digest() -> String {
+    CanonicalizerTupleV1::from_current().compute_digest()
+}
+
 // =============================================================================
 // Queue scanning
 // =============================================================================
@@ -527,7 +599,11 @@ fn persist_queue_scheduler_state(
 ///
 /// Malformed, unreadable, or oversize files are quarantined with receipts
 /// (INV-WRK-007) rather than silently dropped.
-fn scan_pending(queue_root: &Path, fac_root: &Path) -> Result<Vec<PendingCandidate>, String> {
+fn scan_pending(
+    queue_root: &Path,
+    fac_root: &Path,
+    canonicalizer_tuple_digest: &str,
+) -> Result<Vec<PendingCandidate>, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     if !pending_dir.is_dir() {
         return Ok(Vec::new());
@@ -574,6 +650,7 @@ fn scan_pending(queue_root: &Path, fac_root: &Path) -> Result<Vec<PendingCandida
                     FacJobOutcome::Quarantined,
                     DenialReasonCode::MalformedSpec,
                     &reason,
+                    canonicalizer_tuple_digest,
                 );
                 continue;
             },
@@ -595,6 +672,7 @@ fn scan_pending(queue_root: &Path, fac_root: &Path) -> Result<Vec<PendingCandida
                     FacJobOutcome::Quarantined,
                     DenialReasonCode::MalformedSpec,
                     &reason,
+                    canonicalizer_tuple_digest,
                 );
                 continue;
             },
@@ -666,6 +744,7 @@ fn process_job(
     policy_digest: &[u8; 32],
     _candidates_count: usize,
     print_unit: bool,
+    canonicalizer_tuple_digest: &str,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -702,6 +781,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                Some(canonicalizer_tuple_digest),
                 policy_hash,
             ) {
                 eprintln!(
@@ -728,6 +808,7 @@ fn process_job(
             None,
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -751,6 +832,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                Some(canonicalizer_tuple_digest),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -783,6 +865,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                Some(canonicalizer_tuple_digest),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -811,6 +894,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                Some(canonicalizer_tuple_digest),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -833,6 +917,7 @@ fn process_job(
             None,
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -855,6 +940,7 @@ fn process_job(
             None,
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -885,6 +971,7 @@ fn process_job(
             None,
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -912,6 +999,7 @@ fn process_job(
             Some(&admission_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -989,6 +1077,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1010,6 +1099,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1031,6 +1121,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1115,6 +1206,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1143,6 +1235,7 @@ fn process_job(
                 Some(&queue_trace),
                 None,
                 None,
+                Some(canonicalizer_tuple_digest),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1197,6 +1290,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1224,6 +1318,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1247,6 +1342,7 @@ fn process_job(
                 Some(&queue_trace),
                 None,
                 None,
+                Some(canonicalizer_tuple_digest),
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1305,6 +1401,7 @@ fn process_job(
             Some(&queue_trace),
             None,
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1339,6 +1436,7 @@ fn process_job(
         Some(&queue_trace),
         None,
         patch_digest.as_deref(),
+        Some(canonicalizer_tuple_digest),
         policy_hash,
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
@@ -1376,27 +1474,14 @@ fn process_job(
 
 /// Resolves the queue root directory from `$APM2_HOME/queue`.
 fn resolve_queue_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home()?;
+    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
     Ok(home.join(QUEUE_DIR))
 }
 
 /// Resolves the FAC root directory at `$APM2_HOME/private/fac`.
 fn resolve_fac_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home()?;
+    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
     Ok(home.join("private").join("fac"))
-}
-
-/// Resolves `$APM2_HOME` from environment or default.
-fn resolve_apm2_home() -> Result<PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("APM2_HOME") {
-        let path = PathBuf::from(override_dir);
-        if !path.as_os_str().is_empty() {
-            return Ok(path);
-        }
-    }
-    let base_dirs = directories::BaseDirs::new()
-        .ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(base_dirs.home_dir().join(".apm2"))
 }
 
 /// Ensures all required queue subdirectories exist.
@@ -1593,6 +1678,7 @@ fn move_to_dir_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<(), 
 }
 
 /// Emit a structured job receipt for scan failures (typically malformed input).
+#[allow(clippy::too_many_arguments)]
 fn emit_scan_receipt(
     fac_root: &Path,
     file_name: &str,
@@ -1601,6 +1687,7 @@ fn emit_scan_receipt(
     outcome: FacJobOutcome,
     denial_reason: DenialReasonCode,
     reason: &str,
+    canonicalizer_tuple_digest: &str,
 ) -> Result<PathBuf, String> {
     let receipt = FacJobReceiptV1Builder::new(
         format!("wkr-scan-{}-{}", file_name, current_timestamp_epoch_secs()),
@@ -1609,6 +1696,7 @@ fn emit_scan_receipt(
     )
     .outcome(outcome)
     .denial_reason(denial_reason)
+    .canonicalizer_tuple_digest(canonicalizer_tuple_digest)
     .reason(reason)
     .timestamp_secs(current_timestamp_epoch_secs())
     .try_build()
@@ -1652,6 +1740,7 @@ fn emit_job_receipt(
     eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
     eio29_budget_admission: Option<&BudgetAdmissionTrace>,
     patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
     policy_hash: &str,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
@@ -1679,6 +1768,9 @@ fn emit_job_receipt(
     }
     if let Some(patch_digest) = patch_digest {
         builder = builder.patch_digest(patch_digest);
+    }
+    if let Some(canonicalizer_tuple_digest) = canonicalizer_tuple_digest {
+        builder = builder.canonicalizer_tuple_digest(canonicalizer_tuple_digest);
     }
 
     let receipt = builder
@@ -1937,6 +2029,7 @@ mod tests {
             FacJobOutcome::Quarantined,
             DenialReasonCode::MalformedSpec,
             &long_reason,
+            &CanonicalizerTupleV1::from_current().compute_digest(),
         );
 
         assert!(
@@ -1970,6 +2063,190 @@ mod tests {
         assert_eq!(parse_queue_lane(""), QueueLane::Bulk);
     }
 
+    fn make_receipt_test_spec() -> FacJobSpecV1 {
+        FacJobSpecV1 {
+            schema: "apm2.fac.job_spec.v1".to_string(),
+            job_id: "job-001".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"a".repeat(64),
+            kind: "gates".to_string(),
+            queue_lane: "control".to_string(),
+            priority: 50,
+            enqueue_time: "2026-02-13T12:00:00Z".to_string(),
+            actuation: apm2_core::fac::job_spec::Actuation {
+                lease_id: "lease-001".to_string(),
+                request_id: "b3-256:".to_string() + &"b".repeat(64),
+                channel_context_token: Some("token".to_string()),
+                decoded_source: None,
+            },
+            source: apm2_core::fac::job_spec::JobSource {
+                kind: "mirror_commit".to_string(),
+                repo_id: "repo-001".to_string(),
+                head_sha: "abcd1234abcd1234abcd1234abcd1234abcd1234".to_string(),
+                patch: None,
+            },
+            lane_requirements: apm2_core::fac::job_spec::LaneRequirements {
+                lane_profile_hash: Some("b3-256:".to_string() + &"c".repeat(64)),
+            },
+            constraints: apm2_core::fac::job_spec::JobConstraints {
+                require_nextest: false,
+                test_timeout_seconds: None,
+                memory_max_bytes: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_check_or_admit_canonicalizer_tuple_missing_is_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let _broker = FacBroker::new();
+
+        let result = check_or_admit_canonicalizer_tuple(&fac_root)
+            .expect("first run should return a canonicalizer check result");
+        match result {
+            CanonicalizerTupleCheck::Missing => {},
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_or_admit_canonicalizer_tuple_mismatch_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let mut broker = FacBroker::new();
+
+        broker
+            .admit_canonicalizer_tuple(&fac_root)
+            .expect("seed admitted tuple");
+
+        let mut tuple = CanonicalizerTupleV1::from_current();
+        tuple.canonicalizer_version.push_str("-mismatch");
+        let tuple_path = fac_root
+            .join("broker")
+            .join("admitted_canonicalizer_tuple.v1.json");
+        fs::create_dir_all(fac_root.join("broker")).expect("tuple directory exists");
+        let tuple_bytes = serde_json::to_vec_pretty(&tuple).expect("serialize mismatch tuple");
+        fs::write(&tuple_path, tuple_bytes).expect("write mismatch tuple");
+
+        match check_or_admit_canonicalizer_tuple(&fac_root) {
+            Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple)) => {
+                assert_ne!(admitted_tuple, CanonicalizerTupleV1::from_current());
+            },
+            other => panic!("expected mismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_or_admit_canonicalizer_tuple_rejects_deserialization_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let _broker = FacBroker::new();
+        let tuple_path = fac_root
+            .join("broker")
+            .join("admitted_canonicalizer_tuple.v1.json");
+        fs::create_dir_all(tuple_path.parent().expect("tuple directory parent"))
+            .expect("create tuple directory");
+        fs::write(&tuple_path, b"{not-json").expect("write corrupted tuple");
+
+        let result = check_or_admit_canonicalizer_tuple(&fac_root);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("corrupted"),
+            "expected corruption error, got: {err}"
+        );
+        assert_eq!(
+            fs::read(&tuple_path).expect("read tuple").as_slice(),
+            b"{not-json"
+        );
+    }
+
+    #[test]
+    fn test_emit_job_receipt_includes_canonicalizer_tuple_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let spec = make_receipt_test_spec();
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "control".to_string(),
+            defect_reason: None,
+        };
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Completed,
+            None,
+            "completed",
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            Some(&tuple_digest),
+            &spec.job_spec_digest,
+        )
+        .expect("emit receipt");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+        assert_eq!(
+            receipt_json
+                .get("canonicalizer_tuple_digest")
+                .and_then(|value| value.as_str()),
+            Some(tuple_digest.as_str())
+        );
+        assert!(
+            receipt_json.get("patch_digest").is_none(),
+            "patch_digest should remain unset in this receipt path"
+        );
+    }
+
+    #[test]
+    fn test_emit_job_receipt_channel_boundary_defect_path_sets_canonicalizer_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let canonicalizer_tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let spec = make_receipt_test_spec();
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            "channel boundary violation",
+            None,
+            None,
+            None,
+            None,
+            Some(&canonicalizer_tuple_digest),
+            &spec.job_spec_digest,
+        )
+        .expect("emit receipt");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+        assert_eq!(
+            receipt_json
+                .get("canonicalizer_tuple_digest")
+                .and_then(|value| value.as_str()),
+            Some(canonicalizer_tuple_digest.as_str())
+        );
+        assert!(
+            receipt_json.get("patch_digest").is_none(),
+            "channel-boundary receipt should not set patch_digest"
+        );
+    }
+
     #[test]
     fn test_scan_pending_quarantines_malformed_files() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1981,7 +2258,12 @@ mod tests {
         fs::write(&malformed_path, b"not valid json {{{").expect("write malformed");
 
         let fac_root = dir.path().join("private").join("fac");
-        let candidates = scan_pending(&queue_root, &fac_root).expect("scan");
+        let candidates = scan_pending(
+            &queue_root,
+            &fac_root,
+            &CanonicalizerTupleV1::from_current().compute_digest(),
+        )
+        .expect("scan");
 
         // Malformed file should have been quarantined, not included in candidates.
         assert!(
@@ -2024,7 +2306,12 @@ mod tests {
         fs::write(&oversize_path, &data).expect("write oversize");
 
         let fac_root = dir.path().join("private").join("fac");
-        let candidates = scan_pending(&queue_root, &fac_root).expect("scan");
+        let candidates = scan_pending(
+            &queue_root,
+            &fac_root,
+            &CanonicalizerTupleV1::from_current().compute_digest(),
+        )
+        .expect("scan");
 
         assert!(
             candidates.is_empty(),

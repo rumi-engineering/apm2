@@ -776,6 +776,9 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
         signer.secret_key_bytes().as_ref(),
     )
     .expect("write signing key");
+    FacBroker::new()
+        .admit_canonicalizer_tuple(&fac_root)
+        .expect("admit canonicalizer tuple");
 
     let lease_id = "lease-e2e-once";
     let spec = build_valid_spec_with_token(&signer, lease_id);
