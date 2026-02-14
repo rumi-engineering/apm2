@@ -69,6 +69,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::domain_separator::{GATE_RECEIPT_PREFIX, sign_with_domain, verify_with_domain};
+use super::job_spec::parse_b3_256_digest;
 use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, VerifyingKey};
 // Re-export the generated proto type for wire format serialization.
@@ -79,6 +80,10 @@ pub const FAC_JOB_RECEIPT_SCHEMA: &str = "apm2.fac.job_receipt.v1";
 
 /// Maximum human-reason length for `FacJobReceiptV1`.
 const MAX_FAC_JOB_REASON_LENGTH: usize = 512;
+
+/// Maximum serialized size of a `FacJobReceiptV1` (bytes).
+/// Protects against memory-exhaustion attacks during bounded deserialization.
+pub const MAX_JOB_RECEIPT_SIZE: usize = 65_536;
 
 /// Maximum RFC-0028 boundary defect classes included in a receipt trace.
 const MAX_FAC_JOB_BOUNDARY_DEFECT_CLASSES: usize = 32;
@@ -240,7 +245,7 @@ pub enum DenialReasonCode {
 }
 
 /// Trace of the RFC-0028 channel boundary check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelBoundaryTrace {
     /// Whether the boundary check passed.
@@ -252,7 +257,7 @@ pub struct ChannelBoundaryTrace {
 }
 
 /// Trace of the RFC-0029 queue admission decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueAdmissionTrace {
     /// The admission verdict.
@@ -264,7 +269,7 @@ pub struct QueueAdmissionTrace {
 }
 
 /// Placeholder trace for RFC-0029 budget admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetAdmissionTrace {
     /// Budget admission verdict.
@@ -274,7 +279,7 @@ pub struct BudgetAdmissionTrace {
 }
 
 /// Unified worker receipt for FAC job outcomes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FacJobReceiptV1 {
     /// Schema identifier.
@@ -308,6 +313,240 @@ pub struct FacJobReceiptV1 {
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
     pub content_hash: String,
+}
+
+impl FacJobReceiptV1 {
+    /// Returns canonical bytes for content hash computation.
+    ///
+    /// Encodes all fields except `content_hash` in deterministic order with
+    /// length-prefixing to prevent canonicalization collisions.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512);
+
+        bytes.extend_from_slice(&(self.schema.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.schema.as_bytes());
+
+        bytes.extend_from_slice(&(self.receipt_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.receipt_id.as_bytes());
+
+        bytes.extend_from_slice(&(self.job_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.job_id.as_bytes());
+
+        bytes.extend_from_slice(&(self.job_spec_digest.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.job_spec_digest.as_bytes());
+
+        let outcome_str = serde_json::to_string(&self.outcome).unwrap_or_default();
+        bytes.extend_from_slice(&(outcome_str.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(outcome_str.as_bytes());
+
+        if let Some(reason_code) = &self.denial_reason {
+            bytes.push(1u8);
+            let reason_str = serde_json::to_string(reason_code).unwrap_or_default();
+            bytes.extend_from_slice(&(reason_str.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(reason_str.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
+
+        bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.reason.as_bytes());
+
+        if let Some(trace) = &self.rfc0028_channel_boundary {
+            bytes.push(1u8);
+            bytes.push(u8::from(trace.passed));
+            bytes.extend_from_slice(&trace.defect_count.to_be_bytes());
+            bytes.extend_from_slice(&(trace.defect_classes.len() as u32).to_be_bytes());
+            for class in &trace.defect_classes {
+                bytes.extend_from_slice(&(class.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(class.as_bytes());
+            }
+        } else {
+            bytes.push(0u8);
+        }
+
+        if let Some(trace) = &self.eio29_queue_admission {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(trace.verdict.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.verdict.as_bytes());
+            bytes.extend_from_slice(&(trace.queue_lane.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.queue_lane.as_bytes());
+            if let Some(reason) = &trace.defect_reason {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(reason.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(reason.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
+        } else {
+            bytes.push(0u8);
+        }
+
+        if let Some(trace) = &self.eio29_budget_admission {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(trace.verdict.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.verdict.as_bytes());
+            if let Some(reason) = &trace.reason {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(reason.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(reason.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
+        } else {
+            bytes.push(0u8);
+        }
+
+        bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
+
+        bytes
+    }
+
+    /// Validate all invariant and boundedness requirements for the receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacJobReceiptError`] if:
+    ///
+    /// - A string field exceeds maximum length bounds.
+    /// - A digest field is not formatted as a valid `b3-256:<64 hex>`.
+    /// - Outcome-specific invariants are violated.
+    #[allow(clippy::too_many_lines)] // Validation flow for all fields and invariants is intentionally centralized.
+    pub fn validate(&self) -> Result<(), FacJobReceiptError> {
+        if self.schema.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "schema",
+                actual: self.schema.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.receipt_id.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "receipt_id",
+                actual: self.receipt_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.job_id.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "job_id",
+                actual: self.job_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.reason.chars().count() > MAX_FAC_JOB_REASON_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "reason",
+                actual: self.reason.chars().count(),
+                max: MAX_FAC_JOB_REASON_LENGTH,
+            });
+        }
+        if self.job_spec_digest.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "job_spec_digest",
+                actual: self.job_spec_digest.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if !is_valid_b3_256_digest(&self.job_spec_digest) {
+            return Err(FacJobReceiptError::InvalidData(
+                "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
+            ));
+        }
+        if self.content_hash.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "content_hash",
+                actual: self.content_hash.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if !is_valid_b3_256_digest(&self.content_hash) {
+            return Err(FacJobReceiptError::InvalidData(
+                "content_hash must be 'b3-256:<64 hex>'".to_string(),
+            ));
+        }
+
+        match self.outcome {
+            FacJobOutcome::Completed => {
+                if self.rfc0028_channel_boundary.is_none() {
+                    return Err(FacJobReceiptError::MissingField("rfc0028_channel_boundary"));
+                }
+                if self.eio29_queue_admission.is_none() {
+                    return Err(FacJobReceiptError::MissingField("eio29_queue_admission"));
+                }
+            },
+            FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
+                if self.denial_reason.is_none() {
+                    return Err(FacJobReceiptError::MissingField("denial_reason"));
+                }
+            },
+        }
+
+        if let Some(trace) = &self.rfc0028_channel_boundary {
+            if trace.defect_classes.len() > MAX_FAC_JOB_BOUNDARY_DEFECT_CLASSES {
+                return Err(FacJobReceiptError::InvalidData(
+                    "channel boundary defect class count exceeds limit".to_string(),
+                ));
+            }
+            for class in &trace.defect_classes {
+                if class.len() > MAX_STRING_LENGTH {
+                    return Err(FacJobReceiptError::StringTooLong {
+                        field: "rfc0028_channel_boundary.defect_classes",
+                        actual: class.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            }
+        }
+
+        if let Some(trace) = &self.eio29_queue_admission {
+            if trace.verdict.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_queue_admission.verdict",
+                    actual: trace.verdict.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if trace.queue_lane.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_queue_admission.queue_lane",
+                    actual: trace.queue_lane.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if let Some(defect_reason) = &trace.defect_reason
+                && defect_reason.len() > MAX_STRING_LENGTH
+            {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_queue_admission.defect_reason",
+                    actual: defect_reason.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
+        if let Some(trace) = &self.eio29_budget_admission {
+            if trace.verdict.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_budget_admission.verdict",
+                    actual: trace.verdict.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if let Some(reason) = &trace.reason
+                && reason.len() > MAX_STRING_LENGTH
+            {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_budget_admission.reason",
+                    actual: reason.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Builder for `FacJobReceiptV1`.
@@ -398,7 +637,7 @@ impl FacJobReceiptV1Builder {
     /// - A required field is missing.
     /// - A string exceeds maximum allowed length.
     /// - The receipt is malformed (invalid digest, failed hashing, etc.).
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)] // Validation logic for 12+ fields is sequential and correlated; splitting it obscures invariant dependencies.
     pub fn try_build(self) -> Result<FacJobReceiptV1, FacJobReceiptError> {
         let receipt_id = self.receipt_id;
         let job_id = self.job_id;
@@ -424,10 +663,7 @@ impl FacJobReceiptV1Builder {
             });
         }
 
-        if job_spec_digest.is_empty()
-            || !job_spec_digest.starts_with("b3-256:")
-            || job_spec_digest.len() != 71
-        {
+        if !is_valid_b3_256_digest(&job_spec_digest) {
             return Err(FacJobReceiptError::InvalidData(
                 "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
             ));
@@ -545,27 +781,47 @@ impl FacJobReceiptV1Builder {
             content_hash: String::new(),
         };
 
-        let body = serialize_job_receipt_body_without_content_hash(&candidate)
-            .map_err(|e| FacJobReceiptError::Serialization(e.to_string()))?;
         let mut receipt = candidate;
-        receipt.content_hash = compute_job_receipt_content_hash(&body);
+        receipt.content_hash = compute_job_receipt_content_hash(&receipt);
         Ok(receipt)
     }
 }
 
-fn serialize_job_receipt_body_without_content_hash(
-    receipt: &FacJobReceiptV1,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut receipt = receipt.clone();
-    receipt.content_hash.clear();
-    serde_json::to_vec(&receipt)
+/// Deserializes a bounded `FacJobReceiptV1` from JSON and validates content
+/// constraints after parsing.
+///
+/// # Errors
+///
+/// Returns [`FacJobReceiptError`] if:
+///
+/// - Input exceeds `MAX_JOB_RECEIPT_SIZE`.
+/// - JSON deserialization fails.
+/// - Receipt validation fails.
+pub fn deserialize_job_receipt(bytes: &[u8]) -> Result<FacJobReceiptV1, FacJobReceiptError> {
+    if bytes.len() > MAX_JOB_RECEIPT_SIZE {
+        return Err(FacJobReceiptError::InvalidData(format!(
+            "receipt input size {} exceeds maximum {}",
+            bytes.len(),
+            MAX_JOB_RECEIPT_SIZE
+        )));
+    }
+
+    let receipt: FacJobReceiptV1 = serde_json::from_slice(bytes)
+        .map_err(|e| FacJobReceiptError::Serialization(e.to_string()))?;
+    receipt.validate()?;
+    Ok(receipt)
 }
 
-fn compute_job_receipt_content_hash(bytes: &[u8]) -> String {
+pub fn compute_job_receipt_content_hash(receipt: &FacJobReceiptV1) -> String {
+    let canonical = receipt.canonical_bytes();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"apm2.fac.job_receipt.v1:content_hash");
-    hasher.update(bytes);
-    hasher.finalize().to_hex().to_string()
+    hasher.update(b"apm2.fac.job_receipt.content_hash.v1\0");
+    hasher.update(&canonical);
+    format!("b3-256:{}", hasher.finalize().to_hex())
+}
+
+fn is_valid_b3_256_digest(value: &str) -> bool {
+    parse_b3_256_digest(value).is_some()
 }
 
 /// Persist a content-addressed job receipt.
@@ -580,9 +836,7 @@ pub fn persist_content_addressed_receipt(
     fac_receipts_dir: &Path,
     receipt: &FacJobReceiptV1,
 ) -> Result<PathBuf, String> {
-    let body = serialize_job_receipt_body_without_content_hash(receipt)
-        .map_err(|e| format!("cannot serialize receipt body: {e}"))?;
-    let expected_hash = compute_job_receipt_content_hash(&body);
+    let expected_hash = compute_job_receipt_content_hash(receipt);
 
     if !receipt.content_hash.is_empty() && receipt.content_hash != expected_hash {
         return Err("receipt content_hash does not match serialized body".to_string());
@@ -1272,28 +1526,62 @@ pub mod tests {
     }
 
     #[test]
-    fn test_fac_job_receipt_body_serialization_uses_compact_json() {
-        let mut receipt =
-            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
-
-        let body = serialize_job_receipt_body_without_content_hash(&receipt)
-            .expect("serialize receipt body");
-        receipt.content_hash.clear();
-        let expected = serde_json::to_vec(&receipt).expect("serialize canonical receipt body");
-
-        assert!(!body.contains(&b'\n'));
-        assert!(!body.contains(&b'\r'));
-        assert_eq!(body, expected);
-    }
-
-    #[test]
-    fn test_fac_job_receipt_content_hash_is_deterministic() {
+    fn test_fac_job_receipt_canonical_bytes_deterministic() {
         let first =
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
         let second =
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
 
-        assert_eq!(first.content_hash, second.content_hash);
+        assert_eq!(first.canonical_bytes(), second.canonical_bytes());
+    }
+
+    #[test]
+    fn test_fac_job_receipt_canonical_bytes_collision_resistance() {
+        let first =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        let mut second =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        second.receipt_id.push('x');
+
+        assert_ne!(first.canonical_bytes(), second.canonical_bytes());
+    }
+
+    #[test]
+    fn test_fac_job_receipt_deserialize_roundtrip() {
+        let original =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+
+        let bytes = serde_json::to_vec(&original).expect("serialize sample receipt");
+        let restored = deserialize_job_receipt(&bytes).expect("deserialize receipt");
+
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_validate_rejects_oversized_strings() {
+        let mut receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        receipt.schema = "x".repeat(MAX_STRING_LENGTH + 1);
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::StringTooLong {
+                field: "schema",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_fac_job_receipt_validate_rejects_missing_boundary_for_completed() {
+        let mut receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        receipt.rfc0028_channel_boundary = None;
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::MissingField("rfc0028_channel_boundary"))
+        ));
     }
 
     #[test]

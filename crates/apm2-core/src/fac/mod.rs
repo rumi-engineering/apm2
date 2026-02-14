@@ -298,8 +298,9 @@ pub use receipt::persist_content_addressed_receipt;
 pub use receipt::{
     BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
     FacJobReceiptError, FacJobReceiptV1, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
-    GateReceiptProto, QueueAdmissionTrace, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
-    SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+    GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
+    SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+    deserialize_job_receipt,
 };
 // Re-export retry manager types
 pub use retry_manager::{
