@@ -47,6 +47,9 @@ pub const MAX_HEAD_SHA_LENGTH: usize = 128;
 /// Maximum length for `source.kind`.
 pub const MAX_SOURCE_KIND_LENGTH: usize = 64;
 
+/// Maximum serialized size of a patch payload.
+pub const MAX_PATCH_SIZE: usize = 10_485_760;
+
 /// Maximum serialized size of a `FacJobSpecV1` (bytes).
 /// Protects against memory-exhaustion attacks during bounded deserialization.
 pub const MAX_JOB_SPEC_SIZE: usize = 65_536;
@@ -349,10 +352,26 @@ impl FacJobSpecV1 {
                 value: self.source.kind.clone(),
             });
         }
+        validate_repo_id(&self.source.repo_id)?;
+        validate_head_sha(&self.source.head_sha)?;
         if self.source.kind == "patch_injection" && self.source.patch.is_none() {
             return Err(JobSpecError::EmptyField {
                 field: "source.patch (required for patch_injection)",
             });
+        }
+        if let Some(patch) = &self.source.patch {
+            let patch_bytes =
+                serde_json::to_vec(patch).map_err(|e| JobSpecError::InvalidFormat {
+                    field: "source.patch",
+                    value: e.to_string(),
+                })?;
+            if patch_bytes.len() > MAX_PATCH_SIZE {
+                return Err(JobSpecError::FieldTooLong {
+                    field: "source.patch",
+                    len: patch_bytes.len(),
+                    max: MAX_PATCH_SIZE,
+                });
+            }
         }
 
         check_length("job_id", &self.job_id, MAX_JOB_ID_LENGTH)?;
@@ -684,6 +703,54 @@ fn constant_time_str_eq(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+fn validate_repo_id(repo_id: &str) -> Result<(), JobSpecError> {
+    if repo_id.is_empty() {
+        return Err(JobSpecError::EmptyField {
+            field: "source.repo_id",
+        });
+    }
+    if repo_id.len() > MAX_REPO_ID_LENGTH {
+        return Err(JobSpecError::FieldTooLong {
+            field: "source.repo_id",
+            len: repo_id.len(),
+            max: MAX_REPO_ID_LENGTH,
+        });
+    }
+    if repo_id.contains('\\') || repo_id.starts_with('/') || repo_id.ends_with('/') {
+        return Err(JobSpecError::InvalidFormat {
+            field: "source.repo_id",
+            value: repo_id.to_string(),
+        });
+    }
+    for segment in repo_id.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(JobSpecError::InvalidFormat {
+                field: "source.repo_id",
+                value: repo_id.to_string(),
+            });
+        }
+    }
+    if repo_id.contains("..") {
+        return Err(JobSpecError::InvalidFormat {
+            field: "source.repo_id",
+            value: repo_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_head_sha(head_sha: &str) -> Result<(), JobSpecError> {
+    let is_hex = |value: &str| value.as_bytes().iter().all(u8::is_ascii_hexdigit);
+    match head_sha.len() {
+        40 | 64 if is_hex(head_sha) => Ok(()),
+        _ => Err(JobSpecError::InvalidFormat {
+            field: "source.head_sha",
+            value: head_sha.to_string(),
+        }),
+    }
+}
+
 const fn check_non_empty(field: &'static str, value: &str) -> Result<(), JobSpecError> {
     if value.is_empty() {
         return Err(JobSpecError::EmptyField { field });
@@ -711,7 +778,7 @@ mod tests {
     fn sample_source() -> JobSource {
         JobSource {
             kind: "mirror_commit".to_string(),
-            repo_id: "org/repo".to_string(),
+            repo_id: "org-repo".to_string(),
             head_sha: "a".repeat(40),
             patch: None,
         }
@@ -860,6 +927,23 @@ mod tests {
                 spec.source.kind = "patch_injection".to_string();
                 spec.validate_structure()
             },
+            Err(JobSpecError::EmptyField {
+                field: "source.patch (required for patch_injection)"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_patch_injection_requires_patch_field() {
+        let mut spec = build_with_ids("job-patch", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid base spec");
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = None;
+
+        assert!(matches!(
+            validate_job_spec(&spec),
             Err(JobSpecError::EmptyField {
                 field: "source.patch (required for patch_injection)"
             })

@@ -82,8 +82,8 @@ use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::{
     BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
     FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, MAX_POLICY_SIZE,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, compute_policy_hash, deserialize_policy,
-    parse_policy_hash, persist_content_addressed_receipt, persist_policy,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, compute_policy_hash,
+    deserialize_policy, parse_policy_hash, persist_content_addressed_receipt, persist_policy,
 };
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -628,6 +628,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                None,
                 policy_hash,
             ) {
                 eprintln!(
@@ -653,6 +654,7 @@ fn process_job(
             None,
             None,
             None,
+            None,
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -672,6 +674,7 @@ fn process_job(
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::MissingChannelToken),
                 &reason,
+                None,
                 None,
                 None,
                 None,
@@ -706,6 +709,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                None,
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -733,6 +737,7 @@ fn process_job(
                 None,
                 None,
                 None,
+                None,
                 policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -754,6 +759,7 @@ fn process_job(
             None,
             None,
             None,
+            None,
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -772,6 +778,7 @@ fn process_job(
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ChannelBoundaryViolation),
             &reason,
+            None,
             None,
             None,
             None,
@@ -804,6 +811,7 @@ fn process_job(
             Some(&boundary_trace),
             None,
             None,
+            None,
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -829,6 +837,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&admission_trace),
+            None,
             None,
             policy_hash,
         ) {
@@ -910,6 +919,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            None,
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -930,6 +940,7 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            None,
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -949,6 +960,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
+            None,
             None,
             policy_hash,
         ) {
@@ -1031,6 +1043,148 @@ fn process_job(
         };
     }
 
+    let mirror_manager = RepoMirrorManager::new(fac_root);
+    let mut patch_digest: Option<String> = None;
+    if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
+        let reason = format!("mirror ensure failed: {e}");
+        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
+
+    let lanes_root = fac_root.join("lanes");
+    let lane_workspace = lane_mgr.lane_dir(&acquired_lane_id).join("workspace");
+    if let Err(e) = mirror_manager.checkout_to_lane(
+        &spec.source.repo_id,
+        &spec.source.head_sha,
+        &lane_workspace,
+        &lanes_root,
+    ) {
+        let reason = format!("lane workspace checkout failed: {e}");
+        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
+
+    if spec.source.kind == "patch_injection" {
+        if let Some(patch_value) = &spec.source.patch {
+            let patch_bytes = match serde_json::to_vec(patch_value) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let reason = format!("patch serialization failed: {e}");
+                    let _ =
+                        move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+                    if let Err(receipt_err) = emit_job_receipt(
+                        fac_root,
+                        spec,
+                        FacJobOutcome::Denied,
+                        Some(DenialReasonCode::ValidationFailed),
+                        &reason,
+                        Some(&boundary_trace),
+                        Some(&queue_trace),
+                        None,
+                        None,
+                        policy_hash,
+                    ) {
+                        eprintln!(
+                            "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                        );
+                    }
+                    return JobOutcome::Denied { reason };
+                },
+            };
+            match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
+                Ok(outcome) => {
+                    patch_digest = Some(outcome.patch_digest);
+                },
+                Err(e) => {
+                    let reason = format!("patch apply failed: {e}");
+                    let _ =
+                        move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+                    if let Err(receipt_err) = emit_job_receipt(
+                        fac_root,
+                        spec,
+                        FacJobOutcome::Denied,
+                        Some(DenialReasonCode::ValidationFailed),
+                        &reason,
+                        Some(&boundary_trace),
+                        Some(&queue_trace),
+                        None,
+                        None,
+                        policy_hash,
+                    ) {
+                        eprintln!(
+                            "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                        );
+                    }
+                    return JobOutcome::Denied { reason };
+                },
+            }
+        } else {
+            let reason = "missing patch payload for patch_injection source kind".to_string();
+            let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                None,
+                None,
+                policy_hash,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+            return JobOutcome::Denied { reason };
+        }
+    } else if spec.source.kind != "mirror_commit" {
+        let reason = format!("unsupported source kind: {}", spec.source.kind);
+        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
+
     // Step 8: Write authoritative GateReceipt and move to completed.
     let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
     let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
@@ -1057,6 +1211,7 @@ fn process_job(
         Some(&boundary_trace),
         Some(&queue_trace),
         None,
+        patch_digest.as_deref(),
         policy_hash,
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
@@ -1369,6 +1524,7 @@ fn emit_job_receipt(
     rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
     eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
     eio29_budget_admission: Option<&BudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
     policy_hash: &str,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
@@ -1393,6 +1549,9 @@ fn emit_job_receipt(
     }
     if let Some(budget_admission_trace) = eio29_budget_admission {
         builder = builder.eio29_budget_admission(budget_admission_trace.clone());
+    }
+    if let Some(patch_digest) = patch_digest {
+        builder = builder.patch_digest(patch_digest);
     }
 
     let receipt = builder

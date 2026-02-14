@@ -99,6 +99,7 @@ pub mod projection_compromise;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
 mod receipt;
+mod repo_mirror;
 pub mod retry_manager;
 pub mod review_blocked;
 pub mod review_receipt;
@@ -306,6 +307,10 @@ pub use receipt::{
     GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
     SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
     deserialize_job_receipt,
+};
+pub use repo_mirror::{
+    CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,
+    RepoMirrorError, RepoMirrorManager,
 };
 // Re-export retry manager types
 pub use retry_manager::{
