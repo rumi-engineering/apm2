@@ -134,12 +134,22 @@ fn bind_review_run_state_integrity_for_home(
 #[derive(Serialize)]
 struct ReviewRunStateIntegrityBinding<'a> {
     run_id: &'a str,
+    owner_repo: &'a str,
+    pr_number: u32,
+    head_sha: &'a str,
+    review_type: &'a str,
+    status: &'a str,
+    sequence_number: u32,
+    restart_count: u32,
+    started_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_reason: Option<&'a str>,
     pid: Option<u32>,
     proc_start_time: Option<u64>,
-    owner_repo: &'a str,
-    head_sha: &'a str,
-    pr_number: u32,
-    review_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_run_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_head_sha: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -298,12 +308,19 @@ pub fn review_run_secret_path(pr_number: u32, review_type: &str) -> Result<PathB
 pub fn run_state_integrity_binding_payload(state: &ReviewRunState) -> Result<Vec<u8>, String> {
     let binding = ReviewRunStateIntegrityBinding {
         run_id: &state.run_id,
+        owner_repo: &state.owner_repo,
+        pr_number: state.pr_number,
+        head_sha: &state.head_sha,
+        review_type: &state.review_type,
+        status: state.status.as_str(),
+        sequence_number: state.sequence_number,
+        restart_count: state.restart_count,
+        started_at: &state.started_at,
+        terminal_reason: state.terminal_reason.as_deref(),
         pid: state.pid,
         proc_start_time: state.proc_start_time,
-        owner_repo: &state.owner_repo,
-        head_sha: &state.head_sha,
-        pr_number: state.pr_number,
-        review_type: &state.review_type,
+        previous_run_id: state.previous_run_id.as_deref(),
+        previous_head_sha: state.previous_head_sha.as_deref(),
     };
     serde_json::to_vec(&binding).map_err(|err| format!("failed to build integrity payload: {err}"))
 }

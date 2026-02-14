@@ -329,10 +329,10 @@ pub fn run_verdict_set(
         },
         Ok(TerminationOutcome::SkippedMismatch) => {
             if termination_state_non_terminal_alive {
-                eprintln!(
-                    "WARNING: verdict for PR #{resolved_pr} type={normalized_dimension}: \
-                     termination authority no longer matches active state"
-                );
+                return Err(format!(
+                    "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
+                     termination authority mismatch while lane was alive"
+                ));
             }
             // State has drifted but process is not confirmed alive — persist receipt
             super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
