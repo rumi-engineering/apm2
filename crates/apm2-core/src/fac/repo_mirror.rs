@@ -650,7 +650,9 @@ fn validate_remote_url(remote_url: &str) -> Result<(), RepoMirrorError> {
         .any(|prefix| remote_url.starts_with(prefix))
     {
         return Err(RepoMirrorError::InvalidRemoteUrl {
-            reason: format!("remote URL protocol not in allowlist; must start with one of: {safe_prefixes:?}"),
+            reason: format!(
+                "remote URL protocol not in allowlist; must start with one of: {safe_prefixes:?}"
+            ),
         });
     }
     if remote_url.starts_with("ext::") {
