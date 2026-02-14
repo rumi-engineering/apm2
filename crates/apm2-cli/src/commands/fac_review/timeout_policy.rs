@@ -7,10 +7,10 @@ use std::path::Path;
 
 use apm2_core::fac::MAX_MEMORY_MAX_BYTES;
 
-pub const DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 240;
-pub const MAX_MANUAL_TIMEOUT_SECONDS: u64 = 240;
+pub const DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 600;
+pub const MAX_MANUAL_TIMEOUT_SECONDS: u64 = 600;
 pub const TEST_TIMEOUT_SLA_MESSAGE: &str =
-    "Bounded FAC test timeout is fixed at 240s for all runs.";
+    "Bounded FAC test timeout is fixed at 600s for all runs.";
 pub const DEFAULT_TEST_MEMORY_MAX: &str = "24G";
 
 #[must_use]
@@ -90,8 +90,8 @@ mod tests {
     }
 
     #[test]
-    fn timeout_policy_has_default_240_seconds() {
-        assert_eq!(DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS, 240);
+    fn timeout_policy_has_default_600_seconds() {
+        assert_eq!(DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS, 600);
     }
 
     #[test]

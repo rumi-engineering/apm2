@@ -1,16 +1,31 @@
 //! Lean `run_push` pipeline: git push → blocking gates → PR/update → dispatch.
+//!
+//! Bridge module: combines FAC core gate orchestration with projection-layer
+//! PR management through `github_projection`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use super::dispatch::dispatch_single_review;
-use super::evidence::{EvidenceGateResult, run_evidence_gates};
-use super::pr_body::{GateResult, sync_gate_status_to_pr};
+use super::evidence::{EvidenceGateResult, run_evidence_gates_with_status};
+use super::gate_cache::GateCache;
+use super::projection::{GateResult, sync_gate_status_to_pr};
 use super::types::{DispatchReviewResult, ReviewKind};
-use super::{github_projection, projection_store};
+use super::{github_projection, lifecycle, projection_store, state};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
+#[cfg(not(test))]
+const RETRY_BACKOFF_BASE_MS: u64 = 250;
+#[cfg(test)]
+const RETRY_BACKOFF_BASE_MS: u64 = 0;
+#[cfg(not(test))]
+const RETRY_BACKOFF_MAX_MS: u64 = 2_000;
+#[cfg(test)]
+const RETRY_BACKOFF_MAX_MS: u64 = 0;
 
 /// Extract `TCK-xxxxx` from arbitrary text.
 fn extract_tck_from_text(input: &str) -> Option<String> {
@@ -326,6 +341,7 @@ fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
     github_projection::enable_auto_merge(repo, pr_number)
 }
 
+#[cfg(test)]
 fn ensure_evidence_gates_pass_with<F>(
     workspace_root: &Path,
     sha: &str,
@@ -357,37 +373,415 @@ where
 fn run_blocking_evidence_gates(
     workspace_root: &Path,
     sha: &str,
+    owner_repo: &str,
+    pr_number: u32,
 ) -> Result<Vec<EvidenceGateResult>, String> {
-    ensure_evidence_gates_pass_with(workspace_root, sha, |root, head_sha| {
-        run_evidence_gates(root, head_sha, None, None)
-    })
+    run_blocking_evidence_gates_with(
+        workspace_root,
+        sha,
+        owner_repo,
+        pr_number,
+        |workspace_root, sha, owner_repo, pr_number| {
+            run_evidence_gates_with_status(workspace_root, sha, owner_repo, pr_number, None)
+        },
+        GateCache::load,
+    )
 }
 
-fn dispatch_reviews_with<F>(
+fn run_blocking_evidence_gates_with<F, G>(
+    workspace_root: &Path,
+    sha: &str,
+    owner_repo: &str,
+    pr_number: u32,
+    mut run_with_status_fn: F,
+    mut load_cache_fn: G,
+) -> Result<Vec<EvidenceGateResult>, String>
+where
+    F: FnMut(&Path, &str, &str, u32) -> Result<bool, String>,
+    G: FnMut(&str) -> Option<GateCache>,
+{
+    let passed = run_with_status_fn(workspace_root, sha, owner_repo, pr_number)?;
+    let mut gate_results = load_cache_fn(sha)
+        .map(|cache| {
+            let mut results = cache
+                .gates
+                .into_iter()
+                .map(|(gate_name, cached)| EvidenceGateResult {
+                    gate_name,
+                    passed: cached.status.eq_ignore_ascii_case("PASS"),
+                    duration_secs: cached.duration_secs,
+                })
+                .collect::<Vec<_>>();
+            results.sort_by(|lhs, rhs| lhs.gate_name.cmp(&rhs.gate_name));
+            results
+        })
+        .unwrap_or_default();
+
+    if passed {
+        validate_cached_gate_results_for_pass(workspace_root, sha, &gate_results)?;
+        return Ok(gate_results);
+    }
+
+    let failed_gates = gate_results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| result.gate_name.as_str())
+        .collect::<Vec<_>>();
+    let failed_summary = if failed_gates.is_empty() {
+        "unknown".to_string()
+    } else {
+        failed_gates.join(",")
+    };
+    if gate_results.is_empty() {
+        gate_results.push(EvidenceGateResult {
+            gate_name: "unknown".to_string(),
+            passed: false,
+            duration_secs: 0,
+        });
+    }
+    Err(format!(
+        "evidence gates failed for sha={sha}; failing gates: {failed_summary}"
+    ))
+}
+
+fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> {
+    let mut expected = BTreeSet::from([
+        "merge_conflict_main".to_string(),
+        "rustfmt".to_string(),
+        "clippy".to_string(),
+        "doc".to_string(),
+        "test".to_string(),
+        "workspace_integrity".to_string(),
+    ]);
+    if workspace_root
+        .join("scripts/ci/test_safety_guard.sh")
+        .exists()
+    {
+        expected.insert("test_safety_guard".to_string());
+    }
+    if workspace_root
+        .join("scripts/ci/review_artifact_lint.sh")
+        .exists()
+    {
+        expected.insert("review_artifact_lint".to_string());
+    }
+    expected
+}
+
+fn validate_cached_gate_results_for_pass(
+    workspace_root: &Path,
+    sha: &str,
+    gate_results: &[EvidenceGateResult],
+) -> Result<(), String> {
+    if gate_results.is_empty() {
+        return Err(format!(
+            "evidence gates reported PASS for sha={sha} but no gate cache artifacts were found; refusing to project empty gate status"
+        ));
+    }
+
+    let failed_gates = gate_results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| result.gate_name.as_str())
+        .collect::<Vec<_>>();
+    if !failed_gates.is_empty() {
+        return Err(format!(
+            "evidence gates reported PASS for sha={sha} but cached gate rows include FAIL verdicts: {}; refusing inconsistent gate projection",
+            failed_gates.join(",")
+        ));
+    }
+
+    let actual = gate_results
+        .iter()
+        .map(|result| result.gate_name.clone())
+        .collect::<BTreeSet<_>>();
+    let expected = expected_gate_names_for_workspace(workspace_root);
+    let missing = expected
+        .difference(&actual)
+        .cloned()
+        .collect::<Vec<String>>();
+    let extra = actual
+        .difference(&expected)
+        .cloned()
+        .collect::<Vec<String>>();
+    if !missing.is_empty() || !extra.is_empty() {
+        let missing_summary = if missing.is_empty() {
+            "-".to_string()
+        } else {
+            missing.join(",")
+        };
+        let extra_summary = if extra.is_empty() {
+            "-".to_string()
+        } else {
+            extra.join(",")
+        };
+        return Err(format!(
+            "evidence gate cache for sha={sha} does not match required gate set (missing={missing_summary}, extra={extra_summary}); refusing gate artifact reuse for push"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PushRetryClass {
+    DispatchTransient,
+    LifecycleRegistryTransient,
+    LifecycleEventTransient,
+    MissingRunIdTransient,
+    IntegrityOrSchema,
+}
+
+impl PushRetryClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DispatchTransient => "dispatch_transient",
+            Self::LifecycleRegistryTransient => "lifecycle_registry_transient",
+            Self::LifecycleEventTransient => "lifecycle_event_transient",
+            Self::MissingRunIdTransient => "missing_run_id_transient",
+            Self::IntegrityOrSchema => "integrity_or_schema",
+        }
+    }
+
+    const fn is_retryable(self) -> bool {
+        !matches!(self, Self::IntegrityOrSchema)
+    }
+}
+
+fn is_integrity_or_schema_error(lowercase_error: &str) -> bool {
+    [
+        "illegal transition",
+        "unexpected lifecycle state schema",
+        "unexpected agent registry schema",
+        "failed to parse lifecycle state",
+        "failed to parse agent registry",
+        "lifecycle state identity mismatch",
+        "identity mismatch",
+        "invalid verdict",
+        "invalid review type",
+        "invalid expected head sha",
+        "cannot register agent spawn with empty run_id",
+        "reason=ambiguous_dispatch_ownership",
+        "reason=stale_head_ambiguity",
+        "corrupt-state",
+        "ambiguous-state",
+    ]
+    .iter()
+    .any(|needle| lowercase_error.contains(needle))
+}
+
+fn classify_dispatch_error(err: &str) -> PushRetryClass {
+    let lower = err.to_ascii_lowercase();
+    if is_integrity_or_schema_error(&lower) {
+        return PushRetryClass::IntegrityOrSchema;
+    }
+    PushRetryClass::DispatchTransient
+}
+
+fn classify_registration_error(err: &str) -> PushRetryClass {
+    let lower = err.to_ascii_lowercase();
+    if is_integrity_or_schema_error(&lower) {
+        return PushRetryClass::IntegrityOrSchema;
+    }
+    if lower.contains("at_capacity") {
+        return PushRetryClass::IntegrityOrSchema;
+    }
+    if lower.contains("registry")
+        || lower.contains("failed to open registry lock")
+        || lower.contains("failed to acquire registry lock")
+    {
+        return PushRetryClass::LifecycleRegistryTransient;
+    }
+    PushRetryClass::LifecycleEventTransient
+}
+
+fn retry_backoff_delay(attempt: u32) -> Duration {
+    if RETRY_BACKOFF_MAX_MS == 0 {
+        return Duration::from_millis(0);
+    }
+    let exponent = attempt.saturating_sub(1).min(8);
+    let scale = 1u64 << exponent;
+    let backoff_ms = RETRY_BACKOFF_BASE_MS.saturating_mul(scale);
+    let clamped_ms = if backoff_ms > RETRY_BACKOFF_MAX_MS {
+        RETRY_BACKOFF_MAX_MS
+    } else {
+        backoff_ms
+    };
+    Duration::from_millis(clamped_ms)
+}
+
+fn next_retry_attempt(
+    retry_counts: &mut BTreeMap<(String, PushRetryClass), u32>,
+    review_type: &str,
+    retry_class: PushRetryClass,
+) -> u32 {
+    let key = (review_type.to_string(), retry_class);
+    let attempts = retry_counts.entry(key).or_insert(0);
+    *attempts = attempts.saturating_add(1);
+    *attempts
+}
+
+fn retry_delay_or_fail(
+    retry_counts: &mut BTreeMap<(String, PushRetryClass), u32>,
+    retry_budget: u32,
+    review_type: &str,
+    phase: &str,
+    retry_class: PushRetryClass,
+    err: &str,
+) -> Result<Duration, String> {
+    if !retry_class.is_retryable() {
+        return Err(format!(
+            "{phase} failed for {review_type} review (class={}): {err}",
+            retry_class.as_str()
+        ));
+    }
+
+    let attempt = next_retry_attempt(retry_counts, review_type, retry_class);
+    if attempt > retry_budget {
+        return Err(format!(
+            "{phase} failed for {review_type} review after exhausting retry budget (class={}, attempts={}, budget={}): {err}",
+            retry_class.as_str(),
+            attempt,
+            retry_budget
+        ));
+    }
+
+    let delay = retry_backoff_delay(attempt);
+    eprintln!(
+        "WARNING: {phase} transient failure for {review_type} review (class={}, attempt {attempt}/{retry_budget}): {err}; retrying in {}ms",
+        retry_class.as_str(),
+        delay.as_millis()
+    );
+    Ok(delay)
+}
+
+fn dispatch_reviews_with<F, R>(
     repo: &str,
     pr_number: u32,
     sha: &str,
     mut dispatch_fn: F,
+    mut register_dispatch_fn: R,
 ) -> Result<(), String>
 where
     F: FnMut(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    R: FnMut(
+        &str,
+        u32,
+        &str,
+        &str,
+        Option<&str>,
+        Option<u32>,
+        Option<u64>,
+    ) -> Result<Option<String>, String>,
 {
     let dispatch_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    let retry_budget = lifecycle::default_retry_budget();
+    let mut retry_counts = BTreeMap::<(String, PushRetryClass), u32>::new();
 
     for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        let result = dispatch_fn(repo, pr_number, kind, sha, dispatch_epoch)
-            .map_err(|err| format!("failed to dispatch {} review: {err}", kind.as_str()))?;
-        eprintln!(
-            "fac push: dispatched {} review (mode={}{})",
-            result.review_type,
-            result.mode,
-            result
-                .pid
-                .map_or_else(String::new, |pid| format!(", pid={pid}")),
-        );
+        let review_type = kind.as_str();
+
+        let dispatch_result = loop {
+            lifecycle::enforce_pr_capacity(repo, pr_number)?;
+            let result = match dispatch_fn(repo, pr_number, kind, sha, dispatch_epoch) {
+                Ok(result) => result,
+                Err(err) => {
+                    let retry_class = classify_dispatch_error(&err);
+                    let delay = retry_delay_or_fail(
+                        &mut retry_counts,
+                        retry_budget,
+                        review_type,
+                        "dispatch",
+                        retry_class,
+                        &err,
+                    )?;
+                    thread::sleep(delay);
+                    continue;
+                },
+            };
+
+            eprintln!(
+                "fac push: dispatched {} review (mode={}{})",
+                result.review_type,
+                result.mode,
+                result
+                    .pid
+                    .map_or_else(String::new, |pid| format!(", pid={pid}")),
+            );
+
+            if result.mode.eq_ignore_ascii_case("joined") {
+                break result;
+            }
+
+            let missing_run_id = result
+                .run_id
+                .as_deref()
+                .is_none_or(|run_id| run_id.trim().is_empty());
+            if missing_run_id {
+                let err = format!(
+                    "non-joined {review_type} dispatch returned empty run_id (mode={})",
+                    result.mode
+                );
+                let delay = retry_delay_or_fail(
+                    &mut retry_counts,
+                    retry_budget,
+                    review_type,
+                    "dispatch_contract",
+                    PushRetryClass::MissingRunIdTransient,
+                    &err,
+                )?;
+                thread::sleep(delay);
+                continue;
+            }
+
+            break result;
+        };
+
+        if dispatch_result.mode.eq_ignore_ascii_case("joined") {
+            continue;
+        }
+
+        let run_id = dispatch_result
+            .run_id
+            .as_deref()
+            .ok_or_else(|| format!("internal error: missing run_id for {review_type} dispatch"))?;
+        loop {
+            match register_dispatch_fn(
+                repo,
+                pr_number,
+                sha,
+                review_type,
+                Some(run_id),
+                dispatch_result.pid,
+                dispatch_result.pid.and_then(state::get_process_start_time),
+            ) {
+                Ok(Some(_)) => {
+                    eprintln!(
+                        "fac push: registered {review_type} reviewer slot for PR #{pr_number} sha {sha}",
+                    );
+                    break;
+                },
+                Ok(None) => {
+                    return Err(format!(
+                        "lifecycle registration failed for {review_type} review: register_reviewer_dispatch returned none"
+                    ));
+                },
+                Err(err) => {
+                    let retry_class = classify_registration_error(&err);
+                    let delay = retry_delay_or_fail(
+                        &mut retry_counts,
+                        retry_budget,
+                        review_type,
+                        "lifecycle_registration",
+                        retry_class,
+                        &err,
+                    )?;
+                    thread::sleep(delay);
+                },
+            }
+        }
     }
 
     Ok(())
@@ -462,10 +856,6 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         metadata.title,
         metadata.ticket_path.display()
     );
-    let local_pr_hint = projection_store::load_branch_identity(repo, &branch)
-        .ok()
-        .flatten()
-        .map(|identity| identity.pr_number);
 
     // Step 1: git push (always force; local branch truth is authoritative).
     let push_output = Command::new("git")
@@ -486,18 +876,7 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         },
     }
 
-    // Step 2: run evidence gates synchronously.
-    eprintln!("fac push: running evidence gates (blocking)");
-    let gate_results = match run_blocking_evidence_gates(&worktree_dir, &sha) {
-        Ok(results) => results,
-        Err(err) => {
-            eprintln!("ERROR: {err}");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-    eprintln!("fac push: evidence gates PASSED");
-
-    // Step 3: create or update PR (projection best-effort; local truth remains
+    // Step 2: create or update PR (projection best-effort; local truth remains
     // authoritative).
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
@@ -507,15 +886,16 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
                 num
             },
             Err(e) => {
-                if let Some(local_pr) = local_pr_hint {
+                let authoritative_pr = find_existing_pr(repo, &branch);
+                if authoritative_pr > 0 {
                     eprintln!(
-                        "WARNING: failed to create PR projection ({e}); continuing with local PR mapping #{local_pr}"
+                        "WARNING: failed to create PR projection ({e}); recovered authoritative PR mapping #{authoritative_pr} from remote"
                     );
-                    local_pr
+                    authoritative_pr
                 } else {
                     eprintln!("ERROR: {e}");
                     eprintln!(
-                        "ERROR: unable to resolve PR mapping for branch `{branch}`; projection bootstrap requires GitHub availability at least once"
+                        "ERROR: unable to resolve authoritative PR mapping for branch `{branch}` after create failure; refusing local fallback to prevent wrong-PR association"
                     );
                     return exit_codes::GENERIC_ERROR;
                 }
@@ -530,16 +910,71 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         eprintln!("fac push: using PR #{pr_number}");
         pr_number
     };
-    if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {
-        eprintln!("WARNING: failed to persist local projection identity: {err}");
-    }
-    if let Err(err) =
-        projection_store::save_pr_body_snapshot(repo, pr_number, &metadata.body, "push")
-    {
-        eprintln!("WARNING: failed to persist local PR body snapshot: {err}");
+
+    if let Err(err) = lifecycle::apply_event(
+        repo,
+        pr_number,
+        &sha,
+        &lifecycle::LifecycleEventKind::PushObserved,
+    ) {
+        eprintln!("ERROR: failed to record push lifecycle event: {err}");
+        return exit_codes::GENERIC_ERROR;
     }
 
-    // Step 3.5: sync gate status section to PR body (best-effort).
+    // Step 3: run evidence gates synchronously with cache-aware status path.
+    let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => {
+            eprintln!("ERROR: failed to re-resolve HEAD SHA before gates");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    if !current_head.eq_ignore_ascii_case(&sha) {
+        eprintln!(
+            "ERROR: HEAD drift detected before gate execution (captured={sha}, current={current_head}); refusing mixed-SHA gate run"
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    if let Err(err) = lifecycle::apply_event(
+        repo,
+        pr_number,
+        &sha,
+        &lifecycle::LifecycleEventKind::GatesStarted,
+    ) {
+        eprintln!("ERROR: failed to record gates_started lifecycle event: {err}");
+        return exit_codes::GENERIC_ERROR;
+    }
+    eprintln!("fac push: running evidence gates (blocking, cache-aware)");
+    let gate_results = match run_blocking_evidence_gates(&worktree_dir, &sha, repo, pr_number) {
+        Ok(results) => {
+            if let Err(err) = lifecycle::apply_event(
+                repo,
+                pr_number,
+                &sha,
+                &lifecycle::LifecycleEventKind::GatesPassed,
+            ) {
+                eprintln!("ERROR: failed to record gates_passed lifecycle event: {err}");
+                return exit_codes::GENERIC_ERROR;
+            }
+            results
+        },
+        Err(err) => {
+            if let Err(state_err) = lifecycle::apply_event(
+                repo,
+                pr_number,
+                &sha,
+                &lifecycle::LifecycleEventKind::GatesFailed,
+            ) {
+                eprintln!("WARNING: failed to record gates_failed lifecycle event: {state_err}");
+            }
+            eprintln!("ERROR: {err}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    eprintln!("fac push: evidence gates PASSED");
+
+    // Step 4: sync gate status section to PR body (best-effort).
     let gate_status_rows = gate_results
         .iter()
         .map(|result| GateResult {
@@ -554,18 +989,35 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         eprintln!("fac push: synced gate status section in PR body for PR #{pr_number}");
     }
 
-    // Step 4: enable auto-merge.
+    // Step 5: enable auto-merge.
     if let Err(e) = enable_auto_merge(repo, pr_number) {
         eprintln!("WARNING: auto-merge enable failed: {e}");
     } else {
         eprintln!("fac push: auto-merge enabled on PR #{pr_number}");
     }
 
-    // Step 5: dispatch reviews.
-    if let Err(e) = dispatch_reviews_with(repo, pr_number, &sha, dispatch_single_review) {
+    // Step 6: dispatch reviews.
+    if let Err(e) = dispatch_reviews_with(
+        repo,
+        pr_number,
+        &sha,
+        dispatch_single_review,
+        lifecycle::register_reviewer_dispatch,
+    ) {
         eprintln!("ERROR: {e}");
         eprintln!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
         return exit_codes::GENERIC_ERROR;
+    }
+
+    // Step 7: persist projection identity only after full local lifecycle stage
+    // succeeds for this SHA (prevents stale identity drift on force-push).
+    if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {
+        eprintln!("WARNING: failed to persist local projection identity: {err}");
+    }
+    if let Err(err) =
+        projection_store::save_pr_body_snapshot(repo, pr_number, &metadata.body, "push")
+    {
+        eprintln!("WARNING: failed to persist local PR body snapshot: {err}");
     }
 
     eprintln!("fac push: done (PR #{pr_number})");
@@ -598,6 +1050,14 @@ mod tests {
             .and_then(|value| value.strip_suffix("\n```"))
             .expect("yaml fence");
         serde_yaml::from_str(content).expect("valid yaml")
+    }
+
+    fn seed_required_pass_cache(sha: &str, workspace_root: &Path) -> GateCache {
+        let mut cache = GateCache::new(sha);
+        for gate in expected_gate_names_for_workspace(workspace_root) {
+            cache.set_with_attestation(&gate, true, 1, None, false, Some("digest".to_string()));
+        }
+        cache
     }
 
     #[test]
@@ -744,8 +1204,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let repo_root = temp_dir.path();
         let tickets_dir = repo_root.join("documents/work/tickets");
-        crate::commands::fac_permissions::ensure_dir_with_mode(&tickets_dir)
-            .expect("create tickets dir");
+        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
         let ticket_path = tickets_dir.join("TCK-00412.yaml");
         let ticket_content = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Any\"\n";
         fs::write(&ticket_path, ticket_content).expect("write ticket");
@@ -774,8 +1233,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let repo_root = temp_dir.path();
         let tickets_dir = repo_root.join("documents/work/tickets");
-        crate::commands::fac_permissions::ensure_dir_with_mode(&tickets_dir)
-            .expect("create tickets dir");
+        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
         let ticket_path = tickets_dir.join("TCK-00444.yaml");
         let ticket_content =
             "ticket_meta:\n  ticket:\n    id: \"TCK-00444\"\n    title: \"Fallback Title\"\n";
@@ -805,8 +1263,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let repo_root = temp_dir.path();
         let tickets_dir = repo_root.join("documents/work/tickets");
-        crate::commands::fac_permissions::ensure_dir_with_mode(&tickets_dir)
-            .expect("create tickets dir");
+        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
         fs::write(tickets_dir.join("TCK-00412.yaml"), "ticket_meta:\n").expect("write ticket");
 
         let err = resolve_pr_metadata(
@@ -878,8 +1335,112 @@ mod tests {
     }
 
     #[test]
+    fn run_blocking_evidence_gates_with_returns_cached_results_for_pass() {
+        let sha = "c".repeat(40);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path();
+        let cache = seed_required_pass_cache(&sha, workspace_root);
+
+        let result = run_blocking_evidence_gates_with(
+            workspace_root,
+            &sha,
+            "guardian-intelligence/apm2",
+            615,
+            |_, _, _, _| Ok(true),
+            |_| Some(cache.clone()),
+        )
+        .expect("pass should return cached rows");
+
+        assert_eq!(
+            result.len(),
+            expected_gate_names_for_workspace(workspace_root).len()
+        );
+        assert!(result.iter().all(|gate| gate.passed));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_fails_closed_when_pass_without_cache_artifacts() {
+        let sha = "d".repeat(40);
+        let err = run_blocking_evidence_gates_with(
+            Path::new("/tmp"),
+            &sha,
+            "guardian-intelligence/apm2",
+            616,
+            |_, _, _, _| Ok(true),
+            |_| None,
+        )
+        .expect_err("missing cache on PASS must fail closed");
+        assert!(err.contains("no gate cache artifacts"));
+        assert!(err.contains(&sha));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_reports_failed_cached_gate_names() {
+        let sha = "e".repeat(40);
+        let mut cache = GateCache::new(&sha);
+        cache.set_with_attestation("rustfmt", false, 1, None, false, None);
+        cache.set_with_attestation("clippy", true, 2, None, false, None);
+
+        let err = run_blocking_evidence_gates_with(
+            Path::new("/tmp"),
+            &sha,
+            "guardian-intelligence/apm2",
+            617,
+            |_, _, _, _| Ok(false),
+            |_| Some(cache.clone()),
+        )
+        .expect_err("failed gate should surface cached failing names");
+        assert!(err.contains("rustfmt"));
+        assert!(!err.contains("clippy"));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_rejects_pass_when_cached_row_is_fail() {
+        let sha = "f".repeat(40);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path();
+        let mut cache = seed_required_pass_cache(&sha, workspace_root);
+        cache.set_with_attestation("rustfmt", false, 1, None, false, Some("digest".to_string()));
+
+        let err = run_blocking_evidence_gates_with(
+            workspace_root,
+            &sha,
+            "guardian-intelligence/apm2",
+            618,
+            |_, _, _, _| Ok(true),
+            |_| Some(cache.clone()),
+        )
+        .expect_err("pass path must fail when cached gate row is FAIL");
+        assert!(err.contains("cached gate rows include FAIL"));
+        assert!(err.contains("rustfmt"));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_rejects_incomplete_cache_on_pass() {
+        let sha = "1".repeat(40);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path();
+        let mut cache = GateCache::new(&sha);
+        cache.set_with_attestation("rustfmt", true, 1, None, false, Some("digest".to_string()));
+        cache.set_with_attestation("clippy", true, 1, None, false, Some("digest".to_string()));
+
+        let err = run_blocking_evidence_gates_with(
+            workspace_root,
+            &sha,
+            "guardian-intelligence/apm2",
+            619,
+            |_, _, _, _| Ok(true),
+            |_| Some(cache.clone()),
+        )
+        .expect_err("pass path must fail on incomplete cache");
+        assert!(err.contains("required gate set"));
+        assert!(err.contains("missing="));
+    }
+
+    #[test]
     fn dispatch_reviews_with_dispatches_security_then_quality() {
         let mut dispatched = Vec::new();
+        let mut registered = Vec::new();
         let result = dispatch_reviews_with(
             "guardian-intelligence/apm2",
             42,
@@ -890,7 +1451,7 @@ mod tests {
                     review_type: kind.as_str().to_string(),
                     mode: "dispatched".to_string(),
                     run_state: "pending".to_string(),
-                    run_id: None,
+                    run_id: Some(format!("{}-run-1", kind.as_str())),
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
@@ -898,14 +1459,23 @@ mod tests {
                     log_file: None,
                 })
             },
+            |_, _, _, review_type, run_id, _, _| {
+                registered.push((review_type.to_string(), run_id.map(str::to_string)));
+                Ok(Some(format!("{review_type}-token")))
+            },
         );
 
         assert!(result.is_ok());
         assert_eq!(dispatched, vec!["security", "quality"]);
+        assert_eq!(registered.len(), 2);
+        assert_eq!(registered[0].0, "security");
+        assert_eq!(registered[1].0, "quality");
+        assert_eq!(registered[0].1.as_deref(), Some("security-run-1"));
+        assert_eq!(registered[1].1.as_deref(), Some("quality-run-1"));
     }
 
     #[test]
-    fn dispatch_reviews_with_fails_closed_on_dispatch_error() {
+    fn dispatch_reviews_with_fails_closed_after_retry_budget_exhaustion() {
         let mut calls = 0usize;
         let err = dispatch_reviews_with(
             "guardian-intelligence/apm2",
@@ -914,13 +1484,13 @@ mod tests {
             |_, _, kind, _, _| {
                 calls += 1;
                 if kind == ReviewKind::Security {
-                    return Err("simulated failure".to_string());
+                    return Err("temporary dispatch failure".to_string());
                 }
                 Ok(DispatchReviewResult {
                     review_type: kind.as_str().to_string(),
                     mode: "dispatched".to_string(),
                     run_state: "pending".to_string(),
-                    run_id: None,
+                    run_id: Some(format!("{}-run-1", kind.as_str())),
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
@@ -928,10 +1498,216 @@ mod tests {
                     log_file: None,
                 })
             },
+            |_, _, _, review_type, _, _, _| Ok(Some(format!("{review_type}-token"))),
         )
         .expect_err("expected dispatch failure");
 
-        assert!(err.contains("failed to dispatch security review"));
+        assert!(err.contains("exhausting retry budget"));
+        assert_eq!(calls, (lifecycle::default_retry_budget() as usize) + 1);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_fails_fast_on_integrity_error() {
+        let mut calls = 0usize;
+        let err = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "c".repeat(40).as_str(),
+            |_, _, kind, _, _| {
+                calls += 1;
+                if kind == ReviewKind::Security {
+                    return Err("illegal transition: untracked + reviewer_spawned".to_string());
+                }
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode: "dispatched".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: Some(format!("{}-run-1", kind.as_str())),
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+            |_, _, _, review_type, _, _, _| Ok(Some(format!("{review_type}-token"))),
+        )
+        .expect_err("expected fail-fast integrity failure");
+
+        assert!(err.contains("class=integrity_or_schema"));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_fails_fast_on_at_capacity_registration_error() {
+        let mut register_calls = 0usize;
+        let err = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "2".repeat(40).as_str(),
+            |_, _, kind, _, _| {
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode: "dispatched".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: Some(format!("{}-run-1", kind.as_str())),
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+            |_, _, _, _, _, _, _| {
+                register_calls += 1;
+                Err("at_capacity: PR #42 already has 2 active agents (max=2)".to_string())
+            },
+        )
+        .expect_err("at_capacity must fail fast and not retry");
+
+        assert!(err.contains("class=integrity_or_schema"));
+        assert_eq!(register_calls, 1);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_retries_missing_run_id_then_succeeds() {
+        let mut security_dispatch_calls = 0usize;
+        let mut quality_dispatch_calls = 0usize;
+        let mut register_calls = 0usize;
+        let result = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "d".repeat(40).as_str(),
+            |_, _, kind, _, _| {
+                let (mode, run_id) = match kind {
+                    ReviewKind::Security => {
+                        security_dispatch_calls += 1;
+                        if security_dispatch_calls <= 2 {
+                            ("dispatched".to_string(), None)
+                        } else {
+                            ("dispatched".to_string(), Some("security-run-3".to_string()))
+                        }
+                    },
+                    ReviewKind::Quality => {
+                        quality_dispatch_calls += 1;
+                        ("dispatched".to_string(), Some("quality-run-1".to_string()))
+                    },
+                };
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode,
+                    run_state: "pending".to_string(),
+                    run_id,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+            |_, _, _, _, _, _, _| {
+                register_calls += 1;
+                Ok(Some("token".to_string()))
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(security_dispatch_calls, 3);
+        assert_eq!(quality_dispatch_calls, 1);
+        assert_eq!(register_calls, 2);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_retries_registration_failures_then_succeeds() {
+        let mut dispatch_calls = 0usize;
+        let mut security_register_calls = 0usize;
+        let result = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "e".repeat(40).as_str(),
+            |_, _, kind, _, _| {
+                dispatch_calls += 1;
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode: "dispatched".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: Some(format!("{}-run-1", kind.as_str())),
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+            |_, _, _, review_type, _, _, _| {
+                if review_type == "security" {
+                    security_register_calls += 1;
+                    if security_register_calls <= 2 {
+                        return Err("failed to acquire registry lock".to_string());
+                    }
+                }
+                Ok(Some("token".to_string()))
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(dispatch_calls, 2);
+        assert_eq!(security_register_calls, 3);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_uses_independent_error_class_budgets() {
+        let mut security_dispatch_calls = 0usize;
+        let mut security_register_calls = 0usize;
+        let result = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "f".repeat(40).as_str(),
+            |_, _, kind, _, _| {
+                if kind == ReviewKind::Security {
+                    security_dispatch_calls += 1;
+                    if security_dispatch_calls == 1 {
+                        return Err("temporary dispatch queue saturation".to_string());
+                    }
+                    if security_dispatch_calls == 2 {
+                        return Ok(DispatchReviewResult {
+                            review_type: kind.as_str().to_string(),
+                            mode: "dispatched".to_string(),
+                            run_state: "pending".to_string(),
+                            run_id: None,
+                            sequence_number: None,
+                            terminal_reason: None,
+                            pid: None,
+                            unit: None,
+                            log_file: None,
+                        });
+                    }
+                }
+                Ok(DispatchReviewResult {
+                    review_type: kind.as_str().to_string(),
+                    mode: "dispatched".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: Some(format!("{}-run-{}", kind.as_str(), security_dispatch_calls)),
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: None,
+                    unit: None,
+                    log_file: None,
+                })
+            },
+            |_, _, _, review_type, _, _, _| {
+                if review_type == "security" {
+                    security_register_calls += 1;
+                    if security_register_calls == 1 {
+                        return Err("failed to acquire registry lock".to_string());
+                    }
+                }
+                Ok(Some("token".to_string()))
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(security_dispatch_calls, 3);
+        assert_eq!(security_register_calls, 2);
     }
 }

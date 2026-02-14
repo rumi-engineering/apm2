@@ -91,11 +91,11 @@ else
     log_pass "Primary gate correctly permits file without ai-review/security literal"
 fi
 
-# Test 2b-iii: SECURITY_REVIEW_PROMPT.md is always exempt -> MUST PASS
-if check_file_for_security_literal "$violation_fixture" "SECURITY_REVIEW_PROMPT.md"; then
-    log_fail "Primary gate not exempting SECURITY_REVIEW_PROMPT.md"
+# Test 2b-iii: SECURITY_REVIEW_PROMPT.cac.json is always exempt -> MUST PASS
+if check_file_for_security_literal "$violation_fixture" "SECURITY_REVIEW_PROMPT.cac.json"; then
+    log_fail "Primary gate not exempting SECURITY_REVIEW_PROMPT.cac.json"
 else
-    log_pass "Primary gate correctly exempts SECURITY_REVIEW_PROMPT.md"
+    log_pass "Primary gate correctly exempts SECURITY_REVIEW_PROMPT.cac.json"
 fi
 
 # Test 2b-iv: Split-token construction (bypass vector) -> MUST FAIL

@@ -276,7 +276,7 @@
         "precondition": "None.",
         "priority_reads": [
           "documents/security/SECURITY_POLICY.cac.json",
-          "documents/reviews/SECURITY_REVIEW_PROMPT.md",
+          "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
           "documents/security/THREAT_MODEL.cac.json",
           "SECURITY.md"
         ],
@@ -297,7 +297,7 @@
         "intent_name": "Code Quality Review",
         "precondition": "You have a PR URL or diff to review.",
         "priority_reads": [
-          "documents/reviews/CODE_QUALITY_PROMPT.md",
+          "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
         ],
         "supplementary_reads": [
           "documents/theory/unified-theory-v2.json",

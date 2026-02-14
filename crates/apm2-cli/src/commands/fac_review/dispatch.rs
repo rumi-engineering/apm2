@@ -13,19 +13,21 @@ use fs2::FileExt;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::projection_store;
 use super::state::{
-    ReviewRunStateLoad, build_review_run_id, get_process_start_time,
-    load_review_run_state_for_home, load_review_run_state_verified_for_home,
+    COMPLETION_RECEIPT_SCHEMA, ReviewRunCompletionReceipt, ReviewRunStateLoad, build_review_run_id,
+    get_process_start_time, load_review_run_state_for_home, load_review_run_state_strict_for_home,
+    load_review_run_state_verified_for_home, load_review_run_termination_receipt_for_home,
     next_review_sequence_number_for_home, try_acquire_review_lease_for_home,
-    write_review_run_state_for_home,
+    write_review_run_completion_receipt_for_home, write_review_run_state_for_home,
+    write_review_run_termination_receipt_for_home,
 };
 use super::types::{
     DISPATCH_LOCK_ACQUIRE_TIMEOUT, DISPATCH_PENDING_TTL, DispatchIdempotencyKey,
     DispatchReviewResult, PendingDispatchEntry, ReviewKind, ReviewRunState, ReviewRunStatus,
     TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP, TERMINAL_DISPATCH_LOCK_TIMEOUT,
-    TERMINAL_SHA_DRIFT_SUPERSEDED, TERMINAL_STALE_HEAD_AMBIGUITY, TERMINATE_TIMEOUT, apm2_home_dir,
-    ensure_parent_dir, now_iso8601,
+    TERMINAL_SHA_DRIFT_SUPERSEDED, TERMINAL_STALE_HEAD_AMBIGUITY,
+    TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, TERMINATE_TIMEOUT, TerminationAuthority,
+    apm2_home_dir, ensure_parent_dir, now_iso8601,
 };
-use super::worktree::resolve_worktree_for_sha;
 use crate::commands::fac_permissions;
 
 const SYSTEMD_DISPATCH_ENV_ALLOWLIST: [&str; 11] = [
@@ -79,6 +81,140 @@ fn review_dispatch_scope_lock_path_for_home(home: &Path, key: &DispatchIdempoten
 
 fn review_dispatch_pending_path_for_home(home: &Path, key: &DispatchIdempotencyKey) -> PathBuf {
     key.pending_path(&review_dispatch_pending_dir_for_home(home))
+}
+
+// ── Worktree discovery ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeEntry {
+    path: PathBuf,
+    head_sha: String,
+    branch: Option<String>,
+}
+
+fn finalize_worktree_entry(
+    entries: &mut Vec<WorktreeEntry>,
+    path: &mut Option<PathBuf>,
+    head_sha: &mut Option<String>,
+    branch: &mut Option<String>,
+) -> Result<(), String> {
+    if path.is_none() && head_sha.is_none() && branch.is_none() {
+        return Ok(());
+    }
+    let Some(entry_path) = path.take() else {
+        return Err("invalid worktree porcelain: missing `worktree` field".to_string());
+    };
+    let Some(entry_head_sha) = head_sha.take() else {
+        return Err(format!(
+            "invalid worktree porcelain: missing `HEAD` field for {}",
+            entry_path.display()
+        ));
+    };
+    super::types::validate_expected_head_sha(&entry_head_sha)?;
+    entries.push(WorktreeEntry {
+        path: entry_path,
+        head_sha: entry_head_sha.to_ascii_lowercase(),
+        branch: branch.take(),
+    });
+    Ok(())
+}
+
+fn parse_worktree_list(porcelain: &str) -> Result<Vec<WorktreeEntry>, String> {
+    let mut entries = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut head_sha: Option<String> = None;
+    let mut branch: Option<String> = None;
+
+    for raw_line in porcelain.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            finalize_worktree_entry(&mut entries, &mut path, &mut head_sha, &mut branch)?;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("worktree ") {
+            if path.is_some() || head_sha.is_some() || branch.is_some() {
+                finalize_worktree_entry(&mut entries, &mut path, &mut head_sha, &mut branch)?;
+            }
+            path = Some(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("HEAD ") {
+            head_sha = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            let normalized = value
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or_else(|| value.trim())
+                .to_string();
+            branch = Some(normalized);
+        }
+    }
+
+    finalize_worktree_entry(&mut entries, &mut path, &mut head_sha, &mut branch)?;
+    Ok(entries)
+}
+
+fn resolve_head_for_path(path: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute git rev-parse HEAD in {}: {err}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    super::types::validate_expected_head_sha(&sha)?;
+    Ok(sha.to_ascii_lowercase())
+}
+
+pub(super) fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, String> {
+    super::types::validate_expected_head_sha(expected_sha)?;
+    let expected_sha = expected_sha.to_ascii_lowercase();
+
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|err| format!("failed to execute `git worktree list --porcelain`: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git worktree list --porcelain` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let porcelain = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git worktree output is not valid UTF-8: {err}"))?;
+    let entries = parse_worktree_list(&porcelain)?;
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.head_sha.eq_ignore_ascii_case(&expected_sha))
+    {
+        return Ok(entry.path.clone());
+    }
+
+    let cwd = std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
+    let cwd_head_sha = resolve_head_for_path(&cwd)?;
+    if cwd_head_sha.eq_ignore_ascii_case(&expected_sha) {
+        eprintln!(
+            "WARNING: no matching worktree found for sha={expected_sha}; falling back to cwd {}",
+            cwd.display()
+        );
+        return Ok(cwd);
+    }
+
+    Err(format!(
+        "no worktree matches head sha {expected_sha}; cwd {} is at {cwd_head_sha}",
+        cwd.display()
+    ))
 }
 
 // ── Pending dispatch I/O ────────────────────────────────────────────────────
@@ -297,6 +433,202 @@ pub(super) fn terminate_process_with_timeout(pid: u32) -> Result<(), String> {
     if is_process_alive(pid) {
         return Err(format!("pid {pid} remained alive after SIGKILL"));
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminationOutcome {
+    Killed,
+    AlreadyDead,
+    SkippedMismatch,
+    IdentityFailure(String),
+}
+
+fn finalize_termination_outcome(
+    home: &Path,
+    authority: &TerminationAuthority,
+    outcome: TerminationOutcome,
+) -> Result<TerminationOutcome, String> {
+    write_termination_receipt(home, authority, &outcome)?;
+    Ok(outcome)
+}
+
+pub fn terminate_review_agent_for_home(
+    home: &Path,
+    authority: &TerminationAuthority,
+) -> Result<TerminationOutcome, String> {
+    let Some(mut state) =
+        load_review_run_state_strict_for_home(home, authority.pr_number, &authority.review_type)?
+    else {
+        return finalize_termination_outcome(home, authority, TerminationOutcome::AlreadyDead);
+    };
+    if state.run_id != authority.run_id {
+        return finalize_termination_outcome(
+            home,
+            authority,
+            TerminationOutcome::IdentityFailure(format!(
+                "run-id mismatch for PR #{}: authority={} state={}",
+                authority.pr_number, authority.run_id, state.run_id
+            )),
+        );
+    }
+    if !state.owner_repo.eq_ignore_ascii_case(&authority.repo) {
+        eprintln!(
+            "WARNING: skipping agent termination: run-state repo {} does not match requested repo {}",
+            state.owner_repo, authority.repo
+        );
+        return finalize_termination_outcome(home, authority, TerminationOutcome::SkippedMismatch);
+    }
+    if state.status.is_terminal() {
+        eprintln!(
+            "INFO: skipping agent termination: run state for PR #{} type {} is already terminal",
+            authority.pr_number, authority.review_type
+        );
+        return finalize_termination_outcome(home, authority, TerminationOutcome::AlreadyDead);
+    }
+
+    if !state.head_sha.eq_ignore_ascii_case(&authority.head_sha) {
+        let message = format!(
+            "skipping agent termination: reviewed sha {} does not match state sha {}",
+            authority.head_sha, state.head_sha
+        );
+        eprintln!("WARNING: {message}");
+        return finalize_termination_outcome(home, authority, TerminationOutcome::SkippedMismatch);
+    }
+    let Some(pid) = state.pid else {
+        return finalize_termination_outcome(
+            home,
+            authority,
+            TerminationOutcome::IdentityFailure(format!(
+                "failed to terminate review agent for PR #{}: missing pid on active state",
+                authority.pr_number
+            )),
+        );
+    };
+    if !is_process_alive(pid) {
+        eprintln!("WARNING: skipping agent termination: pid {pid} is already not alive");
+        return finalize_termination_outcome(home, authority, TerminationOutcome::AlreadyDead);
+    }
+    let Some(recorded_proc_start) = state.proc_start_time else {
+        return finalize_termination_outcome(
+            home,
+            authority,
+            TerminationOutcome::IdentityFailure(format!(
+                "failed to terminate review agent pid {pid}: missing proc_start_time"
+            )),
+        );
+    };
+    if let Err(err) = verify_process_identity(pid, Some(recorded_proc_start)) {
+        return finalize_termination_outcome(
+            home,
+            authority,
+            TerminationOutcome::IdentityFailure(format!(
+                "failed to verify process identity for pid {pid}: {err}"
+            )),
+        );
+    }
+    if !is_process_alive(pid) {
+        eprintln!("WARNING: skipping agent termination: pid {pid} is already not alive");
+        return finalize_termination_outcome(home, authority, TerminationOutcome::AlreadyDead);
+    }
+
+    if let Err(err) = terminate_process_with_timeout(pid) {
+        return finalize_termination_outcome(
+            home,
+            authority,
+            TerminationOutcome::IdentityFailure(format!(
+                "failed to terminate review agent pid={pid}: {err}"
+            )),
+        );
+    }
+
+    if is_process_alive(pid) {
+        return finalize_termination_outcome(
+            home,
+            authority,
+            TerminationOutcome::IdentityFailure(format!(
+                "review agent pid={pid} is still alive after termination attempt"
+            )),
+        );
+    }
+
+    let mut outcome = TerminationOutcome::Killed;
+    state.status = ReviewRunStatus::Done;
+    state.terminal_reason = Some(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED.to_string());
+    if let Err(err) = write_review_run_state_for_home(home, &state).map_err(|err| {
+        format!(
+            "failed to persist terminal review state for PR #{}: {err}",
+            authority.pr_number
+        )
+    }) {
+        outcome = TerminationOutcome::IdentityFailure(err);
+    }
+
+    write_termination_receipt(home, authority, &outcome)?;
+    eprintln!("INFO: terminated review agent pid={pid} after verdict finalized");
+    Ok(outcome)
+}
+
+pub fn write_completion_receipt_for_verdict(
+    home: &Path,
+    authority: &TerminationAuthority,
+    decision: &str,
+) -> Result<(), String> {
+    let completion_receipt = ReviewRunCompletionReceipt {
+        schema: COMPLETION_RECEIPT_SCHEMA.to_string(),
+        emitted_at: now_iso8601(),
+        repo: authority.repo.clone(),
+        pr_number: authority.pr_number,
+        review_type: authority.review_type.clone(),
+        run_id: authority.run_id.clone(),
+        head_sha: authority.head_sha.clone(),
+        decision: decision.to_string(),
+        decision_comment_id: authority.decision_comment_id,
+        decision_author: authority.decision_author.clone(),
+        decision_summary: authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
+    };
+    write_review_run_completion_receipt_for_home(home, &completion_receipt).map(|_| ())
+}
+
+fn write_termination_receipt(
+    home: &Path,
+    authority: &TerminationAuthority,
+    outcome: &TerminationOutcome,
+) -> Result<(), String> {
+    let (outcome_label, outcome_reason) = match outcome {
+        TerminationOutcome::Killed => ("killed", None),
+        TerminationOutcome::AlreadyDead => ("already_dead", None),
+        TerminationOutcome::SkippedMismatch => ("skipped_mismatch", None),
+        TerminationOutcome::IdentityFailure(reason) => ("identity_failure", Some(reason.clone())),
+    };
+    let receipt = super::state::ReviewRunTerminationReceipt {
+        schema: super::state::TERMINATION_RECEIPT_SCHEMA.to_string(),
+        emitted_at: now_iso8601(),
+        repo: authority.repo.clone(),
+        pr_number: authority.pr_number,
+        review_type: authority.review_type.clone(),
+        run_id: authority.run_id.clone(),
+        head_sha: authority.head_sha.clone(),
+        decision_comment_id: authority.decision_comment_id,
+        decision_author: authority.decision_author.clone(),
+        decision_summary: authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
+        outcome: outcome_label.to_string(),
+        outcome_reason,
+    };
+    write_review_run_termination_receipt_for_home(home, &receipt)?;
+    let _ = load_review_run_termination_receipt_for_home(
+        home,
+        authority.pr_number,
+        &authority.review_type,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "termination receipt missing after write for PR #{} type={}",
+            authority.pr_number, authority.review_type
+        )
+    })?;
     Ok(())
 }
 
@@ -1228,9 +1560,8 @@ fn spawn_detached_review(
     ));
     let stdout = fac_permissions::append_fac_file_with_mode(&log_path)
         .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
-    let stderr = stdout
-        .try_clone()
-        .map_err(|err| format!("failed to clone dispatch log handle: {err}"))?;
+    let stderr = fac_permissions::append_fac_file_with_mode(&log_path)
+        .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
     let child = Command::new(&exe_path)
         .arg("fac")
         .arg("review")
@@ -1981,8 +2312,7 @@ mod tests {
             .parent()
             .expect("parent")
             .join("state.backup.json");
-        crate::commands::fac_permissions::ensure_dir_with_mode(alt.parent().expect("alt parent"))
-            .expect("create alt parent");
+        fs::create_dir_all(alt.parent().expect("alt parent")).expect("create alt parent");
         fs::write(
             &alt,
             serde_json::to_vec_pretty(&state).expect("serialize state"),

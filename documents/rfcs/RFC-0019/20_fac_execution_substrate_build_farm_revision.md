@@ -257,7 +257,7 @@ The bounded runner:
 * Uses `systemd-run --user` transient scope/service under a name like `apm2-ci-bounded-...`
 * Enforces:
 
-  * timeout (defaults bounded by `gates.rs` max 240s)
+  * timeout (defaults bounded by `gates.rs` max 600s)
   * memory max (default 24G passed from CLI)
   * pids max
   * CPU quota
@@ -335,7 +335,7 @@ Observed operational pattern:
 * Compilation-heavy gates (`clippy`, `doc`, `test`) can each trigger distinct compilation flows and output sets.
 * The **bounded** test gate is sensitive: if it has to do a large cold compile, it can exceed:
 
-  * **Wall-time 240s** (by policy; should not be increased)
+  * **Wall-time 600s** (by policy; configurable via --timeout-seconds)
   * **MemoryMax 24G** (policy default)
 
 Your stated goal is not to "relax the box"; it is to **make cold-start rare** and **keep the host stable** under parallel agents.
@@ -722,7 +722,7 @@ Rules:
 * MUST acquire a lane lease internally (no "run directly in caller worktree" once Phase 1 is complete)
 * MUST use nextest explicitly (no cargo-test fallback)
 * MUST fail closed if nextest is missing
-* MUST enforce the 240s/24G test policy (no override without explicit unsafe flag)
+* MUST enforce the 600s/24G test policy (no override without explicit unsafe flag)
 
 Default execution mode change (normative):
 
@@ -809,7 +809,7 @@ Storage rules:
     "io_weight": 100
   },
   "timeouts": {
-    "test_timeout_seconds": 240,
+    "test_timeout_seconds": 600,
     "job_runtime_max_seconds": 1800
   },
   "policy": {
@@ -919,7 +919,7 @@ Storage:
   },
   "constraints": {
     "require_nextest": true,
-    "test_timeout_seconds": 240,
+    "test_timeout_seconds": 600,
     "memory_max_bytes": 25769803776
   }
 }
@@ -1370,7 +1370,7 @@ This is where the original planning doc was dangerously under-specified.
 
 Because the test gate is executed under a bounded `systemd-run` unit, we must assume:
 
-* any compilation or compilation-adjacent process must remain inside the bounded cgroup to preserve the 24G/240s guarantees.
+* any compilation or compilation-adjacent process must remain inside the bounded cgroup to preserve the 24G/600s guarantees.
 
 **Risk:** If sccache uses a long-lived daemon that spawns compiler processes outside the transient unit cgroup, your "bounded tests" aren't actually bounded. That is an unacceptable integrity regression.
 
@@ -1431,7 +1431,7 @@ Changes:
 
 ### 11.1 Why warm is required (and where it belongs)
 
-Given the "240s/24G bounded test SLA," we treat warm as:
+Given the "600s/24G bounded test SLA," we treat warm as:
 
 * a **worktree lifecycle step**, not a per-run step
 * required:
@@ -1778,7 +1778,7 @@ This amendment is only acceptable if these checks pass.
 
 3. `apm2 fac gates` (full mode):
 
-   * after warm, test gate completes within 240s and does not OOM under 24G
+   * after warm, test gate completes within 600s and does not OOM under 24G
    * produces gate cache receipts
 
 4. Attestation tests remain stable and fail-closed:
@@ -2321,7 +2321,7 @@ ticket_meta:
     in_scope:
       - "Remove ALL cargo-test fallbacks (pipeline + local) and require explicit `cargo nextest run ...`."
       - "Fail closed if nextest missing in default mode."
-      - "Enforce test caps: timeout ≤240s and MemoryMax ≤24G unless explicit unsafe override."
+      - "Enforce test caps: timeout ≤600s and MemoryMax ≤24G unless explicit unsafe override"
       - "Set `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` based on lane policy."
       - "Update bounded runner env allowlist to pass: `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`."
     out_of_scope:

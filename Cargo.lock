@@ -127,6 +127,7 @@ dependencies = [
  "regex",
  "secrecy",
  "serde",
+ "serde_jcs",
  "serde_json",
  "serde_yaml",
  "sha2",

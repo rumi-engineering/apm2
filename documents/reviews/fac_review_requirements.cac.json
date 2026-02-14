@@ -1,0 +1,356 @@
+{
+  "schema": "apm2.fac.requirements.v1",
+  "schema_version": "1.0.0",
+  "kind": "requirements.specification",
+  "meta": {
+    "stable_id": "dcp://apm2.fac/requirements/fac-review@1",
+    "status": "DRAFT",
+    "classification": "INTERNAL",
+    "owners": ["platform", "security"],
+    "source_of_truth_refs": [
+      "documents/work/tickets/TCK-00604.yaml",
+      "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+      "documents/reviews/CODE_QUALITY_PROMPT.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0019",
+    "provenance": {
+      "actor_id": "HOLON-PLATFORM-GOVERNANCE",
+      "work_id": "TCK-00604-REQUIREMENTS-ASSEMBLY",
+      "source_receipts": [],
+      "incident_refs": [
+        {
+          "ref": "github.com/guardian-intelligence/apm2/pull/656",
+          "type": "verdict_override_incident",
+          "summary": "Security BLOCKER overridden by hallucinated PASS due to restart-after-deny, blind verdict upsert, and mutable state erasure"
+        }
+      ]
+    }
+  },
+  "payload": {
+    "title": "FAC Review Requirements Specification",
+    "purpose": "Define invariants, state machine constraints, architectural boundaries, and operational requirements for the FAC review subsystem. This is the single source of truth from which implementation, tests, and reviewer prompts are derived.",
+
+    "architectural_boundaries": {
+      "id": "ARCH",
+      "title": "Core / Projection Separation",
+      "requirements": [
+        {
+          "id": "ARCH-001",
+          "title": "Core FAC is GitHub-agnostic",
+          "severity": "MUST",
+          "description": "Core FAC modules (lifecycle, dispatch, state, types, events, evidence, gates, gate_attestation, gate_cache, orchestrator, restart, liveness, detection, pipeline, model_pool, backend, merge_conflicts, projection_store, target, findings, logs, projection engine) MUST NOT shell out to `gh`, import github_projection, or depend on GitHub-specific types. All GitHub I/O is routed through projection boundary modules.",
+          "rationale": "The local truth plane must function independently of GitHub availability. Projection failures must never block core state progression.",
+          "verification": "rg 'Command::new\\(\"gh\"\\)' across all core module files returns zero matches."
+        },
+        {
+          "id": "ARCH-002",
+          "title": "Projection boundary modules own all GitHub I/O",
+          "severity": "MUST",
+          "description": "All `gh` CLI invocations, GitHub API interactions, GitHub comment rendering, reviewer identity resolution via GitHub, and GitHub comment caching MUST live exclusively in projection boundary modules: github_projection, github_auth, github_reads, verdict_projection, ci_status, comment, publish, pr_body.",
+          "rationale": "Single responsibility. GitHub API changes, rate limits, and auth failures are contained in the projection layer."
+        },
+        {
+          "id": "ARCH-003",
+          "title": "Dependency direction: projection depends on core, never reverse",
+          "severity": "MUST",
+          "description": "Projection modules MAY import core modules (types, projection_store, state). Core modules MUST NOT import projection boundary modules. The only exception is bridge modules (push, prepare) that orchestrate both core and projection steps.",
+          "rationale": "Prevents circular dependencies and ensures core can be tested without GitHub mocking."
+        },
+        {
+          "id": "ARCH-004",
+          "title": "Logs are purely local with own lifecycle",
+          "severity": "MUST",
+          "description": "The logs module manages local log files exclusively: discovery, reading, rotation, retention. Any GitHub I/O previously embedded in logs (e.g., fetching issue comments for selector zoom) MUST be delegated to a projection boundary module.",
+          "rationale": "Log management is a core operational concern, not a projection concern."
+        }
+      ]
+    },
+
+    "verdict_invariants": {
+      "id": "VERD",
+      "title": "Verdict Integrity",
+      "requirements": [
+        {
+          "id": "VERD-001",
+          "title": "Deny is sticky per SHA",
+          "severity": "MUST",
+          "description": "Once any review attempt sets a deny verdict for a (PR, SHA, dimension) tuple, no subsequent operation MAY overwrite that verdict to approve for the same tuple. Only a new SHA (fix commit) resets the verdict for that dimension. persist_verdict_projection MUST check for existing deny before upserting.",
+          "rationale": "PR #656 incident: a restarted security review hallucinated a PASS and overwrote a legitimate BLOCKER deny. Deny verdicts represent discovered defects — they cannot be erased by re-rolling the dice.",
+          "verification": "Unit test: persist_verdict_projection with existing deny returns error on approve attempt for same SHA."
+        },
+        {
+          "id": "VERD-002",
+          "title": "Verdict reducer deny absorption",
+          "severity": "MUST",
+          "description": "The lifecycle state machine reducer MUST treat VerdictDeny as an absorbing state for a given SHA. Once any dimension transitions to VerdictDeny, the PR state remains VerdictDeny regardless of subsequent VerdictSet events with approve for other dimensions on the same SHA.",
+          "rationale": "Ensures the lifecycle state machine cannot be tricked into MergeReady when any dimension has denied.",
+          "verification": "Unit test: security deny followed by code-quality approve yields VerdictDeny, not VerdictPending."
+        },
+        {
+          "id": "VERD-003",
+          "title": "Completion receipt requires successful termination",
+          "severity": "MUST",
+          "description": "The review run completion receipt MUST NOT be persisted until the reviewer agent has been successfully terminated (Killed or AlreadyDead). If termination fails (IdentityFailure, IntegrityFailure), no completion receipt is written. The verdict is NOT finalized.",
+          "rationale": "Writing the receipt before termination creates a false finalization: the receipt claims completion but the agent may still be running and producing stale output.",
+          "verification": "Unit test: IdentityFailure during termination results in no completion receipt on disk."
+        },
+        {
+          "id": "VERD-004",
+          "title": "Findings are append-only per SHA",
+          "severity": "MUST",
+          "description": "Review findings accumulated for a (PR, SHA, dimension) tuple MUST be preserved even if a subsequent review attempt runs for the same tuple. Later attempts append findings; they do not replace earlier findings.",
+          "rationale": "Prevents loss of legitimate security findings when a review is restarted."
+        },
+        {
+          "id": "VERD-005",
+          "title": "Verdict set implies reviewer completion",
+          "severity": "MUST",
+          "description": "When `apm2 fac review verdict set` is called for a dimension, the corresponding reviewer agent slot in the agent registry MUST be transitioned to completed and its concurrency slot reclaimed. A separate `fac done` call is not required for reviewer agents.",
+          "rationale": "A reviewer that sets a verdict has finished its work. Requiring a separate completion signal is redundant and fragile."
+        }
+      ]
+    },
+
+    "lifecycle_state_machine": {
+      "id": "LIFE",
+      "title": "PR/SHA Lifecycle State Machine",
+      "requirements": [
+        {
+          "id": "LIFE-001",
+          "title": "Single reducer authority",
+          "severity": "MUST",
+          "description": "All PR/SHA state transitions MUST flow through a single reducer entrypoint: apply(state, event) -> next_state | deny. No command handler may mutate lifecycle state directly. The reducer is the sole authority for state progression.",
+          "rationale": "Prevents inconsistent state from ad-hoc mutations across multiple CLI paths."
+        },
+        {
+          "id": "LIFE-002",
+          "title": "Fail-closed on undefined transitions",
+          "severity": "MUST",
+          "description": "Any (state, event) pair not explicitly defined in the transition table MUST be rejected with a machine-readable error. The system MUST NOT silently accept undefined transitions or fall through to a default state.",
+          "rationale": "Undefined transitions are bugs. Fail-closed ensures they are detected immediately."
+        },
+        {
+          "id": "LIFE-003",
+          "title": "Append-only event log",
+          "severity": "MUST",
+          "description": "The lifecycle MUST maintain an append-only event log per (PR, SHA). The event log is the ground truth for state reconstruction. The current state is a derived projection of the event log through the reducer. No operation may delete or mutate prior events.",
+          "rationale": "PR #656 incident: single mutable state.json was overwritten by restart, erasing evidence that a prior review completed with deny."
+        },
+        {
+          "id": "LIFE-004",
+          "title": "Bounded error budget",
+          "severity": "MUST",
+          "description": "Each PR/SHA lifecycle has a bounded error budget (default: max 10 error transitions). When exhausted, the PR transitions to STUCK and requires manual intervention via `apm2 fac recover`. No unbounded retry loops.",
+          "rationale": "Prevents infinite crash-restart cycles that consume resources without progress."
+        },
+        {
+          "id": "LIFE-005",
+          "title": "SHA drift cancels in-flight work",
+          "severity": "MUST",
+          "description": "When a new push is detected (SHA changes) while gates or reviews are in progress for an older SHA, the state machine MUST transition the old SHA's lifecycle to Stale, cancel in-flight agent work, reap those agent slots, and begin the pipeline for the new SHA.",
+          "rationale": "In-flight work for a superseded SHA is wasted. Agents working on stale code must be stopped promptly."
+        },
+        {
+          "id": "LIFE-006",
+          "title": "Defined lifecycle states",
+          "severity": "MUST",
+          "description": "The PR/SHA lifecycle MUST define at minimum these states with precise entry/exit conditions: Pushed, GatesRunning, GatesPassed, GatesFailed, ReviewsDispatched, ReviewInProgress, VerdictPending, VerdictApprove, VerdictDeny, MergeReady, Merged, Stuck, Stale, Recovering.",
+          "rationale": "Every state must be explicitly defined so tooling (doctor, recover, orchestrator) can reason about the PR's position in the pipeline."
+        }
+      ]
+    },
+
+    "agent_lifecycle": {
+      "id": "AGNT",
+      "title": "Agent Lifecycle and Concurrency",
+      "requirements": [
+        {
+          "id": "AGNT-001",
+          "title": "Concurrency cap per PR",
+          "severity": "MUST",
+          "description": "At most 2 agents MAY be active for any single PR at any time. The agent registry MUST be consulted by all dispatch paths (push, restart, review run, orchestrator). Dispatch MUST return a clear 'at capacity' signal when the cap is reached.",
+          "rationale": "Prevents unbounded agent accumulation from crash-restart cycles."
+        },
+        {
+          "id": "AGNT-002",
+          "title": "Stale agent reaping",
+          "severity": "MUST",
+          "description": "The agent registry MUST detect dead agents (PID no longer alive) and reclaim their concurrency slots automatically. Reaping MUST occur before dispatch decisions.",
+          "rationale": "Dead agents must not permanently consume concurrency slots."
+        },
+        {
+          "id": "AGNT-003",
+          "title": "No restart after verdict-set for same SHA+dimension",
+          "severity": "MUST",
+          "description": "Once a verdict has been set for a (PR, SHA, dimension) tuple, the orchestrator MUST NOT restart or re-dispatch a reviewer for that same tuple. The verdict is terminal for that tuple.",
+          "rationale": "PR #656 incident: orchestrator restarted security review after it already set a deny verdict. The restart produced a hallucinated PASS that overwrote the real findings."
+        },
+        {
+          "id": "AGNT-004",
+          "title": "Completion authority proof",
+          "severity": "SHOULD",
+          "description": "Agent completion signals (via `fac done` or implicit verdict-set completion) SHOULD require authority proof (completion token) bound to run_id/pr/sha/role with expiry and replay protection. PID checks alone are insufficient for high-assurance completion.",
+          "rationale": "Prevents spoofed completion signals from unauthorized processes."
+        },
+        {
+          "id": "AGNT-005",
+          "title": "Agent lifecycle states",
+          "severity": "MUST",
+          "description": "The agent lifecycle sub-machine MUST define at minimum: Dispatched, Running, Completed, Crashed, Reaped. Composition with PR lifecycle: Completed reviewer triggers verdict checks; Crashed reviewer may trigger restart (subject to AGNT-003 and error budget).",
+          "rationale": "Explicit agent states enable the orchestrator and doctor command to report precise status."
+        },
+        {
+          "id": "AGNT-006",
+          "title": "Self-termination race avoidance",
+          "severity": "MUST",
+          "description": "The verdict-set flow MUST NOT attempt to kill the reviewer process from within a subprocess spawned by that same reviewer. Completion signaling (marking the slot as completed, writing receipts) and process termination (killing the PID) MUST be separated: the agent signals completion, then the orchestrator (or a separate control path) handles termination.",
+          "rationale": "PR #656 incident: verdict-set tried to terminate the reviewer from within a Codex tool call, creating a self-referential race that left the orchestrator unable to detect clean completion."
+        }
+      ]
+    },
+
+    "state_persistence": {
+      "id": "PERS",
+      "title": "State Persistence and Integrity",
+      "requirements": [
+        {
+          "id": "PERS-001",
+          "title": "HMAC integrity binding on all state files",
+          "severity": "MUST",
+          "description": "Review run state, completion receipts, and termination receipts MUST include HMAC integrity bindings covering all control-plane fields. Verification MUST occur on load; tampered files MUST be rejected.",
+          "rationale": "Prevents state file manipulation from causing incorrect lifecycle transitions."
+        },
+        {
+          "id": "PERS-002",
+          "title": "Projection identity update is last step in push",
+          "severity": "MUST",
+          "description": "Local PR identity/projection update MUST be the LAST step in the push flow — after git push, after gates pass, after review dispatch completes. The local SHA MUST only be persisted once the full pipeline for that SHA has been confirmed.",
+          "rationale": "Premature identity writes cause 'stale identity' errors in restart/recovery when the pipeline fails mid-flight."
+        },
+        {
+          "id": "PERS-003",
+          "title": "Corrupted state transitions to quarantine",
+          "severity": "MUST",
+          "description": "HMAC validation failure, missing mandatory receipt, or partial/truncated write MUST transition the lifecycle to a quarantine state requiring explicit operator intervention via `apm2 fac recover`.",
+          "rationale": "Proceeding on broken state risks incorrect verdicts or lost findings."
+        },
+        {
+          "id": "PERS-004",
+          "title": "Manual termination preserves semantic distinction",
+          "severity": "MUST",
+          "description": "Manual termination via `apm2 fac review terminate` MUST record status=Failed with terminal_reason distinguishable from verdict-finalized completion (status=Done). Downstream consumers that distinguish Failed from Done MUST see the correct semantic.",
+          "rationale": "Administrative interventions must be distinguishable from normal completions in audit trails and diagnostic output."
+        }
+      ]
+    },
+
+    "projection_requirements": {
+      "id": "PROJ",
+      "title": "Projection Layer",
+      "requirements": [
+        {
+          "id": "PROJ-001",
+          "title": "Projections are best-effort and non-blocking",
+          "severity": "MUST",
+          "description": "GitHub projection failures (API errors, rate limits, network timeouts) MUST NOT block local truth plane progression. Projections are best-effort with exponential backoff and circuit-breaker semantics.",
+          "rationale": "The local truth plane is authoritative. GitHub is a read-only view for human consumption."
+        },
+        {
+          "id": "PROJ-002",
+          "title": "Single auth module",
+          "severity": "MUST",
+          "description": "GitHub auth primitives (ensure_gh_cli_ready, resolve_authenticated_gh_login, resolve_local_reviewer_identity) MUST be defined in exactly one module (github_auth). No duplication across barrier/projection/other modules.",
+          "rationale": "Auth duplication leads to drift and inconsistent behavior across code paths."
+        },
+        {
+          "id": "PROJ-003",
+          "title": "Single mutation boundary",
+          "severity": "MUST",
+          "description": "All GitHub API mutations (comment create/update, PR create/update/merge) MUST route through github_projection. No module may shell out to `gh api --method POST/PATCH/PUT/DELETE` directly.",
+          "rationale": "Centralized mutation boundary enables audit logging, rate limiting, and circuit-breaker implementation."
+        }
+      ]
+    },
+
+    "error_handling": {
+      "id": "ERR",
+      "title": "Error Handling and Recovery",
+      "requirements": [
+        {
+          "id": "ERR-001",
+          "title": "Every state defines error transitions",
+          "severity": "MUST",
+          "description": "No lifecycle state may silently swallow failures. Every state MUST define explicit error transitions for: agent crash, timeout, API failure, SHA drift, and corrupted state.",
+          "rationale": "Silent failures leave PRs in undefined limbo with no recovery path."
+        },
+        {
+          "id": "ERR-002",
+          "title": "Premature completion detection",
+          "severity": "MUST",
+          "description": "If an agent signals completion without fulfilling required post-conditions (e.g., reviewer signals done without setting a verdict), the state machine MUST detect this via post-condition checks and transition to a recovery state, not accept the completion.",
+          "rationale": "Prevents incomplete reviews from being treated as passing."
+        },
+        {
+          "id": "ERR-003",
+          "title": "Bounded retry per state",
+          "severity": "MUST",
+          "description": "Each retriable state has a bounded retry count (default: 3). Exceeding the retry count transitions to Stuck. Combined with LIFE-004 global error budget.",
+          "rationale": "Prevents infinite retry loops for systematically failing operations."
+        },
+        {
+          "id": "ERR-004",
+          "title": "Diagnostic command for any PR state",
+          "severity": "MUST",
+          "description": "`apm2 fac doctor --pr N` MUST produce a comprehensive single-source report covering: identity, lifecycle state, gate status, review verdicts, agent registry, recent events, and actionable health diagnostics. The command is purely observational (read-only).",
+          "rationale": "Operators and orchestrator agents need a single command to understand everything about a PR's FAC status."
+        }
+      ]
+    },
+
+    "compatibility": {
+      "id": "COMPAT",
+      "title": "Backwards Compatibility and Migration",
+      "requirements": [
+        {
+          "id": "COMPAT-001",
+          "title": "CLI command surface preservation",
+          "severity": "MUST",
+          "description": "All existing `apm2 fac` CLI commands, flags, and output schemas MUST continue to function. New commands (fac done, fac recover, fac review finding) are additive.",
+          "rationale": "External callers (CI workflows, reviewer prompts, operator scripts) must not break."
+        },
+        {
+          "id": "COMPAT-002",
+          "title": "Legacy finding compatibility shim",
+          "severity": "MUST",
+          "description": "`apm2 fac review comment` MUST remain functional as an alias/shim for `apm2 fac review finding` during the migration window.",
+          "rationale": "Existing reviewer prompts reference `review comment`. They must not break until prompts are updated."
+        },
+        {
+          "id": "COMPAT-003",
+          "title": "Deterministic state migration",
+          "severity": "MUST",
+          "description": "Existing local FAC artifacts (state files, receipts, projection store entries) MUST be migrated deterministically. Ambiguous or corrupt state during migration MUST fail closed and require explicit `fac recover` intervention.",
+          "rationale": "In-flight reviews must not be silently lost or corrupted during the transition."
+        },
+        {
+          "id": "COMPAT-004",
+          "title": "Shadow-mode validation before cutover",
+          "severity": "SHOULD",
+          "description": "The new reducer SHOULD run in shadow mode alongside current logic, comparing projections/terminal outcomes per PR/SHA. Full cutover SHOULD be blocked until divergence is zero across burn-in runs.",
+          "rationale": "Reduces risk of behavioral regressions during the transition from ad-hoc state mutation to reducer authority."
+        }
+      ]
+    },
+
+    "cross_references": {
+      "tickets": ["TCK-00604", "TCK-00603"],
+      "rfcs": ["RFC-0019"],
+      "incidents": [
+        {
+          "ref": "PR #656 verdict override",
+          "requirements_derived": ["VERD-001", "VERD-003", "AGNT-003", "AGNT-006", "LIFE-003"]
+        }
+      ]
+    }
+  }
+}

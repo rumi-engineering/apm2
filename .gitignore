@@ -69,3 +69,6 @@ IMPL_PROMPT*.md
 CLIPPY_FIX.md
 MERGE_CONFLICT*.md
 security_findings.md
+
+# Daemon runtime state
+/tmp/

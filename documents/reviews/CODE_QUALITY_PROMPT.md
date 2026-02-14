@@ -122,7 +122,7 @@ decision_tree:
         - action: command
           run: "apm2 fac review prepare --help"
         - action: command
-          run: "apm2 fac review publish --help"
+          run: "apm2 fac review finding --help"
         - action: command
           run: "apm2 fac review findings --help"
         - action: command
@@ -201,14 +201,13 @@ decision_tree:
           rule: "For PCAC-integrated handlers, verify canonical lifecycle ordering and builder usage; flag manual join-input construction or lifecycle drift as findings."
         - action: classify
           output: [blocker_count, major_count, minor_count, nit_count, verdict]
-      next: STEP_6_PUBLISH
+      next: STEP_6_RECORD_FINDINGS
 
-    - id: STEP_6_PUBLISH
-      purpose: "Publish through FAC projection path only."
+    - id: STEP_6_RECORD_FINDINGS
+      purpose: "Record findings in local FAC projection artifacts (no publish command)."
       steps[1]:
-        - action: command
-          run: "apm2 fac review publish --type code-quality --body-file \"$temp_dir/code_quality_findings.md\" --json"
-          capture_as: publish_json
+        - action: rule
+          rule: "For each finding, call `apm2 fac review finding --type code-quality --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --details \"...\" --risk \"...\" --impact \"...\" --location \"...\" --json`."
       next: STEP_7_SET_VERDICT
 
     - id: STEP_7_SET_VERDICT

@@ -92,6 +92,66 @@ pub(super) fn update_issue_comment(
     Ok(())
 }
 
+pub(super) fn find_latest_issue_comment_id_with_marker(
+    owner_repo: &str,
+    pr_number: u32,
+    marker: &str,
+) -> Result<Option<u64>, String> {
+    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
+    let output = Command::new("gh")
+        .args(["api", "--paginate", "--slurp", &endpoint])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for issue comment discovery: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed listing issue comments for PR #{pr_number}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse issue comments response: {err}"))?;
+
+    let mut max_id = None::<u64>;
+    let mut scan_comments = |comments: &[serde_json::Value]| {
+        for comment in comments {
+            let Some(id) = comment.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let body = comment
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !body.contains(marker) {
+                continue;
+            }
+            max_id = Some(max_id.map_or(id, |current| current.max(id)));
+        }
+    };
+
+    if let Some(items) = value.as_array() {
+        let is_comment_list = items.first().is_some_and(|entry| entry.get("id").is_some());
+        if is_comment_list {
+            scan_comments(items);
+        } else {
+            for page in items {
+                if let Some(comments) = page.as_array() {
+                    scan_comments(comments);
+                }
+            }
+        }
+    }
+    Ok(max_id)
+}
+
+#[allow(dead_code)]
+pub(super) fn patch_issue_comment_body(
+    owner_repo: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<(), String> {
+    update_issue_comment(owner_repo, comment_id, body)
+}
+
 #[allow(dead_code)]
 pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, String> {
     let output = Command::new("gh")

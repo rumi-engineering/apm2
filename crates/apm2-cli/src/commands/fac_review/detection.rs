@@ -1,7 +1,5 @@
 //! Error detection patterns for FAC review logs (HTTP 400, rate limit,
-//! permission denied, verdict extraction).
-
-use regex::Regex;
+//! permission denied).
 
 use super::state::read_last_lines;
 use super::types::COMMENT_PERMISSION_SCAN_LINES;
@@ -130,31 +128,4 @@ fn command_targets_comment_api(command_lower: &str) -> bool {
         || (command_lower.contains("/issues/") && command_lower.contains("/comments"))
         || command_lower.contains("addcomment")
         || command_lower.contains("create-an-issue-comment")
-}
-
-// ── Verdict extraction ──────────────────────────────────────────────────────
-
-pub fn extract_verdict_from_comment_body(body: &str) -> Option<String> {
-    let metadata_verdict = Regex::new("(?i)\"verdict\"\\s*:\\s*\"(pass|fail)\"")
-        .ok()
-        .and_then(|regex| regex.captures(body))
-        .and_then(|captures| {
-            captures
-                .get(1)
-                .map(|capture| capture.as_str().to_ascii_uppercase())
-        });
-    if metadata_verdict.is_some() {
-        return metadata_verdict;
-    }
-
-    let lower = body.to_ascii_lowercase();
-    if lower.contains("## security review: pass") || lower.contains("## code quality review: pass")
-    {
-        return Some("PASS".to_string());
-    }
-    if lower.contains("## security review: fail") || lower.contains("## code quality review: fail")
-    {
-        return Some("FAIL".to_string());
-    }
-    None
 }

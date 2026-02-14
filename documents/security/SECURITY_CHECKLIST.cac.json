@@ -12,8 +12,6 @@
     ],
     "last_aligned_rfc": "RFC-0020",
     "replaces": "documents/security/SECURITY_CHECKLIST.md",
-    "created_at": "2026-02-05T00:00:00Z",
-    "updated_at": "2026-02-05T00:00:00Z",
     "canonicalizer": {
       "canonicalizer_id": "apm2.canonicalizer.jcs",
       "canonicalizer_version": "1.0.0",

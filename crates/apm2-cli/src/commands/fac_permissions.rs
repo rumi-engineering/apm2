@@ -41,6 +41,8 @@ const FAC_SUBDIRS: &[&str] = &[
     "private/fac/prepared",
     "private/fac/tickets",
     "private/fac/evidence",
+    "fac_lifecycle",
+    "fac_projection",
 ];
 
 /// Errors from FAC root permissions validation.

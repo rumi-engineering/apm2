@@ -7,8 +7,6 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::commands::fac_permissions;
-
 // ── Duration / count constants ──────────────────────────────────────────────
 
 pub const EVENT_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
@@ -34,10 +32,8 @@ pub const DISPATCH_LOCK_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Durati
 
 // ── Path / marker constants ─────────────────────────────────────────────────
 
-pub const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.md";
-pub const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.md";
-pub const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
-pub const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
+pub const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json";
+pub const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.cac.json";
 pub const TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP: &str = "ambiguous_dispatch_ownership";
 pub const TERMINAL_STALE_HEAD_AMBIGUITY: &str = "stale_head_ambiguity";
 pub const TERMINAL_SHA_DRIFT_SUPERSEDED: &str = "sha_drift_superseded";
@@ -46,10 +42,22 @@ pub const TERMINAL_INTEGRITY_FAILURE: &str = "integrity_failure";
 pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED: &str = "verdict_finalized_agent_stopped";
 pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY: &str =
     "manual_termination_after_decision";
+pub const TERMINAL_MANUAL_TERMINATION_DECISION_BOUND: &str = "manual_termination_decision_bound";
 
 pub fn is_verdict_finalized_agent_stop_reason(reason: &str) -> bool {
     reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED)
         || reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY)
+}
+
+pub fn normalize_decision_dimension(dimension: &str) -> Result<&'static str, String> {
+    let normalized = dimension.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "security" => Ok("security"),
+        "quality" | "code-quality" => Ok("code-quality"),
+        _ => Err(format!(
+            "invalid verdict dimension `{dimension}` (expected security|code-quality)"
+        )),
+    }
 }
 
 // ── Enums ───────────────────────────────────────────────────────────────────
@@ -658,13 +666,31 @@ pub fn apm2_home_dir() -> Result<PathBuf, String> {
     Ok(base_dirs.home_dir().join(".apm2"))
 }
 
-/// Ensure the parent directory of `path` exists, creating it with mode 0700
-/// if necessary (TCK-00536: safe permissions at create-time).
+fn is_fac_sensitive_dir(path: &Path) -> bool {
+    let Ok(home) = apm2_home_dir() else {
+        return false;
+    };
+    let fac_root = home.join("private").join("fac");
+    let fac_lifecycle_root = home.join("fac_lifecycle");
+    let fac_projection_root = home.join("fac_projection");
+    path.starts_with(&fac_root)
+        || path.starts_with(&fac_lifecycle_root)
+        || path.starts_with(&fac_projection_root)
+}
+
 pub fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Err(format!("path has no parent: {}", path.display()));
     };
-    fac_permissions::ensure_dir_with_mode(parent)
+    if is_fac_sensitive_dir(parent) {
+        return crate::commands::fac_permissions::ensure_dir_with_mode(parent).map_err(|err| {
+            format!(
+                "failed to create secure parent dir {}: {err}",
+                parent.display()
+            )
+        });
+    }
+    std::fs::create_dir_all(parent)
         .map_err(|err| format!("failed to create parent dir {}: {err}", parent.display()))
 }
 

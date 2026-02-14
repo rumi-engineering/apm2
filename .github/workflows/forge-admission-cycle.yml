@@ -146,45 +146,46 @@ jobs:
           max_wait=4800
           poll_interval=30
 
-          # Load trusted reviewer logins from repo
-          trusted_json="$(gh api "repos/${repo}/contents/.github/review-gate/trusted-reviewers.json" \
-            --jq '.content' | base64 -d)"
-          security_logins="$(echo "$trusted_json" | jq -r '[.reviewers.security[].github_logins[]] | join("|")')"
-          quality_logins="$(echo "$trusted_json" | jq -r '[.reviewers.code_quality[].github_logins[]] | join("|")')"
-
-          # Extract the latest review verdict for a given type from PR comments.
-          # Validates: trusted author, correct head_sha, correct pr_number.
-          # Prints one of: PASS, FAIL, or pending.
-          check_verdict() {
-            local review_type="$1"
-            local trusted_re="$2"
-            local marker="apm2-review-metadata:v1:${review_type}"
-
-            # Get body of the latest comment from a trusted author containing the marker
-            local body
-            body="$(gh api "repos/${repo}/issues/${pr_number}/comments" --paginate --jq "
-              [.[] |
-               select(.user.login | test(\"^(${trusted_re})$\")) |
-               select(.body | test(\"${marker}\"))
-              ] | last | .body // empty")"
-
-            [[ -n "$body" ]] || { echo "pending"; return; }
-
-            # Extract the JSON metadata block following the marker
-            local json_block
-            json_block="$(echo "$body" | \
-              sed -n "/${marker}/,\$p" | \
-              sed -n '/```json/,/```/p' | sed '1d;$d')"
-
-            [[ -n "$json_block" ]] || { echo "pending"; return; }
-
-            # Validate SHA + PR binding, return verdict
-            echo "$json_block" | jq -r \
-              --arg sha "$head_sha" \
-              --argjson pr "$pr_number" \
-              'if .head_sha == $sha and .pr_number == $pr then .verdict
-               else "pending" end'
+          to_projection_status() {
+            local decision="${1:-unknown}"
+            case "$decision" in
+              approve) echo "PASS" ;;
+              deny) echo "FAIL" ;;
+              pending|unknown) echo "pending" ;;
+              *) echo "FAIL" ;;
+            esac
           }
+
+          is_integrity_failure() {
+            local msg="${1,,}"
+            [[ "$msg" == *integrity* ]] || [[ "$msg" == *hmac* ]] || [[ "$msg" == *corrupt* ]] || [[ "$msg" == *fail_closed* ]]
+          }
+
+          parse_dimension_decision() {
+            local payload="$1"
+            local review_type="$2"
+            [[ -n "$payload" ]] || { echo "unknown"; return; }
+            echo "$payload" | jq -r \
+              --arg review_type "$review_type" '
+                if (type == "object") and (.schema? == "apm2.review.verdict.v1") then
+                  ((.dimensions // [])
+                    | map(select(.dimension == $review_type))
+                    | first
+                    | .decision // "unknown")
+                else
+                  "unknown"
+                end' 2>/dev/null || echo "unknown"
+          }
+
+          if command -v apm2 >/dev/null 2>&1; then
+            fac_cmd=(apm2)
+          elif [[ -x "./target/release/apm2" ]]; then
+            fac_cmd=(./target/release/apm2)
+          else
+            echo "fac-gate: apm2 binary not found on PATH; building local release binary"
+            cargo build --quiet -p apm2-cli --release
+            fac_cmd=(./target/release/apm2)
+          fi
 
           deadline=$((SECONDS + max_wait))
           echo "fac-gate: polling pr=${pr_number} sha=${head_sha} deadline=${max_wait}s"
@@ -196,11 +197,49 @@ jobs:
             current_head="$(gh api "repos/${repo}/pulls/${pr_number}" --jq '.head.sha' 2>/dev/null || true)"
             if [[ -n "$current_head" && "$current_head" != "$head_sha" ]]; then
               echo "fac-gate: STALE sha=${head_sha} superseded by ${current_head}"
-              exit 1
+              exit 0
             fi
 
-            sec_v="$(check_verdict "security" "$security_logins")"
-            qual_v="$(check_verdict "code-quality" "$quality_logins")"
+            set +e
+            verdict_payload="$("${fac_cmd[@]}" fac review verdict show \
+              --pr "${pr_number}" \
+              --sha "${head_sha}" \
+              --json 2>/dev/null)"
+            verdict_rc=$?
+            set -e
+            if [[ $verdict_rc -ge 126 ]]; then
+              echo "fac-gate: FAIL reason=fac_cli_unavailable rc=${verdict_rc}"
+              exit 1
+            fi
+            if [[ $verdict_rc -ne 0 ]]; then
+              message="$(echo "$verdict_payload" | jq -r '.message // .error // "unavailable"' 2>/dev/null || echo "unavailable")"
+              if is_integrity_failure "$message"; then
+                echo "fac-gate: FAIL reason=verdict_integrity_failure message=${message}"
+                exit 1
+              fi
+              echo "fac-gate: WARN reason=verdict_read_pending rc=${verdict_rc} message=${message}"
+              verdict_payload='{}'
+            fi
+            if ! echo "$verdict_payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              echo "fac-gate: FAIL reason=verdict_payload_malformed"
+              exit 1
+            fi
+            if echo "$verdict_payload" | jq -e '.error? != null' >/dev/null 2>&1; then
+              message="$(echo "$verdict_payload" | jq -r '.message // .error' 2>/dev/null || echo "projection_error")"
+              if is_integrity_failure "$message"; then
+                echo "fac-gate: FAIL reason=verdict_integrity_failure message=${message}"
+                exit 1
+              fi
+              echo "fac-gate: WARN reason=verdict_payload_error message=${message}"
+            fi
+            if echo "$verdict_payload" | jq -e '.fail_closed? == true' >/dev/null 2>&1; then
+              echo "fac-gate: FAIL reason=verdict_integrity_failure (fail_closed=true)"
+              exit 1
+            fi
+            sec_decision="$(parse_dimension_decision "$verdict_payload" "security")"
+            qual_decision="$(parse_dimension_decision "$verdict_payload" "code-quality")"
+            sec_v="$(to_projection_status "$sec_decision")"
+            qual_v="$(to_projection_status "$qual_decision")"
 
             ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "ts=${ts} sha=${head_sha} security=${sec_v} quality=${qual_v}"

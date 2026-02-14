@@ -4,13 +4,13 @@
 
 use serde::Serialize;
 
-use super::barrier::fetch_pr_head_sha_local;
-use super::dispatch::dispatch_single_review;
+use super::dispatch::resolve_worktree_for_sha;
 use super::evidence::run_evidence_gates_with_status;
+use super::projection::fetch_pr_head_sha_authoritative;
 use super::projection_store;
 use super::state::load_review_run_completion_receipt;
 use super::target::resolve_pr_target;
-use super::types::{DispatchReviewResult, ReviewKind, validate_expected_head_sha};
+use super::types::{DispatchReviewResult, validate_expected_head_sha};
 use crate::exit_codes::codes as exit_codes;
 
 // ── Strategy ────────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ fn resolve_pr_context(repo: &str, pr: Option<u32>) -> Result<PrContext, String> 
 }
 
 fn resolve_head_sha_for_restart(owner_repo: &str, pr_number: u32) -> Result<String, String> {
-    let head_sha = fetch_pr_head_sha_local(pr_number)?;
+    let head_sha = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
         if !identity.head_sha.eq_ignore_ascii_case(&head_sha) {
@@ -129,8 +129,7 @@ fn execute_strategy(
         RestartStrategy::Noop => Ok((None, None)),
 
         RestartStrategy::EvidenceRestart | RestartStrategy::FullRestart => {
-            let workspace_root =
-                std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
+            let workspace_root = resolve_worktree_for_sha(&ctx.head_sha)?;
 
             let passed = run_evidence_gates_with_status(
                 &workspace_root,
@@ -155,17 +154,7 @@ fn dispatch_reviews(
     pr_number: u32,
     head_sha: &str,
 ) -> Result<Vec<DispatchReviewResult>, String> {
-    let dispatch_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut results = Vec::with_capacity(2);
-    for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        let result = dispatch_single_review(owner_repo, pr_number, kind, head_sha, dispatch_epoch)?;
-        results.push(result);
-    }
-    Ok(results)
+    super::dispatch_reviews_with_lifecycle(owner_repo, pr_number, head_sha, false)
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────

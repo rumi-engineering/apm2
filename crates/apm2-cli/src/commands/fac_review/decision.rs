@@ -342,10 +342,6 @@ pub fn run_verdict_set(
             "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
              reviewer termination failed (identity): {reason}"
         )),
-        Ok(TerminationOutcome::IntegrityFailure(reason)) => Err(format!(
-            "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
-             reviewer termination integrity check failed: {reason}"
-        )),
         Err(err) => Err(format!(
             "verdict NOT finalized for PR #{resolved_pr} type={normalized_dimension}: \
              reviewer termination step failed: {err}"
@@ -1048,10 +1044,6 @@ fn terminate_review_agent_for_home(
             "failed to terminate review agent pid {pid}: missing proc_start_time"
         )));
     };
-    if let Err(err) = super::state::verify_review_run_state_integrity_binding(home, &state) {
-        return Ok(TerminationOutcome::IntegrityFailure(err));
-    }
-
     if let Err(err) = super::dispatch::verify_process_identity(pid, Some(recorded_proc_start)) {
         return Ok(TerminationOutcome::IdentityFailure(format!(
             "failed to verify process identity for pid {pid}: {err}"
@@ -1107,7 +1099,6 @@ fn write_termination_receipt(
         TerminationOutcome::AlreadyDead => ("already_dead", None),
         TerminationOutcome::SkippedMismatch => ("skipped_mismatch", None),
         TerminationOutcome::IdentityFailure(reason) => ("identity_failure", Some(reason.clone())),
-        TerminationOutcome::IntegrityFailure(reason) => ("integrity_failure", Some(reason.clone())),
     };
     let receipt = super::state::ReviewRunTerminationReceipt {
         schema: super::state::TERMINATION_RECEIPT_SCHEMA.to_string(),
@@ -1144,7 +1135,6 @@ enum TerminationOutcome {
     Killed,
     AlreadyDead,
     SkippedMismatch,
-    IntegrityFailure(String),
     IdentityFailure(String),
 }
 

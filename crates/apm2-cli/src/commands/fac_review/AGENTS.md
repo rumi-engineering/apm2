@@ -17,18 +17,16 @@ apm2 fac review run --pr <N> --type all
        |      +-- backend.rs      (model backend selection: Codex / Gemini / ClaudeCode)
        |      +-- model_pool.rs   (fallback model pool with priority)
        |      +-- liveness.rs     (stall detection via pulse files)
-       |      +-- selector.rs     (review model selection logic)
        |      +-- restart.rs      (CI-state-aware pipeline restart)
        |      +-- merge_conflicts.rs (merge conflict detection)
-       |      +-- worktree.rs     (SHA-to-worktree resolution for detached dispatch)
-       |      +-- timeout_policy.rs (uniform bounded test timeout policy)
+        |      +-- timeout_policy.rs (uniform bounded test timeout policy)
        |
        +-- state.rs          (ReviewStateFile persistence, pulse files, locking)
        +-- types.rs          (shared types, constants, utility functions)
        +-- events.rs         (NDJSON lifecycle telemetry)
        +-- barrier.rs        (GitHub helper primitives: auth/head/metadata rendering)
        +-- ci_status.rs      (CI check-suite status querying)
-       +-- decision.rs       (review verdict set/show)
+       +-- decision.rs       (legacy verdict set/show compatibility helpers)
        +-- detection.rs      (review detection from PR comments)
        +-- evidence.rs       (evidence artifact collection)
        +-- findings.rs       (review findings aggregation)
@@ -38,12 +36,9 @@ apm2 fac review run --pr <N> --type all
        +-- logs.rs           (review log retrieval by PR/selector)
        +-- pipeline.rs       (end-to-end pipeline: dispatch + project)
        +-- prepare.rs        (review input preparation)
-       +-- projection.rs     (projection snapshot for GitHub surfaces)
+       +-- projection.rs     (projection snapshot for GitHub surfaces + PR body gate-status sync)
        +-- projection_store.rs (local canonical projection cache under ~/.apm2/fac_projection)
        +-- github_projection.rs (dedicated GitHub projection writer/read-fallback boundary)
-       +-- publish.rs        (review comment publishing to GitHub)
-       +-- comment.rs        (single SHA-bound finding comment publishing)
-       +-- pr_body.rs        (PR body gate-status marker sync + history retention)
        +-- push.rs           (branch push with commit signing)
        +-- target.rs         (review target resolution)
 ```
@@ -90,7 +85,7 @@ pub enum ReviewKind {
 Internal enum with associated methods for prompt paths, markers, and display strings.
 
 **Contracts:**
-- `prompt_path()` returns `documents/reviews/SECURITY_REVIEW_PROMPT.md` or `documents/reviews/CODE_QUALITY_PROMPT.md`.
+- `prompt_path()` returns `documents/reviews/SECURITY_REVIEW_PROMPT.cac.json` or `documents/reviews/CODE_QUALITY_PROMPT.cac.json`.
 - `marker()` returns the HTML comment marker used to identify review comments on GitHub.
 
 ### `ReviewBackend`
@@ -230,8 +225,7 @@ pub struct ProjectionStatus { pub security: String, pub quality: String, pub ter
 ### Re-exports
 
 ```rust
-pub use decision::VerdictValueArg;
-pub use publish::ReviewPublishTypeArg;
+pub use lifecycle::VerdictValueArg;
 pub use types::ReviewRunType;
 ```
 
@@ -254,9 +248,8 @@ pub use types::ReviewRunType;
 | `run_dispatch(repo, pr, type, sha, force, json)` | Dispatch reviews as detached processes |
 | `run_status(pr_number, type_filter, json)` | Show review run status (optionally one reviewer lane) |
 | `run_findings(repo, pr, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
-| `run_comment(repo, pr, sha, severity, type, body, json)` | Publish a single SHA-bound finding comment |
+| `run_comment(repo, pr, sha, severity, type, body, json)` | Compatibility shim to append a structured finding |
 | `run_prepare(repo, pr, sha, json)` | Prepare review inputs |
-| `run_publish(repo, pr, sha, type, body, json)` | Publish review comment to GitHub |
 | `run_verdict_set(repo, pr, sha, dim, verdict, reason, keep, json)` | Set review verdict |
 | `run_verdict_show(repo, pr, sha, json)` | Show review verdicts |
 | `run_project(pr, sha, since, after_seq, errors, fail_term, format_json, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
@@ -281,8 +274,8 @@ pub use types::ReviewRunType;
 - `~/.apm2/reviews/<pr>/<type>/state.json`: Per-run deterministic state
 - `~/.apm2/review_pulses/`: Pulse files for liveness detection
 - `~/.apm2/review_locks/`: File-based dispatch locks
-- `documents/reviews/SECURITY_REVIEW_PROMPT.md`: Security review prompt
-- `documents/reviews/CODE_QUALITY_PROMPT.md`: Code quality review prompt
+- `documents/reviews/SECURITY_REVIEW_PROMPT.cac.json`: Security review prompt
+- `documents/reviews/CODE_QUALITY_PROMPT.cac.json`: Code quality review prompt
 
 ## Ticket Notes
 

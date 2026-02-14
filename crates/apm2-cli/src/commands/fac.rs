@@ -25,12 +25,12 @@
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
 //!   structured FAC-native format
-//! - `apm2 fac review comment` - Publish one SHA-bound finding comment
 //! - `apm2 fac review verdict` - Show/set SHA-bound approve/deny verdicts per
 //!   review dimension
 //! - `apm2 fac services status` - Inspect daemon/worker managed service health
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
 //!   optimal point
+//! - `apm2 fac recover --pr <N>` - Repair/reconcile local FAC lifecycle state
 //! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
@@ -195,6 +195,12 @@ pub enum FacSubcommand {
     /// to re-run evidence gates, dispatch reviews, or no-op.
     Restart(RestartArgs),
 
+    /// Repair or reconcile local FAC lifecycle state.
+    ///
+    /// Reaps stale agent registry entries and can refresh local PR identity
+    /// from authoritative remote state.
+    Recover(RecoverArgs),
+
     /// Show local pipeline, evidence, and review log paths.
     ///
     /// Lists all FAC log files under `~/.apm2/` with sizes.
@@ -271,6 +277,10 @@ pub struct WorkArgs {
 /// Arguments for `apm2 fac doctor`.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    /// Target pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
     /// Output in JSON format.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -509,6 +519,26 @@ pub struct RestartArgs {
     pub force: bool,
 }
 
+/// Arguments for `apm2 fac recover`.
+#[derive(Debug, Args)]
+pub struct RecoverArgs {
+    /// Pull request number (auto-detected from local branch if omitted).
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Force lifecycle recovery from the current local SHA.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
+    /// Refresh local projection identity from current authoritative PR head.
+    #[arg(long, default_value_t = false)]
+    pub refresh_identity: bool,
+
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 /// Arguments for `apm2 fac logs`.
 #[derive(Debug, Args)]
 pub struct LogsArgs {
@@ -520,7 +550,11 @@ pub struct LogsArgs {
     #[arg(long)]
     pub selector_type: Option<String>,
 
-    /// Selector token to resolve (typed by `--selector-type`).
+    /// Selector token to resolve.
+    ///
+    /// `finding` selectors:
+    /// `finding:v2:<owner/repo>:<pr>:<sha>:<dimension>:<finding_id>`
+    /// `tool_output` selectors: `tool_output:v1:<sha>:<gate>`
     #[arg(long)]
     pub selector: Option<String>,
 
@@ -559,14 +593,16 @@ pub enum ReviewSubcommand {
     Wait(ReviewWaitArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
-    /// Materialize local review inputs (diff + commit history) under /tmp.
+    /// Materialize local review inputs (diff + commit history) under FAC
+    /// private storage.
     Prepare(ReviewPrepareArgs),
-    /// Publish review findings and auto-generate machine-readable metadata.
-    Publish(ReviewPublishArgs),
-    /// Retrieve structured review findings for a PR head SHA.
-    Findings(ReviewFindingsArgs),
-    /// Publish one SHA-bound finding comment with machine-readable metadata.
+    /// Append one structured SHA-bound finding to local FAC findings.
+    Finding(ReviewFindingArgs),
+    /// Compatibility shim for deprecated `review comment` (maps to finding).
+    #[command(hide = true)]
     Comment(ReviewCommentArgs),
+    /// Retrieve structured SHA-bound review findings for a PR head SHA.
+    Findings(ReviewFindingsArgs),
     /// Show or set explicit verdict state per review dimension.
     Verdict(ReviewVerdictArgs),
     /// Render one condensed projection line for GitHub log surfaces.
@@ -712,8 +748,8 @@ pub struct ReviewFindingsArgs {
     #[arg(long)]
     pub sha: Option<String>,
 
-    /// Ignore local cached comments and re-fetch from GitHub projection.
-    #[arg(long, default_value_t = false)]
+    /// Deprecated compatibility flag; ignored because findings are local-only.
+    #[arg(long, default_value_t = false, hide = true)]
     pub refresh: bool,
 
     /// Emit JSON output for this command.
@@ -737,50 +773,78 @@ pub struct ReviewPrepareArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review publish`.
+/// Arguments for `apm2 fac review finding`.
 #[derive(Debug, Args)]
-pub struct ReviewPublishArgs {
+pub struct ReviewFindingArgs {
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
 
-    /// Optional head SHA override (defaults to PR head SHA).
+    /// Optional head SHA override (defaults to local PR identity SHA).
     #[arg(long)]
     pub sha: Option<String>,
 
-    /// Review dimension to publish (`security` or `code-quality`).
+    /// Review dimension (`security` or `code-quality`).
     #[arg(long = "type", value_enum)]
-    pub review_type: fac_review::ReviewPublishTypeArg,
+    pub review_type: fac_review::ReviewFindingTypeArg,
 
-    /// Path to markdown findings body.
+    /// Finding severity (`blocker`, `major`, `minor`, `nit`).
+    #[arg(long, value_enum)]
+    pub severity: fac_review::ReviewFindingSeverityArg,
+
+    /// Short finding summary.
     #[arg(long)]
-    pub body_file: PathBuf,
+    pub summary: String,
+
+    /// Optional detailed remediation body (alias: --body).
+    #[arg(long = "details", alias = "body")]
+    pub details: Option<String>,
+
+    /// Optional risk statement.
+    #[arg(long)]
+    pub risk: Option<String>,
+
+    /// Optional impact statement.
+    #[arg(long)]
+    pub impact: Option<String>,
+
+    /// Optional location hint (`path:line` or symbol name).
+    #[arg(long)]
+    pub location: Option<String>,
+
+    /// Optional reviewer identity tag.
+    #[arg(long)]
+    pub reviewer_id: Option<String>,
+
+    /// Optional evidence pointer (selector or local path hint).
+    #[arg(long)]
+    pub evidence_pointer: Option<String>,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review comment`.
+/// Arguments for deprecated `apm2 fac review comment` compatibility shim.
 #[derive(Debug, Args)]
 pub struct ReviewCommentArgs {
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
 
-    /// Optional head SHA override (defaults to `git rev-parse HEAD`).
+    /// Optional head SHA override (defaults to local PR identity SHA).
     #[arg(long)]
     pub sha: Option<String>,
 
-    /// Finding severity (`blocker`, `major`, `minor`, or `nit`).
-    #[arg(long, value_enum)]
-    pub severity: fac_review::ReviewCommentSeverityArg,
-
-    /// Finding type (`security` or `code-quality`).
+    /// Review dimension (`security` or `code-quality`).
     #[arg(long = "type", value_enum)]
     pub review_type: fac_review::ReviewCommentTypeArg,
 
-    /// Finding body text. If omitted, body is read from stdin.
+    /// Finding severity (`blocker`, `major`, `minor`, `nit`).
+    #[arg(long, value_enum)]
+    pub severity: fac_review::ReviewCommentSeverityArg,
+
+    /// Finding body text (when omitted, read from stdin).
     #[arg(long)]
     pub body: Option<String>,
 
@@ -844,7 +908,8 @@ pub struct ReviewVerdictSetArgs {
     #[arg(long)]
     pub reason: Option<String>,
 
-    /// Keep prepared review input files under /tmp after verdict is written.
+    /// Keep prepared review input files under FAC private storage after verdict
+    /// is written.
     #[arg(long, default_value_t = false)]
     pub keep_prepared_inputs: bool,
 
@@ -1363,14 +1428,15 @@ pub fn run_fac(
     config_path: &Path,
 ) -> u8 {
     let json_output = cmd.json;
+    let machine_output = json_output || subcommand_requests_machine_output(&cmd.subcommand);
 
-    // TCK-00536: Validate FAC root permissions on every FAC command entry.
-    // Refuse to proceed if `$APM2_HOME` or `$APM2_HOME/private/fac` have
-    // unsafe permissions (group/world-writable or wrong ownership).
     if let Err(err) = crate::commands::fac_permissions::validate_fac_root_permissions() {
-        eprintln!("ERROR: FAC root permissions check failed (fail-closed).");
-        eprintln!("{err}");
-        return exit_codes::GENERIC_ERROR;
+        return output_error(
+            machine_output,
+            "fac_root_permissions_failed",
+            &format!("FAC root permissions check failed (fail-closed): {err}"),
+            exit_codes::GENERIC_ERROR,
+        );
     }
 
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
@@ -1383,11 +1449,14 @@ pub fn run_fac(
             | FacSubcommand::Lane(_)
             | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
+            | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
-            eprintln!("WARNING: Could not auto-start daemon: {e}");
+            if !machine_output {
+                eprintln!("WARNING: Could not auto-start daemon: {e}");
+            }
         }
     }
 
@@ -1410,13 +1479,21 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Doctor(args) => {
-            match crate::commands::daemon::doctor(
-                operator_socket,
-                config_path,
-                json_output || args.json,
-            ) {
-                Ok(()) => exit_codes::SUCCESS,
-                Err(_) => exit_codes::GENERIC_ERROR,
+            if let Some(pr) = args.pr {
+                let repo = match derive_fac_repo_or_exit(json_output || args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_doctor(&repo, pr, json_output || args.json)
+            } else {
+                match crate::commands::daemon::doctor(
+                    operator_socket,
+                    config_path,
+                    json_output || args.json,
+                ) {
+                    Ok(()) => exit_codes::SUCCESS,
+                    Err(_) => exit_codes::GENERIC_ERROR,
+                }
             }
         },
         FacSubcommand::Services(args) => match &args.subcommand {
@@ -1486,6 +1563,20 @@ pub fn run_fac(
                 Err(code) => return code,
             };
             fac_review::run_restart(&repo, args.pr, args.force, json_output)
+        },
+        FacSubcommand::Recover(args) => {
+            let output_json = json_output || args.json;
+            let repo = match derive_fac_repo_or_exit(output_json) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_recover(
+                &repo,
+                args.pr,
+                args.force,
+                args.refresh_identity,
+                output_json,
+            )
         },
         FacSubcommand::Logs(args) => {
             let repo = match derive_fac_repo_or_exit(json_output || args.json) {
@@ -1561,18 +1652,40 @@ pub fn run_fac(
                     json_output || prepare_args.json,
                 )
             },
-            ReviewSubcommand::Publish(publish_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || publish_args.json) {
+            ReviewSubcommand::Finding(finding_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || finding_args.json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
-                fac_review::run_publish(
+                fac_review::run_finding(
                     &repo,
-                    publish_args.pr,
-                    publish_args.sha.as_deref(),
-                    publish_args.review_type,
-                    &publish_args.body_file,
-                    json_output || publish_args.json,
+                    finding_args.pr,
+                    finding_args.sha.as_deref(),
+                    finding_args.review_type,
+                    finding_args.severity,
+                    &finding_args.summary,
+                    finding_args.details.as_deref(),
+                    finding_args.risk.as_deref(),
+                    finding_args.impact.as_deref(),
+                    finding_args.location.as_deref(),
+                    finding_args.reviewer_id.as_deref(),
+                    finding_args.evidence_pointer.as_deref(),
+                    json_output || finding_args.json,
+                )
+            },
+            ReviewSubcommand::Comment(comment_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || comment_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_comment_compat(
+                    &repo,
+                    comment_args.pr,
+                    comment_args.sha.as_deref(),
+                    comment_args.review_type,
+                    comment_args.severity,
+                    comment_args.body.as_deref(),
+                    json_output || comment_args.json,
                 )
             },
             ReviewSubcommand::Findings(findings_args) => {
@@ -1586,21 +1699,6 @@ pub fn run_fac(
                     findings_args.sha.as_deref(),
                     findings_args.refresh,
                     json_output || findings_args.json,
-                )
-            },
-            ReviewSubcommand::Comment(comment_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || comment_args.json) {
-                    Ok(value) => value,
-                    Err(code) => return code,
-                };
-                fac_review::run_comment(
-                    &repo,
-                    comment_args.pr,
-                    comment_args.sha.as_deref(),
-                    comment_args.severity,
-                    comment_args.review_type,
-                    comment_args.body.as_deref(),
-                    json_output || comment_args.json,
                 )
             },
             ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
@@ -1668,6 +1766,48 @@ pub fn run_fac(
         ),
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
+    }
+}
+
+const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool {
+    match subcommand {
+        FacSubcommand::Doctor(args) => args.json,
+        FacSubcommand::Recover(args) => args.json,
+        FacSubcommand::Logs(args) => args.json,
+        FacSubcommand::Review(args) => match &args.subcommand {
+            ReviewSubcommand::Wait(wait_args) => matches!(wait_args.format, ReviewFormatArg::Json),
+            ReviewSubcommand::Status(status_args) => status_args.json,
+            ReviewSubcommand::Prepare(prepare_args) => prepare_args.json,
+            ReviewSubcommand::Finding(finding_args) => finding_args.json,
+            ReviewSubcommand::Comment(comment_args) => comment_args.json,
+            ReviewSubcommand::Findings(findings_args) => findings_args.json,
+            ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
+                ReviewVerdictSubcommand::Show(show_args) => show_args.json,
+                ReviewVerdictSubcommand::Set(set_args) => set_args.json,
+            },
+            ReviewSubcommand::Project(project_args) => {
+                matches!(project_args.format, ReviewFormatArg::Json)
+            },
+            ReviewSubcommand::Terminate(term_args) => term_args.json,
+            ReviewSubcommand::Run(_)
+            | ReviewSubcommand::Dispatch(_)
+            | ReviewSubcommand::Tail(_) => false,
+        },
+        FacSubcommand::Gates(_)
+        | FacSubcommand::Work(_)
+        | FacSubcommand::Services(_)
+        | FacSubcommand::Gc(_)
+        | FacSubcommand::RoleLaunch(_)
+        | FacSubcommand::Episode(_)
+        | FacSubcommand::Receipt(_)
+        | FacSubcommand::Context(_)
+        | FacSubcommand::Resume(_)
+        | FacSubcommand::Lane(_)
+        | FacSubcommand::Push(_)
+        | FacSubcommand::Restart(_)
+        | FacSubcommand::Worker(_)
+        | FacSubcommand::Pipeline(_)
+        | FacSubcommand::Pr(_) => false,
     }
 }
 
@@ -2138,7 +2278,8 @@ fn extract_episode_info(event: &EventRecord, episode_id: &str) -> Option<Episode
             tool_log_index_hash: payload
                 .get("tool_log_index_hash")
                 .and_then(|v| v.as_str())
-                .and_then(|s| hex::decode(s).ok()),
+                .and_then(|s| parse_cas_hash_32("tool_log_index_hash", s).ok())
+                .map(|value| value.to_vec()),
         });
     }
 
@@ -2161,15 +2302,19 @@ fn extract_episode_info(event: &EventRecord, episode_id: &str) -> Option<Episode
         tool_log_index_hash: payload
             .get("tool_log_index_hash")
             .and_then(|v| v.as_str())
-            .and_then(|s| hex::decode(s).ok()),
+            .and_then(|s| parse_cas_hash_32("tool_log_index_hash", s).ok())
+            .map(|value| value.to_vec()),
     })
 }
 
 /// Loads a tool log index from CAS by hash.
 fn load_tool_log_index_from_cas(cas_path: &Path, hash: &[u8]) -> Option<ToolLogIndexV1> {
-    let Ok(file_path) = resolve_cas_file_path(cas_path, hash, "tool_log_index_hash") else {
+    if hash.len() != 32 {
         return None;
-    };
+    }
+    let hex_hash = hex::encode(hash);
+    let (prefix, suffix) = hex_hash.split_at(4);
+    let file_path = cas_path.join("objects").join(prefix).join(suffix);
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = std::fs::metadata(&file_path).ok()?;
@@ -2196,91 +2341,6 @@ fn load_tool_log_index_from_cas(cas_path: &Path, hash: &[u8]) -> Option<ToolLogI
     Some(index)
 }
 
-#[derive(Debug)]
-enum CasHashParseError {
-    Empty {
-        field: &'static str,
-    },
-    InvalidHex {
-        field: &'static str,
-        error: hex::FromHexError,
-    },
-    InvalidLength {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
-    },
-}
-
-impl std::fmt::Display for CasHashParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty { field } => write!(f, "{field} is empty"),
-            Self::InvalidHex { field, error } => write!(f, "{field} is not valid hex: {error}"),
-            Self::InvalidLength {
-                field,
-                expected,
-                actual,
-            } => {
-                write!(f, "{field} must be {expected} bytes, got {actual} bytes")
-            },
-        }
-    }
-}
-
-fn parse_cas_hash_32(field: &'static str, value: &str) -> Result<[u8; 32], CasHashParseError> {
-    if value.is_empty() {
-        return Err(CasHashParseError::Empty { field });
-    }
-    let bytes =
-        hex::decode(value).map_err(|error| CasHashParseError::InvalidHex { field, error })?;
-    if bytes.len() != 32 {
-        return Err(CasHashParseError::InvalidLength {
-            field,
-            expected: 32,
-            actual: bytes.len(),
-        });
-    }
-    let mut parsed = [0u8; 32];
-    parsed.copy_from_slice(&bytes);
-    Ok(parsed)
-}
-
-fn output_hash_validation_error(json_output: bool, field: &str, error: &CasHashParseError) -> u8 {
-    output_error(
-        json_output,
-        "invalid_hash",
-        &format!("invalid {field}: {error}"),
-        exit_codes::VALIDATION_ERROR,
-    )
-}
-
-fn resolve_cas_file_path(
-    cas_path: &Path,
-    hash: &[u8],
-    field: &'static str,
-) -> Result<PathBuf, CasHashParseError> {
-    if hash.len() != 32 {
-        return Err(CasHashParseError::InvalidLength {
-            field,
-            expected: 32,
-            actual: hash.len(),
-        });
-    }
-    let hex_hash = hex::encode(hash);
-    let (prefix, suffix) = hex_hash.split_at(4);
-    Ok(cas_path.join("objects").join(prefix).join(suffix))
-}
-
-fn parse_cas_hash_to_path(
-    cas_path: &Path,
-    value: &str,
-    field: &'static str,
-) -> Result<(PathBuf, [u8; 32]), CasHashParseError> {
-    let hash = parse_cas_hash_32(field, value)?;
-    Ok((resolve_cas_file_path(cas_path, &hash, field)?, hash))
-}
-
 // =============================================================================
 // Receipt Show Command
 // =============================================================================
@@ -2297,13 +2357,30 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
         );
     }
 
+    // Parse and normalize hash.
     let (file_path, hash_bytes) =
         match parse_cas_hash_to_path(cas_path, &args.receipt_hash, "receipt_hash") {
             Ok(value) => value,
-            Err(error) => {
-                return output_hash_validation_error(json_output, "receipt hash", &error);
+            Err(CasHashParseError::InvalidHex { message, .. }) => {
+                return output_error(
+                    json_output,
+                    "invalid_hash",
+                    &format!("Invalid hex encoding: {message}"),
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+            Err(CasHashParseError::InvalidLength {
+                expected, actual, ..
+            }) => {
+                return output_error(
+                    json_output,
+                    "invalid_hash",
+                    &format!("Receipt hash must be {expected} bytes, got {actual}"),
+                    exit_codes::VALIDATION_ERROR,
+                );
             },
         };
+    let normalized_hash = hex::encode(hash_bytes);
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = match std::fs::metadata(&file_path) {
@@ -2386,7 +2463,7 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
         );
 
     let response = ReceiptShowResponse {
-        hash: args.receipt_hash.clone(),
+        hash: normalized_hash,
         receipt_type,
         size_bytes: content.len() as u64,
         content: parsed_content,
@@ -2476,6 +2553,19 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
     "unknown".to_string()
 }
 
+fn default_context_rebuild_output_dir(episode_id: &str) -> PathBuf {
+    let apm2_home = std::env::var_os("APM2_HOME")
+        .map(PathBuf::from)
+        .filter(|value| !value.as_os_str().is_empty())
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".apm2")))
+        .unwrap_or_else(|| PathBuf::from(".apm2-fallback"));
+    apm2_home
+        .join("private")
+        .join("fac")
+        .join("context_rebuild")
+        .join(episode_id)
+}
+
 // =============================================================================
 // Context Rebuild Command
 // =============================================================================
@@ -2506,28 +2596,12 @@ fn run_context_rebuild(
     }
 
     // Determine output directory
-    let output_dir = if let Some(output_dir) = &args.output_dir {
-        output_dir.clone()
-    } else {
-        let apm2_home = match crate::commands::fac_review::apm2_home_dir() {
-            Ok(apm2_home) => apm2_home,
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "home_dir_error",
-                    &format!("failed to resolve APM2 home directory: {e}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        };
-        apm2_home
-            .join("private")
-            .join("fac")
-            .join("context_rebuild")
-            .join(&args.episode_id)
-    };
+    let output_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| default_context_rebuild_output_dir(&args.episode_id));
 
-    // Create output directory
+    // Create output directory with secure permissions.
     if let Err(e) = crate::commands::fac_permissions::ensure_dir_with_mode(&output_dir) {
         return output_error(
             json_output,
@@ -2564,7 +2638,7 @@ fn run_context_rebuild(
     };
 
     // Find episode spawn event to get context pack hash
-    let mut context_pack_hash: Option<[u8; 32]> = None;
+    let mut context_pack_hash: Option<Vec<u8>> = None;
     let mut artifacts_retrieved = 0u64;
     let batch_size = 1000u64;
     let mut scanned_count = 0u64;
@@ -2601,27 +2675,11 @@ fn run_context_rebuild(
                         if let Ok(payload) =
                             serde_json::from_slice::<serde_json::Value>(&event.payload)
                         {
-                            if let Some(hash_str) =
-                                payload.get("context_pack_hash").and_then(|v| v.as_str())
-                            {
-                                let parsed_hash = match parse_cas_hash_32(
-                                    "context_pack_hash",
-                                    hash_str,
-                                ) {
-                                    Ok(hash) => hash,
-                                    Err(error) => {
-                                        return output_error(
-                                            json_output,
-                                            "invalid_hash",
-                                            &format!(
-                                                "Invalid context pack hash in episode event: {error}"
-                                            ),
-                                            exit_codes::VALIDATION_ERROR,
-                                        );
-                                    },
-                                };
-                                context_pack_hash = Some(parsed_hash);
-                            }
+                            context_pack_hash = payload
+                                .get("context_pack_hash")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| parse_cas_hash_32("context_pack_hash", s).ok())
+                                .map(|value| value.to_vec());
                         }
                         break;
                     }
@@ -2649,18 +2707,9 @@ fn run_context_rebuild(
     };
 
     // Load context pack from CAS
-    let hex_hash = hex::encode(context_pack_hash);
-    let (pack_path, _) = match parse_cas_hash_to_path(cas_path, &hex_hash, "context pack hash") {
-        Ok(value) => value,
-        Err(error) => {
-            return output_error(
-                json_output,
-                "invalid_hash",
-                &format!("Invalid context pack hash in ledger: {error}"),
-                exit_codes::VALIDATION_ERROR,
-            );
-        },
-    };
+    let hex_hash = hex::encode(&context_pack_hash);
+    let (prefix, suffix) = hex_hash.split_at(4);
+    let pack_path = cas_path.join("objects").join(prefix).join(suffix);
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = match std::fs::metadata(&pack_path) {
@@ -2722,19 +2771,10 @@ fn run_context_rebuild(
         if let Some(artifacts) = pack_json.get("artifacts").and_then(|v| v.as_array()) {
             for artifact in artifacts {
                 if let Some(hash_str) = artifact.get("hash").and_then(|v| v.as_str()) {
-                    let artifact_hash = match parse_cas_hash_32("artifact hash", hash_str) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return output_error(
-                                json_output,
-                                "invalid_hash",
-                                &format!("Invalid artifact hash in context pack: {error}"),
-                                exit_codes::VALIDATION_ERROR,
-                            );
-                        },
-                    };
-                    if retrieve_artifact_to_dir(cas_path, &artifact_hash, &output_dir).is_ok() {
-                        artifacts_retrieved += 1;
+                    if let Ok(artifact_hash) = parse_cas_hash_32("artifact_hash", hash_str) {
+                        if retrieve_artifact_to_dir(cas_path, &artifact_hash, &output_dir).is_ok() {
+                            artifacts_retrieved += 1;
+                        }
                     }
                 }
             }
@@ -2781,6 +2821,12 @@ fn retrieve_artifact_to_dir(
     hash: &[u8],
     output_dir: &Path,
 ) -> Result<(), std::io::Error> {
+    if hash.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("artifact hash must be 32 bytes, got {}", hash.len()),
+        ));
+    }
     let hex_hash = hex::encode(hash);
     let (prefix, suffix) = hex_hash.split_at(4);
     let src_path = cas_path.join("objects").join(prefix).join(suffix);
@@ -3520,6 +3566,50 @@ fn constant_time_hash_eq(computed: &[u8], expected: &[u8]) -> bool {
     bool::from(computed.ct_eq(expected))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CasHashParseError {
+    InvalidHex {
+        field: &'static str,
+        message: String,
+    },
+    InvalidLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+fn parse_cas_hash_32(field: &'static str, hash_hex: &str) -> Result<[u8; 32], CasHashParseError> {
+    let decoded = hex::decode(hash_hex.trim()).map_err(|err| CasHashParseError::InvalidHex {
+        field,
+        message: err.to_string(),
+    })?;
+    if decoded.len() != 32 {
+        return Err(CasHashParseError::InvalidLength {
+            field,
+            expected: 32,
+            actual: decoded.len(),
+        });
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn parse_cas_hash_to_path(
+    cas_path: &Path,
+    hash_hex: &str,
+    field: &'static str,
+) -> Result<(PathBuf, [u8; 32]), CasHashParseError> {
+    let hash_bytes = parse_cas_hash_32(field, hash_hex)?;
+    let normalized_hex = hex::encode(hash_bytes);
+    let (prefix, suffix) = normalized_hex.split_at(4);
+    Ok((
+        cas_path.join("objects").join(prefix).join(suffix),
+        hash_bytes,
+    ))
+}
+
 fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
     fac_review::derive_repo().map_err(|err| {
         output_error(
@@ -4013,29 +4103,76 @@ mod tests {
     }
 
     #[test]
+    fn test_subcommand_machine_output_detection_for_nested_json() {
+        let review_status = FacSubcommand::Review(ReviewArgs {
+            subcommand: ReviewSubcommand::Status(ReviewStatusArgs {
+                pr: Some(615),
+                review_type: None,
+                json: true,
+            }),
+        });
+        assert!(subcommand_requests_machine_output(&review_status));
+
+        let recover = FacSubcommand::Recover(RecoverArgs {
+            pr: Some(615),
+            force: false,
+            refresh_identity: false,
+            json: true,
+        });
+        assert!(subcommand_requests_machine_output(&recover));
+
+        let restart = FacSubcommand::Restart(RestartArgs {
+            pr: Some(615),
+            force: false,
+        });
+        assert!(!subcommand_requests_machine_output(&restart));
+
+        let worker = FacSubcommand::Worker(WorkerArgs {
+            once: true,
+            poll_interval_secs: 1,
+            max_jobs: 1,
+            print_unit: false,
+        });
+        assert!(!subcommand_requests_machine_output(&worker));
+    }
+
+    #[test]
     fn test_review_prompt_command_sequence_parses_with_verdict_surface() {
         assert_fac_command_parses(&["fac", "review", "prepare", "--json"]);
+        assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
         assert_fac_command_parses(&[
             "fac",
             "review",
-            "publish",
+            "finding",
             "--type",
             "security",
-            "--body-file",
-            "/tmp/security_findings.md",
+            "--severity",
+            "major",
+            "--summary",
+            "Unsafe deserialization path",
+            "--body",
+            "Untrusted bytes reach bincode::deserialize without schema guard.",
+            "--risk",
+            "RCE",
+            "--impact",
+            "Compromise of CI runner",
+            "--location",
+            "src/parser.rs:88",
             "--json",
         ]);
         assert_fac_command_parses(&[
             "fac",
             "review",
-            "publish",
+            "comment",
             "--type",
             "code-quality",
-            "--body-file",
-            "/tmp/code_quality_findings.md",
+            "--severity",
+            "minor",
+            "--body",
+            "Legacy compatibility shim still accepted",
             "--json",
         ]);
-        assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
+        assert_fac_command_parses(&["fac", "review", "findings", "--refresh", "--json"]);
         assert_fac_command_parses(&[
             "fac",
             "review",
@@ -4061,6 +4198,21 @@ mod tests {
             "--reason",
             "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
             "--json",
+        ]);
+    }
+
+    #[test]
+    fn test_lane_reset_and_worker_commands_parse() {
+        assert_fac_command_parses(&["fac", "lane", "reset", "lane-00"]);
+        assert_fac_command_parses(&["fac", "lane", "reset", "lane-07", "--force"]);
+        assert_fac_command_parses(&["fac", "worker", "--once"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "worker",
+            "--poll-interval-secs",
+            "2",
+            "--max-jobs",
+            "5",
         ]);
     }
 

@@ -25,12 +25,11 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use super::barrier::resolve_authenticated_gh_login;
 use super::types::now_iso8601;
+use super::{github_projection, projection_store};
 
 // ── Marker ───────────────────────────────────────────────────────────────────
 
@@ -130,117 +129,16 @@ impl CiStatus {
 
 // ── Comment CRUD ─────────────────────────────────────────────────────────────
 
-/// Find an existing CI status comment for the given SHA, returning
-/// (`comment_id`, parsed [`CiStatus`]).
-pub fn find_status_comment(
-    owner_repo: &str,
-    pr_number: u32,
-    sha: &str,
-    expected_author_login: Option<&str>,
-) -> Result<Option<(u64, CiStatus)>, String> {
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
-    let output = Command::new("gh")
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|e| format!("failed to fetch PR comments: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh api failed: {stderr}"));
-    }
-
-    let comments: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("failed to parse comment response: {e}"))?;
-
-    Ok(latest_status_comment_for_sha(
-        &comments,
-        sha,
-        expected_author_login,
-    ))
-}
-
-fn latest_status_comment_for_sha(
-    comments: &[serde_json::Value],
-    sha: &str,
-    expected_author_login: Option<&str>,
-) -> Option<(u64, CiStatus)> {
-    let mut latest_match: Option<(u64, CiStatus)> = None;
-    let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
-
-    for comment in comments {
-        if let Some(expected_author) = expected_author_lower.as_deref() {
-            let author = comment
-                .get("user")
-                .and_then(|value| value.get("login"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if author != expected_author {
-                continue;
-            }
-        }
-
-        let body = comment
-            .get("body")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if !body.contains(&format!("<!-- {STATUS_MARKER} -->")) {
-            continue;
-        }
-
-        let Some(yaml_str) = extract_yaml_block(body) else {
-            continue;
-        };
-        let Ok(status) = serde_yaml::from_str::<CiStatus>(yaml_str) else {
-            continue;
-        };
-        if status.sha != sha {
-            continue;
-        }
-
-        let comment_id = comment
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        latest_match = Some((comment_id, status));
-    }
-
-    latest_match
-}
-
 /// Post a single CI status comment on a PR and return the created comment id.
 pub fn create_status_comment(
     owner_repo: &str,
     pr_number: u32,
     status: &CiStatus,
-) -> Result<u64, String> {
+) -> Result<(u64, String), String> {
     let body = status.to_comment_body();
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
-
-    let output = Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "POST",
-            &endpoint,
-            "-f",
-            &format!("body={body}"),
-        ])
-        .output()
-        .map_err(|e| format!("failed to POST status comment: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("status comment POST failed: {stderr}"));
-    }
-
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("failed to parse status comment POST response: {e}"))?;
-    let comment_id = value
-        .get("id")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "status comment POST response missing id".to_string())?;
-    Ok(comment_id)
+    github_projection::create_issue_comment(owner_repo, pr_number, &body)
+        .map(|response| (response.id, response.html_url))
+        .map_err(|err| format!("status comment POST failed: {err}"))
 }
 
 /// Update an existing CI status comment in place.
@@ -250,45 +148,40 @@ pub fn update_status_comment(
     status: &CiStatus,
 ) -> Result<(), String> {
     let body = status.to_comment_body();
-    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
-
-    let output = Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "PATCH",
-            &endpoint,
-            "-f",
-            &format!("body={body}"),
-        ])
-        .output()
-        .map_err(|e| format!("failed to PATCH status comment: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("status comment PATCH failed: {stderr}"));
-    }
-    Ok(())
+    github_projection::update_issue_comment(owner_repo, comment_id, &body)
+        .map_err(|err| format!("status comment PATCH failed: {err}"))
 }
 
-/// Extract the YAML content from a fenced code block in a comment body.
-fn extract_yaml_block(body: &str) -> Option<&str> {
-    let start_marker = "```yaml\n";
-    let end_marker = "\n```";
+fn find_cached_status_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> {
+    let comments =
+        projection_store::load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)
+            .ok()
+            .flatten()?;
+    comments.iter().rev().find_map(|comment| {
+        let body = comment.get("body").and_then(serde_json::Value::as_str)?;
+        if !body.contains(STATUS_MARKER) {
+            return None;
+        }
+        comment.get("id").and_then(serde_json::Value::as_u64)
+    })
+}
 
-    let start = body.find(start_marker)?;
-    let yaml_start = start + start_marker.len();
-
-    // Skip the `# apm2-ci-status:v1` comment line if present.
-    let remaining = &body[yaml_start..];
-    let yaml_content_start = if remaining.starts_with("# ") {
-        remaining.find('\n').map(|i| yaml_start + i + 1)?
-    } else {
-        yaml_start
-    };
-
-    let end = body[yaml_content_start..].find(end_marker)?;
-    Some(&body[yaml_content_start..yaml_content_start + end])
+fn cache_status_comment(
+    owner_repo: &str,
+    pr_number: u32,
+    comment_id: u64,
+    status: &CiStatus,
+    html_url: &str,
+) {
+    let body = status.to_comment_body();
+    let _ = projection_store::upsert_issue_comment_cache_entry(
+        owner_repo,
+        pr_number,
+        comment_id,
+        html_url,
+        &body,
+        "apm2-fac-ci-status",
+    );
 }
 
 // ── Deferred updater ─────────────────────────────────────────────────────────
@@ -302,7 +195,6 @@ pub struct ThrottledUpdater {
     owner_repo: String,
     pr_number: u32,
     comment_id: Cell<Option<u64>>,
-    expected_author_login: Option<String>,
 }
 
 impl ThrottledUpdater {
@@ -312,43 +204,66 @@ impl ThrottledUpdater {
             owner_repo: owner_repo.to_string(),
             pr_number,
             comment_id: Cell::new(None),
-            expected_author_login: resolve_authenticated_gh_login(),
         }
     }
 
     fn sync_status_comment(&self, status: &CiStatus) -> Result<(), String> {
-        let comment_id = if let Some(id) = self.comment_id.get() {
-            id
-        } else {
-            let maybe_existing =
-                if let Some(expected_author) = self.expected_author_login.as_deref() {
-                    find_status_comment(
+        let cached_id = self
+            .comment_id
+            .get()
+            .or_else(|| find_cached_status_comment_id(&self.owner_repo, self.pr_number))
+            .or_else(|| {
+                match github_projection::find_latest_issue_comment_id_with_marker(
+                    &self.owner_repo,
+                    self.pr_number,
+                    STATUS_MARKER,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!(
+                            "WARNING: ci_status remote status-comment discovery failed: {err}"
+                        );
+                        None
+                    },
+                }
+            });
+
+        if let Some(comment_id) = cached_id {
+            match update_status_comment(&self.owner_repo, comment_id, status) {
+                Ok(()) => {
+                    self.comment_id.set(Some(comment_id));
+                    let html_url = format!(
+                        "https://github.com/{}/pull/{}#issuecomment-{}",
+                        self.owner_repo, self.pr_number, comment_id
+                    );
+                    cache_status_comment(
                         &self.owner_repo,
                         self.pr_number,
-                        &status.sha,
-                        Some(expected_author),
-                    )?
-                } else {
-                    None
-                };
-
-            if let Some((existing_id, _existing_status)) = maybe_existing {
-                self.comment_id.set(Some(existing_id));
-                existing_id
-            } else {
-                let created_id = create_status_comment(&self.owner_repo, self.pr_number, status)?;
-                self.comment_id.set(Some(created_id));
-                return Ok(());
+                        comment_id,
+                        status,
+                        &html_url,
+                    );
+                    return Ok(());
+                },
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: ci_status patch for comment {comment_id} failed; creating replacement status comment: {err}"
+                    );
+                },
             }
-        };
-
-        if comment_id == 0 {
-            let created_id = create_status_comment(&self.owner_repo, self.pr_number, status)?;
-            self.comment_id.set(Some(created_id));
-            return Ok(());
         }
 
-        update_status_comment(&self.owner_repo, comment_id, status)
+        let (created_id, created_url) =
+            create_status_comment(&self.owner_repo, self.pr_number, status)?;
+        self.comment_id.set(Some(created_id));
+        cache_status_comment(
+            &self.owner_repo,
+            self.pr_number,
+            created_id,
+            status,
+            &created_url,
+        );
+        Ok(())
     }
 
     /// Sync the current status projection to GitHub.
@@ -442,13 +357,18 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_body_roundtrip_via_extract_yaml() {
+    fn test_comment_body_roundtrip_yaml_payload() {
         let mut s = CiStatus::new("abc123full", 7);
         s.set_result("fmt", true, 2);
         s.set_result("clippy", false, 30);
 
         let body = s.to_comment_body();
-        let yaml_str = extract_yaml_block(&body).expect("should find YAML block");
+        let start = body.find("```yaml\n").expect("yaml block start") + "```yaml\n".len();
+        let end = body[start..].find("\n```").expect("yaml block end") + start;
+        let yaml_payload = &body[start..end];
+        let yaml_str = yaml_payload
+            .strip_prefix("# apm2-ci-status:v1\n")
+            .unwrap_or(yaml_payload);
         let restored: CiStatus = serde_yaml::from_str(yaml_str).expect("should parse YAML");
 
         assert_eq!(restored.sha, "abc123full");
@@ -456,84 +376,6 @@ mod tests {
         assert_eq!(restored.gates.len(), 2);
         assert_eq!(restored.gates["fmt"].status, "PASS");
         assert_eq!(restored.gates["clippy"].status, "FAIL");
-    }
-
-    // ── extract_yaml_block ──────────────────────────────────────────────
-
-    #[test]
-    fn test_extract_yaml_block_returns_none_for_empty() {
-        assert!(extract_yaml_block("").is_none());
-        assert!(extract_yaml_block("no yaml here").is_none());
-    }
-
-    #[test]
-    fn test_extract_yaml_block_skips_comment_line() {
-        let body = "<!-- m -->\n```yaml\n# apm2-ci-status:v1\nsha: abc\npr: 1\n```\n";
-        let yaml = extract_yaml_block(body).unwrap();
-        assert!(yaml.starts_with("sha:"), "should skip # comment line");
-    }
-
-    #[test]
-    fn test_latest_status_comment_for_sha_returns_latest_match() {
-        let c1 = serde_json::json!({
-            "id": 100_u64,
-            "user": { "login": "fac-bot" },
-            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:00Z\ngates:\n  rustfmt:\n    status: PASS\n    duration_secs: 1\n```\n"
-        });
-        let c2 = serde_json::json!({
-            "id": 101_u64,
-            "user": { "login": "fac-bot" },
-            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: other-sha\npr: 7\nupdated_at: 2026-02-11T00:00:01Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 1\n```\n"
-        });
-        let c3 = serde_json::json!({
-            "id": 102_u64,
-            "user": { "login": "fac-bot" },
-            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:02Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 2\n```\n"
-        });
-
-        let comments = vec![c1, c2, c3];
-        let (id, status) = latest_status_comment_for_sha(&comments, "deadbeef", None)
-            .expect("should find latest status comment");
-        assert_eq!(id, 102);
-        assert_eq!(status.gates["rustfmt"].status, "FAIL");
-        assert_eq!(status.gates["rustfmt"].duration_secs, Some(2));
-    }
-
-    #[test]
-    fn test_latest_status_comment_for_sha_ignores_invalid_entries() {
-        let missing_marker = serde_json::json!({
-            "id": 10_u64,
-            "user": { "login": "fac-bot" },
-            "body": "```yaml\nsha: deadbeef\n```\n"
-        });
-        let invalid_yaml = serde_json::json!({
-            "id": 11_u64,
-            "user": { "login": "fac-bot" },
-            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\nthis: is: not: valid: yaml\n```\n"
-        });
-
-        let comments = vec![missing_marker, invalid_yaml];
-        assert!(latest_status_comment_for_sha(&comments, "deadbeef", None).is_none());
-    }
-
-    #[test]
-    fn test_latest_status_comment_for_sha_filters_untrusted_author() {
-        let spoofed = serde_json::json!({
-            "id": 103_u64,
-            "user": { "login": "random-user" },
-            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:03Z\ngates:\n  rustfmt:\n    status: PASS\n    duration_secs: 1\n```\n"
-        });
-        let trusted = serde_json::json!({
-            "id": 104_u64,
-            "user": { "login": "fac-bot" },
-            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:04Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 2\n```\n"
-        });
-
-        let comments = vec![spoofed, trusted];
-        let (id, status) = latest_status_comment_for_sha(&comments, "deadbeef", Some("fac-bot"))
-            .expect("should find trusted status comment");
-        assert_eq!(id, 104);
-        assert_eq!(status.gates["rustfmt"].status, "FAIL");
     }
 
     // ── Security boundary: no sensitive data in comment body ────────────

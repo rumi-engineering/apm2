@@ -21,7 +21,7 @@ ticket_meta:
     in_scope:
       - "Remove ALL cargo-test fallbacks (pipeline + local) and require explicit `cargo nextest run ...`."
       - "Fail closed if nextest missing in default mode."
-      - "Enforce test caps: timeout ≤240s and MemoryMax ≤24G unless explicit unsafe override."
+      - "Enforce test caps: timeout ≤600s and MemoryMax ≤24G unless explicit unsafe override."
       - "Set `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` based on lane policy."
       - "Update bounded runner env allowlist to pass: `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`."
     out_of_scope:

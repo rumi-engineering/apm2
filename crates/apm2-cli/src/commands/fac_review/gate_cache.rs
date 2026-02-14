@@ -4,10 +4,12 @@
 //! `~/.apm2/private/fac/gate_cache_v2/{sha}/{gate}.yaml`.
 //! Legacy v1 (`gate_cache/{sha}.yaml`) is read as best-effort fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::gate_attestation::MERGE_CONFLICT_GATE_NAME;
@@ -86,6 +88,51 @@ fn cache_sha_dir_v2(sha: &str) -> Result<PathBuf, String> {
     Ok(cache_dir_v2()?.join(sha))
 }
 
+fn cache_lock_dir_v2() -> Result<PathBuf, String> {
+    Ok(cache_dir_v2()?.join(".locks"))
+}
+
+fn cache_lock_path_v2(sha: &str) -> Result<PathBuf, String> {
+    Ok(cache_lock_dir_v2()?.join(format!("{sha}.lock")))
+}
+
+fn acquire_sha_lock(sha: &str, exclusive: bool) -> Result<std::fs::File, String> {
+    let lock_path = cache_lock_path_v2(sha)?;
+    let lock_parent = lock_path
+        .parent()
+        .ok_or_else(|| format!("lock path has no parent: {}", lock_path.display()))?;
+    fac_permissions::ensure_dir_with_mode(lock_parent)
+        .map_err(|err| format!("failed to create gate cache lock dir: {err}"))?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open gate cache lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    if exclusive {
+        FileExt::lock_exclusive(&lock_file).map_err(|err| {
+            format!(
+                "failed to acquire exclusive gate cache lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    } else {
+        FileExt::lock_shared(&lock_file).map_err(|err| {
+            format!(
+                "failed to acquire shared gate cache lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    }
+    Ok(lock_file)
+}
+
 fn sanitize_gate_name_for_path(gate: &str) -> String {
     gate.chars()
         .map(|ch| {
@@ -133,7 +180,7 @@ impl GateCache {
         }
     }
 
-    fn load_v2(sha: &str) -> Option<Self> {
+    fn load_v2_unlocked(sha: &str) -> Option<Self> {
         let dir = cache_sha_dir_v2(sha).ok()?;
         if !dir.exists() {
             return None;
@@ -164,7 +211,7 @@ impl GateCache {
         }
     }
 
-    fn load_v1(sha: &str) -> Option<Self> {
+    fn load_v1_unlocked(sha: &str) -> Option<Self> {
         let path = cache_path_v1(sha).ok()?;
         if !path.exists() {
             return None;
@@ -183,15 +230,18 @@ impl GateCache {
     /// Load cache from disk for the given SHA. Returns `None` if not found or
     /// unparseable.
     pub fn load(sha: &str) -> Option<Self> {
-        Self::load_v2(sha).or_else(|| Self::load_v1(sha))
+        let _lock = acquire_sha_lock(sha, false).ok()?;
+        Self::load_v2_unlocked(sha).or_else(|| Self::load_v1_unlocked(sha))
     }
 
     /// Write cache to disk using v2 per-gate files.
     pub fn save(&self) -> Result<(), String> {
+        let _lock = acquire_sha_lock(&self.sha, true)?;
         let dir = cache_sha_dir_v2(&self.sha)?;
         fac_permissions::ensure_dir_with_mode(&dir)
             .map_err(|err| format!("failed to create gate cache dir: {err}"))?;
 
+        let mut expected_paths = BTreeSet::new();
         for (gate_name, result) in &self.gates {
             let entry = GateCacheEntryV2 {
                 schema: CACHE_SCHEMA_V2.to_string(),
@@ -202,8 +252,40 @@ impl GateCache {
             let content = serde_yaml::to_string(&entry)
                 .map_err(|err| format!("failed to serialize gate cache entry: {err}"))?;
             let path = cache_gate_path_v2(&self.sha, gate_name)?;
+            expected_paths.insert(path.clone());
             fac_permissions::write_fac_file_with_mode(path.as_path(), content.as_bytes())
                 .map_err(|err| format!("failed to write cache entry {}: {err}", path.display()))?;
+        }
+
+        // Remove stale per-gate cache files so push never projects stale extras.
+        let entries = fs::read_dir(&dir)
+            .map_err(|err| format!("failed to list gate cache dir {}: {err}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                format!(
+                    "failed to read gate cache dir entry in {}: {err}",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                continue;
+            }
+            if expected_paths.contains(&path) {
+                continue;
+            }
+            if file_is_symlink(&path)? {
+                return Err(format!(
+                    "refusing to remove symlinked gate cache entry {}",
+                    path.display()
+                ));
+            }
+            fs::remove_file(&path).map_err(|err| {
+                format!(
+                    "failed to remove stale gate cache entry {}: {err}",
+                    path.display()
+                )
+            })?;
         }
         Ok(())
     }

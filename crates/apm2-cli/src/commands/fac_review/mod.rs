@@ -12,36 +12,36 @@
 mod backend;
 mod barrier;
 mod ci_status;
-mod comment;
-mod decision;
 mod detection;
 mod dispatch;
 mod events;
 mod evidence;
+mod finding;
 mod findings;
+mod findings_store;
 mod gate_attestation;
 mod gate_cache;
 mod gates;
+mod github_auth;
 mod github_projection;
+mod github_reads;
+mod lifecycle;
 mod liveness;
 mod logs;
 mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
-mod pr_body;
 mod prepare;
 mod projection;
 mod projection_store;
-mod publish;
 mod push;
 mod restart;
-mod selector;
 mod state;
 mod target;
 mod timeout_policy;
 mod types;
-mod worktree;
+mod verdict_projection;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -50,23 +50,114 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 // Re-export public API for use by `fac.rs`
-pub use comment::{ReviewCommentSeverityArg, ReviewCommentTypeArg};
-pub use decision::VerdictValueArg;
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
+pub use finding::{
+    ReviewFindingSeverityArg as ReviewCommentSeverityArg, ReviewFindingSeverityArg,
+    ReviewFindingTypeArg as ReviewCommentTypeArg, ReviewFindingTypeArg,
+};
+pub use lifecycle::VerdictValueArg;
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
-pub use publish::ReviewPublishTypeArg;
+use serde::Serialize;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
+pub use types::ReviewRunType;
 use types::{
-    DispatchSummary, ProjectionStatus, ReviewKind, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
+    DispatchReviewResult, DispatchSummary, ProjectionStatus, ReviewKind,
+    TERMINAL_MANUAL_TERMINATION_DECISION_BOUND, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
     TERMINATE_TIMEOUT, is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
 };
-pub use types::{ReviewRunType, apm2_home_dir};
 
 use crate::exit_codes::codes as exit_codes;
+
+const DOCTOR_SCHEMA: &str = "apm2.fac.review.doctor.v1";
+const DOCTOR_STALE_GATE_AGE_SECONDS: i64 = 6 * 60 * 60;
+
+#[derive(Debug, Serialize)]
+struct DoctorHealthItem {
+    severity: &'static str,
+    message: String,
+    remediation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorIdentitySnapshot {
+    pr_number: u32,
+    branch: Option<String>,
+    worktree: Option<String>,
+    source: Option<String>,
+    local_sha: Option<String>,
+    updated_at: Option<String>,
+    remote_head_sha: Option<String>,
+    stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorLifecycleSnapshot {
+    state: String,
+    time_in_state_seconds: i64,
+    error_budget_used: u32,
+    retry_budget_remaining: u32,
+    updated_at: String,
+    last_event_seq: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorGateSnapshot {
+    name: String,
+    status: String,
+    completed_at: Option<String>,
+    freshness_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReviewSnapshot {
+    dimension: String,
+    verdict: String,
+    reviewed_sha: String,
+    reviewed_by: String,
+    reviewed_at: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorAgentSnapshot {
+    agent_type: String,
+    state: String,
+    run_id: String,
+    sha: String,
+    pid: Option<u32>,
+    pid_alive: bool,
+    started_at: String,
+    completion_status: Option<String>,
+    completion_summary: Option<String>,
+    completion_token_hash: String,
+    completion_token_expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorAgentSection {
+    max_active_agents_per_pr: usize,
+    active_agents: usize,
+    total_agents: usize,
+    entries: Vec<DoctorAgentSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorPrSummary {
+    schema: String,
+    pr_number: u32,
+    owner_repo: String,
+    identity: DoctorIdentitySnapshot,
+    lifecycle: Option<DoctorLifecycleSnapshot>,
+    gates: Vec<DoctorGateSnapshot>,
+    reviews: Vec<DoctorReviewSnapshot>,
+    agents: Option<DoctorAgentSection>,
+    health: Vec<DoctorHealthItem>,
+}
 
 // ── Process management helpers (used by orchestrator) ───────────────────────
 
@@ -166,6 +257,665 @@ fn emit_run_ndjson_since(
         }
     }
     Ok(())
+}
+
+pub fn run_doctor(repo: &str, pr_number: u32, json_output: bool) -> u8 {
+    let summary = run_doctor_inner(repo, pr_number);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    } else {
+        emit_doctor_report(&summary);
+    }
+    exit_codes::SUCCESS
+}
+
+fn run_doctor_inner(owner_repo: &str, pr_number: u32) -> DoctorPrSummary {
+    let mut health = Vec::new();
+    let identity = match projection_store::load_pr_identity_snapshot(owner_repo, pr_number) {
+        Ok(value) => value,
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "high",
+                message: format!("failed to read local PR identity: {err}"),
+                remediation:
+                    "run `apm2 fac push --pr <PR_NUMBER>` to refresh local projection data"
+                        .to_string(),
+            });
+            None
+        },
+    };
+
+    let local_sha = identity.as_ref().map(|record| record.head_sha.clone());
+    let branch = identity.as_ref().and_then(|record| record.branch.clone());
+    let worktree = identity.as_ref().and_then(|record| record.worktree.clone());
+    let identity_source = identity.as_ref().map(|record| record.source.clone());
+    let identity_updated_at = identity.as_ref().map(|record| record.updated_at.clone());
+
+    let mut remote_head = None;
+    match github_reads::fetch_pr_head_sha(owner_repo, pr_number) {
+        Ok(value) => {
+            if let Err(err) = validate_expected_head_sha(&value) {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!("invalid remote PR head SHA from GitHub: {err}"),
+                    remediation:
+                        "retry later when GitHub API returns a valid SHA or refresh repo credentials"
+                            .to_string(),
+                });
+            } else {
+                remote_head = Some(value.to_ascii_lowercase());
+            }
+        },
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "medium",
+                message: format!("could not resolve remote PR head SHA: {err}"),
+                remediation: "retry doctor after GH API access is restored".to_string(),
+            });
+        },
+    }
+    let stale = match (&local_sha, remote_head.as_deref()) {
+        (Some(local), Some(remote)) => !local.eq_ignore_ascii_case(remote),
+        _ => false,
+    };
+
+    if stale {
+        health.push(DoctorHealthItem {
+            severity: "high",
+            message: format!(
+                "local SHA {} != remote SHA {}",
+                local_sha.as_deref().unwrap_or("unknown"),
+                remote_head.as_deref().unwrap_or("unknown")
+            ),
+            remediation: "fetch latest PR head and rerun the FAC pipeline for this SHA".to_string(),
+        });
+    } else if local_sha.is_none() {
+        health.push(DoctorHealthItem {
+            severity: "high",
+            message: "no local PR identity snapshot found for this PR".to_string(),
+            remediation: "run `apm2 fac push --pr <PR_NUMBER>` to create local identity"
+                .to_string(),
+        });
+    }
+
+    let lifecycle = match lifecycle::load_pr_lifecycle_snapshot(owner_repo, pr_number) {
+        Ok(Some(snapshot)) => {
+            match snapshot.pr_state.as_str() {
+                "stuck" => health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "lifecycle reducer is in STUCK state".to_string(),
+                    remediation: "run `apm2 fac restart --pr <PR_NUMBER>` to reconcile state".to_string(),
+                }),
+                "stale" => health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: "lifecycle reducer indicates STALE state".to_string(),
+                    remediation: "run `apm2 fac push --pr <PR_NUMBER> --force` to refresh lifecycle state".to_string(),
+                }),
+                "recovering" => health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: "lifecycle reducer indicates RECOVERING state".to_string(),
+                    remediation:
+                        "run `apm2 fac recover --pr <PR_NUMBER> --refresh-identity` if recovery stalls".to_string(),
+                }),
+                _ => {},
+            }
+            if snapshot.retry_budget_remaining == 0 {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "retry budget exhausted".to_string(),
+                    remediation:
+                        "manual investigation required; stop retries until state is repaired"
+                            .to_string(),
+                });
+            } else if snapshot.error_budget_used > 0 {
+                health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: format!(
+                        "error budget used: {}/{}",
+                        snapshot.error_budget_used,
+                        10
+                    ),
+                    remediation:
+                        "run `apm2 fac doctor --pr <PR_NUMBER>` after `apm2 fac restart` to verify trend".to_string(),
+                });
+            }
+            if snapshot.error_budget_used >= 8 {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "high lifecycle error budget usage".to_string(),
+                    remediation:
+                        "investigate repeating failures in lifecycle events and CI diagnostics"
+                            .to_string(),
+                });
+            }
+
+            if let Some(local_sha) = local_sha.as_deref()
+                && !snapshot.current_sha.eq_ignore_ascii_case(local_sha)
+            {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!(
+                        "lifecycle current SHA {} != local identity SHA {}",
+                        snapshot.current_sha, local_sha
+                    ),
+                    remediation:
+                        "run `apm2 fac push --pr <PR_NUMBER>` to align lifecycle with current local SHA".to_string(),
+                });
+            }
+
+            Some(DoctorLifecycleSnapshot {
+                state: snapshot.pr_state.clone(),
+                time_in_state_seconds: snapshot.time_in_state_seconds,
+                error_budget_used: snapshot.error_budget_used,
+                retry_budget_remaining: snapshot.retry_budget_remaining,
+                updated_at: snapshot.updated_at.clone(),
+                last_event_seq: snapshot.last_event_seq,
+            })
+        },
+        Ok(None) => {
+            health.push(DoctorHealthItem {
+                severity: "high",
+                message: "no lifecycle record found for this PR".to_string(),
+                remediation: "run `apm2 fac push --pr <PR_NUMBER>`".to_string(),
+            });
+            None
+        },
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "high",
+                message: format!("failed to read lifecycle snapshot: {err}"),
+                remediation:
+                    "run `apm2 fac push --pr <PR_NUMBER>` and re-run doctor after recovery"
+                        .to_string(),
+            });
+            None
+        },
+    };
+
+    let mut gates = Vec::new();
+    match local_sha.as_deref() {
+        Some(sha) => match gate_cache::GateCache::load(sha) {
+            Some(cache) => {
+                if cache.gates.is_empty() {
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message: "no cached gate results for current SHA".to_string(),
+                        remediation: "run `apm2 fac push --pr <PR_NUMBER>`".to_string(),
+                    });
+                }
+                for (name, result) in cache.gates {
+                    let freshness = gate_result_freshness_seconds(&result.completed_at);
+                    let status = verdict_from_gate_status(&result.status);
+                    if status == "FAIL" {
+                        health.push(DoctorHealthItem {
+                            severity: "high",
+                            message: format!("gate {name} failed"),
+                            remediation: format!(
+                                "rerun gate evidence stage with `apm2 fac push --pr {pr_number}`"
+                            ),
+                        });
+                    } else if status == "NOT_RUN" {
+                        health.push(DoctorHealthItem {
+                            severity: "medium",
+                            message: format!(
+                                "gate {name} has non-terminal status `{}`",
+                                result.status
+                            ),
+                            remediation: format!(
+                                "rerun evidence stage for PR #{pr_number} if stale"
+                            ),
+                        });
+                    } else if freshness.is_some_and(|age| age > DOCTOR_STALE_GATE_AGE_SECONDS) {
+                        health.push(DoctorHealthItem {
+                            severity: "low",
+                            message: format!(
+                                "gate {name} cache is stale ({})",
+                                format_freshness_age(freshness)
+                            ),
+                            remediation: "rerun gate evidence to refresh cache".to_string(),
+                        });
+                    }
+                    gates.push(DoctorGateSnapshot {
+                        name,
+                        status: status.to_string(),
+                        completed_at: if result.completed_at.trim().is_empty() {
+                            None
+                        } else {
+                            Some(result.completed_at.clone())
+                        },
+                        freshness_seconds: freshness,
+                    });
+                }
+            },
+            None => {
+                health.push(DoctorHealthItem {
+                    severity: "low",
+                    message: "no gate cache found for local SHA".to_string(),
+                    remediation: format!(
+                        "run `apm2 fac push --pr {pr_number}` to populate evidence cache"
+                    ),
+                });
+            },
+        },
+        None => health.push(DoctorHealthItem {
+            severity: "high",
+            message: "no local SHA resolved for gate review".to_string(),
+            remediation: "establish local identity via `apm2 fac push --pr <PR_NUMBER>`"
+                .to_string(),
+        }),
+    }
+
+    let reviews = if let Some(sha) = local_sha.as_deref() {
+        match verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, sha) {
+            Ok(Some(snapshot)) => {
+                if !snapshot.errors.is_empty() {
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message: snapshot.errors.join("; "),
+                        remediation:
+                            "rerun review verdict emission paths for missing or corrupted entries"
+                                .to_string(),
+                    });
+                }
+                collect_review_dimension_snapshots(&snapshot)
+            },
+            Ok(None) => {
+                health.push(DoctorHealthItem {
+                    severity: "medium",
+                    message: "no verdict projection for local SHA".to_string(),
+                    remediation:
+                        "run both `fac review run --pr` and `fac review verdict show --pr --sha`"
+                            .to_string(),
+                });
+                collect_default_review_dimension_snapshots(sha)
+            },
+            Err(err) => {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!("failed to load verdict projection: {err}"),
+                    remediation:
+                        "re-run review verdict flow (`fac review set`) after integrity check"
+                            .to_string(),
+                });
+                collect_default_review_dimension_snapshots(sha)
+            },
+        }
+    } else {
+        health.push(DoctorHealthItem {
+            severity: "high",
+            message: "no local SHA resolved for verdict lookup".to_string(),
+            remediation: "establish local PR identity before reading verdicts".to_string(),
+        });
+        Vec::new()
+    };
+
+    let agents = match lifecycle::load_agent_registry_snapshot_for_pr(owner_repo, pr_number) {
+        Ok(snapshot) => {
+            let max_active = snapshot.max_active_agents_per_pr;
+            let active_agents = snapshot.active_agents;
+            if active_agents > max_active {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: format!(
+                        "active agent entries ({active_agents}) exceed configured max ({max_active})"
+                    ),
+                    remediation:
+                        "run `apm2 fac recover --pr <PR_NUMBER>` to prune stale/invalid registry entries"
+                            .to_string(),
+                });
+            }
+
+            for entry in &snapshot.entries {
+                if entry.pid.is_some()
+                    && matches!(entry.state.as_str(), "running" | "dispatched")
+                    && !entry.pid_alive
+                {
+                    health.push(DoctorHealthItem {
+                        severity: "high",
+                        message: format!(
+                            "{} lane pid={} is no longer alive",
+                            entry.agent_type,
+                            entry.pid.unwrap_or(0)
+                        ),
+                        remediation:
+                            "run `apm2 fac restart --pr <PR_NUMBER>` to reclaim lane state"
+                                .to_string(),
+                    });
+                }
+                if entry.pid.is_none()
+                    && matches!(entry.state.as_str(), "running" | "dispatched" | "stuck")
+                {
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message: format!(
+                            "{} lane for PR #{} has missing PID in state {}",
+                            entry.agent_type, pr_number, entry.state
+                        ),
+                        remediation:
+                            "rerun `apm2 fac restart --pr <PR_NUMBER>` and watch for slot reapage"
+                                .to_string(),
+                    });
+                }
+            }
+            if let Some(lifecycle) = lifecycle.as_ref()
+                && lifecycle.state == "review_in_progress"
+                && active_agents == 0
+            {
+                health.push(DoctorHealthItem {
+                    severity: "high",
+                    message: "review_in_progress lifecycle state with zero active agents"
+                        .to_string(),
+                    remediation: "run `apm2 fac restart --pr <PR_NUMBER>` to resume reviews"
+                        .to_string(),
+                });
+            }
+
+            let mut entries = Vec::with_capacity(snapshot.entries.len());
+            for entry in snapshot.entries {
+                entries.push(DoctorAgentSnapshot {
+                    agent_type: entry.agent_type,
+                    state: entry.state,
+                    run_id: entry.run_id,
+                    sha: entry.sha,
+                    pid: entry.pid,
+                    pid_alive: entry.pid_alive,
+                    started_at: entry.started_at,
+                    completion_status: entry.completion_status,
+                    completion_summary: entry.completion_summary,
+                    completion_token_hash: entry.completion_token_hash,
+                    completion_token_expires_at: entry.completion_token_expires_at,
+                });
+            }
+            Some(DoctorAgentSection {
+                max_active_agents_per_pr: max_active,
+                active_agents,
+                total_agents: entries.len(),
+                entries,
+            })
+        },
+        Err(err) => {
+            health.push(DoctorHealthItem {
+                severity: "medium",
+                message: format!("failed to load agent registry snapshot: {err}"),
+                remediation: "run `apm2 fac recover --pr <PR_NUMBER>`".to_string(),
+            });
+            None
+        },
+    };
+
+    DoctorPrSummary {
+        schema: DOCTOR_SCHEMA.to_string(),
+        pr_number,
+        owner_repo: owner_repo.to_ascii_lowercase(),
+        identity: DoctorIdentitySnapshot {
+            pr_number,
+            branch,
+            worktree,
+            source: identity_source,
+            local_sha,
+            updated_at: identity_updated_at,
+            remote_head_sha: remote_head,
+            stale,
+        },
+        lifecycle,
+        gates,
+        reviews,
+        agents,
+        health,
+    }
+}
+
+fn collect_default_review_dimension_snapshots(local_sha: &str) -> Vec<DoctorReviewSnapshot> {
+    vec![
+        DoctorReviewSnapshot {
+            dimension: "security".to_string(),
+            verdict: "pending".to_string(),
+            reviewed_sha: local_sha.to_string(),
+            reviewed_by: String::new(),
+            reviewed_at: String::new(),
+            reason: "no verified projection loaded".to_string(),
+        },
+        DoctorReviewSnapshot {
+            dimension: "code-quality".to_string(),
+            verdict: "pending".to_string(),
+            reviewed_sha: local_sha.to_string(),
+            reviewed_by: String::new(),
+            reviewed_at: String::new(),
+            reason: "no verified projection loaded".to_string(),
+        },
+    ]
+}
+
+fn collect_review_dimension_snapshots(
+    snapshot: &verdict_projection::VerdictProjectionSnapshot,
+) -> Vec<DoctorReviewSnapshot> {
+    let mut mapped = std::collections::BTreeMap::<
+        String,
+        &verdict_projection::VerdictProjectionDimensionSnapshot,
+    >::new();
+    for entry in &snapshot.dimensions {
+        mapped.insert(entry.dimension.clone(), entry);
+    }
+    ["security", "code-quality"]
+        .into_iter()
+        .map(|dimension| {
+            let Some(entry) = mapped.get(dimension) else {
+                return DoctorReviewSnapshot {
+                    dimension: (*dimension).to_string(),
+                    verdict: "pending".to_string(),
+                    reviewed_sha: snapshot.head_sha.clone(),
+                    reviewed_by: String::new(),
+                    reviewed_at: String::new(),
+                    reason: "missing dimension in projection".to_string(),
+                };
+            };
+            DoctorReviewSnapshot {
+                dimension: entry.dimension.clone(),
+                verdict: entry.decision.clone(),
+                reviewed_sha: entry.reviewed_sha.clone(),
+                reviewed_by: entry.reviewed_by.clone(),
+                reviewed_at: entry.reviewed_at.clone(),
+                reason: entry.reason.clone(),
+            }
+        })
+        .collect()
+}
+
+fn verdict_from_gate_status(status: &str) -> &'static str {
+    match status.to_ascii_uppercase().as_str() {
+        "PASS" => "PASS",
+        "FAIL" => "FAIL",
+        _ => "NOT_RUN",
+    }
+}
+
+fn gate_result_freshness_seconds(completed_at: &str) -> Option<i64> {
+    if completed_at.trim().is_empty() {
+        return None;
+    }
+    let Ok(parsed) = DateTime::parse_from_rfc3339(completed_at) else {
+        return None;
+    };
+    let age = Utc::now() - parsed.with_timezone(&Utc);
+    let Ok(duration) = age.to_std() else {
+        return None;
+    };
+    Some(
+        i64::try_from(duration.as_secs())
+            .unwrap_or(i64::MAX)
+            .clamp(0, i64::MAX),
+    )
+}
+
+fn format_freshness_age(seconds: Option<i64>) -> String {
+    let Some(seconds) = seconds else {
+        return "unknown".to_string();
+    };
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / (60 * 60))
+    }
+}
+
+fn emit_doctor_report(summary: &DoctorPrSummary) {
+    println!("FAC Doctor");
+    println!("  PR:         #{}", summary.pr_number);
+    println!("  Repo:       {}", summary.owner_repo);
+    println!(
+        "  Identity SHA local={} remote={}",
+        summary.identity.local_sha.as_deref().unwrap_or("-"),
+        summary.identity.remote_head_sha.as_deref().unwrap_or("-")
+    );
+    if summary.identity.stale {
+        println!("  Identity:   STALE");
+    }
+    println!(
+        "  Branch:     {}",
+        summary.identity.branch.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  Worktree:   {}",
+        summary.identity.worktree.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  Identity source: {}",
+        summary.identity.source.as_deref().unwrap_or("-")
+    );
+
+    println!("IDENTITY");
+    println!(
+        "  local_sha:  {}{}",
+        summary.identity.local_sha.as_deref().unwrap_or("unknown"),
+        if summary.identity.stale {
+            " [STALE]"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  remote_sha: {}",
+        summary
+            .identity
+            .remote_head_sha
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    println!(
+        "  branch:     {}",
+        summary.identity.branch.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  worktree:   {}",
+        summary.identity.worktree.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  updated_at: {}",
+        summary.identity.updated_at.as_deref().unwrap_or("n/a")
+    );
+
+    println!("LIFECYCLE");
+    if let Some(lifecycle) = &summary.lifecycle {
+        println!("  state:           {}", lifecycle.state);
+        println!("  time_in_state:   {}s", lifecycle.time_in_state_seconds);
+        println!("  error_budget:    {}", lifecycle.error_budget_used);
+        println!("  retry_budget:    {}", lifecycle.retry_budget_remaining);
+        println!("  updated_at:      {}", lifecycle.updated_at);
+        println!("  last_event_seq:  {}", lifecycle.last_event_seq);
+    } else {
+        println!("  unavailable");
+    }
+
+    println!("GATES");
+    if summary.gates.is_empty() {
+        println!("  no gate cache entries found");
+    } else {
+        for gate in &summary.gates {
+            println!(
+                "  {}: {} (freshness={})",
+                gate.name,
+                gate.status,
+                format_freshness_age(gate.freshness_seconds)
+            );
+            if let Some(completed_at) = gate.completed_at.as_deref() {
+                println!("    completed_at: {completed_at}");
+            }
+        }
+    }
+
+    println!("REVIEWS");
+    if summary.reviews.is_empty() {
+        println!("  no review projection found");
+    } else {
+        for review in &summary.reviews {
+            println!("  {}: {}", review.dimension, review.verdict);
+            println!(
+                "    reviewed_sha: {}  reviewed_by: {}",
+                if review.reviewed_sha.is_empty() {
+                    "-"
+                } else {
+                    &review.reviewed_sha
+                },
+                if review.reviewed_by.is_empty() {
+                    "-"
+                } else {
+                    &review.reviewed_by
+                }
+            );
+            if !review.reason.is_empty() {
+                println!("    reason: {}", review.reason);
+            }
+            if !review.reviewed_at.is_empty() {
+                println!("    reviewed_at: {}", review.reviewed_at);
+            }
+        }
+    }
+
+    println!("AGENTS");
+    if let Some(agents) = &summary.agents {
+        println!(
+            "  active_slots: {}/{}",
+            agents.active_agents, agents.max_active_agents_per_pr
+        );
+        println!("  total_entries: {}", agents.total_agents);
+        if agents.entries.is_empty() {
+            println!("  no entries");
+        } else {
+            for entry in &agents.entries {
+                println!(
+                    "  {} {} pid={:?} alive={} sha={} run_id={}",
+                    entry.agent_type,
+                    entry.state,
+                    entry.pid,
+                    entry.pid_alive,
+                    entry.sha,
+                    entry.run_id
+                );
+            }
+        }
+    } else {
+        println!("  unavailable");
+    }
+
+    println!("HEALTH");
+    if summary.health.is_empty() {
+        println!("  PASS: no blockers");
+    } else {
+        for item in &summary.health {
+            println!(
+                "  [{}] {}",
+                item.severity.to_ascii_uppercase(),
+                item.message
+            );
+            println!("      remediation: {}", item.remediation);
+        }
+    }
 }
 
 // ── Public entry points ─────────────────────────────────────────────────────
@@ -594,73 +1344,72 @@ pub fn run_findings(
     }
 }
 
-pub fn run_prepare(repo: &str, pr_number: Option<u32>, sha: Option<&str>, json_output: bool) -> u8 {
-    match prepare::run_prepare(repo, pr_number, sha, json_output) {
-        Ok(code) => code,
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_prepare_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_publish(
-    repo: &str,
-    pr_number: Option<u32>,
-    sha: Option<&str>,
-    review_type: ReviewPublishTypeArg,
-    body_file: &Path,
-    json_output: bool,
-) -> u8 {
-    match publish::run_publish(repo, pr_number, sha, review_type, body_file, json_output) {
-        Ok(code) => code,
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_publish_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-pub fn run_comment(
+pub fn run_finding(
     repo: &str,
     pr_number: Option<u32>,
     sha: Option<&str>,
-    severity: ReviewCommentSeverityArg,
-    review_type: ReviewCommentTypeArg,
-    body: Option<&str>,
+    review_type: ReviewFindingTypeArg,
+    severity: ReviewFindingSeverityArg,
+    summary: &str,
+    details: Option<&str>,
+    risk: Option<&str>,
+    impact: Option<&str>,
+    location: Option<&str>,
+    reviewer_id: Option<&str>,
+    evidence_pointer: Option<&str>,
     json_output: bool,
 ) -> u8 {
-    match comment::run_comment(
+    match finding::run_finding(
         repo,
         pr_number,
         sha,
-        severity,
         review_type,
+        severity,
+        summary,
+        details,
+        risk,
+        impact,
+        location,
+        reviewer_id,
+        evidence_pointer,
+        json_output,
+    ) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_finding_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_comment_compat(
+    repo: &str,
+    pr_number: Option<u32>,
+    sha: Option<&str>,
+    review_type: ReviewFindingTypeArg,
+    severity: ReviewFindingSeverityArg,
+    body: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match finding::run_comment_compat(
+        repo,
+        pr_number,
+        sha,
+        review_type,
+        severity,
         body,
         json_output,
     ) {
@@ -668,7 +1417,29 @@ pub fn run_comment(
         Err(err) => {
             if json_output {
                 let payload = serde_json::json!({
-                    "error": "fac_review_comment_failed",
+                    "error": "fac_review_comment_compat_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_prepare(repo: &str, pr_number: Option<u32>, sha: Option<&str>, json_output: bool) -> u8 {
+    match prepare::run_prepare(repo, pr_number, sha, json_output) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_prepare_failed",
                     "message": err,
                 });
                 println!(
@@ -695,7 +1466,7 @@ pub fn run_verdict_set(
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> u8 {
-    match decision::run_verdict_set(
+    lifecycle::run_verdict_set(
         repo,
         pr_number,
         sha,
@@ -704,25 +1475,7 @@ pub fn run_verdict_set(
         reason,
         keep_prepared_inputs,
         json_output,
-    ) {
-        Ok(code) => code,
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_verdict_set_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
+    )
 }
 
 pub fn run_verdict_show(
@@ -731,25 +1484,7 @@ pub fn run_verdict_show(
     sha: Option<&str>,
     json_output: bool,
 ) -> u8 {
-    match decision::run_verdict_show(repo, pr_number, sha, json_output) {
-        Ok(code) => code,
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_verdict_show_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
+    lifecycle::run_verdict_show(repo, pr_number, sha, json_output)
 }
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
@@ -1082,7 +1817,7 @@ fn run_terminate_inner_for_home(
         }
     }
 
-    let authority = decision::resolve_termination_authority_for_home(
+    let authority = verdict_projection::resolve_termination_authority_for_home(
         home,
         &owner_repo,
         resolved_pr,
@@ -1104,48 +1839,25 @@ fn run_terminate_inner_for_home(
         ));
     }
 
-    let mut killed = false;
-    if let Some(pid) = run_state.pid {
-        if state::is_process_alive(pid) {
-            dispatch::verify_process_identity(pid, run_state.proc_start_time)?;
-            dispatch::terminate_process_with_timeout(pid)?;
-            killed = true;
-        }
+    let outcome = dispatch::terminate_review_agent_for_home(home, &authority)?;
+    let killed = matches!(outcome, dispatch::TerminationOutcome::Killed);
+
+    let failure = match &outcome {
+        dispatch::TerminationOutcome::Killed | dispatch::TerminationOutcome::AlreadyDead => None,
+        dispatch::TerminationOutcome::SkippedMismatch => Some(format!(
+            "termination skipped for PR #{resolved_pr} type={review_type}: process identity did not match authority"
+        )),
+        dispatch::TerminationOutcome::IdentityFailure(reason) => Some(format!(
+            "failed to terminate PR #{resolved_pr} type={review_type}: {reason}"
+        )),
+    };
+    if let Some(message) = failure {
+        return Err(message);
     }
 
     run_state.status = types::ReviewRunStatus::Failed;
-    run_state.terminal_reason = Some("manual_termination_decision_bound".to_string());
+    run_state.terminal_reason = Some(TERMINAL_MANUAL_TERMINATION_DECISION_BOUND.to_string());
     state::write_review_run_state_for_home(home, &run_state)?;
-
-    let receipt = state::ReviewRunTerminationReceipt {
-        schema: state::TERMINATION_RECEIPT_SCHEMA.to_string(),
-        emitted_at: types::now_iso8601(),
-        repo: owner_repo,
-        pr_number: resolved_pr,
-        review_type: review_type.to_string(),
-        run_id: run_state.run_id.clone(),
-        head_sha: run_state.head_sha.clone(),
-        decision_comment_id: authority.decision_comment_id,
-        decision_author: authority.decision_author.clone(),
-        decision_summary: authority.decision_signature.clone(),
-        integrity_hmac: String::new(),
-        outcome: if killed {
-            "killed".to_string()
-        } else {
-            "already_dead".to_string()
-        },
-        outcome_reason: Some(format!(
-            "manual_termination via `apm2 fac review terminate` decision_comment_id={}",
-            authority.decision_comment_id
-        )),
-    };
-    state::write_review_run_termination_receipt_for_home(home, &receipt)?;
-    let _ = state::load_review_run_termination_receipt_for_home(home, resolved_pr, review_type)?
-        .ok_or_else(|| {
-            format!(
-                "termination receipt missing after write for PR #{resolved_pr} type={review_type}"
-            )
-        })?;
 
     if json_output {
         println!(
@@ -1157,6 +1869,7 @@ fn run_terminate_inner_for_home(
                 "run_id": run_state.run_id,
                 "pid": run_state.pid,
                 "process_killed": killed,
+                "outcome": format!("{outcome:?}"),
             }))
             .unwrap_or_default()
         );
@@ -1172,6 +1885,16 @@ fn run_terminate_inner_for_home(
     }
 
     Ok(())
+}
+
+pub fn run_recover(
+    repo: &str,
+    pr_number: Option<u32>,
+    force: bool,
+    refresh_identity: bool,
+    json_output: bool,
+) -> u8 {
+    lifecycle::run_recover(repo, pr_number, force, refresh_identity, json_output)
 }
 
 pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
@@ -1225,7 +1948,7 @@ fn run_dispatch_inner(
     expected_head_sha: Option<&str>,
     force: bool,
 ) -> Result<DispatchSummary, String> {
-    let current_head_sha = barrier::fetch_pr_head_sha_local(pr_number)?;
+    let current_head_sha = projection::fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
         if !identity.head_sha.eq_ignore_ascii_case(&current_head_sha) {
@@ -1256,6 +1979,7 @@ fn run_dispatch_inner(
 
     let mut results = Vec::with_capacity(kinds.len());
     for kind in kinds {
+        lifecycle::enforce_pr_capacity(owner_repo, pr_number)?;
         let result = dispatch_single_review_with_force(
             owner_repo,
             pr_number,
@@ -1264,6 +1988,41 @@ fn run_dispatch_inner(
             dispatch_epoch,
             force,
         )?;
+        if !result.mode.eq_ignore_ascii_case("joined") {
+            let run_id = result
+                .run_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "non-joined {} dispatch returned empty run_id (mode={})",
+                        kind.as_str(),
+                        result.mode
+                    )
+                })?;
+            let token = lifecycle::register_reviewer_dispatch(
+                owner_repo,
+                pr_number,
+                &current_head_sha,
+                kind.as_str(),
+                Some(run_id),
+                result.pid,
+                result.pid.and_then(state::get_process_start_time),
+            )?;
+            if token.is_none() {
+                return Err(format!(
+                    "lifecycle registration failed for {} review: register_reviewer_dispatch returned none",
+                    kind.as_str()
+                ));
+            }
+            eprintln!(
+                "fac dispatch: registered {} reviewer slot for PR #{} sha {}",
+                kind.as_str(),
+                pr_number,
+                current_head_sha,
+            );
+        }
         results.push(result);
     }
 
@@ -1274,6 +2033,23 @@ fn run_dispatch_inner(
         dispatch_epoch,
         results,
     })
+}
+
+pub(super) fn dispatch_reviews_with_lifecycle(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    force: bool,
+) -> Result<Vec<DispatchReviewResult>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let summary = run_dispatch_inner(
+        owner_repo,
+        pr_number,
+        ReviewRunType::All,
+        Some(head_sha),
+        force,
+    )?;
+    Ok(summary.results)
 }
 
 // ── Status / Tail ───────────────────────────────────────────────────────────
@@ -1588,10 +2364,7 @@ mod tests {
     use super::barrier::{
         build_barrier_decision_event, is_allowed_author_association, read_event_payload_bounded,
     };
-    use super::detection::{
-        detect_comment_permission_denied, detect_http_400_or_rate_limit,
-        extract_verdict_from_comment_body,
-    };
+    use super::detection::{detect_comment_permission_denied, detect_http_400_or_rate_limit};
     use super::events::emit_review_event_to_path;
     use super::model_pool::{MODEL_POOL, select_fallback_model, select_review_model_random};
     use super::projection::{
@@ -1685,14 +2458,13 @@ mod tests {
         comment_id: u64,
     ) {
         let pr_dir = projection_pr_dir_for_home(home, owner_repo, pr_number);
-        crate::commands::fac_permissions::ensure_dir_with_mode(&pr_dir)
-            .expect("create projection pr dir");
+        std::fs::create_dir_all(&pr_dir).expect("create projection pr dir");
         let dimension = if review_type.eq_ignore_ascii_case("quality") {
             "code-quality"
         } else {
             "security"
         };
-        let decision_yaml = serde_yaml::to_string(&serde_json::json!({
+        let decision_payload = serde_json::json!({
             "schema": "apm2.review.verdict.v1",
             "pr": pr_number,
             "sha": head_sha,
@@ -1705,36 +2477,37 @@ mod tests {
                     "set_at": "2026-02-13T00:00:00Z"
                 }
             }
-        }))
-        .expect("serialize decision yaml");
-        let body = format!("<!-- apm2-review-verdict:v1 -->\n```yaml\n{decision_yaml}```\n");
-        let issue_comments_payload = serde_json::json!({
-            "schema": "apm2.fac.projection.issue_comments.v1",
+        });
+        let verdict_projection_payload = serde_json::json!({
+            "schema": "apm2.fac.projection.verdict.v1",
             "owner_repo": owner_repo,
             "pr_number": pr_number,
+            "head_sha": head_sha,
             "updated_at": "2026-02-13T00:00:00Z",
-            "comments": [
-                {
-                    "id": comment_id,
-                    "body": body,
-                    "html_url": format!("https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"),
-                    "created_at": "2026-02-13T00:00:00Z",
-                    "user": {
-                        "login": reviewer_login
-                    }
-                }
-            ]
+            "decision_comment_id": comment_id,
+            "decision_comment_url": format!("https://github.com/{owner_repo}/pull/{pr_number}#issuecomment-{comment_id}"),
+            "decision_signature": "",
+            "dimensions": decision_payload["dimensions"],
         });
         let reviewer_payload = serde_json::json!({
             "schema": "apm2.fac.projection.reviewer.v1",
             "reviewer_id": reviewer_login,
             "updated_at": "2026-02-13T00:00:00Z"
         });
+        let sha_dir = pr_dir.join(format!("sha-{}", super::types::sanitize_for_path(head_sha)));
+        std::fs::create_dir_all(&sha_dir).expect("create projection sha dir");
+        let verdict_projection_bytes =
+            serde_json::to_vec_pretty(&verdict_projection_payload).expect("serialize projection");
         std::fs::write(
-            pr_dir.join("issue_comments.json"),
-            serde_json::to_vec_pretty(&issue_comments_payload).expect("serialize issue comments"),
+            pr_dir.join("verdict_projection.json"),
+            &verdict_projection_bytes,
         )
-        .expect("write issue comments projection");
+        .expect("write verdict projection");
+        std::fs::write(
+            sha_dir.join("verdict_projection.json"),
+            &verdict_projection_bytes,
+        )
+        .expect("write sha verdict projection");
         std::fs::write(
             pr_dir.join("reviewer.json"),
             serde_json::to_vec_pretty(&reviewer_payload).expect("serialize reviewer projection"),
@@ -2324,9 +3097,19 @@ mod tests {
             receipt["decision_author"],
             serde_json::json!("test-reviewer")
         );
+        let decision_summary = receipt["decision_summary"]
+            .as_str()
+            .expect("decision_summary must be present");
         assert_eq!(
-            receipt["decision_summary"],
-            serde_json::json!("security:approve|code-quality:missing")
+            decision_summary.len(),
+            64,
+            "decision_summary must be a sha256 hex digest"
+        );
+        assert!(
+            decision_summary
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "decision_summary must be lowercase hex"
         );
         let integrity_hmac = receipt["integrity_hmac"]
             .as_str()
@@ -2334,6 +3117,17 @@ mod tests {
         assert!(
             !integrity_hmac.is_empty(),
             "integrity_hmac must not be empty"
+        );
+        let loaded = super::state::load_review_run_state_for_home(home, pr_number, "security")
+            .expect("load run-state");
+        let terminal_state = match loaded {
+            super::state::ReviewRunStateLoad::Present(state) => state,
+            other => panic!("expected present state, got {other:?}"),
+        };
+        assert_eq!(terminal_state.status, ReviewRunStatus::Failed);
+        assert_eq!(
+            terminal_state.terminal_reason.as_deref(),
+            Some(super::types::TERMINAL_MANUAL_TERMINATION_DECISION_BOUND)
         );
 
         let _ = std::fs::remove_file(state_path);
@@ -2398,29 +3192,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_verdict_from_comment_body_prefers_metadata() {
-        let body = r#"
-## Security Review: PASS
-
-<!-- apm2-review-metadata:v1:security -->
-```json
-{"verdict":"FAIL"}
-```
-"#;
-        let verdict = extract_verdict_from_comment_body(body).expect("verdict from metadata");
-        assert_eq!(verdict, "FAIL");
-    }
-
-    #[test]
     fn test_pulse_file_roundtrip() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))
-                .expect("set temp pulse dir permissions");
-        }
         let path = temp_dir.path().join("review_pulse_security.json");
         write_pulse_file_to_path(&path, "0123456789abcdef").expect("write pulse");
         let pulse = read_pulse_file_from_path(&path)

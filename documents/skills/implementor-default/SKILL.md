@@ -242,7 +242,7 @@ decision_tree:
             If gates fail to start, check: (1) evidence log directory exists: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`; (2) process health: `systemctl --user status apm2-daemon`; (3) disk space: `df -h`. If disk is full, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`.
         - id: WARM_BUILD_IF_COLD
           action: |
-            If gate execution hits cold-start timeouts (240s wall-time exceeded during large compilations), pre-warm by running `cargo build --workspace` before retrying gates. This populates compiled dependencies so subsequent gate runs avoid full recompilation.
+            If gate execution hits cold-start timeouts (600s wall-time exceeded during large compilations), pre-warm by running `cargo build --workspace` before retrying gates. This populates compiled dependencies so subsequent gate runs avoid full recompilation.
         - id: READ_FAC_LOGS_ON_FAIL
           action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs under `${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/`."
         - id: HANDLE_RESOURCE_EXHAUSTION

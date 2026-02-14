@@ -118,7 +118,7 @@ decision_tree:
         - action: command
           run: "apm2 fac review prepare --help"
         - action: command
-          run: "apm2 fac review publish --help"
+          run: "apm2 fac review finding --help"
         - action: command
           run: "apm2 fac review findings --help"
         - action: command
@@ -199,14 +199,13 @@ decision_tree:
           rule: "If a handler has authority-bearing side effects but lacks AJC lifecycle enforcement (join -> revalidate -> consume -> effect), emit a MAJOR finding."
         - action: classify
           output: [blocker_count, major_count, minor_count, nit_count, verdict]
-      next: STEP_6_PUBLISH
+      next: STEP_6_RECORD_FINDINGS
 
-    - id: STEP_6_PUBLISH
-      purpose: "Publish through FAC projection path only."
+    - id: STEP_6_RECORD_FINDINGS
+      purpose: "Record findings in local FAC projection artifacts (no publish command)."
       steps[1]:
-        - action: command
-          run: "apm2 fac review publish --type security --body-file \"$temp_dir/security_findings.md\" --json"
-          capture_as: publish_json
+        - action: rule
+          rule: "For each finding, call `apm2 fac review finding --type security --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --details \"...\" --risk \"...\" --impact \"...\" --location \"...\" --json`."
       next: STEP_7_SET_VERDICT
 
     - id: STEP_7_SET_VERDICT

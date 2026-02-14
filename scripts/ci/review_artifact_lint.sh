@@ -90,11 +90,8 @@ check_dependencies
 #   - apm2 fac review — for review operations
 #
 # KNOWN-GOOD LINE ALLOWLIST (replaces blanket file exemption):
-#   CODE_QUALITY_PROMPT.md has a single legitimate gh api call that writes
-#   the ai-review/code-quality status.  Instead of exempting the entire file,
-#   we strip lines matching the known-good pattern (containing both "gh api"
-#   or "statuses" AND "ai-review/code-quality") before running checks.  All
-#   remaining content is checked by every gate.
+#   The CAC JSON prompt files use `apm2 fac review` commands exclusively.
+#   No review artifact should contain direct gh api calls.
 #
 # Similarly, `gh pr review --approve` bypasses the review gate and is always
 # forbidden in all review artifacts (no exemptions).
@@ -285,18 +282,18 @@ log_info "Primary gate: scanning for ai-review/security literal in non-exempt fi
 check_file_for_security_literal() {
     local file="$1"
     local file_basename="$2"
-    # SECURITY_REVIEW_PROMPT.md is permitted to reference the security context.
-    if [[ "$file_basename" == "SECURITY_REVIEW_PROMPT.md" ]]; then
+    # SECURITY_REVIEW_PROMPT is permitted to reference the security context.
+    if [[ "$file_basename" == "SECURITY_REVIEW_PROMPT.cac.json" ]]; then
         return 1
     fi
-    # CODE_QUALITY_PROMPT.md is a canonical controlled file that legitimately
+    # CODE_QUALITY_PROMPT is a canonical controlled file that legitimately
     # references "ai-review/code-quality" (containing the "ai-review" substring)
     # and discusses security concepts in prose.  It is exempt from the
     # split-token heuristic but NOT from the direct literal check (Check 1
     # below still applies — if it ever contains "ai-review/security" literally,
     # that would be caught).
     local exempt_from_split_token=0
-    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
+    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.cac.json" ]]; then
         exempt_from_split_token=1
     fi
 
@@ -315,7 +312,7 @@ check_file_for_security_literal() {
         match_info=$(grep -ni 'ai-review/security' "$file" | head -1 || echo "(found in flattened stream)")
         log_error "Forbidden ai-review/security literal in non-exempt review artifact:"
         log_error "  ${file}: ${match_info}"
-        log_error "  Only SECURITY_REVIEW_PROMPT.md may reference this context."
+        log_error "  Only SECURITY_REVIEW_PROMPT.cac.json may reference this context."
         return 0
     fi
 
@@ -339,7 +336,7 @@ check_file_for_security_literal() {
             log_error "  ${file}"
             log_error "  Both 'ai-review' and 'security' appear in code context."
             log_error "  This may be split-token construction of the forbidden context."
-            log_error "  Only SECURITY_REVIEW_PROMPT.md may reference the security context."
+            log_error "  Only SECURITY_REVIEW_PROMPT.cac.json may reference the security context."
             return 0
         fi
     fi
@@ -360,7 +357,7 @@ while IFS= read -r review_file; do
         VIOLATIONS=1
     fi
 
-done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
+done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' -o -name '*PROMPT*.json' \) 2>/dev/null)
 
 # Defense-in-depth: per-line pattern detection via continuation-joined lines.
 # This catches patterns even if the file-level check somehow missed them.
@@ -383,16 +380,16 @@ while IFS= read -r review_file; do
             VIOLATIONS=1
         fi
     done < <(join_continuations "$review_file")
-done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
+done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' -o -name '*PROMPT*.json' \) 2>/dev/null)
 
 # Check 2: Review prompt metadata templates must require head_sha and pr_number binding.
-# Both CODE_QUALITY_PROMPT.md and SECURITY_REVIEW_PROMPT.md must contain
-# metadata block constraints that enforce SHA pinning.
+# Both CODE_QUALITY_PROMPT.cac.json and SECURITY_REVIEW_PROMPT.cac.json must
+# contain metadata block constraints that enforce SHA pinning.
 log_info "Checking review prompt metadata SHA-pinning constraints..."
 
 REVIEW_PROMPTS=(
-    "${REVIEW_DIR}/CODE_QUALITY_PROMPT.md"
-    "${REVIEW_DIR}/SECURITY_REVIEW_PROMPT.md"
+    "${REVIEW_DIR}/CODE_QUALITY_PROMPT.cac.json"
+    "${REVIEW_DIR}/SECURITY_REVIEW_PROMPT.cac.json"
 )
 
 for prompt_file in "${REVIEW_PROMPTS[@]}"; do

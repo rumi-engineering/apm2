@@ -1,8 +1,7 @@
 //! Local authoritative projection storage for FAC review CLI flows.
 //!
 //! This module provides a local-first state surface under
-//! `~/.apm2/fac_projection`. GitHub reads are treated as temporary fallback and
-//! can be disabled via `APM2_FAC_GH_READ_FALLBACK=0`.
+//! `~/.apm2/fac_projection`.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -23,7 +22,6 @@ const BRANCH_HINT_SCHEMA: &str = "apm2.fac.projection.branch_hint.v1";
 const ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
 const REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 const PR_BODY_SCHEMA: &str = "apm2.fac.projection.pr_body.v1";
-const GH_READ_FALLBACK_ENV: &str = "APM2_FAC_GH_READ_FALLBACK";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +36,31 @@ pub(super) struct ProjectionIdentityRecord {
     pub worktree: Option<String>,
     pub source: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectionIdentitySnapshot {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub head_sha: String,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub source: String,
+    pub updated_at: String,
+}
+
+impl From<ProjectionIdentityRecord> for ProjectionIdentitySnapshot {
+    fn from(value: ProjectionIdentityRecord) -> Self {
+        Self {
+            owner_repo: value.owner_repo,
+            pr_number: value.pr_number,
+            head_sha: value.head_sha,
+            branch: value.branch,
+            worktree: value.worktree,
+            source: value.source,
+            updated_at: value.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,20 +99,6 @@ struct PrBodySnapshot {
     body: String,
     source: String,
     updated_at: String,
-}
-
-pub(super) fn gh_read_fallback_enabled() -> bool {
-    let Some(raw) = std::env::var_os(GH_READ_FALLBACK_ENV) else {
-        return true;
-    };
-    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
-    !matches!(value.as_str(), "0" | "false" | "no" | "off")
-}
-
-pub(super) fn gh_read_fallback_disabled_error(operation: &str) -> String {
-    format!(
-        "{operation} requires local projection data; GitHub read fallback is disabled (set {GH_READ_FALLBACK_ENV}=1 temporarily to allow bootstrap)"
-    )
 }
 
 fn projection_root() -> Result<PathBuf, String> {
@@ -135,10 +144,6 @@ fn reviewer_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
 
 fn pr_body_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(pr_dir(owner_repo, pr_number)?.join("pr_body_snapshot.json"))
-}
-
-fn fallback_reads_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
-    Ok(pr_dir(owner_repo, pr_number)?.join("fallback_reads.ndjson"))
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -238,6 +243,13 @@ pub(super) fn load_pr_identity(
     pr_number: u32,
 ) -> Result<Option<ProjectionIdentityRecord>, String> {
     read_json_optional(&identity_path(owner_repo, pr_number)?)
+}
+
+pub fn load_pr_identity_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<ProjectionIdentitySnapshot>, String> {
+    Ok(load_pr_identity(owner_repo, pr_number)?.map(ProjectionIdentitySnapshot::from))
 }
 
 pub(super) fn load_branch_identity(
@@ -397,26 +409,6 @@ pub(super) fn load_pr_body_snapshot(
         return Ok(None);
     };
     Ok(Some(payload.body))
-}
-
-pub(super) fn record_fallback_read(
-    owner_repo: &str,
-    pr_number: u32,
-    operation: &str,
-) -> Result<(), String> {
-    let path = fallback_reads_path(owner_repo, pr_number)?;
-    ensure_parent_dir(&path)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| format!("failed to open fallback log {}: {err}", path.display()))?;
-    let line = serde_json::json!({
-        "ts": now_iso8601(),
-        "operation": operation,
-    });
-    writeln!(file, "{line}")
-        .map_err(|err| format!("failed to append fallback log {}: {err}", path.display()))
 }
 
 fn current_branch() -> Result<String, String> {

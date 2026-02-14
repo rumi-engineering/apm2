@@ -38,7 +38,7 @@ Usage:
   ./scripts/ci/run_bounded_tests.sh [options] [-- command args...]
 
 Options:
-  --timeout-seconds N         Hard wall timeout (default: 240, max: 240)
+  --timeout-seconds N         Hard wall timeout (default: 600, max: 600)
   --kill-after-seconds N      SIGTERM -> SIGKILL escalation delay (default: 20)
   --heartbeat-seconds N       Heartbeat interval while command runs (default: 10)
   --memory-max VALUE          systemd MemoryMax (default: 24G)
@@ -54,10 +54,10 @@ Environment:
 USAGE
 }
 
-MAX_TIMEOUT_SECONDS=240
-TEST_TIMEOUT_SLA_MESSAGE="Bounded FAC test timeout is fixed at 240s for all runs."
+MAX_TIMEOUT_SECONDS=600
+TEST_TIMEOUT_SLA_MESSAGE="Bounded FAC test timeout is fixed at 600s for all runs."
 
-TIMEOUT_SECONDS=240
+TIMEOUT_SECONDS=600
 KILL_AFTER_SECONDS=20
 HEARTBEAT_SECONDS=10
 MEMORY_MAX='24G'

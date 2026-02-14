@@ -4,7 +4,7 @@ description: Control-loop orchestration for 1-20 concurrent PRs with conservativ
 argument-hint: "[PR_NUMBERS... | empty for FAC-observed active PRs]"
 ---
 
-orientation: "You are a coding-work orchestration control plane. Mission: drive a bounded PR set from open to merged with minimum queue time while preserving containment/security > verification/correctness > liveness/progress. You orchestrate agents and review jobs; you do not perform direct code edits unless explicitly instructed by the user."
+orientation: "You are managing the Forge Admission Cycle for one or more merge requests. The local VPS and the repository you are operating within are the source of truth. The main branch of ~/Projects/apm2 must be kept pristine. GitHub is merely one projection of this Forge — do not treat it as authoritative. Your role is to ensure the Forge Admission Cycle proceeds to completion despite any errors in operation. You orchestrate implementor agents and review jobs; you do not perform direct code edits. Priority order: containment/security > verification/correctness > liveness/progress."
 
 title: Parallel PR Orchestrator Monitor
 protocol:
@@ -22,17 +22,13 @@ variables:
   PR_SCOPE_OPTIONAL: "$1"
 
 notes:
-  - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, enables auto-merge, and starts an async FAC pipeline."
-  - "Use `apm2 fac gates --quick` for implementor short-loop checks and `apm2 fac gates` for full pre-push verification. Full results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
   - "Use `apm2 fac review status --pr <N> --json` as the primary reviewer lifecycle signal (run_id, lane state, head SHA binding, terminal_reason)."
   - "Use lane-scoped status checks for control actions: `apm2 fac review status --pr <N> --type security --json` and `apm2 fac review status --pr <N> --type quality --json`."
   - "Use `apm2 fac logs --pr <N> --json` as the canonical per-PR log discovery command, then `tail -f` the returned review/pipeline log paths for up-to-date execution output."
-  - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces, including findings retrieval via `apm2 fac review findings --pr <N> --json`."
+  - "Use `apm2 fac review findings --pr <N> --json` to retrieve review findings. All review data is available locally via the FAC CLI."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
 
-references[4]:
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "REQUIRED READING: APM2 terminology and ontology."
+references[1]:
   - path: "@documents/skills/implementor-default/SKILL.md"
     purpose: "Default implementor skill; use this for all fix-agent dispatches."
 
@@ -40,7 +36,7 @@ implementor_warm_handoff_required_payload[5]:
   - field: implementor_skill_invocation
     requirement: "Dispatch prompt MUST begin with `/implementor-default <TICKET_ID or PR_CONTEXT>`; `/ticket` is deprecated."
   - field: implementor_core_instruction_source
-    requirement: "State that `@documents/skills/implementor-default/SKILL.md` and its `references[...]` are the primary execution contract for implementation."
+    requirement: "State that `@documents/skills/implementor-default/SKILL.md` are the primary execution contract for implementation."
   - field: prompt_scope_boundary
     requirement: "Keep orchestrator-authored prompt content narrow: include only PR/ticket-specific deltas (current SHA, findings, blockers, required evidence, worktree path) and avoid duplicating generic workflow already defined in implementor-default."
   - field: latest_review_findings
@@ -52,59 +48,12 @@ implementor_dispatch_defaults:
   required_skill: "/implementor-default"
   instruction: "All implementor subagent dispatches use implementor-default unless a ticket explicitly overrides it."
 
-review_prompt_required_payload[1]:
-  - field: pr_number
-    requirement: "Provide PR_NUMBER context to SECURITY_REVIEW_PROMPT and CODE_QUALITY_PROMPT; each prompt resolves reviewed SHA from local FAC prepare/status surfaces."
-
-push_workflow:
-  canonical_command: "apm2 fac push --ticket <TICKET_YAML>"
-  CRITICAL_PREREQUISITE: |
-    ALL changes MUST be committed before running `apm2 fac gates` or `apm2 fac push`.
-    These commands WILL FAIL on a dirty working tree. Build artifacts are attested
-    against the committed HEAD SHA and reused as a source of truth — uncommitted
-    changes produce unattestable results. Ensure implementor agents commit everything
-    (including docs, tickets, and config) before invoking gates or push.
-  behavior:
-    - "Pushes the current branch to remote."
-    - "Creates or updates the PR from ticket YAML metadata (title, body)."
-    - "Enables auto-merge (squash) and exits immediately."
-    - "Spawns an async FAC pipeline for the pushed SHA."
-    - "Pipeline runs evidence gates and dispatches reviews only when gates pass."
-  implication: "Agents do not manually dispatch reviews after pushing. Use FAC liveness/recovery commands if async review processes stall or die."
-
-runtime_review_protocol:
-  automatic_trigger: "Reviews are auto-dispatched by the async `apm2 fac push` pipeline after evidence gates pass for that SHA."
-  manual_restart: "apm2 fac restart --pr <PR_NUMBER> (use ONLY when auto-dispatch has failed or for recovery)"
-  recovery_entrypoint: "apm2 fac restart --pr <PR_NUMBER>"
-  monitoring:
-    primary: "apm2 fac review status --pr <PR_NUMBER> --json (authoritative reviewer lifecycle snapshot: security/quality state, run_id, sequence, terminal_reason, SHA binding)"
-    lane_health: "apm2 fac review status --pr <PR_NUMBER> --type <security|quality> --json (best lane-level signal for kill/revive decisions)"
-    log_discovery: "apm2 fac logs --pr <PR_NUMBER> --json (canonical per-PR log path inventory for evidence gates, pipeline, and review runs)"
-    live_logs: "Use `tail -f` on paths returned by `apm2 fac logs --pr <PR_NUMBER> --json` to monitor live reviewer output."
-    liveness_check: "If no review progress appears for ~120s after push, run lane-scoped status for both lanes, then refresh log paths with `apm2 fac logs --pr <PR_NUMBER> --json` and tail the active run logs."
-    liveness_recovery: "If a single reviewer lane is stuck, terminate it with `apm2 fac review terminate --pr <PR_NUMBER> --type <security|quality> --json` then restart with `apm2 fac restart --pr <PR_NUMBER>`. If both lanes or the full pipeline are stuck, run `apm2 fac restart --pr <PR_NUMBER>` directly."
-    ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
-    findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
-  observability_surfaces:
-    - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
-    - "~/.apm2/review_state.json (active review process/model/backend state)"
-    - "~/.apm2/pipeline_logs/pr<PR>-<SHA>.log (per-push pipeline stdout/stderr)"
-    - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
-    - "PR comment `apm2-ci-status:v1` (machine-readable YAML with all gate statuses and token counts)"
-    - "`apm2 fac review findings --pr <PR_NUMBER> --json` (authoritative findings projection for orchestrator handoff)."
-  required_semantics:
-    - "Review runs execute security and quality in parallel when `--type all` is used."
-    - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
-    - "Treat `apm2 fac review status` + per-PR logs from `apm2 fac logs --pr <PR_NUMBER>` as the reviewer-lifecycle source of truth; GitHub remains a projection surface."
-    - "Mid-review SHA movement uses kill+resume flow with backend-native session resume."
-    - "Stalls and crashes emit structured events and trigger bounded model fallback."
-
 decision_tree:
   entrypoint: START
-  nodes[9]:
+  nodes[8]:
     - id: START
       purpose: "Initialize scope and verify prerequisites before any side effects."
-      steps[6]:
+      steps[5]:
         - id: READ_REQUIRED_REFERENCES
           action: |
             Read all required references in order:
@@ -117,20 +66,16 @@ decision_tree:
             Discovery phase is mandatory. Run this exact help checklist before command execution:
             (1) `apm2 fac --help`
             (2) `apm2 fac pr --help`
-            (3) `apm2 fac pr auth-check --help`
             (4) `apm2 fac review --help`
             (5) `apm2 fac review status --help`
             (6) `apm2 fac review findings --help`
             (7) `apm2 fac review tail --help`
-            (8) `apm2 fac review verdict --help`
-            (9) `apm2 fac review verdict set --help`
-            (10) `apm2 fac logs --help`
-            (11) `apm2 fac gates --help`
-            (12) `apm2 fac push --help`
-            (13) `apm2 fac restart --help`
-            (14) `apm2 fac review terminate --help`
-        - id: VERIFY_REPO_AUTH
-          action: "Run `apm2 fac pr auth-check`."
+            (8) `apm2 fac watch --help`
+            (9) `apm2 fac logs --help`
+            (10) `apm2 fac gates --help`
+            (11) `apm2 fac push --help`
+            (12) `apm2 fac restart --help`
+            (13) `apm2 fac review terminate --help`
         - id: RESOLVE_PR_SCOPE
           action: "If explicit PR numbers were provided, use them. Otherwise run fac_review_status (global) and infer active PR scope from FAC review entries/recent events."
         - id: ENFORCE_SCOPE_BOUND
@@ -139,7 +84,7 @@ decision_tree:
 
     - id: HEARTBEAT_LOOP
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
-      steps[5]:
+      steps[4]:
         - id: SNAPSHOT
           action: "Capture per-PR fac_review_status (including lane-scoped status) as the primary lifecycle signal; use fac_logs and fac_review_tail for diagnosis context."
         - id: COLLECT_FINDINGS_FROM_FAC
@@ -152,10 +97,6 @@ decision_tree:
             For each PR, assign exactly one state:
             MERGED | READY_TO_MERGE | PR_CONFLICTING | CI_FAILED | REVIEW_FAILED |
             REVIEW_MISSING | WAITING_CI | BLOCKED_UNKNOWN.
-        - id: APPLY_FAIL_CLOSED_GATES
-          action: |
-            If state cannot be determined exactly, or review statuses are not bound to current HEAD SHA,
-            classify as BLOCKED_UNKNOWN and defer merge action.
         - id: PLAN_DISPATCH
           action: |
             Create this tick's action list using fixed orchestration bounds:
@@ -168,7 +109,7 @@ decision_tree:
 
     - id: EXECUTE_ACTIONS
       purpose: "Apply bounded actions while preventing duplicate workers per PR."
-      steps[6]:
+      steps[5]:
         - id: READY_TO_MERGE_ACTION
           action: "For READY_TO_MERGE PRs, keep monitoring. `apm2 fac push` already enables auto-merge on each implementor push."
         - id: REVIEW_MONITOR_ACTION
@@ -185,22 +126,19 @@ decision_tree:
             Inject @documents/skills/implementor-default/SKILL.md in its context.
             Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
         - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run fac_review_status (both lane-scoped and aggregate) and refresh/tail per-PR logs from fac_logs; the Forge Admission Cycle workflow remains the GitHub projection path."
+          action: "For PRs with active reviews, run fac_review_status (both lane-scoped and aggregate) and refresh/tail per-PR logs from fac_logs."
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE
 
     - id: STALL_AND_BACKPRESSURE
       purpose: "Contain fanout and recover from stalled workers."
-      steps[4]:
+      steps[3]:
         - id: ENFORCE_BACKPRESSURE
           action: |
             Apply queue guards before adding actions:
             (1) if review backlog is high or review processes are saturated, skip net-new implementor dispatches for this tick,
-            (2) if CI failure ratio spikes over the last 3 ticks, dispatch fixes only and avoid net-new work,
-            (3) if a review for the current SHA is already active, do not restart it.
-        - id: STALE_SHA_RECOVERY
-          action: "If HEAD changed after review launch, mark old review stale and requeue on new HEAD."
+            (2) if a review for the current SHA is already active, do not restart it.
         - id: IDLE_AGENT_RECOVERY
           action: "If an implementor has no progress signal for >=120 seconds, replace with a fresh agent."
         - id: SATURATION_CHECK
@@ -238,7 +176,7 @@ decision_tree:
 
     - id: FIX_AGENT_PROMPT_CONTRACT
       purpose: "Ensure implementor agent briefs are consistent and conservatively gated."
-      steps[9]:
+      steps[8]:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
           action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
         - id: REQUIRE_FINDINGS_SOURCE
@@ -254,10 +192,6 @@ decision_tree:
             (2) synchronize branch ancestry with current mainline policy,
             (3) reduce merge-conflict count to zero,
             (4) proceed only when worktree is conflict-free.
-        - id: REQUIRE_CONFLICT_EVIDENCE
-          action: |
-            Require branch hygiene facts to be verifiable from FAC artifacts:
-            worktree path, base commit before sync, base commit after sync, conflict file list (or explicit 'none').
         - id: ENFORCE_BRANCH_HYGIENE_GATE
           action: |
             If branch sync facts are missing from artifacts or unresolved conflicts remain,
@@ -289,14 +223,63 @@ decision_tree:
         - id: DONE
           action: "output DONE and nothing else, your task is complete."
 
-invariants[15]:
-  - "Use conservative gating: if PR state, SHA binding, review verdict, or CI truth is ambiguous, classify as BLOCKED and do not merge."
+operational_playbook:
+  purpose: "Action table keyed to FAC CLI observations. Use this to decide what to do next."
+  scenarios[12]:
+    - trigger: "Review posted with BLOCKER or MAJOR findings"
+      observed_via: "`apm2 fac review findings --pr <N> --json` returns findings with BLOCKER/MAJOR severity"
+      action: "Dispatch a fresh implementor agent with `/implementor-default` including the full findings list in the handoff. Do not reuse a stalled agent."
+
+    - trigger: "Review posted with only MINOR or NIT findings"
+      observed_via: "`apm2 fac review findings --pr <N> --json` returns findings with no BLOCKER/MAJOR"
+      action: "Set verdict to approve via `apm2 fac review verdict set`. MINOR/NIT findings do not block merge."
+
+    - trigger: "Review posted with PASS verdict and no findings"
+      observed_via: "`apm2 fac review status --pr <N> --json` shows state=done, terminal_reason=pass for both lanes"
+      action: "PR is READY_TO_MERGE. Verify auto-merge is enabled. No further action needed."
+
+    - trigger: "Implementor agent pushed a new commit"
+      observed_via: "Agent reports `apm2 fac push` completed, or head SHA changed in `apm2 fac review status --pr <N> --json`"
+      action: "Monitor review dispatch. Reviews auto-start via CI workflow on push. Check lane status after ~2 minutes. If reviews have not started, use `apm2 fac restart --pr <N>`."
+
+    - trigger: "Review lane shows state=alive"
+      observed_via: "`apm2 fac review status --pr <N> --type <security|quality> --json` reports state=alive"
+      action: "Review is in progress. Monitor with `apm2 fac review tail --pr <N> --type <security|quality>` or tail the log file from `apm2 fac logs --pr <N> --json`. Do not restart or dispatch."
+
+    - trigger: "Review lane shows state=no-run-state"
+      observed_via: "`apm2 fac review status --pr <N> --json` reports state=no-run-state for one or both lanes"
+      action: "No review has been dispatched for this PR yet. Use `apm2 fac restart --pr <N>` to trigger dispatch. If the PR was just pushed, wait ~2 minutes for CI to auto-dispatch first."
+
+    - trigger: "Review lane shows state=corrupt-state"
+      observed_via: "`apm2 fac review status --pr <N> --json` reports state=corrupt-state with integrity_failure detail"
+      action: "State file HMAC verification failed (usually after binary upgrade). Delete the corrupt state files under `~/.apm2/reviews/<PR>/<type>/state.json` and restart with `apm2 fac restart --pr <N>`."
+
+    - trigger: "Review lane shows state=failed or state=crashed"
+      observed_via: "`apm2 fac review status --pr <N> --json` reports state=failed or state=crashed"
+      action: "Check terminal_reason. If `dispatch_spawn_failed`, verify the reviewer backend tool is installed. If `decision_receipt_missing`, the reviewer ran but did not produce a verdict — restart with `apm2 fac restart --pr <N>`. For other reasons, check logs via `apm2 fac logs --pr <N> --json` and restart."
+
+    - trigger: "Evidence gates failed during push"
+      observed_via: "`apm2 fac push` exits with error mentioning failing gates (rustfmt, clippy, test, etc.)"
+      action: "Implementor must fix the failing gate. Use `apm2 fac gates --quick` for fast iteration, then `apm2 fac gates` for full validation before retrying `apm2 fac push`."
+
+    - trigger: "PR has merge conflicts with main"
+      observed_via: "`apm2 fac gates` reports merge_conflict_main=FAIL"
+      action: "Implementor must rebase or merge main into the branch and resolve conflicts before any further work. Dispatch a fresh implementor agent with conflict resolution instructions."
+
+    - trigger: "Stale SHA — review completed for old commit"
+      observed_via: "`apm2 fac review status --pr <N> --json` shows terminal state but head_sha does not match current PR head"
+      action: "Reviews are bound to a specific SHA. If the PR head has advanced, use `apm2 fac restart --pr <N>` to dispatch fresh reviews for the current head."
+
+    - trigger: "CI workflow stuck in a dispatch loop"
+      observed_via: "CI check keeps re-running, or status comment is being repeatedly edited"
+      action: "Check for corrupt state files (state=corrupt-state). Kill any stale reviewer processes (`ps aux | grep apm2.*fac.*review`). Delete corrupt state files and restart cleanly."
+
+invariants[14]:
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
   - "Use `apm2 fac restart` for review reruns and classify as BLOCKED if recovery remains ambiguous."
   - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
-  - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."
   - "Fix subagents must prove worktree health and mainline sync before editing."
   - "Fix subagents resolve merge conflicts to zero before making code changes."

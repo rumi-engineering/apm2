@@ -12,8 +12,6 @@
       "documents/security/INCIDENT_RESPONSE.cac.json"
     ],
     "replaces": "documents/security/consensus-runbook.md",
-    "created_at": "2026-02-05T00:00:00Z",
-    "updated_at": "2026-02-05T00:00:00Z",
     "last_aligned_rfc": "RFC-0020",
     "canonicalizer": {
       "canonicalizer_id": "apm2.canonicalizer.jcs",

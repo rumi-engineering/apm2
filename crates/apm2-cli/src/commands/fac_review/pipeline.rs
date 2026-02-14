@@ -4,9 +4,8 @@
 //! PR. Runs evidence gates with CI status comment updates, then dispatches
 //! reviews if all gates pass.
 
-use super::dispatch::dispatch_single_review;
+use super::dispatch::resolve_worktree_for_sha;
 use super::evidence::run_evidence_gates_with_status;
-use super::types::ReviewKind;
 use crate::exit_codes::codes as exit_codes;
 
 /// Run the full evidence → review pipeline.
@@ -30,8 +29,7 @@ pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str) -> u8 {
 }
 
 fn run_pipeline_inner(repo: &str, pr_number: u32, sha: &str) -> Result<bool, String> {
-    let workspace_root =
-        std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
+    let workspace_root = resolve_worktree_for_sha(sha)?;
 
     eprintln!("pipeline: running evidence gates for PR #{pr_number} sha={sha}");
 
@@ -44,34 +42,16 @@ fn run_pipeline_inner(repo: &str, pr_number: u32, sha: &str) -> Result<bool, Str
 
     eprintln!("pipeline: evidence gates PASSED — dispatching reviews");
 
-    let dispatch_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        match dispatch_single_review(repo, pr_number, kind, sha, dispatch_epoch) {
-            Ok(result) => {
-                eprintln!(
-                    "pipeline: dispatched {} review (mode={}{})",
-                    result.review_type,
-                    result.mode,
-                    result
-                        .pid
-                        .map_or_else(String::new, |p| format!(", pid={p}")),
-                );
-            },
-            Err(err) => {
-                eprintln!(
-                    "pipeline: failed to dispatch {} review: {err}",
-                    kind.as_str()
-                );
-                return Err(format!(
-                    "review dispatch failed for {}: {err}",
-                    kind.as_str()
-                ));
-            },
-        }
+    let results = super::dispatch_reviews_with_lifecycle(repo, pr_number, sha, false)?;
+    for result in results {
+        eprintln!(
+            "pipeline: dispatched {} review (mode={}{})",
+            result.review_type,
+            result.mode,
+            result
+                .pid
+                .map_or_else(String::new, |p| format!(", pid={p}")),
+        );
     }
 
     eprintln!("pipeline: complete");

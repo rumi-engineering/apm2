@@ -317,7 +317,7 @@ Symptom: apm2 fac gates hangs or returns immediately with no output
 2. Check evidence logs: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and `apm2 fac --json logs`
 3. Check disk space: `df -h` and `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/"`
 
-### 6.2 Cold-start timeout (240s exceeded)
+### 6.2 Cold-start timeout (600s exceeded)
 
 ```
 Symptom: Test gate fails with timeout during large compilation

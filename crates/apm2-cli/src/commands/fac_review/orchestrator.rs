@@ -10,8 +10,6 @@ use super::backend::{
     build_prompt_content, build_resume_spawn_command_for_backend, build_sha_update_message,
     build_spawn_command_for_backend,
 };
-use super::barrier::fetch_pr_head_sha_local;
-use super::decision::resolve_completion_signal_from_projection_for_home;
 use super::detection::{detect_comment_permission_denied, detect_http_400_or_rate_limit};
 use super::events::emit_event;
 use super::liveness::scan_log_liveness;
@@ -20,6 +18,8 @@ use super::model_pool::{
     acquire_provider_slot, backoff_before_cross_family_fallback, ensure_model_backend_available,
     select_cross_family_fallback, select_fallback_model, select_review_model_random,
 };
+use super::prepare::prepared_review_root;
+use super::projection::fetch_pr_head_sha_authoritative;
 use super::state::{
     COMPLETION_RECEIPT_SCHEMA, ReviewRunCompletionReceipt, build_review_run_id, build_run_key,
     find_active_review_entry, get_process_start_time, load_review_run_completion_receipt,
@@ -34,9 +34,9 @@ use super::types::{
     SingleReviewSummary, SpawnMode, apm2_home_dir, is_verdict_finalized_agent_stop_reason,
     now_iso8601, split_owner_repo, validate_expected_head_sha,
 };
+use super::verdict_projection::resolve_completion_signal_from_projection_for_home;
 
 const STALE_ARTIFACT_TTL_SECS_DEFAULT: u64 = 24 * 60 * 60;
-const PREPARED_REVIEW_ROOT: &str = "/tmp/apm2-fac-review";
 const STALE_TEMP_FILE_PREFIXES: [&str; 3] = [
     "apm2_fac_review_",
     "apm2_fac_prompt_",
@@ -139,7 +139,8 @@ fn cleanup_stale_temp_files(ttl: Duration) -> Result<(), String> {
 }
 
 fn cleanup_stale_prepared_inputs(ttl: Duration) -> Result<(), String> {
-    let root = std::path::Path::new(PREPARED_REVIEW_ROOT);
+    let root_path = prepared_review_root();
+    let root = root_path.as_path();
     if !root.exists() {
         return Ok(());
     }
@@ -290,7 +291,7 @@ pub fn run_review_inner(
         eprintln!("WARNING: failed to clean stale FAC artifacts: {err}");
     }
     let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
-    let current_head_sha = fetch_pr_head_sha_local(pr_number)?;
+    let current_head_sha = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
         if !expected.eq_ignore_ascii_case(&current_head_sha) {
@@ -702,7 +703,7 @@ fn run_single_review(
             &run_id,
             &current_head_sha,
         )? {
-            let latest_head = fetch_pr_head_sha_local(pr_number)?;
+            let latest_head = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
             if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
                 let old_sha = current_head_sha.clone();
                 emit_run_event(
@@ -899,7 +900,7 @@ fn run_single_review(
                     }),
                 )?;
                 super::terminate_child(&mut child)?;
-                let latest_head = fetch_pr_head_sha_local(pr_number)?;
+                let latest_head = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
                 emit_run_event(
                     "pulse_check",
                     &current_head_sha,
@@ -1025,7 +1026,7 @@ fn run_single_review(
                             )?;
                         }
 
-                        let latest_head = fetch_pr_head_sha_local(pr_number)?;
+                        let latest_head = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
                         emit_run_event(
                             "pulse_check",
                             &current_head_sha,
@@ -1320,7 +1321,7 @@ fn run_single_review(
             thread::sleep(LOOP_SLEEP);
 
             if last_pulse_check.elapsed() >= PULSE_POLL_INTERVAL {
-                let latest_head = fetch_pr_head_sha_local(pr_number)?;
+                let latest_head = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
                 emit_run_event(
                     "pulse_check",
                     &current_head_sha,

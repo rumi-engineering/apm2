@@ -3,16 +3,15 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::barrier::{ensure_gh_cli_ready, resolve_authenticated_gh_login};
-use super::selector::{
+use super::findings::{
     SelectorToken, parse_selector, parse_selector_type, render_tool_output_selector,
 };
-use super::types::{QUALITY_MARKER, SECURITY_MARKER, apm2_home_dir, validate_expected_head_sha};
+use super::findings_store;
+use super::types::apm2_home_dir;
 use crate::exit_codes::codes as exit_codes;
 
 const SELECTOR_ZOOM_SCHEMA: &str = "apm2.fac.selector_zoom.v1";
@@ -43,28 +42,6 @@ struct SelectorZoomSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     sha_binding: Option<String>,
     payload: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct IssueComment {
-    id: u64,
-    body: String,
-    html_url: String,
-    #[serde(default)]
-    user: Option<IssueUser>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct IssueUser {
-    login: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ReviewMetadata {
-    schema: String,
-    review_type: String,
-    pr_number: u32,
-    head_sha: String,
 }
 
 // ── Selector zoom-in ────────────────────────────────────────────────────────
@@ -125,81 +102,64 @@ fn resolve_selector_zoom(
 
     match parsed_selector {
         SelectorToken::Finding(finding) => {
-            ensure_gh_cli_ready()?;
-            let expected_author = resolve_authenticated_gh_login().ok_or_else(|| {
-                "failed to resolve authenticated GitHub login for trusted selector zoom".to_string()
+            let bundle = findings_store::load_findings_bundle(
+                &finding.owner_repo,
+                finding.pr,
+                &finding.sha,
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "missing SHA-bound findings bundle for repo={} pr={} sha={}",
+                    finding.owner_repo, finding.pr, finding.sha
+                )
             })?;
 
-            let comment = fetch_issue_comment(&finding.owner_repo, finding.comment_id)?;
-            let comment_author = comment
-                .user
-                .as_ref()
-                .map(|user| user.login.as_str())
-                .unwrap_or_default();
-            if !comment_author.eq_ignore_ascii_case(&expected_author) {
-                return Err(format!(
-                    "comment {} was authored by `{comment_author}`, expected trusted login `{expected_author}`",
-                    comment.id
-                ));
-            }
-
-            let marker = marker_for_dimension(&finding.dimension)?;
-            let metadata = parse_metadata_from_comment(&comment.body, marker)?;
-            if metadata.schema != "apm2.review.metadata.v1" {
-                return Err(format!(
-                    "invalid metadata schema `{}` for finding selector",
-                    metadata.schema
-                ));
-            }
-            validate_expected_head_sha(&metadata.head_sha)?;
-            if metadata.pr_number != finding.pr {
-                return Err(format!(
-                    "selector PR #{} does not match comment metadata PR #{}",
-                    finding.pr, metadata.pr_number
-                ));
-            }
-            if !metadata.head_sha.eq_ignore_ascii_case(&finding.sha) {
-                return Err(format!(
-                    "selector SHA {} does not match comment metadata SHA {}",
-                    finding.sha, metadata.head_sha
-                ));
-            }
-            if normalize_review_type(&metadata.review_type) != finding.dimension {
-                return Err(format!(
-                    "selector dimension `{}` does not match comment metadata dimension `{}`",
-                    finding.dimension, metadata.review_type
-                ));
-            }
-
-            let line_text = comment
-                .body
-                .lines()
-                .nth(finding.line.saturating_sub(1))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+            let dimension = findings_store::find_dimension(&bundle, &finding.dimension)
                 .ok_or_else(|| {
                     format!(
-                        "selector line {} is missing or empty in comment {}",
-                        finding.line, finding.comment_id
+                        "missing SHA-bound findings for dimension `{}` in repo={} pr={} sha={}",
+                        finding.dimension, finding.owner_repo, finding.pr, finding.sha
                     )
                 })?;
 
-            let digest = sha256_hex(comment.body.as_bytes());
-            let content_ref = format!("{}#line-{}", comment.html_url, finding.line);
+            let finding_record =
+                findings_store::find_finding(&bundle, &finding.dimension, &finding.finding_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing SHA-bound finding `{}` for dimension `{}`",
+                            finding.finding_id, finding.dimension
+                        )
+                    })?;
+
+            let bundle_path = findings_store::findings_bundle_path(
+                &finding.owner_repo,
+                finding.pr,
+                &finding.sha,
+            )?;
+            let content_ref = format!("{}#{}", bundle_path.display(), finding_record.finding_id);
+
+            let content_digest = if finding_record.evidence_digest.trim().is_empty() {
+                sha256_hex(finding_record.summary.as_bytes())
+            } else {
+                finding_record.evidence_digest.clone()
+            };
+
             let payload = serde_json::json!({
                 "owner_repo": finding.owner_repo,
                 "pr": finding.pr,
                 "dimension": finding.dimension,
-                "comment_id": finding.comment_id,
-                "line": finding.line,
-                "text": line_text,
+                "status": dimension.status,
+                "verdict": dimension.verdict,
+                "finding_id": finding_record.finding_id,
+                "severity": finding_record.severity,
+                "summary": finding_record.summary,
             });
 
             Ok(SelectorZoomSummary {
                 schema: SELECTOR_ZOOM_SCHEMA.to_string(),
                 selector_type: parsed_type.as_str().to_string(),
                 selector: selector.to_string(),
-                content_digest: digest,
+                content_digest,
                 content_ref,
                 sha_binding: Some(finding.sha),
                 payload,
@@ -238,62 +198,6 @@ fn resolve_selector_zoom(
             })
         },
     }
-}
-
-fn fetch_issue_comment(owner_repo: &str, comment_id: u64) -> Result<IssueComment, String> {
-    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
-    let output = Command::new("gh")
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for comment lookup: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh api failed fetching comment {}: {}",
-            comment_id,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    serde_json::from_slice::<IssueComment>(&output.stdout)
-        .map_err(|err| format!("failed to parse comment payload for {comment_id}: {err}"))
-}
-
-fn marker_for_dimension(dimension: &str) -> Result<&'static str, String> {
-    match dimension {
-        "security" => Ok(SECURITY_MARKER),
-        "code-quality" => Ok(QUALITY_MARKER),
-        other => Err(format!(
-            "unsupported finding dimension `{other}` for selector zoom"
-        )),
-    }
-}
-
-fn normalize_review_type(input: &str) -> String {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "security" => "security".to_string(),
-        "quality" | "code-quality" | "code_quality" => "code-quality".to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn parse_metadata_from_comment(body: &str, marker: &str) -> Result<ReviewMetadata, String> {
-    let marker_idx = body
-        .find(marker)
-        .ok_or_else(|| format!("missing expected marker `{marker}` in comment body"))?;
-    let after_marker = &body[marker_idx + marker.len()..];
-    let json_payload = extract_fenced_block(after_marker, "json")
-        .ok_or_else(|| "missing fenced json metadata block after marker".to_string())?;
-    serde_json::from_str::<ReviewMetadata>(json_payload)
-        .map_err(|err| format!("failed to parse metadata JSON: {err}"))
-}
-
-fn extract_fenced_block<'a>(source: &'a str, language: &str) -> Option<&'a str> {
-    let start_marker = format!("```{language}");
-    let start = source.find(&start_marker)?;
-    let after_start = &source[start + start_marker.len()..];
-    let content = after_start.strip_prefix('\n').unwrap_or(after_start);
-    let end = content.find("\n```")?;
-    Some(content[..end].trim())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -504,43 +408,7 @@ pub fn run_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        extract_fenced_block, normalize_review_type, parse_metadata_from_comment, sha256_hex,
-        truncate_excerpt,
-    };
-
-    #[test]
-    fn test_extract_fenced_block_json() {
-        let source = "```json\n{\"a\":1}\n```\n";
-        let block = extract_fenced_block(source, "json").expect("json block");
-        assert_eq!(block, "{\"a\":1}");
-    }
-
-    #[test]
-    fn test_parse_metadata_from_comment() {
-        let body = r#"
-<!-- apm2-review-metadata:v1:security -->
-```json
-{
-  "schema": "apm2.review.metadata.v1",
-  "review_type": "security",
-  "pr_number": 482,
-  "head_sha": "0123456789abcdef0123456789abcdef01234567"
-}
-```
-"#;
-        let parsed = parse_metadata_from_comment(body, "<!-- apm2-review-metadata:v1:security -->")
-            .expect("metadata");
-        assert_eq!(parsed.review_type, "security");
-        assert_eq!(parsed.pr_number, 482);
-    }
-
-    #[test]
-    fn test_normalize_review_type() {
-        assert_eq!(normalize_review_type("quality"), "code-quality");
-        assert_eq!(normalize_review_type("code_quality"), "code-quality");
-        assert_eq!(normalize_review_type("security"), "security");
-    }
+    use super::{sha256_hex, truncate_excerpt};
 
     #[test]
     fn test_truncate_excerpt_respects_bounds() {
