@@ -474,6 +474,10 @@ pub struct WorkerArgs {
     /// Maximum total jobs to process before exiting (0 = unlimited).
     #[arg(long, default_value_t = 0)]
     pub max_jobs: u64,
+
+    /// Print computed systemd unit properties for each selected job.
+    #[arg(long, default_value_t = false)]
+    pub print_unit: bool,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -1660,6 +1664,7 @@ pub fn run_fac(
             args.poll_interval_secs,
             args.max_jobs,
             json_output,
+            args.print_unit,
         ),
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),

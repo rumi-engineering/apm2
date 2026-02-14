@@ -82,10 +82,10 @@ use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BudgetAdmissionTrace, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES, DenialReasonCode,
-    FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, MAX_POLICY_SIZE,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, compute_policy_hash,
-    deserialize_policy, parse_policy_hash, persist_content_addressed_receipt, persist_policy,
-    run_preflight,
+    FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, LaneProfileV1,
+    MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager,
+    SystemdUnitProperties, compute_policy_hash, deserialize_policy, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -200,7 +200,15 @@ struct PendingCandidate {
 /// * `poll_interval_secs` - Seconds between queue scans in continuous mode.
 /// * `max_jobs` - Maximum total jobs to process before exiting (0 = unlimited).
 /// * `json_output` - If true, emit JSON output.
-pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_output: bool) -> u8 {
+/// * `print_unit` - If true, print systemd unit directives/properties for each
+///   job.
+pub fn run_fac_worker(
+    once: bool,
+    poll_interval_secs: u64,
+    max_jobs: u64,
+    json_output: bool,
+    print_unit: bool,
+) -> u8 {
     let poll_interval_secs = poll_interval_secs.min(MAX_POLL_INTERVAL_SECS);
 
     // Resolve queue root directory
@@ -420,6 +428,8 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
                     &signer,
                     &policy_hash,
                     &policy_digest,
+                    candidates.len(),
+                    print_unit,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -654,6 +664,8 @@ fn process_job(
     signer: &Signer,
     policy_hash: &str,
     policy_digest: &[u8; 32],
+    _candidates_count: usize,
+    print_unit: bool,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -1084,12 +1096,12 @@ fn process_job(
         };
     };
 
+    let claimed_path = claimed_dir.join(&file_name);
+
     if let Err(error) = run_preflight(fac_root, &lane_mgr, DEFAULT_MIN_FREE_BYTES) {
-        if let Err(move_err) = move_to_dir_safe(
-            &claimed_dir.join(&file_name),
-            &queue_root.join(DENIED_DIR),
-            &file_name,
-        ) {
+        if let Err(move_err) =
+            move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name)
+        {
             eprintln!("worker: WARNING: failed to move job to denied: {move_err}");
         }
         let reason = format!("preflight failed: {error:?}");
@@ -1112,6 +1124,45 @@ fn process_job(
         };
     }
 
+    // Step 7: Compute authoritative Systemd properties for the acquired lane.
+    // This is the single source of truth for CPU/memory/PIDs/IO/timeouts and
+    // is shared between user-mode and system-mode execution backends.
+    let lane_dir = lane_mgr.lane_dir(&acquired_lane_id);
+    let lane_profile = match LaneProfileV1::load(&lane_dir) {
+        Ok(profile) => profile,
+        Err(e) => {
+            let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
+            let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                None,
+                None,
+                policy_hash,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+            return JobOutcome::Denied { reason };
+        },
+    };
+
+    let lane_systemd_properties =
+        SystemdUnitProperties::from_lane_profile(&lane_profile, Some(&spec.constraints));
+    if print_unit {
+        eprintln!(
+            "worker: computed systemd properties for job {}",
+            spec.job_id
+        );
+        eprintln!("{}", lane_systemd_properties.to_unit_directives());
+        eprintln!("worker: D-Bus properties for job {}", spec.job_id);
+        eprintln!("{:?}", lane_systemd_properties.to_dbus_properties());
+    }
+
     // Step 7: Execute job under containment.
     //
     // For the default-mode MVP, execution validates that the job is structurally
@@ -1121,7 +1172,6 @@ fn process_job(
     //
     // We verify that the claimed file is still present and intact before
     // marking as completed.
-    let claimed_path = claimed_dir.join(&file_name);
     if !claimed_path.exists() {
         return JobOutcome::Skipped {
             reason: "claimed file disappeared during execution".to_string(),

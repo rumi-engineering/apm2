@@ -402,3 +402,43 @@ deletion primitive for lane cleanup and reset operations.
 - `core.symlinks=false` prevents symlink creation in workspaces
 - `--no-hardlinks` prevents object sharing between mirror and workspace
 - Path traversal prevention delegated to `git apply` (standard git safety)
+
+### `systemd_properties` — Authoritative lane→systemd unit property mapping
+
+The `systemd_properties` submodule is the single translation layer from
+`LaneProfileV1` + `JobConstraints` into executable unit constraints for both
+default worker flow and future system-mode execution backends.
+
+## Core Type
+
+**Core type**: `SystemdUnitProperties`
+
+- Canonical fields:
+  - `cpu_quota_percent` → `CPUQuota`
+  - `memory_max_bytes` → `MemoryMax`
+  - `tasks_max` → `TasksMax`
+  - `io_weight` → `IOWeight`
+  - `timeout_start_sec` → `TimeoutStartSec`
+  - `runtime_max_sec` → `RuntimeMaxSec`
+  - `kill_mode` → `KillMode` (default `control-group`)
+- Input binding:
+  - `from_lane_profile(&LaneProfileV1, Option<&JobConstraints>)`
+- Override semantics:
+  - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
+
+## Rendering API
+
+- `to_unit_directives() -> String`: `[Service]` section directives.
+- `to_dbus_properties() -> Vec<(String, String)>`: serializable property
+  key/value pairs for transient-unit invocation.
+
+## Security Invariants (TCK-00530)
+
+- [INV-SYS-001] Unit limits are generated from persisted lane profile defaults
+  or authoritative overrides only; no duplicated ad-hoc calculations in caller
+  sites.
+- [INV-SYS-002] `JobConstraints` values are applied with lane ceiling semantics
+  (`min`) so a job cannot increase resource or timeout limits above lane
+  defaults.
+- [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
+  with machine-readable receipt output, not silent continuation.

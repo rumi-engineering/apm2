@@ -121,6 +121,7 @@ pub mod safe_rmtree;
 pub mod scheduler_state;
 pub mod selection_policy;
 pub mod serde_helpers;
+mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
 pub mod transcript_binding;
@@ -559,3 +560,4 @@ pub use safe_rmtree::{
     MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
     safe_rmtree_v1,
 };
+pub use systemd_properties::SystemdUnitProperties;
