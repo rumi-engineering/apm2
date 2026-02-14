@@ -18,13 +18,14 @@ use apm2_core::fac::{
     ChannelBoundaryTrace, DenialReasonCode, FacBroker, FacJobOutcome, FacJobReceiptV1,
     FacJobReceiptV1Builder, FacJobSpecV1, FacJobSpecV1Builder, FacPolicyV1, JobSource,
     LaneProfileV1, MAX_JOB_RECEIPT_SIZE, MAX_JOB_SPEC_SIZE, MAX_POLICY_SIZE,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, compute_policy_hash, compute_test_env,
-    deserialize_job_receipt, deserialize_policy, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, compute_job_receipt_content_hash_v2,
+    compute_policy_hash, compute_test_env, deserialize_job_receipt, deserialize_policy,
+    parse_policy_hash, persist_content_addressed_receipt_v2, persist_policy,
 };
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use blake3;
 use chrono::{SecondsFormat, Utc};
+use uuid::Uuid;
 
 use super::evidence::{EvidenceGateOptions, run_evidence_gates};
 use super::gate_attestation::build_nextest_command;
@@ -170,7 +171,7 @@ struct GateResult {
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn run_gates_inner(
-    _force: bool,
+    force: bool,
     quick: bool,
     timeout_seconds: u64,
     memory_max: &str,
@@ -192,8 +193,10 @@ fn run_gates_inner(
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
     let timeout_decision = resolve_bounded_test_timeout(&workspace_root, timeout_seconds);
 
-    // 1. Require clean working tree for full gates only.
-    ensure_clean_working_tree(&workspace_root, quick)?;
+    // 1. Require clean working tree for full gates only. `--force` bypasses the
+    //    clean-tree requirement (for re-running gates against the same committed
+    //    SHA when unrelated files are modified).
+    ensure_clean_working_tree(&workspace_root, quick || force)?;
 
     // 2. Resolve HEAD SHA.
     let sha_output = Command::new("git")
@@ -372,6 +375,13 @@ fn run_gates_direct_finalize(
     })
 }
 
+/// Default `--pids-max` value.  When the user has not explicitly overridden
+/// it, we know the value is the lane default and suppress the queued-mode
+/// rejection.
+const DEFAULT_PIDS_MAX: u64 = 1536;
+/// Default `--cpu-quota` value.
+const DEFAULT_CPU_QUOTA: &str = "200%";
+
 #[allow(clippy::too_many_arguments)]
 fn run_gates_queue(
     quick: bool,
@@ -386,7 +396,23 @@ fn run_gates_queue(
 ) -> Result<GatesSummary, String> {
     validate_wait_timeout(wait_timeout)?;
 
-    let _ = (pids_max, cpu_quota);
+    // MAJOR-4: Reject explicit --pids-max and --cpu-quota overrides in
+    // queued mode — the worker applies lane defaults and cannot honor
+    // per-job cgroup overrides.  Only non-default values are rejected.
+    if pids_max != DEFAULT_PIDS_MAX {
+        return Err(format!(
+            "--pids-max ({pids_max}) is not supported in queued mode. \
+             The worker applies lane defaults. Use --direct to override \
+             resource limits locally."
+        ));
+    }
+    if cpu_quota != DEFAULT_CPU_QUOTA {
+        return Err(format!(
+            "--cpu-quota ({cpu_quota}) is not supported in queued mode. \
+             The worker applies lane defaults. Use --direct to override \
+             resource limits locally."
+        ));
+    }
 
     let spec = build_gates_job_spec(
         workspace_root,
@@ -402,6 +428,12 @@ fn run_gates_queue(
     ensure_queue_root_dirs(&queue_root)?;
     let mut broker = load_or_init_broker(&fac_root)?;
     bootstrap_broker_for_issuance(&fac_root, &mut broker)?;
+
+    // MAJOR-6: Worker liveness precheck — if no worker has ever
+    // processed a job (no receipts exist and broker state is fresh),
+    // fail fast with actionable remediation instead of blocking until
+    // --wait-timeout.
+    check_worker_liveness(&fac_root)?;
 
     let mut spec = spec;
     let job_spec_digest = parse_policy_hash(&spec.job_spec_digest).ok_or_else(|| {
@@ -422,9 +454,12 @@ fn run_gates_queue(
     let pending_path = write_pending_job_spec(&queue_root, &spec)?;
     save_broker_state(&broker, &fac_root)?;
 
+    // BLOCKER-1 / MAJOR-5: Use spec_digest for receipt matching and
+    // verify content hash on found receipt.
     let receipt = match wait_for_matching_receipt(
         &fac_root.join(FAC_RECEIPTS_DIR),
         &spec.job_id,
+        &spec.job_spec_digest,
         wait_timeout,
     ) {
         Ok(receipt) => receipt,
@@ -469,6 +504,44 @@ fn run_gates_queue(
     })
 }
 
+/// MAJOR-6: Check for evidence of worker liveness before entering the
+/// receipt polling loop.
+///
+/// If no receipts directory exists or is empty AND the broker state
+/// file is absent, no worker has ever processed a job in this FAC root.
+/// Fail fast with actionable guidance instead of blocking for the full
+/// `--wait-timeout`.
+fn check_worker_liveness(fac_root: &Path) -> Result<(), String> {
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    let broker_state_path = fac_root.join(FAC_BROKER_STATE_FILE);
+
+    // If a broker state file exists we know the broker has been used
+    // at least once.  The worker may be temporarily offline but was
+    // previously live — allow the poll loop to run.
+    if broker_state_path.exists() {
+        return Ok(());
+    }
+
+    // If receipts directory has any JSON files, a worker was active
+    // at some point.
+    if receipts_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&receipts_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(
+        "error: no worker appears to be running (no broker state or receipts found)\n\
+         hint: start a worker with: apm2 fac services ensure\n\
+         hint: or use --direct to run gates locally (unsafe)"
+            .to_string(),
+    )
+}
+
 fn validate_wait_timeout(wait_timeout: u64) -> Result<(), String> {
     if wait_timeout == 0 {
         return Err("--wait-timeout must be greater than zero.".to_string());
@@ -483,8 +556,14 @@ fn build_gates_job_spec(
     effective_timeout_seconds: u64,
     memory_max_bytes: u64,
 ) -> Result<FacJobSpecV1, String> {
-    let now = current_timestamp_epoch_secs();
-    let job_id = format!("fac-gates-{}-{now}", short_hash_or_fallback(head_sha));
+    // BLOCKER-1 / MAJOR-5: Use UUIDv7 for high-entropy, non-predictable,
+    // globally-unique job IDs instead of sha+epoch_seconds (which was
+    // deterministic and collision-prone at second granularity).
+    let job_id = format!(
+        "fac-gates-{}-{}",
+        short_hash_or_fallback(head_sha),
+        Uuid::now_v7()
+    );
     let enqueue_time = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
     let repo_id = workspace_root
@@ -505,7 +584,7 @@ fn build_gates_job_spec(
         "gates",
         "bulk",
         enqueue_time,
-        format!("lease-{now}"),
+        format!("lease-{}", Uuid::now_v7()),
         source,
     )
     .priority(25)
@@ -548,20 +627,37 @@ fn ensure_queue_root_dirs(queue_root: &Path) -> Result<(), String> {
 
 fn load_or_init_broker(fac_root: &Path) -> Result<FacBroker, String> {
     let signer = load_or_generate_persistent_signer(fac_root)?;
-    let mut default_state = BrokerState::default();
     let state_path = fac_root.join(FAC_BROKER_STATE_FILE);
-    if state_path.exists() {
-        if let Some(state) = load_broker_state(&state_path) {
-            default_state = state;
-        }
-    }
-    FacBroker::from_signer_and_state(signer, default_state)
+    let state = if state_path.exists() {
+        // MAJOR-2: Propagate load errors as hard failures.  If the
+        // broker state file exists but cannot be read or parsed, we
+        // must not silently fall back to a default state (fail-open).
+        load_broker_state(&state_path)?
+    } else {
+        // First-run: no state file exists, use default.
+        BrokerState::default()
+    };
+    FacBroker::from_signer_and_state(signer, state)
         .map_err(|e| format!("cannot construct broker from signing key and state: {e}"))
 }
 
-fn load_broker_state(state_path: &Path) -> Option<BrokerState> {
-    let bytes = read_bounded(state_path, 1_048_576).ok()?;
-    FacBroker::deserialize_state(&bytes).ok()
+/// Load broker state from disk with bounded reads and error propagation.
+///
+/// Returns `Err` if the file exists but cannot be read or deserialized.
+/// Only the caller decides when to fall back to defaults (first-run case).
+fn load_broker_state(state_path: &Path) -> Result<BrokerState, String> {
+    let bytes = read_bounded(state_path, 1_048_576).map_err(|e| {
+        format!(
+            "cannot read broker state file {}: {e}",
+            state_path.display()
+        )
+    })?;
+    FacBroker::deserialize_state(&bytes).map_err(|e| {
+        format!(
+            "cannot parse broker state file {}: {e}",
+            state_path.display()
+        )
+    })
 }
 
 /// Bootstrap the broker for channel context token issuance.
@@ -689,9 +785,16 @@ fn write_pending_job_spec(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
     Ok(target)
 }
 
+/// Poll for a receipt matching the given `job_id` with the additional
+/// security requirement that `receipt.job_spec_digest == expected_spec_digest`.
+///
+/// After finding a matching receipt, its content hash is recomputed
+/// from canonical bytes (v2) and verified against `receipt.content_hash`
+/// to detect any post-creation tampering.
 fn wait_for_matching_receipt(
     receipts_dir: &Path,
     job_id: &str,
+    expected_spec_digest: &str,
     wait_timeout: u64,
 ) -> Result<FacJobReceiptV1, String> {
     let start = Instant::now();
@@ -723,6 +826,28 @@ fn wait_for_matching_receipt(
                     continue;
                 };
                 if receipt.job_id == job_id {
+                    // BLOCKER-1b: Verify receipt.job_spec_digest matches
+                    // the expected digest.  A forged receipt with a
+                    // different spec digest is rejected.
+                    if receipt.job_spec_digest != expected_spec_digest {
+                        return Err(format!(
+                            "receipt spec digest mismatch: expected {expected_spec_digest}, \
+                             got {}. Possible receipt forgery.",
+                            receipt.job_spec_digest
+                        ));
+                    }
+
+                    // BLOCKER-1c: Verify receipt content hash matches
+                    // canonical bytes to detect post-creation tampering.
+                    let expected_hash = compute_job_receipt_content_hash_v2(&receipt);
+                    if receipt.content_hash != expected_hash {
+                        return Err(format!(
+                            "receipt content hash mismatch: receipt says {}, \
+                             recomputed {}. Possible tampering.",
+                            receipt.content_hash, expected_hash
+                        ));
+                    }
+
                     return Ok(receipt);
                 }
                 seen_files.insert(file_name);
@@ -806,11 +931,13 @@ fn emit_direct_fac_receipt(
         receipt = receipt.denial_reason(DenialReasonCode::ValidationFailed);
     }
 
+    // Use v2 build + persistence which includes `unsafe_direct` in
+    // canonical bytes for integrity binding (MAJOR-3).
     let receipt = receipt
-        .try_build()
+        .try_build_v2()
         .map_err(|e| format!("cannot build direct receipt: {e}"))?;
 
-    persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+    persist_content_addressed_receipt_v2(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
         .map_err(|e| format!("cannot persist direct receipt: {e}"))?;
 
     Ok(())
@@ -1054,8 +1181,13 @@ mod tests {
     #[test]
     fn test_wait_for_matching_receipt_returns_timeout_error() {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let error = wait_for_matching_receipt(temp_dir.path(), "no-such-job", 1)
-            .expect_err("receipt poll should timeout when missing");
+        let error = wait_for_matching_receipt(
+            temp_dir.path(),
+            "no-such-job",
+            "b3-256:0000000000000000000000000000000000000000000000000000000000000000",
+            1,
+        )
+        .expect_err("receipt poll should timeout when missing");
 
         assert!(error.contains("error: no worker processed job within 1s"));
         assert!(error.contains("ensure worker is running: apm2 fac services ensure"));
@@ -1066,33 +1198,70 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let dir = temp_dir.path();
 
-        let receipt = FacJobReceiptV1Builder::new(
-            "receipt-001",
-            "job-001",
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .outcome(FacJobOutcome::Completed)
-        .reason("completed")
-        .timestamp_secs(1_700_000_000)
-        .rfc0028_channel_boundary(ChannelBoundaryTrace {
-            passed: true,
-            defect_count: 0,
-            defect_classes: Vec::new(),
-        })
-        .eio29_queue_admission(JobQueueAdmissionTrace {
-            verdict: "allow".to_string(),
-            queue_lane: "bulk".to_string(),
-            defect_reason: None,
-        })
-        .try_build()
-        .expect("build sample receipt");
+        let spec_digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let receipt = FacJobReceiptV1Builder::new("receipt-001", "job-001", spec_digest)
+            .outcome(FacJobOutcome::Completed)
+            .reason("completed")
+            .timestamp_secs(1_700_000_000)
+            .rfc0028_channel_boundary(ChannelBoundaryTrace {
+                passed: true,
+                defect_count: 0,
+                defect_classes: Vec::new(),
+            })
+            .eio29_queue_admission(JobQueueAdmissionTrace {
+                verdict: "allow".to_string(),
+                queue_lane: "bulk".to_string(),
+                defect_reason: None,
+            })
+            .try_build_v2()
+            .expect("build sample receipt");
 
         let receipt_path = dir.join("sample.json");
         let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt");
         fs::write(&receipt_path, bytes).expect("write sample receipt");
 
-        let found = wait_for_matching_receipt(dir, "job-001", 5).expect("find matching receipt");
+        let found = wait_for_matching_receipt(dir, "job-001", spec_digest, 5)
+            .expect("find matching receipt");
         assert_eq!(found.receipt_id, "receipt-001");
+    }
+
+    #[test]
+    fn test_wait_for_matching_receipt_rejects_wrong_spec_digest() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let dir = temp_dir.path();
+
+        let actual_digest =
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wrong_digest =
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let receipt = FacJobReceiptV1Builder::new("receipt-003", "job-003", actual_digest)
+            .outcome(FacJobOutcome::Completed)
+            .reason("completed")
+            .timestamp_secs(1_700_000_000)
+            .rfc0028_channel_boundary(ChannelBoundaryTrace {
+                passed: true,
+                defect_count: 0,
+                defect_classes: Vec::new(),
+            })
+            .eio29_queue_admission(JobQueueAdmissionTrace {
+                verdict: "allow".to_string(),
+                queue_lane: "bulk".to_string(),
+                defect_reason: None,
+            })
+            .try_build_v2()
+            .expect("build receipt");
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize");
+        fs::write(dir.join("receipt-003.json"), bytes).expect("write receipt");
+
+        // Expect rejection: caller expects wrong_digest but receipt has actual_digest.
+        let err = wait_for_matching_receipt(dir, "job-003", wrong_digest, 2)
+            .expect_err("wrong spec digest must be rejected");
+        assert!(
+            err.contains("spec digest mismatch"),
+            "error should mention digest mismatch: {err}"
+        );
     }
 
     #[test]
@@ -1103,32 +1272,30 @@ mod tests {
         // Non-JSON file should be skipped without error.
         fs::write(dir.join("not-json.txt"), "hello").expect("write non-json");
 
+        let spec_digest = "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         // Write valid matching receipt.
-        let receipt = FacJobReceiptV1Builder::new(
-            "receipt-002",
-            "job-002",
-            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )
-        .outcome(FacJobOutcome::Completed)
-        .reason("ok")
-        .timestamp_secs(1_700_000_000)
-        .rfc0028_channel_boundary(ChannelBoundaryTrace {
-            passed: true,
-            defect_count: 0,
-            defect_classes: Vec::new(),
-        })
-        .eio29_queue_admission(JobQueueAdmissionTrace {
-            verdict: "allow".to_string(),
-            queue_lane: "bulk".to_string(),
-            defect_reason: None,
-        })
-        .try_build()
-        .expect("build receipt");
+        let receipt = FacJobReceiptV1Builder::new("receipt-002", "job-002", spec_digest)
+            .outcome(FacJobOutcome::Completed)
+            .reason("ok")
+            .timestamp_secs(1_700_000_000)
+            .rfc0028_channel_boundary(ChannelBoundaryTrace {
+                passed: true,
+                defect_count: 0,
+                defect_classes: Vec::new(),
+            })
+            .eio29_queue_admission(JobQueueAdmissionTrace {
+                verdict: "allow".to_string(),
+                queue_lane: "bulk".to_string(),
+                defect_reason: None,
+            })
+            .try_build_v2()
+            .expect("build receipt");
 
         let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize");
         fs::write(dir.join("receipt-match.json"), bytes).expect("write receipt");
 
-        let found = wait_for_matching_receipt(dir, "job-002", 2).expect("find receipt");
+        let found =
+            wait_for_matching_receipt(dir, "job-002", spec_digest, 2).expect("find receipt");
         assert_eq!(found.receipt_id, "receipt-002");
     }
 

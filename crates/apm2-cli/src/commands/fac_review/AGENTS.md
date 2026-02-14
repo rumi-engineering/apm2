@@ -294,3 +294,11 @@ pub use types::ReviewRunType;
   - Queue/key/pending directories use `fac_permissions::ensure_dir_with_mode` (0700 at create-time).
   - Signing key and job spec writes use `fac_permissions::write_fac_file_with_mode` (0600 at create-time).
   - Policy loaded from `$FAC_ROOT/policy/fac_policy.v1.json` with documented default fallback.
+  - **Round 2 hardening**:
+    - Job IDs use UUIDv7 for high-entropy, non-predictable, collision-free identifiers.
+    - Receipt matching verifies `job_spec_digest` and recomputes v2 content hash to detect forgery/tampering.
+    - Broker state deserialization errors propagate as hard failures (fail-closed); default state only on first run.
+    - `--pids-max` and `--cpu-quota` rejected with error in queued mode (worker uses lane defaults).
+    - Worker liveness precheck before entering receipt poll loop; fails fast with remediation guidance.
+    - `--force` flag wired: bypasses clean-tree requirement (re-run against committed SHA with unrelated modifications).
+    - `canonical_bytes_v2()` and `compute_job_receipt_content_hash_v2()` include `unsafe_direct` in integrity binding.
