@@ -12,14 +12,14 @@ Type=simple
 # MemoryMax=25769803776
 # TasksMax=1536
 # IOWeight=100
-# TimeoutStartSec=240
+# TimeoutStartSec=600
 # RuntimeMaxSec=1800
 # KillMode=control-group
 CPUQuota=200%
 MemoryMax=25769803776
 TasksMax=1536
 IOWeight=100
-TimeoutStartSec=240
+TimeoutStartSec=600
 RuntimeMaxSec=1800
 KillMode=control-group
 # Adjust this path to match your deployment layout if different.
