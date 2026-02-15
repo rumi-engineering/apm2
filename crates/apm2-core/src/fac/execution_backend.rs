@@ -26,10 +26,15 @@
 //!
 //! - System-mode jobs run as a dedicated service user (`_apm2-job` by default,
 //!   configurable via `APM2_FAC_SERVICE_USER`).
+//! - The service user is validated at configuration time: uid 0 (root) and
+//!   well-known privileged names are rejected to prevent privilege escalation
+//!   via env-var injection.
 //! - `KillMode=control-group` ensures child processes remain inside the job
 //!   unit's cgroup.
 //! - All resource limits (CPU, memory, PIDs, I/O, timeouts) are preserved
 //!   identically between backends via `SystemdUnitProperties`.
+//! - Non-UTF-8 environment variable values are rejected (fail-closed) rather
+//!   than silently falling back to defaults.
 //!
 //! # Invariants
 //!
@@ -43,6 +48,11 @@
 //!   validation.
 //! - [INV-EXEC-005] Command construction produces deterministic output for the
 //!   same inputs.
+//! - [INV-EXEC-006] The service user MUST NOT resolve to uid 0 (root) or be a
+//!   well-known privileged name. Privilege escalation via
+//!   `APM2_FAC_SERVICE_USER=root` is denied.
+//! - [INV-EXEC-007] Non-UTF-8 env var values produce `Err` (fail-closed), not
+//!   silent fallback to defaults.
 
 use std::fmt;
 use std::path::Path;
@@ -74,6 +84,12 @@ const MAX_ENV_VALUE_LENGTH: usize = 256;
 /// growth). System-mode adds at most 1 extra property (User=) beyond
 /// the base set from `SystemdUnitProperties`.
 const MAX_PROPERTY_ARGS: usize = 32;
+
+/// Well-known privileged user names that MUST be rejected as service
+/// users regardless of their actual uid on the system. This is a
+/// defense-in-depth measure against misconfigured `/etc/passwd` entries
+/// where `root` might be remapped to a non-zero uid.
+const DENIED_SERVICE_USER_NAMES: &[&str] = &["root"];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error Types
@@ -144,6 +160,25 @@ pub enum ExecutionBackendError {
     /// cgroup v2 controllers not available.
     #[error("cgroup v2 controllers not available (bounded execution unavailable)")]
     CgroupV2Unavailable,
+
+    /// Service user resolves to a privileged identity (uid 0 or privileged
+    /// group membership).
+    #[error("service user '{user}' is privileged (uid={uid}): {reason}")]
+    PrivilegedServiceUser {
+        /// The user name.
+        user: String,
+        /// The resolved uid.
+        uid: u32,
+        /// Explanation of why the identity is rejected.
+        reason: String,
+    },
+
+    /// Non-UTF-8 environment variable value (fail-closed).
+    #[error("environment variable {var} contains non-UTF-8 bytes (fail-closed)")]
+    EnvValueNotUtf8 {
+        /// Name of the environment variable.
+        var: &'static str,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -488,7 +523,16 @@ fn build_property_list(props: &SystemdUnitProperties) -> Vec<String> {
 /// Allows alphanumeric characters, dashes, and underscores. Must start
 /// with a letter or underscore. Must not be empty or exceed
 /// `MAX_SERVICE_USER_LENGTH`.
+///
+/// **Security**: After syntax validation, the user name is resolved to a
+/// system uid via `nix::unistd::User::from_name()`. Uid 0 (root) and
+/// well-known privileged names (see [`DENIED_SERVICE_USER_NAMES`]) are
+/// rejected to prevent privilege escalation via env-var injection.
+/// Names that do not resolve to a system user are accepted (the user
+/// may not yet exist on the build host; systemd-run will fail at
+/// runtime if the user is truly missing).
 fn validate_service_user(user: &str) -> Result<(), ExecutionBackendError> {
+    // ── Syntax checks ────────────────────────────────────────────────
     if user.is_empty() {
         return Err(ExecutionBackendError::InvalidServiceUser {
             user: user.to_string(),
@@ -525,6 +569,30 @@ fn validate_service_user(user: &str) -> Result<(), ExecutionBackendError> {
         }
     }
 
+    // ── Privilege checks ─────────────────────────────────────────────
+    // Deny well-known privileged names regardless of their uid mapping.
+    if DENIED_SERVICE_USER_NAMES.contains(&user) {
+        return Err(ExecutionBackendError::PrivilegedServiceUser {
+            user: user.to_string(),
+            uid: 0,
+            reason: "well-known privileged user name is denied as service user".to_string(),
+        });
+    }
+
+    // Resolve to uid and reject uid 0 (root).
+    if let Ok(Some(passwd)) = nix::unistd::User::from_name(user) {
+        if passwd.uid.as_raw() == 0 {
+            return Err(ExecutionBackendError::PrivilegedServiceUser {
+                user: user.to_string(),
+                uid: 0,
+                reason: "uid 0 (root) is denied as service user".to_string(),
+            });
+        }
+    }
+    // If the user does not exist in /etc/passwd, we allow it through
+    // syntax validation. systemd-run will fail at runtime if the user
+    // is truly missing, which is the correct fail-closed behavior.
+
     Ok(())
 }
 
@@ -545,9 +613,14 @@ fn read_bounded_env(var: &'static str) -> Result<Option<String>, ExecutionBacken
             }
             Ok(Some(value))
         },
-        // NotPresent or NotUnicode — treat as not set.
-        // Non-UTF-8 values are rejected (fail-closed).
-        Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => Ok(None),
+        // Not set — genuine absence.
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        // Non-UTF-8 — fail-closed: reject rather than silently falling
+        // back to defaults. An attacker could inject non-UTF-8 bytes to
+        // bypass backend selection policy.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ExecutionBackendError::EnvValueNotUtf8 { var })
+        },
     }
 }
 
@@ -1039,5 +1112,71 @@ mod tests {
         assert!(cmd.args.iter().any(|a| a == "CPUQuota=0%"));
         assert!(cmd.args.iter().any(|a| a == "MemoryMax=0"));
         assert!(cmd.args.iter().any(|a| a == "TasksMax=0"));
+    }
+
+    // ── Privilege escalation prevention ──────────────────────────────
+
+    #[test]
+    fn service_user_root_is_rejected() {
+        let err = validate_service_user("root").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("privileged"),
+            "error should mention privileged: {err}"
+        );
+        assert!(msg.contains("root"), "error should mention root: {err}");
+    }
+
+    #[test]
+    fn system_mode_config_rejects_root() {
+        let err = SystemModeConfig::new("root").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("privileged"),
+            "error should mention privileged: {err}"
+        );
+    }
+
+    #[test]
+    fn service_user_apm2_job_default_accepted() {
+        assert!(
+            validate_service_user(DEFAULT_SERVICE_USER).is_ok(),
+            "default service user '{DEFAULT_SERVICE_USER}' must be accepted",
+        );
+    }
+
+    #[test]
+    fn service_user_nobody_accepted() {
+        // 'nobody' is a standard low-privilege user; should pass
+        // validation (its uid != 0 on well-configured systems).
+        assert!(
+            validate_service_user("nobody").is_ok(),
+            "nobody should be accepted"
+        );
+    }
+
+    // ── Error display for new variants ───────────────────────────────
+
+    #[test]
+    fn error_display_privileged_service_user() {
+        let err = ExecutionBackendError::PrivilegedServiceUser {
+            user: "root".to_string(),
+            uid: 0,
+            reason: "uid 0 is denied".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("root"));
+        assert!(msg.contains("uid=0"));
+        assert!(msg.contains("uid 0 is denied"));
+    }
+
+    #[test]
+    fn error_display_env_value_not_utf8() {
+        let err = ExecutionBackendError::EnvValueNotUtf8 {
+            var: "APM2_FAC_SERVICE_USER",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("APM2_FAC_SERVICE_USER"));
+        assert!(msg.contains("non-UTF-8"));
     }
 }
