@@ -683,8 +683,10 @@ fn attach_log_bundle_hash(
 }
 
 /// Maximum bytes to read from a single log file during bundle hashing.
-/// Matches the stream cap used when writing evidence logs.
-const LOG_BUNDLE_PER_FILE_MAX_BYTES: u64 = LOG_STREAM_MAX_BYTES;
+/// Slightly larger than `LOG_STREAM_MAX_BYTES` to account for stream prefixes
+/// (`=== stdout ===\n`, `=== stderr ===\n`) and any separator overhead that the
+/// log writer prepends outside the payload byte counter.
+const LOG_BUNDLE_PER_FILE_MAX_BYTES: u64 = LOG_STREAM_MAX_BYTES + 4096;
 
 fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
     let mut log_paths: Vec<PathBuf> = fs::read_dir(logs_dir)
