@@ -2,11 +2,16 @@
 //! selector-based zoom-in.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::evidence::LANE_EVIDENCE_GATES;
 use super::findings::{
     SelectorToken, parse_selector, parse_selector_type, render_tool_output_selector,
 };
@@ -166,17 +171,58 @@ fn resolve_selector_zoom(
             })
         },
         SelectorToken::ToolOutput(tool_output) => {
-            let evidence_path = apm2_home_dir()?
-                .join("private")
-                .join("fac")
-                .join("evidence")
-                .join(format!("{}.log", tool_output.gate));
-            let content = fs::read(&evidence_path).map_err(|err| {
+            // Fail closed: verify gate cache proves this gate ran for the requested SHA.
+            let gate_cache =
+                super::gate_cache::GateCache::load(&tool_output.sha).ok_or_else(|| {
+                    format!(
+                        "no gate cache found for SHA {} — cannot validate tool output selector",
+                        tool_output.sha
+                    )
+                })?;
+            let cached_result = gate_cache.get(&tool_output.gate).ok_or_else(|| {
                 format!(
-                    "failed to read tool output log {}: {err}",
-                    evidence_path.display()
+                    "gate `{}` not found in cache for SHA {} — cannot validate tool output selector",
+                    tool_output.gate, tool_output.sha
                 )
             })?;
+
+            // Resolve log path from the SHA-bound gate cache entry rather than
+            // searching by mtime, which could return a log from a different SHA.
+            let evidence_path = cached_result
+                .log_path
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .ok_or_else(|| {
+                    format!(
+                        "no SHA-bound evidence log path found for gate `{}` at SHA {} — \
+                         cached log_path is missing or the file no longer exists",
+                        tool_output.gate, tool_output.sha
+                    )
+                })?;
+            // Open with O_NOFOLLOW to atomically reject symlinks at the
+            // kernel level, preventing symlink traversal attacks on
+            // evidence log paths.
+            let content = {
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NOFOLLOW);
+                let mut file = options.open(&evidence_path).map_err(|err| {
+                    format!(
+                        "failed to open tool output log {}: {err}",
+                        evidence_path.display()
+                    )
+                })?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).map_err(|err| {
+                    format!(
+                        "failed to read tool output log {}: {err}",
+                        evidence_path.display()
+                    )
+                })?;
+                buf
+            };
             let digest = sha256_hex(&content);
             let content_ref = evidence_path.display().to_string();
             let text = String::from_utf8_lossy(&content);
@@ -223,6 +269,90 @@ fn truncate_excerpt(text: &str, max_lines: usize, max_chars: usize) -> String {
     out
 }
 
+fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
+    let lanes_dir = home.join("private/fac/lanes");
+    let mut logs = Vec::new();
+    let Ok(lanes) = fs::read_dir(&lanes_dir) else {
+        return logs;
+    };
+
+    for lane_dir_entry in lanes.filter_map(Result::ok) {
+        let lane_dir_path = lane_dir_entry.path();
+        let lane_is_dir = lane_dir_path
+            .metadata()
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if !lane_is_dir {
+            continue;
+        }
+
+        let jobs_dir = lane_dir_path.join("logs");
+        let mut latest_job: Option<(PathBuf, SystemTime)> = None;
+        let Ok(jobs) = fs::read_dir(&jobs_dir) else {
+            continue;
+        };
+
+        for job_dir_entry in jobs.filter_map(Result::ok) {
+            let job_dir_path = job_dir_entry.path();
+            let is_dir = job_dir_entry.file_type().map_or_else(
+                |_| {
+                    job_dir_path
+                        .metadata()
+                        .map(|meta| meta.is_dir())
+                        .unwrap_or(false)
+                },
+                |ft| ft.is_dir(),
+            );
+            if !is_dir {
+                continue;
+            }
+
+            let modified = job_dir_path
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            match &latest_job {
+                Some((_, current)) if *current >= modified => {},
+                _ => latest_job = Some((job_dir_path, modified)),
+            }
+        }
+
+        if let Some((latest_job_dir, _)) = latest_job {
+            for gate in LANE_EVIDENCE_GATES {
+                logs.push(latest_job_dir.join(format!("{gate}.log")));
+            }
+        }
+    }
+
+    logs.sort();
+    logs
+}
+
+#[allow(dead_code)] // Retained for future log discovery / fallback use cases.
+fn find_latest_evidence_gate_log(home: &Path, gate: &str) -> Option<PathBuf> {
+    let expected_name = format!("{gate}.log");
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
+    for path in lane_evidence_log_dirs(home) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            continue;
+        }
+        if !path.exists() {
+            continue;
+        }
+        let modified = path
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .is_none_or(|(_, current)| modified > *current)
+        {
+            latest = Some((path, modified));
+        }
+    }
+    latest.map(|(path, _)| path)
+}
+
 // ── Log discovery ───────────────────────────────────────────────────────────
 
 fn discover_logs(pr_number: Option<u32>) -> Result<LogsSummary, String> {
@@ -230,20 +360,8 @@ fn discover_logs(pr_number: Option<u32>) -> Result<LogsSummary, String> {
     let mut entries = Vec::new();
 
     // Evidence gate logs (always relevant).
-    let evidence_dir = home.join("private/fac/evidence");
-    if evidence_dir.is_dir() {
-        let gate_names = [
-            "rustfmt",
-            "clippy",
-            "doc",
-            "test",
-            "test_safety_guard",
-            "workspace_integrity",
-        ];
-        for gate in &gate_names {
-            let path = evidence_dir.join(format!("{gate}.log"));
-            push_entry(&mut entries, "evidence", &path);
-        }
+    for path in lane_evidence_log_dirs(&home) {
+        push_entry(&mut entries, "evidence", &path);
     }
 
     // Pipeline logs (filter by PR if provided).

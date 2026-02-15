@@ -25,7 +25,6 @@ use super::timeout_policy::{
     MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, max_memory_bytes, parse_memory_limit,
     resolve_bounded_test_timeout,
 };
-use super::types::apm2_home_dir;
 use crate::exit_codes::codes as exit_codes;
 
 const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
@@ -257,7 +256,10 @@ fn run_gates_inner(
                     .ok()
                     .map(|attestation| attestation.attestation_digest)
             });
-            let evidence_log_digest = gate_log_digest(&result.gate_name);
+            let evidence_log_digest = result
+                .log_path
+                .as_ref()
+                .and_then(|path| gate_log_digest(path));
             cache.set_with_attestation(
                 &result.gate_name,
                 result.passed,
@@ -265,6 +267,21 @@ fn run_gates_inner(
                 attestation_digest,
                 quick,
                 evidence_log_digest,
+                result
+                    .log_path
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .map(str::to_string),
+            );
+        }
+        for result in &gate_results {
+            cache.backfill_evidence_metadata(
+                &result.gate_name,
+                result.log_bundle_hash.as_deref(),
+                result.bytes_written,
+                result.bytes_total,
+                result.was_truncated,
+                result.log_path.as_ref().and_then(|p| p.to_str()),
             );
         }
         cache.save()?;
@@ -320,16 +337,11 @@ fn run_gates_inner(
     })
 }
 
-fn gate_log_digest(gate_name: &str) -> Option<String> {
-    let path = apm2_home_dir()
-        .ok()?
-        .join("private/fac/evidence")
-        .join(format!("{gate_name}.log"));
-
-    if !path.exists() {
+fn gate_log_digest(log_path: &Path) -> Option<String> {
+    if !log_path.exists() {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    let bytes = fs::read(log_path).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Some(format!("{:x}", hasher.finalize()))

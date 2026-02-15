@@ -4,18 +4,20 @@
 //! PR management through `github_projection`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::dispatch::dispatch_single_review;
-use super::evidence::{EvidenceGateResult, run_evidence_gates, run_evidence_gates_with_status};
+use super::evidence::{
+    EvidenceGateResult, LANE_EVIDENCE_GATES, run_evidence_gates, run_evidence_gates_with_status,
+};
 use super::gate_cache::GateCache;
 use super::projection::{GateResult, sync_gate_status_to_pr};
 use super::types::{
@@ -433,6 +435,7 @@ where
             gate_name: "unknown".to_string(),
             passed: false,
             duration_secs: 0,
+            ..Default::default()
         });
     }
     Err(format!(
@@ -454,6 +457,12 @@ fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> 
         .exists()
     {
         expected.insert("test_safety_guard".to_string());
+    }
+    if workspace_root
+        .join("scripts/ci/review_artifact_lint.sh")
+        .exists()
+    {
+        expected.insert("review_artifact_lint".to_string());
     }
     expected
 }
@@ -1088,16 +1097,121 @@ fn normalize_error_hint(value: &str) -> Option<String> {
     Some(hint)
 }
 
+fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
+    let lanes_dir = home.join("private/fac/lanes");
+    let mut logs = Vec::new();
+    let Ok(lanes) = fs::read_dir(&lanes_dir) else {
+        return logs;
+    };
+
+    for lane_dir_entry in lanes.filter_map(Result::ok) {
+        let lane_dir_path = lane_dir_entry.path();
+        if !lane_dir_path
+            .metadata()
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let jobs_dir = lane_dir_path.join("logs");
+        let Ok(jobs) = fs::read_dir(&jobs_dir) else {
+            continue;
+        };
+
+        let mut latest_job: Option<(PathBuf, SystemTime)> = None;
+        for job_dir_entry in jobs.filter_map(Result::ok) {
+            let job_dir_path = job_dir_entry.path();
+            let is_dir = job_dir_entry.file_type().map_or_else(
+                |_| {
+                    job_dir_path
+                        .metadata()
+                        .map(|meta| meta.is_dir())
+                        .unwrap_or(false)
+                },
+                |ft| ft.is_dir(),
+            );
+            if !is_dir {
+                continue;
+            }
+
+            let modified = job_dir_path
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            match &latest_job {
+                Some((_, current)) if *current >= modified => {},
+                _ => latest_job = Some((job_dir_path, modified)),
+            }
+        }
+
+        if let Some((latest_job_dir, _)) = latest_job {
+            for gate_name in LANE_EVIDENCE_GATES {
+                logs.push(latest_job_dir.join(format!("{gate_name}.log")));
+            }
+        }
+    }
+
+    logs.sort();
+    logs
+}
+
+fn find_latest_evidence_gate_log(home: &Path, gate_name: &str) -> Option<PathBuf> {
+    let expected_name = format!("{gate_name}.log");
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
+    for path in lane_evidence_log_dirs(home) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            continue;
+        }
+        if !path.exists() {
+            continue;
+        }
+        let modified = path
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .is_none_or(|(_, current)| modified > *current)
+        {
+            latest = Some((path, modified));
+        }
+    }
+    latest.map(|(path, _)| path)
+}
+
 fn gate_log_path(gate_name: &str) -> Result<PathBuf, String> {
-    Ok(apm2_home_dir()?
-        .join("private/fac/evidence")
-        .join(format!("{gate_name}.log")))
+    let home = apm2_home_dir()?;
+    find_latest_evidence_gate_log(&home, gate_name).ok_or_else(|| {
+        format!("no evidence gate log found for gate {gate_name} in any lane job directory")
+    })
 }
 
 fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
     let path = gate_log_path(gate_name).ok()?;
-    let content = std::fs::read_to_string(path).ok()?;
+    let mut file = super::evidence::open_nofollow(&path).ok()?;
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut content).ok()?;
     normalize_error_hint(&content)
+}
+
+/// Resolve a failure hint from the per-gate evidence result's exact log path,
+/// falling back to global lane/job discovery only when the result carries no
+/// usable `log_path`.  This prevents concurrent runs from selecting another
+/// job's log file.
+fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
+    if let Some(ref log_path) = result.log_path {
+        if let Ok(mut file) = super::evidence::open_nofollow(log_path) {
+            let mut content = String::new();
+            if std::io::Read::read_to_string(&mut file, &mut content).is_ok() {
+                if let Some(hint) = normalize_error_hint(&content) {
+                    return Some(hint);
+                }
+            }
+        }
+    }
+    // Fallback: global discovery across all lane/job directories.
+    latest_gate_error_hint(&result.gate_name)
 }
 
 pub fn run_push(
@@ -1325,7 +1439,7 @@ pub fn run_push(
                 if gate.passed {
                     attempt.set_stage_pass(stage, gate.duration_secs);
                 } else {
-                    let hint = latest_gate_error_hint(&gate.gate_name).or_else(|| {
+                    let hint = gate_error_hint_from_result(gate).or_else(|| {
                         normalize_error_hint(&format!("gate {} failed", gate.gate_name))
                     });
                     attempt.set_stage_fail(stage, gate.duration_secs, None, hint);
@@ -1620,6 +1734,7 @@ mod tests {
                 gate_name,
                 passed: true,
                 duration_secs: 1,
+                ..Default::default()
             })
             .collect()
     }
@@ -1877,16 +1992,19 @@ mod tests {
                             gate_name: "rustfmt".to_string(),
                             passed: false,
                             duration_secs: 1,
+                            ..Default::default()
                         },
                         EvidenceGateResult {
                             gate_name: "clippy".to_string(),
                             passed: true,
                             duration_secs: 2,
+                            ..Default::default()
                         },
                         EvidenceGateResult {
                             gate_name: "doc".to_string(),
                             passed: false,
                             duration_secs: 3,
+                            ..Default::default()
                         },
                     ],
                 ))
@@ -1952,11 +2070,13 @@ mod tests {
                             gate_name: "rustfmt".to_string(),
                             passed: false,
                             duration_secs: 1,
+                            ..Default::default()
                         },
                         EvidenceGateResult {
                             gate_name: "clippy".to_string(),
                             passed: true,
                             duration_secs: 2,
+                            ..Default::default()
                         },
                     ],
                 ))
@@ -2001,11 +2121,13 @@ mod tests {
                 gate_name: "rustfmt".to_string(),
                 passed: true,
                 duration_secs: 1,
+                ..Default::default()
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
                 passed: true,
                 duration_secs: 1,
+                ..Default::default()
             },
         ];
 
