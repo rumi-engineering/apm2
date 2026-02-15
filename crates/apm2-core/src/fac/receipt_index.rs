@@ -635,14 +635,19 @@ pub fn lookup_job_receipt(receipts_dir: &Path, job_id: &str) -> Option<FacJobRec
     // Try the index first — O(1) lookup.
     if let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) {
         if let Some(digest) = index.latest_digest_for_job(job_id) {
-            let receipt_path = receipts_dir.join(format!("{digest}.json"));
-            if let Some(receipt) = load_receipt_bounded(&receipt_path) {
-                if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
-                    return Some(receipt);
+            // Validate digest is a well-formed BLAKE3-256 hex string before
+            // using it as a filesystem path component (path traversal prevention).
+            if is_valid_digest(digest) {
+                let receipt_path = receipts_dir.join(format!("{digest}.json"));
+                if let Some(receipt) = load_receipt_bounded(&receipt_path) {
+                    if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
+                        return Some(receipt);
+                    }
+                    // Index was stale or integrity check failed — fall through
+                    // to scan.
                 }
-                // Index was stale or integrity check failed — fall through to
-                // scan.
             }
+            // Malformed digest or failed verification — fall through to scan.
         }
     }
 
@@ -682,17 +687,22 @@ pub fn has_receipt_for_job(receipts_dir: &Path, job_id: &str) -> bool {
     // Try the index first — O(1) lookup with full verification.
     if let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) {
         if let Some(digest) = index.latest_digest_for_job(job_id) {
-            let receipt_path = receipts_dir.join(format!("{digest}.json"));
-            // Load the receipt with bounded read + O_NOFOLLOW, then verify:
-            // 1. receipt.job_id matches the requested job_id (prevents index corruption
-            //    from causing false duplicate detection)
-            // 2. content-hash integrity (prevents tampered receipts)
-            if let Some(receipt) = load_receipt_bounded(&receipt_path) {
-                if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
-                    return true;
+            // Validate digest is a well-formed BLAKE3-256 hex string before
+            // using it as a filesystem path component (path traversal prevention).
+            if is_valid_digest(digest) {
+                let receipt_path = receipts_dir.join(format!("{digest}.json"));
+                // Load the receipt with bounded read + O_NOFOLLOW, then verify:
+                // 1. receipt.job_id matches the requested job_id (prevents index corruption
+                //    from causing false duplicate detection)
+                // 2. content-hash integrity (prevents tampered receipts)
+                if let Some(receipt) = load_receipt_bounded(&receipt_path) {
+                    if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
+                        return true;
+                    }
                 }
             }
-            // Index entry failed verification — stale/corrupt, fall through.
+            // Index entry failed verification — stale/corrupt/malformed, fall
+            // through.
         }
     }
 
@@ -700,11 +710,23 @@ pub fn has_receipt_for_job(receipts_dir: &Path, job_id: &str) -> bool {
     scan_receipt_for_job(receipts_dir, job_id).is_some()
 }
 
+/// Validate that a digest string is a well-formed BLAKE3-256 hex digest.
+///
+/// Must be exactly 64 lowercase hex characters. Rejects path separators,
+/// `..`, and any non-hex characters to prevent path traversal when the
+/// digest is used as a filename component.
+fn is_valid_digest(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Verify content-addressed integrity of a loaded receipt against its
 /// expected digest from the index.
 ///
-/// Tries both v1 and v2 hash schemes (receipts may use either). Returns
-/// `true` if either hash matches the expected digest.
+/// Recomputes the hash from the receipt's canonical content using both v1
+/// and v2 hash schemes. Returns `true` if either recomputed hash matches.
+///
+/// The receipt's self-reported `content_hash` field is **never** trusted —
+/// an attacker could set it to any value to bypass verification.
 fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) -> bool {
     // Try v1 hash first (most common for existing receipts).
     let v1_hash = compute_job_receipt_content_hash(receipt);
@@ -716,10 +738,7 @@ fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) ->
     if v2_hash == expected_digest {
         return true;
     }
-    // Also check the receipt's own content_hash field.
-    if !receipt.content_hash.is_empty() && receipt.content_hash == expected_digest {
-        return true;
-    }
+    // Never trust receipt.content_hash — must always recompute.
     false
 }
 
@@ -1428,5 +1447,124 @@ mod tests {
         let found = lookup_job_receipt(receipts_dir, "job-integrity");
         assert!(found.is_some(), "should find receipt with valid integrity");
         assert_eq!(found.unwrap().content_hash, hash);
+    }
+
+    // =========================================================================
+    // MAJOR-2: digest validation (path traversal prevention)
+    // =========================================================================
+
+    #[test]
+    fn test_is_valid_digest_accepts_valid_blake3() {
+        assert!(is_valid_digest(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"
+        ));
+        assert!(is_valid_digest(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(is_valid_digest(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_digest_rejects_path_traversal() {
+        // Too short.
+        assert!(!is_valid_digest("abcd"));
+        // Contains path separator.
+        assert!(!is_valid_digest(
+            "../../../etc/passwd\x00000000000000000000000000000000000000000000000"
+        ));
+        // Contains non-hex chars.
+        assert!(!is_valid_digest(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
+        // Too long (65 chars).
+        assert!(!is_valid_digest(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a"
+        ));
+        // Empty.
+        assert!(!is_valid_digest(""));
+        // Contains slash.
+        assert!(!is_valid_digest(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"
+        ));
+        // Contains backslash.
+        assert!(!is_valid_digest(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\\7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f"
+        ));
+    }
+
+    #[test]
+    fn test_lookup_rejects_malformed_index_digest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Build a corrupt index with a path-traversal digest.
+        let mut index = ReceiptIndexV1::new();
+        let corrupt_header = ReceiptHeaderV1 {
+            content_hash: "../../../etc/passwd".to_string(),
+            job_id: "job-traversal".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 1000,
+            queue_lane: None,
+            unsafe_direct: false,
+        };
+        index.upsert(corrupt_header).expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        // lookup_job_receipt must not attempt to open the traversal path.
+        let found = lookup_job_receipt(receipts_dir, "job-traversal");
+        assert!(
+            found.is_none(),
+            "must reject malformed digest in index (path traversal)"
+        );
+    }
+
+    #[test]
+    fn test_has_receipt_rejects_malformed_index_digest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Build a corrupt index with a non-hex digest.
+        let mut index = ReceiptIndexV1::new();
+        let corrupt_header = ReceiptHeaderV1 {
+            content_hash: "not-a-valid-hex-digest-at-all!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                .to_string(),
+            job_id: "job-bad-digest".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 1000,
+            queue_lane: None,
+            unsafe_direct: false,
+        };
+        index.upsert(corrupt_header).expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        // has_receipt_for_job must fall through to scan, not use bad digest as path.
+        assert!(
+            !has_receipt_for_job(receipts_dir, "job-bad-digest"),
+            "must reject malformed digest in index"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-3: verify_receipt_integrity must not trust content_hash field
+    // =========================================================================
+
+    #[test]
+    fn test_verify_integrity_rejects_self_reported_content_hash() {
+        // Create a receipt whose content_hash == expected_digest but whose
+        // recomputed hash does NOT match. This tests that the content_hash
+        // field is never trusted as a fallback.
+        let fake_digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let receipt = FacJobReceiptV1 {
+            content_hash: fake_digest.to_string(),
+            ..make_receipt("job-fake", "placeholder", 1000)
+        };
+        // The receipt's content_hash matches expected_digest, but the
+        // recomputed hashes (v1 and v2) will NOT match.
+        assert!(
+            !verify_receipt_integrity(&receipt, fake_digest),
+            "must not trust receipt's self-reported content_hash"
+        );
     }
 }
