@@ -1210,6 +1210,14 @@ pub fn persist_content_addressed_receipt(
     fs::rename(&temp_path, &final_path)
         .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
 
+    // Best-effort incremental index update (TCK-00560).
+    // Index is non-authoritative cache; failure here does not affect
+    // receipt persistence correctness.
+    let _ = super::receipt_index::ReceiptIndexV1::incremental_update(
+        fac_receipts_dir,
+        &canonical_receipt,
+    );
+
     Ok(final_path)
 }
 
@@ -1242,6 +1250,12 @@ pub fn persist_content_addressed_receipt_v2(
     fs::write(&temp_path, body).map_err(|e| format!("cannot write temp receipt file: {e}"))?;
     fs::rename(&temp_path, &final_path)
         .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
+
+    // Best-effort incremental index update (TCK-00560).
+    let _ = super::receipt_index::ReceiptIndexV1::incremental_update(
+        fac_receipts_dir,
+        &canonical_receipt,
+    );
 
     Ok(final_path)
 }
