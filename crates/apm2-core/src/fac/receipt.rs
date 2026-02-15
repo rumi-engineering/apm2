@@ -1212,11 +1212,16 @@ pub fn persist_content_addressed_receipt(
 
     // Best-effort incremental index update (TCK-00560).
     // Index is non-authoritative cache; failure here does not affect
-    // receipt persistence correctness.
-    let _ = super::receipt_index::ReceiptIndexV1::incremental_update(
+    // receipt persistence correctness. On failure, delete the stale index
+    // to force a rebuild on next read, ensuring consistency.
+    if let Err(e) = super::receipt_index::ReceiptIndexV1::incremental_update(
         fac_receipts_dir,
         &canonical_receipt,
-    );
+    ) {
+        eprintln!("WARN: failed to update receipt index: {e}");
+        let index_path = super::receipt_index::ReceiptIndexV1::index_path(fac_receipts_dir);
+        let _ = fs::remove_file(&index_path);
+    }
 
     Ok(final_path)
 }
@@ -1252,10 +1257,15 @@ pub fn persist_content_addressed_receipt_v2(
         .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
 
     // Best-effort incremental index update (TCK-00560).
-    let _ = super::receipt_index::ReceiptIndexV1::incremental_update(
+    // On failure, delete the stale index to force a rebuild on next read.
+    if let Err(e) = super::receipt_index::ReceiptIndexV1::incremental_update(
         fac_receipts_dir,
         &canonical_receipt,
-    );
+    ) {
+        eprintln!("WARN: failed to update receipt index (v2): {e}");
+        let index_path = super::receipt_index::ReceiptIndexV1::index_path(fac_receipts_dir);
+        let _ = fs::remove_file(&index_path);
+    }
 
     Ok(final_path)
 }

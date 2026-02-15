@@ -497,8 +497,10 @@ queue_lane, etc.).
   with bounded directory scan fallback. Verifies content-addressed integrity
   (BLAKE3 hash) before returning — on mismatch, treats as index corruption and
   falls back to directory scan. Primary consumer entry point.
-- `has_receipt_for_job(receipts_dir, job_id)`: Lightweight O(1) index check for
-  receipt existence without loading full receipt. Falls back to bounded directory
+- `has_receipt_for_job(receipts_dir, job_id)`: Index-first O(1) receipt existence
+  check with full verification. Loads the receipt via `load_receipt_bounded`
+  (O_NOFOLLOW + size cap), verifies `receipt.job_id == requested_job_id` and
+  content-hash integrity before returning true. Falls back to bounded directory
   scan. Used by the worker for duplicate detection.
 - `list_receipt_headers(receipts_dir)`: List all indexed headers sorted by
   timestamp (most recent first). No directory scanning.
@@ -521,6 +523,14 @@ All receipt-touching hot paths consult the index first:
 - **CLI receipt status** (`apm2 fac receipts status`): Uses `lookup_job_receipt`
   (index-first with fallback).
 - **CLI receipt reindex** (`apm2 fac receipts reindex`): Full rebuild from store.
+- **Receipt persistence** error handling: Both `persist_content_addressed_receipt`
+  and `persist_content_addressed_receipt_v2` log warnings on `incremental_update`
+  failure and delete the stale index to force rebuild on next read.
+- **Gates**: Use their own gate-result cache (`gate_cache.rs`), not the job receipt
+  store. No index wiring needed.
+- **Metrics**: Daemon and consensus metrics modules do not reference the job receipt
+  store. No index wiring needed.
+- **GC/Quarantine**: Persist GC receipts (different type), do not scan job receipts.
 
 ### Security Invariants (TCK-00560)
 
