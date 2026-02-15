@@ -2,7 +2,8 @@
 //! selector-based zoom-in.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -166,11 +167,13 @@ fn resolve_selector_zoom(
             })
         },
         SelectorToken::ToolOutput(tool_output) => {
-            let evidence_path = apm2_home_dir()?
-                .join("private")
-                .join("fac")
-                .join("evidence")
-                .join(format!("{}.log", tool_output.gate));
+            let evidence_path = find_latest_evidence_gate_log(&apm2_home_dir()?, &tool_output.gate)
+                .ok_or_else(|| {
+                    format!(
+                        "no evidences logs found for lane-scoped gate `{}`",
+                        tool_output.gate
+                    )
+                })?;
             let content = fs::read(&evidence_path).map_err(|err| {
                 format!(
                     "failed to read tool output log {}: {err}",
@@ -223,6 +226,100 @@ fn truncate_excerpt(text: &str, max_lines: usize, max_chars: usize) -> String {
     out
 }
 
+const LANE_EVIDENCE_GATES: &[&str] = &[
+    "merge_conflict_main",
+    "rustfmt",
+    "clippy",
+    "doc",
+    "test",
+    "test_safety_guard",
+    "workspace_integrity",
+    "review_artifact_lint",
+];
+
+fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
+    let lanes_dir = home.join("private/fac/lanes");
+    let mut logs = Vec::new();
+    let Ok(lanes) = fs::read_dir(&lanes_dir) else {
+        return logs;
+    };
+
+    for lane_dir_entry in lanes.filter_map(Result::ok) {
+        let lane_dir_path = lane_dir_entry.path();
+        let lane_is_dir = lane_dir_path
+            .metadata()
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if !lane_is_dir {
+            continue;
+        }
+
+        let jobs_dir = lane_dir_path.join("logs");
+        let mut latest_job: Option<(PathBuf, SystemTime)> = None;
+        let Ok(jobs) = fs::read_dir(&jobs_dir) else {
+            continue;
+        };
+
+        for job_dir_entry in jobs.filter_map(Result::ok) {
+            let job_dir_path = job_dir_entry.path();
+            let is_dir = job_dir_entry.file_type().map_or_else(
+                |_| {
+                    job_dir_path
+                        .metadata()
+                        .map(|meta| meta.is_dir())
+                        .unwrap_or(false)
+                },
+                |ft| ft.is_dir(),
+            );
+            if !is_dir {
+                continue;
+            }
+
+            let modified = job_dir_path
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            match &latest_job {
+                Some((_, current)) if *current >= modified => {},
+                _ => latest_job = Some((job_dir_path, modified)),
+            }
+        }
+
+        if let Some((latest_job_dir, _)) = latest_job {
+            for gate in LANE_EVIDENCE_GATES {
+                logs.push(latest_job_dir.join(format!("{gate}.log")));
+            }
+        }
+    }
+
+    logs.sort();
+    logs
+}
+
+fn find_latest_evidence_gate_log(home: &Path, gate: &str) -> Option<PathBuf> {
+    let expected_name = format!("{gate}.log");
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
+    for path in lane_evidence_log_dirs(home) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            continue;
+        }
+        if !path.exists() {
+            continue;
+        }
+        let modified = path
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .is_none_or(|(_, current)| modified > *current)
+        {
+            latest = Some((path, modified));
+        }
+    }
+    latest.map(|(path, _)| path)
+}
+
 // ── Log discovery ───────────────────────────────────────────────────────────
 
 fn discover_logs(pr_number: Option<u32>) -> Result<LogsSummary, String> {
@@ -230,20 +327,8 @@ fn discover_logs(pr_number: Option<u32>) -> Result<LogsSummary, String> {
     let mut entries = Vec::new();
 
     // Evidence gate logs (always relevant).
-    let evidence_dir = home.join("private/fac/evidence");
-    if evidence_dir.is_dir() {
-        let gate_names = [
-            "rustfmt",
-            "clippy",
-            "doc",
-            "test",
-            "test_safety_guard",
-            "workspace_integrity",
-        ];
-        for gate in &gate_names {
-            let path = evidence_dir.join(format!("{gate}.log"));
-            push_entry(&mut entries, "evidence", &path);
-        }
+    for path in lane_evidence_log_dirs(&home) {
+        push_entry(&mut entries, "evidence", &path);
     }
 
     // Pipeline logs (filter by PR if provided).

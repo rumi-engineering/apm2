@@ -4,12 +4,12 @@
 //! PR management through `github_projection`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,16 @@ use super::{github_projection, lifecycle, projection_store, state};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
+const LANE_EVIDENCE_GATES: &[&str] = &[
+    "merge_conflict_main",
+    "rustfmt",
+    "clippy",
+    "doc",
+    "test",
+    "test_safety_guard",
+    "workspace_integrity",
+    "review_artifact_lint",
+];
 #[cfg(not(test))]
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
 #[cfg(test)]
@@ -433,6 +443,7 @@ where
             gate_name: "unknown".to_string(),
             passed: false,
             duration_secs: 0,
+            ..Default::default()
         });
     }
     Err(format!(
@@ -1088,10 +1099,94 @@ fn normalize_error_hint(value: &str) -> Option<String> {
     Some(hint)
 }
 
+fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
+    let lanes_dir = home.join("private/fac/lanes");
+    let mut logs = Vec::new();
+    let Ok(lanes) = fs::read_dir(&lanes_dir) else {
+        return logs;
+    };
+
+    for lane_dir_entry in lanes.filter_map(Result::ok) {
+        let lane_dir_path = lane_dir_entry.path();
+        if !lane_dir_path
+            .metadata()
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let jobs_dir = lane_dir_path.join("logs");
+        let Ok(jobs) = fs::read_dir(&jobs_dir) else {
+            continue;
+        };
+
+        let mut latest_job: Option<(PathBuf, SystemTime)> = None;
+        for job_dir_entry in jobs.filter_map(Result::ok) {
+            let job_dir_path = job_dir_entry.path();
+            let is_dir = job_dir_entry.file_type().map_or_else(
+                |_| {
+                    job_dir_path
+                        .metadata()
+                        .map(|meta| meta.is_dir())
+                        .unwrap_or(false)
+                },
+                |ft| ft.is_dir(),
+            );
+            if !is_dir {
+                continue;
+            }
+
+            let modified = job_dir_path
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            match &latest_job {
+                Some((_, current)) if *current >= modified => {},
+                _ => latest_job = Some((job_dir_path, modified)),
+            }
+        }
+
+        if let Some((latest_job_dir, _)) = latest_job {
+            for gate_name in LANE_EVIDENCE_GATES {
+                logs.push(latest_job_dir.join(format!("{gate_name}.log")));
+            }
+        }
+    }
+
+    logs.sort();
+    logs
+}
+
+fn find_latest_evidence_gate_log(home: &Path, gate_name: &str) -> Option<PathBuf> {
+    let expected_name = format!("{gate_name}.log");
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
+    for path in lane_evidence_log_dirs(home) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            continue;
+        }
+        if !path.exists() {
+            continue;
+        }
+        let modified = path
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .is_none_or(|(_, current)| modified > *current)
+        {
+            latest = Some((path, modified));
+        }
+    }
+    latest.map(|(path, _)| path)
+}
+
 fn gate_log_path(gate_name: &str) -> Result<PathBuf, String> {
-    Ok(apm2_home_dir()?
-        .join("private/fac/evidence")
-        .join(format!("{gate_name}.log")))
+    let home = apm2_home_dir()?;
+    find_latest_evidence_gate_log(&home, gate_name).ok_or_else(|| {
+        format!("no evidence gate log found for gate {gate_name} in any lane job directory")
+    })
 }
 
 fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
@@ -1620,6 +1715,7 @@ mod tests {
                 gate_name,
                 passed: true,
                 duration_secs: 1,
+                ..Default::default()
             })
             .collect()
     }
@@ -1877,16 +1973,19 @@ mod tests {
                             gate_name: "rustfmt".to_string(),
                             passed: false,
                             duration_secs: 1,
+                            ..Default::default()
                         },
                         EvidenceGateResult {
                             gate_name: "clippy".to_string(),
                             passed: true,
                             duration_secs: 2,
+                            ..Default::default()
                         },
                         EvidenceGateResult {
                             gate_name: "doc".to_string(),
                             passed: false,
                             duration_secs: 3,
+                            ..Default::default()
                         },
                     ],
                 ))
@@ -1952,11 +2051,13 @@ mod tests {
                             gate_name: "rustfmt".to_string(),
                             passed: false,
                             duration_secs: 1,
+                            ..Default::default()
                         },
                         EvidenceGateResult {
                             gate_name: "clippy".to_string(),
                             passed: true,
                             duration_secs: 2,
+                            ..Default::default()
                         },
                     ],
                 ))
@@ -2001,11 +2102,13 @@ mod tests {
                 gate_name: "rustfmt".to_string(),
                 passed: true,
                 duration_secs: 1,
+                ..Default::default()
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
                 passed: true,
                 duration_secs: 1,
+                ..Default::default()
             },
         ];
 
