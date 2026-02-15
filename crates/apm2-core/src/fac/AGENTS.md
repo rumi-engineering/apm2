@@ -403,11 +403,46 @@ deletion primitive for lane cleanup and reset operations.
 - `--no-hardlinks` prevents object sharing between mirror and workspace
 - Path traversal prevention delegated to `git apply` (standard git safety)
 
+### `execution_backend` — System-mode and user-mode execution backend selection (TCK-00529)
+
+The `execution_backend` submodule implements backend selection for FAC job
+execution. On headless VPS environments without a user D-Bus session, jobs
+run via `systemd-run --system` with a dedicated service user instead of
+`systemd-run --user`.
+
+**Core types**:
+- `ExecutionBackend`: Enum with `UserMode` and `SystemMode` variants.
+- `SystemModeConfig`: Configuration for system-mode (service user).
+- `SystemdRunCommand`: Fully constructed `systemd-run` command specification.
+
+**Key functions**:
+- `select_backend()`: Read `APM2_FAC_EXECUTION_BACKEND` env var (`user` |
+  `system` | `auto`). Auto-mode probes for user bus availability and falls
+  back to system-mode.
+- `select_and_validate_backend()`: Like `select_backend()` but validates
+  prerequisites (user bus exists for user-mode).
+- `build_systemd_run_command()`: Construct the `systemd-run` command for
+  either backend with properties from `SystemdUnitProperties`.
+- `probe_user_bus()`: Check whether a user D-Bus session bus socket exists.
+
+**Environment variables**:
+- `APM2_FAC_EXECUTION_BACKEND`: `user` | `system` | `auto` (default: `auto`)
+- `APM2_FAC_SERVICE_USER`: Service user for system-mode (default: `_apm2-job`)
+
+**Security invariants**:
+- [INV-EXEC-001] Backend selection is fail-closed: invalid config → `Err`.
+- [INV-EXEC-002] System-mode always sets `User=` property; user-mode never
+  does.
+- [INV-EXEC-003] Service user name is validated (alphanumeric/dash/underscore,
+  bounded length).
+- [INV-EXEC-004] Environment variable reads use bounded-length validation.
+- [INV-EXEC-005] Command construction is deterministic for same inputs.
+
 ### `systemd_properties` — Authoritative lane→systemd unit property mapping
 
 The `systemd_properties` submodule is the single translation layer from
 `LaneProfileV1` + `JobConstraints` into executable unit constraints for both
-default worker flow and future system-mode execution backends.
+user-mode and system-mode execution backends.
 
 ## Core Type
 
