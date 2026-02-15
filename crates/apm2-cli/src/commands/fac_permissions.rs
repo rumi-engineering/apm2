@@ -461,7 +461,7 @@ pub fn append_fac_file_with_mode(path: &Path) -> Result<std::fs::File, FacPermis
 ///
 /// Returns a `FacPermissionsError` describing the first violation found.
 #[cfg(unix)]
-fn validate_directory(path: &Path, expected_uid: u32) -> Result<(), FacPermissionsError> {
+pub fn validate_directory(path: &Path, expected_uid: u32) -> Result<(), FacPermissionsError> {
     if !path.exists() {
         ensure_dir_with_mode(path)?;
     }
@@ -491,7 +491,7 @@ fn validate_directory(path: &Path, expected_uid: u32) -> Result<(), FacPermissio
 }
 
 #[cfg(not(unix))]
-fn validate_directory(path: &Path, _expected_uid: u32) -> Result<(), FacPermissionsError> {
+pub fn validate_directory(path: &Path, _expected_uid: u32) -> Result<(), FacPermissionsError> {
     // On non-Unix platforms, ensure the directory exists but skip permission
     // checks.
     if !path.exists() {

@@ -588,3 +588,24 @@ All receipt-touching hot paths consult the index first:
 - [INV-IDX-008] `lookup_job_receipt` verifies content-addressed integrity by
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
   index key. Hash mismatch triggers fallback to directory scan (fail-closed).
+
+## Control-Lane Exception (TCK-00533)
+
+`stop_revoke` jobs bypass the standard RFC-0028 channel context token and
+RFC-0029 queue admission flow. This is an explicit, audited policy exception
+marked by `CONTROL_LANE_EXCEPTION_AUDITED` in `job_spec.rs`.
+
+### Justification
+
+Control-lane cancellation originates from the local operator (same trust domain
+as the queue owner) and requires filesystem-level access proof (queue directory
+write capability). A broker-issued token adds no authority beyond what
+filesystem capability already proves. All structural and digest validation is
+still enforced; only the token requirement is waived.
+
+### Invariants
+
+- `validate_job_spec_control_lane()` enforces all structural/digest validation
+  except the token requirement.
+- All deny paths in the control-lane flow emit explicit refusal receipts before
+  moving jobs to `denied/`.

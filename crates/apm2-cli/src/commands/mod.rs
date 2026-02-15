@@ -49,6 +49,7 @@ pub mod export;
 pub mod fac;
 pub mod fac_broker;
 pub mod fac_gc;
+pub mod fac_job;
 pub mod fac_permissions;
 pub mod fac_pr;
 pub mod fac_quarantine;
