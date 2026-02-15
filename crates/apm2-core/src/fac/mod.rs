@@ -110,6 +110,8 @@ pub mod projection_compromise;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
 mod receipt;
+/// Non-authoritative, rebuildable receipt index for fast job/receipt lookup.
+pub mod receipt_index;
 mod repo_mirror;
 pub mod retry_manager;
 pub mod review_blocked;
@@ -327,6 +329,12 @@ pub use receipt::{
     SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
     compute_job_receipt_content_hash, compute_job_receipt_content_hash_v2, deserialize_job_receipt,
     persist_content_addressed_receipt, persist_content_addressed_receipt_v2,
+};
+// Re-export receipt index types (TCK-00560)
+pub use receipt_index::{
+    INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
+    MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
+    ReceiptIndexV1,
 };
 pub use repo_mirror::{
     CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,

@@ -385,6 +385,12 @@ pub struct ReceiptArgs {
 pub enum ReceiptSubcommand {
     /// Show receipt from CAS.
     Show(ReceiptShowArgs),
+    /// Rebuild the receipt index from the receipt store.
+    ///
+    /// Forces a full scan of all receipt files and rebuilds the
+    /// non-authoritative index used for fast job/receipt lookup.
+    /// The index is a cache — this command is safe to run at any time.
+    Reindex,
 }
 
 /// Arguments for `apm2 fac receipt show`.
@@ -1643,6 +1649,7 @@ pub fn run_fac(
             ReceiptSubcommand::Show(show_args) => {
                 run_receipt_show(show_args, &cas_path, json_output)
             },
+            ReceiptSubcommand::Reindex => run_receipt_reindex(json_output),
         },
         FacSubcommand::Context(args) => match &args.subcommand {
             ContextSubcommand::Rebuild(rebuild_args) => {
@@ -2690,6 +2697,92 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
     }
 
     "unknown".to_string()
+}
+
+// =============================================================================
+// Receipt Reindex Command (TCK-00560)
+// =============================================================================
+
+/// Execute the receipt reindex command.
+///
+/// Rebuilds the non-authoritative receipt index by scanning all receipt files
+/// in the receipt store. The index is a cache for fast job/receipt lookup.
+fn run_receipt_reindex(json_output: bool) -> u8 {
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    if !receipts_dir.is_dir() {
+        if json_output {
+            let result = serde_json::json!({
+                "status": "ok",
+                "message": "no receipt directory found, nothing to index",
+                "entries": 0,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "no receipt directory found at {}, nothing to index",
+                receipts_dir.display()
+            );
+        }
+        return exit_codes::SUCCESS;
+    }
+
+    let start = std::time::Instant::now();
+    match apm2_core::fac::ReceiptIndexV1::rebuild_from_store(&receipts_dir) {
+        Ok(index) => {
+            let count = index.len();
+            match index.persist(&receipts_dir) {
+                Ok(index_path) => {
+                    let elapsed = start.elapsed();
+                    if json_output {
+                        let result = serde_json::json!({
+                            "status": "ok",
+                            "entries": count,
+                            "index_path": index_path.display().to_string(),
+                            "rebuild_epoch": index.rebuild_epoch,
+                            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&result).unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "receipt index rebuilt: {} entries in {:.2}s → {}",
+                            count,
+                            elapsed.as_secs_f64(),
+                            index_path.display()
+                        );
+                    }
+                    exit_codes::SUCCESS
+                },
+                Err(err) => output_error(
+                    json_output,
+                    "index_persist_failed",
+                    &format!("failed to persist receipt index: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                ),
+            }
+        },
+        Err(err) => output_error(
+            json_output,
+            "index_rebuild_failed",
+            &format!("failed to rebuild receipt index: {err}"),
+            exit_codes::GENERIC_ERROR,
+        ),
+    }
 }
 
 fn default_context_rebuild_output_dir(episode_id: &str) -> PathBuf {

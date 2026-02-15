@@ -460,3 +460,47 @@ The `FacJobReceiptV1` type supports two canonical byte representations:
 
 Both representations are length-prefixed. The distinct domain separators ensure
 no hash collision between v1 and v2 hashes for identical receipt content.
+
+## receipt_index Submodule (TCK-00560)
+
+The `receipt_index` submodule implements a non-authoritative, rebuildable index
+for fast job/receipt lookup. The index lives under
+`$APM2_HOME/private/fac/receipts/index/` and maps `job_id` to the latest receipt
+content hash, and content hash to parsed header fields (outcome, timestamp,
+queue_lane, etc.).
+
+### Key Types
+
+- `ReceiptIndexV1`: In-memory index with `job_index` (job_id → content_hash) and
+  `header_index` (content_hash → `ReceiptHeaderV1`). Supports incremental update,
+  full rebuild from receipt store, atomic persistence, and bounded-read loading.
+- `ReceiptHeaderV1`: Parsed header fields extracted from `FacJobReceiptV1`
+  (content_hash, job_id, outcome, timestamp_secs, queue_lane, unsafe_direct).
+
+### Core Capabilities
+
+- `rebuild_from_store(receipts_dir)`: Scan all receipt files, parse, build index.
+  Bounded by `MAX_REBUILD_SCAN_FILES` (65536).
+- `incremental_update(receipts_dir, receipt)`: Load-or-rebuild index, upsert new
+  receipt header, persist atomically.
+- `load_or_rebuild(receipts_dir)`: Load index from disk, rebuild on missing/corrupt.
+- `persist(receipts_dir)`: Atomic write (temp + rename) to index subdirectory.
+- `latest_digest_for_job(job_id)`: O(1) lookup of latest receipt hash for a job.
+- `header_for_digest(content_hash)`: O(1) lookup of parsed header by content hash.
+- Both `persist_content_addressed_receipt` and `persist_content_addressed_receipt_v2`
+  call `incremental_update` as a best-effort post-persist step.
+
+### Security Invariants (TCK-00560)
+
+- [INV-IDX-001] Index is non-authoritative. It is treated as attacker-writable
+  cache under A2 assumptions. Never trusted for authorization/admission/caching.
+- [INV-IDX-002] All in-memory collections bounded by `MAX_INDEX_ENTRIES` (16384)
+  and `MAX_JOB_INDEX_ENTRIES` (16384). Overflow returns Err, not truncation.
+- [INV-IDX-003] Index file reads bounded by `MAX_INDEX_FILE_SIZE` (8 MiB) before
+  deserialization (RSK-1601 prevention).
+- [INV-IDX-004] Rebuild scans bounded by `MAX_REBUILD_SCAN_FILES` (65536).
+- [INV-IDX-005] Corrupt/missing index triggers automatic rebuild from receipt
+  store. System correctness never depends on index availability.
+- [INV-IDX-006] Index persistence uses atomic write (temp + rename).
+- [INV-IDX-007] Individual receipt file reads during rebuild are bounded by
+  `MAX_JOB_RECEIPT_SIZE` before deserialization.
