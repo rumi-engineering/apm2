@@ -448,7 +448,7 @@ pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, json_output: bool) -> u
     let _ = json_output;
     let mut repairs_applied = Vec::new();
     if fix {
-        let pre_repair = run_doctor_inner(repo, pr_number, Vec::new());
+        let pre_repair = run_doctor_inner(repo, pr_number, Vec::new(), false);
         let plan = derive_doctor_repair_plan(&pre_repair);
         let force_repair = doctor_requires_force_repair(&pre_repair);
         if plan.reap_stale_agents
@@ -486,7 +486,7 @@ pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, json_output: bool) -> u
         }
     }
 
-    let summary = run_doctor_inner(repo, pr_number, repairs_applied);
+    let summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
     println!(
         "{}",
         serde_json::to_string_pretty(&summary)
@@ -515,7 +515,7 @@ pub fn collect_tracked_pr_summaries(
         let Some(owner_repo) = resolve_owner_repo_for_pr(pr_number, fallback_owner_repo) else {
             continue;
         };
-        let summary = run_doctor_inner(&owner_repo, pr_number, Vec::new());
+        let summary = run_doctor_inner(&owner_repo, pr_number, Vec::new(), true);
         let lifecycle_state = summary
             .lifecycle
             .as_ref()
@@ -568,6 +568,7 @@ fn run_doctor_inner(
     owner_repo: &str,
     pr_number: u32,
     repairs_applied: Vec<DoctorRepairApplied>,
+    lightweight: bool,
 ) -> DoctorPrSummary {
     let mut health = Vec::new();
     let identity = match projection_store::load_pr_identity_snapshot(owner_repo, pr_number) {
@@ -591,27 +592,29 @@ fn run_doctor_inner(
     let identity_updated_at = identity.as_ref().map(|record| record.updated_at.clone());
 
     let mut remote_head = None;
-    match github_reads::fetch_pr_head_sha(owner_repo, pr_number) {
-        Ok(value) => {
-            if let Err(err) = validate_expected_head_sha(&value) {
+    if !lightweight {
+        match github_reads::fetch_pr_head_sha(owner_repo, pr_number) {
+            Ok(value) => {
+                if let Err(err) = validate_expected_head_sha(&value) {
+                    health.push(DoctorHealthItem {
+                        severity: "high",
+                        message: format!("invalid remote PR head SHA from GitHub: {err}"),
+                        remediation:
+                            "retry later when GitHub API returns a valid SHA or refresh repo credentials"
+                                .to_string(),
+                    });
+                } else {
+                    remote_head = Some(value.to_ascii_lowercase());
+                }
+            },
+            Err(err) => {
                 health.push(DoctorHealthItem {
-                    severity: "high",
-                    message: format!("invalid remote PR head SHA from GitHub: {err}"),
-                    remediation:
-                        "retry later when GitHub API returns a valid SHA or refresh repo credentials"
-                            .to_string(),
+                    severity: "medium",
+                    message: format!("could not resolve remote PR head SHA: {err}"),
+                    remediation: "retry doctor after GH API access is restored".to_string(),
                 });
-            } else {
-                remote_head = Some(value.to_ascii_lowercase());
-            }
-        },
-        Err(err) => {
-            health.push(DoctorHealthItem {
-                severity: "medium",
-                message: format!("could not resolve remote PR head SHA: {err}"),
-                remediation: "retry doctor after GH API access is restored".to_string(),
-            });
-        },
+            },
+        }
     }
     let stale = match (&local_sha, remote_head.as_deref()) {
         (Some(local), Some(remote)) => !local.eq_ignore_ascii_case(remote),
@@ -931,17 +934,31 @@ fn run_doctor_inner(
             }
 
             let mut entries = Vec::with_capacity(snapshot.entries.len());
-            let active_run_ids = snapshot
-                .entries
-                .iter()
-                .map(|entry| entry.run_id.trim().to_string())
-                .filter(|run_id| !run_id.is_empty())
-                .collect::<std::collections::BTreeSet<_>>();
-            let event_signals = scan_event_signals_for_pr(pr_number, &active_run_ids);
-            let activity_map = event_signals.activity_timestamps;
-            let model_attempts = event_signals.model_attempts;
-            let findings_activity =
-                latest_finding_activity_by_dimension(owner_repo, pr_number, local_sha.as_deref());
+            let (activity_map, model_attempts, findings_activity) = if lightweight {
+                (
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                )
+            } else {
+                let active_run_ids = snapshot
+                    .entries
+                    .iter()
+                    .map(|entry| entry.run_id.trim().to_string())
+                    .filter(|run_id| !run_id.is_empty())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let event_signals = scan_event_signals_for_pr(pr_number, &active_run_ids);
+                let fa = latest_finding_activity_by_dimension(
+                    owner_repo,
+                    pr_number,
+                    local_sha.as_deref(),
+                );
+                (
+                    event_signals.activity_timestamps,
+                    event_signals.model_attempts,
+                    fa,
+                )
+            };
             for entry in snapshot.entries {
                 let dimension = doctor_dimension_for_agent(&entry.agent_type);
                 let started_at = parse_rfc3339_utc(entry.started_at.as_str());
@@ -1022,8 +1039,15 @@ fn run_doctor_inner(
         remote_head.as_ref(),
         merge_conflict_status,
     );
-    let github_projection =
-        build_doctor_github_projection_status(owner_repo, pr_number, local_sha.as_deref());
+    let github_projection = if lightweight {
+        DoctorGithubProjectionStatus {
+            auto_merge_enabled: false,
+            last_comment_updated_at: None,
+            projection_lag_seconds: None,
+        }
+    } else {
+        build_doctor_github_projection_status(owner_repo, pr_number, local_sha.as_deref())
+    };
     let latest_push_attempt =
         match build_doctor_push_attempt_summary(owner_repo, pr_number, local_sha.as_deref()) {
             Ok(value) => value,
