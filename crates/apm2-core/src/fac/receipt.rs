@@ -264,6 +264,10 @@ pub enum DenialReasonCode {
     /// authority.  The queue root or a subdirectory is not owned by the
     /// current uid or has group/world-accessible mode bits.
     UnsafeQueuePermissions,
+    /// Canonicalizer tuple digest could not be parsed from b3-256 hex string.
+    /// Fail-closed: unparseable digest cannot be used for token binding
+    /// validation.
+    InvalidCanonicalizerDigest,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -2413,6 +2417,10 @@ pub mod tests {
             (
                 DenialReasonCode::InsufficientDiskSpace,
                 "\"insufficient_disk_space\"",
+            ),
+            (
+                DenialReasonCode::InvalidCanonicalizerDigest,
+                "\"invalid_canonicalizer_digest\"",
             ),
         ];
 

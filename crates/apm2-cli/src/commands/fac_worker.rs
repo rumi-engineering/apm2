@@ -1169,15 +1169,44 @@ fn process_job(
 
     // TCK-00565: Build expected token binding for fail-closed validation.
     // Parse the canonicalizer tuple digest from the b3-256 hex string to raw bytes.
-    let ct_digest_bytes = parse_b3_256_digest(canonicalizer_tuple_digest);
-    let expected_binding = ct_digest_bytes
-        .as_ref()
-        .map(|ct_bytes| ExpectedTokenBinding {
-            fac_policy_hash: policy_digest,
-            canonicalizer_tuple_digest: ct_bytes,
-            boundary_id: DEFAULT_BOUNDARY_ID,
-            current_tick: broker.current_tick(),
-        });
+    // Fail-closed: if the digest cannot be parsed, deny the job immediately —
+    // never fall through with None (which would skip token binding validation).
+    let Some(ct_digest_bytes) = parse_b3_256_digest(canonicalizer_tuple_digest) else {
+        let reason = format!(
+            "invalid canonicalizer tuple digest: cannot parse b3-256 hex: {canonicalizer_tuple_digest}"
+        );
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::InvalidCanonicalizerDigest),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    };
+    let expected_binding = ExpectedTokenBinding {
+        fac_policy_hash: policy_digest,
+        canonicalizer_tuple_digest: &ct_digest_bytes,
+        boundary_id: DEFAULT_BOUNDARY_ID,
+        current_tick: broker.current_tick(),
+    };
 
     let boundary_check = match decode_channel_context_token_with_binding(
         token,
@@ -1185,7 +1214,7 @@ fn process_job(
         &spec.actuation.lease_id,
         current_time_secs,
         &spec.actuation.request_id,
-        expected_binding.as_ref(),
+        Some(&expected_binding),
     ) {
         Ok(check) => check,
         Err(e) => {
