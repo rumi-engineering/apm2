@@ -604,6 +604,20 @@ ticket_meta:
           no new crate dependencies.
 
           Reference: documents/work/prompts/codex-projection-decoupling.md
+      - id: DONE_BOUNDED_RUNNER_KILLSIGNAL_FIX
+        title: "Fix scope cleanup false-FAIL: KillSignal SIGTERM→SIGKILL"
+        detail: |
+          Already completed in this branch:
+          - build_bounded_test_command() set KillSignal=SIGTERM, which allowed
+            TERM-ignoring descendant processes (e.g. tck_00392's
+            `trap '' TERM; sleep 600`) to survive scope stop, causing systemd to
+            wait for TimeoutStopSec and report `Failed with result 'timeout'`
+          - Changed KillSignal=SIGTERM to KillSignal=SIGKILL so scope cleanup is
+            immediate and unconditional — stray processes cannot block scope stop
+          - Combined with existing FinalKillSignal=SIGKILL, SendSIGKILL=yes, and
+            KillMode=control-group for defense-in-depth
+          - Root cause: tests intentionally spawn TERM-resistant processes to
+            validate containment; the bounded runner must tolerate this
       - id: DONE_BOUNDED_RUNNER_SETENV_FIX
         title: "Fix env var forwarding gap in bounded test runner"
         detail: |
@@ -910,6 +924,7 @@ ticket_meta:
       - "Core FAC modules (lifecycle, dispatch, state, types, events, evidence, gates, findings, logs, projection) contain zero `Command::new(\"gh\")` calls after projection decoupling."
       - "github_auth.rs is the single canonical location for `ensure_gh_cli_ready` and `resolve_authenticated_gh_login` — no copies in barrier.rs or projection.rs."
       - "verdict_projection.rs contains all verdict comment rendering/parsing logic previously in projection.rs."
+      - "Bounded test runner uses KillSignal=SIGKILL so TERM-ignoring descendant processes (from containment tests) cannot cause false-FAIL via scope stop timeout."
       - "`build_bounded_test_command()` forwards caller-supplied lane profile env vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) via --setenv to the systemd-run scope."
       - "All evidence gates and tests pass."
   notes:
