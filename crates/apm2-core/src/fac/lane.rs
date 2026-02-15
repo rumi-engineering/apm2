@@ -102,7 +102,7 @@ pub const MAX_LEASE_FILE_SIZE: u64 = 1024 * 1024;
 pub const MAX_PROFILE_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Maximum allowed test timeout in seconds for FAC execution paths.
-pub const MAX_TEST_TIMEOUT_SECONDS: u64 = 240;
+pub const MAX_TEST_TIMEOUT_SECONDS: u64 = 600;
 
 /// Maximum allowed memory cap in bytes for FAC execution paths (48 GiB).
 pub const MAX_MEMORY_MAX_BYTES: u64 = 51_539_607_552;
@@ -474,7 +474,7 @@ pub struct LaneTimeouts {
 impl Default for LaneTimeouts {
     fn default() -> Self {
         Self {
-            test_timeout_seconds: 240,
+            test_timeout_seconds: 600,
             job_runtime_max_seconds: 1800,
         }
     }
@@ -2444,7 +2444,7 @@ mod tests {
 
     #[test]
     fn lane_profile_rejects_unknown_fields() {
-        let json = r#"{"schema":"apm2.fac.lane_profile.v1","lane_id":"lane-00","node_fingerprint":"x","boundary_id":"boundary-00","resource_profile":{"cpu_quota_percent":200,"memory_max_bytes":100,"pids_max":1536,"io_weight":100},"timeouts":{"test_timeout_seconds":240,"job_runtime_max_seconds":1800},"policy":{"fac_policy_hash":"","nextest_profile":"ci","deny_ambient_cargo_home":true},"extra_field":"evil"}"#;
+        let json = r#"{"schema":"apm2.fac.lane_profile.v1","lane_id":"lane-00","node_fingerprint":"x","boundary_id":"boundary-00","resource_profile":{"cpu_quota_percent":200,"memory_max_bytes":100,"pids_max":1536,"io_weight":100},"timeouts":{"test_timeout_seconds":600,"job_runtime_max_seconds":1800},"policy":{"fac_policy_hash":"","nextest_profile":"ci","deny_ambient_cargo_home":true},"extra_field":"evil"}"#;
         let result: Result<LaneProfileV1, _> = serde_json::from_str(json);
         assert!(result.is_err(), "must reject unknown fields (CTR-1604)");
     }

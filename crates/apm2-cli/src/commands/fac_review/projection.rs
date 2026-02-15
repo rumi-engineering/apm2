@@ -1075,6 +1075,7 @@ mod tests {
             model_id: Some("gpt-5.3-codex".to_string()),
             backend_id: Some("codex".to_string()),
             restart_count: 0,
+            nudge_count: 0,
             sequence_number: 2,
             previous_run_id: None,
             previous_head_sha: None,

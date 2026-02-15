@@ -208,7 +208,7 @@ pub fn build_resume_spawn_command_for_backend(
     backend: ReviewBackend,
     log_path: &Path,
     model: &str,
-    sha_update_msg: &str,
+    resume_prompt_path: &Path,
 ) -> SpawnCommand {
     match backend {
         ReviewBackend::Codex => SpawnCommand {
@@ -219,11 +219,11 @@ pub fn build_resume_spawn_command_for_backend(
                 "--last".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--json".to_string(),
-                sha_update_msg.to_string(),
+                "-".to_string(),
             ],
             log_path: log_path.to_path_buf(),
             append_log: true,
-            stdin_file: None,
+            stdin_file: Some(resume_prompt_path.to_path_buf()),
         },
         ReviewBackend::Gemini => SpawnCommand {
             program: "gemini".to_string(),
@@ -234,17 +234,16 @@ pub fn build_resume_spawn_command_for_backend(
                 "--resume".to_string(),
                 "latest".to_string(),
                 "-p".to_string(),
-                sha_update_msg.to_string(),
+                String::new(),
             ],
             log_path: log_path.to_path_buf(),
             append_log: true,
-            stdin_file: None,
+            stdin_file: Some(resume_prompt_path.to_path_buf()),
         },
         ReviewBackend::ClaudeCode => SpawnCommand {
             program: "claude".to_string(),
             args: vec![
                 "-p".to_string(),
-                sha_update_msg.to_string(),
                 "--model".to_string(),
                 model.to_string(),
                 "--output-format".to_string(),
@@ -255,7 +254,7 @@ pub fn build_resume_spawn_command_for_backend(
             ],
             log_path: log_path.to_path_buf(),
             append_log: true,
-            stdin_file: None,
+            stdin_file: Some(resume_prompt_path.to_path_buf()),
         },
     }
 }
@@ -376,52 +375,56 @@ mod tests {
     #[test]
     fn spawn_command_resume_codex_appends_to_log() {
         let log = Path::new("/tmp/resume.log");
+        let prompt = Path::new("/tmp/resume_prompt.md");
         let cmd = build_resume_spawn_command_for_backend(
             ReviewBackend::Codex,
             log,
             "gpt-5.3-codex",
-            "SHA update message",
+            prompt,
         );
 
         assert_eq!(cmd.program, "codex");
         assert!(cmd.args.contains(&"resume".to_string()));
         assert!(cmd.args.contains(&"--last".to_string()));
-        assert!(cmd.args.contains(&"SHA update message".to_string()));
+        assert!(cmd.args.contains(&"-".to_string()));
         assert!(cmd.append_log);
-        assert!(cmd.stdin_file.is_none());
+        assert_eq!(cmd.stdin_file, Some(prompt.to_path_buf()));
     }
 
     #[test]
     fn spawn_command_resume_gemini_appends_to_log() {
         let log = Path::new("/tmp/resume.log");
+        let prompt = Path::new("/tmp/resume_prompt.md");
         let cmd = build_resume_spawn_command_for_backend(
             ReviewBackend::Gemini,
             log,
             "gemini-3-flash-preview",
-            "resume msg",
+            prompt,
         );
 
         assert_eq!(cmd.program, "gemini");
         assert!(cmd.args.contains(&"--resume".to_string()));
         assert!(cmd.args.contains(&"latest".to_string()));
-        assert!(cmd.args.contains(&"resume msg".to_string()));
+        assert!(cmd.args.contains(&String::new()));
         assert!(cmd.append_log);
+        assert_eq!(cmd.stdin_file, Some(prompt.to_path_buf()));
     }
 
     #[test]
     fn spawn_command_resume_claude_appends_to_log() {
         let log = Path::new("/tmp/resume.log");
+        let prompt = Path::new("/tmp/resume_prompt.md");
         let cmd = build_resume_spawn_command_for_backend(
             ReviewBackend::ClaudeCode,
             log,
             "claude-3-7-sonnet",
-            "resume msg",
+            prompt,
         );
 
         assert_eq!(cmd.program, "claude");
         assert!(cmd.args.contains(&"--resume".to_string()));
-        assert!(cmd.args.contains(&"resume msg".to_string()));
         assert!(cmd.append_log);
+        assert_eq!(cmd.stdin_file, Some(prompt.to_path_buf()));
     }
 
     #[test]
