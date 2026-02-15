@@ -94,6 +94,71 @@ mod remote_url_tests {
         let result = parse_github_remote_url("https://github.com/my.org/my_repo.git");
         assert_eq!(result, Some(("my.org".to_string(), "my_repo".to_string())));
     }
+
+    // --- Negative tests for extra path segments (MAJOR fix) ---
+
+    #[test]
+    fn reject_https_extra_path_segments() {
+        // Must reject URLs with extra path beyond owner/repo
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/tree/main"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_https_extra_path_blob() {
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/blob/main/README.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_https_extra_path_pulls() {
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/pulls"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_ssh_extra_path_segments() {
+        assert_eq!(
+            parse_github_remote_url("ssh://git@github.com/owner/repo/extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_http_extra_path_segments() {
+        assert_eq!(
+            parse_github_remote_url("http://github.com/owner/repo/extra/path"),
+            None
+        );
+    }
+
+    #[test]
+    fn accept_https_trailing_slash() {
+        // Trailing slash should still parse correctly
+        let result = parse_github_remote_url("https://github.com/owner/repo/");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn accept_scp_trailing_slash() {
+        let result = parse_github_remote_url("git@github.com:owner/repo/");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn reject_https_extra_with_git_suffix() {
+        // Must not accept extra segments even with .git at the end
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/extra.git"),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

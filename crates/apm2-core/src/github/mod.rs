@@ -263,6 +263,7 @@ pub fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
 
     // git@github.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
         let rest = rest.strip_suffix(".git").unwrap_or(rest);
         let parts: Vec<&str> = rest.splitn(2, '/').collect();
         if parts.len() == 2
@@ -281,9 +282,13 @@ pub fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
         "http://github.com/",
     ] {
         if let Some(rest) = url.strip_prefix(prefix) {
+            // Strip optional trailing slash before .git check
+            let rest = rest.strip_suffix('/').unwrap_or(rest);
             let rest = rest.strip_suffix(".git").unwrap_or(rest);
+            // Split into at most 3 parts to detect extra segments
             let parts: Vec<&str> = rest.splitn(3, '/').collect();
-            if parts.len() >= 2
+            // Require exact owner/repo shape — reject extra path segments
+            if parts.len() == 2
                 && is_valid_github_segment(parts[0])
                 && is_valid_github_segment(parts[1])
             {
