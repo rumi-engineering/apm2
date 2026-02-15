@@ -106,7 +106,8 @@ impl EcosystemConfig {
     ///
     /// 1. Using XDG-standard default paths for all daemon paths.
     /// 2. Auto-detecting GitHub owner/repo from `git remote get-url origin`.
-    /// 3. Using `$GITHUB_TOKEN` (or `$GH_TOKEN`) for projection auth.
+    /// 3. Using `$GITHUB_TOKEN` (or `$GH_TOKEN`) for projection auth, with
+    ///    fallback to systemd credentials and APM2 credential files.
     ///
     /// The projection worker is enabled only when both the GitHub token
     /// and owner/repo are successfully detected. Otherwise, the config
@@ -114,6 +115,13 @@ impl EcosystemConfig {
     ///
     /// **This is for the short-lived CLI only.** The long-lived daemon
     /// must NOT use auto-detection from CWD (see MAJOR-1 in daemon/main.rs).
+    ///
+    /// # Security
+    ///
+    /// This calls `detect_github_owner_repo_from_cwd()` which executes a
+    /// PATH-resolved `git` binary. This is acceptable for the CLI context
+    /// (runs with user privileges), but the daemon MUST use explicit config.
+    /// See security review finding f-686-security-*.
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -121,18 +129,12 @@ impl EcosystemConfig {
         // Detect GitHub owner/repo from CWD git remote
         let github_coords = crate::github::detect_github_owner_repo_from_cwd();
 
-        // Check for GitHub token in env
-        let github_token_env = if std::env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
+        // Check for GitHub token via unified resolution chain (TCK-00595 MAJOR FIX):
+        // env vars -> $CREDENTIALS_DIRECTORY/gh-token ->
+        // $APM2_HOME/private/creds/gh-token
+        let github_token_env = if resolve_github_token("GITHUB_TOKEN").is_some() {
             Some("GITHUB_TOKEN".to_string())
-        } else if std::env::var("GH_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
+        } else if resolve_github_token("GH_TOKEN").is_some() {
             Some("GH_TOKEN".to_string())
         } else {
             None
@@ -895,6 +897,54 @@ const fn default_instances() -> u32 {
     1
 }
 
+/// Resolve a GitHub token value from available sources (TCK-00595 MAJOR FIX).
+///
+/// Resolution order:
+/// 1. Environment variable named by `env_var_name` (e.g., `GITHUB_TOKEN`).
+/// 2. Systemd credential directory: `$CREDENTIALS_DIRECTORY/gh-token`. This is
+///    where `LoadCredential=gh-token:...` in the unit file places the token
+///    when running under systemd.
+/// 3. APM2 credential file: `$APM2_HOME/private/creds/gh-token` (direct file
+///    fallback for non-systemd environments).
+///
+/// Returns the token string, or `None` if no source provides a value.
+///
+/// The caller is responsible for wrapping the result in `SecretString` or
+/// otherwise protecting the token in memory.
+#[must_use]
+pub fn resolve_github_token(env_var_name: &str) -> Option<String> {
+    // 1. Standard env var
+    if let Ok(val) = std::env::var(env_var_name) {
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+
+    // 2. Systemd credential directory ($CREDENTIALS_DIRECTORY/gh-token)
+    if let Ok(cred_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
+        let cred_path = std::path::Path::new(&cred_dir).join("gh-token");
+        if let Ok(contents) = std::fs::read_to_string(&cred_path) {
+            let trimmed = contents.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+
+    // 3. APM2 credential file fallback ($APM2_HOME/private/creds/gh-token)
+    if let Some(apm2_home) = crate::github::resolve_apm2_home() {
+        let cred_path = apm2_home.join("private/creds/gh-token");
+        if let Ok(contents) = std::fs::read_to_string(&cred_path) {
+            let trimmed = contents.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+
+    None
+}
+
 /// Configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -1252,6 +1302,33 @@ mod tests {
         assert!(
             !config.daemon.session_socket.as_os_str().is_empty(),
             "session_socket must have a default path"
+        );
+    }
+
+    /// TCK-00595 MAJOR FIX: `resolve_github_token` does not panic when
+    /// called with any env var name, including ones that do not exist.
+    #[test]
+    fn test_resolve_github_token_no_panic_on_missing_var() {
+        // Env var that does not exist — function should return None or
+        // fall through to credential file checks without panicking.
+        let result = resolve_github_token("APM2_TEST_TOKEN_NONEXISTENT_VAR_12345");
+        // We cannot guarantee None because $CREDENTIALS_DIRECTORY or
+        // $APM2_HOME/private/creds/gh-token might exist in the test env.
+        // The key assertion is: no panic.
+        let _ = result;
+    }
+
+    /// TCK-00595 MAJOR FIX: `resolve_github_token` returns the env var
+    /// value when the env var is set (tested via a known-set variable).
+    #[test]
+    fn test_resolve_github_token_reads_env_var() {
+        // PATH is always set on any unix system — use it as a proxy to
+        // verify the env var reading path works (not a real token, just
+        // verifying the function reads env vars correctly).
+        let result = resolve_github_token("PATH");
+        assert!(
+            result.is_some(),
+            "resolve_github_token should return Some for a set env var"
         );
     }
 }

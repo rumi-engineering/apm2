@@ -667,19 +667,24 @@ pub fn collect_doctor_checks(
     // source is available (neither token nor app config).
     let cred_fail_status: &str = if full { "ERROR" } else { "WARN" };
 
-    // Probe all credential sources before determining status
+    // Probe all credential sources before determining status.
+    // TCK-00595 MAJOR FIX: Use unified token resolution chain that checks
+    // env vars, $CREDENTIALS_DIRECTORY/gh-token (systemd LoadCredential),
+    // and $APM2_HOME/private/creds/gh-token.
     let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(ref v) if !v.is_empty());
     let gh_token_set = matches!(std::env::var("GH_TOKEN"), Ok(ref v) if !v.is_empty());
-    let any_token = github_token_set || gh_token_set;
+    let any_env_token = github_token_set || gh_token_set;
+    // Unified resolution: checks env + systemd creds + APM2 cred file
+    let unified_token_available = apm2_core::config::resolve_github_token("GITHUB_TOKEN").is_some()
+        || apm2_core::config::resolve_github_token("GH_TOKEN").is_some();
     let app_config = apm2_core::github::load_github_app_config();
     let app_configured = app_config.is_some();
 
     // Any valid credential source (token OR app) satisfies the requirement
-    let any_credential_source = any_token || app_configured;
+    let any_credential_source = unified_token_available || app_configured;
 
-    // GITHUB_TOKEN / GH_TOKEN env var — only ERROR in full mode when
-    // neither token NOR app config is available
-    let creds_token_status = if any_token {
+    // GitHub token — check all resolution sources
+    let creds_token_status = if unified_token_available {
         "OK"
     } else if app_configured {
         // App config is present as alternative — tokens are optional
@@ -690,15 +695,19 @@ pub fn collect_doctor_checks(
     checks.push(DaemonDoctorCheck {
         name: "creds_github_token".to_string(),
         status: creds_token_status,
-        message: if any_token {
+        message: if any_env_token {
             "GitHub token environment variable is set (GITHUB_TOKEN or GH_TOKEN)".to_string()
+        } else if unified_token_available {
+            "GitHub token resolved via systemd credentials or APM2 credential file".to_string()
         } else if app_configured {
             "GitHub token not set, but GitHub App credentials are configured (OK as alternative)"
                 .to_string()
         } else {
-            "neither GITHUB_TOKEN nor GH_TOKEN is set; GitHub-facing commands will fail. \
-             Remediation: export GITHUB_TOKEN=<token>, or configure GitHub App credentials \
-             as an alternative (see `apm2 fac pr auth-setup`)"
+            "GitHub token not found. Checked: GITHUB_TOKEN/GH_TOKEN env vars, \
+             $CREDENTIALS_DIRECTORY/gh-token (systemd), $APM2_HOME/private/creds/gh-token. \
+             Remediation: export GITHUB_TOKEN=<token>, write token to \
+             $APM2_HOME/private/creds/gh-token, or configure GitHub App credentials \
+             (see `apm2 fac pr auth-setup`)"
                 .to_string()
         },
     });
@@ -708,7 +717,7 @@ pub fn collect_doctor_checks(
 
     // GitHub App config (github_app.toml) — only ERROR in full mode when
     // neither app config NOR token is available
-    let app_status = if app_configured || any_token {
+    let app_status = if app_configured || unified_token_available {
         "OK"
     } else {
         cred_fail_status
@@ -718,7 +727,7 @@ pub fn collect_doctor_checks(
         status: app_status,
         message: if app_configured {
             "GitHub App configuration found (github_app.toml)".to_string()
-        } else if any_token {
+        } else if unified_token_available {
             "GitHub App not configured, but token auth is available (OK as alternative)".to_string()
         } else {
             "GitHub App not configured (no github_app.toml found). \

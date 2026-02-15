@@ -308,25 +308,63 @@ pub fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
 /// for **short-lived CLI** processes only. The long-lived daemon should NOT
 /// use this — it must use explicit config to avoid cross-repository pollution.
 ///
+/// # Security
+///
+/// This function executes a PATH-resolved `git` binary. In environments where
+/// PATH can be manipulated by an attacker, a malicious binary could execute
+/// arbitrary code. This is an accepted risk for the **CLI-only** context:
+/// - The CLI already runs with the invoking user's full privileges.
+/// - The daemon MUST NOT call this function (use explicit config instead).
+/// - A 5-second timeout bounds execution to prevent hang-based `DoS`.
+///
 /// Returns `None` if:
 /// - Not in a git repo
 /// - No `origin` remote
 /// - Remote URL is not a recognized GitHub format
-/// - `git` binary is unavailable
+/// - `git` binary is unavailable or times out
 #[must_use]
 pub fn detect_github_owner_repo_from_cwd() -> Option<(String, String)> {
-    let output = std::process::Command::new("git")
+    use wait_timeout::ChildExt;
+
+    // Spawn git with piped stdout, bounded by a 5-second timeout to prevent
+    // hang-based DoS from a malicious or unresponsive git binary.
+    let mut child = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
 
-    if !output.status.success() {
+    let timeout = std::time::Duration::from_secs(5);
+    let status = match child.wait_timeout(timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            // Timed out — kill the process and return None
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        },
+        Err(_) => return None,
+    };
+
+    if !status.success() {
         return None;
     }
 
-    let url = String::from_utf8(output.stdout).ok()?;
+    // Read stdout from the completed process
+    let mut stdout_buf = Vec::with_capacity(MAX_REMOTE_URL_LENGTH);
+    if let Some(stdout) = child.stdout.take() {
+        use std::io::Read;
+        // Bounded read to prevent memory DoS
+        stdout
+            .take(MAX_REMOTE_URL_LENGTH as u64)
+            .read_to_end(&mut stdout_buf)
+            .ok()?;
+    } else {
+        return None;
+    }
+
+    let url = String::from_utf8(stdout_buf).ok()?;
     let url = url.trim();
     parse_github_remote_url(url)
 }
