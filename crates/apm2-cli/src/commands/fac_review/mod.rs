@@ -436,7 +436,16 @@ fn emit_run_ndjson_since(
     Ok(())
 }
 
-pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, _json_output: bool) -> u8 {
+/// Run doctor diagnostics for a specific PR.
+///
+/// `json_output` is accepted for CLI flag consistency but doctor `--pr` always
+/// emits JSON — it is primarily a machine-readable diagnostic surface consumed
+/// by orchestrator agents. The parameter is kept explicit (not prefixed with
+/// `_`) to document this intentional design choice.
+pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, json_output: bool) -> u8 {
+    // Doctor --pr always emits JSON regardless of the flag value; this is
+    // intentional — the output is consumed by automation, not humans.
+    let _ = json_output;
     let mut repairs_applied = Vec::new();
     if fix {
         let pre_repair = run_doctor_inner(repo, pr_number, Vec::new());

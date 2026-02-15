@@ -292,3 +292,5 @@ pub use types::ReviewRunType;
   - `maybe_auto_merge_if_ready()` now runs on a background thread (fire-and-forget) so git merge operations do not block the `verdict set` response path. Reviewer agents are no longer at risk of hitting internal timeouts due to slow git operations during auto-merge.
   - `load_findings_bundle()` implements one-time HMAC migration for pre-existing findings bundles: bundles created before HMAC integrity was introduced are migrated on first load (HMAC computed and persisted) rather than rejected. This preserves auto-verdict derivation and `verdict show` for active PRs.
   - `fetch_pr_body_for_projection()` no longer makes a redundant GitHub API call when the first call returns empty and the local snapshot is also empty.
+  - Restored `review_artifact_lint` in `post_test_script_gates` in both `run_evidence_gates()` and `run_evidence_gates_with_status()` — the gate was accidentally dropped during bounded-runner refactoring.
+  - `run_doctor()` `json_output` parameter is now explicit (no underscore prefix) with documentation that doctor `--pr` intentionally always emits JSON as a machine-readable diagnostic surface.

@@ -511,8 +511,9 @@ pub fn run_evidence_gates(
     let pre_test_script_gates: &[(&str, &str)] =
         &[("test_safety_guard", "scripts/ci/test_safety_guard.sh")];
 
-    // No post-test script gates currently enabled.
-    let post_test_script_gates: &[(&str, &str)] = &[];
+    // Script gates that run AFTER tests (ordering dependency on test).
+    let post_test_script_gates: &[(&str, &str)] =
+        &[("review_artifact_lint", "scripts/ci/review_artifact_lint.sh")];
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
@@ -766,7 +767,9 @@ pub fn run_evidence_gates_with_status(
     let pre_test_script_gates: &[(&str, &str)] =
         &[("test_safety_guard", "scripts/ci/test_safety_guard.sh")];
 
-    let post_test_script_gates: &[(&str, &str)] = &[];
+    // Script gates that run AFTER tests (ordering dependency on test).
+    let post_test_script_gates: &[(&str, &str)] =
+        &[("review_artifact_lint", "scripts/ci/review_artifact_lint.sh")];
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
