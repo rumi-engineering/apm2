@@ -179,6 +179,13 @@ pub struct DaemonConfig {
     #[serde(default = "default_state_file")]
     pub state_file: PathBuf,
 
+    /// Path to the daemon ledger database.
+    ///
+    /// Defaults to `$APM2_DATA_DIR/ledger.db` (or XDG equivalent) when not
+    /// specified in config.
+    #[serde(default = "default_ledger_db")]
+    pub ledger_db: Option<PathBuf>,
+
     /// Audit configuration.
     #[serde(default)]
     pub audit: AuditConfig,
@@ -633,6 +640,7 @@ impl Default for DaemonConfig {
             session_socket: default_session_socket(),
             log_dir: default_log_dir(),
             state_file: default_state_file(),
+            ledger_db: default_ledger_db(),
             audit: AuditConfig::default(),
             projection: ProjectionConfig::default(),
             cas_path: None,
@@ -828,6 +836,11 @@ fn default_log_dir() -> PathBuf {
 
 fn default_state_file() -> PathBuf {
     default_data_dir().join("state.json")
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_ledger_db() -> Option<PathBuf> {
+    Some(default_data_dir().join("ledger.db"))
 }
 
 /// Credential profile configuration (in ecosystem file).
@@ -1074,10 +1087,43 @@ mod tests {
             config.daemon.session_socket,
             PathBuf::from("/tmp/apm2/session.sock")
         );
+        assert_eq!(
+            config.daemon.ledger_db,
+            Some(default_data_dir().join("ledger.db"))
+        );
         assert_eq!(config.daemon.audit.retention_days, 90);
         assert_eq!(config.daemon.audit.max_size_bytes, 536_870_912);
         assert_eq!(config.credentials.len(), 1);
         assert_eq!(config.processes[0].instances, 2);
+    }
+
+    #[test]
+    fn test_parse_daemon_ledger_db_from_toml() {
+        let toml = r#"
+            [daemon]
+            operator_socket = "/tmp/apm2/operator.sock"
+            session_socket = "/tmp/apm2/session.sock"
+            ledger_db = "/tmp/apm2/custom-ledger.db"
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let config = EcosystemConfig::from_toml(toml).expect("config should parse");
+        assert_eq!(
+            config.daemon.ledger_db,
+            Some(PathBuf::from("/tmp/apm2/custom-ledger.db"))
+        );
+    }
+
+    #[test]
+    fn test_daemon_default_sets_ledger_db() {
+        let config = EcosystemConfig::default();
+        assert_eq!(
+            config.daemon.ledger_db,
+            Some(default_data_dir().join("ledger.db"))
+        );
     }
 
     /// UT-00280-01: Test that DD-009 rejects legacy socket configuration

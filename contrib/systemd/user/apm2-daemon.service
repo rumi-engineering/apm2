@@ -25,7 +25,7 @@ LoadCredential=gh-token:%h/.apm2/private/creds/gh-token
 Sockets=apm2-daemon.socket
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.apm2
+ReadWritePaths=%h/.apm2 %h/.local/share/apm2
 NoNewPrivileges=yes
 PrivateTmp=yes
 

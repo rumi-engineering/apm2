@@ -69,7 +69,7 @@ LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
 Sockets=apm2-daemon.socket\n\
 ProtectSystem=strict\n\
 ProtectHome=read-only\n\
-ReadWritePaths=%h/.apm2\n\
+ReadWritePaths=%h/.apm2 %h/.local/share/apm2\n\
 NoNewPrivileges=yes\n\
 PrivateTmp=yes\n\
 \n\
@@ -87,7 +87,7 @@ Requires=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=%exe_path% fac worker --poll-interval 10\n\
+ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
@@ -97,7 +97,7 @@ Environment=RUST_LOG=info\n\
 LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
 ProtectSystem=strict\n\
 ProtectHome=read-only\n\
-ReadWritePaths=%h/.apm2\n\
+ReadWritePaths=%h/.apm2 %h/.local/share/apm2\n\
 NoNewPrivileges=yes\n\
 PrivateTmp=yes\n\
 \n\
@@ -115,7 +115,7 @@ Requires=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=%exe_path% fac worker --poll-interval 10\n\
+ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
@@ -125,7 +125,7 @@ Environment=RUST_LOG=info\n\
 LoadCredential=gh-token:%h/.apm2/private/creds/gh-token\n\
 ProtectSystem=strict\n\
 ProtectHome=read-only\n\
-ReadWritePaths=%h/.apm2\n\
+ReadWritePaths=%h/.apm2 %h/.local/share/apm2\n\
 NoNewPrivileges=yes\n\
 PrivateTmp=yes\n\
 \n\
@@ -954,13 +954,17 @@ fn check_projection_worker_health(
     } else {
         None
     };
-    check_projection_worker_health_with_overrides(config_path, daemon_running, runtime_overrides)
+    check_projection_worker_health_with_overrides(
+        config_path,
+        daemon_running,
+        runtime_overrides.as_ref(),
+    )
 }
 
 fn check_projection_worker_health_with_overrides(
     config_path: &Path,
     daemon_running: bool,
-    runtime_overrides: Option<DaemonRuntimePathOverrides>,
+    runtime_overrides: Option<&DaemonRuntimePathOverrides>,
 ) -> ProjectionHealthResult {
     // Try to load the config to check projection settings
     let config = config_path
@@ -1014,10 +1018,11 @@ fn check_projection_worker_health_with_overrides(
     //   `ledger_db_path.with_extension("projection_cache.db")`
     // - otherwise: `{state_file_dir}/projection_cache.db`
     let effective_state_file = runtime_overrides
-        .as_ref()
         .and_then(|overrides| overrides.state_file.clone())
         .unwrap_or_else(|| config.daemon.state_file.clone());
-    let effective_ledger_db = runtime_overrides.and_then(|overrides| overrides.ledger_db);
+    let effective_ledger_db = runtime_overrides
+        .and_then(|overrides| overrides.ledger_db.clone())
+        .or_else(|| config.daemon.ledger_db.clone());
     let cache_path = projection_cache_path_for_daemon_paths(
         &effective_state_file,
         effective_ledger_db.as_deref(),
@@ -1461,15 +1466,15 @@ mod tests {
     #[test]
     fn projection_health_enabled_no_cache_returns_error() {
         let temp = tempfile::TempDir::new().unwrap();
-        let state_path = temp.path().join("state.json");
+        let ledger_path = temp.path().join("ledger.db");
         let config_path = temp.path().join("ecosystem.toml");
         std::fs::write(
             &config_path,
             format!(
                 "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
-                 state_file = \"{}\"\n\
+                 ledger_db = \"{}\"\n\
                  [daemon.projection]\nenabled = true\ngithub_owner = \"owner\"\ngithub_repo = \"repo\"\n",
-                state_path.display()
+                ledger_path.display()
             ),
         )
         .unwrap();
@@ -1485,19 +1490,19 @@ mod tests {
     #[test]
     fn projection_health_enabled_with_cache_returns_ok() {
         let temp = tempfile::TempDir::new().unwrap();
-        let state_path = temp.path().join("state.json");
+        let ledger_path = temp.path().join("ledger.db");
         let config_path = temp.path().join("ecosystem.toml");
         // Create the projection cache file to simulate active worker
-        let cache_path = temp.path().join("projection_cache.db");
+        let cache_path = ledger_path.with_extension("projection_cache.db");
         std::fs::write(&cache_path, b"dummy").unwrap();
 
         std::fs::write(
             &config_path,
             format!(
                 "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
-                 state_file = \"{}\"\n\
+                 ledger_db = \"{}\"\n\
                  [daemon.projection]\nenabled = true\ngithub_owner = \"owner\"\ngithub_repo = \"repo\"\n",
-                state_path.display()
+                ledger_path.display()
             ),
         )
         .unwrap();
@@ -1506,6 +1511,28 @@ mod tests {
         assert_eq!(result.status, "OK");
         assert!(!result.is_error);
         assert!(result.message.contains("projection worker active"));
+    }
+
+    #[test]
+    fn daemon_service_templates_use_expected_worker_flag_and_rw_paths() {
+        assert!(
+            WORKER_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
+            "worker service template must use --poll-interval-secs"
+        );
+        assert!(
+            WORKER_TEMPLATE_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
+            "worker@ template must use --poll-interval-secs"
+        );
+        for template in [
+            DAEMON_SERVICE_TEMPLATE,
+            WORKER_SERVICE_TEMPLATE,
+            WORKER_TEMPLATE_SERVICE_TEMPLATE,
+        ] {
+            assert!(
+                template.contains("ReadWritePaths=%h/.apm2 %h/.local/share/apm2"),
+                "template must allow writes to both APM2 home and XDG data path"
+            );
+        }
     }
 
     #[test]
@@ -1547,14 +1574,15 @@ mod tests {
         let runtime_ledger = temp.path().join("ledger.db");
         let runtime_cache = runtime_ledger.with_extension("projection_cache.db");
         std::fs::write(&runtime_cache, b"dummy").unwrap();
+        let runtime_overrides = DaemonRuntimePathOverrides {
+            state_file: None,
+            ledger_db: Some(runtime_ledger),
+        };
 
         let result = check_projection_worker_health_with_overrides(
             &config_path,
             true,
-            Some(DaemonRuntimePathOverrides {
-                state_file: None,
-                ledger_db: Some(runtime_ledger),
-            }),
+            Some(&runtime_overrides),
         );
         assert_eq!(result.status, "OK");
         assert!(!result.is_error);

@@ -23,7 +23,7 @@ TimeoutStartSec=600
 RuntimeMaxSec=1800
 KillMode=control-group
 # Adjust this path to match your deployment layout if different.
-ExecStart=%h/.cargo/bin/apm2 fac worker --poll-interval 10
+ExecStart=%h/.cargo/bin/apm2 fac worker --poll-interval-secs 10
 Restart=always
 RestartSec=5
 WatchdogSec=300
