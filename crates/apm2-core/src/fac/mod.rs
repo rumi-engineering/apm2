@@ -146,12 +146,14 @@ mod role_spec;
 mod role_spec_v2;
 pub mod safe_rmtree;
 pub mod scheduler_state;
+pub mod sd_notify;
 pub mod selection_policy;
 pub mod serde_helpers;
 mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
 pub mod transcript_binding;
+pub mod worker_heartbeat;
 
 // Re-export broker types (TCK-00510)
 // Re-export taint tracking types (TCK-00339)

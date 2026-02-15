@@ -1066,6 +1066,12 @@ async fn async_main(args: Args) -> Result<()> {
         daemon_config.session_socket_path
     );
 
+    // TCK-00600: Notify systemd that the daemon is ready.
+    // This must happen after socket bind so that clients can connect
+    // immediately after systemd considers the service started.
+    let _ = apm2_core::fac::sd_notify::notify_ready();
+    let _ = apm2_core::fac::sd_notify::notify_status("daemon ready, accepting connections");
+
     {
         let inner = state.read().await;
         info!("Managing {} processes", inner.supervisor.process_count());
@@ -1225,8 +1231,14 @@ async fn async_main(args: Args) -> Result<()> {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
+            // TCK-00600: Watchdog ticker sends WATCHDOG=1 to systemd at half
+            // the WatchdogSec interval. Runs in the same poller task because
+            // it already ticks every 10 seconds.
+            let mut watchdog = apm2_core::fac::sd_notify::WatchdogTicker::new();
             loop {
                 interval.tick().await;
+                // TCK-00600: Ping systemd watchdog if due.
+                watchdog.ping_if_due();
                 let events = orch.poll_timeouts().await;
                 if !events.is_empty() {
                     info!(
@@ -2187,6 +2199,9 @@ async fn async_main(args: Args) -> Result<()> {
     // remain in daemon state AND a pre-recorded PID set to guarantee
     // containment even for processes whose runner was dropped mid-stop.
     info!("Shutting down daemon...");
+
+    // TCK-00600: Notify systemd that the daemon is stopping.
+    let _ = apm2_core::fac::sd_notify::notify_stopping();
 
     // Record all tracked PIDs BEFORE the graceful phase so we can always
     // find orphans in the force-kill phase.

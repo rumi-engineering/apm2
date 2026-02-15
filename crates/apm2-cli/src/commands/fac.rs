@@ -93,13 +93,14 @@ const DEFAULT_LEDGER_FILENAME: &str = "ledger.db";
 const DEFAULT_CAS_DIRNAME: &str = "cas";
 
 const SERVICES_UNIT_NAMES: [&str; 2] = ["apm2-daemon.service", "apm2-worker.service"];
-const SERVICE_STATUS_PROPERTIES: [&str; 6] = [
+const SERVICE_STATUS_PROPERTIES: [&str; 7] = [
     "LoadState",
     "ActiveState",
     "SubState",
     "UnitFileState",
     "MainPID",
     "ActiveEnterTimestampMonotonic",
+    "WatchdogUSec",
 ];
 
 // =============================================================================
@@ -1441,6 +1442,10 @@ struct ServiceStatusResponse {
     pub main_pid: u32,
     /// Unit uptime in seconds.
     pub uptime_seconds: u64,
+    /// Watchdog timeout in seconds (0 if not configured).
+    pub watchdog_sec: u64,
+    /// Deterministic health verdict: "healthy", "degraded", or "unhealthy".
+    pub health: String,
     /// Error encountered while checking the unit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -1449,8 +1454,14 @@ struct ServiceStatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServicesStatusResponse {
+    /// Overall health: "healthy" if all services are healthy, "degraded"
+    /// otherwise.
+    pub overall_health: String,
     /// List of managed services.
     pub services: Vec<ServiceStatusResponse>,
+    /// Worker heartbeat status (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_heartbeat: Option<apm2_core::fac::worker_heartbeat::HeartbeatStatus>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1498,29 +1509,44 @@ fn run_services_status(_json_output: bool) -> u8 {
                     enabled: "unknown".to_string(),
                     main_pid: 0,
                     uptime_seconds: 0,
+                    watchdog_sec: 0,
+                    health: "unhealthy".to_string(),
                     error: Some(message),
                 }
             },
         };
 
-        let healthy = status.error.is_none()
-            && status.load_state == "loaded"
-            && status.active_state == "active"
-            && status.enabled == "enabled";
-        if !healthy {
+        if status.health != "healthy" {
             degraded = true;
         }
 
         services.push(status);
     }
 
+    // TCK-00600: Read worker heartbeat for liveness assessment.
+    let worker_heartbeat = apm2_core::github::resolve_apm2_home().map(|home| {
+        let fac_root = home.join("private").join("fac");
+        apm2_core::fac::worker_heartbeat::read_heartbeat(&fac_root)
+    });
+
+    // If the worker service is active but heartbeat is stale, mark as degraded.
+    if let Some(ref hb) = worker_heartbeat {
+        if hb.found && !hb.fresh {
+            degraded = true;
+        }
+    }
+
+    let overall_health = if degraded { "degraded" } else { "healthy" }.to_string();
+
     let response = ServicesStatusResponse {
+        overall_health,
         services: services.clone(),
+        worker_heartbeat,
     };
     if let Ok(json) = serde_json::to_string_pretty(&response) {
         println!("{json}");
     } else {
-        println!("{{\"services\":[]}}");
+        println!("{{\"overall_health\":\"unhealthy\",\"services\":[]}}");
         degraded = true;
     }
 
@@ -1592,6 +1618,7 @@ fn parse_systemctl_show_output(
     let mut enabled = String::new();
     let mut main_pid = String::new();
     let mut active_enter_timestamp = String::new();
+    let mut watchdog_usec = String::new();
 
     for line in output.lines() {
         if let Some((key, value)) = line.split_once('=') {
@@ -1602,6 +1629,7 @@ fn parse_systemctl_show_output(
                 "UnitFileState" => enabled = value.to_string(),
                 "MainPID" => main_pid = value.to_string(),
                 "ActiveEnterTimestampMonotonic" => active_enter_timestamp = value.to_string(),
+                "WatchdogUSec" => watchdog_usec = value.to_string(),
                 _ => {},
             }
         }
@@ -1622,6 +1650,25 @@ fn parse_systemctl_show_output(
     };
     let uptime_seconds = compute_service_uptime(current_boot_micros, active_enter);
 
+    // TCK-00600: Parse watchdog timeout from usec to seconds.
+    let watchdog_timeout_secs = watchdog_usec
+        .parse::<u64>()
+        .ok()
+        .map_or(0, |usec| usec / 1_000_000);
+
+    // TCK-00600: Compute deterministic health verdict.
+    // healthy = loaded + active + enabled
+    // degraded = loaded but not active (e.g., activating, reloading)
+    // unhealthy = not loaded, failed, or errored
+    let health = if load_state == "loaded" && active_state == "active" && enabled == "enabled" {
+        "healthy"
+    } else if load_state == "loaded" && active_state != "failed" {
+        "degraded"
+    } else {
+        "unhealthy"
+    }
+    .to_string();
+
     Ok(ServiceStatusResponse {
         unit: unit_name.to_string(),
         scope: scope.label().to_string(),
@@ -1631,6 +1678,8 @@ fn parse_systemctl_show_output(
         enabled,
         main_pid,
         uptime_seconds,
+        watchdog_sec: watchdog_timeout_secs,
+        health,
         error: None,
     })
 }

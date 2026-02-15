@@ -509,6 +509,7 @@ pub fn run_fac_worker(
     let verifying_key = broker.verifying_key();
 
     let mut total_processed: u64 = 0;
+    let mut cycle_count: u64 = 0;
     let mut summary = WorkerSummary {
         jobs_processed: 0,
         jobs_completed: 0,
@@ -517,8 +518,33 @@ pub fn run_fac_worker(
         jobs_skipped: 0,
     };
 
+    // TCK-00600: Notify systemd that the worker is ready and initialize
+    // the watchdog ticker for periodic keepalive pings.
+    let _ = apm2_core::fac::sd_notify::notify_ready();
+    let _ = apm2_core::fac::sd_notify::notify_status("worker ready, polling queue");
+    let mut watchdog = apm2_core::fac::sd_notify::WatchdogTicker::new();
+
     loop {
         let cycle_start = Instant::now();
+        cycle_count = cycle_count.saturating_add(1);
+
+        // TCK-00600: Ping systemd watchdog each cycle to prove liveness.
+        watchdog.ping_if_due();
+
+        // TCK-00600: Write worker heartbeat file for `services status`.
+        if let Err(e) = apm2_core::fac::worker_heartbeat::write_heartbeat(
+            &fac_root,
+            cycle_count,
+            summary.jobs_completed as u64,
+            summary.jobs_denied as u64,
+            summary.jobs_quarantined as u64,
+            "healthy",
+        ) {
+            // Non-fatal: heartbeat is observability, not correctness.
+            if !json_output {
+                eprintln!("WARNING: heartbeat write failed: {e}");
+            }
+        }
 
         // Scan pending directory (quarantines malformed files inline).
         let candidates = match scan_pending(&queue_root, &fac_root, &current_tuple_digest) {

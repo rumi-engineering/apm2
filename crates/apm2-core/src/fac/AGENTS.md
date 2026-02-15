@@ -655,6 +655,80 @@ All receipt-touching hot paths consult the index first:
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
   index key. Hash mismatch triggers fallback to directory scan (fail-closed).
 
+## sd_notify Submodule (TCK-00600)
+
+The `sd_notify` submodule implements the systemd notification protocol for
+Type=notify services. It provides zero-dependency sd_notify(3) support using
+Unix datagram sockets to `$NOTIFY_SOCKET`.
+
+### Key Types
+
+- `WatchdogTicker`: Tracks watchdog ping interval and last-ping time using
+  monotonic `Instant`. Reads `WATCHDOG_USEC` from environment at construction.
+  If `WATCHDOG_USEC` is absent or zero, the ticker is disabled (no-op pings).
+  Ping interval is `WATCHDOG_USEC / 2` (systemd recommendation), with a minimum
+  floor of 5 seconds.
+
+### Core Functions
+
+- `notify_ready()`: Sends `READY=1` to systemd. Called once after service
+  initialization is complete (socket bind for daemon, broker connection for
+  worker).
+- `notify_stopping()`: Sends `STOPPING=1` to systemd. Called at the start of
+  graceful shutdown.
+- `notify_watchdog()`: Sends `WATCHDOG=1` to systemd. Called periodically by
+  `WatchdogTicker::ping_if_due()`.
+- `notify_status(msg)`: Sends `STATUS=<msg>` to systemd for human-readable
+  status in `systemctl status` output.
+
+### Security Invariants (TCK-00600)
+
+- [INV-SDN-001] `NOTIFY_SOCKET` path is validated: must be absolute or abstract
+  (starts with `/` or `@`), and bounded by `MAX_NOTIFY_SOCKET_PATH_LEN` (256).
+- [INV-SDN-002] All notify functions return `bool` (success/failure), never
+  panic. Missing `NOTIFY_SOCKET` is a silent no-op (non-systemd environments).
+- [INV-SDN-003] `WatchdogTicker` uses monotonic `Instant` for interval tracking
+  (INV-2501 compliance). No wall-clock time dependency.
+- [INV-SDN-004] Minimum ping interval is 5 seconds to prevent excessive
+  datagram traffic.
+
+## worker_heartbeat Submodule (TCK-00600)
+
+The `worker_heartbeat` submodule implements a cross-process liveness signal for
+the FAC worker. The worker writes a JSON heartbeat file on each poll cycle;
+`apm2 fac services status` reads it to determine worker health beyond what
+systemd process monitoring provides.
+
+### Key Types
+
+- `WorkerHeartbeatV1`: Schema-versioned heartbeat payload with PID, Unix
+  timestamp, cycle count, cumulative job stats, and self-reported health status.
+- `HeartbeatStatus`: Read result indicating whether the heartbeat file was
+  found, whether it is fresh (within `MAX_HEARTBEAT_AGE_SECS`), the age in
+  seconds, PID, and health status string.
+
+### Core Functions
+
+- `write_heartbeat(fac_root, cycle_count, jobs_completed, jobs_denied,
+  jobs_quarantined, health_status)`: Atomic write (temp+rename) to
+  `<fac_root>/worker_heartbeat.json`.
+- `read_heartbeat(fac_root)`: Bounded read with staleness detection. Returns
+  `HeartbeatStatus` (never errors; missing/corrupt files return default).
+
+### Security Invariants (TCK-00600)
+
+- [INV-WHB-001] Heartbeat file writes use atomic temp+rename to prevent partial
+  reads.
+- [INV-WHB-002] Heartbeat file reads are bounded by `MAX_HEARTBEAT_FILE_SIZE`
+  (8 KiB) before deserialization.
+- [INV-WHB-003] Schema mismatch or parse failure returns a default
+  `HeartbeatStatus` with `found: false` (fail-open for observability, not
+  authority).
+- [INV-WHB-004] Staleness is detected by comparing `timestamp_unix` against
+  current time with `MAX_HEARTBEAT_AGE_SECS` (120 seconds) threshold.
+- [INV-WHB-005] The heartbeat file is not authoritative for admission or
+  security decisions. It is an observability signal only.
+
 ## Control-Lane Exception (TCK-00533)
 
 `stop_revoke` jobs bypass the standard RFC-0028 channel context token and

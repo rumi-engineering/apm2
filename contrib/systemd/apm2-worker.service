@@ -6,7 +6,9 @@ Wants=apm2-daemon.service
 Requires=apm2-daemon.service
 
 [Service]
-Type=simple
+# TCK-00600: Type=notify — worker sends READY=1 after broker connection,
+# WATCHDOG=1 periodically. systemd restarts if watchdog is not pinged.
+Type=notify
 # Resource limits derived from LaneProfileV1 defaults
 # CPUQuota=200%
 # MemoryMax=25769803776
