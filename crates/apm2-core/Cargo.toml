@@ -111,6 +111,7 @@ criterion.workspace = true
 # Certificate generation (test-only)
 rcgen.workspace = true
 x509-cert.workspace = true
+filetime = "0.2"
 
 [build-dependencies]
 prost-build.workspace = true
