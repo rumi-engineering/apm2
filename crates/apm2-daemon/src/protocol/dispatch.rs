@@ -6442,6 +6442,34 @@ impl PrivilegedResponse {
         })
     }
 
+    /// Creates a budget-denied error response with a structured denial receipt
+    /// (TCK-00568, INV-CPRL-003).
+    ///
+    /// Extracts the `ControlPlaneDenialReceipt` from the `ProtocolError` and
+    /// JSON-serializes it into the error message alongside the human-readable
+    /// reason. This preserves machine-readable audit evidence through the
+    /// protobuf error channel.
+    ///
+    /// Message format: `"control-plane budget denied:
+    /// {reason}\n{receipt_json}"`
+    #[must_use]
+    pub fn budget_denied(err: ProtocolError) -> Self {
+        match err {
+            ProtocolError::BudgetExceeded { reason, receipt } => {
+                let receipt_json =
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "{}".to_string());
+                Self::Error(PrivilegedError {
+                    code: PrivilegedErrorCode::CapabilityRequestRejected.into(),
+                    message: format!("control-plane budget denied: {reason}\n{receipt_json}"),
+                })
+            },
+            other => Self::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("control-plane budget denied: {other}"),
+            ),
+        }
+    }
+
     /// Encodes the response to bytes.
     ///
     /// The format is: [tag: u8][payload: protobuf]
@@ -8097,10 +8125,34 @@ impl PrivilegedDispatcher {
                 .lock()
                 .expect("control_plane_budget mutex poisoned");
             if let Err(e) = budget.admit_token_issuance() {
-                return Err(vec![ChannelBoundaryDefect::new(
-                    ChannelViolationClass::MissingChannelMetadata,
-                    format!("admission denied: {e}"),
-                )]);
+                let receipt = match &e {
+                    apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::BudgetExceeded {
+                        receipt, ..
+                    }
+                    | apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::CounterOverflow {
+                        receipt, ..
+                    } => Some(receipt.clone()),
+                    apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::InvalidLimits {
+                        ..
+                    } => None,
+                };
+                let detail = format!("admission denied: {e}");
+                let defect = receipt.map_or_else(
+                    || {
+                        ChannelBoundaryDefect::new(
+                            ChannelViolationClass::MissingChannelMetadata,
+                            detail.clone(),
+                        )
+                    },
+                    |r| {
+                        ChannelBoundaryDefect::with_budget_denial(
+                            ChannelViolationClass::MissingChannelMetadata,
+                            detail.clone(),
+                            r,
+                        )
+                    },
+                );
+                return Err(vec![defect]);
             }
         }
 
@@ -8614,9 +8666,9 @@ impl PrivilegedDispatcher {
     /// limits and resets counters to start a fresh budget window with the
     /// new limits.
     ///
-    /// TODO(TCK-00584): Wire this method into daemon startup and hot-reload
-    /// profile loading so that `EconomicsProfile::control_plane_limits`
-    /// values are applied to the active broker state at runtime.
+    /// Wired into `DispatcherState` construction so that
+    /// `EconomicsProfile::control_plane_limits` values are applied to the
+    /// active broker state at runtime.
     pub fn set_control_plane_limits(
         &self,
         limits: apm2_core::fac::broker_rate_limits::ControlPlaneLimits,
@@ -8976,6 +9028,25 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Applies control-plane budget limits from an `EconomicsProfile`
+    /// (TCK-00568).
+    ///
+    /// If `limits` is `Some`, validates and applies the limits. If `None`,
+    /// keeps the default limits (fail-safe — default limits are enforced).
+    ///
+    /// This builder is called during `DispatcherState` construction so that
+    /// profile-driven limits are active from daemon startup.
+    #[must_use]
+    pub fn with_economics_control_plane_limits(
+        self,
+        limits: Option<apm2_core::fac::broker_rate_limits::ControlPlaneLimits>,
+    ) -> Self {
+        if let Some(limits) = limits {
+            self.set_control_plane_limits(limits);
+        }
         self
     }
 
@@ -10811,10 +10882,7 @@ impl PrivilegedDispatcher {
         // WorkClaim fields (policy_resolution, custody domains, permeability_receipt).
         let estimated_claim_bytes = claim.estimate_serialized_bytes();
         if let Err(e) = self.admit_queue_enqueue(estimated_claim_bytes) {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("control-plane budget denied: {e}"),
-            ));
+            return Ok(PrivilegedResponse::budget_denied(e));
         }
 
         let claim = match self.work_registry.register_claim(claim) {
@@ -16428,10 +16496,7 @@ impl PrivilegedDispatcher {
         // INV-CPRL-002: Budget check occurs BEFORE any state mutation (CAS store).
         #[allow(clippy::cast_possible_truncation)]
         if let Err(e) = self.admit_bundle_export(request.bundle_bytes.len() as u64) {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("control-plane budget denied: {e}"),
-            ));
+            return Ok(PrivilegedResponse::budget_denied(e));
         }
 
         // Require CAS to be configured (fail-closed)
@@ -19236,6 +19301,157 @@ mod tests {
                 binding.canonicalizer_tuple_digest, [0u8; 32],
                 "canonicalizer tuple digest must be non-zero"
             );
+        }
+    }
+
+    mod budget_denial_receipt_propagation {
+        use super::*;
+
+        /// TCK-00568: Token issuance denial propagates structured receipt
+        /// through `ChannelBoundaryDefect`.
+        #[test]
+        fn token_issuance_denial_includes_receipt_in_defect() {
+            let dispatcher = PrivilegedDispatcher::new();
+            dispatcher.set_admission_health_gate(true);
+            // Set limits to 0 tokens — all issuance denied (fail-closed).
+            dispatcher.set_control_plane_limits(
+                apm2_core::fac::broker_rate_limits::ControlPlaneLimits {
+                    max_token_issuance: 0,
+                    ..apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
+                },
+            );
+
+            let signer = apm2_core::crypto::Signer::generate();
+            let issued_at_secs = 1_000_000;
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                "lease-budget-test",
+                "REQ-BUDGET",
+                issued_at_secs,
+                &ToolClass::Execute,
+                true,
+                true,
+                true,
+                true,
+                BoundaryFlowRuntimeState::allow_all(true),
+            );
+
+            let defects = result.expect_err("zero-limit token issuance should be denied");
+            assert_eq!(defects.len(), 1, "should produce exactly one defect");
+            let defect = &defects[0];
+            assert!(
+                defect.detail.contains("admission denied"),
+                "detail should mention admission denied: {:?}",
+                defect.detail
+            );
+            let receipt = defect
+                .budget_denial_receipt
+                .as_ref()
+                .expect("defect must carry a ControlPlaneDenialReceipt (INV-CPRL-003)");
+            assert_eq!(
+                receipt.dimension,
+                apm2_core::fac::broker_rate_limits::ControlPlaneDimension::TokenIssuance
+            );
+            assert_eq!(receipt.limit, 0);
+            assert_eq!(receipt.current_usage, 0);
+            assert_eq!(receipt.requested_increment, 1);
+        }
+
+        /// TCK-00568: `ClaimWork`/`PublishChangeSet` denial produces a
+        /// `PrivilegedResponse::Error` with JSON-serialized denial receipt
+        /// in the message.
+        #[test]
+        fn budget_denied_response_includes_json_receipt() {
+            let receipt = apm2_core::fac::broker_rate_limits::ControlPlaneDenialReceipt {
+                dimension:
+                    apm2_core::fac::broker_rate_limits::ControlPlaneDimension::QueueEnqueueOps,
+                current_usage: 100,
+                limit: 100,
+                requested_increment: 1,
+                reason: "broker_queue_enqueue_rate_exceeded".to_string(),
+            };
+            let err = ProtocolError::BudgetExceeded {
+                reason: "broker_queue_enqueue_rate_exceeded".to_string(),
+                receipt: receipt.clone(),
+            };
+
+            let response = PrivilegedResponse::budget_denied(err);
+            match response {
+                PrivilegedResponse::Error(ref e) => {
+                    assert!(
+                        e.message.contains("control-plane budget denied"),
+                        "message should contain denial prefix: {:?}",
+                        e.message
+                    );
+                    // The message must contain JSON-serialized receipt for audit.
+                    let json_part = e
+                        .message
+                        .split('\n')
+                        .nth(1)
+                        .expect("message must have newline-separated receipt JSON");
+                    let parsed: apm2_core::fac::broker_rate_limits::ControlPlaneDenialReceipt =
+                        serde_json::from_str(json_part)
+                            .expect("receipt JSON must deserialize to ControlPlaneDenialReceipt");
+                    assert_eq!(parsed, receipt);
+                },
+                other => panic!("expected Error variant, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00568: `with_economics_control_plane_limits` applies
+        /// non-default limits at construction time.
+        #[test]
+        fn with_economics_control_plane_limits_applies_limits() {
+            let custom_limits = apm2_core::fac::broker_rate_limits::ControlPlaneLimits {
+                max_token_issuance: 2,
+                max_queue_enqueue_ops: 1,
+                max_queue_bytes: 64,
+                max_bundle_export_bytes: 128,
+            };
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_economics_control_plane_limits(Some(custom_limits));
+            dispatcher.set_admission_health_gate(true);
+
+            // Issue 2 tokens (should succeed).
+            let signer = apm2_core::crypto::Signer::generate();
+            for i in 0..2 {
+                let result = dispatcher
+                    .validate_channel_boundary_and_issue_context_token_with_flow(
+                        &signer,
+                        "lease-limit-test",
+                        &format!("REQ-{i}"),
+                        1_000_000,
+                        &ToolClass::Execute,
+                        true,
+                        true,
+                        true,
+                        true,
+                        BoundaryFlowRuntimeState::allow_all(true),
+                    );
+                assert!(result.is_ok(), "token {i} should be admitted with limit=2");
+            }
+
+            // Third token should be denied.
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                "lease-limit-test",
+                "REQ-DENIED",
+                1_000_000,
+                &ToolClass::Execute,
+                true,
+                true,
+                true,
+                true,
+                BoundaryFlowRuntimeState::allow_all(true),
+            );
+            let defects = result.expect_err("third token should be denied with limit=2");
+            assert_eq!(defects.len(), 1);
+            let receipt = defects[0]
+                .budget_denial_receipt
+                .as_ref()
+                .expect("denial must carry receipt");
+            assert_eq!(receipt.current_usage, 2);
+            assert_eq!(receipt.limit, 2);
         }
     }
 

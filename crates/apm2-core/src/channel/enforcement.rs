@@ -9,6 +9,7 @@ use subtle::ConstantTimeEq;
 
 use crate::crypto::{Signature, Signer, VerifyingKey, parse_signature, verify_signature};
 use crate::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
+use crate::fac::broker_rate_limits::ControlPlaneDenialReceipt;
 
 /// Maximum string length for channel enforcement detail fields.
 pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
@@ -473,12 +474,19 @@ pub enum ChannelContextTokenError {
 
 /// Channel boundary violation defect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChannelBoundaryDefect {
     /// The type of violation.
     pub violation_class: ChannelViolationClass,
     /// Human-readable detail (bounded to `MAX_CHANNEL_DETAIL_LENGTH`).
     pub detail: String,
+    /// Structured budget denial receipt (TCK-00568, INV-CPRL-003).
+    ///
+    /// Present when the defect was caused by a control-plane budget
+    /// denial. Contains machine-readable evidence of the exceeded
+    /// dimension, current usage, configured limit, and stable reason
+    /// code for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_denial_receipt: Option<ControlPlaneDenialReceipt>,
 }
 
 impl ChannelBoundaryDefect {
@@ -488,6 +496,22 @@ impl ChannelBoundaryDefect {
         Self {
             violation_class,
             detail: truncate_channel_detail(detail.into()),
+            budget_denial_receipt: None,
+        }
+    }
+
+    /// Construct a channel boundary defect with a budget denial receipt
+    /// (TCK-00568, INV-CPRL-003).
+    #[must_use]
+    pub fn with_budget_denial(
+        violation_class: ChannelViolationClass,
+        detail: impl Into<String>,
+        receipt: ControlPlaneDenialReceipt,
+    ) -> Self {
+        Self {
+            violation_class,
+            detail: truncate_channel_detail(detail.into()),
+            budget_denial_receipt: Some(receipt),
         }
     }
 }
