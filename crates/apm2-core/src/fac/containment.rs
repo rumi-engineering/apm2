@@ -71,7 +71,11 @@ pub const MAX_PID_VALUE: u32 = 4_194_304;
 
 /// Maximum number of directory entries scanned in `/proc` during
 /// process discovery.
-pub const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
+///
+/// Set to 131,072 to accommodate high-thread-count systems (e.g., 128-core
+/// machines with thread-per-core workloads). The previous value (65,536)
+/// could trigger false containment failures on such systems.
+pub const MAX_PROC_SCAN_ENTRIES: usize = 131_072;
 
 /// Maximum number of containment mismatches recorded in a verdict.
 pub const MAX_CONTAINMENT_MISMATCHES: usize = 256;
@@ -502,6 +506,86 @@ fn read_ppid_from_status(status_path: &Path, pid: u32) -> Result<u32, Containmen
 }
 
 // =============================================================================
+// Cgroup Procs Discovery (daemonized process detection)
+// =============================================================================
+
+/// Maximum number of PIDs read from a single `cgroup.procs` file.
+///
+/// Prevents memory exhaustion if the cgroup contains an unexpectedly large
+/// number of processes.
+const MAX_CGROUP_PROCS_ENTRIES: usize = 16_384;
+
+/// Maximum byte size for reading `cgroup.procs` files (64 KiB).
+///
+/// A PID line is at most ~8 bytes plus newline; 16,384 entries fit within
+/// ~160 KiB, but we cap the read at 64 KiB as a safety bound.
+const MAX_CGROUP_PROCS_READ_SIZE: u64 = 65_536;
+
+/// Discovers PIDs from a cgroup `cgroup.procs` file.
+///
+/// Reads `/sys/fs/cgroup/<cgroup_path>/cgroup.procs` (or equivalent under
+/// `cgroup_root`) to find all PIDs assigned to the cgroup hierarchy. This
+/// catches daemonized (double-forked) processes that escape the BFS parent
+/// tree walk because they have been re-parented to PID 1.
+///
+/// # Arguments
+///
+/// * `cgroup_path` - The cgroup v2 path (e.g.,
+///   `/system.slice/apm2-job.service`)
+/// * `cgroup_root` - Root of the cgroup filesystem (typically `/sys/fs/cgroup`)
+///
+/// # Returns
+///
+/// A set of PIDs found in the cgroup. Returns an empty set on any read error
+/// (fail-open for this supplementary scan -- the main BFS scan is fail-closed,
+/// and any PIDs discovered here that are NOT in the BFS results are flagged
+/// as escaped).
+#[must_use]
+pub fn discover_cgroup_procs_with_root(
+    cgroup_path: &str,
+    cgroup_root: &Path,
+) -> std::collections::BTreeSet<u32> {
+    let mut pids = std::collections::BTreeSet::new();
+
+    // Strip leading slash from cgroup_path for path joining.
+    let relative_path = cgroup_path.strip_prefix('/').unwrap_or(cgroup_path);
+    let procs_file = cgroup_root.join(relative_path).join("cgroup.procs");
+
+    let Ok(file) = File::open(&procs_file) else {
+        return pids;
+    };
+
+    let mut reader = BufReader::new(file).take(MAX_CGROUP_PROCS_READ_SIZE);
+    let mut content = String::with_capacity(512);
+    if reader.read_to_string(&mut content).is_err() {
+        return pids;
+    }
+
+    for line in content.lines() {
+        if pids.len() >= MAX_CGROUP_PROCS_ENTRIES {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(pid) = trimmed.parse::<u32>() {
+            if pid > 0 && pid <= MAX_PID_VALUE {
+                pids.insert(pid);
+            }
+        }
+    }
+
+    pids
+}
+
+/// Discovers PIDs from the system cgroup filesystem at `/sys/fs/cgroup`.
+#[must_use]
+pub fn discover_cgroup_procs(cgroup_path: &str) -> std::collections::BTreeSet<u32> {
+    discover_cgroup_procs_with_root(cgroup_path, Path::new("/sys/fs/cgroup"))
+}
+
+// =============================================================================
 // Containment Verification
 // =============================================================================
 
@@ -534,6 +618,9 @@ pub fn verify_containment(
 
 /// Verifies containment with a configurable procfs root (for testing).
 ///
+/// Delegates to [`verify_containment_with_proc_and_cgroup`] using the
+/// system cgroup root (`/sys/fs/cgroup`).
+///
 /// # Errors
 ///
 /// Returns [`ContainmentError::InvalidPid`] if the reference PID is invalid.
@@ -546,11 +633,42 @@ pub fn verify_containment_with_proc(
     sccache_enabled: bool,
     proc_root: &Path,
 ) -> Result<ContainmentVerdict, ContainmentError> {
+    verify_containment_with_proc_and_cgroup(
+        reference_pid,
+        sccache_enabled,
+        proc_root,
+        Path::new("/sys/fs/cgroup"),
+    )
+}
+
+/// Verifies containment with configurable procfs and cgroup roots (for
+/// testing).
+///
+/// This is the fully testable variant that accepts both a proc root and a
+/// cgroup filesystem root. The cgroup.procs scan detects daemonized (double-
+/// forked, re-parented to PID 1) processes that escape BFS parent tree walk.
+///
+/// # Errors
+///
+/// Returns [`ContainmentError::InvalidPid`] if the reference PID is invalid.
+/// Returns [`ContainmentError::ProcReadFailed`] if the reference cgroup cannot
+/// be read. Returns [`ContainmentError::TooManyChildren`] if the child count
+/// exceeds limits. Returns [`ContainmentError::TooManyMismatches`] if mismatch
+/// count exceeds limits.
+pub fn verify_containment_with_proc_and_cgroup(
+    reference_pid: u32,
+    sccache_enabled: bool,
+    proc_root: &Path,
+    cgroup_root: &Path,
+) -> Result<ContainmentVerdict, ContainmentError> {
     // Read the reference cgroup path (fail-closed: error if unreadable)
     let reference_cgroup = read_cgroup_path_from_proc(reference_pid, proc_root)?;
 
-    // Discover children
+    // Discover children via BFS on parent tree (PPid walk)
     let children = discover_children_from_proc(reference_pid, proc_root)?;
+
+    // Collect BFS-discovered PIDs for cross-referencing
+    let bfs_pids: std::collections::BTreeSet<u32> = children.iter().map(|c| c.pid).collect();
 
     let mut mismatches = Vec::new();
     let mut critical_count: u32 = 0;
@@ -592,6 +710,64 @@ pub fn verify_containment_with_proc(
         }
     }
 
+    // MAJOR-3 fix: Scan cgroup.procs to detect daemonized processes
+    // (double-forked, re-parented to PID 1) that are invisible to the
+    // BFS PPid walk. Any PID in cgroup.procs that is NOT in the BFS
+    // result set (and is not the reference PID itself) has escaped the
+    // parent tree — treat as a mismatch.
+    let cgroup_pids = discover_cgroup_procs_with_root(&reference_cgroup, cgroup_root);
+    for &cgroup_pid in &cgroup_pids {
+        if cgroup_pid == reference_pid {
+            continue;
+        }
+        if bfs_pids.contains(&cgroup_pid) {
+            // Already accounted for by BFS walk — no action needed.
+            continue;
+        }
+
+        // This PID is in the cgroup but was NOT found via BFS: it was
+        // likely daemonized (double-forked). Read its comm and cgroup
+        // to record a proper mismatch entry.
+        let comm = read_comm(cgroup_pid, proc_root).unwrap_or_else(|_| "<unknown>".to_string());
+        let child_cgroup = read_cgroup_path_from_proc(cgroup_pid, proc_root)
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+
+        let is_critical = CONTAINMENT_CRITICAL_PROCESSES
+            .iter()
+            .any(|&name| comm.contains(name));
+        if is_critical {
+            critical_count = critical_count.saturating_add(1);
+        }
+        if comm.contains("sccache") {
+            sccache_detected = true;
+        }
+
+        // Check containment for the cgroup-discovered process
+        let contained = is_cgroup_contained(&child_cgroup, &reference_cgroup);
+        if !contained {
+            if mismatches.len() >= MAX_CONTAINMENT_MISMATCHES {
+                return Err(ContainmentError::TooManyMismatches {
+                    count: mismatches.len().saturating_add(1),
+                    max: MAX_CONTAINMENT_MISMATCHES,
+                });
+            }
+
+            mismatches.push(ContainmentMismatch {
+                pid: cgroup_pid,
+                process_name: truncate_string(&comm, MAX_MISMATCH_DETAIL_LENGTH),
+                expected_cgroup: truncate_string(&reference_cgroup, MAX_MISMATCH_DETAIL_LENGTH),
+                actual_cgroup: truncate_string(&child_cgroup, MAX_MISMATCH_DETAIL_LENGTH),
+            });
+        }
+    }
+
+    let total_checked = children.len().saturating_add(
+        cgroup_pids
+            .iter()
+            .filter(|&&pid| pid != reference_pid && !bfs_pids.contains(&pid))
+            .count(),
+    );
+
     let all_contained = mismatches.is_empty();
 
     // Sccache gating: if sccache is enabled and containment failed,
@@ -612,7 +788,7 @@ pub fn verify_containment_with_proc(
     Ok(ContainmentVerdict {
         contained: all_contained,
         reference_cgroup,
-        processes_checked: children.len() as u32,
+        processes_checked: total_checked as u32,
         critical_processes_found: critical_count,
         mismatches,
         sccache_detected,
@@ -1282,5 +1458,163 @@ mod tests {
         assert!(result.is_ok(), "single PPid failure should not overflow");
         let children = result.unwrap();
         assert_eq!(children.len(), 1, "only PID 3 should be discovered");
+    }
+
+    // ========================================================================
+    // cgroup.procs discovery tests (MAJOR-3 regression)
+    // ========================================================================
+
+    #[test]
+    fn discover_cgroup_procs_reads_pids_from_file() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a mock cgroup.procs file at
+        // <cgroup_root>/system.slice/test/cgroup.procs
+        let cgroup_dir = tmp.path().join("system.slice").join("test");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        fs::write(cgroup_dir.join("cgroup.procs"), "100\n200\n300\n").unwrap();
+
+        let pids = discover_cgroup_procs_with_root("/system.slice/test", tmp.path());
+        assert_eq!(pids.len(), 3);
+        assert!(pids.contains(&100));
+        assert!(pids.contains(&200));
+        assert!(pids.contains(&300));
+    }
+
+    #[test]
+    fn discover_cgroup_procs_empty_on_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pids = discover_cgroup_procs_with_root("/nonexistent", tmp.path());
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn discover_cgroup_procs_ignores_invalid_pids() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let cgroup_dir = tmp.path().join("test");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        fs::write(cgroup_dir.join("cgroup.procs"), "100\nnot_a_pid\n0\n200\n").unwrap();
+
+        let pids = discover_cgroup_procs_with_root("/test", tmp.path());
+        assert_eq!(pids.len(), 2);
+        assert!(pids.contains(&100));
+        assert!(pids.contains(&200));
+    }
+
+    #[test]
+    fn verify_containment_detects_daemonized_via_cgroup_procs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // Child PID 101 (normal child of 100, in same cgroup)
+        let child_dir = proc_root.join("101");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(child_dir.join("status"), "Name:\trustc\nPPid:\t100\n").unwrap();
+        fs::write(
+            child_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(child_dir.join("comm"), "rustc\n").unwrap();
+
+        // Daemonized PID 999 (re-parented to PID 1, but in a DIFFERENT cgroup).
+        // This PID would NOT be found by BFS since its PPid is 1, not 100 or 101.
+        // It appears only in cgroup.procs.
+        let daemon_dir = proc_root.join("999");
+        fs::create_dir_all(&daemon_dir).unwrap();
+        fs::write(daemon_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(
+            daemon_dir.join("cgroup"),
+            "0::/user.slice/sccache.service\n",
+        )
+        .unwrap();
+        fs::write(daemon_dir.join("comm"), "sccache\n").unwrap();
+
+        // Create cgroup.procs listing PIDs 100, 101, and 999
+        let cgroup_dir = cgroup_root.join("system.slice").join("apm2-job.service");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        fs::write(cgroup_dir.join("cgroup.procs"), "100\n101\n999\n").unwrap();
+
+        let verdict =
+            verify_containment_with_proc_and_cgroup(100, true, &proc_root, &cgroup_root).unwrap();
+
+        // PID 999 should be detected as escaped since its cgroup
+        // (/user.slice/sccache.service) doesn't match the reference
+        // (/system.slice/apm2-job.service).
+        assert!(
+            !verdict.contained,
+            "daemonized escaped process must break containment"
+        );
+        assert!(verdict.sccache_detected, "sccache must be detected");
+        assert!(
+            verdict.sccache_auto_disabled,
+            "sccache must be auto-disabled"
+        );
+
+        // Verify the mismatch is recorded
+        assert!(
+            verdict.mismatches.iter().any(|m| m.pid == 999),
+            "daemonized PID 999 must be in mismatches"
+        );
+    }
+
+    #[test]
+    fn verify_containment_cgroup_procs_no_false_positive() {
+        // All PIDs in cgroup.procs are also in the BFS tree and contained.
+        // Should produce no mismatches.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference PID 100
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // Child PID 101 (in same cgroup)
+        let child_dir = proc_root.join("101");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(child_dir.join("status"), "Name:\trustc\nPPid:\t100\n").unwrap();
+        fs::write(
+            child_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(child_dir.join("comm"), "rustc\n").unwrap();
+
+        // cgroup.procs has same PIDs
+        let cgroup_dir = cgroup_root.join("system.slice").join("apm2-job.service");
+        fs::create_dir_all(&cgroup_dir).unwrap();
+        fs::write(cgroup_dir.join("cgroup.procs"), "100\n101\n").unwrap();
+
+        let verdict =
+            verify_containment_with_proc_and_cgroup(100, false, &proc_root, &cgroup_root).unwrap();
+
+        assert!(
+            verdict.contained,
+            "all contained PIDs must not produce mismatches"
+        );
+        assert!(verdict.mismatches.is_empty());
     }
 }

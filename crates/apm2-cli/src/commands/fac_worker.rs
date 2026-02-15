@@ -1983,7 +1983,40 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    // Step 8: Write authoritative GateReceipt and move to completed.
+    // Step 8: Containment verification (TCK-00548 BLOCKER-1).
+    //
+    // Verify that the worker's process tree is contained within the
+    // expected cgroup hierarchy. This uses the current process PID as
+    // the reference because the default-mode worker validates the job
+    // spec in-process (no subprocess spawning yet).
+    //
+    // sccache detection: check if RUSTC_WRAPPER is set to sccache.
+    let sccache_active = std::env::var("RUSTC_WRAPPER")
+        .ok()
+        .is_some_and(|v| v.contains("sccache"));
+    let containment_trace =
+        match apm2_core::fac::containment::verify_containment(std::process::id(), sccache_active) {
+            Ok(verdict) => {
+                eprintln!(
+                    "worker: containment check: contained={} processes_checked={} mismatches={}",
+                    verdict.contained,
+                    verdict.processes_checked,
+                    verdict.mismatches.len(),
+                );
+                Some(apm2_core::fac::containment::ContainmentTrace::from_verdict(
+                    &verdict,
+                ))
+            },
+            Err(err) => {
+                // Fail-closed: containment check error is logged but does not
+                // prevent job completion. The receipt will record None for
+                // containment, which reviewers can flag.
+                eprintln!("worker: WARNING: containment check failed: {err}");
+                None
+            },
+        };
+
+    // Step 9: Write authoritative GateReceipt and move to completed.
     let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
     let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
     let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
@@ -2013,7 +2046,7 @@ fn process_job(
         Some(canonicalizer_tuple_digest),
         None,
         policy_hash,
-        None,
+        containment_trace.as_ref(),
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
         if let Err(move_err) = move_to_dir_safe(
@@ -3604,5 +3637,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// BLOCKER-1 regression: Completed receipts must include containment
+    /// evidence when a `ContainmentTrace` is provided.
+    #[test]
+    fn test_emit_job_receipt_includes_containment_trace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let spec = make_receipt_test_spec();
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let containment_trace = apm2_core::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/apm2-job.service".to_string(),
+            processes_checked: 5,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        };
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Completed,
+            None,
+            "completed",
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            Some(&tuple_digest),
+            None,
+            &spec.job_spec_digest,
+            Some(&containment_trace),
+        )
+        .expect("emit receipt with containment");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+
+        let containment = receipt_json
+            .get("containment")
+            .expect("containment field must be present in completed receipt");
+        assert_eq!(
+            containment
+                .get("verified")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+        );
+        assert_eq!(
+            containment
+                .get("cgroup_path")
+                .and_then(serde_json::Value::as_str),
+            Some("/system.slice/apm2-job.service"),
+        );
+        assert_eq!(
+            containment
+                .get("processes_checked")
+                .and_then(serde_json::Value::as_u64),
+            Some(5),
+        );
+    }
+
+    /// BLOCKER-1 regression: Completed receipts without containment must
+    /// NOT have the containment field (None case).
+    #[test]
+    fn test_emit_job_receipt_omits_containment_when_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let spec = make_receipt_test_spec();
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Completed,
+            None,
+            "completed",
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            Some(&tuple_digest),
+            None,
+            &spec.job_spec_digest,
+            None,
+        )
+        .expect("emit receipt without containment");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+
+        assert!(
+            receipt_json.get("containment").is_none(),
+            "containment field must be absent when None"
+        );
     }
 }

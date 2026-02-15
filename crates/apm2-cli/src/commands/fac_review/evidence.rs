@@ -602,6 +602,10 @@ struct PipelineTestCommand {
     bounded_runner: bool,
     effective_timeout_seconds: u64,
     test_env: Vec<(String, String)>,
+    /// Env var keys to remove from the spawned process environment.
+    /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
+    /// that could bypass the bounded test's cgroup containment (TCK-00548).
+    env_remove_keys: Vec<String>,
 }
 
 fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestCommand, String> {
@@ -640,6 +644,7 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
         bounded_runner: true,
         effective_timeout_seconds: timeout_decision.effective_seconds,
         test_env,
+        env_remove_keys: bounded_spec.env_remove_keys,
     })
 }
 
@@ -1581,6 +1586,11 @@ pub fn run_evidence_gates_with_status(
                 .command
                 .split_first()
                 .ok_or_else(|| "pipeline test command is empty".to_string())?;
+            let pipeline_env_remove = if pipeline_test_command.env_remove_keys.is_empty() {
+                None
+            } else {
+                Some(pipeline_test_command.env_remove_keys.as_slice())
+            };
             let (passed, stream_stats) = run_single_evidence_gate_with_env(
                 workspace_root,
                 sha,
@@ -1589,7 +1599,7 @@ pub fn run_evidence_gates_with_status(
                 &test_args.iter().map(String::as_str).collect::<Vec<_>>(),
                 &log_path,
                 Some(&pipeline_test_command.test_env),
-                None, // No env_remove_keys for pipeline test commands
+                pipeline_env_remove,
             );
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
@@ -2523,6 +2533,26 @@ mod tests {
                 );
             },
         }
+    }
+
+    #[test]
+    fn pipeline_test_command_carries_env_remove_keys() {
+        // BLOCKER-2 regression: build_pipeline_test_command must propagate
+        // env_remove_keys from bounded_spec so the pipeline/restart path
+        // strips sccache env vars.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        if let Ok(command) = build_pipeline_test_command(temp_dir.path()) {
+            // The bounded test runner always strips at least RUSTC_WRAPPER.
+            assert!(
+                command
+                    .env_remove_keys
+                    .contains(&"RUSTC_WRAPPER".to_string()),
+                "pipeline test command must carry RUSTC_WRAPPER in env_remove_keys, got: {:?}",
+                command.env_remove_keys
+            );
+        }
+        // If the bounded runner is unavailable (Err), the test cannot
+        // verify this assertion — skip gracefully.
     }
 
     /// Helper: create a temporary directory with 0o700 permissions for test
