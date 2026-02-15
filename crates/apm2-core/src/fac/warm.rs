@@ -25,20 +25,30 @@
 //!
 //! # Security Invariants
 //!
-//! - [INV-WARM-001] All string fields bounded by `MAX_*` constants.
+//! - [INV-WARM-001] All string fields bounded by `MAX_*` constants during both
+//!   construction and deserialization (SEC-CTRL-FAC-0016).
 //! - [INV-WARM-002] Warm uses lane target namespace (`CARGO_TARGET_DIR`).
 //! - [INV-WARM-003] Warm uses FAC-managed `CARGO_HOME`.
-//! - [INV-WARM-004] Phase count bounded by `MAX_WARM_PHASES`.
+//! - [INV-WARM-004] Phase count bounded by `MAX_WARM_PHASES` during both
+//!   construction and deserialization.
 //! - [INV-WARM-005] Content hash uses domain-separated BLAKE3 with
 //!   length-prefixed injective framing.
+//! - [INV-WARM-006] Content hash verification uses constant-time comparison via
+//!   `subtle::ConstantTimeEq` (INV-PC-001 consistency).
+//! - [INV-WARM-007] Phase execution enforces `MAX_PHASE_TIMEOUT_SECS` via
+//!   `Child::try_wait` polling + `Child::kill` on timeout.
+//! - [INV-WARM-008] Tool version collection uses bounded stdout reads
+//!   (`Read::take(MAX_VERSION_OUTPUT_BYTES)`) to prevent OOM.
 
 use std::fmt;
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::path::Path;
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +84,9 @@ pub const DEFAULT_WARM_PHASES: &[WarmPhase] = &[
 
 /// Maximum wall-clock time for a single warm phase (seconds).
 pub const MAX_PHASE_TIMEOUT_SECS: u64 = 1800;
+
+/// Maximum bytes to read from tool version stdout (finding #7: bounded reads).
+const MAX_VERSION_OUTPUT_BYTES: u64 = 8192;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase Enum
@@ -176,6 +189,15 @@ pub enum WarmError {
         reason: String,
     },
 
+    /// Phase execution exceeded `MAX_PHASE_TIMEOUT_SECS`.
+    #[error("phase {phase} timed out after {timeout_secs}s")]
+    PhaseTimeout {
+        /// Phase that timed out.
+        phase: String,
+        /// Timeout duration in seconds.
+        timeout_secs: u64,
+    },
+
     /// I/O error.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -199,12 +221,17 @@ pub enum WarmError {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Result of executing a single warm phase.
+///
+/// [INV-WARM-001] All string fields use bounded deserialization to prevent
+/// OOM from crafted JSON (SEC-CTRL-FAC-0016).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WarmPhaseResult {
     /// Phase name.
+    #[serde(deserialize_with = "deserialize_bounded_name")]
     pub name: String,
     /// Command that was executed.
+    #[serde(deserialize_with = "deserialize_bounded_cmd")]
     pub cmd: String,
     /// Exit code from the command (None if the command could not be spawned).
     pub exit_code: Option<i32>,
@@ -217,46 +244,83 @@ pub struct WarmPhaseResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Content-addressed receipt for a warm operation.
+///
+/// [INV-WARM-001] All string fields bounded by `MAX_WARM_STRING_LENGTH` and
+/// `phases` bounded by `MAX_WARM_PHASES` during deserialization to prevent OOM
+/// from crafted JSON (SEC-CTRL-FAC-0016).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WarmReceiptV1 {
     /// Schema identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub schema: String,
     /// Lane identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub lane_id: String,
     /// BLAKE3 hash of the canonical lane profile JSON.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub lane_profile_hash: String,
     /// Workspace root path.
+    ///
+    /// NOTE (finding #9): This is an absolute path local to the worker that
+    /// executed the warm operation. It is intentionally absolute because warm
+    /// receipts are verified locally on the same machine where the lane
+    /// workspace exists. Cross-machine portability is out of scope for
+    /// lane-scoped warm receipts (the lane namespace is inherently local).
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub workspace_root: String,
     /// Git HEAD SHA at warm time.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub git_head_sha: String,
     /// ISO 8601 start time.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub started_at: String,
     /// ISO 8601 finish time.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub finished_at: String,
     /// Per-phase results.
+    #[serde(deserialize_with = "deserialize_bounded_phases")]
     pub phases: Vec<WarmPhaseResult>,
     /// Tool versions collected at warm time.
     pub tool_versions: WarmToolVersions,
     /// BLAKE3 content hash of the receipt payload.
+    #[serde(deserialize_with = "deserialize_bounded_string_field")]
     pub content_hash: String,
 }
 
 /// Tool version snapshot at warm time.
+///
+/// [INV-WARM-001] All string fields bounded during deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WarmToolVersions {
     /// `rustc --version` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_bounded_optional_string_field"
+    )]
     pub rustc: Option<String>,
     /// `cargo --version` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_bounded_optional_string_field"
+    )]
     pub cargo: Option<String>,
     /// `cargo clippy --version` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_bounded_optional_string_field"
+    )]
     pub clippy: Option<String>,
     /// `cargo nextest --version` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_bounded_optional_string_field"
+    )]
     pub nextest: Option<String>,
 }
 
@@ -304,19 +368,30 @@ impl WarmReceiptV1 {
 
     /// Verify content hash integrity.
     ///
+    /// Uses constant-time comparison via `subtle::ConstantTimeEq` to prevent
+    /// timing side-channel leakage (INV-PC-001 consistency).
+    ///
     /// # Errors
     ///
     /// Returns `WarmError::ContentHashMismatch` if the declared hash does not
     /// match the computed hash.
     pub fn verify_content_hash(&self) -> Result<(), WarmError> {
         let computed = self.compute_content_hash();
-        if self.content_hash != computed {
-            return Err(WarmError::ContentHashMismatch {
+        // [INV-WARM-006] Constant-time comparison prevents timing side-channels
+        // on cryptographic hash values, consistent with INV-PC-001.
+        if self
+            .content_hash
+            .as_bytes()
+            .ct_eq(computed.as_bytes())
+            .into()
+        {
+            Ok(())
+        } else {
+            Err(WarmError::ContentHashMismatch {
                 declared: self.content_hash.clone(),
                 computed,
-            });
+            })
         }
-        Ok(())
     }
 
     /// Persist the receipt to the FAC receipts directory.
@@ -437,6 +512,22 @@ fn build_phase_command(
 }
 
 /// Execute a single warm phase and return the result.
+///
+/// Enforces `MAX_PHASE_TIMEOUT_SECS` via `Child::wait` with a polling loop
+/// and `Child::kill` on timeout. This prevents unbounded blocking if a cargo
+/// command hangs (e.g., due to a malicious `build.rs`).
+///
+/// # Containment Note (finding #6)
+///
+/// Warm execution runs within the FAC worker's systemd transient unit,
+/// inheriting cgroup + namespace isolation from TCK-00529/TCK-00511.
+/// The worker executes jobs as systemd transient units with
+/// `MemoryMax`, `CPUQuota`, `TasksMax`, `RuntimeMaxSec`, and
+/// `KillMode=control-group` properties. `build.rs` scripts from
+/// untrusted repos execute within this containment boundary. Explicit
+/// bubblewrap wrapping is not added here because the systemd unit
+/// boundary already provides process, resource, and filesystem
+/// isolation at the job level.
 #[must_use]
 pub fn execute_warm_phase(
     phase: WarmPhase,
@@ -445,9 +536,45 @@ pub fn execute_warm_phase(
     cargo_target_dir: &Path,
 ) -> WarmPhaseResult {
     let (mut cmd, cmd_str) = build_phase_command(phase, workspace, cargo_home, cargo_target_dir);
-    let start = Instant::now();
+    // Suppress stdout/stderr to prevent unbounded pipe buffering on the parent.
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
 
-    let exit_code = cmd.status().ok().and_then(|s| s.code());
+    let start = Instant::now();
+    let timeout = Duration::from_secs(MAX_PHASE_TIMEOUT_SECS);
+
+    #[allow(clippy::option_if_let_else)] // complex timeout logic not suited for map_or
+    let exit_code = match cmd.spawn() {
+        Ok(mut child) => {
+            // [INV-WARM-007] Enforce MAX_PHASE_TIMEOUT_SECS via polling
+            // wait loop. On timeout, kill the child and report None exit
+            // code to indicate abnormal termination.
+            let mut result = None;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        result = status.code();
+                        break;
+                    },
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            // Timeout exceeded — kill and break.
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            // exit_code = None signals timeout/kill.
+                            break;
+                        }
+                        // Sleep briefly to avoid busy-spinning. 100ms resolution
+                        // is adequate for phases running minutes.
+                        std::thread::sleep(Duration::from_millis(100));
+                    },
+                    Err(_) => break,
+                }
+            }
+            result
+        },
+        Err(_) => None,
+    };
 
     let duration = start.elapsed();
     #[allow(clippy::cast_possible_truncation)] // clamped to u64::MAX before cast
@@ -583,20 +710,144 @@ fn format_epoch_secs(secs: u64) -> String {
     format!("{secs}.000000000")
 }
 
+/// Collect version output from a tool command with bounded stdout reads.
+///
+/// [INV-WARM-008] Uses `Read::take(MAX_VERSION_OUTPUT_BYTES)` to prevent OOM
+/// from a malicious or verbose tool wrapper producing unbounded stdout
+/// (finding #7: bounded I/O on untrusted process output).
 fn version_output(program: &str, args: &[&str]) -> Option<String> {
-    Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                String::from_utf8(out.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let stdout = child.stdout.take()?;
+    let mut bounded = stdout.take(MAX_VERSION_OUTPUT_BYTES);
+    let mut buf = Vec::with_capacity(256);
+    if bounded.read_to_end(&mut buf).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+
+    let status = child.wait().ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    String::from_utf8(buf).ok().map(|s| s.trim().to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bounded Deserialization Helpers (SEC-CTRL-FAC-0016, finding #3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Deserialize a string field with `MAX_WARM_STRING_LENGTH` bound.
+fn deserialize_bounded_string_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > MAX_WARM_STRING_LENGTH {
+        return Err(de::Error::custom(format!(
+            "string field exceeds maximum length ({} > {})",
+            s.len(),
+            MAX_WARM_STRING_LENGTH
+        )));
+    }
+    Ok(s)
+}
+
+/// Deserialize an optional string field with `MAX_WARM_STRING_LENGTH` bound.
+fn deserialize_bounded_optional_string_field<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    if let Some(ref s) = opt {
+        if s.len() > MAX_WARM_STRING_LENGTH {
+            return Err(de::Error::custom(format!(
+                "optional string field exceeds maximum length ({} > {})",
+                s.len(),
+                MAX_WARM_STRING_LENGTH
+            )));
+        }
+    }
+    Ok(opt)
+}
+
+/// Deserialize `name` field with `MAX_WARM_STRING_LENGTH` bound.
+fn deserialize_bounded_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > MAX_WARM_STRING_LENGTH {
+        return Err(de::Error::custom(format!(
+            "field 'name' exceeds maximum length ({} > {})",
+            s.len(),
+            MAX_WARM_STRING_LENGTH
+        )));
+    }
+    Ok(s)
+}
+
+/// Deserialize `cmd` field with `MAX_WARM_CMD_LENGTH` bound.
+fn deserialize_bounded_cmd<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > MAX_WARM_CMD_LENGTH {
+        return Err(de::Error::custom(format!(
+            "field 'cmd' exceeds maximum length ({} > {})",
+            s.len(),
+            MAX_WARM_CMD_LENGTH
+        )));
+    }
+    Ok(s)
+}
+
+/// Deserialize `phases` vec with `MAX_WARM_PHASES` bound.
+fn deserialize_bounded_phases<'de, D>(deserializer: D) -> Result<Vec<WarmPhaseResult>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedPhasesVisitor;
+
+    impl<'de> Visitor<'de> for BoundedPhasesVisitor {
+        type Value = Vec<WarmPhaseResult>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            let max = MAX_WARM_PHASES;
+            write!(formatter, "a sequence with at most {max} items")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_WARM_PHASES));
+
+            while let Some(item) = seq.next_element()? {
+                if vec.len() >= MAX_WARM_PHASES {
+                    let max = MAX_WARM_PHASES;
+                    return Err(de::Error::custom(format!(
+                        "collection 'phases' exceeds maximum size of {max}"
+                    )));
+                }
+                vec.push(item);
             }
-        })
+
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedPhasesVisitor)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -757,5 +1008,138 @@ mod tests {
     fn test_collect_tool_versions_does_not_panic() {
         // Should not panic even if tools are missing.
         let _ = collect_tool_versions();
+    }
+
+    // ── Bounded deserialization tests (finding #3) ───────────────────────
+
+    #[test]
+    fn test_deserialize_rejects_too_many_phases() {
+        // Build a JSON receipt with MAX_WARM_PHASES + 1 phases.
+        let mut phases_json = Vec::new();
+        for i in 0..=MAX_WARM_PHASES {
+            phases_json.push(format!(
+                r#"{{"name":"p{i}","cmd":"echo","exit_code":0,"duration_ms":1}}"#,
+            ));
+        }
+        let phases_csv = phases_json.join(",");
+        let json = format!(
+            r#"{{
+                "schema":"test",
+                "lane_id":"l",
+                "lane_profile_hash":"h",
+                "workspace_root":"/tmp",
+                "git_head_sha":"abc",
+                "started_at":"0",
+                "finished_at":"0",
+                "phases":[{phases_csv}],
+                "tool_versions":{{}},
+                "content_hash":"h"
+            }}"#,
+        );
+        let result: Result<WarmReceiptV1, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject >MAX_WARM_PHASES phases");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds maximum size"),
+            "error should mention size: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_string_field() {
+        let long = "x".repeat(MAX_WARM_STRING_LENGTH + 1);
+        let json = format!(
+            r#"{{
+                "schema":"{long}",
+                "lane_id":"l",
+                "lane_profile_hash":"h",
+                "workspace_root":"/tmp",
+                "git_head_sha":"abc",
+                "started_at":"0",
+                "finished_at":"0",
+                "phases":[],
+                "tool_versions":{{}},
+                "content_hash":"h"
+            }}"#,
+        );
+        let result: Result<WarmReceiptV1, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject oversized string field");
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_cmd_field() {
+        let long_cmd = "x".repeat(MAX_WARM_CMD_LENGTH + 1);
+        let json = format!(
+            r#"{{
+                "schema":"test",
+                "lane_id":"l",
+                "lane_profile_hash":"h",
+                "workspace_root":"/tmp",
+                "git_head_sha":"abc",
+                "started_at":"0",
+                "finished_at":"0",
+                "phases":[{{"name":"p","cmd":"{long_cmd}","exit_code":0,"duration_ms":1}}],
+                "tool_versions":{{}},
+                "content_hash":"h"
+            }}"#,
+        );
+        let result: Result<WarmReceiptV1, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject oversized cmd field");
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_optional_tool_version() {
+        let long = "x".repeat(MAX_WARM_STRING_LENGTH + 1);
+        let json = format!(
+            r#"{{
+                "schema":"test",
+                "lane_id":"l",
+                "lane_profile_hash":"h",
+                "workspace_root":"/tmp",
+                "git_head_sha":"abc",
+                "started_at":"0",
+                "finished_at":"0",
+                "phases":[],
+                "tool_versions":{{"rustc":"{long}"}},
+                "content_hash":"h"
+            }}"#,
+        );
+        let result: Result<WarmReceiptV1, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject oversized tool version");
+    }
+
+    // ── Constant-time comparison test (finding #5) ──────────────────────
+
+    #[test]
+    fn test_verify_content_hash_constant_time() {
+        let mut receipt = WarmReceiptV1 {
+            schema: WARM_RECEIPT_SCHEMA.to_string(),
+            lane_id: "lane-00".to_string(),
+            lane_profile_hash: "b3-256:aabbccdd".to_string(),
+            workspace_root: "/tmp/workspace".to_string(),
+            git_head_sha: "abc123".to_string(),
+            started_at: "100.000000000".to_string(),
+            finished_at: "200.000000000".to_string(),
+            phases: vec![],
+            tool_versions: WarmToolVersions {
+                rustc: None,
+                cargo: None,
+                clippy: None,
+                nextest: None,
+            },
+            content_hash: String::new(),
+        };
+        receipt.content_hash = receipt.compute_content_hash();
+        // Valid hash passes.
+        assert!(receipt.verify_content_hash().is_ok());
+
+        // Tampered hash fails.
+        receipt.content_hash =
+            "b3-256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        assert!(receipt.verify_content_hash().is_err());
+
+        // Different-length hash fails.
+        receipt.content_hash = "short".to_string();
+        assert!(receipt.verify_content_hash().is_err());
     }
 }
