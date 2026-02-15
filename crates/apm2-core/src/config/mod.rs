@@ -98,6 +98,56 @@ impl EcosystemConfig {
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(ConfigError::Serialize)
     }
+
+    /// Build a default config with environment-based auto-detection.
+    ///
+    /// TCK-00595: Enables config-less startup for the CLI layer. When no
+    /// `ecosystem.toml` exists, this method constructs a usable config by:
+    ///
+    /// 1. Using XDG-standard default paths for all daemon paths.
+    /// 2. Auto-detecting GitHub owner/repo from `git remote get-url origin`.
+    /// 3. Using `$GITHUB_TOKEN` (or `$GH_TOKEN`) for projection auth.
+    ///
+    /// The projection worker is enabled only when both the GitHub token
+    /// and owner/repo are successfully detected. Otherwise, the config
+    /// defaults to projection-disabled.
+    ///
+    /// **This is for the short-lived CLI only.** The long-lived daemon
+    /// must NOT use auto-detection from CWD (see MAJOR-1 in daemon/main.rs).
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        // Detect GitHub owner/repo from CWD git remote
+        let github_coords = crate::github::detect_github_owner_repo_from_cwd();
+
+        // Check for GitHub token in env
+        let github_token_env = if std::env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            Some("GITHUB_TOKEN".to_string())
+        } else if std::env::var("GH_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            Some("GH_TOKEN".to_string())
+        } else {
+            None
+        };
+
+        // Enable projection only when we have both coordinates and a token
+        if let (Some((owner, repo)), Some(token_env)) = (&github_coords, &github_token_env) {
+            config.daemon.projection.enabled = true;
+            config.daemon.projection.github_owner.clone_from(owner);
+            config.daemon.projection.github_repo.clone_from(repo);
+            config.daemon.projection.github_token_env = Some(format!("${token_env}"));
+        }
+
+        config
+    }
 }
 
 /// Daemon configuration.
@@ -1186,6 +1236,22 @@ mod tests {
         assert!(
             result.is_ok(),
             "empty sinks config must be accepted (no projection): {result:?}"
+        );
+    }
+
+    /// TCK-00595: `from_env()` produces a valid default config with XDG paths.
+    #[test]
+    fn test_from_env_produces_defaults() {
+        // from_env() should never panic regardless of environment state.
+        let config = EcosystemConfig::from_env();
+        // Operator and session sockets should be non-empty paths
+        assert!(
+            !config.daemon.operator_socket.as_os_str().is_empty(),
+            "operator_socket must have a default path"
+        );
+        assert!(
+            !config.daemon.session_socket.as_os_str().is_empty(),
+            "session_socket must have a default path"
         );
     }
 }

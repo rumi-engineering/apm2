@@ -198,6 +198,26 @@ impl EcosystemConfig {
 
 All parsing methods return `Result` - untrusted input cannot trigger panics (RSK-0701).
 
+### Environment-Based Auto-Config (TCK-00595)
+
+```rust
+impl EcosystemConfig {
+    /// Build a default config with environment-based auto-detection.
+    /// Enables config-less CLI startup.
+    pub fn from_env() -> Self;
+}
+```
+
+`from_env()` constructs a usable config without an `ecosystem.toml` by:
+1. Using XDG-standard default paths for all daemon paths.
+2. Auto-detecting GitHub owner/repo from `git remote get-url origin` (CWD).
+3. Using `$GITHUB_TOKEN` or `$GH_TOKEN` for projection auth.
+
+Projection is enabled only when BOTH GitHub coordinates AND a token are detected.
+
+**IMPORTANT:** This is for the **short-lived CLI only**. The long-lived daemon
+must NOT use CWD auto-detection (see MAJOR-1 fix in `apm2-daemon/src/main.rs`).
+
 ## Examples
 
 ### Minimal Configuration

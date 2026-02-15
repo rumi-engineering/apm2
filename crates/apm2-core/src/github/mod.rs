@@ -230,5 +230,101 @@ fn validate_repository_segment(segment: &str, name: &str) -> Result<(), GitHubEr
     Ok(())
 }
 
+/// Maximum length for a git remote URL to parse.
+const MAX_REMOTE_URL_LENGTH: usize = 2048;
+
+/// Validates that a GitHub owner or repo segment contains only safe
+/// characters (`[a-zA-Z0-9._-]`) and is within 100 chars.
+fn is_valid_github_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 100
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+}
+
+/// Parse a GitHub remote URL into `(owner, repo)`.
+///
+/// Supports common URL formats:
+/// - `git@github.com:owner/repo.git`
+/// - `ssh://git@github.com/owner/repo.git`
+/// - `https://github.com/owner/repo.git`
+/// - `https://github.com/owner/repo`
+/// - `http://github.com/owner/repo`
+///
+/// Owner and repo segments are validated to contain only `[a-zA-Z0-9._-]`.
+///
+/// Returns `None` if the URL cannot be parsed or contains invalid segments.
+#[must_use]
+pub fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
+    // Bounded input to prevent DoS on extremely long strings
+    if url.len() > MAX_REMOTE_URL_LENGTH || url.is_empty() {
+        return None;
+    }
+
+    // git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2
+            && is_valid_github_segment(parts[0])
+            && is_valid_github_segment(parts[1])
+        {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+        return None;
+    }
+
+    // ssh://, https://, http://
+    for prefix in &[
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    ] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let rest = rest.strip_suffix(".git").unwrap_or(rest);
+            let parts: Vec<&str> = rest.splitn(3, '/').collect();
+            if parts.len() >= 2
+                && is_valid_github_segment(parts[0])
+                && is_valid_github_segment(parts[1])
+            {
+                return Some((parts[0].to_string(), parts[1].to_string()));
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
+/// Detect GitHub owner and repo from the `origin` remote of the current
+/// working directory.
+///
+/// Runs `git remote get-url origin` and parses the output. This is intended
+/// for **short-lived CLI** processes only. The long-lived daemon should NOT
+/// use this — it must use explicit config to avoid cross-repository pollution.
+///
+/// Returns `None` if:
+/// - Not in a git repo
+/// - No `origin` remote
+/// - Remote URL is not a recognized GitHub format
+/// - `git` binary is unavailable
+#[must_use]
+pub fn detect_github_owner_repo_from_cwd() -> Option<(String, String)> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8(output.stdout).ok()?;
+    let url = url.trim();
+    parse_github_remote_url(url)
+}
+
 #[cfg(test)]
 mod tests;
