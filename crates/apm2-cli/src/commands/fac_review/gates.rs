@@ -268,6 +268,15 @@ fn run_gates_inner(
                 evidence_log_digest,
             );
         }
+        for result in &gate_results {
+            cache.backfill_evidence_metadata(
+                &result.gate_name,
+                result.log_bundle_hash.as_deref(),
+                result.bytes_written,
+                result.bytes_total,
+                result.was_truncated,
+            );
+        }
         cache.save()?;
     }
 

@@ -1195,6 +1195,22 @@ fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
     normalize_error_hint(&content)
 }
 
+/// Resolve a failure hint from the per-gate evidence result's exact log path,
+/// falling back to global lane/job discovery only when the result carries no
+/// usable `log_path`.  This prevents concurrent runs from selecting another
+/// job's log file.
+fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
+    if let Some(ref log_path) = result.log_path {
+        if let Ok(content) = std::fs::read_to_string(log_path) {
+            if let Some(hint) = normalize_error_hint(&content) {
+                return Some(hint);
+            }
+        }
+    }
+    // Fallback: global discovery across all lane/job directories.
+    latest_gate_error_hint(&result.gate_name)
+}
+
 pub fn run_push(
     repo: &str,
     remote: &str,
@@ -1420,7 +1436,7 @@ pub fn run_push(
                 if gate.passed {
                     attempt.set_stage_pass(stage, gate.duration_secs);
                 } else {
-                    let hint = latest_gate_error_hint(&gate.gate_name).or_else(|| {
+                    let hint = gate_error_hint_from_result(gate).or_else(|| {
                         normalize_error_hint(&format!("gate {} failed", gate.gate_name))
                     });
                     attempt.set_stage_fail(stage, gate.duration_secs, None, hint);

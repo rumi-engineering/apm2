@@ -31,6 +31,14 @@ pub struct CachedGateResult {
     pub evidence_log_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quick_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,8 +322,42 @@ impl GateCache {
                 attestation_digest,
                 evidence_log_digest,
                 quick_mode: Some(quick_mode),
+                log_bundle_hash: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
             },
         );
+    }
+
+    /// Backfill truncation and log-bundle metadata from evidence gate results.
+    ///
+    /// Called after all gates have run and `attach_log_bundle_hash` has
+    /// populated per-result `log_bundle_hash` values.  Updates existing
+    /// cache entries in-place so the durable receipt carries the same
+    /// metadata as the in-memory `EvidenceGateResult`.
+    pub fn backfill_evidence_metadata(
+        &mut self,
+        gate_name: &str,
+        log_bundle_hash: Option<&str>,
+        bytes_written: Option<u64>,
+        bytes_total: Option<u64>,
+        was_truncated: Option<bool>,
+    ) {
+        if let Some(entry) = self.gates.get_mut(gate_name) {
+            if log_bundle_hash.is_some() {
+                entry.log_bundle_hash = log_bundle_hash.map(str::to_string);
+            }
+            if bytes_written.is_some() {
+                entry.bytes_written = bytes_written;
+            }
+            if bytes_total.is_some() {
+                entry.bytes_total = bytes_total;
+            }
+            if was_truncated.is_some() {
+                entry.was_truncated = was_truncated;
+            }
+        }
     }
 
     /// Evaluate whether a cached gate result is safe to reuse.

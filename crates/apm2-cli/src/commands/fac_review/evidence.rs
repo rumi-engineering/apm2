@@ -1078,13 +1078,22 @@ pub fn run_evidence_gates_with_status(
         );
         if !passed {
             updater.force_update(&status);
-            let _ = gate_cache.save();
             if let Some(file) = projection_log {
                 for line in &evidence_lines {
                     let _ = writeln!(file, "{line}");
                 }
             }
             attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            for result in &gate_results {
+                gate_cache.backfill_evidence_metadata(
+                    &result.gate_name,
+                    result.log_bundle_hash.as_deref(),
+                    result.bytes_written,
+                    result.bytes_total,
+                    result.was_truncated,
+                );
+            }
+            let _ = gate_cache.save();
             return Ok((false, gate_results));
         }
     }
@@ -1748,6 +1757,19 @@ pub fn run_evidence_gates_with_status(
     }
 
     attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+
+    // Backfill truncation and log-bundle metadata into durable gate receipts
+    // so the persisted cache carries the same observability data as the
+    // in-memory EvidenceGateResult.
+    for result in &gate_results {
+        gate_cache.backfill_evidence_metadata(
+            &result.gate_name,
+            result.log_bundle_hash.as_deref(),
+            result.bytes_written,
+            result.bytes_total,
+            result.was_truncated,
+        );
+    }
 
     // Force a final update to ensure all gate results are posted.
     updater.force_update(&status);
