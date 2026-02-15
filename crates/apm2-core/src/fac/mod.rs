@@ -334,7 +334,7 @@ pub use receipt::{
 pub use receipt_index::{
     INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
     MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
-    ReceiptIndexV1,
+    ReceiptIndexV1, list_receipt_headers, lookup_job_receipt,
 };
 pub use repo_mirror::{
     CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,

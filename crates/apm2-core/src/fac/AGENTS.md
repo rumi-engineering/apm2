@@ -484,11 +484,22 @@ queue_lane, etc.).
 - `incremental_update(receipts_dir, receipt)`: Load-or-rebuild index, upsert new
   receipt header, persist atomically.
 - `load_or_rebuild(receipts_dir)`: Load index from disk, rebuild on missing/corrupt.
-- `persist(receipts_dir)`: Atomic write (temp + rename) to index subdirectory.
+- `persist(receipts_dir)`: Atomic write using `NamedTempFile` (random temp name +
+  fsync + rename) to index subdirectory. Prevents symlink attacks.
 - `latest_digest_for_job(job_id)`: O(1) lookup of latest receipt hash for a job.
 - `header_for_digest(content_hash)`: O(1) lookup of parsed header by content hash.
 - Both `persist_content_addressed_receipt` and `persist_content_addressed_receipt_v2`
   call `incremental_update` as a best-effort post-persist step.
+
+### Consumer Helpers (TCK-00560)
+
+- `lookup_job_receipt(receipts_dir, job_id)`: Index-first O(1) job receipt lookup
+  with bounded directory scan fallback. Primary consumer entry point.
+- `list_receipt_headers(receipts_dir)`: List all indexed headers sorted by
+  timestamp (most recent first). No directory scanning.
+- CLI: `apm2 fac receipts list` — list indexed receipts.
+- CLI: `apm2 fac receipts status <job_id>` — look up latest receipt for a job.
+- CLI: `apm2 fac receipts reindex` — force full rebuild from receipt store.
 
 ### Security Invariants (TCK-00560)
 
@@ -496,11 +507,15 @@ queue_lane, etc.).
   cache under A2 assumptions. Never trusted for authorization/admission/caching.
 - [INV-IDX-002] All in-memory collections bounded by `MAX_INDEX_ENTRIES` (16384)
   and `MAX_JOB_INDEX_ENTRIES` (16384). Overflow returns Err, not truncation.
-- [INV-IDX-003] Index file reads bounded by `MAX_INDEX_FILE_SIZE` (8 MiB) before
-  deserialization (RSK-1601 prevention).
-- [INV-IDX-004] Rebuild scans bounded by `MAX_REBUILD_SCAN_FILES` (65536).
+  Upsert checks ALL capacities before ANY mutation (no dangling entries).
+- [INV-IDX-003] Index file reads use open-once with `O_NOFOLLOW` + bounded
+  streaming reads from the same handle (no stat-then-read TOCTOU).
+- [INV-IDX-004] Rebuild scans count EVERY directory entry (not just `.json`
+  files) toward `MAX_REBUILD_SCAN_FILES` (65536). Adversarial non-JSON entries
+  cannot bypass the scan cap.
 - [INV-IDX-005] Corrupt/missing index triggers automatic rebuild from receipt
   store. System correctness never depends on index availability.
-- [INV-IDX-006] Index persistence uses atomic write (temp + rename).
-- [INV-IDX-007] Individual receipt file reads during rebuild are bounded by
-  `MAX_JOB_RECEIPT_SIZE` before deserialization.
+- [INV-IDX-006] Index persistence uses `NamedTempFile` with random name, fsync,
+  and atomic rename. No predictable temp paths.
+- [INV-IDX-007] Individual receipt file reads during rebuild use open-once with
+  `O_NOFOLLOW` + bounded streaming reads (no stat-then-read TOCTOU).

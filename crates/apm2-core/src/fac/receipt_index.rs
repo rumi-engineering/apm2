@@ -33,6 +33,7 @@
 //! update returns an error.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -274,17 +275,25 @@ impl ReceiptIndexV1 {
         let job_id = header.job_id.clone();
         let timestamp = header.timestamp_secs;
 
-        // Check capacity before inserting a new header entry.
-        if !self.header_index.contains_key(&content_hash)
-            && self.header_index.len() >= MAX_INDEX_ENTRIES
-        {
+        // Check ALL capacities before ANY mutation to prevent inconsistent
+        // state on overflow (review finding: NIT capacity check ordering).
+        let is_new_header = !self.header_index.contains_key(&content_hash);
+        let is_new_job = !self.job_index.contains_key(&job_id);
+
+        if is_new_header && self.header_index.len() >= MAX_INDEX_ENTRIES {
             return Err(ReceiptIndexError::IndexAtCapacity {
                 current: self.header_index.len(),
                 max: MAX_INDEX_ENTRIES,
             });
         }
+        if is_new_job && self.job_index.len() >= MAX_JOB_INDEX_ENTRIES {
+            return Err(ReceiptIndexError::IndexAtCapacity {
+                current: self.job_index.len(),
+                max: MAX_JOB_INDEX_ENTRIES,
+            });
+        }
 
-        // Insert or replace header entry.
+        // All capacity checks passed — safe to mutate.
         self.header_index.insert(content_hash.clone(), header);
 
         // Update job_index: point to the latest receipt (by timestamp).
@@ -297,12 +306,6 @@ impl ReceiptIndexV1 {
                 self.job_index.insert(job_id, content_hash);
             }
         } else {
-            if self.job_index.len() >= MAX_JOB_INDEX_ENTRIES {
-                return Err(ReceiptIndexError::IndexAtCapacity {
-                    current: self.job_index.len(),
-                    max: MAX_JOB_INDEX_ENTRIES,
-                });
-            }
             self.job_index.insert(job_id, content_hash);
         }
 
@@ -360,9 +363,13 @@ impl ReceiptIndexV1 {
         let entries = std::fs::read_dir(receipts_dir)
             .map_err(|e| ReceiptIndexError::io("read receipt directory", e))?;
 
-        let mut scanned: usize = 0;
+        // Count EVERY visited directory entry toward the scan cap, not just
+        // .json files. This prevents adversarial non-JSON entries from
+        // bypassing MAX_REBUILD_SCAN_FILES (security review finding: MAJOR-2).
+        let mut visited: usize = 0;
         for entry_result in entries {
-            if scanned >= MAX_REBUILD_SCAN_FILES {
+            visited = visited.saturating_add(1);
+            if visited > MAX_REBUILD_SCAN_FILES {
                 break;
             }
 
@@ -382,21 +389,28 @@ impl ReceiptIndexV1 {
                 continue;
             }
 
-            scanned += 1;
-
-            // Bounded read: skip files exceeding receipt size cap.
-            let Ok(metadata) = std::fs::metadata(&path) else {
+            // Bounded read via open-once with O_NOFOLLOW (TOCTOU-safe).
+            // Opens the file handle first, then checks size from the same
+            // handle to avoid stat-then-read race (security finding: MAJOR-1).
+            let Ok(file) = open_no_follow(&path) else {
                 continue;
             };
-            if metadata.len() > MAX_JOB_RECEIPT_SIZE as u64 {
+            let Ok(file_meta) = file.metadata() else {
+                continue;
+            };
+            if file_meta.len() > MAX_JOB_RECEIPT_SIZE as u64 {
+                continue;
+            }
+            let mut buf = Vec::new();
+            let cap = MAX_JOB_RECEIPT_SIZE as u64;
+            if file.take(cap + 1).read_to_end(&mut buf).is_err() {
+                continue;
+            }
+            if buf.len() as u64 > cap {
                 continue;
             }
 
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-
-            let Ok(receipt) = serde_json::from_slice::<FacJobReceiptV1>(&bytes) else {
+            let Ok(receipt) = serde_json::from_slice::<FacJobReceiptV1>(&buf) else {
                 continue; // Not a valid job receipt — skip.
             };
 
@@ -445,12 +459,31 @@ impl ReceiptIndexV1 {
         let index_path = index_dir.join(INDEX_FILE_NAME);
         let bytes = self.to_json_bytes()?;
 
-        // Atomic write: temp file + rename.
-        let tmp_path = index_dir.join(format!("{INDEX_FILE_NAME}.tmp"));
-        std::fs::write(&tmp_path, &bytes)
-            .map_err(|e| ReceiptIndexError::io("write index temp file", e))?;
-        std::fs::rename(&tmp_path, &index_path)
-            .map_err(|e| ReceiptIndexError::io("rename index file", e))?;
+        // Atomic write using NamedTempFile: random temp name in the same
+        // directory, write + fsync, then rename-into-place. This prevents
+        // symlink attacks on predictable temp paths (security finding: MAJOR-3).
+        let temp = tempfile::NamedTempFile::new_in(&index_dir)
+            .map_err(|e| ReceiptIndexError::io("create temp file for index", e))?;
+
+        // Set restrictive permissions on the temp file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(temp.path(), perms);
+        }
+
+        {
+            use std::io::Write;
+            let mut file = temp.as_file();
+            file.write_all(&bytes)
+                .map_err(|e| ReceiptIndexError::io("write index temp file", e))?;
+            file.sync_all()
+                .map_err(|e| ReceiptIndexError::io("fsync index temp file", e))?;
+        }
+
+        temp.persist(&index_path)
+            .map_err(|e| ReceiptIndexError::io("rename index temp file to final path", e.error))?;
 
         Ok(index_path)
     }
@@ -466,13 +499,17 @@ impl ReceiptIndexV1 {
     pub fn load(receipts_dir: &Path) -> Result<Option<Self>, ReceiptIndexError> {
         let index_path = Self::index_path(receipts_dir);
 
-        if !index_path.exists() {
-            return Ok(None);
-        }
+        // Open once with O_NOFOLLOW, then check size on the same handle.
+        // This avoids stat-then-read TOCTOU (security finding: MAJOR-1).
+        let file = match open_no_follow(&index_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(ReceiptIndexError::io("open index file", e)),
+        };
 
-        // Bounded read: check size before reading.
-        let metadata = std::fs::metadata(&index_path)
-            .map_err(|e| ReceiptIndexError::io("stat index file", e))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| ReceiptIndexError::io("fstat index file", e))?;
         if metadata.len() > MAX_INDEX_FILE_SIZE {
             return Err(ReceiptIndexError::IndexTooLarge {
                 size: metadata.len(),
@@ -480,10 +517,20 @@ impl ReceiptIndexV1 {
             });
         }
 
-        let bytes =
-            std::fs::read(&index_path).map_err(|e| ReceiptIndexError::io("read index file", e))?;
+        // Bounded streaming read from the already-opened handle.
+        let mut buf = Vec::new();
+        let cap = MAX_INDEX_FILE_SIZE;
+        file.take(cap + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ReceiptIndexError::io("read index file", e))?;
+        if buf.len() as u64 > cap {
+            return Err(ReceiptIndexError::IndexTooLarge {
+                size: buf.len() as u64,
+                max: cap,
+            });
+        }
 
-        let index: Self = serde_json::from_slice(&bytes)
+        let index: Self = serde_json::from_slice(&buf)
             .map_err(|e| ReceiptIndexError::Serialization(e.to_string()))?;
 
         index.validate()?;
@@ -529,6 +576,131 @@ impl ReceiptIndexV1 {
         index.persist(receipts_dir)?;
         Ok(())
     }
+}
+
+// =============================================================================
+// Symlink-safe File Open
+// =============================================================================
+
+/// Open a file for reading without following symlinks (`O_NOFOLLOW` on Unix).
+///
+/// On non-Unix platforms, falls back to a plain open (no symlink protection).
+fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
+// =============================================================================
+// Consumer Helpers
+// =============================================================================
+
+/// Look up the latest receipt for a job using the index, with fallback to
+/// directory scan if the index does not contain the job.
+///
+/// Returns the parsed [`FacJobReceiptV1`] if found, or `None` if no receipt
+/// exists for the given job ID. The index is loaded (or rebuilt) automatically.
+///
+/// # Security
+///
+/// The index is non-authoritative; this function reads the receipt from the
+/// content-addressed store and verifies it. The index only provides the
+/// content hash hint.
+#[must_use]
+pub fn lookup_job_receipt(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
+    // Try the index first — O(1) lookup.
+    if let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) {
+        if let Some(digest) = index.latest_digest_for_job(job_id) {
+            let receipt_path = receipts_dir.join(format!("{digest}.json"));
+            if let Some(receipt) = load_receipt_bounded(&receipt_path) {
+                if receipt.job_id == job_id {
+                    return Some(receipt);
+                }
+                // Index was stale — fall through to scan.
+            }
+        }
+    }
+
+    // Fallback: bounded directory scan (last resort).
+    scan_receipt_for_job(receipts_dir, job_id)
+}
+
+/// List receipt headers from the index without directory scanning.
+///
+/// Returns an iterator-like vec of headers from the index, sorted by
+/// timestamp descending (most recent first). If the index cannot be loaded,
+/// returns an empty vec.
+#[must_use]
+pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
+    let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) else {
+        return Vec::new();
+    };
+    let mut headers: Vec<ReceiptHeaderV1> = index.header_index.into_values().collect();
+    headers.sort_by(|a, b| b.timestamp_secs.cmp(&a.timestamp_secs));
+    headers
+}
+
+/// Load a single receipt file with bounded read and `O_NOFOLLOW`.
+fn load_receipt_bounded(path: &Path) -> Option<FacJobReceiptV1> {
+    let file = open_no_follow(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if meta.len() > MAX_JOB_RECEIPT_SIZE as u64 {
+        return None;
+    }
+    let mut buf = Vec::new();
+    let cap = MAX_JOB_RECEIPT_SIZE as u64;
+    file.take(cap + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > cap {
+        return None;
+    }
+    serde_json::from_slice::<FacJobReceiptV1>(&buf).ok()
+}
+
+/// Bounded fallback scan: iterate the receipt directory looking for a specific
+/// job ID. Bounded by `MAX_REBUILD_SCAN_FILES`.
+fn scan_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
+    let entries = std::fs::read_dir(receipts_dir).ok()?;
+    let mut visited: usize = 0;
+    let mut best: Option<FacJobReceiptV1> = None;
+
+    for entry_result in entries {
+        visited = visited.saturating_add(1);
+        if visited > MAX_REBUILD_SCAN_FILES {
+            break;
+        }
+        let Ok(entry) = entry_result else { continue };
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if path.is_dir() {
+            continue;
+        }
+        let Some(receipt) = load_receipt_bounded(&path) else {
+            continue;
+        };
+        if receipt.job_id != job_id {
+            continue;
+        }
+        // Keep the receipt with the latest timestamp.
+        if best
+            .as_ref()
+            .is_none_or(|b| receipt.timestamp_secs >= b.timestamp_secs)
+        {
+            best = Some(receipt);
+        }
+    }
+    best
 }
 
 // =============================================================================
@@ -866,5 +1038,138 @@ mod tests {
         assert_eq!(index.latest_digest_for_job("job-a"), Some("hash-a2"));
         assert_eq!(index.latest_digest_for_job("job-b"), Some("hash-b1"));
         assert_eq!(index.len(), 3); // 3 distinct hashes.
+    }
+
+    // =========================================================================
+    // NIT-2 regression: upsert capacity check ordering
+    // =========================================================================
+
+    #[test]
+    fn test_upsert_capacity_check_does_not_leave_dangling_header() {
+        // Fill header_index to capacity with unique jobs.
+        let mut index = ReceiptIndexV1::new();
+        for i in 0..MAX_INDEX_ENTRIES {
+            let header = make_header(&format!("job-{i}"), &format!("hash-{i}"), i as u64);
+            index.upsert(header).expect("upsert within capacity");
+        }
+        assert_eq!(index.header_index.len(), MAX_INDEX_ENTRIES);
+        assert_eq!(index.job_index.len(), MAX_INDEX_ENTRIES);
+
+        // Attempting to add a new header+job should fail on header capacity
+        // and leave BOTH maps unchanged.
+        let header_before = index.header_index.len();
+        let job_before = index.job_index.len();
+        let overflow = make_header("new-job", "new-hash", 99999);
+        assert!(index.upsert(overflow).is_err());
+        assert_eq!(index.header_index.len(), header_before);
+        assert_eq!(index.job_index.len(), job_before);
+    }
+
+    // =========================================================================
+    // MAJOR-2 regression: rebuild counts all directory entries
+    // =========================================================================
+
+    #[test]
+    fn test_rebuild_counts_non_json_entries_toward_scan_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write a valid receipt.
+        let r1 = make_receipt("job-1", "hash-1", 1000);
+        let bytes1 = serde_json::to_vec_pretty(&r1).expect("ser");
+        std::fs::write(receipts_dir.join("hash-1.json"), bytes1).expect("write");
+
+        // Write many non-JSON junk files — these should still count toward
+        // the scan cap to prevent bypass.
+        for i in 0..10 {
+            std::fs::write(receipts_dir.join(format!("junk-{i}.tmp")), b"not a receipt")
+                .expect("write");
+        }
+
+        // Rebuild should still find the receipt since 11 entries < cap.
+        let index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+        assert!(!index.is_empty(), "should find the valid receipt");
+    }
+
+    // =========================================================================
+    // Consumer helper tests
+    // =========================================================================
+
+    #[test]
+    fn test_lookup_job_receipt_via_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write a receipt file.
+        let r1 = make_receipt("job-1", "hash-1", 1000);
+        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
+        std::fs::write(receipts_dir.join("hash-1.json"), &bytes).expect("write");
+
+        // Build the index.
+        let index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+        index.persist(receipts_dir).expect("persist");
+
+        // Lookup via the public helper.
+        let found = lookup_job_receipt(receipts_dir, "job-1");
+        assert!(found.is_some(), "should find receipt for job-1");
+        let receipt = found.unwrap();
+        assert_eq!(receipt.job_id, "job-1");
+        assert_eq!(receipt.content_hash, "hash-1");
+    }
+
+    #[test]
+    fn test_lookup_job_receipt_fallback_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write a receipt file but do NOT build the index.
+        let r1 = make_receipt("job-fallback", "hash-fallback", 2000);
+        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
+        std::fs::write(receipts_dir.join("hash-fallback.json"), &bytes).expect("write");
+
+        // Lookup should still work via fallback scan (and auto-rebuild).
+        let found = lookup_job_receipt(receipts_dir, "job-fallback");
+        assert!(found.is_some(), "should find receipt via fallback");
+        assert_eq!(found.unwrap().job_id, "job-fallback");
+    }
+
+    #[test]
+    fn test_lookup_job_receipt_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let found = lookup_job_receipt(receipts_dir, "nonexistent-job");
+        assert!(found.is_none(), "should return None for nonexistent job");
+    }
+
+    #[test]
+    fn test_list_receipt_headers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write receipt files.
+        for (i, ts) in [(1, 3000_u64), (2, 1000), (3, 2000)] {
+            let r = make_receipt(&format!("job-{i}"), &format!("hash-{i}"), ts);
+            let bytes = serde_json::to_vec_pretty(&r).expect("ser");
+            std::fs::write(receipts_dir.join(format!("hash-{i}.json")), &bytes).expect("write");
+        }
+
+        // Build index.
+        let index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+        index.persist(receipts_dir).expect("persist");
+
+        // List headers — should be sorted by timestamp descending.
+        let headers = list_receipt_headers(receipts_dir);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0].timestamp_secs, 3000);
+        assert_eq!(headers[1].timestamp_secs, 2000);
+        assert_eq!(headers[2].timestamp_secs, 1000);
+    }
+
+    #[test]
+    fn test_list_receipt_headers_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let headers = list_receipt_headers(tmp.path());
+        assert!(headers.is_empty());
     }
 }
