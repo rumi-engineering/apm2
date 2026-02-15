@@ -39,6 +39,11 @@ pub struct CachedGateResult {
     pub bytes_total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was_truncated: Option<bool>,
+    /// Absolute path to the evidence log file produced during this gate run.
+    /// SHA-bound: ensures tool-output selectors resolve to the exact log for
+    /// the requested SHA rather than the latest file by mtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +309,7 @@ impl GateCache {
     }
 
     /// Record a gate result with attestation metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_with_attestation(
         &mut self,
         gate: &str,
@@ -312,6 +318,7 @@ impl GateCache {
         attestation_digest: Option<String>,
         quick_mode: bool,
         evidence_log_digest: Option<String>,
+        log_path: Option<String>,
     ) {
         self.gates.insert(
             gate.to_string(),
@@ -326,6 +333,7 @@ impl GateCache {
                 bytes_written: None,
                 bytes_total: None,
                 was_truncated: None,
+                log_path,
             },
         );
     }
@@ -343,6 +351,7 @@ impl GateCache {
         bytes_written: Option<u64>,
         bytes_total: Option<u64>,
         was_truncated: Option<bool>,
+        log_path: Option<&str>,
     ) {
         if let Some(entry) = self.gates.get_mut(gate_name) {
             if log_bundle_hash.is_some() {
@@ -356,6 +365,9 @@ impl GateCache {
             }
             if was_truncated.is_some() {
                 entry.was_truncated = was_truncated;
+            }
+            if log_path.is_some() {
+                entry.log_path = log_path.map(str::to_string);
             }
         }
     }
@@ -421,6 +433,7 @@ mod tests {
             Some("digest-a".to_string()),
             false,
             Some("log-a".to_string()),
+            None,
         );
         cache.set_with_attestation(
             "clippy",
@@ -429,6 +442,7 @@ mod tests {
             Some("digest-b".to_string()),
             false,
             Some("log-b".to_string()),
+            None,
         );
 
         let fmt = cache.get("rustfmt").expect("should exist");
@@ -453,6 +467,7 @@ mod tests {
             Some("digest-a".to_string()),
             false,
             Some("log-a".to_string()),
+            None,
         );
         cache.set_with_attestation(
             "clippy",
@@ -461,6 +476,7 @@ mod tests {
             Some("digest-b".to_string()),
             false,
             Some("log-b".to_string()),
+            None,
         );
         assert!(cache.gates.values().all(|result| result.status == "PASS"));
 
@@ -471,6 +487,7 @@ mod tests {
             Some("digest-c".to_string()),
             false,
             Some("log-c".to_string()),
+            None,
         );
         assert!(cache.gates.values().any(|result| result.status != "PASS"));
     }
@@ -485,6 +502,7 @@ mod tests {
             Some("digest-a".to_string()),
             false,
             Some("log-a".to_string()),
+            Some("/tmp/rustfmt.log".to_string()),
         );
         cache.set_with_attestation(
             "clippy",
@@ -493,6 +511,7 @@ mod tests {
             Some("digest-b".to_string()),
             false,
             Some("log-b".to_string()),
+            Some("/tmp/clippy.log".to_string()),
         );
 
         let yaml = serde_yaml::to_string(&cache).expect("serialize");
@@ -522,6 +541,7 @@ mod tests {
             Some("digest-1".to_string()),
             false,
             Some("log-digest".to_string()),
+            None,
         );
         assert_eq!(
             cache.check_reuse("rustfmt", Some("digest-1"), true),
