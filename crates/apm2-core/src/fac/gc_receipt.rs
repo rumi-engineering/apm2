@@ -104,6 +104,7 @@ pub enum GcActionKind {
     LaneTarget,
     LaneLog,
     GateCache,
+    BlobPrune,
     QuarantinePrune,
     DeniedPrune,
     CargoCache,
@@ -236,5 +237,7 @@ mod tests {
         assert_eq!(v, "\"quarantine_prune\"");
         let denied = serde_json::to_string(&GcActionKind::DeniedPrune).expect("serialize");
         assert_eq!(denied, "\"denied_prune\"");
+        let blob = serde_json::to_string(&GcActionKind::BlobPrune).expect("serialize");
+        assert_eq!(blob, "\"blob_prune\"");
     }
 }

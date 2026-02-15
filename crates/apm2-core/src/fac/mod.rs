@@ -73,6 +73,8 @@ pub mod adapter_selection;
 mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
+/// Content-addressed blob store for FAC patch data.
+pub mod blob_store;
 pub mod broker;
 pub mod broker_health;
 pub mod builtin_profiles;
@@ -168,6 +170,7 @@ pub use artifact_manifest::{
     DataClassification, HygieneError, MAX_ARTIFACTS,
     MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH, validate_evidence_hygiene_for_admission,
 };
+pub use blob_store::{BLOB_DIR, BlobStore, BlobStoreError, MAX_BLOB_SIZE};
 pub use broker::{
     BrokerError, BrokerSignatureVerifier, BrokerState, DEFAULT_ENVELOPE_TTL_TICKS, FacBroker,
     MAX_ADMITTED_POLICY_DIGESTS, MAX_AUTHORITY_CLOCK_LENGTH, MAX_BOUNDARY_ID_LENGTH,

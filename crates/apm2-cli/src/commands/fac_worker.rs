@@ -88,9 +88,9 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
-    BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1, ChannelBoundaryTrace,
-    DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
-    GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
+    BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
+    ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1,
+    GateReceipt, GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
     QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, SystemdUnitProperties,
     compute_policy_hash, deserialize_policy, parse_policy_hash, persist_content_addressed_receipt,
     persist_policy, run_preflight,
@@ -1662,7 +1662,6 @@ fn process_job(
                 return deny_with_reason(&format!("invalid base64 in patch.bytes: {err}"));
             },
         };
-
         if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
             let actual_digest = format!("b3-256:{}", blake3::hash(&patch_bytes).to_hex());
             let expected_bytes = expected_digest.as_bytes();
@@ -1674,6 +1673,11 @@ fn process_job(
                     "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
                 ));
             }
+        }
+
+        let blob_store = BlobStore::new(fac_root);
+        if let Err(error) = blob_store.store(&patch_bytes) {
+            return deny_with_reason(&format!("failed to store patch in blob store: {error}"));
         }
 
         let patch_outcome = match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
