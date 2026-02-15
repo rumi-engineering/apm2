@@ -99,6 +99,9 @@ mod canonicalizer_tuple;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
+/// Containment verification: cgroup membership checks for child processes
+/// (TCK-00548).
+pub mod containment;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
@@ -229,6 +232,14 @@ pub use ci_import::{
     CiEvidenceImport, CiEvidenceImportBuilder, CiImportAttestation, CiImportAttestationBuilder,
     CiImportError, CiImportPolicy, MAX_ARTIFACT_DIGESTS, MAX_IMPORT_ID_LENGTH,
     MAX_WORKFLOW_RUN_ID_LENGTH, can_transition_to_ready_for_review, validate_ci_import,
+};
+// Re-export containment verification types (TCK-00548)
+pub use containment::{
+    ContainmentError, ContainmentMismatch, ContainmentTrace, ContainmentVerdict,
+    MAX_CHILD_PROCESSES, MAX_CONTAINMENT_MISMATCHES, MAX_PROC_READ_SIZE, MAX_PROC_SCAN_ENTRIES,
+    check_sccache_containment, check_sccache_containment_with_proc, discover_children,
+    discover_children_from_proc, is_cgroup_contained, read_cgroup_path, read_cgroup_path_from_proc,
+    verify_containment, verify_containment_with_proc,
 };
 // Re-export determinism types
 pub use determinism::{

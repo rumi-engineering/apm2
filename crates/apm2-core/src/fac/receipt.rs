@@ -367,6 +367,13 @@ pub struct FacJobReceiptV1 {
     /// It is intentionally optional and currently not populated by the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    /// Containment verification trace (TCK-00548).
+    ///
+    /// Records whether child processes (rustc, nextest, etc.) were verified
+    /// to share the same cgroup as the job unit, and whether sccache was
+    /// auto-disabled due to containment failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment: Option<super::containment::ContainmentTrace>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -485,6 +492,20 @@ impl FacJobReceiptV1 {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
+        }
+
+        // TCK-00548: Containment trace. Appended at end for backward
+        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(trace) = &self.containment {
+            bytes.push(1u8);
+            bytes.push(u8::from(trace.verified));
+            bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.cgroup_path.as_bytes());
+            bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
+            bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
+            bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
         bytes
@@ -610,6 +631,20 @@ impl FacJobReceiptV1 {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
+        }
+
+        // TCK-00548: Containment trace. Appended at end for backward
+        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(trace) = &self.containment {
+            bytes.push(1u8);
+            bytes.push(u8::from(trace.verified));
+            bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.cgroup_path.as_bytes());
+            bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
+            bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
+            bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
         bytes
@@ -806,6 +841,18 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00548: Validate containment trace bounds to prevent
+        // memory exhaustion via oversized cgroup_path (MAJOR-1).
+        if let Some(trace) = &self.containment {
+            if trace.cgroup_path.len() > super::containment::MAX_CGROUP_PATH_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "containment.cgroup_path",
+                    actual: trace.cgroup_path.len(),
+                    max: super::containment::MAX_CGROUP_PATH_LENGTH,
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -827,6 +874,7 @@ pub struct FacJobReceiptV1Builder {
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    containment: Option<super::containment::ContainmentTrace>,
     timestamp_secs: Option<u64>,
 }
 
@@ -920,6 +968,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn eio29_budget_admission(mut self, trace: BudgetAdmissionTrace) -> Self {
         self.eio29_budget_admission = Some(trace);
+        self
+    }
+
+    /// Sets the containment verification trace (TCK-00548).
+    #[must_use]
+    pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
+        self.containment = Some(trace);
         self
     }
 
@@ -1128,6 +1183,7 @@ impl FacJobReceiptV1Builder {
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
+            containment: self.containment,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
@@ -2977,5 +3033,135 @@ pub mod tests {
                 ..
             })
         ));
+    }
+
+    // ========================================================================
+    // Containment validation regression tests (MAJOR-1, MAJOR-2)
+    // ========================================================================
+
+    #[test]
+    fn test_validate_rejects_oversized_containment_cgroup_path() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "x".repeat(crate::fac::containment::MAX_CGROUP_PATH_LENGTH + 1),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        // Recompute content hash so other validations pass
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::StringTooLong {
+                field: "containment.cgroup_path",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_containment_trace() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 5,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        // Recompute content hash so hash validation passes
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(receipt.validate().is_ok());
+    }
+
+    #[test]
+    fn test_canonical_bytes_v1_includes_containment_trace() {
+        let mut r = make_valid_receipt();
+        r.containment = None;
+        let hash_none = r.canonical_bytes();
+
+        r.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 3,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let hash_some = r.canonical_bytes();
+
+        assert_ne!(
+            hash_none, hash_some,
+            "v1 canonical_bytes must change when containment trace is set"
+        );
+    }
+
+    #[test]
+    fn test_canonical_bytes_v1_containment_different_values_produce_different_hashes() {
+        let mut r = make_valid_receipt();
+        r.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/a".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let hash_a = r.canonical_bytes();
+
+        r.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: false,
+            cgroup_path: "/b".to_string(),
+            processes_checked: 10,
+            mismatch_count: 3,
+            sccache_auto_disabled: true,
+        });
+        let hash_b = r.canonical_bytes();
+
+        assert_ne!(
+            hash_a, hash_b,
+            "different containment values must produce different v1 hashes"
+        );
+    }
+
+    #[test]
+    fn test_canonical_bytes_v1_backward_compatible_without_containment() {
+        // Verify that a receipt without containment produces the same
+        // canonical bytes as before the TCK-00548 change.
+        let r1 = make_valid_receipt();
+        assert!(r1.containment.is_none());
+        let bytes1 = r1.canonical_bytes();
+
+        let r2 = make_valid_receipt();
+        let bytes2 = r2.canonical_bytes();
+
+        assert_eq!(
+            bytes1, bytes2,
+            "receipts without containment must produce identical v1 canonical bytes"
+        );
+    }
+
+    #[test]
+    fn test_canonical_bytes_v2_includes_containment_trace() {
+        let mut r = make_valid_receipt();
+        r.containment = None;
+        let hash_none = r.canonical_bytes_v2();
+
+        r.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 3,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let hash_some = r.canonical_bytes_v2();
+
+        assert_ne!(
+            hash_none, hash_some,
+            "v2 canonical_bytes must change when containment trace is set"
+        );
     }
 }
