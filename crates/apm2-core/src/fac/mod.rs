@@ -319,8 +319,8 @@ pub use merge_receipt::{
     MergeReceiptProto,
 };
 pub use policy::{
-    EnvSetEntry, FacPolicyError, FacPolicyV1, POLICY_SCHEMA_ID, compute_policy_hash,
-    deserialize_policy, parse_policy_hash, persist_policy,
+    EnvSetEntry, FacPolicyError, FacPolicyV1, POLICY_SCHEMA_ID, build_job_environment,
+    compute_policy_hash, deserialize_policy, parse_policy_hash, persist_policy,
 };
 // Re-export policy inheritance types (TCK-00340)
 pub use policy_inheritance::{

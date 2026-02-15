@@ -33,8 +33,18 @@ const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
     "CARGO_BUILD_JOBS",
     "NEXTEST_TEST_THREADS",
     "CARGO_HOME",
+    "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "RUSTDOCFLAGS",
+    // TCK-00526: PATH, HOME, USER, and LANG are required for correct
+    // toolchain resolution inside the bounded test unit. These are
+    // included in the FAC policy's default env_allowlist_prefixes and
+    // must be forwarded through systemd --setenv to maintain execution
+    // correctness.
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
 ];
 
 /// `RUSTC_WRAPPER` and `SCCACHE_*` are intentionally EXCLUDED from the

@@ -6,6 +6,7 @@
 //! JSON-like bytes with domain separation, and the resulting digest is embedded
 //! in RFC-0028 boundary bindings.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -326,6 +327,101 @@ impl FacPolicyV1 {
 
         Ok(())
     }
+
+    /// Resolves the effective `CARGO_HOME` path for FAC job execution.
+    ///
+    /// Priority:
+    /// 1. `policy.cargo_home` (explicit override)
+    /// 2. `$APM2_HOME/private/fac/cargo_home` (managed default when
+    ///    `deny_ambient_cargo_home` is true)
+    /// 3. `None` (ambient `CARGO_HOME` allowed — only when
+    ///    `deny_ambient_cargo_home` is false)
+    #[must_use]
+    pub fn resolve_cargo_home(&self, apm2_home: &Path) -> Option<PathBuf> {
+        if let Some(ref explicit) = self.cargo_home {
+            return Some(PathBuf::from(explicit));
+        }
+        if self.deny_ambient_cargo_home {
+            return Some(apm2_home.join("private/fac/cargo_home"));
+        }
+        None
+    }
+}
+
+/// Build a filtered environment map for FAC job execution from policy rules.
+///
+/// Algorithm:
+/// 1. Start with an empty environment (default-deny).
+/// 2. From the ambient environment (`ambient_env`), inherit only variables that
+///    match at least one `env_allowlist_prefixes` entry.
+/// 3. Remove any variable matching `env_denylist_prefixes` (denylist wins).
+/// 4. Remove all variables listed in `env_clear` (unconditional strip).
+/// 5. Apply `env_set` overrides (force-set specific key=value pairs).
+/// 6. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
+///    the ambient environment, replace it with the managed path.
+/// 7. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
+///
+/// The result is a deterministic `BTreeMap<String, String>` of environment
+/// variables suitable for passing to `Command::envs()` after clearing the
+/// inherited environment.
+///
+/// # Arguments
+///
+/// * `policy`      – The validated `FacPolicyV1` to enforce.
+/// * `ambient_env` – The current process environment as key-value pairs.
+///   Typically from `std::env::vars()`.
+/// * `apm2_home`   – The `$APM2_HOME` directory (for managed `CARGO_HOME`).
+#[must_use]
+pub fn build_job_environment(
+    policy: &FacPolicyV1,
+    ambient_env: &[(String, String)],
+    apm2_home: &Path,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+
+    // Step 1-2: Inherit only allowlisted variables.
+    for (key, value) in ambient_env {
+        let allowed = policy
+            .env_allowlist_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix.as_str()));
+        if allowed {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Step 3: Remove denylisted variables (denylist takes priority).
+    env.retain(|key, _| {
+        !policy
+            .env_denylist_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix.as_str()))
+    });
+
+    // Step 4: Unconditionally clear specific variables.
+    for key in &policy.env_clear {
+        env.remove(key);
+    }
+
+    // Step 5: Force-set policy overrides.
+    for entry in &policy.env_set {
+        env.insert(entry.key.clone(), entry.value.clone());
+    }
+
+    // Step 6: Enforce managed CARGO_HOME when ambient is denied.
+    if let Some(cargo_home) = policy.resolve_cargo_home(apm2_home) {
+        env.insert(
+            "CARGO_HOME".to_string(),
+            cargo_home.to_string_lossy().to_string(),
+        );
+    }
+
+    // Step 7: Enforce CARGO_TARGET_DIR from policy.
+    if let Some(ref target_dir) = policy.cargo_target_dir {
+        env.insert("CARGO_TARGET_DIR".to_string(), target_dir.clone());
+    }
+
+    env
 }
 
 /// Computes the deterministic policy hash using domain-separated BLAKE3.
@@ -614,5 +710,215 @@ mod tests {
         let restored = deserialize_policy(&bytes).expect("deserialize persisted policy");
 
         assert_eq!(policy, restored);
+    }
+
+    // ── build_job_environment tests (TCK-00526) ──
+
+    #[test]
+    fn test_build_job_environment_clears_by_default() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient = vec![
+            ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
+            ("RANDOM_VAR".to_string(), "value".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        // SECRET_TOKEN and RANDOM_VAR don't match any allowlist prefix.
+        assert!(!env.contains_key("SECRET_TOKEN"));
+        assert!(!env.contains_key("RANDOM_VAR"));
+    }
+
+    #[test]
+    fn test_build_job_environment_allows_allowlisted_prefixes() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient = vec![
+            ("CARGO_HOME".to_string(), "/home/user/.cargo".to_string()),
+            ("RUSTFLAGS".to_string(), "-C opt-level=2".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("USER".to_string(), "testuser".to_string()),
+            ("LANG".to_string(), "en_US.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "en_US.UTF-8".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        // CARGO_HOME is overridden by the managed path (deny_ambient_cargo_home=true).
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/tmp/test-apm2-home/private/fac/cargo_home")
+        );
+        assert_eq!(
+            env.get("RUSTFLAGS").map(String::as_str),
+            Some("-C opt-level=2")
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
+        assert_eq!(env.get("USER").map(String::as_str), Some("testuser"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some("en_US.UTF-8"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm"));
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_denylist_overrides_allowlist() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        // AWS_SECRET_KEY starts with "AWS_" which is in the denylist.
+        // But it does NOT start with any allowlist prefix, so it would
+        // be filtered at step 1 anyway. Let's test a case where there
+        // is overlap: DOCKER_HOST is in the denylist (DOCKER_ prefix).
+        let ambient = vec![
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                "/path".to_string(),
+            ),
+            ("GITHUB_TOKEN".to_string(), "ghp_abc".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!env.contains_key("GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(!env.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn test_build_job_environment_env_clear_strips_unconditionally() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        // LD_PRELOAD is in env_clear. Even though it doesn't match the
+        // allowlist, env_clear is an additional guarantee.
+        let ambient = vec![
+            ("LD_PRELOAD".to_string(), "/bad/lib.so".to_string()),
+            ("LD_LIBRARY_PATH".to_string(), "/bad/libs".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert!(!env.contains_key("LD_PRELOAD"));
+        assert!(!env.contains_key("LD_LIBRARY_PATH"));
+    }
+
+    #[test]
+    fn test_build_job_environment_env_set_overrides() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        // Default policy has env_set with CARGO_TARGET_DIR=target.
+        let ambient: Vec<(String, String)> =
+            vec![("CARGO_TARGET_DIR".to_string(), "/custom/target".to_string())];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        // env_set forces CARGO_TARGET_DIR to "target".
+        assert_eq!(
+            env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("target")
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_managed_cargo_home_when_denied() {
+        let policy = FacPolicyV1::default_policy();
+        assert!(policy.deny_ambient_cargo_home);
+        assert!(policy.cargo_home.is_none());
+
+        let apm2_home = Path::new("/home/user/.apm2");
+        let ambient = vec![("CARGO_HOME".to_string(), "/home/user/.cargo".to_string())];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        // Ambient CARGO_HOME must be replaced with managed path.
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/cargo_home")
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_explicit_cargo_home_override() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.cargo_home = Some("/opt/fac/cargo".to_string());
+
+        let apm2_home = Path::new("/home/user/.apm2");
+        let ambient = vec![("CARGO_HOME".to_string(), "/home/user/.cargo".to_string())];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/opt/fac/cargo")
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_allows_ambient_cargo_home_when_not_denied() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        policy.cargo_home = None;
+
+        let apm2_home = Path::new("/home/user/.apm2");
+        let ambient = vec![("CARGO_HOME".to_string(), "/home/user/.cargo".to_string())];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        // Should inherit the ambient value since deny is off.
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/home/user/.cargo")
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_result_is_deterministic() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/apm2");
+        let ambient = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("CARGO_HOME".to_string(), "/home/user/.cargo".to_string()),
+        ];
+        let env1 = build_job_environment(&policy, &ambient, apm2_home);
+        let env2 = build_job_environment(&policy, &ambient, apm2_home);
+        assert_eq!(env1, env2);
+    }
+
+    #[test]
+    fn test_build_job_environment_empty_ambient() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/apm2");
+        let ambient: Vec<(String, String)> = Vec::new();
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        // Should still have env_set entries and managed CARGO_HOME.
+        assert_eq!(
+            env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("target")
+        );
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/tmp/apm2/private/fac/cargo_home")
+        );
+    }
+
+    #[test]
+    fn test_resolve_cargo_home_explicit_override() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.cargo_home = Some("/opt/cargo".to_string());
+        let result = policy.resolve_cargo_home(Path::new("/home/user/.apm2"));
+        assert_eq!(result, Some(PathBuf::from("/opt/cargo")));
+    }
+
+    #[test]
+    fn test_resolve_cargo_home_managed_default() {
+        let policy = FacPolicyV1::default_policy();
+        // deny_ambient_cargo_home=true, cargo_home=None
+        let result = policy.resolve_cargo_home(Path::new("/home/user/.apm2"));
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/home/user/.apm2/private/fac/cargo_home"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_cargo_home_ambient_allowed() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        policy.cargo_home = None;
+        let result = policy.resolve_cargo_home(Path::new("/home/user/.apm2"));
+        assert_eq!(result, None);
     }
 }
