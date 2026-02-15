@@ -61,6 +61,19 @@ const B3_256_PREFIX: &str = "b3-256:";
 const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control", "stop_revoke"];
 const VALID_SOURCE_KINDS: &[&str] = &["mirror_commit", "patch_injection"];
 
+/// Audited policy exception marker: `stop_revoke` jobs bypass RFC-0028 channel
+/// context token and RFC-0029 queue admission.
+///
+/// **Justification**: Control-lane cancellation originates from the local
+/// operator (same trust domain) and requires filesystem-level access proof
+/// (queue directory ownership).  A broker-issued token adds no authority
+/// beyond what filesystem capability already provides.  All structural and
+/// digest validation is still enforced; only the token requirement is waived.
+///
+/// See [`validate_job_spec_control_lane`] for the full policy exception
+/// documentation.
+pub const CONTROL_LANE_EXCEPTION_AUDITED: bool = true;
+
 /// Maps job kind to RFC-0029 budget admission keys.
 #[must_use]
 pub fn job_kind_to_budget_key(kind: &str) -> (RiskTier, BoundaryIntentClass) {
@@ -620,6 +633,35 @@ pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
 /// `stop_revoke` jobs are operator-initiated local commands; the worker MUST
 /// verify local-origin authority (queue directory ownership) instead of an
 /// RFC-0028 token.
+///
+/// # `AUDITED_CONTROL_LANE_EXCEPTION`: RFC-0028/0029 bypass justification
+///
+/// Control-lane cancellation (`stop_revoke`) uses local operator authority
+/// proof instead of the standard RFC-0028 channel context token and RFC-0029
+/// queue admission flow.  This is an **explicit, audited policy exception**
+/// justified by the following trust model:
+///
+/// 1. **Same trust domain**: Cancellation originates from the local operator
+///    (the same user who owns the queue root directory).  The operator already
+///    has filesystem-level privilege over the queue, so a broker-issued token
+///    would add no additional authority — it would prove what filesystem access
+///    already proves.
+///
+/// 2. **Capability-based proof**: The worker verifies authority by attempting a
+///    probe write to the queue root directory.  Only callers with write access
+///    to the directory succeed.  This is a stronger proof than a token for
+///    local operations because it demonstrates *current* filesystem capability,
+///    not a cached authorization.
+///
+/// 3. **Digest integrity preserved**: All structural and digest validation
+///    (schema, field bounds, BLAKE3 digest, `request_id` binding) is still
+///    enforced.  The only bypass is the token requirement.
+///
+/// 4. **Fail-closed on all deny paths**: Every deny path in the control-lane
+///    flow emits an explicit refusal receipt before moving the job to
+///    `denied/`.  No evidence is dropped.
+///
+/// See [`CONTROL_LANE_EXCEPTION_AUDITED`] for the compile-time marker.
 ///
 /// # Errors
 ///

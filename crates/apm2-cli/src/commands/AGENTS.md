@@ -181,3 +181,16 @@ pub enum EventSubcommand {
   `$APM2_HOME` critical subdirectories (`private`, `private/fac`, and related cache/evidence roots).
 - Command modules now use shared helpers in `fac_permissions` when creating FAC directories/files so
   sensitive artifacts are created with safe modes (`0700` for directories, `0600` for files).
+
+## Cancel / Stop-Revoke Invariants (Updated for TCK-00533)
+
+- **Bounded I/O** (`fac_job.rs`): `read_job_spec` uses `File::open().take(MAX_SIZE+1)` to prevent
+  denial-of-service via special files (procfs, FIFOs, `/dev/zero`). No metadata-only size checks.
+- **Receipt-before-move** (`fac_job.rs`): `cancel_pending_job` emits the cancellation receipt
+  BEFORE moving the job to `cancelled/`. A job is never in `cancelled/` without a terminal receipt.
+- **Fail-closed claimed cancel** (`fac_job.rs`): `cancel_claimed_job` returns a hard error if the
+  claimed job spec cannot be read. No success without a `CancellationRequested` receipt.
+- **Lane sanitization** (`fac_worker.rs`): `stop_target_unit_exact` rejects `queue_lane` values
+  containing characters outside `[A-Za-z0-9_-]` to prevent command injection via unit names.
+- **Control-lane refusal receipts** (`fac_worker.rs`): All deny paths in the control-lane
+  `stop_revoke` flow emit explicit refusal receipts before moving jobs to `denied/`.

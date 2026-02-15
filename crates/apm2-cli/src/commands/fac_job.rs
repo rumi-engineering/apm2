@@ -46,7 +46,8 @@
 //! - [INV-CANCEL-008] Claimed-job cancel emits `CancellationRequested` (non-
 //!   terminal); terminal `Cancelled` receipt is emitted only by the worker.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -296,16 +297,9 @@ fn cancel_pending_job(
         },
     };
 
-    // Atomically move to cancelled/ (INV-CANCEL-003).
-    let cancelled_path = match move_to_dir_safe(path, &queue_root.join(CANCELLED_DIR), &file_name) {
-        Ok(p) => p,
-        Err(e) => {
-            output_error(json_output, &format!("cannot move job to cancelled: {e}"));
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
-    // MAJOR 6: Emit cancellation receipt (INV-CANCEL-002). Failure is fatal.
+    // BLOCKER-2 fix: Emit the cancellation receipt BEFORE the state transition.
+    // This ensures a job is NEVER in cancelled/ without a terminal receipt.
+    // If receipt emission fails, the job remains in pending/ (safe state).
     let receipt_path = match emit_cancellation_receipt(fac_root, &spec, "pending", reason) {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(e) => {
@@ -313,6 +307,16 @@ fn cancel_pending_job(
                 json_output,
                 &format!("FATAL: cancellation receipt emission failed: {e}"),
             );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // Atomically move to cancelled/ (INV-CANCEL-003).
+    // Receipt is already persisted, so the cancelled/ invariant holds.
+    let cancelled_path = match move_to_dir_safe(path, &queue_root.join(CANCELLED_DIR), &file_name) {
+        Ok(p) => p,
+        Err(e) => {
+            output_error(json_output, &format!("cannot move job to cancelled: {e}"));
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -400,28 +404,28 @@ fn cancel_claimed_job(
         return exit_codes::GENERIC_ERROR;
     }
 
-    // MAJOR 1: Emit a CancellationRequested (non-terminal) receipt.
+    // MAJOR 1+2 fix: Emit a CancellationRequested (non-terminal) receipt.
     // The final Cancelled receipt will be emitted by the worker when
     // stop_revoke completes.
-    let Ok(spec_for_receipt) = read_job_spec(claimed_path) else {
-        // Fall back to a minimal receipt without full spec data.
-        eprintln!("WARNING: cannot read claimed job spec for receipt");
-        let output = CancelOutput {
-            job_id: job_id.to_string(),
-            previous_state: "claimed".to_string(),
-            action: "stop_revoke enqueued".to_string(),
-            receipt_path: None,
-            stop_revoke_spec_path: Some(spec_path.to_string_lossy().to_string()),
-        };
-        if json_output {
-            print_json(&output);
-        } else {
-            eprintln!(
-                "cancel: stop_revoke enqueued for claimed job {job_id} ({})",
-                spec_path.display()
+    //
+    // MAJOR-2 fix: If read_job_spec fails, treat as a HARD failure.
+    // A cancellation MUST NOT complete without a cancellation-requested receipt.
+    // The stop_revoke spec is already enqueued, but we return an error exit
+    // code to signal that the receipt could not be emitted.
+    let spec_for_receipt = match read_job_spec(claimed_path) {
+        Ok(spec) => spec,
+        Err(e) => {
+            output_error(
+                json_output,
+                &format!(
+                    "FATAL: cannot read claimed job spec for receipt emission: {e}; \
+                     stop_revoke was enqueued at {} but cancellation-requested receipt \
+                     could not be emitted (fail-closed)",
+                    spec_path.display()
+                ),
             );
-        }
-        return exit_codes::SUCCESS;
+            return exit_codes::GENERIC_ERROR;
+        },
     };
 
     // MAJOR 1+6: Emit CancellationRequested receipt. Failure is fatal.
@@ -701,17 +705,22 @@ fn resolve_fac_root() -> Result<PathBuf, String> {
 }
 
 /// Reads and deserializes a job spec from a file with bounded I/O.
+///
+/// BLOCKER-1 fix: Uses `File::open().take(MAX_JOB_SPEC_SIZE + 1)` to enforce
+/// the size limit on the actual read operation.  This prevents
+/// denial-of-service via special files (e.g. `/dev/zero`, procfs, FIFOs) where
+/// `metadata.len()` may report zero or misleading sizes while producing
+/// unbounded data on read.
 fn read_job_spec(path: &Path) -> Result<FacJobSpecV1, String> {
-    let metadata =
-        fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-    if metadata.len() > MAX_JOB_SPEC_SIZE as u64 {
-        return Err(format!(
-            "file size {} exceeds max {}",
-            metadata.len(),
-            MAX_JOB_SPEC_SIZE
-        ));
-    }
-    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    // Read at most MAX_JOB_SPEC_SIZE + 1 bytes.  If we get more than
+    // MAX_JOB_SPEC_SIZE, the file is over the limit.
+    let limit = (MAX_JOB_SPEC_SIZE as u64).saturating_add(1);
+    let mut bounded_reader = file.take(limit);
+    let mut bytes = Vec::with_capacity(MAX_JOB_SPEC_SIZE.min(8192));
+    bounded_reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     if bytes.len() > MAX_JOB_SPEC_SIZE {
         return Err(format!(
             "file content {} exceeds max {}",
@@ -1044,5 +1053,71 @@ mod tests {
             result.is_ok(),
             "should succeed on owned directory: {result:?}"
         );
+    }
+
+    /// BLOCKER-1 regression: `read_job_spec` must reject files exceeding
+    /// `MAX_JOB_SPEC_SIZE` via bounded read, not metadata check.
+    #[test]
+    fn test_read_job_spec_rejects_oversized_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let oversized_path = tmp.path().join("oversized.json");
+        // Write a file that exceeds MAX_JOB_SPEC_SIZE.
+        let oversized_content = vec![b'{'; MAX_JOB_SPEC_SIZE + 100];
+        fs::write(&oversized_path, &oversized_content).unwrap();
+
+        let result = read_job_spec(&oversized_path);
+        assert!(result.is_err(), "should reject oversized file");
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("exceeds max"),
+            "error should mention size limit: {err_msg}"
+        );
+    }
+
+    /// BLOCKER-1 regression: `read_job_spec` must work for valid small files.
+    #[test]
+    fn test_read_job_spec_accepts_valid_spec() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spec = build_stop_revoke_spec("bounded-read-test", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
+        let spec_path = tmp.path().join("valid.json");
+        fs::write(&spec_path, &spec_json).unwrap();
+
+        let result = read_job_spec(&spec_path);
+        assert!(result.is_ok(), "should accept valid spec: {result:?}");
+        assert_eq!(result.unwrap().job_id, spec.job_id);
+    }
+
+    /// MAJOR-2 regression: `cancel_claimed_job` must fail if the claimed job
+    /// spec cannot be read (receipt cannot be emitted).
+    #[test]
+    fn test_cancel_claimed_fails_on_unreadable_spec() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        let fac_root = tmp.path().join("fac");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).unwrap();
+
+        // Create a claimed job spec that contains invalid JSON.
+        let bad_path = queue_root.join(CLAIMED_DIR).join("bad-job.json");
+        fs::write(&bad_path, b"not valid json").unwrap();
+
+        let exit_code = cancel_claimed_job(
+            &bad_path,
+            "bad-job",
+            "test cancellation",
+            &queue_root,
+            &fac_root,
+            false,
+        );
+        // MAJOR-2: must return error (not success) when spec cannot be read.
+        assert_ne!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "should fail when claimed job spec cannot be read"
+        );
+        assert_eq!(exit_code, exit_codes::GENERIC_ERROR);
     }
 }
