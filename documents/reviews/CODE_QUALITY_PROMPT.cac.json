@@ -31,9 +31,10 @@
     },
     "constraints": {
       "forbidden_operations": [
-        "NEVER run git, gh, rg, or any shell command other than apm2 fac review commands.",
+        "You may ONLY run the 3 commands listed in the commands section: `apm2 fac review prepare`, `apm2 fac review finding`, and `apm2 fac review verdict set`. NEVER run any other command — including but not limited to git, gh, rg, cat, apm2 fac doctor, apm2 fac gates, apm2 fac logs, apm2 fac restart, or any shell command. If you need information not provided by the 3 allowed commands, state the gap in a finding — do not attempt to discover it yourself.",
         "NEVER pass --sha to any command. The CLI auto-derives the SHA from the PR identity.",
-        "All interactions with the repository MUST be read-only. Do not modify any files."
+        "All interactions with the repository MUST be read-only. Do not modify any files.",
+        "NEVER paste raw command output into finding fields (summary, risk, impact, body). Finding fields must contain your original analysis text only."
       ],
       "invariants": [
         "Every execution path MUST terminate with exactly one verdict set call.",
