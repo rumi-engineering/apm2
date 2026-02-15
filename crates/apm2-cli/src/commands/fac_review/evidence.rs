@@ -12,8 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, build_job_environment,
-    compute_test_env, persist_policy,
+    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, build_job_environment, compute_test_env,
 };
 use blake3;
 use sha2::{Digest, Sha256};
@@ -36,6 +35,34 @@ use super::timeout_policy::{
     max_memory_bytes, parse_memory_limit, resolve_bounded_test_timeout,
 };
 use super::types::now_iso8601;
+
+/// Env var keys unconditionally stripped from ALL gate phases as
+/// defense-in-depth against wrapper injection (TCK-00526, TCK-00548). These are
+/// stripped by `build_job_environment` at the policy level AND by
+/// `env_remove()` on the spawned `Command` for belt-and-suspenders containment.
+const WRAPPER_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
+
+/// Prefix for env vars unconditionally stripped from ALL gate phases.
+const WRAPPER_STRIP_PREFIXES: &[&str] = &["SCCACHE_"];
+
+/// Compute the full set of wrapper-stripping `env_remove_keys` by combining the
+/// static `WRAPPER_STRIP_KEYS` with any ambient `SCCACHE_*` variables.
+fn compute_gate_env_remove_keys() -> Vec<String> {
+    let mut keys: Vec<String> = WRAPPER_STRIP_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    for (key, _) in std::env::vars() {
+        if WRAPPER_STRIP_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    keys
+}
 
 /// Progress event emitted by evidence gate execution at each gate boundary.
 ///
@@ -872,57 +899,16 @@ fn build_gate_policy_env() -> Result<Vec<(String, String)>, String> {
     Ok(policy_env.into_iter().collect())
 }
 
-/// Load or create FAC policy for the pipeline evidence path.
+/// Load or create FAC policy. Delegates to the shared `policy_loader` module
+/// for bounded I/O and deduplication (TCK-00526).
 fn load_or_create_pipeline_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
-    let policy_path = fac_root.join("policy/fac_policy.v1.json");
-    if policy_path.exists() {
-        let bytes = fs::read(&policy_path)
-            .map_err(|e| format!("cannot read FAC policy at {}: {e}", policy_path.display()))?;
-        if bytes.len() > apm2_core::fac::policy::MAX_POLICY_SIZE {
-            return Err(format!(
-                "FAC policy file exceeds max size: {} > {}",
-                bytes.len(),
-                apm2_core::fac::policy::MAX_POLICY_SIZE,
-            ));
-        }
-        apm2_core::fac::deserialize_policy(&bytes).map_err(|e| format!("invalid FAC policy: {e}"))
-    } else {
-        let default_policy = FacPolicyV1::default_policy();
-        persist_policy(fac_root, &default_policy)
-            .map_err(|e| format!("cannot persist default FAC policy: {e}"))?;
-        Ok(default_policy)
-    }
+    super::policy_loader::load_or_create_fac_policy(fac_root)
 }
 
-/// Ensure managed `CARGO_HOME` directory for pipeline evidence path.
+/// Ensure managed `CARGO_HOME` directory exists. Delegates to the shared
+/// `policy_loader` module (TCK-00526).
 fn ensure_pipeline_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
-    if cargo_home.exists() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(cargo_home)
-            .map_err(|e| {
-                format!(
-                    "cannot create managed CARGO_HOME at {}: {e}",
-                    cargo_home.display()
-                )
-            })?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(cargo_home).map_err(|e| {
-            format!(
-                "cannot create managed CARGO_HOME at {}: {e}",
-                cargo_home.display()
-            )
-        })?;
-    }
-    Ok(())
+    super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
 
 fn allocate_lane_job_logs_dir() -> Result<(PathBuf, LaneLockGuard), String> {
@@ -1109,6 +1095,17 @@ pub fn run_evidence_gates(
     // script gates, preventing ambient secret leakage.
     let gate_env = build_gate_policy_env()?;
 
+    // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
+    // build_job_environment already strips these at the policy level, but
+    // env_remove on the spawned Command provides defense-in-depth against
+    // parent process env inheritance.
+    let gate_wrapper_strip = compute_gate_env_remove_keys();
+    let gate_wrapper_strip_ref: Option<&[String]> = if gate_wrapper_strip.is_empty() {
+        None
+    } else {
+        Some(&gate_wrapper_strip)
+    };
+
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
         (
@@ -1170,7 +1167,8 @@ pub fn run_evidence_gates(
         }
     }
 
-    // Phase 1: cargo fmt/clippy/doc — all receive the policy-filtered env.
+    // Phase 1: cargo fmt/clippy/doc — all receive the policy-filtered env
+    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
     for &(gate_name, cmd_args) in gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
@@ -1183,7 +1181,7 @@ pub fn run_evidence_gates(
             &cmd_args[1..],
             &log_path,
             Some(&gate_env),
-            None,
+            gate_wrapper_strip_ref,
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
@@ -1207,7 +1205,8 @@ pub fn run_evidence_gates(
         ));
     }
 
-    // Phase 2: pre-test script gates — all receive the policy-filtered env.
+    // Phase 2: pre-test script gates — all receive the policy-filtered env
+    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
     for &(gate_name, script_path) in pre_test_script_gates {
         let full_path = workspace_root.join(script_path);
         if !full_path.exists() {
@@ -1224,7 +1223,7 @@ pub fn run_evidence_gates(
             &[full_path.to_str().unwrap_or("")],
             &log_path,
             Some(&gate_env),
-            None,
+            gate_wrapper_strip_ref,
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
@@ -1290,7 +1289,10 @@ pub fn run_evidence_gates(
         // back to the policy-filtered gate env.
         let caller_test_env = resolve_evidence_test_command_environment(opts);
         let test_env: Option<&[(String, String)]> = caller_test_env.or(Some(&gate_env));
-        let env_remove = resolve_evidence_env_remove_keys(opts);
+        // TCK-00526: Use caller-provided env_remove_keys if available
+        // (bounded test runner computes these), otherwise fall back to the
+        // gate-level wrapper strip keys for defense-in-depth.
+        let env_remove = resolve_evidence_env_remove_keys(opts).or(gate_wrapper_strip_ref);
         let (test_cmd, test_args) = test_command
             .split_first()
             .ok_or_else(|| "test command is empty".to_string())?;
@@ -1351,7 +1353,8 @@ pub fn run_evidence_gates(
     }
     evidence_lines.push(wi_line);
 
-    // Phase 4: post-test script gates — all receive the policy-filtered env.
+    // Phase 4: post-test script gates — all receive the policy-filtered env
+    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
     for &(gate_name, script_path) in post_test_script_gates {
         let full_path = workspace_root.join(script_path);
         if !full_path.exists() {
@@ -1368,7 +1371,7 @@ pub fn run_evidence_gates(
             &[full_path.to_str().unwrap_or("")],
             &log_path,
             Some(&gate_env),
-            None,
+            gate_wrapper_strip_ref,
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
@@ -1421,6 +1424,14 @@ pub fn run_evidence_gates_with_status(
 
     // TCK-00526: Build policy-filtered environment for ALL gates.
     let gate_env = build_gate_policy_env()?;
+
+    // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
+    let gate_wrapper_strip = compute_gate_env_remove_keys();
+    let gate_wrapper_strip_ref: Option<&[String]> = if gate_wrapper_strip.is_empty() {
+        None
+    } else {
+        Some(&gate_wrapper_strip)
+    };
 
     let mut status = CiStatus::new(sha, pr_number);
     let updater = ThrottledUpdater::new(owner_repo, pr_number);
@@ -1635,7 +1646,7 @@ pub fn run_evidence_gates_with_status(
             &cmd_args[1..],
             &log_path,
             Some(&gate_env),
-            None,
+            gate_wrapper_strip_ref,
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
@@ -1791,7 +1802,7 @@ pub fn run_evidence_gates_with_status(
             &[full_path.to_str().unwrap_or("")],
             &log_path,
             Some(&gate_env),
-            None,
+            gate_wrapper_strip_ref,
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
@@ -2228,7 +2239,7 @@ pub fn run_evidence_gates_with_status(
             &[full_path.to_str().unwrap_or("")],
             &log_path,
             Some(&gate_env),
-            None,
+            gate_wrapper_strip_ref,
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();

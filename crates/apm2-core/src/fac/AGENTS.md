@@ -667,10 +667,19 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   2. Inherit only variables matching `env_allowlist_prefixes`.
   3. Remove variables matching `env_denylist_prefixes` (denylist wins).
   4. Strip variables listed in `env_clear` (unconditional).
-  5. Apply `env_set` overrides (force-set key=value pairs).
-  6. Enforce managed `CARGO_HOME` when `deny_ambient_cargo_home` is true.
-  7. Enforce `CARGO_TARGET_DIR` from policy.
+  5. Hardcoded containment safety: unconditionally strip `RUSTC_WRAPPER` and
+     all `SCCACHE_*` variables regardless of policy configuration (defense-in-depth,
+     non-configurable).
+  6. Apply `env_set` overrides (force-set key=value pairs).
+  7. Enforce managed `CARGO_HOME` when `deny_ambient_cargo_home` is true.
+  8. Enforce `CARGO_TARGET_DIR` from policy.
   Output is a deterministic `BTreeMap` (sorted keys).
+
+  The default policy `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `RUSTUP_`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_TEST_THREADS`)
+  instead of a broad `RUST` prefix to prevent `RUSTC_WRAPPER` admission. The
+  default `env_denylist_prefixes` include `RUSTC_WRAPPER` and `SCCACHE_` as
+  additional defense-in-depth.
 
 - `FacPolicyV1::resolve_cargo_home(apm2_home) -> Option<PathBuf>`:
   Priority: explicit `cargo_home` > managed path (`$APM2_HOME/private/fac/cargo_home`
@@ -678,11 +687,18 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
 
 ### Enforcement Sites
 
+- **Shared policy loader** (`fac_review/policy_loader.rs`): Shared module for
+  bounded I/O policy loading (`O_NOFOLLOW` + `Read::take` at `MAX_POLICY_SIZE + 1`)
+  and managed `CARGO_HOME` creation. Both gates and evidence modules delegate here.
 - **Gates** (`fac_review/gates.rs`): `compute_nextest_test_environment()` loads
-  policy, calls `build_job_environment()`, then overlays lane-derived env vars.
-  `ensure_managed_cargo_home()` creates the managed directory with 0o700 permissions.
+  policy via `policy_loader::load_or_create_fac_policy()`, calls
+  `build_job_environment()`, then overlays lane-derived env vars.
+  `ensure_managed_cargo_home()` delegates to `policy_loader`.
 - **Pipeline/Evidence** (`fac_review/evidence.rs`): `build_pipeline_test_command()`
-  loads policy and builds policy-filtered env for bounded test execution.
+  loads policy via `policy_loader::load_or_create_fac_policy()` and builds
+  policy-filtered env for bounded test execution. All gate phases (fmt, clippy,
+  doc, script gates) strip `RUSTC_WRAPPER` and `SCCACHE_*` via `env_remove_keys`
+  on `Command` (defense-in-depth alongside policy-level stripping).
 - **Bounded test runner** (`fac_review/bounded_test_runner.rs`):
   `SYSTEMD_SETENV_ALLOWLIST_EXACT` includes `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
   `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient
@@ -703,6 +719,13 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
 - [INV-ENV-006] Managed `CARGO_HOME` directory is created with 0o700 permissions
   (CTR-2611) on Unix.
 - [INV-ENV-007] Output environment is deterministic (`BTreeMap` sorted by key).
+- [INV-ENV-008] `RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped by
+  `build_job_environment()` regardless of policy configuration (hardcoded
+  defense-in-depth). This prevents compiler injection even if a custom policy
+  inadvertently re-admits these variables via allowlist prefixes.
+- [INV-ENV-009] Default `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `RUSTUP_`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_TEST_THREADS`)
+  to prevent broad `RUST` prefix from admitting `RUSTC_WRAPPER`.
 
 ## Receipt Versioning (TCK-00518)
 
