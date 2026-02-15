@@ -35476,9 +35476,7 @@ mod tests {
 
         #[test]
         fn estimate_includes_permeability_receipt() {
-            use apm2_core::policy::permeability::{
-                AuthorityVector, PermeabilityReceiptBuilder,
-            };
+            use apm2_core::policy::permeability::{AuthorityVector, PermeabilityReceiptBuilder};
 
             let mut claim = minimal_claim();
             let base_estimate = claim.estimate_serialized_bytes();
