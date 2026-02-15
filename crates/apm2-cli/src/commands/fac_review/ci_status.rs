@@ -366,7 +366,8 @@ mod tests {
         s.set_result("clippy", false, 30);
 
         let body = s.to_comment_body();
-        let yaml_payload = fenced_yaml::extract_fenced_yaml(&body).expect("yaml block payload");
+        let yaml_payload =
+            fenced_yaml::parse::extract_fenced_yaml(&body).expect("yaml block payload");
         let yaml_str = yaml_payload
             .strip_prefix("# apm2-ci-status:v1\n")
             .unwrap_or(yaml_payload);

@@ -27,7 +27,6 @@ pub fn emit_jsonl<T: Serialize>(event: &T) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn emit_json_error(code: &str, message: &str) -> Result<(), String> {
     emit_jsonl(&serde_json::json!({
         "error": code,

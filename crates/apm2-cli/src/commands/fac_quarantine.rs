@@ -116,56 +116,26 @@ fn run_quarantine_list(_args: &QuarantineListArgs, json_output: bool) -> u8 {
     let total_bytes: u64 = entries.iter().map(|entry| entry.size_bytes).sum();
     let oldest_entry_age_secs = entries.first().map(|entry| entry.age_secs);
 
-    if json_output {
-        let payload = serde_json::json!({
-            "entries": entries,
-            "summary": {
-                "total_entries": total_entries,
-                "total_bytes": total_bytes,
-                "oldest_entry_age_secs": oldest_entry_age_secs,
-            },
-        });
-        return match serde_json::to_string_pretty(&payload) {
-            Ok(json) => {
-                println!("{json}");
-                exit_codes::SUCCESS
-            },
-            Err(error) => output_error(
-                json_output,
-                "fac_quarantine_list_serialize_failed",
-                &format!("cannot serialize list output: {error}"),
-                exit_codes::GENERIC_ERROR,
-            ),
-        };
+    let payload = serde_json::json!({
+        "entries": entries,
+        "summary": {
+            "total_entries": total_entries,
+            "total_bytes": total_bytes,
+            "oldest_entry_age_secs": oldest_entry_age_secs,
+        },
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(json) => {
+            println!("{json}");
+            exit_codes::SUCCESS
+        },
+        Err(error) => output_error(
+            json_output,
+            "fac_quarantine_list_serialize_failed",
+            &format!("cannot serialize list output: {error}"),
+            exit_codes::GENERIC_ERROR,
+        ),
     }
-
-    if entries.is_empty() {
-        println!("No quarantine or denied entries found.");
-        println!("Summary: 0 entries, 0 bytes, oldest age 0s");
-        return exit_codes::SUCCESS;
-    }
-
-    println!(
-        "{:<10} {:<12} {:>12} {:>12}  path",
-        "directory", "filename", "size", "age",
-    );
-    for entry in &entries {
-        println!(
-            "{:<10} {:<12} {:>12} {:>12}  {}",
-            entry.directory,
-            entry.filename,
-            format_bytes(entry.size_bytes),
-            format_age(entry.age_secs),
-            entry.path,
-        );
-    }
-
-    if let Some(oldest) = oldest_entry_age_secs {
-        println!("Summary: {total_entries} entries, {total_bytes} bytes, oldest age {oldest}s");
-    } else {
-        println!("Summary: {total_entries} entries, {total_bytes} bytes, oldest age n/a");
-    }
-    exit_codes::SUCCESS
 }
 
 fn run_quarantine_prune(args: &QuarantinePruneArgs, json_output: bool) -> u8 {
@@ -223,22 +193,18 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs, json_output: bool) -> u8 {
     };
 
     if plan.targets.is_empty() {
-        if json_output {
-            let payload = serde_json::json!({
-                "apply": apply,
-                "summary": {
-                    "total_targets": 0,
-                    "total_bytes": 0_u64,
-                },
-                "targets": [],
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-            );
-        } else {
-            println!("No entries would be deleted.");
-        }
+        let payload = serde_json::json!({
+            "apply": apply,
+            "summary": {
+                "total_targets": 0,
+                "total_bytes": 0_u64,
+            },
+            "targets": [],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
         return exit_codes::SUCCESS;
     }
 
@@ -250,43 +216,30 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs, json_output: bool) -> u8 {
         .sum();
 
     if !apply {
-        if json_output {
-            let targets = plan
-                .targets
-                .iter()
-                .map(|target| {
-                    let target_path = target.path.display().to_string();
-                    serde_json::json!({
-                        "kind": queue_prune_kind_label_for_target(target.kind, &target_path),
-                        "estimated_bytes": target.estimated_bytes,
-                        "path": sanitize_for_terminal(&target_path),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let payload = serde_json::json!({
-                "apply": false,
-                "summary": {
-                    "total_targets": total_targets,
-                    "total_bytes": total_bytes,
-                },
-                "targets": targets,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-            );
-        } else {
-            println!("Would delete {total_targets} entries ({total_bytes} bytes)");
-            for target in &plan.targets {
+        let targets = plan
+            .targets
+            .iter()
+            .map(|target| {
                 let target_path = target.path.display().to_string();
-                println!(
-                    "{} {} {}",
-                    queue_prune_kind_label_for_target(target.kind, &target_path),
-                    target.estimated_bytes,
-                    sanitize_for_terminal(&target_path),
-                );
-            }
-        }
+                serde_json::json!({
+                    "kind": queue_prune_kind_label_for_target(target.kind, &target_path),
+                    "estimated_bytes": target.estimated_bytes,
+                    "path": sanitize_for_terminal(&target_path),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "apply": false,
+            "summary": {
+                "total_targets": total_targets,
+                "total_bytes": total_bytes,
+            },
+            "targets": targets,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
         return exit_codes::SUCCESS;
     }
 
@@ -345,25 +298,20 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs, json_output: bool) -> u8 {
         },
     };
 
-    if json_output {
-        let payload = serde_json::json!({
-            "apply": true,
-            "summary": {
-                "total_targets": total_targets,
-                "total_bytes": total_bytes,
-                "before_free_bytes": before_free,
-                "after_free_bytes": after_free,
-            },
-            "receipt": receipt_path.to_string_lossy(),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Pruned {total_targets} entries ({total_bytes} bytes)");
-        println!("receipt: {}", receipt_path.display());
-    }
+    let payload = serde_json::json!({
+        "apply": true,
+        "summary": {
+            "total_targets": total_targets,
+            "total_bytes": total_bytes,
+            "before_free_bytes": before_free,
+            "after_free_bytes": after_free,
+        },
+        "receipt": receipt_path.to_string_lossy(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
     exit_codes::SUCCESS
 }
 
@@ -429,31 +377,6 @@ fn scan_queue_dir(
     out
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_age(secs: u64) -> String {
-    if secs >= 86_400 {
-        format!("{}d", secs / 86_400)
-    } else if secs >= 3600 {
-        format!("{}h", secs / 3600)
-    } else if secs >= 60 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
 fn sanitize_for_terminal(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -500,28 +423,16 @@ fn infer_queue_root(fac_root: &Path) -> PathBuf {
     )
 }
 
-fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
-    if json_output {
-        let payload = serde_json::json!({
-            "error": code,
-            "message": message,
-        });
-        if let Ok(json) = serde_json::to_string_pretty(&payload) {
-            println!("{json}");
-        } else {
-            println!("{{\"error\":\"{code}\",\"message\":\"{message}\"}}");
-        }
-        return exit_code;
+fn output_error(_json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
+    let payload = serde_json::json!({
+        "error": code,
+        "message": message,
+    });
+    if let Ok(json) = serde_json::to_string_pretty(&payload) {
+        println!("{json}");
+    } else {
+        println!("{{\"error\":\"{code}\",\"message\":\"{message}\"}}");
     }
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "error": code,
-            "message": message,
-        }))
-        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-    );
     exit_code
 }
 
