@@ -1545,10 +1545,11 @@ fn read_bounded_line<R: BufRead>(
     let line_limit_plus_one = max_line_bytes.saturating_add(1);
     let line_limit = u64::try_from(line_limit_plus_one).unwrap_or(u64::MAX);
 
-    let mut limited_reader = reader.by_ref().take(line_limit);
-    let bytes_read = limited_reader.read_until(b'\n', &mut line)?;
-    let limit_reached = limited_reader.limit() == 0;
-    drop(limited_reader);
+    let (bytes_read, limit_reached) = {
+        let mut limited_reader = reader.by_ref().take(line_limit);
+        let bytes_read = limited_reader.read_until(b'\n', &mut line)?;
+        (bytes_read, limited_reader.limit() == 0)
+    };
 
     if bytes_read == 0 {
         return Ok((BoundedLineRead::Eof, 0));
@@ -1825,10 +1826,12 @@ fn count_log_lines_bounded(path: &Path) -> Option<u64> {
         byte_count = byte_count.saturating_add(bytes_read as u64);
         last_byte = chunk.get(bytes_read.saturating_sub(1)).copied();
 
-        let newline_count = chunk[..bytes_read]
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count() as u64;
+        let mut newline_count = 0_u64;
+        for byte in &chunk[..bytes_read] {
+            if *byte == b'\n' {
+                newline_count = newline_count.saturating_add(1);
+            }
+        }
         line_count = line_count.saturating_add(newline_count);
     }
 
@@ -6037,8 +6040,9 @@ mod tests {
     fn test_count_log_lines_bounded_handles_single_oversized_line_without_oom() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let path = temp.path().join("oversized.log");
-        let oversized =
-            "z".repeat((super::DOCTOR_LOG_SCAN_MAX_BYTES as usize).saturating_add(4096));
+        let max_scan_bytes =
+            usize::try_from(super::DOCTOR_LOG_SCAN_MAX_BYTES).expect("scan byte cap fits usize");
+        let oversized = "z".repeat(max_scan_bytes.saturating_add(4096));
         std::fs::write(&path, oversized).expect("write oversized log");
 
         let line_count =
