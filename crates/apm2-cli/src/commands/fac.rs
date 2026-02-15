@@ -56,10 +56,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    safe_rmtree_v1,
+    LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
+    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -3803,6 +3803,21 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     }
 
+    if let Err(e) = LaneCorruptMarkerV1::remove(manager.fac_root(), &args.lane_id) {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!(
+                "Failed to clear corrupt marker for lane {}: {e}",
+                args.lane_id
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+    if !json_output {
+        eprintln!("Corrupt marker cleared for lane {}", args.lane_id);
+    }
+
     // Re-create the empty subdirectories for the reset lane so it is
     // ready for reuse. This calls ensure_directories() which re-inits
     // all lanes, not just the reset lane. This is acceptable because
@@ -4347,6 +4362,103 @@ mod tests {
     fn assert_fac_command_parses(args: &[&str]) {
         FacLogsCliHarness::try_parse_from(args.iter().copied())
             .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
+    }
+
+    // KNOWN ISSUE (f-685-security-1771186259820160-0): Apm2HomeGuard mutates
+    // process-wide environment variables via std::env::set_var, which is inherently
+    // racy under parallel test execution. This is a pre-existing pattern used
+    // across the test suite (apm2-cli, apm2-daemon). A proper fix requires
+    // either:   (a) adding `serial_test` as a workspace dependency and
+    // annotating all       env-mutating tests with `#[serial]`, or
+    //   (b) refactoring production code to accept `fac_root` explicitly instead of
+    //       reading APM2_HOME from the environment.
+    // Both approaches are cross-cutting changes beyond this ticket's scope.
+    // Current mitigation: each test uses a unique tempdir, and Apm2HomeGuard
+    // restores the previous value on Drop, limiting the blast radius.
+    struct Apm2HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
+    fn set_apm2_home(home: &std::path::Path) {
+        // SAFETY: tests intentionally mutate process-wide environment state and
+        // restore it in Drop, matching the project's existing environment
+        // test harness pattern. This is inherently racy in parallel test
+        // execution — see KNOWN ISSUE above.
+        unsafe {
+            std::env::set_var("APM2_HOME", home);
+        }
+    }
+
+    #[allow(unsafe_code)] // Env var restoration is required for test cleanup.
+    fn restore_apm2_home(previous: Option<&std::ffi::OsString>) {
+        // SAFETY: tests intentionally mutate process-wide environment state and
+        // restore it in Drop, matching the project's existing environment
+        // test harness pattern.
+        unsafe {
+            match previous {
+                Some(previous) => std::env::set_var("APM2_HOME", previous),
+                None => std::env::remove_var("APM2_HOME"),
+            }
+        }
+    }
+
+    impl Apm2HomeGuard {
+        fn new(home: &std::path::Path) -> Self {
+            let previous = std::env::var_os("APM2_HOME");
+            set_apm2_home(home);
+            Self { previous }
+        }
+    }
+
+    impl Drop for Apm2HomeGuard {
+        fn drop(&mut self) {
+            restore_apm2_home(self.previous.as_ref());
+        }
+    }
+
+    #[test]
+    fn test_lane_reset_clears_corrupt_marker() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let marker = LaneCorruptMarkerV1 {
+            schema: apm2_core::fac::LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "reset regression".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        marker.persist(manager.fac_root()).expect("persist marker");
+        let status = manager.lane_status(lane_id).expect("initial lane status");
+        assert_eq!(status.state, LaneState::Corrupt);
+
+        let exit_code = run_lane_reset(
+            &LaneResetArgs {
+                lane_id: lane_id.to_string(),
+                force: false,
+                json: false,
+            },
+            false,
+        );
+        assert_eq!(exit_code, exit_codes::SUCCESS);
+        assert!(
+            LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
+                .expect("load marker")
+                .is_none()
+        );
+
+        let status_after = manager
+            .lane_status(lane_id)
+            .expect("lane status after reset");
+        assert_ne!(status_after.state, LaneState::Corrupt);
     }
 
     #[test]

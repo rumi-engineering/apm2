@@ -365,11 +365,13 @@ pub use quarantine::{
 };
 // Re-export receipt types
 pub use receipt::{
-    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
-    FacJobReceiptError, FacJobReceiptV1, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
-    GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
-    SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
-    compute_job_receipt_content_hash, compute_job_receipt_content_hash_v2, deserialize_job_receipt,
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
+    FacJobOutcome, FacJobReceiptError, FacJobReceiptV1, FacJobReceiptV1Builder, GateReceipt,
+    GateReceiptBuilder, GateReceiptProto, LANE_CLEANUP_RECEIPT_SCHEMA, LaneCleanupReceiptError,
+    LaneCleanupReceiptV1, MAX_JOB_RECEIPT_SIZE, MAX_LANE_CLEANUP_RECEIPT_SIZE, QueueAdmissionTrace,
+    ReceiptError, SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS,
+    SUPPORTED_RECEIPT_VERSIONS, compute_job_receipt_content_hash,
+    compute_job_receipt_content_hash_v2, deserialize_job_receipt,
     persist_content_addressed_receipt, persist_content_addressed_receipt_v2,
 };
 // Re-export receipt index types (TCK-00560)
@@ -600,8 +602,9 @@ pub use execution_backend::{
 };
 // Re-export lane types (TCK-00515)
 pub use lane::{
-    DEFAULT_LANE_COUNT, LANE_COUNT_ENV_VAR, LANE_ID_PREFIX, LANE_LEASE_V1_SCHEMA,
-    LANE_LOCK_TIMEOUT, LANE_PROFILE_V1_SCHEMA, LaneError, LaneLeaseV1, LaneLockGuard, LaneManager,
+    DEFAULT_LANE_COUNT, LANE_CORRUPT_MARKER_SCHEMA, LANE_COUNT_ENV_VAR, LANE_ID_PREFIX,
+    LANE_LEASE_V1_SCHEMA, LANE_LOCK_TIMEOUT, LANE_PROFILE_V1_SCHEMA, LaneCleanupError,
+    LaneCleanupOutcome, LaneCorruptMarkerV1, LaneError, LaneLeaseV1, LaneLockGuard, LaneManager,
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
     MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE,
     MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, MAX_TEST_TIMEOUT_SECONDS, ResourceProfile,
