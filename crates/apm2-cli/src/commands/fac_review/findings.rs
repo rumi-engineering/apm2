@@ -215,6 +215,10 @@ struct FindingRecord {
     location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviewer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
     created_at: String,
     evidence_selector: String,
     evidence_digest: String,
@@ -387,6 +391,8 @@ fn to_finding_record(
         impact: finding.impact.clone(),
         location: finding.location.clone(),
         reviewer_id: finding.reviewer_id.clone(),
+        model_id: finding.model_id.clone(),
+        backend_id: finding.backend_id.clone(),
         created_at: finding.created_at.clone(),
         evidence_selector: selector,
         evidence_digest: finding.evidence_digest.clone(),
@@ -405,36 +411,12 @@ fn normalize_severity(input: &str) -> String {
 }
 
 fn emit_report(report: &FindingsReport, json_output: bool) -> Result<(), String> {
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(report)
-                .map_err(|err| format!("failed to serialize findings report: {err}"))?
-        );
-        return Ok(());
-    }
-
-    println!("FAC Review Findings");
-    println!("  PR:            #{}", report.pr_number);
-    println!("  Head SHA:      {}", report.head_sha);
-    println!("  Overall:       {}", report.overall_status);
-
-    for dimension in &report.dimensions {
-        println!("  - {}: {}", dimension.dimension, dimension.status);
-        if let Some(error) = &dimension.error {
-            println!("      error:    {error}");
-        } else {
-            println!("      findings: {}", dimension.findings.len());
-        }
-    }
-
-    if !report.errors.is_empty() {
-        println!("  Errors:");
-        for error in &report.errors {
-            println!("    - {error}");
-        }
-    }
-
+    let _ = json_output;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report)
+            .map_err(|err| format!("failed to serialize findings report: {err}"))?
+    );
     Ok(())
 }
 
@@ -531,6 +513,8 @@ mod tests {
                         impact: Some("privilege escalation".to_string()),
                         location: Some("src/auth.rs:44".to_string()),
                         reviewer_id: Some("fac-reviewer".to_string()),
+                        model_id: None,
+                        backend_id: None,
                         created_at: "2026-02-14T00:00:00Z".to_string(),
                         evidence_digest: "abc".to_string(),
                         raw_evidence_pointer: "/tmp/review.md#line-10".to_string(),

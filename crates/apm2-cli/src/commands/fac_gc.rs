@@ -27,12 +27,16 @@ pub struct GcArgs {
 }
 
 /// Run garbage collection for FAC workspace artifacts.
-pub fn run_gc(args: &GcArgs) -> u8 {
+pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
+    let json_output = parent_json_output || args.json;
     let lane_manager = match LaneManager::from_default_home() {
         Ok(manager) => manager,
         Err(error) => {
-            eprintln!("ERROR: cannot initialize lane manager: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_gc_error(
+                "fac_gc_lane_manager_init_failed",
+                &format!("cannot initialize lane manager: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
@@ -41,8 +45,11 @@ pub fn run_gc(args: &GcArgs) -> u8 {
     let policy = match load_or_create_policy(&fac_root) {
         Ok(policy) => policy,
         Err(error) => {
-            eprintln!("ERROR: cannot load fac policy: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_gc_error(
+                "fac_gc_policy_load_failed",
+                &format!("cannot load fac policy: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
@@ -57,18 +64,24 @@ pub fn run_gc(args: &GcArgs) -> u8 {
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            eprintln!("ERROR: planning failed: {error:?}");
-            return exit_codes::GENERIC_ERROR;
+            return output_gc_error(
+                "fac_gc_plan_failed",
+                &format!("planning failed: {error:?}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
     if args.dry_run {
-        if args.json {
+        if json_output {
             match serde_json::to_string_pretty(&gc_plan_to_json(&plan)) {
                 Ok(json) => println!("{json}"),
                 Err(error) => {
-                    eprintln!("ERROR: cannot serialize plan: {error}");
-                    return exit_codes::GENERIC_ERROR;
+                    return output_gc_error(
+                        "fac_gc_serialize_plan_failed",
+                        &format!("cannot serialize plan: {error}"),
+                        exit_codes::GENERIC_ERROR,
+                    );
                 },
             }
         } else {
@@ -87,16 +100,22 @@ pub fn run_gc(args: &GcArgs) -> u8 {
     let before_free = match check_disk_space(&fac_root) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("ERROR: cannot sample pre-gc free space: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_gc_error(
+                "fac_gc_pre_disk_sample_failed",
+                &format!("cannot sample pre-gc free space: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
     let mut receipt = execute_gc(&plan);
     let after_free = match check_disk_space(&fac_root) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("ERROR: cannot sample post-gc free space: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_gc_error(
+                "fac_gc_post_disk_sample_failed",
+                &format!("cannot sample post-gc free space: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
     let action_count = receipt.actions.len();
@@ -129,12 +148,15 @@ pub fn run_gc(args: &GcArgs) -> u8 {
     ) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("ERROR: cannot persist GC receipt: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_gc_error(
+                "fac_gc_receipt_persist_failed",
+                &format!("cannot persist GC receipt: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
-    if args.json {
+    if json_output {
         let payload = json!({
             "applied": true,
             "plan_targets": plan.targets.len(),
@@ -145,8 +167,11 @@ pub fn run_gc(args: &GcArgs) -> u8 {
         match serde_json::to_string_pretty(&payload) {
             Ok(json) => println!("{json}"),
             Err(error) => {
-                eprintln!("ERROR: cannot print json: {error}");
-                return exit_codes::GENERIC_ERROR;
+                return output_gc_error(
+                    "fac_gc_serialize_result_failed",
+                    &format!("cannot print json: {error}"),
+                    exit_codes::GENERIC_ERROR,
+                );
             },
         }
     } else {
@@ -159,6 +184,18 @@ pub fn run_gc(args: &GcArgs) -> u8 {
         println!("receipt: {}", path.display());
     }
     exit_codes::SUCCESS
+}
+
+fn output_gc_error(code: &str, message: &str, exit_code: u8) -> u8 {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "error": code,
+            "message": message,
+        }))
+        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+    );
+    exit_code
 }
 
 fn gc_plan_to_json(plan: &GcPlan) -> serde_json::Value {

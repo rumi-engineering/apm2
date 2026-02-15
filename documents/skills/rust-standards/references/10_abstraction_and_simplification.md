@@ -65,7 +65,21 @@ smell_patterns:
   - id: SMELL-DUP
     pattern: "duplicated_logic_across_callsites"
     severity: MAJOR
-    remediation: "Extract shared logic into helper function"
+    description: |
+      Non-trivial functionality implemented in more than one location with
+      substantively identical logic. Applies to: structured output emission,
+      error formatting, state computation, file I/O patterns, CLI arg
+      resolution, projection rendering, serialization protocols, validation
+      logic, and any operation with behavioral semantics that could diverge.
+      Copy-paste of non-trivial logic creates drift risk: one copy gets
+      fixed or extended while others silently diverge. This is MAJOR, not
+      a nit — behavioral divergence between copies is a latent defect.
+    exclusions: |
+      Trivial duplication is excluded: repeated one-liners, simple field
+      access, boilerplate derives, or cases where extraction would create
+      a helper with no reuse beyond the two sites and no behavioral
+      semantics that could independently diverge.
+    remediation: "Extract shared logic into helper function or module"
 
   - id: SMELL-FLAG
     pattern: "temporary_flags_unclear_lifecycle"

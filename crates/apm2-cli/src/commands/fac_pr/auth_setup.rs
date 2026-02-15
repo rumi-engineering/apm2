@@ -112,27 +112,10 @@ pub fn run_pr_auth_setup(args: &PrAuthSetupCliArgs, json_output: bool) -> u8 {
         config_file: persisted.config_path.display().to_string(),
     };
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("GitHub App private key stored in OS keyring.");
-        println!("Config written to: {}", result.config_file);
-        println!("  auth-check reads app/install IDs and keyring metadata from this file.");
-        if let Some(path) = result.fallback_private_key_file.as_deref() {
-            println!("Private key file fallback enabled: {path}");
-            println!(
-                "  Disable by rerunning auth-setup without --allow-private-key-file-fallback."
-            );
-        } else {
-            println!("Private key file fallback disabled (keyring-first).");
-        }
-        if result.source_file_deleted {
-            println!("Deleted source private key file after keyring import.");
-        }
-    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+    );
 
     exit_codes::SUCCESS
 }
