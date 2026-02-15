@@ -86,7 +86,7 @@ use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
     parse_b3_256_digest, validate_job_spec, validate_job_spec_control_lane,
 };
-use apm2_core::fac::lane::LaneManager;
+use apm2_core::fac::lane::{LaneLockGuard, LaneManager};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
@@ -1699,18 +1699,7 @@ fn process_job(
     let _ = lane_mgr.ensure_directories();
 
     let lane_ids = LaneManager::default_lane_ids();
-    let mut acquired_guard = None;
-    let mut acquired_lane_id = String::new();
-
-    for lane_id in &lane_ids {
-        if let Ok(Some(guard)) = lane_mgr.try_lock(lane_id) {
-            acquired_guard = Some(guard);
-            acquired_lane_id.clone_from(lane_id);
-            break;
-        }
-    }
-
-    let Some(_lane_guard) = acquired_guard else {
+    let Some((_lane_guard, acquired_lane_id)) = acquire_worker_lane(&lane_mgr, &lane_ids) else {
         // No lane available -> move back to pending for retry.
         if let Err(move_err) = move_to_dir_safe(
             &claimed_path,
@@ -2085,43 +2074,10 @@ fn process_job(
         },
     };
 
-    // Step 8a: Lane cleanup and cleanup receipt emission.
-    // On failure, emit a failed cleanup receipt and persist the corrupt marker.
-    let cleanup_steps = match lane_mgr.run_lane_cleanup(&acquired_lane_id, &lane_workspace) {
-        Ok(steps) => steps,
-        Err(err) => {
-            let reason = format!("lane cleanup failed: {err}");
-            let failed_receipt_digest = emit_lane_cleanup_receipt(
-                fac_root,
-                &acquired_lane_id,
-                LaneCleanupOutcome::Failed,
-                Vec::new(),
-                Some(&reason),
-            )
-            .ok();
-
-            let marker = LaneCorruptMarkerV1 {
-                schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
-                lane_id: acquired_lane_id.clone(),
-                reason: reason.clone(),
-                cleanup_receipt_digest: failed_receipt_digest,
-                detected_at: current_timestamp_epoch_secs().to_string(),
-            };
-            if let Err(marker_err) = marker.persist(fac_root) {
-                eprintln!("worker: WARNING: failed to persist corrupt lane marker: {marker_err}");
-            }
-            return deny_with_reason(&reason);
-        },
-    };
-
-    if let Err(err) = emit_lane_cleanup_receipt(
-        fac_root,
-        &acquired_lane_id,
-        LaneCleanupOutcome::Success,
-        cleanup_steps,
-        None,
-    ) {
-        eprintln!("worker: WARNING: lane cleanup receipt emission failed: {err}");
+    if let Err(reason) =
+        execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
+    {
+        return deny_with_reason(&reason);
     }
 
     // Step 9: Write authoritative GateReceipt and move to completed.
@@ -2188,6 +2144,87 @@ fn process_job(
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
+    }
+}
+
+/// Try to acquire a non-corrupt worker lane lock in order.
+fn acquire_worker_lane(
+    lane_mgr: &LaneManager,
+    lane_ids: &[String],
+) -> Option<(LaneLockGuard, String)> {
+    for lane_id in lane_ids {
+        let guard = match lane_mgr.try_lock(lane_id) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("worker: WARNING: failed to probe lane {lane_id}: {err}");
+                continue;
+            },
+        };
+
+        match LaneCorruptMarkerV1::load(lane_mgr.fac_root(), lane_id) {
+            Ok(Some(marker)) => {
+                eprintln!(
+                    "worker: WARNING: skipping corrupt lane {lane_id}: {reason}",
+                    reason = marker.reason
+                );
+            },
+            Ok(None) => return Some((guard, lane_id.clone())),
+            Err(err) => {
+                eprintln!(
+                    "worker: WARNING: skipping lane {lane_id} after corrupt marker check failed: {err}"
+                );
+            },
+        }
+    }
+
+    None
+}
+
+/// Run lane cleanup and emit cleanup receipts.
+/// On failure, mark the lane as corrupt.
+fn execute_lane_cleanup(
+    fac_root: &Path,
+    lane_mgr: &LaneManager,
+    lane_id: &str,
+    lane_workspace: &Path,
+) -> Result<(), String> {
+    match lane_mgr.run_lane_cleanup(lane_id, lane_workspace) {
+        Ok(steps_completed) => {
+            if let Err(err) = emit_lane_cleanup_receipt(
+                fac_root,
+                lane_id,
+                LaneCleanupOutcome::Success,
+                steps_completed,
+                None,
+            ) {
+                eprintln!("worker: WARNING: lane cleanup receipt emission failed: {err}");
+            }
+            Ok(())
+        },
+        Err(err) => {
+            let reason = format!("lane cleanup failed: {err}");
+            let failed_receipt_digest = emit_lane_cleanup_receipt(
+                fac_root,
+                lane_id,
+                LaneCleanupOutcome::Failed,
+                Vec::new(),
+                Some(&reason),
+            )
+            .ok();
+
+            let marker = LaneCorruptMarkerV1 {
+                schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+                lane_id: lane_id.to_string(),
+                reason: reason.clone(),
+                cleanup_receipt_digest: failed_receipt_digest,
+                detected_at: current_timestamp_epoch_secs().to_string(),
+            };
+            if let Err(marker_err) = marker.persist(fac_root) {
+                eprintln!("worker: WARNING: failed to persist corrupt lane marker: {marker_err}");
+            }
+            Err(reason)
+        },
     }
 }
 
@@ -3311,6 +3348,8 @@ fn print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::fac::LaneState;
+
     use super::*;
 
     #[test]
@@ -3930,6 +3969,182 @@ mod tests {
         assert!(
             receipt_json.get("containment").is_none(),
             "containment field must be absent when None"
+        );
+    }
+
+    fn init_test_workspace_git_repo(workspace: &Path) {
+        let init_output = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("init git repo");
+        assert!(
+            init_output.status.success(),
+            "git init should succeed, got {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        let set_name_output = std::process::Command::new("git")
+            .args(["config", "user.name", "apm2 test"])
+            .current_dir(workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("set git user name");
+        assert!(
+            set_name_output.status.success(),
+            "git config user.name should succeed, got {}",
+            String::from_utf8_lossy(&set_name_output.stderr)
+        );
+
+        let set_email_output = std::process::Command::new("git")
+            .args(["config", "user.email", "test@apm2.local"])
+            .current_dir(workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("set git user email");
+        assert!(
+            set_email_output.status.success(),
+            "git config user.email should succeed, got {}",
+            String::from_utf8_lossy(&set_email_output.stderr)
+        );
+
+        fs::write(workspace.join("README.md"), b"seed").expect("write seed file");
+
+        let add_output = std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git add");
+        assert!(
+            add_output.status.success(),
+            "git add should succeed, got {}",
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+
+        let commit_output = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git commit");
+        assert!(
+            commit_output.status.success(),
+            "git commit should succeed, got {}",
+            String::from_utf8_lossy(&commit_output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_execute_lane_cleanup_success_emits_success_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let lane_id = "lane-00";
+        let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
+        init_test_workspace_git_repo(&workspace);
+
+        execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
+            .expect("lane cleanup should succeed");
+
+        let status = lane_mgr.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Idle);
+
+        let receipt_file = fs::read_dir(fac_root.join(FAC_RECEIPTS_DIR))
+            .expect("receipts dir")
+            .flatten()
+            .find(|entry| entry.file_type().is_ok_and(|ty| ty.is_file()))
+            .expect("at least one lane cleanup receipt");
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(receipt_file.path()).expect("read receipt"),
+        )
+        .expect("parse lane cleanup receipt");
+        assert_eq!(
+            receipt_json
+                .get("outcome")
+                .and_then(serde_json::Value::as_str),
+            Some("success"),
+            "cleanup success should emit success receipt"
+        );
+        assert_eq!(
+            receipt_json
+                .get("lane_id")
+                .and_then(serde_json::Value::as_str),
+            Some(lane_id),
+            "receipt should target executed lane"
+        );
+    }
+
+    #[test]
+    fn test_execute_lane_cleanup_failure_marks_corrupt_and_emits_failed_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let lane_id = "lane-00";
+        let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
+
+        let err = execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
+            .expect_err("cleanup should fail when workspace is not a git repo");
+        assert!(err.contains("lane cleanup failed"));
+
+        let status = lane_mgr.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Corrupt);
+
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("marker should be persisted on cleanup failure")
+            .expect("marker should exist");
+        assert!(marker.reason.contains("lane cleanup failed"));
+
+        let receipt_file = fs::read_dir(fac_root.join(FAC_RECEIPTS_DIR))
+            .expect("receipts dir")
+            .flatten()
+            .find(|entry| entry.file_type().is_ok_and(|ty| ty.is_file()))
+            .expect("at least one lane cleanup receipt");
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(receipt_file.path()).expect("read receipt"),
+        )
+        .expect("parse lane cleanup receipt");
+        assert_eq!(
+            receipt_json
+                .get("outcome")
+                .and_then(serde_json::Value::as_str),
+            Some("failed"),
+            "cleanup failure should emit failed receipt"
+        );
+    }
+
+    #[test]
+    fn test_acquire_worker_lane_skips_corrupt_and_uses_next_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let corrupt_marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: "lane-00".to_string(),
+            reason: "corrupt from previous failed cleanup".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        corrupt_marker
+            .persist(&fac_root)
+            .expect("persist corrupt marker");
+
+        let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
+        let (_guard, acquired_lane_id) =
+            acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
+        assert_eq!(
+            acquired_lane_id, "lane-01",
+            "corrupt lane should be skipped and next lane acquired"
         );
     }
 }
