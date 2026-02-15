@@ -139,10 +139,20 @@ Key re-exports:
 - [`apm2_core::evidence`](../../../apm2-core/src/evidence/AGENTS.md) -- Core evidence types and `EvidenceReducer`
 - [`apm2_core::crypto`](../../../apm2-core/src/crypto/AGENTS.md) -- Cryptographic primitives
 
+## Safe I/O (TCK-00537)
+
+The `keychain.rs` module uses `crate::fs_safe` primitives for manifest persistence:
+
+- **Writes**: `fs_safe::atomic_write_json` for crash-safe manifest updates (temp + fsync + rename)
+- **Reads**: `fs_safe::bounded_read_json` for symlink-safe, size-bounded manifest reads with O_NOFOLLOW
+- Both `KeyManifest::save()` and `OsKeychain::save_manifest()` use atomic writes.
+- Both `KeyManifest::load()` and `OsKeychain::load_manifest_from_path()` use bounded reads.
+
 ## References
 
 - AD-RECEIPT-001: Tool receipt generation
 - AD-VERIFY-001: Deterministic serialization
 - AD-KEY-001: Key lifecycle management
+- TCK-00537: Safe atomic file I/O primitives migration
 - CTR-1303: Bounded collections with `MAX_*` constants
 - CTR-1909: Constant-time operations for sensitive comparisons

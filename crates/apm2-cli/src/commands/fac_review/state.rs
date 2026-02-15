@@ -60,7 +60,7 @@ pub struct ReviewRunCompletionReceipt {
 }
 
 type HmacSha256 = Hmac<Sha256>;
-const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
+const RUN_SECRET_MAX_FILE_BYTES: u64 = 1024;
 const RUN_SECRET_LEN_BYTES: usize = 32;
 const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
 pub const TERMINATION_RECEIPT_SCHEMA: &str = "apm2.review.termination_receipt.v1";
@@ -1716,7 +1716,7 @@ mod tests {
         let home = temp.path();
         let path = review_run_secret_path_for_home(home, 441, "security");
         std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
-        std::fs::write(&path, "a".repeat(129)).expect("write oversized run secret");
+        std::fs::write(&path, "a".repeat(1025)).expect("write oversized run secret");
 
         let err = read_run_secret_for_home(home, 441, "security")
             .expect_err("oversized run secret must fail closed");

@@ -116,7 +116,7 @@ mod tests {
         let properties = SystemdUnitProperties::from_lane_profile(&profile, None);
 
         assert_eq!(properties.cpu_quota_percent, 200);
-        assert_eq!(properties.memory_max_bytes, 25_769_803_776);
+        assert_eq!(properties.memory_max_bytes, 51_539_607_552);
         assert_eq!(properties.tasks_max, 1536);
         assert_eq!(properties.io_weight, 100);
         assert_eq!(properties.timeout_start_sec, 240);
@@ -162,7 +162,7 @@ mod tests {
         let directives = properties.to_unit_directives();
         let expected = [
             "CPUQuota=200%",
-            "MemoryMax=25769803776",
+            "MemoryMax=51539607552",
             "TasksMax=1536",
             "IOWeight=100",
             "TimeoutStartSec=240",
@@ -182,7 +182,7 @@ mod tests {
         let properties = properties.to_dbus_properties();
         let expected = vec![
             ("CPUQuota".to_string(), "200%".to_string()),
-            ("MemoryMax".to_string(), "25769803776".to_string()),
+            ("MemoryMax".to_string(), "51539607552".to_string()),
             ("TasksMax".to_string(), "1536".to_string()),
             ("IOWeight".to_string(), "100".to_string()),
             ("TimeoutStartSec".to_string(), "240".to_string()),

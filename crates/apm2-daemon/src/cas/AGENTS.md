@@ -122,8 +122,18 @@ impl DurableCas {
 - [`apm2_daemon::projection`](../projection/AGENTS.md) -- Projection receipts stored in CAS
 - [`apm2_core::evidence`](../../../apm2-core/src/evidence/AGENTS.md) -- Core evidence types
 
+## Safe I/O (TCK-00537)
+
+All persistent file operations use `crate::fs_safe` primitives:
+
+- **Writes**: `fs_safe::atomic_write` (temp file + fsync + rename + dir fsync)
+- **Reads**: `fs_safe::bounded_read` (symlink refusal via O_NOFOLLOW, bounded size, regular-file check)
+- The `persist_total_size()` method uses `atomic_write` for crash-safe metadata updates.
+- The `recover_total_size()` method uses `bounded_read` for symlink-safe, size-bounded reads.
+
 ## References
 
 - TCK-00293: Durable CAS backend + wiring
+- TCK-00537: Safe atomic file I/O primitives migration
 - RFC-0018: HEF requirements for evidence durability
 - REQ-HEF-0009: `ChangeSetBundle` in CAS referenced by ledger
