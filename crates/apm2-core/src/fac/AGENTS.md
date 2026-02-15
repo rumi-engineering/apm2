@@ -649,6 +649,58 @@ user-mode and system-mode execution backends.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
+## Policy Environment Enforcement (TCK-00526)
+
+The `policy` module provides centralized environment filtering for all FAC job
+execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`,
+`env_denylist_prefixes`, `env_set`, `deny_ambient_cargo_home`, `cargo_home`,
+`cargo_target_dir`) are enforced at runtime by `build_job_environment()`.
+
+### Key Functions
+
+- `build_job_environment(policy, ambient_env, apm2_home) -> BTreeMap<String, String>`:
+  Centralized default-deny environment builder. Algorithm:
+  1. Start with empty env (default-deny).
+  2. Inherit only variables matching `env_allowlist_prefixes`.
+  3. Remove variables matching `env_denylist_prefixes` (denylist wins).
+  4. Strip variables listed in `env_clear` (unconditional).
+  5. Apply `env_set` overrides (force-set key=value pairs).
+  6. Enforce managed `CARGO_HOME` when `deny_ambient_cargo_home` is true.
+  7. Enforce `CARGO_TARGET_DIR` from policy.
+  Output is a deterministic `BTreeMap` (sorted keys).
+
+- `FacPolicyV1::resolve_cargo_home(apm2_home) -> Option<PathBuf>`:
+  Priority: explicit `cargo_home` > managed path (`$APM2_HOME/private/fac/cargo_home`
+  when `deny_ambient_cargo_home` is true) > `None` (ambient allowed).
+
+### Enforcement Sites
+
+- **Gates** (`fac_review/gates.rs`): `compute_nextest_test_environment()` loads
+  policy, calls `build_job_environment()`, then overlays lane-derived env vars.
+  `ensure_managed_cargo_home()` creates the managed directory with 0o700 permissions.
+- **Pipeline/Evidence** (`fac_review/evidence.rs`): `build_pipeline_test_command()`
+  loads policy and builds policy-filtered env for bounded test execution.
+- **Bounded test runner** (`fac_review/bounded_test_runner.rs`):
+  `SYSTEMD_SETENV_ALLOWLIST_EXACT` includes `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
+  `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient
+  units.
+
+### Security Invariants (TCK-00526)
+
+- [INV-ENV-001] Default-deny: ambient environment variables are not inherited unless
+  explicitly allowlisted by `env_allowlist_prefixes`.
+- [INV-ENV-002] Denylist takes priority over allowlist when both match a variable.
+- [INV-ENV-003] `env_clear` unconditionally strips named variables regardless of
+  allowlist/denylist.
+- [INV-ENV-004] `env_set` overrides are applied last (before CARGO_HOME/TARGET_DIR),
+  ensuring policy-defined values cannot be overridden by ambient state.
+- [INV-ENV-005] When `deny_ambient_cargo_home` is true, `CARGO_HOME` is always set
+  to the managed path (`$APM2_HOME/private/fac/cargo_home`), preventing reliance on
+  `~/.cargo` state.
+- [INV-ENV-006] Managed `CARGO_HOME` directory is created with 0o700 permissions
+  (CTR-2611) on Unix.
+- [INV-ENV-007] Output environment is deterministic (`BTreeMap` sorted by key).
+
 ## Receipt Versioning (TCK-00518)
 
 The `FacJobReceiptV1` type supports two canonical byte representations:

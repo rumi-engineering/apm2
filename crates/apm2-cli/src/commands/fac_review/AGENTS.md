@@ -302,3 +302,7 @@ pub use types::ReviewRunType;
   - `fetch_pr_body_for_projection()` no longer makes a redundant GitHub API call when the first call returns empty and the local snapshot is also empty.
   - Restored `review_artifact_lint` in `post_test_script_gates` in both `run_evidence_gates()` and `run_evidence_gates_with_status()` — the gate was accidentally dropped during bounded-runner refactoring.
   - `run_doctor()` `json_output` parameter is now explicit (no underscore prefix) with documentation that doctor `--pr` intentionally always emits JSON as a machine-readable diagnostic surface.
+- TCK-00526: FAC-managed `CARGO_HOME` + env clearing policy enforcement.
+  - `gates.rs`: `compute_nextest_test_environment()` loads `FacPolicyV1` and calls `build_job_environment()` to produce a policy-filtered environment. Lane-derived env vars (`NEXTEST_TEST_THREADS`, `CARGO_BUILD_JOBS`) are overlaid after policy filtering. `load_or_create_gate_policy()` and `ensure_managed_cargo_home()` helpers added.
+  - `evidence.rs`: `build_pipeline_test_command()` loads policy and builds policy-filtered environment for bounded pipeline test execution. `load_or_create_pipeline_policy()` and `ensure_pipeline_managed_cargo_home()` helpers added.
+  - `bounded_test_runner.rs`: `SYSTEMD_SETENV_ALLOWLIST_EXACT` extended with `RUSTUP_HOME`, `PATH`, `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient units.

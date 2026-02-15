@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apm2_core::fac::{LaneLockGuard, LaneManager, LaneProfileV1, compute_test_env};
+use apm2_core::fac::{
+    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, build_job_environment,
+    compute_test_env, persist_policy,
+};
 use blake3;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -762,11 +765,32 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
         ));
     }
 
+    // TCK-00526: Load FAC policy for environment enforcement in the
+    // pipeline path. Same policy-driven env clearing as the gates path.
+    let apm2_home = apm2_core::github::resolve_apm2_home()
+        .ok_or_else(|| "cannot resolve APM2_HOME for env policy enforcement".to_string())?;
+    let fac_root = apm2_home.join("private/fac");
+    let policy = load_or_create_pipeline_policy(&fac_root)?;
+
+    // Ensure managed CARGO_HOME exists when policy denies ambient.
+    if let Some(cargo_home) = policy.resolve_cargo_home(&apm2_home) {
+        ensure_pipeline_managed_cargo_home(&cargo_home)?;
+    }
+
     let timeout_decision =
         resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
     let profile = LaneProfileV1::new("lane-00", "b3-256:fac-review", "boundary-00")
         .map_err(|err| format!("failed to construct FAC pipeline lane profile: {err}"))?;
-    let mut test_env = compute_test_env(&profile);
+    let lane_env = compute_test_env(&profile);
+
+    // TCK-00526: Build policy-filtered environment.
+    let ambient: Vec<(String, String)> = std::env::vars().collect();
+    let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
+    for (key, value) in &lane_env {
+        policy_env.insert(key.clone(), value.clone());
+    }
+    let mut test_env: Vec<(String, String)> = policy_env.into_iter().collect();
+
     let bounded_spec = build_systemd_bounded_test_command(
         workspace_root,
         BoundedTestLimits {
@@ -806,6 +830,59 @@ fn resolve_evidence_test_command_environment(
 
 fn resolve_evidence_env_remove_keys(opts: Option<&EvidenceGateOptions>) -> Option<&[String]> {
     opts.and_then(|o| (!o.env_remove_keys.is_empty()).then_some(o.env_remove_keys.as_slice()))
+}
+
+/// Load or create FAC policy for the pipeline evidence path.
+fn load_or_create_pipeline_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
+    let policy_path = fac_root.join("policy/fac_policy.v1.json");
+    if policy_path.exists() {
+        let bytes = fs::read(&policy_path)
+            .map_err(|e| format!("cannot read FAC policy at {}: {e}", policy_path.display()))?;
+        if bytes.len() > apm2_core::fac::policy::MAX_POLICY_SIZE {
+            return Err(format!(
+                "FAC policy file exceeds max size: {} > {}",
+                bytes.len(),
+                apm2_core::fac::policy::MAX_POLICY_SIZE,
+            ));
+        }
+        apm2_core::fac::deserialize_policy(&bytes).map_err(|e| format!("invalid FAC policy: {e}"))
+    } else {
+        let default_policy = FacPolicyV1::default_policy();
+        persist_policy(fac_root, &default_policy)
+            .map_err(|e| format!("cannot persist default FAC policy: {e}"))?;
+        Ok(default_policy)
+    }
+}
+
+/// Ensure managed `CARGO_HOME` directory for pipeline evidence path.
+fn ensure_pipeline_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
+    if cargo_home.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(cargo_home)
+            .map_err(|e| {
+                format!(
+                    "cannot create managed CARGO_HOME at {}: {e}",
+                    cargo_home.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(cargo_home).map_err(|e| {
+            format!(
+                "cannot create managed CARGO_HOME at {}: {e}",
+                cargo_home.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn allocate_lane_job_logs_dir() -> Result<(PathBuf, LaneLockGuard), String> {
