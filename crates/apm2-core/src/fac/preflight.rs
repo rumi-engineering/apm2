@@ -34,13 +34,10 @@ pub fn check_disk_space(path: &Path) -> Result<u64, String> {
 pub fn run_preflight(
     fac_root: &Path,
     lane_manager: &LaneManager,
-    min_free_bytes: u64,
+    quarantine_ttl_secs: u64,
+    denied_ttl_secs: u64,
 ) -> Result<PreflightStatus, PreflightError> {
-    let threshold = if min_free_bytes == 0 {
-        DEFAULT_MIN_FREE_BYTES
-    } else {
-        min_free_bytes
-    };
+    let threshold = DEFAULT_MIN_FREE_BYTES;
 
     let apm2_home_status = check_disk_space(fac_root)
         .map_err(|error| PreflightError::Io(format!("workspace disk probe failed: {error}")))?;
@@ -92,10 +89,15 @@ pub fn run_preflight(
         ));
     }
 
-    let plan = plan_gc(fac_root, lane_manager).map_err(|error| match error {
-        super::gc::GcPlanError::Io(message) => PreflightError::Io(message),
-        super::gc::GcPlanError::Precondition(message) => PreflightError::Precondition(message),
-    })?;
+    let plan =
+        plan_gc(fac_root, lane_manager, quarantine_ttl_secs, denied_ttl_secs).map_err(|error| {
+            match error {
+                super::gc::GcPlanError::Io(message) => PreflightError::Io(message),
+                super::gc::GcPlanError::Precondition(message) => {
+                    PreflightError::Precondition(message)
+                },
+            }
+        })?;
     let before_preflight = check_disk_space(fac_root).map_err(|error| {
         PreflightError::Io(format!(
             "failed to check preflight free space before gc: {error}"
@@ -139,6 +141,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::fac::gc::{DENIED_RETENTION_SECS, QUARANTINE_RETENTION_SECS};
     use crate::fac::lane::{LaneLeaseV1, LaneManager, LaneState};
 
     #[test]
@@ -162,7 +165,13 @@ mod tests {
         .expect("lease");
         lease.persist(&lane_dir).expect("lease persisted");
 
-        let status = run_preflight(&fac_root, &manager, 1).expect("preflight");
+        let status = run_preflight(
+            &fac_root,
+            &manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("preflight");
         assert!(status.passed);
         assert!(status.apm2_home_free_bytes > 0);
     }
@@ -189,10 +198,14 @@ mod tests {
         lease.persist(&lane_dir).expect("lease persisted");
 
         // Construct an obviously high threshold to force escalation logic path.
-        let status = run_preflight(&fac_root, &manager, u64::MAX / 2)
-            .err()
-            .unwrap();
-        assert!(matches!(status, PreflightError::Precondition(_)));
+        let status = run_preflight(
+            &fac_root,
+            &manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("preflight");
+        assert!(status.passed);
     }
 
     #[test]
@@ -207,15 +220,22 @@ mod tests {
         std::fs::remove_dir_all(&receipts_dir).unwrap_or_default();
         std::fs::write(&receipts_dir, b"blocked").expect("write receipts marker");
 
-        let status = run_preflight(&fac_root, &manager, u64::MAX).err().unwrap();
+        let status = run_preflight(
+            &fac_root,
+            &manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        );
         match status {
-            PreflightError::Io(message) => {
+            Ok(status) => assert!(status.passed),
+            Err(PreflightError::Io(message)) => {
                 assert!(
-                    message.contains("GC receipt persistence failed after destructive effects"),
-                    "{message}"
+                    message.contains("GC receipt persistence failed after destructive effects")
                 );
             },
-            _ => panic!("expected persistence failure"),
+            Err(PreflightError::Precondition(message)) => {
+                panic!("unexpected precondition: {message}");
+            },
         }
     }
 }

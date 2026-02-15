@@ -52,6 +52,18 @@ fn default_economics_profile_hash() -> [u8; 32] {
         .unwrap_or([0u8; 32])
 }
 
+const fn default_quarantine_max_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+const fn default_quarantine_ttl_days() -> u32 {
+    14
+}
+
+const fn default_denied_ttl_days() -> u32 {
+    7
+}
+
 /// Errors returned by policy parsing, validation, and persistence.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -182,6 +194,18 @@ pub struct FacPolicyV1 {
     /// Required override for `CARGO_HOME`.
     pub cargo_home: Option<String>,
 
+    /// Maximum total bytes for quarantine directory. Default: 512 MiB.
+    #[serde(default = "default_quarantine_max_bytes")]
+    pub quarantine_max_bytes: u64,
+
+    /// Days to retain quarantined jobs before pruning. Default: 14.
+    #[serde(default = "default_quarantine_ttl_days")]
+    pub quarantine_ttl_days: u32,
+
+    /// Days to retain denied jobs before pruning. Default: 7.
+    #[serde(default = "default_denied_ttl_days")]
+    pub denied_ttl_days: u32,
+
     /// Risk tier for this policy.
     pub risk_tier: RiskTier,
 
@@ -243,6 +267,9 @@ impl FacPolicyV1 {
             deny_ambient_cargo_home: true,
             cargo_target_dir: Some("target".to_string()),
             cargo_home: None,
+            quarantine_max_bytes: default_quarantine_max_bytes(),
+            quarantine_ttl_days: default_quarantine_ttl_days(),
+            denied_ttl_days: default_denied_ttl_days(),
             risk_tier: RiskTier::Tier2,
             determinism_class: DeterminismClass::SoftDeterministic,
             economics_profile_hash,

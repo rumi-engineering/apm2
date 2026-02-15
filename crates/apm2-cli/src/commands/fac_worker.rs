@@ -89,8 +89,8 @@ use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1, ChannelBoundaryTrace,
-    DEFAULT_MIN_FREE_BYTES, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1,
-    GateReceipt, GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
+    DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
+    GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
     QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, SystemdUnitProperties,
     compute_policy_hash, deserialize_policy, parse_policy_hash, persist_content_addressed_receipt,
     persist_policy, run_preflight,
@@ -1420,7 +1420,12 @@ fn process_job(
         };
     };
 
-    if let Err(error) = run_preflight(fac_root, &lane_mgr, DEFAULT_MIN_FREE_BYTES) {
+    if let Err(error) = run_preflight(
+        fac_root,
+        &lane_mgr,
+        u64::from(policy.quarantine_ttl_days).saturating_mul(86400),
+        u64::from(policy.denied_ttl_days).saturating_mul(86400),
+    ) {
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),

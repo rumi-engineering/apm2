@@ -11,6 +11,10 @@ use crate::fac::safe_rmtree::{
 
 pub const GATE_CACHE_TTL_SECS: u64 = 2_592_000;
 pub const QUARANTINE_RETENTION_SECS: u64 = 2_592_000;
+pub const DENIED_RETENTION_SECS: u64 = 604_800;
+const DENIED_DIR: &str = "denied";
+const QUARANTINE_DIR: &str = "quarantine";
+const LEGACY_QUARANTINE_DIR: &str = "quarantined";
 const CARGO_HOME_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const FAC_CARGO_HOME_DIR: &str = "cargo_home";
 const FAC_LEGACY_EVIDENCE_DIR: &str = "evidence";
@@ -43,8 +47,17 @@ pub enum GcPlanError {
 /// # Errors
 ///
 /// Returns `GcPlanError::Io` when workspace inspection fails.
-pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, GcPlanError> {
+pub fn plan_gc(
+    fac_root: &Path,
+    lane_manager: &LaneManager,
+    quarantine_ttl_secs: u64,
+    denied_ttl_secs: u64,
+) -> Result<GcPlan, GcPlanError> {
     let mut targets = Vec::new();
+    let effective_quarantine_ttl =
+        effective_retention_seconds(quarantine_ttl_secs, QUARANTINE_RETENTION_SECS);
+    let effective_denied_ttl = effective_retention_seconds(denied_ttl_secs, DENIED_RETENTION_SECS);
+
     let statuses = lane_manager
         .all_lane_statuses()
         .map_err(|error| GcPlanError::Io(error.to_string()))?;
@@ -112,39 +125,215 @@ pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, Gc
         });
     }
 
-    let quarantine_root = queue_root.join("quarantine");
-    if let Ok(entries) = std::fs::read_dir(&quarantine_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_stale_by_mtime(&path, QUARANTINE_RETENTION_SECS) {
-                targets.push(GcTarget {
-                    path: path.clone(),
-                    allowed_parent: quarantine_root.clone(),
-                    kind: crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
-                    estimated_bytes: estimate_dir_size(&path),
-                });
-            }
-        }
-    }
+    collect_stale_queue_targets(
+        &queue_root,
+        QUARANTINE_DIR,
+        crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
+        effective_quarantine_ttl,
+        &mut targets,
+    );
 
     // Legacy directory name — scan for backward compatibility during transition.
-    let legacy_quarantine_root = queue_root.join("quarantined");
-    if let Ok(entries) = std::fs::read_dir(&legacy_quarantine_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_stale_by_mtime(&path, QUARANTINE_RETENTION_SECS) {
-                targets.push(GcTarget {
-                    path: path.clone(),
-                    allowed_parent: legacy_quarantine_root.clone(),
-                    kind: crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
-                    estimated_bytes: estimate_dir_size(&path),
-                });
-            }
-        }
-    }
+    collect_stale_queue_targets(
+        &queue_root,
+        LEGACY_QUARANTINE_DIR,
+        crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
+        effective_quarantine_ttl,
+        &mut targets,
+    );
+
+    collect_stale_queue_targets(
+        &queue_root,
+        DENIED_DIR,
+        crate::fac::gc_receipt::GcActionKind::DeniedPrune,
+        effective_denied_ttl,
+        &mut targets,
+    );
 
     targets.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes));
     Ok(GcPlan { targets })
+}
+
+/// Create a focused quarantine/denied GC plan with TTL and quota policy.
+///
+/// # Errors
+///
+/// Returns `GcPlanError::Io` when entries cannot be scanned.
+pub fn plan_quarantine_prune(
+    queue_root: &Path,
+    quarantine_ttl_secs: u64,
+    denied_ttl_secs: u64,
+    quarantine_max_bytes: u64,
+    now_secs: u64,
+) -> Result<GcPlan, GcPlanError> {
+    let effective_quarantine_ttl =
+        effective_retention_seconds(quarantine_ttl_secs, QUARANTINE_RETENTION_SECS);
+    let effective_denied_ttl = effective_retention_seconds(denied_ttl_secs, DENIED_RETENTION_SECS);
+    let effective_quarantine_max_bytes = if quarantine_max_bytes == 0 {
+        u64::MAX
+    } else {
+        quarantine_max_bytes
+    };
+
+    let mut quarantine_entries = Vec::new();
+
+    let mut candidates: Vec<(QueueEntry, crate::fac::gc_receipt::GcActionKind)> = Vec::new();
+    for entry in collect_queue_entries(queue_root, QUARANTINE_DIR) {
+        if is_stale_entry(&entry, effective_quarantine_ttl, now_secs) {
+            candidates.push((entry, crate::fac::gc_receipt::GcActionKind::QuarantinePrune));
+            continue;
+        }
+        quarantine_entries.push(entry);
+    }
+
+    for entry in collect_queue_entries(queue_root, DENIED_DIR) {
+        if is_stale_entry(&entry, effective_denied_ttl, now_secs) {
+            candidates.push((entry, crate::fac::gc_receipt::GcActionKind::DeniedPrune));
+        }
+    }
+
+    let mut quarantine_bytes: u64 = quarantine_entries
+        .iter()
+        .map(|entry| entry.estimated_bytes)
+        .sum();
+
+    let needs_dir_size = effective_quarantine_max_bytes != u64::MAX
+        && (quarantine_bytes > effective_quarantine_max_bytes
+            || quarantine_entries.iter().any(|entry| entry.path.is_dir()));
+
+    if needs_dir_size {
+        for entry in &mut quarantine_entries {
+            if entry.path.is_dir() {
+                entry.estimated_bytes = estimate_dir_size(&entry.path);
+            }
+        }
+        quarantine_bytes = quarantine_entries
+            .iter()
+            .map(|entry| entry.estimated_bytes)
+            .sum();
+    }
+
+    if quarantine_bytes > effective_quarantine_max_bytes
+        && effective_quarantine_max_bytes != u64::MAX
+    {
+        quarantine_entries.sort_by(|a, b| compare_entry_age_then_size_desc(a, b, now_secs));
+        for entry in &quarantine_entries {
+            if quarantine_bytes <= effective_quarantine_max_bytes {
+                break;
+            }
+            candidates.push((
+                entry.clone(),
+                crate::fac::gc_receipt::GcActionKind::QuarantinePrune,
+            ));
+            quarantine_bytes = quarantine_bytes.saturating_sub(entry.estimated_bytes);
+        }
+    }
+
+    candidates.sort_by(|(a, _), (b, _)| compare_entry_age_then_size_desc(a, b, now_secs));
+
+    Ok(GcPlan {
+        targets: candidates
+            .into_iter()
+            .map(|entry| GcTarget {
+                path: entry.0.path,
+                allowed_parent: entry.0.allowed_parent,
+                kind: entry.1,
+                estimated_bytes: entry.0.estimated_bytes,
+            })
+            .collect(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct QueueEntry {
+    path: PathBuf,
+    allowed_parent: PathBuf,
+    estimated_bytes: u64,
+    modified_secs: u64,
+}
+
+fn collect_queue_entries(queue_root: &Path, directory: &str) -> Vec<QueueEntry> {
+    let allowed_parent = queue_root.join(directory);
+    let Ok(entries) = std::fs::read_dir(&allowed_parent) else {
+        return Vec::new();
+    };
+
+    let mut count = 0usize;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        count += 1;
+        if count > MAX_DIR_ENTRIES {
+            break;
+        }
+        let path = entry.path();
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+            continue;
+        };
+        let estimated_bytes = metadata.len();
+        out.push(QueueEntry {
+            path,
+            allowed_parent: allowed_parent.clone(),
+            estimated_bytes,
+            modified_secs: duration.as_secs(),
+        });
+    }
+    out
+}
+
+fn compare_entry_age_then_size_desc(
+    a: &QueueEntry,
+    b: &QueueEntry,
+    now: u64,
+) -> std::cmp::Ordering {
+    let a_age = age_secs(now, a.modified_secs);
+    let b_age = age_secs(now, b.modified_secs);
+    b_age
+        .cmp(&a_age)
+        .then_with(|| b.estimated_bytes.cmp(&a.estimated_bytes))
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+fn collect_stale_queue_targets(
+    queue_root: &Path,
+    directory: &str,
+    kind: crate::fac::gc_receipt::GcActionKind,
+    ttl_secs: u64,
+    targets: &mut Vec<GcTarget>,
+) {
+    let now = current_wall_clock_secs();
+    for entry in collect_queue_entries(queue_root, directory) {
+        if !is_stale_entry(&entry, ttl_secs, now) {
+            continue;
+        }
+        targets.push(GcTarget {
+            path: entry.path,
+            allowed_parent: entry.allowed_parent,
+            kind,
+            estimated_bytes: entry.estimated_bytes,
+        });
+    }
+}
+
+const fn age_secs(now: u64, modified_secs: u64) -> u64 {
+    now.saturating_sub(modified_secs)
+}
+
+const fn is_stale_entry(entry: &QueueEntry, ttl_secs: u64, now: u64) -> bool {
+    is_stale_by_mtime_seconds(entry.modified_secs, ttl_secs, now)
+}
+
+const fn is_stale_by_mtime_seconds(modified_secs: u64, ttl_secs: u64, now: u64) -> bool {
+    ttl_secs != 0 && modified_secs.saturating_add(ttl_secs) <= now
+}
+
+const fn effective_retention_seconds(value: u64, fallback: u64) -> u64 {
+    if value == 0 { fallback } else { value }
 }
 
 /// Execute a garbage-collection plan and produce a best-effort receipt.
@@ -204,7 +393,7 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
                 };
                 actions.push(crate::fac::gc_receipt::GcAction {
                     target_path: target.path.display().to_string(),
-                    action_kind: target.kind.clone(),
+                    action_kind: target.kind,
                     bytes_freed: target.estimated_bytes,
                     files_deleted,
                     dirs_deleted,
@@ -282,6 +471,19 @@ fn current_wall_clock_secs() -> u64 {
 }
 
 fn estimate_dir_size(path: &Path) -> u64 {
+    let Ok(metadata) = path.symlink_metadata() else {
+        return 0;
+    };
+    if metadata.file_type().is_symlink() {
+        return 0;
+    }
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+
     let mut total = 0u64;
     let mut stack = Vec::from([(path.to_path_buf(), 0usize)]);
     let mut entries_count = 0usize;
@@ -306,6 +508,9 @@ fn estimate_dir_size(path: &Path) -> u64 {
             let Ok(metadata) = entry_path.symlink_metadata() else {
                 continue;
             };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
             if metadata.is_file() {
                 total = total.saturating_add(metadata.len());
             } else if metadata.is_dir() {
@@ -383,10 +588,28 @@ fn try_acquire_lane_lock(path: &Path) -> Result<Option<std::fs::File>, std::io::
 
 #[cfg(test)]
 mod tests {
+    use std::thread::sleep;
+    use std::time::Duration;
+
     use tempfile::tempdir;
 
     use super::*;
     use crate::fac::lane::{LaneLeaseV1, LaneManager, LaneState};
+
+    fn write_file(path: &Path, size: u64) {
+        let file = std::fs::File::create(path).expect("create file");
+        file.set_len(size).expect("set file size");
+    }
+
+    fn file_modified_secs(path: &Path) -> u64 {
+        path.symlink_metadata()
+            .expect("metadata")
+            .modified()
+            .expect("modified")
+            .duration_since(UNIX_EPOCH)
+            .expect("duration")
+            .as_secs()
+    }
 
     #[test]
     fn test_gc_plan_skips_running_lanes() {
@@ -414,7 +637,13 @@ mod tests {
         .expect("lease");
         lease.persist(&lane_dir).expect("persist lease");
 
-        let plan = plan_gc(&fac_root, &lane_manager).expect("plan");
+        let plan = plan_gc(
+            &fac_root,
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("plan");
         assert!(
             !plan
                 .targets
@@ -448,5 +677,167 @@ mod tests {
         assert!(r.actions.len() == 1 || r.errors.len() == 1);
         assert_eq!(r.errors.len(), 0);
         assert!(!temp.path().join("x").exists());
+    }
+
+    #[test]
+    fn test_plan_quarantine_prune_ttl_expiration_prunes_stale_items() {
+        let dir = tempdir().expect("tmp");
+        let queue_root = dir.path().join("queue");
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+        let denied_dir = queue_root.join(DENIED_DIR);
+        std::fs::create_dir_all(&quarantine_dir).expect("mkdir quarantine");
+        std::fs::create_dir_all(&denied_dir).expect("mkdir denied");
+
+        let quarantine_item = quarantine_dir.join("stale-quarantine.json");
+        let denied_item = denied_dir.join("stale-denied.json");
+        write_file(&quarantine_item, 10);
+        write_file(&denied_item, 20);
+
+        let plan = plan_quarantine_prune(
+            &queue_root,
+            1,
+            1,
+            10_000,
+            current_wall_clock_secs().saturating_add(10),
+        )
+        .expect("plan");
+
+        assert_eq!(plan.targets.len(), 2);
+        assert!(
+            plan.targets
+                .iter()
+                .any(|target| target.path == quarantine_item)
+        );
+        assert!(plan.targets.iter().any(|target| target.path == denied_item));
+        assert!(plan.targets.iter().any(|target| matches!(
+            target.kind,
+            crate::fac::gc_receipt::GcActionKind::QuarantinePrune
+        )));
+        assert!(plan.targets.iter().any(|target| matches!(
+            target.kind,
+            crate::fac::gc_receipt::GcActionKind::DeniedPrune
+        )));
+    }
+
+    #[test]
+    fn test_plan_quarantine_prune_quota_prunes_oldest_items_first() {
+        let dir = tempdir().expect("tmp");
+        let queue_root = dir.path().join("queue");
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine_dir).expect("mkdir quarantine");
+
+        let oldest = quarantine_dir.join("oldest.json");
+        let middle = quarantine_dir.join("middle.json");
+        let newest = quarantine_dir.join("newest.json");
+
+        write_file(&oldest, 20);
+        sleep(Duration::from_secs(1));
+        write_file(&middle, 20);
+        sleep(Duration::from_secs(1));
+        write_file(&newest, 1);
+
+        let entries = collect_queue_entries(&queue_root, QUARANTINE_DIR);
+        let now_secs = current_wall_clock_secs().saturating_add(10);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.estimated_bytes)
+                .sum::<u64>(),
+            41
+        );
+        assert!(
+            entries.iter().all(|entry| !is_stale_entry(
+                entry,
+                effective_retention_seconds(QUARANTINE_RETENTION_SECS, QUARANTINE_RETENTION_SECS),
+                now_secs
+            )),
+            "quota test entries must be within TTL"
+        );
+
+        let plan = plan_quarantine_prune(
+            &queue_root,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+            15,
+            now_secs,
+        )
+        .expect("plan");
+
+        assert_eq!(plan.targets.len(), 2);
+        assert_eq!(plan.targets[0].path, oldest);
+        assert_eq!(plan.targets[1].path, middle);
+    }
+
+    #[test]
+    fn test_plan_quarantine_prune_eviction_order_oldest_then_largest() {
+        let dir = tempdir().expect("tmp");
+        let queue_root = dir.path().join("queue");
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine_dir).expect("mkdir quarantine");
+
+        let (large_same_age_entry, small_same_age_entry) = (0..20)
+            .find_map(|attempt| {
+                let large = quarantine_dir.join(format!("same-age-large-{attempt}.json"));
+                let small = quarantine_dir.join(format!("same-age-small-{attempt}.json"));
+
+                write_file(&large, 30);
+                write_file(&small, 20);
+
+                if file_modified_secs(&large) == file_modified_secs(&small) {
+                    Some((large, small))
+                } else {
+                    let _ = std::fs::remove_file(&large);
+                    let _ = std::fs::remove_file(&small);
+                    sleep(Duration::from_secs(1));
+                    None
+                }
+            })
+            .expect("same-age entries");
+
+        let older_modified_secs = file_modified_secs(&small_same_age_entry);
+        let _newer_entry = (0..20)
+            .find_map(|attempt| {
+                let candidate = quarantine_dir.join(format!("newer-{attempt}.json"));
+                write_file(&candidate, 1);
+                if file_modified_secs(&candidate) > older_modified_secs {
+                    Some(candidate)
+                } else {
+                    let _ = std::fs::remove_file(&candidate);
+                    sleep(Duration::from_secs(1));
+                    None
+                }
+            })
+            .expect("newer entry");
+
+        let entries = collect_queue_entries(&queue_root, QUARANTINE_DIR);
+        let now_secs = current_wall_clock_secs().saturating_add(10);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.estimated_bytes)
+                .sum::<u64>(),
+            51
+        );
+        assert!(
+            entries.iter().all(|entry| !is_stale_entry(
+                entry,
+                effective_retention_seconds(QUARANTINE_RETENTION_SECS, QUARANTINE_RETENTION_SECS),
+                now_secs
+            )),
+            "eviction ordering test entries must be within TTL"
+        );
+
+        let plan = plan_quarantine_prune(
+            &queue_root,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+            15,
+            now_secs,
+        )
+        .expect("plan");
+
+        assert_eq!(plan.targets.len(), 2);
+        assert_eq!(plan.targets[0].path, large_same_age_entry);
+        assert_eq!(plan.targets[1].path, small_same_age_entry);
     }
 }
