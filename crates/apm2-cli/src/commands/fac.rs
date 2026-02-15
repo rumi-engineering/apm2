@@ -4314,6 +4314,17 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
     }
 
+    // KNOWN ISSUE (f-685-security-1771186259820160-0): Apm2HomeGuard mutates
+    // process-wide environment variables via std::env::set_var, which is inherently
+    // racy under parallel test execution. This is a pre-existing pattern used
+    // across the test suite (apm2-cli, apm2-daemon). A proper fix requires
+    // either:   (a) adding `serial_test` as a workspace dependency and
+    // annotating all       env-mutating tests with `#[serial]`, or
+    //   (b) refactoring production code to accept `fac_root` explicitly instead of
+    //       reading APM2_HOME from the environment.
+    // Both approaches are cross-cutting changes beyond this ticket's scope.
+    // Current mitigation: each test uses a unique tempdir, and Apm2HomeGuard
+    // restores the previous value on Drop, limiting the blast radius.
     struct Apm2HomeGuard {
         previous: Option<std::ffi::OsString>,
     }
@@ -4322,7 +4333,8 @@ mod tests {
     fn set_apm2_home(home: &std::path::Path) {
         // SAFETY: tests intentionally mutate process-wide environment state and
         // restore it in Drop, matching the project's existing environment
-        // test harness pattern.
+        // test harness pattern. This is inherently racy in parallel test
+        // execution — see KNOWN ISSUE above.
         unsafe {
             std::env::set_var("APM2_HOME", home);
         }

@@ -2380,9 +2380,15 @@ fn check_process_liveness(pid: u32) -> ProcessLiveness {
     //   1. `pid` is non-zero (guarded by the `pid == 0` early return above).
     //   2. Signal 0 is used, which performs an existence check without delivering
     //      any signal — a standard POSIX `kill(2)` operation.
-    //   3. The cast from `u32` to `i32` (`pid_t`) is bounded: valid PIDs fit in
-    //      `i32`. Wrapping of very large `u32` values produces a negative `pid_t`,
-    //      which `kill()` rejects with `ESRCH` (treated as dead below).
+    //   3. The cast from `u32` to `i32` (`pid_t`) is bounded: valid Linux PIDs fit
+    //      in `i32`. Wrapping of very large `u32` values (> i32::MAX) produces a
+    //      negative `pid_t`. Negative values sent to `kill()` signal process groups
+    //      by absolute value (e.g., -1 signals all processes). However, the
+    //      function remains safe and fail-closed: signal 0 delivers no actual
+    //      signal, and only an explicit ESRCH errno maps to `Dead`. Process-group
+    //      signals that succeed return 0 (mapped to `Alive`), and EPERM or other
+    //      errors map to `PermissionDenied` — both are fail-closed outcomes that
+    //      prevent lane reuse.
     //
     // Post-condition: `ret` contains the kernel return value (0 = exists,
     // -1 = error with errno set). No memory is accessed, no signal is

@@ -63,6 +63,7 @@
 //! ```
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -212,6 +213,10 @@ pub enum LaneCleanupReceiptError {
     /// Serialization error.
     #[error("serialization failed: {0}")]
     Serialization(String),
+
+    /// I/O error during persistence.
+    #[error("i/o error: {0}")]
+    Io(String),
 }
 
 /// Canonical receipt for lane cleanup operations.
@@ -408,8 +413,9 @@ impl LaneCleanupReceiptV1 {
 
     /// Persist a receipt into `receipts_dir`.
     ///
-    /// Writes to `<content_hash>.json`, replacing any existing file atomically
-    /// through `temp -> rename`.
+    /// Uses the atomic write protocol (CTR-2607): writes to a `NamedTempFile`
+    /// with restrictive permissions (0o600 on Unix), calls `sync_all()` for
+    /// durability, then atomically renames into `<content_hash>.json`.
     ///
     /// # Errors
     ///
@@ -440,11 +446,50 @@ impl LaneCleanupReceiptV1 {
             .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
 
         let final_path = fac_receipts_dir.join(format!("{}.json", copy.content_hash));
-        let tmp_path = fac_receipts_dir.join(format!("{}.tmp", copy.content_hash));
-        fs::write(&tmp_path, bytes)
-            .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
-        fs::rename(&tmp_path, &final_path)
-            .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
+
+        // Atomic write protocol: NamedTempFile + 0o600 + sync_all + rename
+        // (matches LaneCorruptMarkerV1::persist via atomic_write in lane.rs)
+        let temp = tempfile::NamedTempFile::new_in(fac_receipts_dir).map_err(|e| {
+            LaneCleanupReceiptError::Io(format!(
+                "creating temp file in {}: {e}",
+                fac_receipts_dir.display()
+            ))
+        })?;
+
+        // Set restrictive permissions before writing content (INV-LANE-CLEANUP-001).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(temp.path(), perms).map_err(|e| {
+                LaneCleanupReceiptError::Io(format!(
+                    "setting permissions on temp file {}: {e}",
+                    temp.path().display()
+                ))
+            })?;
+        }
+
+        let mut file = temp.as_file();
+        file.write_all(&bytes).map_err(|e| {
+            LaneCleanupReceiptError::Io(format!(
+                "writing temp file for {}: {e}",
+                final_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            LaneCleanupReceiptError::Io(format!(
+                "syncing temp file for {}: {e}",
+                final_path.display()
+            ))
+        })?;
+
+        temp.persist(&final_path).map_err(|e| {
+            LaneCleanupReceiptError::Io(format!(
+                "renaming temp file to {}: {}",
+                final_path.display(),
+                e.error
+            ))
+        })?;
 
         Ok(final_path)
     }
@@ -2491,6 +2536,51 @@ pub mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_cleanup_receipt_persist_creates_file_with_content_hash() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let receipt = sample_cleanup_receipt(LaneCleanupOutcome::Success);
+        let path = receipt.persist(dir.path(), 1_700_000_001).expect("persist");
+
+        assert!(path.exists(), "receipt file must exist after persist");
+        let content = std::fs::read_to_string(&path).expect("read receipt");
+        let parsed: LaneCleanupReceiptV1 =
+            serde_json::from_str(&content).expect("parse persisted receipt");
+        assert!(!parsed.content_hash.is_empty());
+        assert!(parsed.content_hash.starts_with("b3-256:"));
+        assert_eq!(parsed.timestamp_secs, 1_700_000_001);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cleanup_receipt_persist_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let receipt = sample_cleanup_receipt(LaneCleanupOutcome::Success);
+        let path = receipt.persist(dir.path(), 1_700_000_002).expect("persist");
+
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "receipt file must have 0o600 permissions, got {mode:#o}"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_receipt_persist_failed_outcome() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let receipt = sample_cleanup_receipt(LaneCleanupOutcome::Failed);
+        let path = receipt.persist(dir.path(), 1_700_000_003).expect("persist");
+
+        let content = std::fs::read_to_string(&path).expect("read receipt");
+        let parsed: LaneCleanupReceiptV1 =
+            serde_json::from_str(&content).expect("parse persisted receipt");
+        assert_eq!(parsed.outcome, LaneCleanupOutcome::Failed);
+        assert!(parsed.failure_reason.is_some());
     }
 
     #[test]
