@@ -1336,16 +1336,6 @@ pub fn run_push(
             if let Err(err) = append_push_attempt_record(repo, attempt_pr_number, &attempt) {
                 human_log!("WARNING: failed to append push attempt log: {err}");
             }
-            if $code != exit_codes::SUCCESS {
-                emit_push_summary(
-                    "fail",
-                    attempt_pr_number,
-                    false,
-                    None,
-                    Some("fac_push_failed"),
-                    Some("fac push failed"),
-                );
-            }
             if json_output && $code != exit_codes::SUCCESS {
                 let _ = emit_jsonl(&StageEvent {
                     event: "push_error".to_string(),
@@ -1356,21 +1346,21 @@ pub fn run_push(
                     }),
                 });
             }
-            return $code;
-        }};
-        ($code:expr, $error:expr, $message:expr) => {{
-            if let Err(err) = append_push_attempt_record(repo, attempt_pr_number, &attempt) {
-                human_log!("WARNING: failed to append push attempt log: {err}");
-            }
             if $code != exit_codes::SUCCESS {
                 emit_push_summary(
                     "fail",
                     attempt_pr_number,
                     false,
                     None,
-                    Some($error),
-                    Some($message.as_ref()),
+                    Some("fac_push_failed"),
+                    Some("fac push failed"),
                 );
+            }
+            return $code;
+        }};
+        ($code:expr, $error:expr, $message:expr) => {{
+            if let Err(err) = append_push_attempt_record(repo, attempt_pr_number, &attempt) {
+                human_log!("WARNING: failed to append push attempt log: {err}");
             }
             if json_output && $code != exit_codes::SUCCESS {
                 let _ = emit_jsonl(&StageEvent {
@@ -1381,6 +1371,16 @@ pub fn run_push(
                         "message": $message,
                     }),
                 });
+            }
+            if $code != exit_codes::SUCCESS {
+                emit_push_summary(
+                    "fail",
+                    attempt_pr_number,
+                    false,
+                    None,
+                    Some($error),
+                    Some($message.as_ref()),
+                );
             }
             return $code;
         }};
