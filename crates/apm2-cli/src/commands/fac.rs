@@ -3769,6 +3769,9 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
             exit_codes::GENERIC_ERROR,
         );
     }
+    if !json_output {
+        eprintln!("Corrupt marker cleared for lane {}", args.lane_id);
+    }
 
     // Re-create the empty subdirectories for the reset lane so it is
     // ready for reuse. This calls ensure_directories() which re-inits
