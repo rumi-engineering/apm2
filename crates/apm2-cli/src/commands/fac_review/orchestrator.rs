@@ -1,5 +1,6 @@
 //! Core state machine: `run_review_inner` and `run_single_review`.
 
+use std::io::Read;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -37,6 +38,10 @@ use super::types::{
 use super::verdict_projection::resolve_completion_signal_from_projection_for_home;
 
 const STALE_ARTIFACT_TTL_SECS_DEFAULT: u64 = 24 * 60 * 60;
+const MAX_MISSING_VERDICT_NUDGES: u32 = 1;
+const MISSING_VERDICT_NUDGE_PROMPT_MAX_BYTES: u64 = 64 * 1024;
+const MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS: usize = 4_000;
+const MISSING_VERDICT_NUDGE_DISABLE_ENV: &str = "APM2_FAC_DISABLE_NUDGE";
 const STALE_TEMP_FILE_PREFIXES: [&str; 3] = [
     "apm2_fac_review_",
     "apm2_fac_prompt_",
@@ -48,6 +53,82 @@ struct CompletionSignal {
     verdict: String,
     decision: String,
     decision_comment_id: u64,
+}
+
+fn bool_env_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn missing_verdict_nudge_disabled() -> bool {
+    bool_env_enabled(MISSING_VERDICT_NUDGE_DISABLE_ENV)
+}
+
+const fn verdict_dimension_for_kind(review_kind: ReviewKind) -> &'static str {
+    match review_kind {
+        ReviewKind::Security => "security",
+        ReviewKind::Quality => "code-quality",
+    }
+}
+
+fn required_verdict_command(review_kind: ReviewKind) -> String {
+    format!(
+        "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\" --json",
+        verdict_dimension_for_kind(review_kind)
+    )
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("\n...[truncated]");
+    out
+}
+
+fn read_prompt_excerpt_for_nudge(prompt_path: &std::path::Path) -> String {
+    let Ok(mut file) = fs::File::open(prompt_path) else {
+        return "prompt unavailable".to_string();
+    };
+    let mut limited = Vec::new();
+    if file
+        .by_ref()
+        .take(MISSING_VERDICT_NUDGE_PROMPT_MAX_BYTES)
+        .read_to_end(&mut limited)
+        .is_err()
+    {
+        return "prompt unavailable".to_string();
+    }
+    let text = String::from_utf8_lossy(&limited);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "prompt unavailable".to_string();
+    }
+    truncate_chars(trimmed, MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS)
+}
+
+fn build_missing_verdict_nudge_message(
+    review_kind: ReviewKind,
+    prompt_path: &std::path::Path,
+) -> String {
+    let command = required_verdict_command(review_kind);
+    let prompt_excerpt = read_prompt_excerpt_for_nudge(prompt_path);
+    format!(
+        "RESUME TASK - REQUIRED TERMINAL COMMAND NOT EXECUTED.\n\
+         You exited without running your required terminal command.\n\
+         You MUST execute this command before exiting:\n\n\
+         {command}\n\n\
+         Your original assignment was:\n\
+         ---\n\
+         {prompt_excerpt}\n\
+         ---\n\n\
+         Review your findings and execute the verdict command now."
+    )
 }
 
 // ── Token usage extraction ───────────────────────────────────────────────────
@@ -673,6 +754,7 @@ fn run_single_review(
         model_id: Some(current_model.model.clone()),
         backend_id: Some(current_model.backend.as_str().to_string()),
         restart_count,
+        nudge_count: 0,
         sequence_number,
         previous_run_id: None,
         previous_head_sha: None,
@@ -848,12 +930,20 @@ fn run_single_review(
                 &current_model.model,
                 Some(&last_message_path),
             )?,
-            SpawnMode::Resume { message } => build_resume_spawn_command_for_backend(
-                current_model.backend,
-                &log_path,
-                &current_model.model,
-                message,
-            ),
+            SpawnMode::Resume { message } => {
+                fs::write(&last_message_path, message).map_err(|err| {
+                    format!(
+                        "failed to write resume message {}: {err}",
+                        last_message_path.display()
+                    )
+                })?;
+                build_resume_spawn_command_for_backend(
+                    current_model.backend,
+                    &log_path,
+                    &current_model.model,
+                    &last_message_path,
+                )
+            },
         };
 
         let _provider_slot_lease = match acquire_provider_slot(current_model.backend) {
@@ -1174,6 +1264,38 @@ fn run_single_review(
                             ),
                             final_head_sha: current_head_sha,
                         });
+                    }
+
+                    if run_state.nudge_count < MAX_MISSING_VERDICT_NUDGES
+                        && restart_count < MAX_RESTART_ATTEMPTS
+                        && !missing_verdict_nudge_disabled()
+                    {
+                        let nudge_message =
+                            build_missing_verdict_nudge_message(review_kind, &prompt_path);
+                        let required_command = required_verdict_command(review_kind);
+                        run_state.nudge_count = run_state.nudge_count.saturating_add(1);
+                        emit_run_event(
+                            "nudge_resume",
+                            &current_head_sha,
+                            serde_json::json!({
+                                "nudge_count": run_state.nudge_count,
+                                "required_command": required_command,
+                                "reason": "clean_exit_without_verdict",
+                            }),
+                        )?;
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Pending,
+                            Some("nudge_resume".to_string()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
+                        spawn_mode = SpawnMode::Resume {
+                            message: nudge_message,
+                        };
+                        continue 'restart_loop;
                     }
 
                     let comment_permission_denied = detect_comment_permission_denied(&log_path);
@@ -1570,5 +1692,36 @@ fn run_single_review(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS, ReviewKind, build_missing_verdict_nudge_message,
+        required_verdict_command,
+    };
+
+    #[test]
+    fn required_verdict_command_uses_code_quality_dimension_for_quality_reviews() {
+        let command = required_verdict_command(ReviewKind::Quality);
+        assert!(command.starts_with("cargo run -p apm2-cli -- fac review verdict set"));
+        assert!(command.contains("--dimension code-quality"));
+        assert!(!command.contains("--sha"));
+    }
+
+    #[test]
+    fn build_missing_verdict_nudge_message_embeds_required_command_and_prompt_excerpt() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let prompt_path = temp.path().join("prompt.md");
+        let oversized_prompt = "x".repeat(MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS + 128);
+        std::fs::write(&prompt_path, oversized_prompt).expect("write prompt");
+
+        let message = build_missing_verdict_nudge_message(ReviewKind::Security, &prompt_path);
+
+        assert!(message.contains("RESUME TASK"));
+        assert!(message.contains("cargo run -p apm2-cli -- fac review verdict set"));
+        assert!(message.contains("--dimension security"));
+        assert!(message.contains("...[truncated]"));
     }
 }
