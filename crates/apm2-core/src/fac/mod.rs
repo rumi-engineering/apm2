@@ -261,6 +261,7 @@ pub use job_spec::{
     MAX_HEAD_SHA_LENGTH, MAX_JOB_ID_LENGTH, MAX_JOB_SPEC_SIZE, MAX_KIND_LENGTH,
     MAX_LEASE_ID_LENGTH, MAX_QUEUE_LANE_LENGTH, MAX_REPO_ID_LENGTH, MAX_REQUEST_ID_LENGTH,
     MAX_SOURCE_KIND_LENGTH, deserialize_job_spec, validate_job_spec,
+    validate_job_spec_control_lane,
 };
 // Re-export key policy types
 pub use key_policy::{

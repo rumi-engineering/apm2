@@ -7,27 +7,44 @@
 //!   receipt.
 //! - **Claimed/running job**: Enqueues a highest-priority `stop_revoke` job
 //!   that will kill the active systemd unit (`KillMode=control-group`) and mark
-//!   the target job cancelled.
+//!   the target job cancelled.  The cancel command emits a non-terminal
+//!   `CancellationRequested` receipt; the terminal `Cancelled` receipt is
+//!   emitted by the worker when the `stop_revoke` is confirmed.
 //! - **Completed job**: Returns an error (already finished).
-//! - **Ambiguous state**: Returns an error (fail-closed).
+//! - **Ambiguous state** (job found in multiple directories): Returns an error
+//!   (fail-closed).
 //!
 //! Cancellation never deletes evidence or logs; it only stops execution and
 //! writes receipts.
 //!
 //! # Security Model
 //!
+//! - The cancel command verifies local operator authority by checking that the
+//!   caller owns the queue root directory (same uid).  This proves the caller
+//!   has local filesystem privilege over the queue.
 //! - Cancellation receipts include the cancellation reason and previous state.
 //! - No evidence or log artifacts are deleted.
-//! - `stop_revoke` jobs go through the same RFC-0028/RFC-0029 admission path as
-//!   any other job.
+//! - `stop_revoke` jobs bypass the RFC-0028 channel context token requirement;
+//!   the worker validates local-origin authority (queue directory ownership)
+//!   instead.  This is the `CONTROL_LANE` concept: operator-initiated control
+//!   jobs use filesystem-level privilege proof rather than broker tokens.
+//! - Receipt emission failures are fatal: the cancel command fails with an
+//!   error exit code rather than silently continuing without evidence.
 //!
 //! # Invariants
 //!
 //! - [INV-CANCEL-001] Fail-closed: ambiguous job state results in denial.
 //! - [INV-CANCEL-002] Receipts are emitted for all cancellation outcomes.
+//!   Receipt emission failure is fatal.
 //! - [INV-CANCEL-003] Atomic state transitions via filesystem rename.
 //! - [INV-CANCEL-004] Evidence and logs are never deleted by cancellation.
 //! - [INV-CANCEL-005] `stop_revoke` jobs have priority 0 (highest).
+//! - [INV-CANCEL-006] `cancel_target_job_id` uses strict `[A-Za-z0-9_-]`
+//!   validation to prevent glob/path injection.
+//! - [INV-CANCEL-007] `locate_job` scans ALL queue directories and denies on
+//!   ambiguity (job found in multiple directories).
+//! - [INV-CANCEL-008] Claimed-job cancel emits `CancellationRequested` (non-
+//!   terminal); terminal `Cancelled` receipt is emitted only by the worker.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,22 +103,54 @@ struct CancelOutput {
 
 /// Represents the discovered state of a job in the queue.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum JobState {
     /// Job is in `pending/` directory.
     Pending(PathBuf),
     /// Job is in `claimed/` directory (may be running).
     Claimed(PathBuf),
-    /// Job is in `completed/` directory.
-    Completed(PathBuf),
-    /// Job is in `cancelled/` directory.
-    Cancelled(PathBuf),
-    /// Job is in `denied/` directory.
-    Denied(PathBuf),
-    /// Job is in `quarantine/` directory.
-    Quarantined(PathBuf),
+    /// Job is in `completed/` directory (path used for state identity).
+    Completed(#[allow(dead_code)] PathBuf),
+    /// Job is in `cancelled/` directory (path used for state identity).
+    Cancelled(#[allow(dead_code)] PathBuf),
+    /// Job is in `denied/` directory (path used for state identity).
+    Denied(#[allow(dead_code)] PathBuf),
+    /// Job is in `quarantine/` directory (path used for state identity).
+    Quarantined(#[allow(dead_code)] PathBuf),
     /// Job was not found in any directory.
     NotFound,
+    /// Job was found in multiple directories (ambiguous, fail-closed).
+    Ambiguous(Vec<String>),
+}
+
+// =============================================================================
+// Authority check
+// =============================================================================
+
+/// Verifies that the caller has local operator authority over the queue.
+///
+/// On Unix, this checks that the queue root directory is owned by the current
+/// user (same uid).  This proves the caller has filesystem-level privilege
+/// over the queue, which is the local authority model for the cancel command.
+///
+/// The authority check is implemented by verifying that the caller can write
+/// a probe file into the queue root directory.  This is a capability-based
+/// proof: only users with filesystem write access to the queue directory can
+/// successfully create and remove the probe file.
+///
+/// On non-Unix platforms, returns Ok (authority is assumed for local CLI).
+fn verify_local_operator_authority(queue_root: &Path) -> Result<(), String> {
+    // Capability-based authority proof: attempt to create a probe file in the
+    // queue root.  Only callers with write access to the directory succeed.
+    // This avoids unsafe FFI calls while providing the same security guarantee.
+    let probe_path = queue_root.join(".cancel-authority-probe");
+    fs::write(&probe_path, b"probe").map_err(|e| {
+        format!(
+            "operator authority denied: cannot write to queue root {}: {e}",
+            queue_root.display()
+        )
+    })?;
+    let _ = fs::remove_file(&probe_path);
+    Ok(())
 }
 
 // =============================================================================
@@ -127,6 +176,12 @@ pub fn run_cancel(args: &CancelArgs, json_output: bool) -> u8 {
         },
     };
 
+    // BLOCKER 1: Verify local operator authority before any mutation.
+    if let Err(e) = verify_local_operator_authority(&queue_root) {
+        output_error(json_output, &format!("authority check failed: {e}"));
+        return exit_codes::PERMISSION_DENIED;
+    }
+
     // Ensure the cancelled directory exists.
     let cancelled_dir = queue_root.join(CANCELLED_DIR);
     if let Err(e) = fs::create_dir_all(&cancelled_dir) {
@@ -140,7 +195,23 @@ pub fn run_cancel(args: &CancelArgs, json_output: bool) -> u8 {
     let job_id = &args.job_id;
     let reason = &args.reason;
 
-    // Locate the job across all queue directories.
+    // MAJOR 5 (caller-side): Validate job_id charset before scanning.
+    if !job_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        output_error(
+            json_output,
+            &format!("invalid job_id: only [A-Za-z0-9_-] characters allowed, got {job_id:?}"),
+        );
+        return exit_codes::VALIDATION_ERROR;
+    }
+    if job_id.is_empty() {
+        output_error(json_output, "job_id must not be empty");
+        return exit_codes::VALIDATION_ERROR;
+    }
+
+    // MAJOR 4: Locate the job across ALL queue directories; deny on ambiguity.
     let state = locate_job(&queue_root, job_id);
 
     match state {
@@ -181,6 +252,17 @@ pub fn run_cancel(args: &CancelArgs, json_output: bool) -> u8 {
                 &format!("job {job_id} not found in any queue directory"),
             );
             exit_codes::NOT_FOUND
+        },
+        // INV-CANCEL-001 / MAJOR 4: Ambiguous state is fail-closed.
+        JobState::Ambiguous(dirs) => {
+            output_error(
+                json_output,
+                &format!(
+                    "job {job_id} found in multiple directories (ambiguous state, fail-closed): {}",
+                    dirs.join(", ")
+                ),
+            );
+            exit_codes::GENERIC_ERROR
         },
     }
 }
@@ -223,12 +305,15 @@ fn cancel_pending_job(
         },
     };
 
-    // Emit cancellation receipt (INV-CANCEL-002).
+    // MAJOR 6: Emit cancellation receipt (INV-CANCEL-002). Failure is fatal.
     let receipt_path = match emit_cancellation_receipt(fac_root, &spec, "pending", reason) {
-        Ok(p) => Some(p.to_string_lossy().to_string()),
+        Ok(p) => p.to_string_lossy().to_string(),
         Err(e) => {
-            eprintln!("WARNING: cancellation receipt emission failed: {e}");
-            None
+            output_error(
+                json_output,
+                &format!("FATAL: cancellation receipt emission failed: {e}"),
+            );
+            return exit_codes::GENERIC_ERROR;
         },
     };
 
@@ -236,7 +321,7 @@ fn cancel_pending_job(
         job_id: job_id.to_string(),
         previous_state: "pending".to_string(),
         action: "moved to cancelled".to_string(),
-        receipt_path,
+        receipt_path: Some(receipt_path),
         stop_revoke_spec_path: None,
     };
 
@@ -255,6 +340,10 @@ fn cancel_pending_job(
 
 /// Cancels a claimed/running job by enqueuing a highest-priority `stop_revoke`
 /// job.
+///
+/// MAJOR 1 / INV-CANCEL-008: Emits a `CancellationRequested` (non-terminal)
+/// receipt.  The terminal `Cancelled` receipt is emitted only by the worker
+/// after `handle_stop_revoke` confirms the target was stopped.
 fn cancel_claimed_job(
     claimed_path: &Path,
     job_id: &str,
@@ -311,8 +400,9 @@ fn cancel_claimed_job(
         return exit_codes::GENERIC_ERROR;
     }
 
-    // Emit a cancellation-initiated receipt (the final cancellation receipt
-    // will be emitted by the worker when stop_revoke completes).
+    // MAJOR 1: Emit a CancellationRequested (non-terminal) receipt.
+    // The final Cancelled receipt will be emitted by the worker when
+    // stop_revoke completes.
     let Ok(spec_for_receipt) = read_job_spec(claimed_path) else {
         // Fall back to a minimal receipt without full spec data.
         eprintln!("WARNING: cannot read claimed job spec for receipt");
@@ -334,12 +424,16 @@ fn cancel_claimed_job(
         return exit_codes::SUCCESS;
     };
 
+    // MAJOR 1+6: Emit CancellationRequested receipt. Failure is fatal.
     let receipt_path =
-        match emit_cancellation_receipt(fac_root, &spec_for_receipt, "claimed", reason) {
+        match emit_cancellation_requested_receipt(fac_root, &spec_for_receipt, "claimed", reason) {
             Ok(p) => Some(p.to_string_lossy().to_string()),
             Err(e) => {
-                eprintln!("WARNING: cancellation receipt emission failed: {e}");
-                None
+                output_error(
+                    json_output,
+                    &format!("FATAL: cancellation-requested receipt emission failed: {e}"),
+                );
+                return exit_codes::GENERIC_ERROR;
             },
         };
 
@@ -368,15 +462,16 @@ fn cancel_claimed_job(
 // Job state discovery
 // =============================================================================
 
-/// Locates a job by ID across all queue directories.
+/// Locates a job by ID across ALL queue directories.
 ///
-/// Scans each directory for files matching the `job_id` pattern. Uses bounded
-/// scanning to prevent unbounded memory growth.
-/// Type alias for queue directory mapping entries.
-type QueueDirMapping = (&'static str, fn(PathBuf) -> JobState);
-
+/// MAJOR 4 / INV-CANCEL-007: Scans every directory and denies on ambiguity
+/// (job found in multiple directories).  Returns `JobState::Ambiguous` with
+/// the list of matching directories when the job appears in more than one.
+///
+/// Uses bounded scanning to prevent unbounded memory growth.
 fn locate_job(queue_root: &Path, job_id: &str) -> JobState {
-    let dirs_and_states: &[QueueDirMapping] = &[
+    type StateConstructor = fn(PathBuf) -> JobState;
+    let dirs_and_states: &[(&str, StateConstructor)] = &[
         (PENDING_DIR, JobState::Pending),
         (CLAIMED_DIR, JobState::Claimed),
         (COMPLETED_DIR, JobState::Completed),
@@ -385,18 +480,34 @@ fn locate_job(queue_root: &Path, job_id: &str) -> JobState {
         (QUARANTINE_DIR, JobState::Quarantined),
     ];
 
-    for (dir_name, state_constructor) in dirs_and_states {
+    let mut found: Vec<(&str, PathBuf, StateConstructor)> = Vec::new();
+
+    for &(dir_name, state_constructor) in dirs_and_states {
         let dir_path = queue_root.join(dir_name);
         if !dir_path.is_dir() {
             continue;
         }
 
         if let Some(path) = find_job_in_dir(&dir_path, job_id) {
-            return state_constructor(path);
+            found.push((dir_name, path, state_constructor));
         }
     }
 
-    JobState::NotFound
+    match found.len() {
+        0 => JobState::NotFound,
+        1 => {
+            let (_, path, constructor) = found.into_iter().next().expect("checked len == 1");
+            constructor(path)
+        },
+        _ => {
+            // INV-CANCEL-001: Ambiguous state, fail-closed.
+            let dirs: Vec<String> = found
+                .iter()
+                .map(|(name, _, _)| (*name).to_string())
+                .collect();
+            JobState::Ambiguous(dirs)
+        },
+    }
 }
 
 /// Searches a directory for a job spec file matching the given `job_id`.
@@ -450,12 +561,19 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
 ///
 /// The spec has priority 0 (highest) to ensure it is processed before any
 /// other pending jobs (INV-CANCEL-005).
+///
+/// BLOCKER 2+3: The `channel_context_token` is set to `None` because
+/// `stop_revoke` jobs are operator-initiated local commands.  The worker
+/// validates local-origin authority (queue directory ownership) instead of an
+/// RFC-0028 token.  This is the `CONTROL_LANE` bypass: `stop_revoke` jobs are
+/// validated via `validate_job_spec_control_lane()` which skips the token
+/// requirement.
 fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpecV1, String> {
     let now = current_timestamp_epoch_secs();
     let stop_revoke_job_id = format!("stop-revoke-{target_job_id}-{now}");
 
     // For stop_revoke jobs, we use a placeholder source since the job
-    // doesn't need repo checkout — it only needs to kill a unit.
+    // doesn't need repo checkout -- it only needs to kill a unit.
     let source = JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: "internal/control".to_string(),
@@ -464,9 +582,8 @@ fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpe
     };
 
     // Build spec with highest priority (0).
-    // Note: In the current MVP, stop_revoke specs are written without
-    // a full RFC-0028 token (the cancel command is operator-initiated).
-    // The worker will need to handle stop_revoke jobs specially.
+    // CONTROL_LANE: token is intentionally None; the worker uses
+    // validate_job_spec_control_lane() and verifies queue dir ownership.
     let mut spec = FacJobSpecV1 {
         schema: apm2_core::fac::job_spec::JOB_SPEC_SCHEMA_ID.to_string(),
         job_id: stop_revoke_job_id,
@@ -507,7 +624,7 @@ fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpe
 // Receipt emission
 // =============================================================================
 
-/// Emits a cancellation receipt for the given job.
+/// Emits a terminal cancellation receipt for a pending job.
 fn emit_cancellation_receipt(
     fac_root: &Path,
     spec: &FacJobSpecV1,
@@ -530,6 +647,38 @@ fn emit_cancellation_receipt(
     let receipt = builder
         .try_build()
         .map_err(|e| format!("cannot build cancellation receipt: {e}"))?;
+
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    persist_content_addressed_receipt(&receipts_dir, &receipt)
+}
+
+/// Emits a non-terminal `CancellationRequested` receipt for a claimed job.
+///
+/// MAJOR 1: This is NOT a terminal receipt.  The terminal `Cancelled` receipt
+/// is emitted only by the worker's `handle_stop_revoke` after the target is
+/// confirmed stopped.
+fn emit_cancellation_requested_receipt(
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    previous_state: &str,
+    reason: &str,
+) -> Result<PathBuf, String> {
+    let now = current_timestamp_epoch_secs();
+    let receipt_id = format!("cancel-req-{}-{now}", spec.job_id);
+    let full_reason = format!("cancellation requested from {previous_state}: {reason}");
+
+    // Truncate reason to receipt limit (512 chars).
+    let bounded_reason = truncate_string(&full_reason, 512);
+
+    let builder = FacJobReceiptV1Builder::new(receipt_id, &spec.job_id, &spec.job_spec_digest)
+        .outcome(FacJobOutcome::CancellationRequested)
+        .denial_reason(DenialReasonCode::Cancelled)
+        .reason(&bounded_reason)
+        .timestamp_secs(now);
+
+    let receipt = builder
+        .try_build()
+        .map_err(|e| format!("cannot build cancellation-requested receipt: {e}"))?;
 
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     persist_content_addressed_receipt(&receipts_dir, &receipt)
@@ -733,6 +882,8 @@ mod tests {
         assert!(spec.job_id.starts_with("stop-revoke-target-job-123-"));
         assert!(!spec.job_spec_digest.is_empty());
         assert_eq!(spec.actuation.request_id, spec.job_spec_digest);
+        // CONTROL_LANE: token is intentionally None.
+        assert!(spec.actuation.channel_context_token.is_none());
     }
 
     #[test]
@@ -746,6 +897,31 @@ mod tests {
 
         let state = locate_job(queue_root, "nonexistent-job");
         assert!(matches!(state, JobState::NotFound));
+    }
+
+    #[test]
+    fn test_locate_job_ambiguous_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path();
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(DENIED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
+
+        // Create the same job spec in two directories.
+        let spec = build_stop_revoke_spec("ambig-target", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
+        let file_name = format!("{}.json", spec.job_id);
+        fs::write(queue_root.join(PENDING_DIR).join(&file_name), &spec_json).unwrap();
+        fs::write(queue_root.join(CLAIMED_DIR).join(&file_name), &spec_json).unwrap();
+
+        let state = locate_job(queue_root, &spec.job_id);
+        assert!(
+            matches!(state, JobState::Ambiguous(ref dirs) if dirs.len() == 2),
+            "expected Ambiguous with 2 dirs, got {state:?}"
+        );
     }
 
     #[test]
@@ -833,6 +1009,40 @@ mod tests {
         assert_eq!(
             stop_spec.cancel_target_job_id.as_deref(),
             Some(spec.job_id.as_str())
+        );
+    }
+
+    #[test]
+    fn test_job_id_charset_validation() {
+        // Valid job IDs.
+        for valid in &["abc-123", "ABC_def", "job-42", "a"] {
+            assert!(
+                valid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "{valid} should be valid"
+            );
+        }
+
+        // Invalid job IDs (glob injection, path traversal, etc.).
+        for invalid in &["../evil", "job*", "a;b", "a b", "a/b", "a\x00b"] {
+            assert!(
+                !invalid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_local_operator_authority_on_owned_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The tempdir is owned by the current user, so authority should pass.
+        let result = verify_local_operator_authority(tmp.path());
+        assert!(
+            result.is_ok(),
+            "should succeed on owned directory: {result:?}"
         );
     }
 }

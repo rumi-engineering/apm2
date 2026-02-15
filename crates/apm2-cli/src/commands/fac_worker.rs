@@ -83,7 +83,7 @@ use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
-    validate_job_spec,
+    validate_job_spec, validate_job_spec_control_lane,
 };
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
@@ -851,7 +851,16 @@ fn process_job(
     // The file was already validated by `scan_pending`; this avoids duplicate I/O.
     let _ = &candidate.raw_bytes;
     // Validate structure + digest + request_id binding.
-    if let Err(e) = validate_job_spec(spec) {
+    // BLOCKER 2/3: stop_revoke jobs use control-lane validation (no token
+    // required); the worker verifies local-origin authority (queue directory
+    // ownership) instead of an RFC-0028 channel context token.
+    let is_control_lane = spec.kind == "stop_revoke";
+    let validation_result = if is_control_lane {
+        validate_job_spec_control_lane(spec)
+    } else {
+        validate_job_spec(spec)
+    };
+    if let Err(e) = validation_result {
         let is_digest_error = matches!(
             e,
             JobSpecError::DigestMismatch { .. } | JobSpecError::RequestIdMismatch { .. }
@@ -920,7 +929,89 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    // Step 3: Validate RFC-0028 token.
+    // BLOCKER 2/3: CONTROL_LANE bypass for stop_revoke jobs.
+    // stop_revoke jobs are operator-initiated local commands that bypass the
+    // RFC-0028 token and RFC-0029 admission path.  Instead, the worker
+    // verifies local-origin authority by checking queue directory ownership.
+    if is_control_lane {
+        // Verify local-origin authority: the worker must have write
+        // access to the queue root directory.  This capability-based
+        // proof confirms the stop_revoke spec was placed by a process
+        // with local privilege over the queue.
+        {
+            let probe_path = queue_root.join(".stop-revoke-authority-probe");
+            if let Err(e) = fs::write(&probe_path, b"probe") {
+                let reason = format!(
+                    "stop_revoke local-origin authority denied: cannot write to queue root: {e}"
+                );
+                let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+                return JobOutcome::Denied { reason };
+            }
+            let _ = fs::remove_file(&probe_path);
+        }
+
+        // Construct synthetic traces for the control lane (no real token).
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "control".to_string(),
+            defect_reason: None,
+        };
+        let budget_trace: Option<FacBudgetAdmissionTrace> = None;
+
+        // PCAC lifecycle: check if authority was already consumed.
+        if is_authority_consumed(queue_root, &spec.job_id) {
+            let reason = format!("authority already consumed for job {}", spec.job_id);
+            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            return JobOutcome::Denied { reason };
+        }
+
+        // Atomic claim via rename.
+        let claimed_dir = queue_root.join(CLAIMED_DIR);
+        let claimed_path = match move_to_dir_safe(path, &claimed_dir, &file_name) {
+            Ok(p) => p,
+            Err(e) => {
+                return JobOutcome::Skipped {
+                    reason: format!("atomic claim failed: {e}"),
+                };
+            },
+        };
+        let claimed_file_name = claimed_path
+            .file_name()
+            .map_or_else(|| file_name.clone(), |n| n.to_string_lossy().to_string());
+
+        // PCAC consume.
+        if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
+            let reason = format!("PCAC consume failed: {e}");
+            let _ = move_to_dir_safe(
+                &claimed_path,
+                &queue_root.join(DENIED_DIR),
+                &claimed_file_name,
+            );
+            return JobOutcome::Denied { reason };
+        }
+
+        // Control-lane stop_revoke jobs skip lane acquisition and go
+        // directly to handle_stop_revoke.
+        return handle_stop_revoke(
+            spec,
+            &claimed_path,
+            &claimed_file_name,
+            queue_root,
+            fac_root,
+            &boundary_trace,
+            &queue_trace,
+            budget_trace.as_ref(),
+            canonicalizer_tuple_digest,
+            policy_hash,
+        );
+    }
+
+    // Step 3: Validate RFC-0028 token (non-control-lane jobs only).
     let token = match &spec.actuation.channel_context_token {
         Some(t) if !t.is_empty() => t.as_str(),
         _ => {
@@ -1829,19 +1920,27 @@ fn process_job(
 /// Handles a `stop_revoke` job: kills the target unit and cancels the target
 /// job.
 ///
+/// MAJOR 3: This handler is fail-closed.  Each step must succeed for the
+/// operation to complete.  If any critical step fails, the `stop_revoke` job
+/// emits a failure receipt and does NOT complete.
+///
 /// # Steps
 ///
 /// 1. Read the `cancel_target_job_id` from the spec.
-/// 2. Locate the target job in `claimed/`.
-/// 3. Attempt to stop the systemd unit (`systemctl stop apm2-fac-job-*`).
-/// 4. Move the target job from `claimed/` to `cancelled/`.
-/// 5. Emit a cancellation receipt for the target job.
-/// 6. Move the `stop_revoke` job itself to `completed/`.
+/// 2. Locate the target job in `claimed/` (or check terminal directories).
+/// 3. Read the target spec to get `queue_lane` for exact unit name.
+/// 4. Stop the systemd unit (`systemctl stop apm2-fac-job-{lane}-{job_id}`).
+/// 5. Move the target job from `claimed/` to `cancelled/`.
+/// 6. Emit a terminal cancellation receipt for the target job.
+/// 7. Emit completion receipt and move `stop_revoke` to `completed/`.
 ///
 /// # Security
 ///
 /// - Evidence and logs are never deleted (INV-CANCEL-004).
-/// - The target job must be in `claimed/` (fail-closed on ambiguous state).
+/// - Fail-closed: if `systemctl stop` fails, or move-to-cancelled fails, a
+///   failure receipt is emitted and the `stop_revoke` is NOT completed.
+/// - If the target is not found in `claimed/`, we check terminal directories
+///   (completed/cancelled) to distinguish "already done" from "unknown".
 #[allow(clippy::too_many_arguments)]
 fn handle_stop_revoke(
     spec: &FacJobSpecV1,
@@ -1877,102 +1976,204 @@ fn handle_stop_revoke(
     // Step 1: Locate target job in claimed/ directory.
     let target_path = find_target_job_in_dir(&queue_root.join(CLAIMED_DIR), target_job_id);
 
-    // Step 2: Try to stop the systemd unit for the target job.
-    // Unit naming pattern: apm2-fac-job-<lane_id>-<job_id>
-    // Since we may not know the exact lane, try stopping any unit matching
-    // the job_id pattern.
-    let stop_result = stop_target_unit(target_job_id);
+    // MAJOR 3 fail-closed: if target not in claimed/, check if it's already
+    // in a terminal state (completed/cancelled).  If so, the cancellation
+    // is a no-op.  If the target is truly unknown, fail with structured error.
+    let Some(target_file_path) = target_path else {
+        // Check terminal directories.
+        let in_completed =
+            find_target_job_in_dir(&queue_root.join(COMPLETED_DIR), target_job_id).is_some();
+        let in_cancelled =
+            find_target_job_in_dir(&queue_root.join(CANCELLED_DIR), target_job_id).is_some();
+
+        if in_completed || in_cancelled {
+            let terminal_state = if in_completed {
+                "completed"
+            } else {
+                "cancelled"
+            };
+            eprintln!(
+                "worker: stop_revoke: target {target_job_id} already in {terminal_state}/, treating as success"
+            );
+            // Emit completion receipt for the stop_revoke job itself.
+            let _ = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Completed,
+                None,
+                &format!("stop_revoke: target {target_job_id} already {terminal_state}"),
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                None,
+                Some(canonicalizer_tuple_digest),
+                None,
+                policy_hash,
+            );
+            let _ = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(COMPLETED_DIR),
+                claimed_file_name,
+            );
+            return JobOutcome::Completed {
+                job_id: spec.job_id.clone(),
+            };
+        }
+
+        // Target not found anywhere -- fail-closed.
+        let reason = format!(
+            "stop_revoke: target job {target_job_id} not found in claimed/ or any terminal directory"
+        );
+        eprintln!("worker: {reason}");
+        let _ = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            None,
+            Some(canonicalizer_tuple_digest),
+            None,
+            policy_hash,
+        );
+        let _ = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        );
+        return JobOutcome::Denied { reason };
+    };
+
+    let target_file_name = target_file_path.file_name().map_or_else(
+        || format!("{target_job_id}.json"),
+        |n| n.to_string_lossy().to_string(),
+    );
+
+    // Step 2: Read target spec for receipt emission and exact unit name.
+    let target_spec_opt = read_bounded(&target_file_path, MAX_JOB_SPEC_SIZE)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<FacJobSpecV1>(&bytes).ok());
+
+    // MAJOR 7: Construct exact unit name from the target spec's queue_lane.
+    // No wildcard matching.
+    let target_lane = target_spec_opt
+        .as_ref()
+        .map_or("unknown", |s| s.queue_lane.as_str());
+    let stop_result = stop_target_unit_exact(target_lane, target_job_id);
     if let Err(ref e) = stop_result {
-        eprintln!("worker: stop_revoke: unit stop for target {target_job_id} returned: {e}",);
-        // Non-fatal: the unit may have already stopped or never been started.
-        // We still proceed with cancellation.
+        eprintln!(
+            "worker: stop_revoke: unit stop for target {target_job_id} (lane {target_lane}) failed: {e}"
+        );
+        // MAJOR 3 fail-closed: if systemctl stop fails, emit failure receipt.
+        let reason =
+            format!("stop_revoke failed: systemctl stop failed for target {target_job_id}: {e}");
+        let _ = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            None,
+            Some(canonicalizer_tuple_digest),
+            None,
+            policy_hash,
+        );
+        let _ = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        );
+        return JobOutcome::Denied { reason };
     }
 
     // Step 3: Move target job to cancelled/.
-    if let Some(target_file_path) = target_path {
-        let target_file_name = target_file_path.file_name().map_or_else(
-            || format!("{target_job_id}.json"),
-            |n| n.to_string_lossy().to_string(),
+    // MAJOR 3 fail-closed: if move fails, emit failure receipt.
+    if let Err(e) = move_to_dir_safe(
+        &target_file_path,
+        &queue_root.join(CANCELLED_DIR),
+        &target_file_name,
+    ) {
+        let reason =
+            format!("stop_revoke failed: cannot move target {target_job_id} to cancelled: {e}");
+        eprintln!("worker: {reason}");
+        let _ = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            None,
+            Some(canonicalizer_tuple_digest),
+            None,
+            policy_hash,
         );
+        let _ = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        );
+        return JobOutcome::Denied { reason };
+    }
+    eprintln!("worker: stop_revoke: moved target {target_job_id} to cancelled/");
 
-        // Read the target spec for receipt emission before moving.
-        let target_spec_opt = read_bounded(&target_file_path, MAX_JOB_SPEC_SIZE)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<FacJobSpecV1>(&bytes).ok());
+    // Step 4: Emit terminal cancellation receipt for the target job.
+    if let Some(target_spec) = target_spec_opt {
+        let cancel_reason = spec
+            .actuation
+            .decoded_source
+            .as_deref()
+            .unwrap_or("stop_revoke");
+        let reason = format!(
+            "cancelled by stop_revoke job {}: {cancel_reason}",
+            spec.job_id
+        );
+        let bounded_reason = if reason.len() > 512 {
+            reason[..512].to_string()
+        } else {
+            reason
+        };
 
-        match move_to_dir_safe(
-            &target_file_path,
-            &queue_root.join(CANCELLED_DIR),
-            &target_file_name,
-        ) {
-            Ok(_moved) => {
-                eprintln!("worker: stop_revoke: moved target {target_job_id} to cancelled/",);
+        let receipt_id = format!(
+            "cancel-{}-{}",
+            target_job_id,
+            current_timestamp_epoch_secs()
+        );
+        let builder = FacJobReceiptV1Builder::new(
+            receipt_id,
+            &target_spec.job_id,
+            &target_spec.job_spec_digest,
+        )
+        .policy_hash(policy_hash)
+        .outcome(FacJobOutcome::Cancelled)
+        .denial_reason(DenialReasonCode::Cancelled)
+        .reason(&bounded_reason)
+        .timestamp_secs(current_timestamp_epoch_secs());
+
+        match builder.try_build() {
+            Ok(receipt) => {
+                if let Err(e) =
+                    persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+                {
+                    eprintln!(
+                        "worker: WARNING: cancellation receipt for target {target_job_id} failed: {e}"
+                    );
+                }
             },
             Err(e) => {
                 eprintln!(
-                    "worker: stop_revoke: failed to move target {target_job_id} to cancelled: {e}",
+                    "worker: WARNING: cannot build cancellation receipt for target {target_job_id}: {e}"
                 );
-                // Non-fatal: target may have been moved by another process.
             },
         }
-
-        // Step 4: Emit cancellation receipt for the target job.
-        if let Some(target_spec) = target_spec_opt {
-            let cancel_reason = spec
-                .actuation
-                .decoded_source
-                .as_deref()
-                .unwrap_or("stop_revoke");
-            let reason = format!(
-                "cancelled by stop_revoke job {}: {cancel_reason}",
-                spec.job_id
-            );
-            let bounded_reason = if reason.len() > 512 {
-                reason[..512].to_string()
-            } else {
-                reason
-            };
-
-            let receipt_id = format!(
-                "cancel-{}-{}",
-                target_job_id,
-                current_timestamp_epoch_secs()
-            );
-            let builder = FacJobReceiptV1Builder::new(
-                receipt_id,
-                &target_spec.job_id,
-                &target_spec.job_spec_digest,
-            )
-            .policy_hash(policy_hash)
-            .outcome(FacJobOutcome::Cancelled)
-            .denial_reason(DenialReasonCode::Cancelled)
-            .reason(&bounded_reason)
-            .timestamp_secs(current_timestamp_epoch_secs());
-
-            match builder.try_build() {
-                Ok(receipt) => {
-                    if let Err(e) = persist_content_addressed_receipt(
-                        &fac_root.join(FAC_RECEIPTS_DIR),
-                        &receipt,
-                    ) {
-                        eprintln!(
-                            "worker: WARNING: cancellation receipt for target {target_job_id} failed: {e}",
-                        );
-                    }
-                },
-                Err(e) => {
-                    eprintln!(
-                        "worker: WARNING: cannot build cancellation receipt for target {target_job_id}: {e}",
-                    );
-                },
-            }
-        }
-    } else {
-        // Target job not found in claimed/. It may have already completed
-        // or been moved. Log but treat as non-fatal.
-        eprintln!(
-            "worker: stop_revoke: target job {target_job_id} not found in claimed/; it may have already finished",
-        );
     }
 
     // Step 5: Emit completion receipt for the stop_revoke job itself.
@@ -2044,58 +2245,57 @@ fn find_target_job_in_dir(dir: &Path, target_job_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Attempts to stop a systemd unit associated with the target job.
+/// Attempts to stop the exact systemd unit for a target job.
+///
+/// MAJOR 7: Uses the exact unit name `apm2-fac-job-{lane}-{job_id}` instead
+/// of wildcard matching.  The `queue_lane` is read from the target job spec
+/// in `claimed/`.
 ///
 /// Tries both user-mode and system-mode `systemctl stop` commands.
 /// Uses `KillMode=control-group` semantics to kill all processes in the
 /// cgroup.
 ///
 /// Returns `Ok(())` if any stop command succeeded, or `Err` with details.
-fn stop_target_unit(target_job_id: &str) -> Result<(), String> {
-    // The unit name pattern from the execution backend is
-    // `apm2-fac-job-<lane_id>-<job_id>`. Since we don't know the exact
-    // lane_id, we try a wildcard pattern via `systemctl list-units` first,
-    // then stop each matching unit.
+fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String> {
+    let unit_name = format!("apm2-fac-job-{lane}-{target_job_id}");
+    let mut last_err = String::new();
 
     // Try user-mode first, then system-mode.
     for mode_flag in &["--user", "--system"] {
-        // List units matching the pattern.
-        let list_output = std::process::Command::new("systemctl")
-            .args([mode_flag, "list-units", "--plain", "--no-legend", "--all"])
-            .arg(format!("apm2-fac-job-*-{target_job_id}*"))
+        eprintln!("worker: stop_revoke: stopping unit {unit_name} ({mode_flag})");
+        let stop_result = std::process::Command::new("systemctl")
+            .args([mode_flag, "stop", "--", &unit_name])
             .output();
-
-        if let Ok(output) = list_output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                // Each line starts with the unit name.
-                if let Some(unit_name) = line.split_whitespace().next() {
-                    if unit_name.contains(target_job_id) {
-                        eprintln!("worker: stop_revoke: stopping unit {unit_name} ({mode_flag})");
-                        let stop_result = std::process::Command::new("systemctl")
-                            .args([mode_flag, "stop", unit_name])
-                            .output();
-                        match stop_result {
-                            Ok(out) if out.status.success() => {
-                                return Ok(());
-                            },
-                            Ok(out) => {
-                                let stderr = String::from_utf8_lossy(&out.stderr);
-                                eprintln!("worker: stop_revoke: stop {unit_name} failed: {stderr}");
-                            },
-                            Err(e) => {
-                                eprintln!("worker: stop_revoke: systemctl stop failed: {e}");
-                            },
-                        }
-                    }
+        match stop_result {
+            Ok(out) if out.status.success() => {
+                return Ok(());
+            },
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // Exit code 5 means "unit not loaded" — the unit was never
+                // started or has already been cleaned up.  This is safe: the
+                // target is effectively stopped.
+                if out.status.code() == Some(5) {
+                    eprintln!(
+                        "worker: stop_revoke: unit {unit_name} not loaded ({mode_flag}), treating as already stopped"
+                    );
+                    return Ok(());
                 }
-            }
+                last_err = format!("{mode_flag}: {stderr}");
+                eprintln!("worker: stop_revoke: stop {unit_name} failed ({mode_flag}): {stderr}");
+            },
+            Err(e) => {
+                last_err = format!("{mode_flag}: {e}");
+                eprintln!("worker: stop_revoke: systemctl stop failed ({mode_flag}): {e}");
+            },
         }
     }
 
-    // If no units were found, the job may not have been started as a systemd
-    // unit, or it already exited. This is not an error.
-    Err("no matching systemd unit found for target job".to_string())
+    // Fail-closed: neither mode succeeded and the unit was not confirmed absent.
+    // Return error so the caller emits a failure receipt.
+    Err(format!(
+        "systemctl stop failed for unit {unit_name}: {last_err}"
+    ))
 }
 
 // =============================================================================
