@@ -209,7 +209,10 @@ impl<'a> BudgetAdmissionEvaluator<'a> {
                     | EconomicsProfileError::InvalidSchemaVersion { .. }
                     | EconomicsProfileError::DuplicateBudgetEntry { .. }
                     | EconomicsProfileError::BudgetEntriesTooLarge { .. }
-                    | EconomicsProfileError::Serialization { .. } => DENY_REASON_PROFILE_INVALID,
+                    | EconomicsProfileError::Serialization { .. }
+                    | EconomicsProfileError::InvalidControlPlaneLimits { .. } => {
+                        DENY_REASON_PROFILE_INVALID
+                    },
                     EconomicsProfileError::Cas(_) => DENY_REASON_PROFILE_UNRESOLVED,
                 }
             })?;

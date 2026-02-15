@@ -16,6 +16,7 @@
 
 use std::io;
 
+use apm2_core::fac::broker_rate_limits::ControlPlaneDenialReceipt;
 use thiserror::Error;
 
 /// Maximum frame size in bytes (16 MiB).
@@ -119,6 +120,20 @@ pub enum ProtocolError {
     Serialization {
         /// Description of the serialization failure.
         reason: String,
+    },
+
+    /// Control-plane budget exceeded (TCK-00568).
+    ///
+    /// The requested operation would exceed a configured control-plane rate
+    /// limit or quota. Carries a structured [`ControlPlaneDenialReceipt`]
+    /// with machine-readable evidence of the exceeded dimension, current
+    /// usage, and the configured limit (INV-CPRL-003).
+    #[error("control-plane budget exceeded: {reason}")]
+    BudgetExceeded {
+        /// Human-readable denial reason.
+        reason: String,
+        /// Structured denial receipt for audit (INV-CPRL-003).
+        receipt: ControlPlaneDenialReceipt,
     },
 }
 

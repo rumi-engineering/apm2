@@ -1520,6 +1520,21 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
 
+/// Wire-framing overhead added on top of JSON-serialized `WorkClaim`
+/// size for queue-byte accounting (TCK-00568).
+///
+/// Accounts for envelope headers, length-prefix framing, and encoding
+/// differences between JSON and binary wire formats. This is an
+/// upper-bound adjustment — it is acceptable to overcount.
+pub const CLAIM_WIRE_FRAMING_OVERHEAD_BYTES: usize = 128;
+
+/// Fallback byte estimate used when `WorkClaim` serialization fails
+/// (TCK-00568).
+///
+/// Set conservatively high so that a serialization failure does not
+/// silently undercount and bypass byte quotas (fail-closed).
+pub const CLAIM_SERIALIZATION_FALLBACK_BYTES: usize = 8192;
+
 /// Maximum supported delegation depth for `DelegateSublease` lineage.
 ///
 /// Keep this aligned with the core delegation ceiling so recursion-depth
@@ -4861,6 +4876,32 @@ pub struct WorkClaim {
     pub permeability_receipt: Option<apm2_core::policy::permeability::PermeabilityReceipt>,
 }
 
+impl WorkClaim {
+    /// Returns a deterministic upper-bound byte estimate for queue-byte
+    /// accounting (TCK-00568).
+    ///
+    /// Uses JSON serialization of the full claim to capture ALL fields
+    /// (`policy_resolution`, `executor_custody_domains`,
+    /// `author_custody_domains`, `permeability_receipt`), then adds a
+    /// fixed framing overhead to ensure the result is a conservative
+    /// upper bound that never undercounts actual payload size.
+    ///
+    /// SECURITY: Lossy estimates that omit variable-length fields enable
+    /// attackers to bypass byte quotas. Serialization-based measurement
+    /// is the canonical defence.
+    pub fn estimate_serialized_bytes(&self) -> u64 {
+        // Serialize to JSON bytes — this is deterministic for the same
+        // field values and captures every field including nested structs.
+        let json_len = serde_json::to_vec(self)
+            .map(|v| v.len())
+            .unwrap_or(CLAIM_SERIALIZATION_FALLBACK_BYTES);
+        // Add fixed overhead for wire framing, envelope metadata, and
+        // any non-JSON representation differences (e.g., bincode would
+        // be smaller but we account for the largest plausible encoding).
+        (json_len + CLAIM_WIRE_FRAMING_OVERHEAD_BYTES) as u64
+    }
+}
+
 mod work_role_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -6401,6 +6442,34 @@ impl PrivilegedResponse {
         })
     }
 
+    /// Creates a budget-denied error response with a structured denial receipt
+    /// (TCK-00568, INV-CPRL-003).
+    ///
+    /// Extracts the `ControlPlaneDenialReceipt` from the `ProtocolError` and
+    /// JSON-serializes it into the error message alongside the human-readable
+    /// reason. This preserves machine-readable audit evidence through the
+    /// protobuf error channel.
+    ///
+    /// Message format: `"control-plane budget denied:
+    /// {reason}\n{receipt_json}"`
+    #[must_use]
+    pub fn budget_denied(err: ProtocolError) -> Self {
+        match err {
+            ProtocolError::BudgetExceeded { reason, receipt } => {
+                let receipt_json =
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "{}".to_string());
+                Self::Error(PrivilegedError {
+                    code: PrivilegedErrorCode::CapabilityRequestRejected.into(),
+                    message: format!("control-plane budget denied: {reason}\n{receipt_json}"),
+                })
+            },
+            other => Self::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("control-plane budget denied: {other}"),
+            ),
+        }
+    }
+
     /// Encodes the response to bytes.
     ///
     /// The format is: [tag: u8][payload: protobuf]
@@ -7335,6 +7404,31 @@ pub struct PrivilegedDispatcher {
     /// - **Happens-before**: store(healthy, Release) in poller happens-before
     ///   load(Acquire) in token issuance paths.
     admission_health_gate: AtomicBool,
+
+    /// TCK-00568: Control-plane budget tracker under a unified mutex.
+    ///
+    /// All control-plane rate limit counters (token issuance, queue enqueue
+    /// ops/bytes, bundle export bytes) and their configured limits are held
+    /// together in a single `Mutex<ControlPlaneBudget>`. This eliminates
+    /// the BLOCKER-level race condition from round 1 where separate atomic
+    /// counters could wrap to `u64::MAX` if `reset_control_plane_counters`
+    /// ran between an increment and its rollback.
+    ///
+    /// # Synchronization Protocol (RS-21)
+    ///
+    /// - **Protected data**: All control-plane counters and limits.
+    /// - **Writers**: `admit_queue_enqueue()`, `admit_bundle_export()`,
+    ///   `validate_channel_boundary_and_issue_context_token_with_flow()`
+    ///   (concurrent from multiple session/operator handlers).
+    /// - **Reset writers**: `reset_control_plane_counters()` called at tick
+    ///   advancement boundaries by the daemon health poller.
+    /// - **Lock acquisition**: All operations acquire the mutex, perform
+    ///   check-then-increment atomically, and release. No `.await` is held
+    ///   across the lock. Lock contention is bounded by the short critical
+    ///   section (counter read + compare + write).
+    /// - **Happens-before**: Lock acquire/release provides full happens-before
+    ///   ordering between all counter operations and resets.
+    control_plane_budget: Mutex<apm2_core::fac::broker_rate_limits::ControlPlaneBudget>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -7842,6 +7936,31 @@ impl BoundaryFlowRuntimeState {
     }
 }
 
+/// Converts a `ControlPlaneBudgetError` from the core budget tracker into a
+/// structured `ProtocolError::BudgetExceeded` with the denial receipt.
+fn budget_error_to_protocol_error(
+    err: apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError,
+) -> ProtocolError {
+    match err {
+        apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::BudgetExceeded {
+            reason,
+            receipt,
+        } => ProtocolError::BudgetExceeded { reason, receipt },
+        apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::CounterOverflow {
+            dimension,
+            receipt,
+        } => ProtocolError::BudgetExceeded {
+            reason: format!("counter overflow: {dimension}"),
+            receipt,
+        },
+        apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::InvalidLimits { detail } => {
+            ProtocolError::Serialization {
+                reason: format!("invalid control-plane limits: {detail}"),
+            }
+        },
+    }
+}
+
 impl PrivilegedDispatcher {
     /// Builds a channel-boundary check from daemon-classified tool context.
     ///
@@ -7994,6 +8113,49 @@ impl PrivilegedDispatcher {
             )]);
         }
 
+        // TCK-00568: Control-plane token issuance rate limit.
+        // INV-CPRL-002: Budget check occurs BEFORE any state mutation or
+        // token issuance. Acquires the unified control-plane budget mutex
+        // for atomic check-and-increment (fixes BLOCKER race condition
+        // from round 1 where separate atomic counters could wrap to
+        // u64::MAX on concurrent reset).
+        {
+            let mut budget = self
+                .control_plane_budget
+                .lock()
+                .expect("control_plane_budget mutex poisoned");
+            if let Err(e) = budget.admit_token_issuance() {
+                let receipt = match &e {
+                    apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::BudgetExceeded {
+                        receipt, ..
+                    }
+                    | apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::CounterOverflow {
+                        receipt, ..
+                    } => Some(receipt.clone()),
+                    apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::InvalidLimits {
+                        ..
+                    } => None,
+                };
+                let detail = format!("admission denied: {e}");
+                let defect = receipt.map_or_else(
+                    || {
+                        ChannelBoundaryDefect::new(
+                            ChannelViolationClass::MissingChannelMetadata,
+                            detail.clone(),
+                        )
+                    },
+                    |r| {
+                        ChannelBoundaryDefect::with_budget_denial(
+                            ChannelViolationClass::MissingChannelMetadata,
+                            detail.clone(),
+                            r,
+                        )
+                    },
+                );
+                return Err(vec![defect]);
+            }
+        }
+
         let check = self.build_channel_boundary_check_with_flow(
             tool_class,
             policy_verified,
@@ -8141,6 +8303,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8231,6 +8399,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8338,6 +8512,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8423,6 +8603,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8448,6 +8634,96 @@ impl PrivilegedDispatcher {
     /// in `set_admission_health_gate`.
     pub fn admission_health_gate_passed(&self) -> bool {
         self.admission_health_gate.load(Ordering::Acquire)
+    }
+
+    /// Resets all control-plane budget counters for a new budget window
+    /// (TCK-00568).
+    ///
+    /// Called at tick advancement boundaries by the daemon tick driver.
+    /// Concurrent requests that are in-flight will observe the reset on
+    /// their next lock acquisition.
+    pub fn reset_control_plane_counters(&self) {
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        budget.reset();
+    }
+
+    /// Returns the current token issuance count (observability).
+    #[must_use]
+    pub fn token_issuance_count(&self) -> u64 {
+        self.control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned")
+            .tokens_issued()
+    }
+
+    /// Updates the control-plane limits from an `EconomicsProfile`
+    /// (TCK-00568).
+    ///
+    /// Called when a new profile is loaded (startup or hot-reload). Replaces
+    /// limits and resets counters to start a fresh budget window with the
+    /// new limits.
+    ///
+    /// Wired into `DispatcherState` construction so that
+    /// `EconomicsProfile::control_plane_limits` values are applied to the
+    /// active broker state at runtime.
+    pub fn set_control_plane_limits(
+        &self,
+        limits: apm2_core::fac::broker_rate_limits::ControlPlaneLimits,
+    ) {
+        if let Err(e) = limits.validate() {
+            warn!(
+                error = %e,
+                "Ignoring invalid control-plane limits (fail-closed, keeping current limits)"
+            );
+            return;
+        }
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        // Replace the budget with the new limits and reset counters.
+        *budget = apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(limits)
+            .expect("limits already validated");
+    }
+
+    /// Checks queue enqueue admission against control-plane budget
+    /// (TCK-00568).
+    ///
+    /// Acquires the control-plane budget mutex and performs a unified
+    /// check-then-increment for both the operation count and byte count.
+    /// Returns `Ok(())` on admission, or `Err` with a structured
+    /// `ProtocolError::BudgetExceeded` if the budget would be exceeded.
+    ///
+    /// INV-CPRL-002: Budget check occurs BEFORE any state mutation.
+    pub fn admit_queue_enqueue(&self, bytes: u64) -> Result<(), ProtocolError> {
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        budget
+            .admit_queue_enqueue(bytes)
+            .map_err(budget_error_to_protocol_error)
+    }
+
+    /// Checks bundle export admission against control-plane budget
+    /// (TCK-00568).
+    ///
+    /// Acquires the control-plane budget mutex and performs a unified
+    /// check-then-increment. Returns `Ok(())` on admission, or `Err`
+    /// with a structured `ProtocolError::BudgetExceeded`.
+    ///
+    /// INV-CPRL-002: Budget check occurs BEFORE any state mutation.
+    pub fn admit_bundle_export(&self, bytes: u64) -> Result<(), ProtocolError> {
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        budget
+            .admit_bundle_export(bytes)
+            .map_err(budget_error_to_protocol_error)
     }
 
     /// Sets the boundary ID for TCK-00565 token binding contract.
@@ -8752,6 +9028,25 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Applies control-plane budget limits from an `EconomicsProfile`
+    /// (TCK-00568).
+    ///
+    /// If `limits` is `Some`, validates and applies the limits. If `None`,
+    /// keeps the default limits (fail-safe — default limits are enforced).
+    ///
+    /// This builder is called during `DispatcherState` construction so that
+    /// profile-driven limits are active from daemon startup.
+    #[must_use]
+    pub fn with_economics_control_plane_limits(
+        self,
+        limits: Option<apm2_core::fac::broker_rate_limits::ControlPlaneLimits>,
+    ) -> Self {
+        if let Some(limits) = limits {
+            self.set_control_plane_limits(limits);
+        }
         self
     }
 
@@ -10579,6 +10874,15 @@ impl PrivilegedDispatcher {
                     format!("authority binding validation failed: {auth_err}"),
                 ));
             }
+        }
+
+        // TCK-00568: Control-plane queue enqueue rate limit.
+        // INV-CPRL-002: Budget check occurs BEFORE state mutation (register_claim).
+        // SECURITY: Use serialization-based byte estimate that accounts for ALL
+        // WorkClaim fields (policy_resolution, custody domains, permeability_receipt).
+        let estimated_claim_bytes = claim.estimate_serialized_bytes();
+        if let Err(e) = self.admit_queue_enqueue(estimated_claim_bytes) {
+            return Ok(PrivilegedResponse::budget_denied(e));
         }
 
         let claim = match self.work_registry.register_claim(claim) {
@@ -16188,6 +16492,13 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // TCK-00568: Control-plane bundle export rate limit.
+        // INV-CPRL-002: Budget check occurs BEFORE any state mutation (CAS store).
+        #[allow(clippy::cast_possible_truncation)]
+        if let Err(e) = self.admit_bundle_export(request.bundle_bytes.len() as u64) {
+            return Ok(PrivilegedResponse::budget_denied(e));
+        }
+
         // Require CAS to be configured (fail-closed)
         let Some(cas) = &self.cas else {
             return Ok(PrivilegedResponse::error(
@@ -18990,6 +19301,157 @@ mod tests {
                 binding.canonicalizer_tuple_digest, [0u8; 32],
                 "canonicalizer tuple digest must be non-zero"
             );
+        }
+    }
+
+    mod budget_denial_receipt_propagation {
+        use super::*;
+
+        /// TCK-00568: Token issuance denial propagates structured receipt
+        /// through `ChannelBoundaryDefect`.
+        #[test]
+        fn token_issuance_denial_includes_receipt_in_defect() {
+            let dispatcher = PrivilegedDispatcher::new();
+            dispatcher.set_admission_health_gate(true);
+            // Set limits to 0 tokens — all issuance denied (fail-closed).
+            dispatcher.set_control_plane_limits(
+                apm2_core::fac::broker_rate_limits::ControlPlaneLimits {
+                    max_token_issuance: 0,
+                    ..apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
+                },
+            );
+
+            let signer = apm2_core::crypto::Signer::generate();
+            let issued_at_secs = 1_000_000;
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                "lease-budget-test",
+                "REQ-BUDGET",
+                issued_at_secs,
+                &ToolClass::Execute,
+                true,
+                true,
+                true,
+                true,
+                BoundaryFlowRuntimeState::allow_all(true),
+            );
+
+            let defects = result.expect_err("zero-limit token issuance should be denied");
+            assert_eq!(defects.len(), 1, "should produce exactly one defect");
+            let defect = &defects[0];
+            assert!(
+                defect.detail.contains("admission denied"),
+                "detail should mention admission denied: {:?}",
+                defect.detail
+            );
+            let receipt = defect
+                .budget_denial_receipt
+                .as_ref()
+                .expect("defect must carry a ControlPlaneDenialReceipt (INV-CPRL-003)");
+            assert_eq!(
+                receipt.dimension,
+                apm2_core::fac::broker_rate_limits::ControlPlaneDimension::TokenIssuance
+            );
+            assert_eq!(receipt.limit, 0);
+            assert_eq!(receipt.current_usage, 0);
+            assert_eq!(receipt.requested_increment, 1);
+        }
+
+        /// TCK-00568: `ClaimWork`/`PublishChangeSet` denial produces a
+        /// `PrivilegedResponse::Error` with JSON-serialized denial receipt
+        /// in the message.
+        #[test]
+        fn budget_denied_response_includes_json_receipt() {
+            let receipt = apm2_core::fac::broker_rate_limits::ControlPlaneDenialReceipt {
+                dimension:
+                    apm2_core::fac::broker_rate_limits::ControlPlaneDimension::QueueEnqueueOps,
+                current_usage: 100,
+                limit: 100,
+                requested_increment: 1,
+                reason: "broker_queue_enqueue_rate_exceeded".to_string(),
+            };
+            let err = ProtocolError::BudgetExceeded {
+                reason: "broker_queue_enqueue_rate_exceeded".to_string(),
+                receipt: receipt.clone(),
+            };
+
+            let response = PrivilegedResponse::budget_denied(err);
+            match response {
+                PrivilegedResponse::Error(ref e) => {
+                    assert!(
+                        e.message.contains("control-plane budget denied"),
+                        "message should contain denial prefix: {:?}",
+                        e.message
+                    );
+                    // The message must contain JSON-serialized receipt for audit.
+                    let json_part = e
+                        .message
+                        .split('\n')
+                        .nth(1)
+                        .expect("message must have newline-separated receipt JSON");
+                    let parsed: apm2_core::fac::broker_rate_limits::ControlPlaneDenialReceipt =
+                        serde_json::from_str(json_part)
+                            .expect("receipt JSON must deserialize to ControlPlaneDenialReceipt");
+                    assert_eq!(parsed, receipt);
+                },
+                other => panic!("expected Error variant, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00568: `with_economics_control_plane_limits` applies
+        /// non-default limits at construction time.
+        #[test]
+        fn with_economics_control_plane_limits_applies_limits() {
+            let custom_limits = apm2_core::fac::broker_rate_limits::ControlPlaneLimits {
+                max_token_issuance: 2,
+                max_queue_enqueue_ops: 1,
+                max_queue_bytes: 64,
+                max_bundle_export_bytes: 128,
+            };
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_economics_control_plane_limits(Some(custom_limits));
+            dispatcher.set_admission_health_gate(true);
+
+            // Issue 2 tokens (should succeed).
+            let signer = apm2_core::crypto::Signer::generate();
+            for i in 0..2 {
+                let result = dispatcher
+                    .validate_channel_boundary_and_issue_context_token_with_flow(
+                        &signer,
+                        "lease-limit-test",
+                        &format!("REQ-{i}"),
+                        1_000_000,
+                        &ToolClass::Execute,
+                        true,
+                        true,
+                        true,
+                        true,
+                        BoundaryFlowRuntimeState::allow_all(true),
+                    );
+                assert!(result.is_ok(), "token {i} should be admitted with limit=2");
+            }
+
+            // Third token should be denied.
+            let result = dispatcher.validate_channel_boundary_and_issue_context_token_with_flow(
+                &signer,
+                "lease-limit-test",
+                "REQ-DENIED",
+                1_000_000,
+                &ToolClass::Execute,
+                true,
+                true,
+                true,
+                true,
+                BoundaryFlowRuntimeState::allow_all(true),
+            );
+            let defects = result.expect_err("third token should be denied with limit=2");
+            assert_eq!(defects.len(), 1);
+            let receipt = defects[0]
+                .budget_denial_receipt
+                .as_ref()
+                .expect("denial must carry receipt");
+            assert_eq!(receipt.current_usage, 2);
+            assert_eq!(receipt.limit, 2);
         }
     }
 
@@ -35155,6 +35617,175 @@ mod tests {
                 },
                 other => panic!("Expected rejection for invalid risk tier, got: {other:?}"),
             }
+        }
+    }
+
+    // ========================================================================
+    // WorkClaim byte estimation regression tests (TCK-00568 security MAJOR fix)
+    // ========================================================================
+
+    mod work_claim_byte_estimation {
+        use super::*;
+
+        fn minimal_claim() -> WorkClaim {
+            WorkClaim {
+                work_id: "W-001".to_string(),
+                lease_id: "L-001".to_string(),
+                actor_id: "A-001".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "ref-001".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            }
+        }
+
+        #[test]
+        fn estimate_includes_policy_resolution_bytes() {
+            let mut claim = minimal_claim();
+            let base_estimate = claim.estimate_serialized_bytes();
+
+            // Inflate policy_resolved_ref with a large string.
+            claim.policy_resolution.policy_resolved_ref = "x".repeat(4096);
+            let inflated_estimate = claim.estimate_serialized_bytes();
+
+            // The estimate MUST grow by at least the net string growth
+            // (4096 - len("ref-001") = 4089). Use 4000 as a conservative
+            // threshold to avoid brittleness from JSON framing variance.
+            assert!(
+                inflated_estimate >= base_estimate + 4000,
+                "estimate did not account for policy_resolution growth: \
+                 base={base_estimate}, inflated={inflated_estimate}"
+            );
+        }
+
+        #[test]
+        fn estimate_includes_custody_domain_vectors() {
+            let mut claim = minimal_claim();
+            let base_estimate = claim.estimate_serialized_bytes();
+
+            // Add 100 custody domains of 100 bytes each (10 KB total).
+            let domains: Vec<String> = (0..100).map(|i| format!("domain-{i:0>94}")).collect();
+            claim.executor_custody_domains = domains.clone();
+            claim.author_custody_domains = domains;
+            let inflated_estimate = claim.estimate_serialized_bytes();
+
+            // Should grow by at least 20KB (100 * 100 * 2 domains).
+            assert!(
+                inflated_estimate >= base_estimate + 20_000,
+                "estimate did not account for custody domain growth: \
+                 base={base_estimate}, inflated={inflated_estimate}"
+            );
+        }
+
+        #[test]
+        fn estimate_includes_permeability_receipt() {
+            use apm2_core::policy::permeability::{AuthorityVector, PermeabilityReceiptBuilder};
+
+            let mut claim = minimal_claim();
+            let base_estimate = claim.estimate_serialized_bytes();
+
+            // Attach a permeability receipt with non-trivial string fields.
+            let parent = AuthorityVector::top();
+            let overlay = AuthorityVector::bottom();
+            let receipt = PermeabilityReceiptBuilder::new(
+                "R-".to_string() + &"z".repeat(256),
+                parent,
+                overlay,
+            )
+            .delegator_actor_id("delegator-".to_string() + &"a".repeat(256))
+            .delegate_actor_id("delegate-".to_string() + &"b".repeat(256))
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(2_000_000)
+            .policy_root_hash([0u8; 32])
+            .build()
+            .expect("receipt build must succeed");
+            claim.permeability_receipt = Some(receipt);
+            let inflated_estimate = claim.estimate_serialized_bytes();
+
+            // Receipt adds non-trivial bytes — at minimum 500+ for the
+            // string fields alone, plus hashes, authority vectors, etc.
+            assert!(
+                inflated_estimate > base_estimate + 500,
+                "estimate did not account for permeability_receipt: \
+                 base={base_estimate}, inflated={inflated_estimate}"
+            );
+        }
+
+        #[test]
+        fn estimate_is_upper_bound_of_json_serialization() {
+            let claim = minimal_claim();
+            let json_bytes = serde_json::to_vec(&claim).unwrap();
+            let estimate = claim.estimate_serialized_bytes();
+
+            // Estimate must be >= actual JSON length (upper bound invariant).
+            assert!(
+                estimate >= json_bytes.len() as u64,
+                "estimate ({estimate}) is less than actual JSON size ({})",
+                json_bytes.len()
+            );
+        }
+
+        #[test]
+        fn estimate_never_undercounts_large_claims() {
+            // Construct a maximally large claim to prove the estimator
+            // does not undercount even adversarial payloads.
+            let claim = WorkClaim {
+                work_id: "W-".to_string() + &"x".repeat(1024),
+                lease_id: "L-".to_string() + &"y".repeat(1024),
+                actor_id: "A-".to_string() + &"z".repeat(1024),
+                role: WorkRole::GateExecutor,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "ref-".to_string() + &"p".repeat(4096),
+                    resolved_policy_hash: [0xFFu8; 32],
+                    capability_manifest_hash: [0xFFu8; 32],
+                    context_pack_hash: [0xFFu8; 32],
+                    role_spec_hash: [0xFFu8; 32],
+                    context_pack_recipe_hash: [0xFFu8; 32],
+                    resolved_risk_tier: 4,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: Some([0xFFu8; 32]),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                executor_custody_domains: (0..200)
+                    .map(|i| format!("exec-domain-{i:0>200}"))
+                    .collect(),
+                author_custody_domains: (0..200)
+                    .map(|i| format!("author-domain-{i:0>200}"))
+                    .collect(),
+                permeability_receipt: None,
+            };
+
+            let json_bytes = serde_json::to_vec(&claim).unwrap();
+            let estimate = claim.estimate_serialized_bytes();
+
+            // Upper-bound invariant: estimate >= actual serialized size.
+            assert!(
+                estimate >= json_bytes.len() as u64,
+                "SECURITY: estimate ({estimate}) undercounts actual JSON size ({}) \
+                 for large claim payload",
+                json_bytes.len()
+            );
+            // Sanity: the estimate should be in the right ballpark
+            // (not wildly over — within 2x of actual).
+            assert!(
+                estimate <= (json_bytes.len() as u64) * 2,
+                "estimate ({estimate}) is unreasonably large compared to actual ({})",
+                json_bytes.len()
+            );
         }
     }
 }

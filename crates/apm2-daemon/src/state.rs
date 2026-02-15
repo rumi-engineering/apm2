@@ -663,7 +663,13 @@ impl DispatcherState {
             Arc::clone(&subscription_registry),
         )
         .with_credential_store(credential_store)
-        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
+        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default())
+        // TCK-00568: Wire default baseline economics profile control-plane
+        // limits into the dispatcher at startup.
+        .with_economics_control_plane_limits(
+            apm2_core::economics::EconomicsProfile::default_baseline()
+                .control_plane_limits,
+        );
 
         // Add metrics if provided
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -756,7 +762,13 @@ impl DispatcherState {
             Arc::clone(&subscription_registry),
         )
         .with_credential_store(credential_store)
-        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
+        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default())
+        // TCK-00568: Wire default baseline economics profile control-plane
+        // limits into the dispatcher at startup.
+        .with_economics_control_plane_limits(
+            apm2_core::economics::EconomicsProfile::default_baseline()
+                .control_plane_limits,
+        );
 
         // Add metrics if provided
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -1549,7 +1561,14 @@ impl DispatcherState {
             profile_hashes,
             Arc::clone(&evidence_cas),
         )
-        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
+        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default())
+        // TCK-00568: Wire default baseline economics profile control-plane
+        // limits into the dispatcher at startup. This ensures configured
+        // budgets are enforced from daemon initialization (not deferred).
+        .with_economics_control_plane_limits(
+            apm2_core::economics::EconomicsProfile::default_baseline()
+                .control_plane_limits,
+        );
 
         privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))

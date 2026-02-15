@@ -1353,6 +1353,13 @@ async fn async_main(args: Args) -> Result<()> {
                     },
                 };
 
+                // TCK-00568: Reset control-plane budget counters at each tick
+                // boundary. This is the ONLY call site for
+                // `reset_control_plane_counters()` — without it, per-tick
+                // rate limits become permanent process-lifetime quotas.
+                apm2_daemon::protocol::session_dispatch::channel_boundary_dispatcher()
+                    .reset_control_plane_counters();
+
                 // Update the static PrivilegedDispatcher's admission health gate.
                 // Release ordering ensures all health evaluation side-effects are
                 // visible to subsequent Acquire loads in the token issuance path.

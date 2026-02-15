@@ -268,6 +268,8 @@ pub enum DenialReasonCode {
     /// Fail-closed: unparseable digest cannot be used for token binding
     /// validation.
     InvalidCanonicalizerDigest,
+    /// Control-plane rate limit or quota exceeded (TCK-00568).
+    ControlPlaneBudgetDenied,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
