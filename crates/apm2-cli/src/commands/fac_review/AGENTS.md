@@ -288,3 +288,7 @@ pub use types::ReviewRunType;
 - TCK-00518: Gate execution is always local (direct mode). The broker/worker queue mode was removed.
   - `apm2 fac gates` runs all evidence gates locally with bounded test execution via `systemd-run`.
   - `--force` flag wired: bypasses clean-tree requirement (re-run against committed SHA with unrelated modifications).
+- TCK-00605: Review findings from review round 1.
+  - `maybe_auto_merge_if_ready()` now runs on a background thread (fire-and-forget) so git merge operations do not block the `verdict set` response path. Reviewer agents are no longer at risk of hitting internal timeouts due to slow git operations during auto-merge.
+  - `load_findings_bundle()` implements one-time HMAC migration for pre-existing findings bundles: bundles created before HMAC integrity was introduced are migrated on first load (HMAC computed and persisted) rather than rejected. This preserves auto-verdict derivation and `verdict show` for active PRs.
+  - `fetch_pr_body_for_projection()` no longer makes a redundant GitHub API call when the first call returns empty and the local snapshot is also empty.

@@ -783,14 +783,18 @@ struct GateMarkerSpan {
 fn fetch_pr_body_for_projection(owner_repo: &str, pr_number: u32) -> Result<String, String> {
     match github_projection::fetch_pr_body(owner_repo, pr_number) {
         Ok(body) if !body.trim().is_empty() => Ok(body),
-        Ok(_) | Err(_) => {
+        first_result => {
             let snapshot = projection_store::load_pr_body_snapshot(owner_repo, pr_number)?;
             if let Some(body) = snapshot.as_ref()
                 && !body.trim().is_empty()
             {
                 return Ok(body.clone());
             }
-            github_projection::fetch_pr_body(owner_repo, pr_number)
+            // Return the original result rather than making a redundant API call.
+            match first_result {
+                Ok(body) => Ok(body),
+                Err(err) => Err(err),
+            }
         },
     }
 }

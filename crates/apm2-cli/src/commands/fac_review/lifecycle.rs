@@ -1999,11 +1999,26 @@ fn maybe_cleanup_worktree_target(worktree: Option<&str>) {
     });
 }
 
+/// Spawn auto-merge on a background thread (fire-and-forget) so git operations
+/// do not block the verdict set response. Large repos or slow filesystems can
+/// cause `try_fast_forward_main` to take several seconds, which may cause
+/// reviewer agents to hit internal timeouts if run synchronously.
+///
+/// The merge result is logged via lifecycle events but never blocks the caller.
+/// This follows the same pattern as `maybe_cleanup_worktree_target`.
 fn maybe_auto_merge_if_ready(record: &PrLifecycleRecord, source: &str) {
     if record.pr_state != PrLifecycleState::MergeReady {
         return;
     }
 
+    let record = record.clone();
+    let source = source.to_string();
+    std::thread::spawn(move || {
+        maybe_auto_merge_if_ready_inner(&record, &source);
+    });
+}
+
+fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
     let identity = match projection_store::load_pr_identity(&record.owner_repo, record.pr_number) {
         Ok(value) => value,
         Err(err) => {
