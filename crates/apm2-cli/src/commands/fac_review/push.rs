@@ -20,7 +20,9 @@ use super::evidence::{
     run_evidence_gates_with_status,
 };
 use super::gate_cache::GateCache;
-use super::jsonl::{GateCompletedEvent, GateErrorEvent, StageEvent, emit_jsonl, ts_now};
+use super::jsonl::{
+    GateCompletedEvent, GateErrorEvent, StageEvent, emit_jsonl, read_log_error_hint, ts_now,
+};
 use super::projection::{GateResult, sync_gate_status_to_pr};
 use super::types::{
     DispatchReviewResult, ReviewKind, apm2_home_dir, ensure_parent_dir, now_iso8601,
@@ -138,19 +140,19 @@ fn parse_commit_history(raw: &str) -> Vec<CommitSummary> {
 fn resolve_commit_history_base_ref(remote: &str) -> Result<String, String> {
     let candidate = format!("{remote}/main");
     let candidate_commit = format!("{candidate}^{{commit}}");
-    let remote_status = Command::new("git")
+    let remote_probe = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", &candidate_commit])
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve commit history base ref: {err}"))?;
-    if remote_status.success() {
+    if remote_probe.status.success() {
         return Ok(candidate);
     }
 
-    let local_status = Command::new("git")
+    let local_probe = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", "main^{commit}"])
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve commit history base ref: {err}"))?;
-    if local_status.success() {
+    if local_probe.status.success() {
         return Ok("main".to_string());
     }
 
@@ -841,7 +843,6 @@ const PUSH_ATTEMPT_SCHEMA: &str = "apm2.fac.push_attempt.v1";
 const PUSH_STAGE_PASS: &str = "pass";
 const PUSH_STAGE_FAIL: &str = "fail";
 const PUSH_STAGE_SKIPPED: &str = "skipped";
-const ERROR_HINT_MAX_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PushAttemptStage {
@@ -1105,21 +1106,7 @@ fn stage_from_gate_name(gate_name: &str) -> &'static str {
 }
 
 fn normalize_error_hint(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut hint = trimmed
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(trimmed)
-        .trim()
-        .to_string();
-    if hint.chars().count() > ERROR_HINT_MAX_CHARS {
-        hint = hint.chars().take(ERROR_HINT_MAX_CHARS).collect();
-    }
-    Some(hint)
+    super::jsonl::normalize_error_hint(value)
 }
 
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
@@ -1214,10 +1201,7 @@ fn gate_log_path(gate_name: &str) -> Result<PathBuf, String> {
 
 fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
     let path = gate_log_path(gate_name).ok()?;
-    let mut file = super::evidence::open_nofollow(&path).ok()?;
-    let mut content = String::new();
-    std::io::Read::read_to_string(&mut file, &mut content).ok()?;
-    normalize_error_hint(&content)
+    read_log_error_hint(&path)
 }
 
 /// Resolve a failure hint from the per-gate evidence result's exact log path,
@@ -1226,13 +1210,8 @@ fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
 /// job's log file.
 fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     if let Some(ref log_path) = result.log_path {
-        if let Ok(mut file) = super::evidence::open_nofollow(log_path) {
-            let mut content = String::new();
-            if std::io::Read::read_to_string(&mut file, &mut content).is_ok() {
-                if let Some(hint) = normalize_error_hint(&content) {
-                    return Some(hint);
-                }
-            }
+        if let Some(hint) = read_log_error_hint(log_path) {
+            return Some(hint);
         }
     }
     // Fallback: global discovery across all lane/job directories.
@@ -1551,31 +1530,54 @@ pub fn run_push(
         Ok(results) => {
             for gate in &results {
                 let stage = stage_from_gate_name(&gate.gate_name);
+                let log_path = gate
+                    .log_path
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string);
+                let error_hint = if gate.passed {
+                    None
+                } else {
+                    gate_error_hint_from_result(gate).or_else(|| {
+                        normalize_error_hint(&format!("gate {} failed", gate.gate_name))
+                    })
+                };
                 if gate.passed {
                     attempt.set_stage_pass(stage, gate.duration_secs);
                 } else {
-                    let hint = gate_error_hint_from_result(gate).or_else(|| {
-                        normalize_error_hint(&format!("gate {} failed", gate.gate_name))
-                    });
-                    attempt.set_stage_fail(stage, gate.duration_secs, None, hint);
+                    attempt.set_stage_fail(stage, gate.duration_secs, None, error_hint.clone());
                 }
-                let status = if gate.passed { "pass" } else { "fail" }.to_string();
-                let _ = emit_jsonl(&GateCompletedEvent {
-                    event: "gate_completed",
-                    gate: gate.gate_name.clone(),
-                    status: status.clone(),
-                    duration_secs: gate.duration_secs,
-                    ts: ts_now(),
-                });
-                if !gate.passed {
-                    let hint = gate_error_hint_from_result(gate)
-                        .unwrap_or_else(|| "gate failed".to_string());
-                    let _ = emit_jsonl(&GateErrorEvent {
-                        event: "gate_error",
+                if json_output {
+                    let status = if gate.passed { "pass" } else { "fail" }.to_string();
+                    let _ = emit_jsonl(&GateCompletedEvent {
+                        event: "gate_completed",
                         gate: gate.gate_name.clone(),
-                        error: hint,
+                        status,
+                        duration_secs: gate.duration_secs,
+                        log_path: log_path.clone(),
+                        bytes_written: gate.bytes_written,
+                        bytes_total: gate.bytes_total,
+                        was_truncated: gate.was_truncated,
+                        log_bundle_hash: gate.log_bundle_hash.clone(),
+                        error_hint: error_hint.clone(),
                         ts: ts_now(),
                     });
+                    if !gate.passed {
+                        let _ = emit_jsonl(&GateErrorEvent {
+                            event: "gate_error",
+                            gate: gate.gate_name.clone(),
+                            error: error_hint
+                                .clone()
+                                .unwrap_or_else(|| "gate failed".to_string()),
+                            log_path,
+                            duration_secs: Some(gate.duration_secs),
+                            bytes_written: gate.bytes_written,
+                            bytes_total: gate.bytes_total,
+                            was_truncated: gate.was_truncated,
+                            log_bundle_hash: gate.log_bundle_hash.clone(),
+                            ts: ts_now(),
+                        });
+                    }
                 }
             }
             results
@@ -1601,12 +1603,65 @@ pub fn run_push(
                             .or_else(|| normalize_error_hint(&format!("gate {gate_name} failed")));
                         attempt.set_stage_fail(stage, gate_result.duration_secs, None, hint);
                     }
+                    if json_output {
+                        let normalized_status = gate_result.status.to_ascii_lowercase();
+                        let log_path = gate_result.log_path.clone();
+                        let error_hint = if gate_result.status.eq_ignore_ascii_case("PASS") {
+                            None
+                        } else {
+                            gate_result.log_path.as_deref().and_then(|path| {
+                                read_log_error_hint(std::path::Path::new(path))
+                                    .or_else(|| latest_gate_error_hint(&gate_name))
+                            })
+                        };
+                        let _ = emit_jsonl(&GateCompletedEvent {
+                            event: "gate_completed",
+                            gate: gate_name.clone(),
+                            status: normalized_status,
+                            duration_secs: gate_result.duration_secs,
+                            log_path: log_path.clone(),
+                            bytes_written: gate_result.bytes_written,
+                            bytes_total: gate_result.bytes_total,
+                            was_truncated: gate_result.was_truncated,
+                            log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                            error_hint: error_hint.clone(),
+                            ts: ts_now(),
+                        });
+                        if gate_result.status.eq_ignore_ascii_case("FAIL") {
+                            let _ = emit_jsonl(&GateErrorEvent {
+                                event: "gate_error",
+                                gate: gate_name.clone(),
+                                error: error_hint.unwrap_or_else(|| "gate failed".to_string()),
+                                log_path,
+                                duration_secs: Some(gate_result.duration_secs),
+                                bytes_written: gate_result.bytes_written,
+                                bytes_total: gate_result.bytes_total,
+                                was_truncated: gate_result.was_truncated,
+                                log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                                ts: ts_now(),
+                            });
+                        }
+                    }
                 }
             }
             if !mapped_any {
                 let duration = gates_started.elapsed().as_secs();
                 for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
                     attempt.set_stage_fail(stage, duration, None, normalize_error_hint(&err));
+                }
+                if json_output {
+                    let _ = emit_jsonl(&GateErrorEvent {
+                        event: "gate_error",
+                        gate: "unknown".to_string(),
+                        error: normalize_error_hint(&err).unwrap_or_else(|| err.clone()),
+                        log_path: None,
+                        duration_secs: Some(duration),
+                        bytes_written: None,
+                        bytes_total: None,
+                        was_truncated: None,
+                        log_bundle_hash: None,
+                        ts: ts_now(),
+                    });
                 }
             }
             if existing_pr_number > 0 {

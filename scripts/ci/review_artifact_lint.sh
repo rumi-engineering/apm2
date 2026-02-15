@@ -382,10 +382,99 @@ while IFS= read -r review_file; do
     done < <(join_continuations "$review_file")
 done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' -o -name '*PROMPT*.json' \) 2>/dev/null)
 
-# Check 2: Review prompt metadata templates must require head_sha and pr_number binding.
-# Both CODE_QUALITY_PROMPT.cac.json and SECURITY_REVIEW_PROMPT.cac.json must
-# contain metadata block constraints that enforce SHA pinning.
-log_info "Checking review prompt metadata SHA-pinning constraints..."
+# Check 2: Review prompts must enforce CLI-owned identity binding.
+#
+# TCK-00605 moved SHA/PR binding from prose metadata fields into deterministic
+# Rust CLI behavior. Prompt artifacts now must prohibit manual --sha usage and
+# require the canonical workspace-binary CLI command path.
+log_info "Checking review prompt CLI identity-binding constraints..."
+
+validate_prompt_identity_constraints() {
+    local prompt_file="$1"
+    python3 - "$prompt_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+except Exception as exc:
+    print(f"invalid JSON: {exc}")
+    sys.exit(2)
+
+errors = []
+payload = doc.get("payload")
+if not isinstance(payload, dict):
+    errors.append("missing payload object")
+    payload = {}
+
+commands = payload.get("commands")
+if not isinstance(commands, dict):
+    errors.append("missing payload.commands object")
+    commands = {}
+
+constraints = payload.get("constraints")
+if not isinstance(constraints, dict):
+    errors.append("missing payload.constraints object")
+    constraints = {}
+
+expected_prefix = "cargo run -p apm2-cli --"
+binary_prefix = commands.get("binary_prefix")
+if binary_prefix != expected_prefix:
+    errors.append("commands.binary_prefix must equal 'cargo run -p apm2-cli --'")
+
+def require_command(name, prefix, must_include):
+    cmd = commands.get(name)
+    if not isinstance(cmd, str):
+        errors.append(f"commands.{name} must be a string")
+        return
+    if not cmd.startswith(prefix):
+        errors.append(f"commands.{name} must start with '{prefix}'")
+    for token in must_include:
+        if token not in cmd:
+            errors.append(f"commands.{name} must include '{token}'")
+
+require_command("prepare", f"{expected_prefix} fac review prepare", ("--json",))
+require_command("finding", f"{expected_prefix} fac review finding", ("--json",))
+require_command("verdict", f"{expected_prefix} fac review verdict set", ("--json",))
+
+forbidden_ops = constraints.get("forbidden_operations")
+if not isinstance(forbidden_ops, list):
+    errors.append("constraints.forbidden_operations must be an array")
+    forbidden_text = ""
+else:
+    forbidden_text = "\n".join(item.lower() for item in forbidden_ops if isinstance(item, str))
+
+if "--sha" not in forbidden_text:
+    errors.append("constraints.forbidden_operations must explicitly forbid --sha")
+if "auto-derives the sha" not in forbidden_text and "sha is managed by the cli" not in forbidden_text:
+    errors.append("constraints.forbidden_operations must declare CLI-managed SHA binding")
+
+invariants = constraints.get("invariants")
+invariant_text_fragments = []
+if not isinstance(invariants, list):
+    errors.append("constraints.invariants must be an array")
+else:
+    for item in invariants:
+        if isinstance(item, str):
+            invariant_text_fragments.append(item.lower())
+        elif isinstance(item, dict):
+            desc = item.get("description")
+            if isinstance(desc, str):
+                invariant_text_fragments.append(desc.lower())
+
+invariant_text = "\n".join(invariant_text_fragments)
+if "sha is managed by the cli" not in invariant_text:
+    errors.append("constraints.invariants must include 'SHA is managed by the CLI'")
+
+if errors:
+    for err in errors:
+        print(err)
+    sys.exit(1)
+PY
+}
 
 REVIEW_PROMPTS=(
     "${REVIEW_DIR}/CODE_QUALITY_PROMPT.cac.json"
@@ -398,72 +487,26 @@ for prompt_file in "${REVIEW_PROMPTS[@]}"; do
         continue
     fi
 
-    # Verify the metadata template contains head_sha field AND exact-binding constraint
-    if ! grep -q '"head_sha"' "$prompt_file" 2>/dev/null; then
-        log_error "Review prompt ${prompt_file} missing head_sha metadata field"
-        VIOLATIONS=1
+    if prompt_check_output="$(validate_prompt_identity_constraints "$prompt_file" 2>&1)"; then
+        log_info "  ${prompt_file}: CLI identity-binding constraints present"
+        continue
     fi
-    # Strict positive-only check: require "head_sha MUST equal" without any
-    # negation words (NOT, never, don't, no) between MUST and the binding
-    # keyword.  This prevents "head_sha MUST NOT equal" from being accepted.
-    head_sha_binding=$(grep -i 'head_sha.*MUST' "$prompt_file" 2>/dev/null || true)
-    if [[ -z "$head_sha_binding" ]]; then
-        log_error "Review prompt ${prompt_file} missing exact-binding constraint for head_sha (must require equality to reviewed_sha)"
-        VIOLATIONS=1
-    else
-        # Check that a positive binding line exists (no negation between MUST and equal/reviewed_sha)
-        has_positive=0
-        while IFS= read -r binding_line; do
-            # Reject if negation words appear after MUST and before the binding keyword
-            if echo "$binding_line" | grep -qiP 'MUST\s+(NOT|never|no)\b'; then
-                continue  # skip negated lines
-            fi
-            if echo "$binding_line" | grep -qi 'MUST.*equal\|MUST.*reviewed_sha'; then
-                has_positive=1
-                break
-            fi
-        done <<< "$head_sha_binding"
-        if [[ $has_positive -eq 0 ]]; then
-            log_error "Review prompt ${prompt_file} head_sha binding constraint is negated or missing positive equality assertion"
-            VIOLATIONS=1
+    prompt_check_status=$?
+
+    VIOLATIONS=1
+    if [[ $prompt_check_status -eq 2 ]]; then
+        log_error "Review prompt ${prompt_file} is not valid JSON"
+        if [[ -n "$prompt_check_output" ]]; then
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && log_error "  ${line}"
+            done <<< "$prompt_check_output"
         fi
+        continue
     fi
 
-    # Verify the metadata template contains pr_number field AND exact-binding constraint
-    if ! grep -q '"pr_number"' "$prompt_file" 2>/dev/null; then
-        log_error "Review prompt ${prompt_file} missing pr_number metadata field"
-        VIOLATIONS=1
-    fi
-    # Strict positive-only check: require "pr_number MUST equal/match" without
-    # negation words between MUST and the binding keyword.
-    pr_number_binding=$(grep -i 'pr_number.*MUST' "$prompt_file" 2>/dev/null || true)
-    if [[ -z "$pr_number_binding" ]]; then
-        log_error "Review prompt ${prompt_file} missing exact-binding constraint for pr_number (must require exact match)"
-        VIOLATIONS=1
-    else
-        has_positive=0
-        while IFS= read -r binding_line; do
-            if echo "$binding_line" | grep -qiP 'MUST\s+(NOT|never|no)\b'; then
-                continue  # skip negated lines
-            fi
-            if echo "$binding_line" | grep -qi 'MUST.*equal\|MUST.*match\|pr_number.*exact'; then
-                has_positive=1
-                break
-            fi
-        done <<< "$pr_number_binding"
-        if [[ $has_positive -eq 0 ]]; then
-            log_error "Review prompt ${prompt_file} pr_number binding constraint is negated or missing positive equality assertion"
-            VIOLATIONS=1
-        fi
-    fi
-
-    # Verify reviewed_sha is assigned from headRefOid
-    if ! grep -q 'reviewed_sha.*headRefOid\|Set reviewed_sha = headRefOid' "$prompt_file" 2>/dev/null; then
-        log_error "Review prompt ${prompt_file} does not bind reviewed_sha to headRefOid"
-        VIOLATIONS=1
-    fi
-
-    log_info "  ${prompt_file}: metadata constraints present"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log_error "Review prompt ${prompt_file}: ${line}"
+    done <<< "$prompt_check_output"
 done
 
 # Check 3: trusted-reviewers.json must exist and be valid JSON

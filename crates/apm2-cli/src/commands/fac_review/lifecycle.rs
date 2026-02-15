@@ -2238,7 +2238,6 @@ fn enqueue_auto_verdict_candidates(candidates: Vec<AutoVerdictCandidate>, source
     if candidates.is_empty() {
         return;
     }
-    let queued = candidates.len();
     std::thread::spawn(move || {
         let outcome = finalize_auto_verdict_candidates(candidates);
         if outcome.failed > 0 {
@@ -2248,9 +2247,6 @@ fn enqueue_auto_verdict_candidates(candidates: Vec<AutoVerdictCandidate>, source
             );
         }
     });
-    eprintln!(
-        "fac lifecycle: queued {queued} reaper auto-verdict candidate(s) for deferred processing ({source})",
-    );
 }
 
 fn normalize_verdict_decision(decision: &str) -> Result<&'static str, String> {

@@ -6,7 +6,10 @@
 
 use super::dispatch::resolve_worktree_for_sha;
 use super::evidence::run_evidence_gates_with_status;
-use super::jsonl::{StageEvent, emit_jsonl, emit_jsonl_error, ts_now};
+use super::jsonl::{
+    GateCompletedEvent, GateErrorEvent, StageEvent, emit_jsonl, emit_jsonl_error,
+    read_log_error_hint, ts_now,
+};
 use crate::exit_codes::codes as exit_codes;
 
 /// Run the full evidence → review pipeline.
@@ -38,6 +41,29 @@ pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) ->
         Err(err) => {
             if json_output {
                 let _ = emit_jsonl_error("pipeline_error", &err);
+                let _ = emit_jsonl(&StageEvent {
+                    event: "pipeline_completed".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "repo": repo,
+                        "pr_number": pr_number,
+                        "sha": sha,
+                        "passed": false,
+                        "error": err,
+                    }),
+                });
+                let _ = emit_jsonl(&StageEvent {
+                    event: "pipeline_summary".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "schema": "apm2.fac.pipeline.summary.v1",
+                        "repo": repo,
+                        "pr_number": pr_number,
+                        "sha": sha,
+                        "passed": false,
+                        "error": err,
+                    }),
+                });
             } else {
                 eprintln!("pipeline error: {err}");
             }
@@ -69,26 +95,113 @@ fn run_pipeline_inner(
         let _ = emit_jsonl(&StageEvent {
             event: "gates_started".to_string(),
             ts: ts_now(),
-            extra: serde_json::json!({}),
+            extra: serde_json::json!({
+                "repo": repo,
+                "pr_number": pr_number,
+                "sha": sha,
+            }),
         });
     } else {
         eprintln!("pipeline: running evidence gates for PR #{pr_number} sha={sha}");
     }
 
-    let (passed, _) =
-        run_evidence_gates_with_status(&workspace_root, sha, repo, pr_number, None, !json_output)?;
+    let (passed, gate_results) = match run_evidence_gates_with_status(
+        &workspace_root,
+        sha,
+        repo,
+        pr_number,
+        None,
+        !json_output,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            if json_output {
+                let _ = emit_jsonl(&StageEvent {
+                    event: "gates_completed".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "status": "error",
+                        "passed": false,
+                        "error": err.as_str(),
+                    }),
+                });
+            }
+            return Err(err);
+        },
+    };
+
+    if json_output {
+        for gate in &gate_results {
+            let status = if gate.passed { "pass" } else { "fail" }.to_string();
+            let error_hint = if gate.passed {
+                None
+            } else {
+                gate.log_path.as_deref().and_then(read_log_error_hint)
+            };
+            let _ = emit_jsonl(&GateCompletedEvent {
+                event: "gate_completed",
+                gate: gate.gate_name.clone(),
+                status,
+                duration_secs: gate.duration_secs,
+                log_path: gate
+                    .log_path
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string),
+                bytes_written: gate.bytes_written,
+                bytes_total: gate.bytes_total,
+                was_truncated: gate.was_truncated,
+                log_bundle_hash: gate.log_bundle_hash.clone(),
+                error_hint: error_hint.clone(),
+                ts: ts_now(),
+            });
+            if !gate.passed {
+                let _ = emit_jsonl(&GateErrorEvent {
+                    event: "gate_error",
+                    gate: gate.gate_name.clone(),
+                    error: error_hint.unwrap_or_else(|| "gate failed".to_string()),
+                    log_path: gate
+                        .log_path
+                        .as_ref()
+                        .and_then(|path| path.to_str())
+                        .map(str::to_string),
+                    duration_secs: Some(gate.duration_secs),
+                    bytes_written: gate.bytes_written,
+                    bytes_total: gate.bytes_total,
+                    was_truncated: gate.was_truncated,
+                    log_bundle_hash: gate.log_bundle_hash.clone(),
+                    ts: ts_now(),
+                });
+            }
+        }
+    }
+
+    let failed_gates = gate_results
+        .iter()
+        .filter(|gate| !gate.passed)
+        .map(|gate| gate.gate_name.clone())
+        .collect::<Vec<_>>();
 
     if !passed {
         if json_output {
             let _ = emit_jsonl(&StageEvent {
                 event: "gates_completed".to_string(),
                 ts: ts_now(),
-                extra: serde_json::json!({ "passed": false }),
+                extra: serde_json::json!({
+                    "passed": false,
+                    "failed_gates": failed_gates,
+                    "gate_count": gate_results.len(),
+                }),
             });
             let _ = emit_jsonl(&StageEvent {
                 event: "pipeline_completed".to_string(),
                 ts: ts_now(),
-                extra: serde_json::json!({ "passed": false }),
+                extra: serde_json::json!({
+                    "passed": false,
+                    "repo": repo,
+                    "pr_number": pr_number,
+                    "sha": sha,
+                }),
             });
         } else {
             eprintln!("pipeline: evidence gates FAILED — skipping review dispatch");
@@ -100,18 +213,40 @@ fn run_pipeline_inner(
         let _ = emit_jsonl(&StageEvent {
             event: "gates_completed".to_string(),
             ts: ts_now(),
-            extra: serde_json::json!({ "passed": true }),
+            extra: serde_json::json!({
+                "passed": true,
+                "gate_count": gate_results.len(),
+            }),
         });
         let _ = emit_jsonl(&StageEvent {
             event: "dispatch_started".to_string(),
             ts: ts_now(),
-            extra: serde_json::json!({}),
+            extra: serde_json::json!({
+                "repo": repo,
+                "pr_number": pr_number,
+                "sha": sha,
+            }),
         });
     } else {
         eprintln!("pipeline: evidence gates PASSED — dispatching reviews");
     }
 
-    let results = super::dispatch_reviews_with_lifecycle(repo, pr_number, sha, false)?;
+    let results = match super::dispatch_reviews_with_lifecycle(repo, pr_number, sha, false) {
+        Ok(value) => value,
+        Err(err) => {
+            if json_output {
+                let _ = emit_jsonl(&StageEvent {
+                    event: "dispatch_completed".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "status": "error",
+                        "error": err.as_str(),
+                    }),
+                });
+            }
+            return Err(err);
+        },
+    };
     for result in results {
         if json_output {
             let _ = emit_jsonl(&StageEvent {
@@ -140,12 +275,19 @@ fn run_pipeline_inner(
         let _ = emit_jsonl(&StageEvent {
             event: "dispatch_completed".to_string(),
             ts: ts_now(),
-            extra: serde_json::json!({}),
+            extra: serde_json::json!({
+                "status": "pass",
+            }),
         });
         let _ = emit_jsonl(&StageEvent {
             event: "pipeline_completed".to_string(),
             ts: ts_now(),
-            extra: serde_json::json!({ "passed": true }),
+            extra: serde_json::json!({
+                "passed": true,
+                "repo": repo,
+                "pr_number": pr_number,
+                "sha": sha,
+            }),
         });
     } else {
         eprintln!("pipeline: complete");

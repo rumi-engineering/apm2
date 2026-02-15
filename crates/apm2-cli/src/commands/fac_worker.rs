@@ -348,10 +348,21 @@ pub fn run_fac_worker(
                 reason: "scheduler state missing, reconstructing conservatively".to_string(),
                 timestamp_secs: current_timestamp_epoch_secs(),
             };
-            eprintln!(
-                "INFO: scheduler state reconstructed: {} ({}, {})",
-                recovery.schema, recovery.reason, recovery.timestamp_secs
-            );
+            if json_output {
+                emit_worker_event(
+                    "scheduler_recovery",
+                    serde_json::json!({
+                        "schema": recovery.schema,
+                        "reason": recovery.reason,
+                        "timestamp_secs": recovery.timestamp_secs,
+                    }),
+                );
+            } else {
+                eprintln!(
+                    "INFO: scheduler state reconstructed: {} ({}, {})",
+                    recovery.schema, recovery.reason, recovery.timestamp_secs
+                );
+            }
             QueueSchedulerState::new()
         },
         Err(e) => {
@@ -361,11 +372,23 @@ pub fn run_fac_worker(
                     .to_string(),
                 timestamp_secs: current_timestamp_epoch_secs(),
             };
-            eprintln!("WARNING: failed to load scheduler state: {e}, starting fresh");
-            eprintln!(
-                "INFO: scheduler state reconstructed: {} ({}, {})",
-                recovery.schema, recovery.reason, recovery.timestamp_secs
-            );
+            if json_output {
+                emit_worker_event(
+                    "scheduler_recovery",
+                    serde_json::json!({
+                        "schema": recovery.schema,
+                        "reason": recovery.reason,
+                        "timestamp_secs": recovery.timestamp_secs,
+                        "load_error": e,
+                    }),
+                );
+            } else {
+                eprintln!("WARNING: failed to load scheduler state: {e}, starting fresh");
+                eprintln!(
+                    "INFO: scheduler state reconstructed: {} ({}, {})",
+                    recovery.schema, recovery.reason, recovery.timestamp_secs
+                );
+            }
             QueueSchedulerState::new()
         },
     };
@@ -455,22 +478,23 @@ pub fn run_fac_worker(
     match check_or_admit_canonicalizer_tuple(&fac_root) {
         Ok(CanonicalizerTupleCheck::Matched) => {},
         Ok(CanonicalizerTupleCheck::Missing) => {
-            eprintln!(
-                "FATAL: no admitted canonicalizer tuple found. Run 'apm2 fac canonicalizer admit' to bootstrap."
+            output_worker_error(
+                json_output,
+                "no admitted canonicalizer tuple found. run `apm2 fac canonicalizer admit` to bootstrap",
             );
             return exit_codes::GENERIC_ERROR;
         },
         Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple)) => {
-            eprintln!("FATAL: canonicalizer tuple mismatch");
-            eprintln!(
-                "  current: {}/{}",
-                current_tuple.canonicalizer_id, current_tuple.canonicalizer_version
+            output_worker_error(
+                json_output,
+                &format!(
+                    "canonicalizer tuple mismatch (current={}/{}, admitted={}/{}). remedy: re-run broker admission or update binary",
+                    current_tuple.canonicalizer_id,
+                    current_tuple.canonicalizer_version,
+                    admitted_tuple.canonicalizer_id,
+                    admitted_tuple.canonicalizer_version
+                ),
             );
-            eprintln!(
-                "  admitted: {}/{}",
-                admitted_tuple.canonicalizer_id, admitted_tuple.canonicalizer_version
-            );
-            eprintln!("  remedy: re-run broker admission or update binary");
             return exit_codes::GENERIC_ERROR;
         },
         Err(e) => {
@@ -541,6 +565,7 @@ pub fn run_fac_worker(
                 );
             }
 
+            let job_started = Instant::now();
             let lane = parse_queue_lane(&candidate.spec.queue_lane);
             let outcome = if let Err(e) = cycle_scheduler.record_admission(lane) {
                 JobOutcome::Denied {
@@ -568,6 +593,7 @@ pub fn run_fac_worker(
                 cycle_scheduler.record_completion(lane);
                 outcome
             };
+            let duration_secs = job_started.elapsed().as_secs();
 
             match &outcome {
                 JobOutcome::Quarantined { reason } => {
@@ -578,6 +604,8 @@ pub fn run_fac_worker(
                             serde_json::json!({
                                 "job_id": candidate.spec.job_id,
                                 "outcome": "quarantined",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
                                 "reason": reason,
                             }),
                         );
@@ -594,6 +622,8 @@ pub fn run_fac_worker(
                             serde_json::json!({
                                 "job_id": candidate.spec.job_id,
                                 "outcome": "denied",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
                                 "reason": reason,
                             }),
                         );
@@ -610,6 +640,8 @@ pub fn run_fac_worker(
                             serde_json::json!({
                                 "job_id": job_id,
                                 "outcome": "completed",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
                             }),
                         );
                     }
@@ -625,6 +657,8 @@ pub fn run_fac_worker(
                             serde_json::json!({
                                 "job_id": candidate.spec.job_id,
                                 "outcome": "skipped",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
                                 "reason": reason,
                             }),
                         );
@@ -3282,14 +3316,7 @@ fn output_worker_error(json_output: bool, message: &str) {
             }),
         );
     } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "error": "fac_worker_failed",
-                "message": message,
-            }))
-            .unwrap_or_default()
-        );
+        eprintln!("worker error: {message}");
     }
 }
 

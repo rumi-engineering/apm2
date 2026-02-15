@@ -22,7 +22,7 @@ use super::gate_attestation::{
 use super::gate_cache::GateCache;
 use super::jsonl::{
     GateCompletedEvent, GateErrorEvent, GateStartedEvent, StageEvent, emit_jsonl, emit_jsonl_error,
-    ts_now,
+    read_log_error_hint, ts_now,
 };
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::timeout_policy::{
@@ -90,16 +90,27 @@ pub fn run_gates(
                         gate: gate.name.clone(),
                         status: normalized_status,
                         duration_secs: gate.duration_secs,
+                        log_path: gate.log_path.clone(),
+                        bytes_written: gate.bytes_written,
+                        bytes_total: gate.bytes_total,
+                        was_truncated: gate.was_truncated,
+                        log_bundle_hash: gate.log_bundle_hash.clone(),
+                        error_hint: gate.error_hint.clone(),
                         ts: ts_now(),
                     });
-                    if !gate.status.eq_ignore_ascii_case("pass") {
+                    if gate.status.eq_ignore_ascii_case("fail") {
                         let _ = emit_jsonl(&GateErrorEvent {
                             event: "gate_error",
                             gate: gate.name.clone(),
-                            error: format!(
-                                "gate {} finished with status {}",
-                                gate.name, gate.status
-                            ),
+                            error: gate.error_hint.clone().unwrap_or_else(|| {
+                                format!("gate {} failed (see log for details)", gate.name)
+                            }),
+                            log_path: gate.log_path.clone(),
+                            duration_secs: Some(gate.duration_secs),
+                            bytes_written: gate.bytes_written,
+                            bytes_total: gate.bytes_total,
+                            was_truncated: gate.was_truncated,
+                            log_bundle_hash: gate.log_bundle_hash.clone(),
                             ts: ts_now(),
                         });
                     }
@@ -205,6 +216,18 @@ struct GateResult {
     name: String,
     status: String,
     duration_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_written: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    was_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_bundle_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_hint: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,27 +408,32 @@ fn run_gates_inner(
     let mut gates = vec![merge_gate];
     let mut evidence_gates: Vec<GateResult> = gate_results
         .iter()
-        .map(|r| GateResult {
-            name: r.gate_name.clone(),
-            status: if r.passed { "PASS" } else { "FAIL" }.to_string(),
-            duration_secs: r.duration_secs,
+        .map(|r| {
+            let error_hint = if r.passed {
+                None
+            } else {
+                r.log_path.as_deref().and_then(read_log_error_hint)
+            };
+            GateResult {
+                name: r.gate_name.clone(),
+                status: if r.passed { "PASS" } else { "FAIL" }.to_string(),
+                duration_secs: r.duration_secs,
+                log_path: r
+                    .log_path
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string),
+                bytes_written: r.bytes_written,
+                bytes_total: r.bytes_total,
+                was_truncated: r.was_truncated,
+                log_bundle_hash: r.log_bundle_hash.clone(),
+                error_hint,
+            }
         })
         .collect();
     gates.append(&mut evidence_gates);
     if quick {
-        // Keep test visible in summary even when skipped for inner-loop runs.
-        let insert_index = gates
-            .iter()
-            .position(|gate| gate.name == "workspace_integrity")
-            .unwrap_or(gates.len());
-        gates.insert(
-            insert_index,
-            GateResult {
-                name: "test".to_string(),
-                status: "SKIP".to_string(),
-                duration_secs: 0,
-            },
-        );
+        normalize_quick_test_gate(&mut gates);
     }
 
     if emit_human_logs {
@@ -474,7 +502,40 @@ fn evaluate_merge_conflict_gate(
         name: "merge_conflict_main".to_string(),
         status: if passed { "PASS" } else { "FAIL" }.to_string(),
         duration_secs: duration,
+        log_path: None,
+        bytes_written: None,
+        bytes_total: None,
+        was_truncated: None,
+        log_bundle_hash: None,
+        error_hint: None,
     })
+}
+
+fn normalize_quick_test_gate(gates: &mut Vec<GateResult>) {
+    // Preserve a single canonical `test` gate entry in quick mode.
+    if let Some(test_gate) = gates.iter_mut().find(|gate| gate.name == "test") {
+        test_gate.status = "SKIP".to_string();
+        return;
+    }
+
+    let insert_index = gates
+        .iter()
+        .position(|gate| gate.name == "workspace_integrity")
+        .unwrap_or(gates.len());
+    gates.insert(
+        insert_index,
+        GateResult {
+            name: "test".to_string(),
+            status: "SKIP".to_string(),
+            duration_secs: 0,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: None,
+        },
+    );
 }
 
 fn compute_nextest_test_environment() -> Result<Vec<(String, String)>, String> {
@@ -589,6 +650,56 @@ mod tests {
 
         let err = ensure_clean_working_tree(repo, false).expect_err("untracked tree should fail");
         assert!(err.contains("working tree has untracked files"));
+    }
+
+    #[test]
+    fn normalize_quick_test_gate_reuses_existing_test_entry() {
+        let mut gates = vec![
+            GateResult {
+                name: "merge_conflict_main".to_string(),
+                status: "PASS".to_string(),
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                error_hint: None,
+            },
+            GateResult {
+                name: "test".to_string(),
+                status: "PASS".to_string(),
+                duration_secs: 2,
+                log_path: Some("/tmp/test.log".to_string()),
+                bytes_written: Some(10),
+                bytes_total: Some(10),
+                was_truncated: Some(false),
+                log_bundle_hash: Some("b3-256:abc".to_string()),
+                error_hint: None,
+            },
+            GateResult {
+                name: "workspace_integrity".to_string(),
+                status: "PASS".to_string(),
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                error_hint: None,
+            },
+        ];
+
+        normalize_quick_test_gate(&mut gates);
+
+        let test_gates = gates
+            .iter()
+            .filter(|gate| gate.name == "test")
+            .collect::<Vec<_>>();
+        assert_eq!(test_gates.len(), 1);
+        let gate = test_gates[0];
+        assert_eq!(gate.status, "SKIP");
+        assert_eq!(gate.log_path.as_deref(), Some("/tmp/test.log"));
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
