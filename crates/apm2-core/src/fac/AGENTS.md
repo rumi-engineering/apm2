@@ -422,6 +422,18 @@ by another worker).
   must precede lane cleanup. Cleanup failure must not negate a completed job.
 - [INV-LANE-CLEANUP-007] Corrupt marker persistence uses crash-safe durability:
   fsync temp file, atomic rename, fsync directory.
+- [INV-LANE-CLEANUP-008] Git commands in lane cleanup use config isolation to
+  prevent LPE via malicious `.git/config` entries. `build_isolated_git_command()`
+  sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, and overrides
+  `core.fsmonitor=`, `core.pager=cat`, `core.editor=:` via `-c` flags. This
+  prevents a malicious job from planting executable config hooks that would run
+  with worker privileges during `git reset` or `git clean`.
+- [INV-LANE-CLEANUP-009] Post-checkout denial paths (checkout failure, patch
+  failure, containment failure, unsupported source kind) must invoke
+  `execute_lane_cleanup` instead of merely removing the lease. This ensures the
+  workspace is restored to a clean state and prevents cross-job contamination.
+  Cleanup failure on denial paths results in CORRUPT lane marking, same as the
+  success path.
 
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 

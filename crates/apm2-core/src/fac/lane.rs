@@ -208,6 +208,49 @@ impl LaneCleanupError {
     }
 }
 
+/// Build a `Command` for git with config isolation to prevent LPE via
+/// malicious `.git/config` entries (e.g., `core.fsmonitor`, `core.pager`).
+///
+/// SEC-CTRL-LANE-CLEANUP-001: Git config isolation for lane cleanup.
+///
+/// A malicious job can modify `.git/config` in the workspace. When the worker
+/// executes `git reset` or `git clean` during cleanup, configs like
+/// `core.fsmonitor` can trigger arbitrary code execution with worker
+/// privileges. This function isolates the git environment by:
+///
+/// 1. Setting `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`
+///    to prevent loading global/system config files.
+/// 2. Passing `-c` overrides for dangerous config keys that could trigger
+///    arbitrary code execution (`core.fsmonitor`, `core.pager`, `core.editor`).
+/// 3. Setting `GIT_TERMINAL_PROMPT=0` to prevent interactive prompts.
+///
+/// The caller is responsible for appending the subcommand args (e.g.,
+/// `["reset", "--hard", "HEAD"]`) and for adding `--no-optional-locks`
+/// where appropriate.
+fn build_isolated_git_command(workspace_path: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    // Disable global and system config files to prevent loading attacker-
+    // planted config from outside the workspace.
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_SYSTEM", "/dev/null");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Override dangerous config keys that can execute arbitrary commands.
+    // These -c flags override any per-repo .git/config values.
+    // --no-optional-locks is a top-level git flag that reduces surface area
+    // by preventing git from taking optional locks (e.g., for gc).
+    cmd.args([
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "core.editor=:",
+    ]);
+    cmd.current_dir(workspace_path);
+    cmd
+}
+
 /// Execute a lane cleanup run using only a FAC root path.
 ///
 /// This is the canonical cleanup runner that performs state transitions.
@@ -1350,10 +1393,17 @@ impl LaneManager {
         };
 
         // Step 1: git reset (restore workspace to HEAD).
-        let reset_output = Command::new("git")
+        //
+        // SEC-CTRL-LANE-CLEANUP-001: Git config isolation.
+        // A malicious job can modify .git/config (e.g., core.fsmonitor,
+        // core.pager) in the workspace. We isolate the git environment by:
+        // 1. Setting GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_SYSTEM=/dev/null to
+        //    prevent loading global/system config files.
+        // 2. Passing -c overrides for dangerous config keys that could trigger
+        //    arbitrary code execution (core.fsmonitor, core.pager, core.editor).
+        // 3. Using --no-optional-locks to reduce surface area.
+        let reset_output = build_isolated_git_command(&workspace_path)
             .args(["reset", "--hard", "HEAD"])
-            .current_dir(&workspace_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output();
         let reset_output = match reset_output {
             Ok(reset_output) => reset_output,
@@ -1382,10 +1432,10 @@ impl LaneManager {
         steps_completed.push(CLEANUP_STEP_GIT_RESET.to_string());
 
         // Step 2: git clean -ffdxq (remove untracked files).
-        let clean_output = Command::new("git")
+        //
+        // SEC-CTRL-LANE-CLEANUP-001: Same git config isolation as Step 1.
+        let clean_output = build_isolated_git_command(&workspace_path)
             .args(["clean", "-ffdxq"])
-            .current_dir(&workspace_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output();
         let clean_output = match clean_output {
             Ok(clean_output) => clean_output,
@@ -3554,6 +3604,108 @@ mod tests {
             acquired_count.load(Ordering::SeqCst),
             1,
             "exactly one thread should have acquired the lock"
+        );
+    }
+
+    #[test]
+    fn build_isolated_git_command_sets_config_isolation() {
+        // SEC-CTRL-LANE-CLEANUP-001: Verify that the isolated git command
+        // sets the expected environment variables and config overrides to
+        // prevent LPE via malicious .git/config entries.
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let cmd = build_isolated_git_command(&workspace);
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().to_string(),
+                    v?.to_string_lossy().to_string(),
+                ))
+            })
+            .collect();
+
+        // Verify GIT_CONFIG_GLOBAL=/dev/null
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v == "/dev/null"),
+            "GIT_CONFIG_GLOBAL must be set to /dev/null, got: {envs:?}"
+        );
+        // Verify GIT_CONFIG_SYSTEM=/dev/null
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_CONFIG_SYSTEM" && v == "/dev/null"),
+            "GIT_CONFIG_SYSTEM must be set to /dev/null, got: {envs:?}"
+        );
+        // Verify GIT_TERMINAL_PROMPT=0
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v == "0"),
+            "GIT_TERMINAL_PROMPT must be set to 0, got: {envs:?}"
+        );
+
+        // Verify -c config overrides and --no-optional-locks in the args.
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let args_str = args.join(" ");
+        assert!(
+            args_str.contains("core.fsmonitor="),
+            "must override core.fsmonitor, got args: {args_str}"
+        );
+        assert!(
+            args_str.contains("core.pager=cat"),
+            "must override core.pager, got args: {args_str}"
+        );
+        assert!(
+            args_str.contains("core.editor=:"),
+            "must override core.editor, got args: {args_str}"
+        );
+        assert!(
+            args_str.contains("--no-optional-locks"),
+            "must include --no-optional-locks, got args: {args_str}"
+        );
+    }
+
+    #[test]
+    fn run_lane_cleanup_uses_config_isolated_git_commands() {
+        // SEC-CTRL-LANE-CLEANUP-001: End-to-end test that lane cleanup
+        // succeeds even when the workspace has a malicious core.fsmonitor
+        // config. If config isolation were not applied, git reset/clean
+        // would try to execute the malicious command and fail (since the
+        // configured command does not exist).
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        // Plant a malicious core.fsmonitor in the workspace's .git/config.
+        // Without config isolation, git reset would try to execute this
+        // nonexistent command and fail.
+        let git_config_path = workspace.join(".git").join("config");
+        let mut config_content = fs::read_to_string(&git_config_path).unwrap_or_default();
+        config_content.push_str("\n[core]\n\tfsmonitor = /nonexistent/malicious-command\n");
+        fs::write(&git_config_path, &config_content).expect("plant malicious git config");
+
+        // Cleanup should succeed because config isolation overrides the
+        // malicious core.fsmonitor with an empty value.
+        let steps = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("lane cleanup should succeed despite malicious git config");
+        assert!(
+            steps.contains(&CLEANUP_STEP_GIT_RESET.to_string()),
+            "git reset should have completed"
+        );
+        assert!(
+            steps.contains(&CLEANUP_STEP_GIT_CLEAN.to_string()),
+            "git clean should have completed"
         );
     }
 }

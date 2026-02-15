@@ -2006,7 +2006,18 @@ fn process_job(
         &lanes_root,
     ) {
         let reason = format!("lane workspace checkout failed: {e}");
-        let _ = LaneLeaseV1::remove(&lane_dir);
+        // SEC-CTRL-LANE-CLEANUP-002: Checkout failure may leave the workspace
+        // in a partially modified state. Run lane cleanup to restore isolation
+        // before denying the job. On cleanup failure, the lane is marked CORRUPT.
+        if let Err(cleanup_err) =
+            execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
+        {
+            eprintln!(
+                "worker: WARNING: lane cleanup during checkout-failure denial failed for {acquired_lane_id}: {cleanup_err}"
+            );
+            // Lane is already marked CORRUPT by execute_lane_cleanup on
+            // failure.
+        }
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -2039,11 +2050,32 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    // Lease-aware denial helper: removes the RUNNING lease before emitting
-    // a deny receipt and moving the job to denied/. This ensures the lane
-    // cleanup state machine never encounters a stale lease after denial.
+    // SEC-CTRL-LANE-CLEANUP-002: Cleanup-aware denial helper for post-checkout
+    // paths.
+    //
+    // After workspace modification (checkout, patch application), a denial MUST
+    // run `execute_lane_cleanup` to restore the workspace to a clean state.
+    // Without this, the next job on the lane inherits a modified workspace,
+    // violating lane isolation invariants (cross-job contamination).
+    //
+    // The cleanup transitions the lease to Cleanup, runs git reset + clean +
+    // temp prune + log quota, then removes the lease on success. On cleanup
+    // failure, the lane is marked CORRUPT via `execute_lane_cleanup`'s
+    // existing corruption handling, preventing future job execution on a
+    // dirty lane.
     let deny_with_reason_and_lease_cleanup = |reason: &str| -> JobOutcome {
-        let _ = LaneLeaseV1::remove(&lane_dir);
+        // Run full lane cleanup to restore workspace isolation.
+        // This is the same cleanup path used after successful job completion.
+        if let Err(cleanup_err) =
+            execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
+        {
+            eprintln!(
+                "worker: WARNING: lane cleanup during denial failed for {acquired_lane_id}: {cleanup_err}"
+            );
+            // Lane is already marked CORRUPT by execute_lane_cleanup on
+            // failure. The denial receipt is still emitted below so
+            // the job has a terminal receipt.
+        }
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -2128,7 +2160,18 @@ fn process_job(
         patch_digest = Some(patch_outcome.patch_digest);
     } else if spec.source.kind != "mirror_commit" {
         let reason = format!("unsupported source kind: {}", spec.source.kind);
-        let _ = LaneLeaseV1::remove(&lane_dir);
+        // SEC-CTRL-LANE-CLEANUP-002: This denial path is post-checkout, so the
+        // workspace may have been modified by a prior checkout. Run lane cleanup
+        // to restore workspace isolation before denying the job.
+        if let Err(cleanup_err) =
+            execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
+        {
+            eprintln!(
+                "worker: WARNING: lane cleanup during source-kind denial failed for {acquired_lane_id}: {cleanup_err}"
+            );
+            // Lane is already marked CORRUPT by execute_lane_cleanup on
+            // failure.
+        }
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -4739,5 +4782,99 @@ mod tests {
         let (_guard, acquired_lane_id) =
             acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
         assert_eq!(acquired_lane_id, "lane-01");
+    }
+
+    #[test]
+    fn test_execute_lane_cleanup_restores_dirty_workspace_on_denial() {
+        // SEC-CTRL-LANE-CLEANUP-002: Verify that execute_lane_cleanup restores
+        // a workspace that has been dirtied by a partial checkout/patch to a
+        // clean state. This is the mechanism used by post-checkout denial paths
+        // to prevent cross-job contamination.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let lane_id = "lane-00";
+        let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
+        persist_running_lease(&lane_mgr, lane_id);
+        init_test_workspace_git_repo(&workspace);
+
+        // Simulate workspace modification from a partial patch or checkout:
+        // create untracked files and modify tracked files.
+        fs::write(
+            workspace.join("malicious_untracked.txt"),
+            b"injected payload",
+        )
+        .expect("create untracked file");
+        fs::write(workspace.join("README.md"), b"modified content").expect("modify tracked file");
+
+        // Verify workspace is dirty before cleanup.
+        assert!(
+            workspace.join("malicious_untracked.txt").exists(),
+            "untracked file should exist before cleanup"
+        );
+        let readme_content = fs::read_to_string(workspace.join("README.md")).expect("read README");
+        assert_eq!(readme_content, "modified content");
+
+        // Run lane cleanup (same function used on denial paths).
+        execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
+            .expect("lane cleanup should succeed");
+
+        // Verify workspace is restored to clean state.
+        assert!(
+            !workspace.join("malicious_untracked.txt").exists(),
+            "untracked file should be removed by git clean"
+        );
+        let restored_readme =
+            fs::read_to_string(workspace.join("README.md")).expect("read restored README");
+        assert_eq!(
+            restored_readme, "seed",
+            "tracked file should be restored to HEAD by git reset"
+        );
+
+        // Verify lane is back to idle (lease removed).
+        let status = lane_mgr.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Idle);
+    }
+
+    #[test]
+    fn test_execute_lane_cleanup_marks_corrupt_on_failure_during_denial() {
+        // SEC-CTRL-LANE-CLEANUP-002: When cleanup fails on a denial path,
+        // the lane should be marked CORRUPT to prevent future jobs from
+        // running on the contaminated workspace.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let lane_id = "lane-00";
+        let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
+        persist_running_lease(&lane_mgr, lane_id);
+        // Do NOT init git repo — this will cause cleanup to fail.
+        fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let err = execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
+            .expect_err("cleanup should fail on non-git workspace");
+        assert!(err.to_string().contains("lane cleanup failed"));
+
+        // Verify lane is marked CORRUPT.
+        let status = lane_mgr.lane_status(lane_id).expect("lane status");
+        assert_eq!(
+            status.state,
+            LaneState::Corrupt,
+            "lane should be CORRUPT after failed cleanup on denial path"
+        );
+
+        // Verify corrupt marker exists.
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("marker load")
+            .expect("corrupt marker should exist");
+        assert!(
+            marker.reason.contains("lane cleanup failed"),
+            "corrupt marker should describe cleanup failure"
+        );
     }
 }
