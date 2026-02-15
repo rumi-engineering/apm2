@@ -84,8 +84,10 @@ const DOCTOR_SCHEMA: &str = "apm2.fac.review.doctor.v1";
 const DOCTOR_STALE_GATE_AGE_SECONDS: i64 = 6 * 60 * 60;
 const DOCTOR_EVENT_SCAN_MAX_LINES: usize = 200_000;
 const DOCTOR_EVENT_SCAN_MAX_LINE_BYTES: usize = 64 * 1024;
+const DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE: u64 = 8 * 1024 * 1024;
 const DOCTOR_LOG_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const DOCTOR_LOG_SCAN_MAX_LINES: u64 = 200_000;
+const DOCTOR_LOG_SCAN_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -1478,12 +1480,14 @@ fn scan_event_signals_for_pr(
             continue;
         };
         let reader = BufReader::new(file);
+        let mut remaining_bytes = DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE;
         scan_event_signals_from_reader_with_budget(
             reader,
             pr_number,
             run_ids,
             &mut signals,
             &mut remaining_lines,
+            &mut remaining_bytes,
         );
     }
     signals
@@ -1497,35 +1501,101 @@ fn scan_event_signals_from_reader<R: BufRead>(
 ) -> DoctorEventSignals {
     let mut signals = DoctorEventSignals::default();
     let mut remaining_lines = DOCTOR_EVENT_SCAN_MAX_LINES;
+    let mut remaining_bytes = DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE;
     scan_event_signals_from_reader_with_budget(
         reader,
         pr_number,
         run_ids,
         &mut signals,
         &mut remaining_lines,
+        &mut remaining_bytes,
     );
     signals
 }
 
+enum BoundedLineRead {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
+fn discard_until_newline<R: BufRead>(reader: &mut R) -> std::io::Result<usize> {
+    let mut consumed = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(consumed);
+        }
+        if let Some(newline_idx) = available.iter().position(|byte| *byte == b'\n') {
+            let consume_bytes = newline_idx.saturating_add(1);
+            reader.consume(consume_bytes);
+            return Ok(consumed.saturating_add(consume_bytes));
+        }
+        let chunk_len = available.len();
+        reader.consume(chunk_len);
+        consumed = consumed.saturating_add(chunk_len);
+    }
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> std::io::Result<(BoundedLineRead, usize)> {
+    let mut line = Vec::new();
+    let line_limit_plus_one = max_line_bytes.saturating_add(1);
+    let line_limit = u64::try_from(line_limit_plus_one).unwrap_or(u64::MAX);
+
+    let mut limited_reader = reader.by_ref().take(line_limit);
+    let bytes_read = limited_reader.read_until(b'\n', &mut line)?;
+    let limit_reached = limited_reader.limit() == 0;
+    drop(limited_reader);
+
+    if bytes_read == 0 {
+        return Ok((BoundedLineRead::Eof, 0));
+    }
+    if limit_reached && !line.ends_with(b"\n") {
+        let drained = discard_until_newline(reader)?;
+        let consumed_total = bytes_read.saturating_add(drained);
+        return Ok((BoundedLineRead::TooLong, consumed_total));
+    }
+
+    Ok((BoundedLineRead::Line(line), bytes_read))
+}
+
 fn scan_event_signals_from_reader_with_budget<R: BufRead>(
-    reader: R,
+    mut reader: R,
     pr_number: u32,
     run_ids: &std::collections::BTreeSet<String>,
     signals: &mut DoctorEventSignals,
     remaining_lines: &mut usize,
+    remaining_bytes: &mut u64,
 ) {
     let mut event_line_counts = std::collections::BTreeMap::<String, u64>::new();
-    for line_result in reader.lines() {
-        if *remaining_lines == 0 {
+    loop {
+        if *remaining_lines == 0 || *remaining_bytes == 0 {
             break;
         }
         *remaining_lines = (*remaining_lines).saturating_sub(1);
-        let Ok(line) = line_result else {
+
+        let Ok((bounded_line, consumed_bytes)) =
+            read_bounded_line(&mut reader, DOCTOR_EVENT_SCAN_MAX_LINE_BYTES)
+        else {
             continue;
         };
-        if line.len() > DOCTOR_EVENT_SCAN_MAX_LINE_BYTES {
-            continue;
-        }
+        let consumed_u64 = u64::try_from(consumed_bytes).unwrap_or(u64::MAX);
+        *remaining_bytes = (*remaining_bytes).saturating_sub(consumed_u64);
+
+        let line = match bounded_line {
+            BoundedLineRead::Eof => break,
+            BoundedLineRead::TooLong => continue,
+            BoundedLineRead::Line(bytes) => {
+                let Ok(line) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                line
+            },
+        };
+
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1733,21 +1803,37 @@ fn collect_log_line_counts_for_pr(pr_number: u32) -> std::collections::BTreeMap<
 fn count_log_lines_bounded(path: &Path) -> Option<u64> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
-    let mut line_buf = Vec::new();
+    let mut chunk = [0_u8; DOCTOR_LOG_SCAN_CHUNK_BYTES];
     let mut line_count = 0_u64;
     let mut byte_count = 0_u64;
+    let mut saw_bytes = false;
+    let mut last_byte = None;
 
-    loop {
-        line_buf.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line_buf).ok()?;
+    while line_count < DOCTOR_LOG_SCAN_MAX_LINES && byte_count < DOCTOR_LOG_SCAN_MAX_BYTES {
+        let remaining_bytes = DOCTOR_LOG_SCAN_MAX_BYTES.saturating_sub(byte_count);
+        let to_read =
+            usize::try_from(remaining_bytes.min(DOCTOR_LOG_SCAN_CHUNK_BYTES as u64)).ok()?;
+        if to_read == 0 {
+            break;
+        }
+        let bytes_read = reader.read(&mut chunk[..to_read]).ok()?;
         if bytes_read == 0 {
             break;
         }
-        line_count = line_count.saturating_add(1);
+
+        saw_bytes = true;
         byte_count = byte_count.saturating_add(bytes_read as u64);
-        if line_count >= DOCTOR_LOG_SCAN_MAX_LINES || byte_count >= DOCTOR_LOG_SCAN_MAX_BYTES {
-            break;
-        }
+        last_byte = chunk.get(bytes_read.saturating_sub(1)).copied();
+
+        let newline_count = chunk[..bytes_read]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as u64;
+        line_count = line_count.saturating_add(newline_count);
+    }
+
+    if saw_bytes && line_count < DOCTOR_LOG_SCAN_MAX_LINES && !matches!(last_byte, Some(b'\n')) {
+        line_count = line_count.saturating_add(1);
     }
 
     Some(line_count)
@@ -5915,6 +6001,49 @@ mod tests {
         let signals =
             super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
         assert_eq!(signals.tool_call_counts.get("keep").copied(), Some(2));
+    }
+
+    #[test]
+    fn test_scan_event_signals_skips_oversized_line_and_keeps_scanning() {
+        let oversized = "x".repeat(super::DOCTOR_EVENT_SCAN_MAX_LINE_BYTES.saturating_add(32));
+        let mut lines = String::new();
+        lines.push_str(&oversized);
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "run_start",
+                "model": "model-safe",
+                "ts": "2026-02-15T00:02:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
+        let models = signals
+            .model_attempts
+            .get("security")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(models, vec!["model-safe".to_string()]);
+    }
+
+    #[test]
+    fn test_count_log_lines_bounded_handles_single_oversized_line_without_oom() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("oversized.log");
+        let oversized =
+            "z".repeat((super::DOCTOR_LOG_SCAN_MAX_BYTES as usize).saturating_add(4096));
+        std::fs::write(&path, oversized).expect("write oversized log");
+
+        let line_count =
+            super::count_log_lines_bounded(&path).expect("bounded count should succeed");
+        assert_eq!(line_count, 1);
     }
 
     /// Verify the doctor interrupt flag uses a global singleton and that the
