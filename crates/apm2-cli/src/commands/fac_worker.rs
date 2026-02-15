@@ -90,11 +90,13 @@ use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
-    ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1,
-    GateReceipt, GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, SystemdUnitProperties,
-    compute_policy_hash, deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, run_preflight,
+    ChannelBoundaryTrace, DenialReasonCode, FAC_LANE_CLEANUP_RECEIPT_SCHEMA, FacJobOutcome,
+    FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
+    LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
+    LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
+    RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
+    load_or_default_boundary_id, parse_policy_hash, persist_content_addressed_receipt,
+    persist_policy, run_preflight,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -1216,6 +1218,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2081,6 +2084,45 @@ fn process_job(
             return deny_with_reason(&format!("containment verification failed: {err}"));
         },
     };
+
+    // Step 8a: Lane cleanup and cleanup receipt emission.
+    // On failure, emit a failed cleanup receipt and persist the corrupt marker.
+    let cleanup_steps = match lane_mgr.run_lane_cleanup(&acquired_lane_id, &lane_workspace) {
+        Ok(steps) => steps,
+        Err(err) => {
+            let reason = format!("lane cleanup failed: {err}");
+            let failed_receipt_digest = emit_lane_cleanup_receipt(
+                fac_root,
+                &acquired_lane_id,
+                LaneCleanupOutcome::Failed,
+                Vec::new(),
+                Some(&reason),
+            )
+            .ok();
+
+            let marker = LaneCorruptMarkerV1 {
+                schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+                lane_id: acquired_lane_id.clone(),
+                reason: reason.clone(),
+                cleanup_receipt_digest: failed_receipt_digest,
+                detected_at: current_timestamp_epoch_secs().to_string(),
+            };
+            if let Err(marker_err) = marker.persist(fac_root) {
+                eprintln!("worker: WARNING: failed to persist corrupt lane marker: {marker_err}");
+            }
+            return deny_with_reason(&reason);
+        },
+    };
+
+    if let Err(err) = emit_lane_cleanup_receipt(
+        fac_root,
+        &acquired_lane_id,
+        LaneCleanupOutcome::Success,
+        cleanup_steps,
+        None,
+    ) {
+        eprintln!("worker: WARNING: lane cleanup receipt emission failed: {err}");
+    }
 
     // Step 9: Write authoritative GateReceipt and move to completed.
     let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
@@ -3002,6 +3044,39 @@ fn emit_scan_receipt(
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
 }
 
+fn emit_lane_cleanup_receipt(
+    fac_root: &Path,
+    lane_id: &str,
+    outcome: LaneCleanupOutcome,
+    steps_completed: Vec<String>,
+    failure_reason: Option<&str>,
+) -> Result<String, String> {
+    let receipt = LaneCleanupReceiptV1 {
+        schema: FAC_LANE_CLEANUP_RECEIPT_SCHEMA.to_string(),
+        receipt_id: format!("wkr-cleanup-{lane_id}-{}", current_timestamp_epoch_secs()),
+        lane_id: lane_id.to_string(),
+        outcome,
+        steps_completed,
+        failure_reason: failure_reason.map(std::string::ToString::to_string),
+        timestamp_secs: 0,
+        content_hash: String::new(),
+    };
+
+    let receipt_path = receipt
+        .persist(&fac_root.join(FAC_RECEIPTS_DIR))
+        .map_err(|e| format!("cannot persist lane cleanup receipt: {e}"))?;
+    receipt_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map_or_else(
+            || Err("receipt filename was not UTF-8".to_string()),
+            |name| {
+                let digest = name.trim_end_matches(".json");
+                Ok(digest.to_string())
+            },
+        )
+}
+
 fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32], FacPolicyV1), String> {
     let policy_dir = fac_root.join("policy");
     let policy_path = policy_dir.join("fac_policy.v1.json");
@@ -3741,6 +3816,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -3812,6 +3892,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),

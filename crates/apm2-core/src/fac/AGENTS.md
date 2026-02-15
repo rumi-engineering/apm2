@@ -383,6 +383,23 @@ deletion primitive for lane cleanup and reset operations.
   immediately (not filtered). On Unix, raw byte scanning catches `.`
   segments that `Path::components()` silently normalizes away.
 
+### Lane Cleanup State Machine (TCK-00569)
+
+Lane cleanup is part of the authoritative execution lifecycle and uses
+`LaneCorruptMarkerV1` for durable fault marking.
+
+### Security Invariants (TCK-00569)
+
+- [INV-LANE-CLEANUP-001] Every lane cleanup attempt emits a
+  `LaneCleanupReceiptV1`, including failures.
+- [INV-LANE-CLEANUP-002] Cleanup failure must persist `LaneCorruptMarkerV1` with
+  `reason` and optional `cleanup_receipt_digest` before returning the lane to
+  denied state.
+- [INV-LANE-CLEANUP-003] `LaneStatusV1` must expose `corrupt_reason` derived
+  from any persistent corrupt marker.
+- [INV-LANE-CLEANUP-004] Lane log retention is enforced by oldest-first file
+  pruning to `MAX_LOG_QUOTA_BYTES`.
+
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 
 **Core type**: `RepoMirrorManager`

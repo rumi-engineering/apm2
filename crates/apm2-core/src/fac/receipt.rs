@@ -64,6 +64,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -84,6 +85,19 @@ const MAX_FAC_JOB_REASON_LENGTH: usize = 512;
 /// Maximum serialized size of a `FacJobReceiptV1` (bytes).
 /// Protects against memory-exhaustion attacks during bounded deserialization.
 pub const MAX_JOB_RECEIPT_SIZE: usize = 65_536;
+
+/// Schema identifier for `LaneCleanupReceiptV1`.
+pub const LANE_CLEANUP_RECEIPT_SCHEMA: &str = "apm2.fac.lane_cleanup_receipt.v1";
+
+/// Maximum serialized size of a `LaneCleanupReceiptV1` (bytes).
+/// Protects against memory-exhaustion attacks during bounded persistence.
+pub const MAX_LANE_CLEANUP_RECEIPT_SIZE: usize = 65_536;
+
+/// Schema identifier for `LaneCleanupReceiptV1`.
+pub const FAC_LANE_CLEANUP_RECEIPT_SCHEMA: &str = LANE_CLEANUP_RECEIPT_SCHEMA;
+
+/// Maximum cleanup reason length for `LaneCleanupReceiptV1`.
+const MAX_CLEANUP_REASON_LENGTH: usize = 512;
 
 /// Maximum RFC-0028 boundary defect classes included in a receipt trace.
 const MAX_FAC_JOB_BOUNDARY_DEFECT_CLASSES: usize = 32;
@@ -168,6 +182,261 @@ pub enum ReceiptError {
         /// List of supported payload schema versions.
         supported: Vec<u32>,
     },
+}
+
+/// Errors that can occur during lane cleanup receipt operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaneCleanupReceiptError {
+    /// Missing required field.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+
+    /// String field exceeds maximum length.
+    #[error("string field {field} exceeds max length: {actual} > {max}")]
+    StringTooLong {
+        /// Field name.
+        field: &'static str,
+        /// Actual length.
+        actual: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Invalid cleanup receipt data.
+    #[error("invalid receipt data: {0}")]
+    InvalidData(String),
+
+    /// Serialization error.
+    #[error("serialization failed: {0}")]
+    Serialization(String),
+}
+
+/// Canonical receipt for lane cleanup operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneCleanupReceiptV1 {
+    /// Schema identifier.
+    pub schema: String,
+    /// Receipt identifier.
+    pub receipt_id: String,
+    /// Lane identifier.
+    pub lane_id: String,
+    /// Cleanup outcome.
+    pub outcome: super::lane::LaneCleanupOutcome,
+    /// Ordered cleanup steps completed before terminal status.
+    #[serde(default)]
+    pub steps_completed: Vec<String>,
+    /// Human-readable failure reason if outcome is failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// Unix epoch seconds for cleanup.
+    pub timestamp_secs: u64,
+    /// BLAKE3 digest of the canonicalized payload.
+    pub content_hash: String,
+}
+
+impl LaneCleanupReceiptV1 {
+    /// Returns canonical bytes for content hash computation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any canonical string component length exceeds `u32::MAX`.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512);
+
+        bytes.extend_from_slice(
+            &u32::try_from(self.schema.len())
+                .expect("lane cleanup schema length fits into u32")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(self.schema.as_bytes());
+
+        bytes.extend_from_slice(
+            &u32::try_from(self.receipt_id.len())
+                .expect("lane cleanup receipt_id length fits into u32")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(self.receipt_id.as_bytes());
+
+        bytes.extend_from_slice(
+            &u32::try_from(self.lane_id.len())
+                .expect("lane cleanup lane_id length fits into u32")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(self.lane_id.as_bytes());
+
+        let outcome_str = serde_json::to_string(&self.outcome)
+            .expect("lane cleanup outcome serialization must not fail");
+        bytes.extend_from_slice(
+            &u32::try_from(outcome_str.len())
+                .expect("lane cleanup outcome string length fits into u32")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(outcome_str.as_bytes());
+
+        bytes.extend_from_slice(
+            &u32::try_from(self.steps_completed.len())
+                .expect("lane cleanup steps_completed length fits into u32")
+                .to_be_bytes(),
+        );
+        for step in &self.steps_completed {
+            bytes.extend_from_slice(
+                &u32::try_from(step.len())
+                    .expect("lane cleanup step string length fits into u32")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(step.as_bytes());
+        }
+
+        if let Some(reason) = &self.failure_reason {
+            bytes.push(1u8);
+            bytes.extend_from_slice(
+                &u32::try_from(reason.len())
+                    .expect("lane cleanup failure reason length fits into u32")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(reason.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
+
+        bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(self.content_hash.len())
+                .expect("lane cleanup content_hash length fits into u32")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(self.content_hash.as_bytes());
+
+        bytes
+    }
+
+    /// Validate invariants and boundedness rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneCleanupReceiptError` on missing fields, length violations,
+    /// or malformed content.
+    pub fn validate(&self) -> Result<(), LaneCleanupReceiptError> {
+        if self.schema != LANE_CLEANUP_RECEIPT_SCHEMA {
+            return Err(LaneCleanupReceiptError::InvalidData(format!(
+                "schema mismatch: expected '{LANE_CLEANUP_RECEIPT_SCHEMA}', got '{}'",
+                self.schema
+            )));
+        }
+        if self.receipt_id.trim().is_empty() {
+            return Err(LaneCleanupReceiptError::MissingField("receipt_id"));
+        }
+        if self.receipt_id.len() > MAX_STRING_LENGTH {
+            return Err(LaneCleanupReceiptError::StringTooLong {
+                field: "receipt_id",
+                actual: self.receipt_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.lane_id.is_empty() {
+            return Err(LaneCleanupReceiptError::MissingField("lane_id"));
+        }
+        if self.lane_id.len() > MAX_STRING_LENGTH {
+            return Err(LaneCleanupReceiptError::StringTooLong {
+                field: "lane_id",
+                actual: self.lane_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if let Some(reason) = &self.failure_reason {
+            if reason.len() > MAX_CLEANUP_REASON_LENGTH {
+                return Err(LaneCleanupReceiptError::StringTooLong {
+                    field: "failure_reason",
+                    actual: reason.len(),
+                    max: MAX_CLEANUP_REASON_LENGTH,
+                });
+            }
+            if reason.is_empty() {
+                return Err(LaneCleanupReceiptError::MissingField("failure_reason"));
+            }
+        } else if matches!(self.outcome, super::lane::LaneCleanupOutcome::Failed) {
+            return Err(LaneCleanupReceiptError::MissingField("failure_reason"));
+        }
+
+        for step in &self.steps_completed {
+            if step.len() > MAX_STRING_LENGTH {
+                return Err(LaneCleanupReceiptError::StringTooLong {
+                    field: "steps_completed",
+                    actual: step.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
+        if self.timestamp_secs == 0 {
+            return Err(LaneCleanupReceiptError::InvalidData(
+                "timestamp_secs must be non-zero".to_string(),
+            ));
+        }
+
+        if !self.content_hash.is_empty() && !is_valid_b3_256_digest(&self.content_hash) {
+            return Err(LaneCleanupReceiptError::InvalidData(
+                "content_hash must be b3-256 format when set".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn compute_content_hash(&self) -> String {
+        let mut clone = self.clone();
+        clone.content_hash.clear();
+        let canonical = clone.canonical_bytes();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.fac.lane_cleanup_receipt.v1\0");
+        hasher.update(&canonical);
+        format!("b3-256:{}", hasher.finalize().to_hex())
+    }
+
+    /// Persist a receipt into `receipts_dir`.
+    ///
+    /// Writes to `<content_hash>.json`, replacing any existing file atomically
+    /// through `temp -> rename`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneCleanupReceiptError::Serialization`, `InvalidData`, or
+    /// `Io` depending on failure mode.
+    pub fn persist(&self, fac_receipts_dir: &Path) -> Result<PathBuf, LaneCleanupReceiptError> {
+        let mut copy = self.clone();
+        copy.schema = LANE_CLEANUP_RECEIPT_SCHEMA.to_string();
+        if copy.timestamp_secs == 0 {
+            copy.timestamp_secs = current_wall_clock_secs();
+        }
+
+        copy.content_hash = copy.compute_content_hash();
+        copy.validate()?;
+
+        let bytes = serde_json::to_vec_pretty(&copy)
+            .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
+        if bytes.len() > MAX_LANE_CLEANUP_RECEIPT_SIZE {
+            return Err(LaneCleanupReceiptError::InvalidData(format!(
+                "receipt too large: {} > {}",
+                bytes.len(),
+                MAX_LANE_CLEANUP_RECEIPT_SIZE
+            )));
+        }
+
+        fs::create_dir_all(fac_receipts_dir)
+            .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
+
+        let final_path = fac_receipts_dir.join(format!("{}.json", copy.content_hash));
+        let tmp_path = fac_receipts_dir.join(format!("{}.tmp", copy.content_hash));
+        fs::write(&tmp_path, bytes)
+            .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
+        fs::rename(&tmp_path, &final_path)
+            .map_err(|e| LaneCleanupReceiptError::Serialization(e.to_string()))?;
+
+        Ok(final_path)
+    }
 }
 
 // =============================================================================
@@ -1267,6 +1536,14 @@ pub fn compute_job_receipt_content_hash_v2(receipt: &FacJobReceiptV1) -> String 
     format!("b3-256:{}", hasher.finalize().to_hex())
 }
 
+#[allow(clippy::disallowed_methods)]
+fn current_wall_clock_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn is_valid_b3_256_digest(value: &str) -> bool {
     parse_b3_256_digest(value).is_some()
 }
@@ -1991,6 +2268,7 @@ pub mod tests {
 
     use super::*;
     use crate::crypto::Signer;
+    use crate::fac::LaneCleanupOutcome;
 
     fn sample_fac_receipt(
         outcome: FacJobOutcome,
@@ -2043,6 +2321,23 @@ pub mod tests {
 
     fn make_valid_receipt() -> FacJobReceiptV1 {
         sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample fac receipt")
+    }
+
+    fn sample_cleanup_receipt(outcome: LaneCleanupOutcome) -> LaneCleanupReceiptV1 {
+        LaneCleanupReceiptV1 {
+            schema: LANE_CLEANUP_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "cleanup-001".to_string(),
+            lane_id: "lane-00".to_string(),
+            outcome,
+            steps_completed: vec!["git_reset".to_string(), "git_clean".to_string()],
+            failure_reason: if matches!(outcome, LaneCleanupOutcome::Failed) {
+                Some("failed to clean".to_string())
+            } else {
+                None
+            },
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+        }
     }
 
     #[test]
@@ -2168,6 +2463,13 @@ pub mod tests {
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
 
         assert_eq!(first.canonical_bytes_v2(), second.canonical_bytes_v2());
+    }
+
+    #[test]
+    fn test_cleanup_receipt_canonical_bytes_deterministic() {
+        let first = sample_cleanup_receipt(LaneCleanupOutcome::Success);
+        let second = sample_cleanup_receipt(LaneCleanupOutcome::Success);
+        assert_eq!(first.canonical_bytes(), second.canonical_bytes());
     }
 
     #[test]
