@@ -723,7 +723,7 @@ pub fn run_evidence_gates_with_status(
     owner_repo: &str,
     pr_number: u32,
     projection_log: Option<&mut File>,
-) -> Result<bool, String> {
+) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let evidence_dir = apm2_home_dir()?.join("private/fac/evidence");
     // TCK-00536: create evidence directory with mode 0700 at create-time.
     crate::commands::fac_permissions::ensure_dir_with_mode(&evidence_dir)
@@ -770,6 +770,7 @@ pub fn run_evidence_gates_with_status(
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
+    let mut gate_results = Vec::new();
 
     // Phase 0: merge conflict gate (always first, always recomputed).
     {
@@ -780,6 +781,11 @@ pub fn run_evidence_gates_with_status(
         let (passed, duration, line) = run_merge_conflict_gate(workspace_root, sha, &evidence_dir);
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         evidence_lines.push(line);
         let merge_log = evidence_dir.join(format!("{gate_name}.log"));
         let merge_digest = sha256_file_hex(&merge_log);
@@ -801,7 +807,7 @@ pub fn run_evidence_gates_with_status(
                     let _ = writeln!(file, "{line}");
                 }
             }
-            return Ok(false);
+            return Ok((false, gate_results));
         }
     }
 
@@ -835,6 +841,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -874,6 +885,11 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -933,6 +949,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -972,6 +993,11 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -1024,6 +1050,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1039,6 +1070,20 @@ pub fn run_evidence_gates_with_status(
                     sha,
                     gate_name
                 );
+                status.set_result(gate_name, false, 0);
+                updater.update(&status);
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: false,
+                    duration_secs: 0,
+                });
+                all_passed = false;
+                evidence_lines.push(format!(
+                    "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                ));
             }
         } else {
             eprintln!(
@@ -1073,6 +1118,11 @@ pub fn run_evidence_gates_with_status(
 
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
+            gate_results.push(EvidenceGateResult {
+                gate_name: gate_name.to_string(),
+                passed,
+                duration_secs: duration,
+            });
             gate_cache.set_with_attestation(
                 gate_name,
                 passed,
@@ -1118,6 +1168,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1139,6 +1194,11 @@ pub fn run_evidence_gates_with_status(
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
             let log_path = evidence_dir.join("workspace_integrity.log");
+            gate_results.push(EvidenceGateResult {
+                gate_name: gate_name.to_string(),
+                passed,
+                duration_secs: duration,
+            });
             gate_cache.set_with_attestation(
                 gate_name,
                 passed,
@@ -1183,6 +1243,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1222,6 +1287,11 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -1250,9 +1320,9 @@ pub fn run_evidence_gates_with_status(
     updater.force_update(&status);
 
     // Persist gate cache so future pipeline runs can reuse results.
-    if let Err(err) = gate_cache.save() {
-        eprintln!("warning: failed to persist attested gate cache: {err}");
-    }
+    gate_cache
+        .save()
+        .map_err(|err| format!("failed to persist attested gate cache: {err}"))?;
 
     if let Some(file) = projection_log {
         for line in &evidence_lines {
@@ -1260,7 +1330,7 @@ pub fn run_evidence_gates_with_status(
         }
     }
 
-    Ok(all_passed)
+    Ok((all_passed, gate_results))
 }
 
 #[cfg(test)]

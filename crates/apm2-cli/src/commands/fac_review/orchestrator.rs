@@ -923,6 +923,19 @@ fn run_single_review(
             restart_count,
             Some(child.id()),
         )?;
+        if let Err(err) = super::lifecycle::bind_reviewer_runtime(
+            owner_repo,
+            pr_number,
+            &current_head_sha,
+            review_type,
+            &run_id,
+            child.id(),
+            run_state.proc_start_time,
+        ) {
+            eprintln!(
+                "WARNING: failed to bind reviewer runtime in agent registry for PR #{pr_number} type={review_type} run_id={run_id}: {err}",
+            );
+        }
 
         emit_run_event(
             "run_start",

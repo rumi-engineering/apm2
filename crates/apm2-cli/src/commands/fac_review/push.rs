@@ -344,7 +344,7 @@ fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), 
     github_projection::update_pr(repo, pr_number, title, body)
 }
 
-/// Enable auto-merge (squash) on a PR.
+/// Enable auto-merge (merge commit) on a PR.
 fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
     github_projection::enable_auto_merge(repo, pr_number)
 }
@@ -391,47 +391,30 @@ fn run_blocking_evidence_gates(
         pr_number,
         |workspace_root, sha, owner_repo, pr_number| {
             pr_number.map_or_else(
-                || run_evidence_gates(workspace_root, sha, None, None).map(|(passed, _)| passed),
+                || run_evidence_gates(workspace_root, sha, None, None),
                 |pr_number| {
                     run_evidence_gates_with_status(workspace_root, sha, owner_repo, pr_number, None)
                 },
             )
         },
-        GateCache::load,
     )
 }
 
-fn run_blocking_evidence_gates_with<F, G>(
+fn run_blocking_evidence_gates_with<F>(
     workspace_root: &Path,
     sha: &str,
     owner_repo: &str,
     pr_number: Option<u32>,
     mut run_with_status_fn: F,
-    mut load_cache_fn: G,
 ) -> Result<Vec<EvidenceGateResult>, String>
 where
-    F: FnMut(&Path, &str, &str, Option<u32>) -> Result<bool, String>,
-    G: FnMut(&str) -> Option<GateCache>,
+    F: FnMut(&Path, &str, &str, Option<u32>) -> Result<(bool, Vec<EvidenceGateResult>), String>,
 {
-    let passed = run_with_status_fn(workspace_root, sha, owner_repo, pr_number)?;
-    let mut gate_results = load_cache_fn(sha)
-        .map(|cache| {
-            let mut results = cache
-                .gates
-                .into_iter()
-                .map(|(gate_name, cached)| EvidenceGateResult {
-                    gate_name,
-                    passed: cached.status.eq_ignore_ascii_case("PASS"),
-                    duration_secs: cached.duration_secs,
-                })
-                .collect::<Vec<_>>();
-            results.sort_by(|lhs, rhs| lhs.gate_name.cmp(&rhs.gate_name));
-            results
-        })
-        .unwrap_or_default();
+    let (passed, mut gate_results) =
+        run_with_status_fn(workspace_root, sha, owner_repo, pr_number)?;
 
     if passed {
-        validate_cached_gate_results_for_pass(workspace_root, sha, &gate_results)?;
+        validate_gate_results_for_pass(workspace_root, sha, &gate_results)?;
         return Ok(gate_results);
     }
 
@@ -475,14 +458,14 @@ fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> 
     expected
 }
 
-fn validate_cached_gate_results_for_pass(
+fn validate_gate_results_for_pass(
     workspace_root: &Path,
     sha: &str,
     gate_results: &[EvidenceGateResult],
 ) -> Result<(), String> {
     if gate_results.is_empty() {
         return Err(format!(
-            "evidence gates reported PASS for sha={sha} but no gate cache artifacts were found; refusing to project empty gate status"
+            "evidence gates reported PASS for sha={sha} but no gate result artifacts were found; refusing to project empty gate status"
         ));
     }
 
@@ -493,7 +476,7 @@ fn validate_cached_gate_results_for_pass(
         .collect::<Vec<_>>();
     if !failed_gates.is_empty() {
         return Err(format!(
-            "evidence gates reported PASS for sha={sha} but cached gate rows include FAIL verdicts: {}; refusing inconsistent gate projection",
+            "evidence gates reported PASS for sha={sha} but reported gate rows include FAIL verdicts: {}; refusing inconsistent gate projection",
             failed_gates.join(",")
         ));
     }
@@ -523,7 +506,7 @@ fn validate_cached_gate_results_for_pass(
             extra.join(",")
         };
         return Err(format!(
-            "evidence gate cache for sha={sha} does not match required gate set (missing={missing_summary}, extra={extra_summary}); refusing gate artifact reuse for push"
+            "evidence gate results for sha={sha} do not match required gate set (missing={missing_summary}, extra={extra_summary}); refusing gate projection"
         ));
     }
     Ok(())
@@ -1630,12 +1613,15 @@ mod tests {
         serde_yaml::from_str(content).expect("valid yaml")
     }
 
-    fn seed_required_pass_cache(sha: &str, workspace_root: &Path) -> GateCache {
-        let mut cache = GateCache::new(sha);
-        for gate in expected_gate_names_for_workspace(workspace_root) {
-            cache.set_with_attestation(&gate, true, 1, None, false, Some("digest".to_string()));
-        }
-        cache
+    fn seed_required_pass_results(workspace_root: &Path) -> Vec<EvidenceGateResult> {
+        expected_gate_names_for_workspace(workspace_root)
+            .into_iter()
+            .map(|gate_name| EvidenceGateResult {
+                gate_name,
+                passed: true,
+                duration_secs: 1,
+            })
+            .collect()
     }
 
     #[test]
@@ -1913,21 +1899,20 @@ mod tests {
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_returns_cached_results_for_pass() {
+    fn run_blocking_evidence_gates_with_returns_reported_results_for_pass() {
         let sha = "c".repeat(40);
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path();
-        let cache = seed_required_pass_cache(&sha, workspace_root);
+        let results = seed_required_pass_results(workspace_root);
 
         let result = run_blocking_evidence_gates_with(
             workspace_root,
             &sha,
             "guardian-intelligence/apm2",
             Some(615),
-            |_, _, _, _| Ok(true),
-            |_| Some(cache.clone()),
+            |_, _, _, _| Ok((true, results.clone())),
         )
-        .expect("pass should return cached rows");
+        .expect("pass should return reported rows");
 
         assert_eq!(
             result.len(),
@@ -1937,80 +1922,101 @@ mod tests {
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_fails_closed_when_pass_without_cache_artifacts() {
+    fn run_blocking_evidence_gates_with_fails_closed_when_pass_without_gate_artifacts() {
         let sha = "d".repeat(40);
         let err = run_blocking_evidence_gates_with(
             Path::new("/tmp"),
             &sha,
             "guardian-intelligence/apm2",
             Some(616),
-            |_, _, _, _| Ok(true),
-            |_| None,
+            |_, _, _, _| Ok((true, Vec::new())),
         )
-        .expect_err("missing cache on PASS must fail closed");
-        assert!(err.contains("no gate cache artifacts"));
+        .expect_err("missing gate artifacts on PASS must fail closed");
+        assert!(err.contains("no gate result artifacts"));
         assert!(err.contains(&sha));
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_reports_failed_cached_gate_names() {
+    fn run_blocking_evidence_gates_with_reports_failed_gate_names() {
         let sha = "e".repeat(40);
-        let mut cache = GateCache::new(&sha);
-        cache.set_with_attestation("rustfmt", false, 1, None, false, None);
-        cache.set_with_attestation("clippy", true, 2, None, false, None);
-
         let err = run_blocking_evidence_gates_with(
             Path::new("/tmp"),
             &sha,
             "guardian-intelligence/apm2",
             Some(617),
-            |_, _, _, _| Ok(false),
-            |_| Some(cache.clone()),
+            |_, _, _, _| {
+                Ok((
+                    false,
+                    vec![
+                        EvidenceGateResult {
+                            gate_name: "rustfmt".to_string(),
+                            passed: false,
+                            duration_secs: 1,
+                        },
+                        EvidenceGateResult {
+                            gate_name: "clippy".to_string(),
+                            passed: true,
+                            duration_secs: 2,
+                        },
+                    ],
+                ))
+            },
         )
-        .expect_err("failed gate should surface cached failing names");
+        .expect_err("failed gate should surface reported failing names");
         assert!(err.contains("rustfmt"));
         assert!(!err.contains("clippy"));
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_rejects_pass_when_cached_row_is_fail() {
+    fn run_blocking_evidence_gates_with_rejects_pass_when_reported_row_is_fail() {
         let sha = "f".repeat(40);
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path();
-        let mut cache = seed_required_pass_cache(&sha, workspace_root);
-        cache.set_with_attestation("rustfmt", false, 1, None, false, Some("digest".to_string()));
+        let mut results = seed_required_pass_results(workspace_root);
+        let rustfmt = results
+            .iter_mut()
+            .find(|result| result.gate_name == "rustfmt")
+            .expect("rustfmt row");
+        rustfmt.passed = false;
 
         let err = run_blocking_evidence_gates_with(
             workspace_root,
             &sha,
             "guardian-intelligence/apm2",
             Some(618),
-            |_, _, _, _| Ok(true),
-            |_| Some(cache.clone()),
+            |_, _, _, _| Ok((true, results.clone())),
         )
-        .expect_err("pass path must fail when cached gate row is FAIL");
-        assert!(err.contains("cached gate rows include FAIL"));
+        .expect_err("pass path must fail when reported gate row is FAIL");
+        assert!(err.contains("reported gate rows include FAIL"));
         assert!(err.contains("rustfmt"));
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_rejects_incomplete_cache_on_pass() {
+    fn run_blocking_evidence_gates_with_rejects_incomplete_results_on_pass() {
         let sha = "1".repeat(40);
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path();
-        let mut cache = GateCache::new(&sha);
-        cache.set_with_attestation("rustfmt", true, 1, None, false, Some("digest".to_string()));
-        cache.set_with_attestation("clippy", true, 1, None, false, Some("digest".to_string()));
+        let incomplete_results = vec![
+            EvidenceGateResult {
+                gate_name: "rustfmt".to_string(),
+                passed: true,
+                duration_secs: 1,
+            },
+            EvidenceGateResult {
+                gate_name: "clippy".to_string(),
+                passed: true,
+                duration_secs: 1,
+            },
+        ];
 
         let err = run_blocking_evidence_gates_with(
             workspace_root,
             &sha,
             "guardian-intelligence/apm2",
             Some(619),
-            |_, _, _, _| Ok(true),
-            |_| Some(cache.clone()),
+            |_, _, _, _| Ok((true, incomplete_results.clone())),
         )
-        .expect_err("pass path must fail on incomplete cache");
+        .expect_err("pass path must fail on incomplete reported gate set");
         assert!(err.contains("required gate set"));
         assert!(err.contains("missing="));
     }

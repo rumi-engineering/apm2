@@ -33,7 +33,7 @@ fn run_pipeline_inner(repo: &str, pr_number: u32, sha: &str) -> Result<bool, Str
 
     eprintln!("pipeline: running evidence gates for PR #{pr_number} sha={sha}");
 
-    let passed = run_evidence_gates_with_status(&workspace_root, sha, repo, pr_number, None)?;
+    let (passed, _) = run_evidence_gates_with_status(&workspace_root, sha, repo, pr_number, None)?;
 
     if !passed {
         eprintln!("pipeline: evidence gates FAILED — skipping review dispatch");

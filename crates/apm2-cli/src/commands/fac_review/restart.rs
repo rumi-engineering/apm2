@@ -160,7 +160,7 @@ fn execute_strategy(
         RestartStrategy::EvidenceRestart | RestartStrategy::FullRestart => {
             let workspace_root = resolve_worktree_for_sha(&ctx.head_sha)?;
 
-            let passed = run_evidence_gates_with_status(
+            let (passed, _) = run_evidence_gates_with_status(
                 &workspace_root,
                 &ctx.head_sha,
                 &ctx.owner_repo,

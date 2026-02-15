@@ -263,7 +263,7 @@ pub(super) fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> 
 pub(super) fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
     let pr_ref = pr_number.to_string();
     let output = Command::new("gh")
-        .args(["pr", "merge", &pr_ref, "--repo", repo, "--auto", "--squash"])
+        .args(["pr", "merge", &pr_ref, "--repo", repo, "--auto", "--merge"])
         .output()
         .map_err(|err| format!("failed to execute gh pr merge --auto: {err}"))?;
 

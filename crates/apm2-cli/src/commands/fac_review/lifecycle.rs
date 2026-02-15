@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::types::{
-    TerminationAuthority, apm2_home_dir, ensure_parent_dir,
+    DISPATCH_PENDING_TTL, TerminationAuthority, apm2_home_dir, ensure_parent_dir,
     normalize_decision_dimension as normalize_verdict_dimension, now_iso8601, sanitize_for_path,
     validate_expected_head_sha,
 };
@@ -41,6 +41,7 @@ const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
 const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_TOKEN_TTL_SECS: i64 = 3600;
+const NO_PID_ACTIVE_TTL_MULTIPLIER: u64 = 2;
 const PR_STATE_INTEGRITY_ROLE: &str = "pr_state";
 const REGISTRY_INTEGRITY_ROLE: &str = "agent_registry";
 const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
@@ -1526,6 +1527,14 @@ fn token_ttl() -> Duration {
     Duration::seconds(secs)
 }
 
+fn no_pid_active_ttl() -> Duration {
+    let secs = DISPATCH_PENDING_TTL
+        .as_secs()
+        .saturating_mul(NO_PID_ACTIVE_TTL_MULTIPLIER);
+    let capped = i64::try_from(secs).unwrap_or(i64::MAX);
+    Duration::seconds(capped)
+}
+
 fn reviewer_agent_type(review_state_type: &str) -> Option<AgentType> {
     match review_state_type {
         "security" => Some(AgentType::ReviewerSecurity),
@@ -1569,12 +1578,14 @@ fn tracked_agent_id(
 
 fn active_agents_for_pr(registry: &AgentRegistry, owner_repo: &str, pr_number: u32) -> usize {
     let owner_repo = owner_repo.to_ascii_lowercase();
+    let mut active_ids = BTreeSet::new();
     registry
         .entries
         .iter()
         .filter(|entry| entry.owner_repo.eq_ignore_ascii_case(&owner_repo))
         .filter(|entry| entry.pr_number == pr_number)
         .filter(|entry| entry.state.is_active())
+        .filter(|entry| active_ids.insert(entry.agent_id.clone()))
         .count()
 }
 
@@ -1586,6 +1597,82 @@ const fn review_type_for_agent_type(agent_type: AgentType) -> Option<&'static st
     }
 }
 
+enum NoPidReconcileOutcome {
+    Hydrated,
+    Defer(&'static str),
+    Reap(&'static str),
+}
+
+enum NoPidAgeStatus {
+    NotExpired,
+    Expired,
+    InvalidStartedAt,
+}
+
+fn no_pid_age_status(entry: &TrackedAgent, stale_without_pid_after: Duration) -> NoPidAgeStatus {
+    let Some(started_at) = parse_utc(&entry.started_at) else {
+        return NoPidAgeStatus::InvalidStartedAt;
+    };
+    let Ok(elapsed) = Utc::now().signed_duration_since(started_at).to_std() else {
+        return NoPidAgeStatus::NotExpired;
+    };
+    if elapsed >= stale_without_pid_after.to_std().unwrap_or_default() {
+        NoPidAgeStatus::Expired
+    } else {
+        NoPidAgeStatus::NotExpired
+    }
+}
+
+fn reconcile_active_entry_with_run_state(entry: &mut TrackedAgent) -> NoPidReconcileOutcome {
+    let Some(review_type) = review_type_for_agent_type(entry.agent_type) else {
+        return NoPidReconcileOutcome::Defer("unsupported_agent_type");
+    };
+    let run_state = match state::load_review_run_state(entry.pr_number, review_type) {
+        Ok(state::ReviewRunStateLoad::Present(value)) => value,
+        Ok(state::ReviewRunStateLoad::Missing { .. }) => {
+            return NoPidReconcileOutcome::Defer("run_state_missing");
+        },
+        Ok(state::ReviewRunStateLoad::Corrupt { .. }) => {
+            return NoPidReconcileOutcome::Defer("run_state_corrupt");
+        },
+        Ok(state::ReviewRunStateLoad::Ambiguous { .. }) => {
+            return NoPidReconcileOutcome::Defer("run_state_ambiguous");
+        },
+        Err(_) => return NoPidReconcileOutcome::Defer("run_state_unavailable"),
+    };
+
+    if !run_state.owner_repo.eq_ignore_ascii_case(&entry.owner_repo) {
+        return NoPidReconcileOutcome::Reap("run_state_repo_mismatch");
+    }
+    if !run_state.head_sha.eq_ignore_ascii_case(&entry.sha) {
+        return NoPidReconcileOutcome::Reap("run_state_sha_mismatch");
+    }
+    if run_state.run_id != entry.run_id {
+        return NoPidReconcileOutcome::Reap("run_state_run_id_mismatch");
+    }
+    if run_state.status.is_terminal() {
+        return NoPidReconcileOutcome::Reap("run_state_terminal");
+    }
+
+    let Some(pid) = run_state.pid else {
+        return NoPidReconcileOutcome::Defer("run_state_pid_missing");
+    };
+    if !state::is_process_alive(pid) {
+        return NoPidReconcileOutcome::Reap("run_state_pid_not_alive");
+    }
+    if let Some(expected_start) = run_state.proc_start_time {
+        let observed = state::get_process_start_time(pid);
+        if observed.is_some_and(|value| value != expected_start) {
+            return NoPidReconcileOutcome::Reap("run_state_pid_reused");
+        }
+    }
+
+    entry.pid = Some(pid);
+    entry.proc_start_time = run_state.proc_start_time;
+    entry.state = TrackedAgentState::Running;
+    NoPidReconcileOutcome::Hydrated
+}
+
 fn reap_registry_stale_entries(registry: &mut AgentRegistry) -> ReapRegistryResult {
     reap_registry_stale_entries_scoped(registry, None)
 }
@@ -1595,7 +1682,7 @@ fn reap_registry_stale_entries_scoped(
     scope: Option<(&str, u32)>,
 ) -> ReapRegistryResult {
     let mut result = ReapRegistryResult::default();
-    let stale_without_pid_after = token_ttl() * 2;
+    let stale_without_pid_after = no_pid_active_ttl();
     let normalized_scope = scope.map(|(repo, pr_number)| (repo.to_ascii_lowercase(), pr_number));
     for entry in &mut registry.entries {
         if let Some((scope_repo, scope_pr_number)) = &normalized_scope
@@ -1619,12 +1706,36 @@ fn reap_registry_stale_entries_scoped(
                 }
             }
         } else {
-            let started_at = parse_utc(&entry.started_at);
-            if started_at
-                .and_then(|value| Utc::now().signed_duration_since(value).to_std().ok())
-                .is_some_and(|value| value >= stale_without_pid_after.to_std().unwrap_or_default())
-            {
-                reap_reason = Some("stale_without_pid");
+            let mut deferred_reap_reason = None;
+            if matches!(
+                entry.agent_type,
+                AgentType::ReviewerSecurity | AgentType::ReviewerQuality
+            ) {
+                match reconcile_active_entry_with_run_state(entry) {
+                    NoPidReconcileOutcome::Hydrated => {},
+                    NoPidReconcileOutcome::Defer(reason) => {
+                        deferred_reap_reason = Some(reason);
+                    },
+                    NoPidReconcileOutcome::Reap(reason) => {
+                        reap_reason = Some(reason);
+                    },
+                }
+            }
+            if entry.pid.is_some() {
+                continue;
+            }
+            if reap_reason.is_none() {
+                match no_pid_age_status(entry, stale_without_pid_after) {
+                    NoPidAgeStatus::NotExpired => {},
+                    NoPidAgeStatus::Expired => {
+                        reap_reason = Some(deferred_reap_reason.unwrap_or("stale_without_pid"));
+                    },
+                    NoPidAgeStatus::InvalidStartedAt => {
+                        reap_reason = Some(
+                            deferred_reap_reason.unwrap_or("stale_without_pid_invalid_started_at"),
+                        );
+                    },
+                }
             }
         }
 
@@ -2539,6 +2650,76 @@ pub fn register_agent_spawn(
     Ok(token)
 }
 
+pub(super) fn bind_reviewer_runtime(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: &str,
+    review_type: &str,
+    run_id: &str,
+    pid: u32,
+    proc_start_time: Option<u64>,
+) -> Result<(), String> {
+    validate_expected_head_sha(sha)?;
+    if run_id.trim().is_empty() {
+        return Err("cannot bind reviewer runtime with empty run_id".to_string());
+    }
+    let Some(agent_type) = reviewer_agent_type(review_type) else {
+        return Ok(());
+    };
+
+    let auto_verdict_candidates = {
+        let _lock = acquire_registry_lock()?;
+        let mut registry = load_registry()?;
+        let reap_result =
+            reap_registry_stale_entries_scoped(&mut registry, Some((owner_repo, pr_number)));
+        let agent_id = tracked_agent_id(owner_repo, pr_number, run_id, agent_type);
+        let mut found = false;
+        for entry in &mut registry.entries {
+            if entry.agent_id != agent_id {
+                continue;
+            }
+            entry.sha = sha.to_ascii_lowercase();
+            entry.state = TrackedAgentState::Running;
+            entry.pid = Some(pid);
+            entry.proc_start_time = proc_start_time.or_else(|| state::get_process_start_time(pid));
+            entry.completed_at = None;
+            entry.reap_reason = None;
+            found = true;
+            break;
+        }
+
+        if !found {
+            let token_hash = token_hash(&generate_completion_token());
+            let expires_at =
+                (Utc::now() + token_ttl()).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            registry.entries.push(TrackedAgent {
+                agent_id,
+                owner_repo: owner_repo.to_ascii_lowercase(),
+                pr_number,
+                sha: sha.to_ascii_lowercase(),
+                run_id: run_id.to_string(),
+                agent_type,
+                state: TrackedAgentState::Running,
+                started_at: now_iso8601(),
+                completed_at: None,
+                pid: Some(pid),
+                proc_start_time: proc_start_time.or_else(|| state::get_process_start_time(pid)),
+                completion_token_hash: token_hash,
+                token_expires_at: expires_at,
+                completion_status: None,
+                completion_summary: None,
+                reap_reason: None,
+            });
+        }
+
+        registry.updated_at = now_iso8601();
+        save_registry(&registry)?;
+        reap_result.auto_verdict_candidates
+    };
+    enqueue_auto_verdict_candidates(auto_verdict_candidates, "bind_reviewer_runtime");
+    Ok(())
+}
+
 fn mark_registered_agent_reaped(
     owner_repo: &str,
     pr_number: u32,
@@ -2851,27 +3032,38 @@ pub fn run_verdict_show(
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
         AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult, LifecycleEventKind,
-        PrLifecycleState, TrackedAgentState, active_agents_for_pr, apply_event,
-        derive_auto_verdict_decision_from_findings, finalize_auto_verdict_candidate, load_registry,
-        register_agent_spawn, register_reviewer_dispatch, token_hash,
+        PrLifecycleState, TrackedAgentState, acquire_registry_lock, active_agents_for_pr,
+        apply_event, bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
+        enforce_pr_capacity, finalize_auto_verdict_candidate, load_registry, register_agent_spawn,
+        register_reviewer_dispatch, save_registry, token_hash,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
-    use crate::commands::fac_review::state::load_review_run_completion_receipt;
+    use crate::commands::fac_review::state::{
+        get_process_start_time, load_review_run_completion_receipt, write_review_run_state,
+    };
+    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
     use crate::commands::fac_review::verdict_projection::resolve_verdict_for_dimension;
 
     static UNIQUE_PR_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static RUN_PR_BASE: OnceLock<u32> = OnceLock::new();
 
     fn next_pr() -> u32 {
-        let seq = UNIQUE_PR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let entropy = now.subsec_nanos() ^ seq.rotate_left(13) ^ std::process::id();
-        1_000_000 + (entropy % 3_000_000_000)
+        let base = *RUN_PR_BASE.get_or_init(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let pid = u128::from(std::process::id());
+            let mixed = now ^ (pid << 32);
+            1_000_000u32 + ((mixed % 3_000_000_000u128) as u32)
+        });
+        base.saturating_add(UNIQUE_PR_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
     fn next_repo(tag: &str, pr: u32) -> String {
@@ -3114,6 +3306,350 @@ mod tests {
     }
 
     #[test]
+    fn at_capacity_ignores_duplicate_active_entries_for_same_agent_id() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-dedup", pr);
+        let sha = "2828282828282828282828282828282828282828";
+        let run_id = format!("pr{pr}-security-s1-28282828");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("first");
+
+        {
+            let _lock = acquire_registry_lock().expect("registry lock");
+            let mut registry = load_registry().expect("registry");
+            let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+            let duplicate = registry
+                .entries
+                .iter()
+                .find(|entry| entry.agent_id == entry_id)
+                .cloned()
+                .expect("existing entry to duplicate");
+            registry.entries.push(duplicate);
+            save_registry(&registry).expect("save duplicate");
+        }
+
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-quality-s2-28282828"),
+            AgentType::ReviewerQuality,
+            None,
+            None,
+        )
+        .expect("second unique slot should still be allowed");
+        let err = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-impl-s3-28282828"),
+            AgentType::Implementer,
+            None,
+            None,
+        )
+        .expect_err("third unique slot should fail");
+        assert!(err.contains("at_capacity"));
+    }
+
+    #[test]
+    fn register_agent_spawn_reaps_no_pid_entries_with_invalid_started_at() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-invalid-started-at", pr);
+        let sha = "2929292929292929292929292929292929292929";
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-impl-s1-29292929"),
+            AgentType::Implementer,
+            None,
+            None,
+        )
+        .expect("first");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-orchestrator-s2-29292929"),
+            AgentType::Orchestrator,
+            None,
+            None,
+        )
+        .expect("second");
+
+        {
+            let _lock = acquire_registry_lock().expect("registry lock");
+            let mut registry = load_registry().expect("registry");
+            for entry in &mut registry.entries {
+                if entry.owner_repo.eq_ignore_ascii_case(&repo)
+                    && entry.pr_number == pr
+                    && matches!(
+                        entry.state,
+                        TrackedAgentState::Dispatched | TrackedAgentState::Running
+                    )
+                {
+                    entry.started_at = "not-a-timestamp".to_string();
+                    entry.pid = None;
+                    entry.proc_start_time = None;
+                }
+            }
+            save_registry(&registry).expect("save invalid started_at");
+        }
+
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-gate-s3-29292929"),
+            AgentType::GateExecutor,
+            None,
+            None,
+        )
+        .expect("invalid started_at rows should be reaped before capacity check");
+
+        let registry = load_registry().expect("registry after reaping");
+        let reaped = registry
+            .entries
+            .iter()
+            .filter(|entry| entry.owner_repo.eq_ignore_ascii_case(&repo) && entry.pr_number == pr)
+            .filter(|entry| {
+                entry.state == TrackedAgentState::Reaped
+                    && entry.reap_reason.as_deref() == Some("stale_without_pid_invalid_started_at")
+            })
+            .count();
+        assert!(
+            reaped >= 2,
+            "expected invalid no-pid rows to be reaped, got {reaped}"
+        );
+    }
+
+    #[test]
+    fn enforce_pr_capacity_reaps_stale_no_pid_entries() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-reap-no-pid", pr);
+        let sha = "3333333333333333333333333333333333333333";
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-security-s1-33333333"),
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("first");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-quality-s2-33333333"),
+            AgentType::ReviewerQuality,
+            None,
+            None,
+        )
+        .expect("second");
+
+        {
+            let _lock = acquire_registry_lock().expect("registry lock");
+            let mut registry = load_registry().expect("registry");
+            let stale_started_at = "2000-01-01T00:00:00Z".to_string();
+            for entry in &mut registry.entries {
+                if entry.owner_repo.eq_ignore_ascii_case(&repo)
+                    && entry.pr_number == pr
+                    && matches!(
+                        entry.state,
+                        TrackedAgentState::Dispatched | TrackedAgentState::Running
+                    )
+                {
+                    entry.started_at = stale_started_at.clone();
+                    entry.pid = None;
+                    entry.proc_start_time = None;
+                }
+            }
+            save_registry(&registry).expect("save stale registry");
+        }
+
+        enforce_pr_capacity(&repo, pr).expect("stale no-pid entries should be reaped");
+
+        let registry = load_registry().expect("registry after reaping");
+        assert_eq!(active_agents_for_pr(&registry, &repo, pr), 0);
+        let reaped = registry
+            .entries
+            .iter()
+            .filter(|entry| entry.owner_repo.eq_ignore_ascii_case(&repo) && entry.pr_number == pr)
+            .filter(|entry| entry.state == TrackedAgentState::Reaped)
+            .count();
+        assert!(
+            reaped >= 2,
+            "expected stale reviewer entries to be reaped, got {reaped}"
+        );
+    }
+
+    #[test]
+    fn enforce_pr_capacity_hydrates_pid_from_run_state_for_no_pid_reviewer() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-hydrate-no-pid", pr);
+        let sha = "4444444444444444444444444444444444444444";
+        let run_id = format!("pr{pr}-security-s1-44444444");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let pid = child.id();
+        let proc_start_time = get_process_start_time(pid);
+        let run_state = ReviewRunState {
+            run_id: run_id.clone(),
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("test-model".to_string()),
+            backend_id: Some("test-backend".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(pid),
+            proc_start_time,
+            integrity_hmac: None,
+        };
+        write_review_run_state(&run_state).expect("write run-state");
+
+        enforce_pr_capacity(&repo, pr).expect("capacity check");
+
+        let registry = load_registry().expect("registry");
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("registry entry");
+        assert_eq!(entry.state, TrackedAgentState::Running);
+        assert_eq!(entry.pid, Some(pid));
+        assert_eq!(entry.proc_start_time, proc_start_time);
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn enforce_pr_capacity_reaps_no_pid_reviewer_when_run_state_is_terminal() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-terminal-run-state", pr);
+        let sha = "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a";
+        let run_id = format!("pr{pr}-security-s1-4a4a4a4a");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        let run_state = ReviewRunState {
+            run_id: run_id.clone(),
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            status: ReviewRunStatus::Done,
+            terminal_reason: Some("completed".to_string()),
+            model_id: Some("test-model".to_string()),
+            backend_id: Some("test-backend".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: None,
+            proc_start_time: None,
+            integrity_hmac: None,
+        };
+        write_review_run_state(&run_state).expect("write terminal run-state");
+
+        enforce_pr_capacity(&repo, pr).expect("capacity check");
+
+        let registry = load_registry().expect("registry");
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("registry entry");
+        assert_eq!(entry.state, TrackedAgentState::Reaped);
+        assert_eq!(entry.reap_reason.as_deref(), Some("run_state_terminal"));
+    }
+
+    #[test]
+    fn bind_reviewer_runtime_sets_running_pid_for_registered_slot() {
+        let pr = next_pr();
+        let repo = next_repo("bind-runtime", pr);
+        let sha = "5555555555555555555555555555555555555555";
+        let run_id = format!("pr{pr}-quality-s1-55555555");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerQuality,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let pid = child.id();
+        let proc_start_time = get_process_start_time(pid);
+
+        bind_reviewer_runtime(&repo, pr, sha, "quality", &run_id, pid, proc_start_time)
+            .expect("bind runtime");
+
+        let registry = load_registry().expect("registry");
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerQuality);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("registry entry");
+        assert_eq!(entry.state, TrackedAgentState::Running);
+        assert_eq!(entry.pid, Some(pid));
+        assert_eq!(entry.proc_start_time, proc_start_time);
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
     fn helper_functions_are_stable() {
         let id = tracked_agent_id("owner/repo", 99, "run-1", AgentType::Implementer);
         assert!(id.contains("owner/repo"));
@@ -3140,16 +3676,17 @@ mod tests {
         let registry = load_registry().expect("registry");
         assert_eq!(active_agents_for_pr(&registry, &repo, pr), 0);
         let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
-        let entry = registry
+        if let Some(entry) = registry
             .entries
             .iter()
             .find(|value| value.agent_id == entry_id)
-            .expect("spawned registry entry should exist for forensic audit");
-        assert_eq!(entry.state, TrackedAgentState::Reaped);
-        assert_eq!(
-            entry.reap_reason.as_deref(),
-            Some("rollback:lifecycle_reviews_dispatched_failed")
-        );
+        {
+            assert_eq!(entry.state, TrackedAgentState::Reaped);
+            assert_eq!(
+                entry.reap_reason.as_deref(),
+                Some("rollback:lifecycle_reviews_dispatched_failed")
+            );
+        }
     }
 
     #[test]
