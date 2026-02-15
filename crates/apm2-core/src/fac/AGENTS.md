@@ -449,6 +449,67 @@ deletion primitive for lane cleanup and reset operations.
   immediately (not filtered). On Unix, raw byte scanning catches `.`
   segments that `Path::components()` silently normalizes away.
 
+### Lane Cleanup State Machine (TCK-00569)
+
+Lane cleanup is part of the authoritative execution lifecycle and uses
+`LaneCorruptMarkerV1` for durable fault marking.
+
+**Lifecycle invariant**: A RUNNING `LaneLeaseV1` must be persisted before
+any execution begins. The lease is created after lane acquisition and lane
+profile loading, binding the current PID, job ID, and lane profile hash.
+This ensures the cleanup state machine in `run_lane_cleanup` can verify
+its RUNNING-state precondition. On every terminal path (denial, skip,
+completion), the lease is removed or transitioned coherently.
+
+**Cleanup ordering**: Lane cleanup runs AFTER job completion (receipt
+emission + move to completed/). Cleanup failures do not change the job
+outcome; they only mark the lane as Corrupt. This decouples job execution
+integrity from infrastructure lifecycle management.
+
+**Process liveness**: Stale lease detection uses `libc::kill(pid, 0)` with
+errno discrimination: ESRCH = dead (safe to recover), EPERM = alive but
+unpermissioned (mark corrupt), success = alive (mark corrupt if flock held
+by another worker).
+
+### Security Invariants (TCK-00569)
+
+- [INV-LANE-CLEANUP-001] Every lane cleanup attempt emits a
+  `LaneCleanupReceiptV1`, including failures.
+- [INV-LANE-CLEANUP-002] Cleanup failure must persist `LaneCorruptMarkerV1` with
+  `reason` and optional `cleanup_receipt_digest` before transitioning the lane to
+  Corrupt state.
+- [INV-LANE-CLEANUP-003] `LaneStatusV1` must expose `corrupt_reason` derived
+  from any persistent corrupt marker.
+- [INV-LANE-CLEANUP-004] Lane log retention is enforced by oldest-first file
+  pruning to `MAX_LOG_QUOTA_BYTES`.
+- [INV-LANE-CLEANUP-004a] `collect_log_entries` bounds per-directory breadth
+  by `MAX_DIR_ENTRIES` (10,000, matching INV-RMTREE-009). Exceeding the limit
+  returns `Err` with a DoS-prevention reason, preventing directory-flood
+  resource exhaustion.
+- [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
+  job execution and removed on every terminal path.
+- [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)
+  must precede lane cleanup. Cleanup failure must not negate a completed job.
+- [INV-LANE-CLEANUP-007] Corrupt marker persistence uses crash-safe durability:
+  fsync temp file, atomic rename, fsync directory.
+- [INV-LANE-CLEANUP-007a] Receipt persistence (`LaneCleanupReceiptV1::persist`)
+  uses the atomic write protocol (CTR-2607): `NamedTempFile` with restrictive
+  permissions (0o600 on Unix), `sync_all()` for durability, then atomic rename.
+  This matches the durable write pattern used by `LaneCorruptMarkerV1::persist`
+  via `atomic_write` in `lane.rs`.
+- [INV-LANE-CLEANUP-008] Git commands in lane cleanup use config isolation to
+  prevent LPE via malicious `.git/config` entries. `build_isolated_git_command()`
+  sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, and overrides
+  `core.fsmonitor=`, `core.pager=cat`, `core.editor=:` via `-c` flags. This
+  prevents a malicious job from planting executable config hooks that would run
+  with worker privileges during `git reset` or `git clean`.
+- [INV-LANE-CLEANUP-009] Post-checkout denial paths (checkout failure, patch
+  failure, containment failure, unsupported source kind) must invoke
+  `execute_lane_cleanup` instead of merely removing the lease. This ensures the
+  workspace is restored to a clean state and prevents cross-job contamination.
+  Cleanup failure on denial paths results in CORRUPT lane marking, same as the
+  success path.
+
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 
 **Core type**: `RepoMirrorManager`
