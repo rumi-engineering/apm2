@@ -451,6 +451,7 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
     )
     .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
     test_env.extend(bounded_spec.environment);
+    test_env.extend(bounded_spec.setenv_pairs);
 
     Ok(PipelineTestCommand {
         command: bounded_spec.command,
