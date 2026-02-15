@@ -1327,6 +1327,7 @@ impl LaneManager {
         let reset_output = match reset_output {
             Ok(reset_output) => reset_output,
             Err(err) => {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
                 return Err(LaneCleanupError::GitCommandFailed {
                     step: CLEANUP_STEP_GIT_RESET,
                     reason: format!("git reset spawn: {err}"),
@@ -1336,6 +1337,7 @@ impl LaneManager {
             },
         };
         if !reset_output.status.success() {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
             return Err(LaneCleanupError::GitCommandFailed {
                 step: CLEANUP_STEP_GIT_RESET,
                 reason: format!(
@@ -1357,6 +1359,7 @@ impl LaneManager {
         let clean_output = match clean_output {
             Ok(clean_output) => clean_output,
             Err(err) => {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
                 return Err(LaneCleanupError::GitCommandFailed {
                     step: CLEANUP_STEP_GIT_CLEAN,
                     reason: format!("git clean spawn: {err}"),
@@ -1366,6 +1369,7 @@ impl LaneManager {
             },
         };
         if !clean_output.status.success() {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
             return Err(LaneCleanupError::GitCommandFailed {
                 step: CLEANUP_STEP_GIT_CLEAN,
                 reason: format!(
@@ -1381,14 +1385,15 @@ impl LaneManager {
         // Step 3: Prune temp directory.
         let tmp_dir = lanes_dir.join("tmp");
         if tmp_dir.exists() {
-            safe_rmtree_v1(&tmp_dir, &lanes_dir).map_err(|e| {
-                LaneCleanupError::TempPruneFailed {
+            if let Err(err) = safe_rmtree_v1(&tmp_dir, &lanes_dir) {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(LaneCleanupError::TempPruneFailed {
                     step: CLEANUP_STEP_TEMP_PRUNE,
-                    reason: format!("{e}"),
+                    reason: format!("{err}"),
                     steps_completed: steps_completed.clone(),
                     failure_step: Some(CLEANUP_STEP_TEMP_PRUNE.to_string()),
-                }
-            })?;
+                });
+            }
         }
         steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
 
@@ -2783,7 +2788,7 @@ mod tests {
         );
 
         let status_during = manager.lane_status(lane_id).expect("status during failure");
-        assert_eq!(status_during.state, LaneState::Cleanup);
+        assert_eq!(status_during.state, LaneState::Corrupt);
 
         drop(guard);
         let status_after = manager.lane_status(lane_id).expect("status after release");
