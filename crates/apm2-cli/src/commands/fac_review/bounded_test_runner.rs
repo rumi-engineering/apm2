@@ -32,6 +32,7 @@ const SYSTEMD_SETENV_ALLOWLIST_PREFIXES: &[&str] = &["SCCACHE_"];
 pub struct BoundedTestCommandSpec {
     pub command: Vec<String>,
     pub environment: Vec<(String, String)>,
+    pub setenv_pairs: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,7 @@ pub fn build_bounded_test_command(
     Ok(BoundedTestCommandSpec {
         command,
         environment,
+        setenv_pairs,
     })
 }
 
