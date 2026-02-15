@@ -825,11 +825,30 @@ fn process_job(
         },
     };
 
+    // Step 0: Index-first duplicate detection (TCK-00560).
+    //
+    // Check the receipt index to see if a receipt already exists for this
+    // job_id. This avoids redundant processing of already-completed jobs
+    // and replaces full directory scans with an O(1) index lookup.
+    //
+    // When a duplicate is detected, the pending file is moved to completed/
+    // so it is not re-scanned every cycle (queue-pinning DoS prevention).
+    let spec = &candidate.spec;
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    if apm2_core::fac::has_receipt_for_job(&receipts_dir, &spec.job_id) {
+        let _ = move_to_dir_safe(path, &queue_root.join(COMPLETED_DIR), &file_name);
+        return JobOutcome::Skipped {
+            reason: format!(
+                "receipt already exists for job {} (index lookup)",
+                spec.job_id
+            ),
+        };
+    }
+
     // Step 1+2: Use the bounded bytes already loaded by scan_pending.
     //
     // The file was already validated by `scan_pending`; this avoids duplicate I/O.
     let _ = &candidate.raw_bytes;
-    let spec = &candidate.spec;
     // Validate structure + digest + request_id binding.
     if let Err(e) = validate_job_spec(spec) {
         let is_digest_error = matches!(
