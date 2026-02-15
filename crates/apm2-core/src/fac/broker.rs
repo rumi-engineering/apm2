@@ -588,12 +588,19 @@ impl FacBroker {
         self.admission_health_gate_passed = passed;
     }
 
-    /// Advances the broker tick by 1 (monotonic).
+    /// Advances the broker tick by 1 (monotonic) and resets the
+    /// control-plane budget for the new window.
+    ///
+    /// TCK-00568: Each tick boundary starts a fresh budget window so that
+    /// rate limits are per-tick, not per-process-lifetime. Without this
+    /// reset, one burst permanently exhausts the budget (Security MAJOR).
     ///
     /// Returns the new tick value.
     #[must_use]
     pub const fn advance_tick(&mut self) -> u64 {
         self.state.current_tick = self.state.current_tick.saturating_add(1);
+        // Reset control-plane budget counters for the new tick window.
+        self.control_plane_budget.reset();
         self.state.current_tick
     }
 
@@ -1643,6 +1650,48 @@ mod tests {
         let t3 = broker.advance_tick();
         assert!(t2 > t1);
         assert!(t3 > t2);
+    }
+
+    #[test]
+    fn advance_tick_resets_control_plane_budget() {
+        use crate::fac::broker_rate_limits::ControlPlaneLimits;
+
+        let limits = ControlPlaneLimits {
+            max_token_issuance: 2,
+            ..ControlPlaneLimits::default()
+        };
+        let mut broker = FacBroker::with_limits(limits).expect("limits should be valid");
+        broker.set_admission_health_gate_for_test(true);
+
+        // Exhaust the token issuance budget.
+        let job_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
+        let _ = broker
+            .issue_channel_context_token(&job_digest, "l1", "r1", "boundary")
+            .expect("first issuance should succeed");
+        let _ = broker
+            .issue_channel_context_token(&job_digest, "l2", "r2", "boundary")
+            .expect("second issuance should succeed");
+
+        // Third issuance should be denied (budget exhausted).
+        let err = broker
+            .issue_channel_context_token(&job_digest, "l3", "r3", "boundary")
+            .unwrap_err();
+        assert!(
+            matches!(err, BrokerError::ControlPlaneBudgetDenied(_)),
+            "expected ControlPlaneBudgetDenied, got {err:?}"
+        );
+
+        // Advance tick — budget resets.
+        let _ = broker.advance_tick();
+
+        // Now issuance should succeed again.
+        let _ = broker
+            .issue_channel_context_token(&job_digest, "l4", "r4", "boundary")
+            .expect("issuance after tick advance should succeed");
+        assert_eq!(broker.control_plane_budget().tokens_issued(), 1);
     }
 
     // -----------------------------------------------------------------------

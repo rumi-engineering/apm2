@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::determinism::canonicalize_json;
 use crate::events::Canonicalize;
 use crate::evidence::{CasError, ContentAddressedStore};
+use crate::fac::broker_rate_limits::ControlPlaneLimits;
 use crate::pcac::{BoundaryIntentClass, RiskTier};
 
 const PROFILE_SCHEMA: &str = "apm2.economics_constraint_profile.v1";
@@ -78,6 +79,12 @@ pub struct EconomicsProfile {
     pub input_state: EconomicsProfileInputState,
     /// Budget matrix keyed by `(RiskTier, BoundaryIntentClass)`.
     pub budget_matrix: BTreeMap<(RiskTier, BoundaryIntentClass), BudgetEntry>,
+    /// Control-plane rate limits (TCK-00568).
+    ///
+    /// CAS-addressed alongside other economics data so that distributed
+    /// quota configuration is hash-bound to the profile. When `None`,
+    /// the broker falls back to [`ControlPlaneLimits::default()`].
+    pub control_plane_limits: Option<ControlPlaneLimits>,
 }
 
 impl Canonicalize for EconomicsProfile {
@@ -159,6 +166,10 @@ struct EconomicsProfileWire {
     lifecycle_cost_vector: LifecycleCostVector,
     input_state: EconomicsProfileInputState,
     budget_entries: Vec<BudgetCell>,
+    /// Control-plane rate limits (TCK-00568). Optional for backwards
+    /// compatibility with profiles serialized before TCK-00568.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_plane_limits: Option<ControlPlaneLimits>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +195,28 @@ impl EconomicsProfile {
             lifecycle_cost_vector,
             input_state,
             budget_matrix,
+            control_plane_limits: None,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Creates a validated economics profile with control-plane limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if profile validation fails.
+    pub fn with_control_plane_limits(
+        lifecycle_cost_vector: LifecycleCostVector,
+        input_state: EconomicsProfileInputState,
+        budget_matrix: BTreeMap<(RiskTier, BoundaryIntentClass), BudgetEntry>,
+        control_plane_limits: ControlPlaneLimits,
+    ) -> Result<Self, EconomicsProfileError> {
+        let profile = Self {
+            lifecycle_cost_vector,
+            input_state,
+            budget_matrix,
+            control_plane_limits: Some(control_plane_limits),
         };
         profile.validate()?;
         Ok(profile)
@@ -224,6 +257,7 @@ impl EconomicsProfile {
             },
             input_state: EconomicsProfileInputState::Current,
             budget_matrix,
+            control_plane_limits: Some(ControlPlaneLimits::default()),
         }
     }
 
@@ -378,6 +412,7 @@ impl EconomicsProfile {
             lifecycle_cost_vector: self.lifecycle_cost_vector,
             input_state: self.input_state,
             budget_entries,
+            control_plane_limits: self.control_plane_limits,
         }
     }
 
@@ -406,6 +441,7 @@ impl EconomicsProfile {
             lifecycle_cost_vector: wire.lifecycle_cost_vector,
             input_state: wire.input_state,
             budget_matrix,
+            control_plane_limits: wire.control_plane_limits,
         })
     }
 }
@@ -557,6 +593,7 @@ mod tests {
                 };
                 MAX_BUDGET_ENTRIES + 1
             ],
+            control_plane_limits: None,
         };
         let payload = serde_json::to_vec(&wire).expect("wire should serialize");
         let mut framed = Vec::from(ECONOMICS_PROFILE_HASH_DOMAIN);

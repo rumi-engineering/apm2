@@ -93,10 +93,16 @@ pub enum ControlPlaneBudgetError {
     },
 
     /// Counter arithmetic overflowed (terminal condition).
+    ///
+    /// INV-CPRL-004: overflow produces a denial receipt with the same
+    /// structured evidence as `BudgetExceeded` so auditors can retrieve
+    /// machine-readable denial evidence for all denial paths.
     #[error("control-plane budget counter overflow: {dimension}")]
     CounterOverflow {
         /// Which dimension overflowed.
         dimension: String,
+        /// Structured denial receipt (INV-CPRL-004).
+        receipt: ControlPlaneDenialReceipt,
     },
 
     /// Limits are invalid (e.g., exceed hard caps).
@@ -293,6 +299,13 @@ impl ControlPlaneBudget {
         let next = self.tokens_issued.checked_add(1).ok_or_else(|| {
             ControlPlaneBudgetError::CounterOverflow {
                 dimension: "tokens_issued".to_string(),
+                receipt: ControlPlaneDenialReceipt {
+                    dimension: ControlPlaneDimension::TokenIssuance,
+                    current_usage: self.tokens_issued,
+                    limit: self.limits.max_token_issuance,
+                    requested_increment: 1,
+                    reason: truncate_reason(DENY_REASON_COUNTER_OVERFLOW),
+                },
             }
         })?;
 
@@ -328,11 +341,25 @@ impl ControlPlaneBudget {
         let next_ops = self.queue_enqueue_ops.checked_add(1).ok_or_else(|| {
             ControlPlaneBudgetError::CounterOverflow {
                 dimension: "queue_enqueue_ops".to_string(),
+                receipt: ControlPlaneDenialReceipt {
+                    dimension: ControlPlaneDimension::QueueEnqueueOps,
+                    current_usage: self.queue_enqueue_ops,
+                    limit: self.limits.max_queue_enqueue_ops,
+                    requested_increment: 1,
+                    reason: truncate_reason(DENY_REASON_COUNTER_OVERFLOW),
+                },
             }
         })?;
         let next_bytes = self.queue_bytes.checked_add(bytes).ok_or_else(|| {
             ControlPlaneBudgetError::CounterOverflow {
                 dimension: "queue_bytes".to_string(),
+                receipt: ControlPlaneDenialReceipt {
+                    dimension: ControlPlaneDimension::QueueBytes,
+                    current_usage: self.queue_bytes,
+                    limit: self.limits.max_queue_bytes,
+                    requested_increment: bytes,
+                    reason: truncate_reason(DENY_REASON_COUNTER_OVERFLOW),
+                },
             }
         })?;
 
@@ -369,6 +396,13 @@ impl ControlPlaneBudget {
         let next = self.bundle_export_bytes.checked_add(bytes).ok_or_else(|| {
             ControlPlaneBudgetError::CounterOverflow {
                 dimension: "bundle_export_bytes".to_string(),
+                receipt: ControlPlaneDenialReceipt {
+                    dimension: ControlPlaneDimension::BundleExportBytes,
+                    current_usage: self.bundle_export_bytes,
+                    limit: self.limits.max_bundle_export_bytes,
+                    requested_increment: bytes,
+                    reason: truncate_reason(DENY_REASON_COUNTER_OVERFLOW),
+                },
             }
         })?;
 
@@ -479,12 +513,21 @@ pub struct ControlPlaneDenialReceipt {
 // Helpers
 // ============================================================================
 
-/// Truncates a reason string to the maximum allowed length.
+/// Truncates a reason string to the maximum allowed length (UTF-8 safe).
+///
+/// Uses `char_indices` to find a safe truncation boundary, ensuring we never
+/// split a multi-byte UTF-8 character (INV-CPRL-005, RSK-2406 panic safety).
 fn truncate_reason(reason: &str) -> String {
     if reason.len() <= MAX_DENIAL_REASON_LENGTH {
         reason.to_string()
     } else {
-        reason[..MAX_DENIAL_REASON_LENGTH].to_string()
+        // Find the last char boundary at or before MAX_DENIAL_REASON_LENGTH.
+        let boundary = reason
+            .char_indices()
+            .take_while(|&(i, _)| i <= MAX_DENIAL_REASON_LENGTH)
+            .last()
+            .map_or(0, |(i, _)| i);
+        reason[..boundary].to_string()
     }
 }
 
@@ -880,5 +923,75 @@ mod tests {
         assert_eq!(denied, 150);
         assert_eq!(budget.queue_enqueue_ops(), 50);
         assert_eq!(budget.queue_bytes(), 250);
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter overflow produces denial receipt (INV-CPRL-004)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn counter_overflow_produces_receipt_token_issuance() {
+        let limits = ControlPlaneLimits {
+            max_token_issuance: MAX_TOKEN_ISSUANCE_LIMIT,
+            ..default_limits()
+        };
+        let mut budget = ControlPlaneBudget::new(limits).unwrap();
+        budget.tokens_issued = u64::MAX;
+        let err = budget.admit_token_issuance().unwrap_err();
+        match err {
+            ControlPlaneBudgetError::CounterOverflow { dimension, receipt } => {
+                assert_eq!(dimension, "tokens_issued");
+                assert_eq!(receipt.dimension, ControlPlaneDimension::TokenIssuance);
+                assert_eq!(receipt.current_usage, u64::MAX);
+                assert_eq!(receipt.limit, MAX_TOKEN_ISSUANCE_LIMIT);
+                assert_eq!(receipt.requested_increment, 1);
+                assert_eq!(receipt.reason, DENY_REASON_COUNTER_OVERFLOW);
+            },
+            other => panic!("expected CounterOverflow with receipt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn counter_overflow_produces_receipt_bundle_export() {
+        let limits = ControlPlaneLimits {
+            max_bundle_export_bytes: MAX_BUNDLE_EXPORT_BYTES_LIMIT,
+            ..default_limits()
+        };
+        let mut budget = ControlPlaneBudget::new(limits).unwrap();
+        budget.bundle_export_bytes = u64::MAX - 10;
+        let err = budget.admit_bundle_export(20).unwrap_err();
+        match err {
+            ControlPlaneBudgetError::CounterOverflow { dimension, receipt } => {
+                assert_eq!(dimension, "bundle_export_bytes");
+                assert_eq!(receipt.dimension, ControlPlaneDimension::BundleExportBytes);
+                assert_eq!(receipt.current_usage, u64::MAX - 10);
+                assert_eq!(receipt.requested_increment, 20);
+                assert_eq!(receipt.reason, DENY_REASON_COUNTER_OVERFLOW);
+            },
+            other => panic!("expected CounterOverflow with receipt, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UTF-8-safe truncation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_reason_utf8_safe() {
+        // Build a string with multi-byte chars that would panic with naive
+        // byte slicing at MAX_DENIAL_REASON_LENGTH.
+        let multi_byte = "\u{1F600}"; // 4-byte emoji
+        let long_reason = multi_byte.repeat(100); // 400 bytes > MAX_DENIAL_REASON_LENGTH
+        // Should NOT panic.
+        let truncated = truncate_reason(&long_reason);
+        assert!(truncated.len() <= MAX_DENIAL_REASON_LENGTH);
+        // Verify the truncated string is valid UTF-8.
+        let _ = truncated.as_str();
+    }
+
+    #[test]
+    fn truncate_reason_short_string_unchanged() {
+        let short = "hello";
+        assert_eq!(truncate_reason(short), "hello");
     }
 }
