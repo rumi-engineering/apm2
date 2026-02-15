@@ -82,6 +82,12 @@ use crate::exit_codes::codes as exit_codes;
 
 const DOCTOR_SCHEMA: &str = "apm2.fac.review.doctor.v1";
 const DOCTOR_STALE_GATE_AGE_SECONDS: i64 = 6 * 60 * 60;
+const DOCTOR_EVENT_SCAN_MAX_LINES: usize = 200_000;
+const DOCTOR_EVENT_SCAN_MAX_LINE_BYTES: usize = 64 * 1024;
+const DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE: u64 = 8 * 1024 * 1024;
+const DOCTOR_LOG_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const DOCTOR_LOG_SCAN_MAX_LINES: u64 = 200_000;
+const DOCTOR_LOG_SCAN_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -147,6 +153,9 @@ struct DoctorAgentSnapshot {
     completion_token_expires_at: String,
     elapsed_seconds: Option<i64>,
     models_attempted: Vec<String>,
+    tool_call_count: Option<u64>,
+    log_line_count: Option<u64>,
+    nudge_count: Option<u32>,
     last_activity_seconds_ago: Option<i64>,
 }
 
@@ -1125,8 +1134,20 @@ fn run_doctor_inner(
             }
 
             let mut entries = Vec::with_capacity(snapshot.entries.len());
-            let (activity_map, model_attempts, findings_activity) = if lightweight {
+            let (
+                activity_map,
+                activity_by_run_id,
+                model_attempts,
+                model_attempts_by_run_id,
+                tool_call_counts,
+                nudge_counts_from_events,
+                findings_activity,
+            ) = if lightweight {
                 (
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
                     std::collections::BTreeMap::new(),
                     std::collections::BTreeMap::new(),
                     std::collections::BTreeMap::new(),
@@ -1146,12 +1167,28 @@ fn run_doctor_inner(
                 );
                 (
                     event_signals.activity_timestamps,
+                    event_signals.activity_timestamps_by_run_id,
                     event_signals.model_attempts,
+                    event_signals.model_attempts_by_run_id,
+                    event_signals.tool_call_counts,
+                    event_signals.nudge_counts,
                     fa,
+                )
+            };
+            let (run_state_nudge_counts, log_line_counts) = if lightweight {
+                (
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                )
+            } else {
+                (
+                    load_run_state_nudge_counts_for_pr(pr_number),
+                    collect_log_line_counts_for_pr(pr_number),
                 )
             };
             for entry in snapshot.entries {
                 let dimension = doctor_dimension_for_agent(&entry.agent_type);
+                let run_id_key = entry.run_id.trim().to_string();
                 let started_at = parse_rfc3339_utc(entry.started_at.as_str());
                 let pulse_activity = dimension
                     .and_then(|review_type| read_pulse_file(pr_number, review_type).ok().flatten())
@@ -1173,7 +1210,10 @@ fn run_doctor_inner(
                     });
                 let elapsed_seconds = started_at.and_then(seconds_since_datetime_utc);
                 let last_activity = dimension.and_then(|review_type| {
-                    let mut latest = activity_map.get(review_type).copied();
+                    let mut latest = activity_by_run_id.get(&run_id_key).copied();
+                    if latest.is_none() {
+                        latest = activity_map.get(review_type).copied();
+                    }
                     if let Some(ts) = pulse_activity {
                         latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
                     }
@@ -1182,6 +1222,23 @@ fn run_doctor_inner(
                     }
                     latest
                 });
+                let models_attempted = model_attempts_by_run_id
+                    .get(&run_id_key)
+                    .cloned()
+                    .or_else(|| {
+                        dimension.and_then(|review_type| model_attempts.get(review_type).cloned())
+                    })
+                    .unwrap_or_default();
+                let tool_call_count = tool_call_counts.get(&run_id_key).copied();
+                let nudge_count = run_state_nudge_counts
+                    .get(&run_id_key)
+                    .copied()
+                    .or_else(|| {
+                        nudge_counts_from_events
+                            .get(&run_id_key)
+                            .and_then(|count| u32::try_from(*count).ok())
+                    });
+                let log_line_count = log_line_counts.get(&run_id_key).copied();
                 entries.push(DoctorAgentSnapshot {
                     agent_type: entry.agent_type,
                     state: entry.state,
@@ -1195,9 +1252,10 @@ fn run_doctor_inner(
                     completion_token_hash: entry.completion_token_hash,
                     completion_token_expires_at: entry.completion_token_expires_at,
                     elapsed_seconds,
-                    models_attempted: dimension
-                        .and_then(|review_type| model_attempts.get(review_type).cloned())
-                        .unwrap_or_default(),
+                    models_attempted,
+                    tool_call_count,
+                    log_line_count,
+                    nudge_count,
                     last_activity_seconds_ago: last_activity.and_then(seconds_since_datetime_utc),
                 });
             }
@@ -1385,7 +1443,11 @@ fn doctor_dimension_for_agent(agent_type: &str) -> Option<&'static str> {
 #[derive(Default)]
 struct DoctorEventSignals {
     activity_timestamps: std::collections::BTreeMap<String, DateTime<Utc>>,
+    activity_timestamps_by_run_id: std::collections::BTreeMap<String, DateTime<Utc>>,
     model_attempts: std::collections::BTreeMap<String, Vec<String>>,
+    model_attempts_by_run_id: std::collections::BTreeMap<String, Vec<String>>,
+    tool_call_counts: std::collections::BTreeMap<String, u64>,
+    nudge_counts: std::collections::BTreeMap<String, u64>,
 }
 
 fn event_dimension_key(review_type: &str) -> Option<String> {
@@ -1403,28 +1465,179 @@ fn scan_event_signals_for_pr(
     let Ok(path) = review_events_path() else {
         return DoctorEventSignals::default();
     };
-    if !path.exists() {
+    let rotated_path = apm2_daemon::telemetry::reviewer::reviewer_events_rotated_path(&path);
+    if !path.exists() && !rotated_path.exists() {
         return DoctorEventSignals::default();
     }
 
-    let Ok(file) = File::open(&path) else {
-        return DoctorEventSignals::default();
-    };
-    let reader = BufReader::new(file);
-    scan_event_signals_from_reader(reader, pr_number, run_ids)
+    scan_event_signals_from_sources_with_budget(
+        &[path, rotated_path],
+        pr_number,
+        run_ids,
+        DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE,
+    )
 }
 
+fn read_event_source_tail(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    if max_bytes == 0 {
+        return Some(Vec::new());
+    }
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len == 0 {
+        return Some(Vec::new());
+    }
+
+    let bytes_to_read = file_len.min(max_bytes);
+    let start_offset = file_len.saturating_sub(bytes_to_read);
+    file.seek(SeekFrom::Start(start_offset)).ok()?;
+
+    let mut tail = Vec::new();
+    file.take(bytes_to_read).read_to_end(&mut tail).ok()?;
+
+    if start_offset > 0 {
+        if let Some(newline_idx) = tail.iter().position(|byte| *byte == b'\n') {
+            tail = tail.split_off(newline_idx.saturating_add(1));
+        } else {
+            tail.clear();
+        }
+    }
+    Some(tail)
+}
+
+fn scan_event_signals_from_sources_with_budget(
+    sources: &[PathBuf],
+    pr_number: u32,
+    run_ids: &std::collections::BTreeSet<String>,
+    max_bytes_per_source: u64,
+) -> DoctorEventSignals {
+    let mut signals = DoctorEventSignals::default();
+    let mut remaining_lines = DOCTOR_EVENT_SCAN_MAX_LINES;
+    for source in sources {
+        if remaining_lines == 0 {
+            break;
+        }
+        let Some(tail_bytes) = read_event_source_tail(source, max_bytes_per_source) else {
+            continue;
+        };
+        let reader = std::io::Cursor::new(tail_bytes);
+        let mut remaining_bytes = max_bytes_per_source;
+        scan_event_signals_from_reader_with_budget(
+            reader,
+            pr_number,
+            run_ids,
+            &mut signals,
+            &mut remaining_lines,
+            &mut remaining_bytes,
+        );
+    }
+    signals
+}
+
+#[cfg(test)]
 fn scan_event_signals_from_reader<R: BufRead>(
     reader: R,
     pr_number: u32,
     run_ids: &std::collections::BTreeSet<String>,
 ) -> DoctorEventSignals {
     let mut signals = DoctorEventSignals::default();
+    let mut remaining_lines = DOCTOR_EVENT_SCAN_MAX_LINES;
+    let mut remaining_bytes = DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE;
+    scan_event_signals_from_reader_with_budget(
+        reader,
+        pr_number,
+        run_ids,
+        &mut signals,
+        &mut remaining_lines,
+        &mut remaining_bytes,
+    );
+    signals
+}
 
-    for line_result in reader.lines() {
-        let Ok(line) = line_result else {
+enum BoundedLineRead {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
+fn discard_until_newline<R: BufRead>(reader: &mut R) -> std::io::Result<usize> {
+    let mut consumed = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(consumed);
+        }
+        if let Some(newline_idx) = available.iter().position(|byte| *byte == b'\n') {
+            let consume_bytes = newline_idx.saturating_add(1);
+            reader.consume(consume_bytes);
+            return Ok(consumed.saturating_add(consume_bytes));
+        }
+        let chunk_len = available.len();
+        reader.consume(chunk_len);
+        consumed = consumed.saturating_add(chunk_len);
+    }
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> std::io::Result<(BoundedLineRead, usize)> {
+    let mut line = Vec::new();
+    let line_limit_plus_one = max_line_bytes.saturating_add(1);
+    let line_limit = u64::try_from(line_limit_plus_one).unwrap_or(u64::MAX);
+
+    let (bytes_read, limit_reached) = {
+        let mut limited_reader = reader.by_ref().take(line_limit);
+        let bytes_read = limited_reader.read_until(b'\n', &mut line)?;
+        (bytes_read, limited_reader.limit() == 0)
+    };
+
+    if bytes_read == 0 {
+        return Ok((BoundedLineRead::Eof, 0));
+    }
+    if limit_reached && !line.ends_with(b"\n") {
+        let drained = discard_until_newline(reader)?;
+        let consumed_total = bytes_read.saturating_add(drained);
+        return Ok((BoundedLineRead::TooLong, consumed_total));
+    }
+
+    Ok((BoundedLineRead::Line(line), bytes_read))
+}
+
+fn scan_event_signals_from_reader_with_budget<R: BufRead>(
+    mut reader: R,
+    pr_number: u32,
+    run_ids: &std::collections::BTreeSet<String>,
+    signals: &mut DoctorEventSignals,
+    remaining_lines: &mut usize,
+    remaining_bytes: &mut u64,
+) {
+    let mut event_line_counts = std::collections::BTreeMap::<String, u64>::new();
+    loop {
+        if *remaining_lines == 0 || *remaining_bytes == 0 {
+            break;
+        }
+        *remaining_lines = (*remaining_lines).saturating_sub(1);
+
+        let Ok((bounded_line, consumed_bytes)) =
+            read_bounded_line(&mut reader, DOCTOR_EVENT_SCAN_MAX_LINE_BYTES)
+        else {
             continue;
         };
+        let consumed_u64 = u64::try_from(consumed_bytes).unwrap_or(u64::MAX);
+        *remaining_bytes = (*remaining_bytes).saturating_sub(consumed_u64);
+
+        let line = match bounded_line {
+            BoundedLineRead::Eof => break,
+            BoundedLineRead::TooLong => continue,
+            BoundedLineRead::Line(bytes) => {
+                let Ok(line) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                line
+            },
+        };
+
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1436,15 +1649,23 @@ fn scan_event_signals_from_reader<R: BufRead>(
         if !matches_pr {
             continue;
         }
+
+        let event_run_id = event
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
         if !run_ids.is_empty() {
-            let event_run_id = event
-                .get("run_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if !run_ids.contains(event_run_id) {
+            let Some(run_id) = event_run_id.as_ref() else {
+                continue;
+            };
+            if !run_ids.contains(run_id) {
                 continue;
             }
         }
+
         let review_type = event
             .get("review_type")
             .and_then(serde_json::Value::as_str)
@@ -1458,12 +1679,16 @@ fn scan_event_signals_from_reader<R: BufRead>(
             .and_then(serde_json::Value::as_str)
             .and_then(parse_rfc3339_utc)
         {
-            signals
-                .activity_timestamps
-                .entry(key.clone())
-                .and_modify(|existing| *existing = (*existing).max(ts))
-                .or_insert(ts);
+            update_activity_timestamp(&mut signals.activity_timestamps, &key, ts);
+            if let Some(run_id) = event_run_id.as_ref() {
+                update_activity_timestamp(&mut signals.activity_timestamps_by_run_id, run_id, ts);
+            }
         }
+
+        let event_name = event
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
 
         if event
             .get("event")
@@ -1472,11 +1697,10 @@ fn scan_event_signals_from_reader<R: BufRead>(
             && let Some(model) = event.get("model").and_then(serde_json::Value::as_str)
             && !model.trim().is_empty()
         {
-            signals
-                .model_attempts
-                .entry(key.clone())
-                .or_default()
-                .push(model.to_string());
+            push_model_attempt(&mut signals.model_attempts, &key, model);
+            if let Some(run_id) = event_run_id.as_ref() {
+                push_model_attempt(&mut signals.model_attempts_by_run_id, run_id, model);
+            }
         }
 
         if event
@@ -1486,15 +1710,177 @@ fn scan_event_signals_from_reader<R: BufRead>(
             && let Some(model) = event.get("to_model").and_then(serde_json::Value::as_str)
             && !model.trim().is_empty()
         {
-            signals
-                .model_attempts
-                .entry(key)
-                .or_default()
-                .push(model.to_string());
+            push_model_attempt(&mut signals.model_attempts, &key, model);
+            if let Some(run_id) = event_run_id.as_ref() {
+                push_model_attempt(&mut signals.model_attempts_by_run_id, run_id, model);
+            }
+        }
+
+        if let Some(run_id) = event_run_id {
+            event_line_counts
+                .entry(run_id.clone())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+
+            if event_name == "nudge_resume" {
+                signals
+                    .nudge_counts
+                    .entry(run_id.clone())
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
+
+            if event_contains_tool_signal(&event)
+                || (!event_name.is_empty() && !is_lifecycle_event_name(event_name))
+            {
+                signals
+                    .tool_call_counts
+                    .entry(run_id)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
         }
     }
 
-    signals
+    for (run_id, total_lines) in event_line_counts {
+        signals
+            .tool_call_counts
+            .entry(run_id)
+            .or_insert(total_lines);
+    }
+}
+
+fn update_activity_timestamp(
+    target: &mut std::collections::BTreeMap<String, DateTime<Utc>>,
+    key: &str,
+    ts: DateTime<Utc>,
+) {
+    target
+        .entry(key.to_string())
+        .and_modify(|existing| *existing = (*existing).max(ts))
+        .or_insert(ts);
+}
+
+fn push_model_attempt(
+    target: &mut std::collections::BTreeMap<String, Vec<String>>,
+    key: &str,
+    model: &str,
+) {
+    target
+        .entry(key.to_string())
+        .or_default()
+        .push(model.to_string());
+}
+
+fn is_lifecycle_event_name(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "run_start"
+            | "run_complete"
+            | "run_crash"
+            | "run_deduplicated"
+            | "model_fallback"
+            | "completion_signal_detected"
+            | "pulse_check"
+            | "liveness_check"
+            | "stall_detected"
+            | "sha_update"
+            | "review_posted"
+            | "nudge_resume"
+    )
+}
+
+fn event_contains_tool_signal(event: &serde_json::Value) -> bool {
+    [
+        "tool",
+        "tool_call",
+        "tool_calls",
+        "tool_name",
+        "toolCall",
+        "toolCallId",
+    ]
+    .iter()
+    .any(|key| event.get(*key).is_some())
+}
+
+fn load_run_state_nudge_counts_for_pr(pr_number: u32) -> std::collections::BTreeMap<String, u32> {
+    let mut counts = std::collections::BTreeMap::new();
+    for review_type in ["security", "quality"] {
+        let Ok(Some(state)) = load_review_run_state_strict(pr_number, review_type) else {
+            continue;
+        };
+        let run_id = state.run_id.trim();
+        if run_id.is_empty() {
+            continue;
+        }
+        counts.insert(run_id.to_string(), state.nudge_count);
+    }
+    counts
+}
+
+fn collect_log_line_counts_for_pr(pr_number: u32) -> std::collections::BTreeMap<String, u64> {
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    let _ = state::with_review_state_shared(|review_state| {
+        for entry in review_state.reviewers.values() {
+            if entry.pr_number != pr_number {
+                continue;
+            }
+            let run_id = entry.run_id.trim();
+            if run_id.is_empty() {
+                continue;
+            }
+            let Some(line_count) = count_log_lines_bounded(&entry.log_file) else {
+                continue;
+            };
+            counts
+                .entry(run_id.to_string())
+                .and_modify(|existing| *existing = (*existing).max(line_count))
+                .or_insert(line_count);
+        }
+        Ok(())
+    });
+    counts
+}
+
+fn count_log_lines_bounded(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut chunk = [0_u8; DOCTOR_LOG_SCAN_CHUNK_BYTES];
+    let mut line_count = 0_u64;
+    let mut byte_count = 0_u64;
+    let mut saw_bytes = false;
+    let mut last_byte = None;
+
+    while line_count < DOCTOR_LOG_SCAN_MAX_LINES && byte_count < DOCTOR_LOG_SCAN_MAX_BYTES {
+        let remaining_bytes = DOCTOR_LOG_SCAN_MAX_BYTES.saturating_sub(byte_count);
+        let to_read =
+            usize::try_from(remaining_bytes.min(DOCTOR_LOG_SCAN_CHUNK_BYTES as u64)).ok()?;
+        if to_read == 0 {
+            break;
+        }
+        let bytes_read = reader.read(&mut chunk[..to_read]).ok()?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        saw_bytes = true;
+        byte_count = byte_count.saturating_add(bytes_read as u64);
+        last_byte = chunk.get(bytes_read.saturating_sub(1)).copied();
+
+        let mut newline_count = 0_u64;
+        for byte in &chunk[..bytes_read] {
+            if *byte == b'\n' {
+                newline_count = newline_count.saturating_add(1);
+            }
+        }
+        line_count = line_count.saturating_add(newline_count);
+    }
+
+    if saw_bytes && line_count < DOCTOR_LOG_SCAN_MAX_LINES && !matches!(last_byte, Some(b'\n')) {
+        line_count = line_count.saturating_add(1);
+    }
+
+    Some(line_count)
 }
 
 fn latest_finding_activity_by_dimension(
@@ -2363,6 +2749,15 @@ fn emit_doctor_report(summary: &DoctorPrSummary) {
                         "    models_attempted: {}",
                         entry.models_attempted.join(", ")
                     );
+                }
+                if let Some(tool_call_count) = entry.tool_call_count {
+                    println!("    tool_call_count: {tool_call_count}");
+                }
+                if let Some(log_line_count) = entry.log_line_count {
+                    println!("    log_line_count: {log_line_count}");
+                }
+                if let Some(nudge_count) = entry.nudge_count {
+                    println!("    nudge_count: {nudge_count}");
                 }
                 if let Some(activity_age) = entry.last_activity_seconds_ago {
                     println!("    last_activity_seconds_ago: {activity_age}");
@@ -3713,6 +4108,7 @@ mod tests {
             model_id: Some("gpt-5.3-codex".to_string()),
             backend_id: Some("codex".to_string()),
             restart_count: 0,
+            nudge_count: 0,
             sequence_number: 1,
             previous_run_id: None,
             previous_head_sha: None,
@@ -5570,6 +5966,186 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(models, vec!["model-keep".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_event_signals_counts_tool_calls_and_nudges_per_run() {
+        let mut lines = String::new();
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "run_start",
+                "model": "model-a",
+                "ts": "2026-02-15T00:01:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "tool_call",
+                "tool": "read_file",
+                "ts": "2026-02-15T00:02:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "nudge_resume",
+                "ts": "2026-02-15T00:03:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
+        assert_eq!(signals.tool_call_counts.get("keep").copied(), Some(1));
+        assert_eq!(signals.nudge_counts.get("keep").copied(), Some(1));
+    }
+
+    #[test]
+    fn test_scan_event_signals_tool_count_falls_back_to_total_lines() {
+        let mut lines = String::new();
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "run_start",
+                "model": "model-a",
+                "ts": "2026-02-15T00:01:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "liveness_check",
+                "ts": "2026-02-15T00:02:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
+        assert_eq!(signals.tool_call_counts.get("keep").copied(), Some(2));
+    }
+
+    #[test]
+    fn test_scan_event_signals_skips_oversized_line_and_keeps_scanning() {
+        let oversized = "x".repeat(super::DOCTOR_EVENT_SCAN_MAX_LINE_BYTES.saturating_add(32));
+        let mut lines = String::new();
+        lines.push_str(&oversized);
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "run_start",
+                "model": "model-safe",
+                "ts": "2026-02-15T00:02:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
+        let models = signals
+            .model_attempts
+            .get("security")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(models, vec!["model-safe".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_event_signals_from_sources_with_budget_prefers_tail_segment() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("review_events.ndjson");
+        let mut lines = String::new();
+        for index in 0..400 {
+            lines.push_str(
+                &serde_json::json!({
+                    "pr_number": 42,
+                    "review_type": "security",
+                    "run_id": format!("old-{index}"),
+                    "event": "run_start",
+                    "model": "model-old",
+                    "ts": "2026-02-15T00:00:00Z"
+                })
+                .to_string(),
+            );
+            lines.push('\n');
+        }
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "run_start",
+                "model": "model-tail",
+                "ts": "2026-02-15T00:01:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "tool_call",
+                "tool": "read_file",
+                "ts": "2026-02-15T00:01:05Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        std::fs::write(&path, lines).expect("write events");
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_sources_with_budget(&[path], 42, &run_ids, 1024);
+        let models = signals
+            .model_attempts
+            .get("security")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(models, vec!["model-tail".to_string()]);
+        assert_eq!(signals.tool_call_counts.get("keep").copied(), Some(1));
+    }
+
+    #[test]
+    fn test_count_log_lines_bounded_handles_single_oversized_line_without_oom() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("oversized.log");
+        let max_scan_bytes =
+            usize::try_from(super::DOCTOR_LOG_SCAN_MAX_BYTES).expect("scan byte cap fits usize");
+        let oversized = "z".repeat(max_scan_bytes.saturating_add(4096));
+        std::fs::write(&path, oversized).expect("write oversized log");
+
+        let line_count =
+            super::count_log_lines_bounded(&path).expect("bounded count should succeed");
+        assert_eq!(line_count, 1);
     }
 
     /// Verify the doctor interrupt flag uses a global singleton and that the

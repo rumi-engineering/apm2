@@ -643,6 +643,9 @@ user-mode and system-mode execution backends.
 - [INV-SYS-001a] Lane-default resource caps enforce a `48 GiB` memory ceiling
   before job constraints; lane constraints cannot raise `MemoryMax` above this
   profile floor.
+- [INV-SYS-001b] Lane/default test timeout baseline is `600s` (`MAX_TEST_TIMEOUT_SECONDS`)
+  and maps directly to `TimeoutStartSec`; callers must not reintroduce ad-hoc
+  `240s` defaults in lane/profile fallback paths.
 - [INV-SYS-002] `JobConstraints` values are applied with lane ceiling semantics
   (`min`) so a job cannot increase resource or timeout limits above lane
   defaults.

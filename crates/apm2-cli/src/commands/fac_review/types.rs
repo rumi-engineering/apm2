@@ -61,6 +61,11 @@ pub fn normalize_decision_dimension(dimension: &str) -> Result<&'static str, Str
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 // ── Enums ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -374,6 +379,10 @@ pub struct ReviewRunState {
     pub backend_id: Option<String>,
     #[serde(default)]
     pub restart_count: u32,
+    /// Number of one-shot resume nudges issued after clean exit without a
+    /// verdict command.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub nudge_count: u32,
     pub sequence_number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_run_id: Option<String>,

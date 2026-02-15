@@ -6,7 +6,7 @@
 //! the operator socket. The `kill` command sends a Shutdown request using
 //! the `OperatorClient`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -825,6 +825,126 @@ struct ProjectionHealthResult {
     is_error: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DaemonRuntimePathOverrides {
+    state_file: Option<PathBuf>,
+    ledger_db: Option<PathBuf>,
+}
+
+fn projection_cache_path_for_daemon_paths(
+    state_file_path: &Path,
+    ledger_db_path: Option<&Path>,
+) -> PathBuf {
+    ledger_db_path.map_or_else(
+        || {
+            state_file_path.parent().map_or_else(
+                || PathBuf::from("/var/lib/apm2/projection_cache.db"),
+                |parent| parent.join("projection_cache.db"),
+            )
+        },
+        |ledger_db| ledger_db.with_extension("projection_cache.db"),
+    )
+}
+
+fn parse_daemon_runtime_overrides_from_argv(args: &[String]) -> DaemonRuntimePathOverrides {
+    let mut overrides = DaemonRuntimePathOverrides::default();
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        if let Some(value) = arg.strip_prefix("--state-file=") {
+            if !value.trim().is_empty() {
+                overrides.state_file = Some(PathBuf::from(value));
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--ledger-db=") {
+            if !value.trim().is_empty() {
+                overrides.ledger_db = Some(PathBuf::from(value));
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if arg == "--state-file" {
+            if let Some(value) = args.get(idx.saturating_add(1))
+                && !value.trim().is_empty()
+            {
+                overrides.state_file = Some(PathBuf::from(value));
+            }
+            idx = idx.saturating_add(2);
+            continue;
+        }
+
+        if arg == "--ledger-db" {
+            if let Some(value) = args.get(idx.saturating_add(1))
+                && !value.trim().is_empty()
+            {
+                overrides.ledger_db = Some(PathBuf::from(value));
+            }
+            idx = idx.saturating_add(2);
+            continue;
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    overrides
+}
+
+fn read_process_cmdline(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let args = raw
+        .split(|byte| *byte == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect::<Vec<_>>();
+    if args.is_empty() { None } else { Some(args) }
+}
+
+fn read_daemon_runtime_overrides_for_pid(pid: u32) -> Option<DaemonRuntimePathOverrides> {
+    let args = read_process_cmdline(pid)?;
+    let program = args.first()?;
+    if !program.contains("apm2-daemon") {
+        return None;
+    }
+    let mut overrides = parse_daemon_runtime_overrides_from_argv(&args[1..]);
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|_| PathBuf::from("/"));
+    overrides.state_file = overrides.state_file.map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    });
+    overrides.ledger_db = overrides.ledger_db.map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    });
+    Some(overrides)
+}
+
+fn read_daemon_pid(pid_file: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(pid_file).ok()?;
+    let parsed = raw.trim().parse::<u32>().ok()?;
+    if parsed == 0 { None } else { Some(parsed) }
+}
+
+fn resolve_daemon_runtime_overrides(
+    config: &apm2_core::config::DaemonConfig,
+) -> Option<DaemonRuntimePathOverrides> {
+    let pid = read_daemon_pid(&config.pid_file)?;
+    read_daemon_runtime_overrides_for_pid(pid)
+}
+
 /// Check projection worker health by examining config and runtime artifacts.
 ///
 /// The projection worker creates a cache database file on startup. When
@@ -833,6 +953,23 @@ struct ProjectionHealthResult {
 fn check_projection_worker_health(
     config_path: &Path,
     daemon_running: bool,
+) -> ProjectionHealthResult {
+    let runtime_overrides = if daemon_running {
+        config_path
+            .exists()
+            .then(|| apm2_core::config::EcosystemConfig::from_file(config_path).ok())
+            .flatten()
+            .and_then(|config| resolve_daemon_runtime_overrides(&config.daemon))
+    } else {
+        None
+    };
+    check_projection_worker_health_with_overrides(config_path, daemon_running, runtime_overrides)
+}
+
+fn check_projection_worker_health_with_overrides(
+    config_path: &Path,
+    daemon_running: bool,
+    runtime_overrides: Option<DaemonRuntimePathOverrides>,
 ) -> ProjectionHealthResult {
     // Try to load the config to check projection settings
     let config = config_path
@@ -881,14 +1018,20 @@ fn check_projection_worker_health(
     }
 
     // Check for projection cache database as evidence the worker started.
-    // The worker creates {state_dir}/projection_cache.db on initialization.
-    let state_dir = config
-        .daemon
-        .state_file
-        .parent()
-        .map_or_else(default_data_dir, Path::to_path_buf);
+    // Mirror daemon path derivation exactly:
+    // - if ledger_db_path is set:
+    //   `ledger_db_path.with_extension("projection_cache.db")`
+    // - otherwise: `{state_file_dir}/projection_cache.db`
+    let effective_state_file = runtime_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.state_file.clone())
+        .unwrap_or_else(|| config.daemon.state_file.clone());
+    let effective_ledger_db = runtime_overrides.and_then(|overrides| overrides.ledger_db);
+    let cache_path = projection_cache_path_for_daemon_paths(
+        &effective_state_file,
+        effective_ledger_db.as_deref(),
+    );
 
-    let cache_path = state_dir.join("projection_cache.db");
     if cache_path.exists() {
         ProjectionHealthResult {
             status: "OK",
@@ -1298,7 +1441,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = check_projection_worker_health(&config_path, true);
+        let result = check_projection_worker_health_with_overrides(&config_path, true, None);
         assert_eq!(result.status, "OK");
         assert!(!result.is_error);
     }
@@ -1316,7 +1459,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = check_projection_worker_health(&config_path, false);
+        let result = check_projection_worker_health_with_overrides(&config_path, false, None);
         assert_eq!(result.status, "ERROR");
         assert!(result.is_error);
         assert!(result.message.contains("daemon is not running"));
@@ -1340,7 +1483,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = check_projection_worker_health(&config_path, true);
+        let result = check_projection_worker_health_with_overrides(&config_path, true, None);
         assert_eq!(result.status, "ERROR");
         assert!(result.is_error);
         assert!(result.message.contains("projection cache not found"));
@@ -1368,10 +1511,62 @@ mod tests {
         )
         .unwrap();
 
-        let result = check_projection_worker_health(&config_path, true);
+        let result = check_projection_worker_health_with_overrides(&config_path, true, None);
         assert_eq!(result.status, "OK");
         assert!(!result.is_error);
         assert!(result.message.contains("projection worker active"));
+    }
+
+    #[test]
+    fn projection_cache_path_uses_ledger_db_extension_when_present() {
+        let state_file = Path::new("/tmp/apm2/state.json");
+        let ledger = Path::new("/tmp/apm2/ledger.db");
+        let cache = projection_cache_path_for_daemon_paths(state_file, Some(ledger));
+        assert_eq!(cache, PathBuf::from("/tmp/apm2/ledger.projection_cache.db"));
+    }
+
+    #[test]
+    fn parse_daemon_runtime_overrides_supports_split_and_equals_flags() {
+        let args = vec![
+            "--state-file".to_string(),
+            "/tmp/state-a.json".to_string(),
+            "--ledger-db=/tmp/ledger-a.db".to_string(),
+        ];
+        let parsed = parse_daemon_runtime_overrides_from_argv(&args);
+        assert_eq!(parsed.state_file, Some(PathBuf::from("/tmp/state-a.json")));
+        assert_eq!(parsed.ledger_db, Some(PathBuf::from("/tmp/ledger-a.db")));
+    }
+
+    #[test]
+    fn projection_health_uses_runtime_ledger_override_when_present() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_path = temp.path().join("state.json");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[daemon]\noperator_socket = \"/tmp/op.sock\"\nsession_socket = \"/tmp/sess.sock\"\n\
+                 state_file = \"{}\"\n\
+                 [daemon.projection]\nenabled = true\ngithub_owner = \"owner\"\ngithub_repo = \"repo\"\n",
+                state_path.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime_ledger = temp.path().join("ledger.db");
+        let runtime_cache = runtime_ledger.with_extension("projection_cache.db");
+        std::fs::write(&runtime_cache, b"dummy").unwrap();
+
+        let result = check_projection_worker_health_with_overrides(
+            &config_path,
+            true,
+            Some(DaemonRuntimePathOverrides {
+                state_file: None,
+                ledger_db: Some(runtime_ledger),
+            }),
+        );
+        assert_eq!(result.status, "OK");
+        assert!(!result.is_error);
     }
 
     /// TCK-00595 MAJOR-3: projection health check returns ERROR when
@@ -1387,7 +1582,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = check_projection_worker_health(&config_path, true);
+        let result = check_projection_worker_health_with_overrides(&config_path, true, None);
         assert_eq!(result.status, "ERROR");
         assert!(result.is_error);
         assert!(result.message.contains("github_owner or github_repo"));
