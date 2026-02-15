@@ -769,7 +769,7 @@ Unix datagram sockets to `$NOTIFY_SOCKET`.
   monotonic `Instant`. Reads `WATCHDOG_USEC` from environment at construction.
   If `WATCHDOG_USEC` is absent or zero, the ticker is disabled (no-op pings).
   Ping interval is `WATCHDOG_USEC / 2` (systemd recommendation), with a minimum
-  floor of 5 seconds.
+  floor of 1 second.
 
 ### Core Functions
 
@@ -786,13 +786,19 @@ Unix datagram sockets to `$NOTIFY_SOCKET`.
 ### Security Invariants (TCK-00600)
 
 - [INV-SDN-001] `NOTIFY_SOCKET` path is validated: must be absolute or abstract
-  (starts with `/` or `@`), and bounded by `MAX_NOTIFY_SOCKET_PATH_LEN` (256).
+  (starts with `/` or `@`), and bounded by `MAX_NOTIFY_SOCKET_PATH` (108 bytes,
+  matching the OS `sockaddr_un.sun_path` limit).
 - [INV-SDN-002] All notify functions return `bool` (success/failure), never
   panic. Missing `NOTIFY_SOCKET` is a silent no-op (non-systemd environments).
 - [INV-SDN-003] `WatchdogTicker` uses monotonic `Instant` for interval tracking
   (INV-2501 compliance). No wall-clock time dependency.
-- [INV-SDN-004] Minimum ping interval is 5 seconds to prevent excessive
-  datagram traffic.
+- [INV-SDN-004] Minimum ping interval is 1 second to prevent excessive
+  datagram traffic while supporting short `WatchdogSec` configurations.
+- [INV-SDN-005] Abstract Unix sockets (prefixed with `@`) use raw
+  `libc::sendto` with a manually constructed `sockaddr_un` where
+  `sun_path[0] = 0` followed by the socket name bytes. Standard
+  `UnixDatagram::send_to` cannot address abstract sockets (it expects
+  filesystem paths). Filesystem path sockets use standard `send_to`.
 
 ## worker_heartbeat Submodule (TCK-00600)
 

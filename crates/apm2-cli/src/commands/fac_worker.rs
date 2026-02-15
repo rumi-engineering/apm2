@@ -528,18 +528,50 @@ pub fn run_fac_worker(
         jobs_skipped: 0,
     };
 
-    // TCK-00600: Notify systemd that the worker is ready and initialize
-    // the watchdog ticker for periodic keepalive pings.
+    // TCK-00600: Notify systemd that the worker is ready and spawn a
+    // background thread for watchdog pings. The background thread pings
+    // independently of the job processing loop, preventing systemd from
+    // restarting the worker during long-running jobs (process_job can
+    // take minutes). The daemon already uses this pattern (background
+    // poller task). The thread is marked as a daemon thread and will
+    // exit when the main worker thread exits.
     let _ = apm2_core::fac::sd_notify::notify_ready();
     let _ = apm2_core::fac::sd_notify::notify_status("worker ready, polling queue");
-    let mut watchdog = apm2_core::fac::sd_notify::WatchdogTicker::new();
+
+    // Spawn a background thread for watchdog pings, independent of job
+    // processing. This follows the same pattern as the daemon's poller
+    // task which pings in a background tokio::spawn.
+    //
+    // Synchronization protocol (RS-21):
+    // - Protected data: `watchdog_stop` AtomicBool.
+    // - Writer: main thread sets `true` on exit (Release).
+    // - Reader: background thread checks with Acquire ordering.
+    // - Happens-before: Release store → Acquire load ensures the stop signal is
+    //   visible to the background thread.
+    let watchdog_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog_stop_bg = std::sync::Arc::clone(&watchdog_stop);
+    let _watchdog_thread = {
+        let ticker = apm2_core::fac::sd_notify::WatchdogTicker::new();
+        if ticker.is_enabled() {
+            let ping_interval = Duration::from_secs(ticker.ping_interval_secs());
+            Some(std::thread::spawn(move || {
+                let mut bg_ticker = ticker;
+                loop {
+                    std::thread::sleep(ping_interval);
+                    if watchdog_stop_bg.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    bg_ticker.ping_if_due();
+                }
+            }))
+        } else {
+            None
+        }
+    };
 
     loop {
         let cycle_start = Instant::now();
         cycle_count = cycle_count.saturating_add(1);
-
-        // TCK-00600: Ping systemd watchdog each cycle to prove liveness.
-        watchdog.ping_if_due();
 
         // TCK-00600: Write worker heartbeat file for `services status`.
         if let Err(e) = apm2_core::fac::worker_heartbeat::write_heartbeat(
@@ -772,6 +804,9 @@ pub fn run_fac_worker(
 
         sleep_remaining(cycle_start, poll_interval_secs);
     }
+
+    // Signal the background watchdog thread to stop.
+    watchdog_stop.store(true, std::sync::atomic::Ordering::Release);
 
     if json_output {
         emit_worker_summary(&summary);

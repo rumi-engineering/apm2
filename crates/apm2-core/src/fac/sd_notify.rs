@@ -17,7 +17,6 @@
 //!   per INV-2501.
 
 use std::os::unix::net::UnixDatagram;
-use std::path::Path;
 use std::time::Instant;
 
 use tracing::{debug, trace, warn};
@@ -26,14 +25,22 @@ use tracing::{debug, trace, warn};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum length of `NOTIFY_SOCKET` path to prevent oversized allocations.
-const MAX_NOTIFY_SOCKET_PATH: usize = 256;
+/// Maximum length of `NOTIFY_SOCKET` path.
+///
+/// The OS limit for Unix domain socket paths is `sizeof(sockaddr_un.sun_path)`
+/// which is 108 bytes on Linux. Paths exceeding this cannot be addressed.
+const MAX_NOTIFY_SOCKET_PATH: usize = 108;
 
 /// Environment variable name for the systemd notification socket.
 const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
 
-/// Minimum watchdog interval to prevent busy-loop notification (5 seconds).
-const MIN_WATCHDOG_INTERVAL_SECS: u64 = 5;
+/// Minimum watchdog interval to prevent busy-loop notification (1 second).
+///
+/// A previous 5-second floor was too conservative: for `WatchdogSec=6`, the
+/// half-interval is 3s which got floored to 5s, risking systemd restart before
+/// ping. A 1-second floor avoids this while still preventing sub-second
+/// chatter.
+const MIN_WATCHDOG_INTERVAL_SECS: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Validation (pure, testable)
@@ -75,6 +82,11 @@ fn compute_watchdog_interval(watchdog_usec_str: &str) -> Option<u64> {
 /// Returns `true` if the message was sent successfully, `false` if the
 /// socket is unavailable or the send failed. Failures are non-fatal and
 /// logged at debug level.
+///
+/// Abstract sockets (prefixed with `@`) are handled via raw `libc::sendto`
+/// with a manually constructed `sockaddr_un` where `sun_path[0] = 0`
+/// followed by the socket name bytes. `UnixDatagram::send_to` cannot
+/// address abstract sockets because it expects filesystem paths.
 fn sd_notify_raw(state: &str) -> bool {
     let Ok(socket_path) = std::env::var(NOTIFY_SOCKET_ENV) else {
         trace!(
@@ -89,19 +101,25 @@ fn sd_notify_raw(state: &str) -> bool {
         return false;
     }
 
-    // For abstract sockets, replace leading '@' with '\0'.
-    let resolved_path = socket_path
-        .strip_prefix('@')
-        .map_or_else(|| socket_path.clone(), |suffix| format!("\0{suffix}"));
-    let target: &Path = Path::new(&resolved_path);
-
     let Ok(sock) = UnixDatagram::unbound() else {
         debug!("Failed to create unbound datagram socket for sd_notify");
         return false;
     };
 
-    match sock.send_to(state.as_bytes(), target) {
-        Ok(_) => {
+    // Abstract sockets (prefixed with `@`) use raw libc::sendto with a
+    // manually constructed sockaddr_un. Filesystem path sockets use
+    // standard UnixDatagram::send_to.
+    let result = socket_path.strip_prefix('@').map_or_else(
+        || {
+            sock.send_to(state.as_bytes(), &socket_path)
+                .map(|_| ())
+                .map_err(|e| format!("{e}"))
+        },
+        |abstract_name| send_to_abstract(&sock, state.as_bytes(), abstract_name),
+    );
+
+    match result {
+        Ok(()) => {
             trace!(
                 "sd_notify sent: {}",
                 state.split('\n').next().unwrap_or(state)
@@ -112,6 +130,83 @@ fn sd_notify_raw(state: &str) -> bool {
             debug!(error = %e, "Failed to send sd_notify message");
             false
         },
+    }
+}
+
+/// Send a datagram to an abstract Unix socket via raw `libc::sendto`.
+///
+/// Constructs a `sockaddr_un` with `sun_path[0] = 0` followed by
+/// `abstract_name` bytes. The address length is
+/// `offsetof(sockaddr_un, sun_path) + 1 + abstract_name.len()`.
+///
+/// # Safety justification
+///
+/// The `libc::sendto` call is safe because:
+/// - `sock` is a valid, owned file descriptor obtained from `UnixDatagram`.
+/// - `addr` is a stack-allocated `sockaddr_un`, fully zeroed before use.
+/// - `addr_len` is computed from the actual name length, not the full struct.
+/// - The name length is bounded by `MAX_NOTIFY_SOCKET_PATH` (validated before
+///   this function is called), which is <= `sun_path` capacity (108 bytes).
+#[allow(unsafe_code)]
+fn send_to_abstract(sock: &UnixDatagram, data: &[u8], abstract_name: &str) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    let name_bytes = abstract_name.as_bytes();
+
+    // sun_path capacity is 108 bytes. Abstract sockets use sun_path[0]=0
+    // plus the name, so the name must fit in 107 bytes.
+    // The MAX_NOTIFY_SOCKET_PATH validation already limits the full path
+    // (including '@' prefix) to 108 bytes, so abstract_name <= 107 bytes.
+    let sun_path_cap = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    if name_bytes.len() + 1 > sun_path_cap {
+        return Err("abstract socket name exceeds sun_path capacity".to_string());
+    }
+
+    // SAFETY: zeroed sockaddr_un is a valid representation (all fields 0).
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // AF_UNIX is a small constant (1) that always fits in sa_family_t (u16).
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    }
+    // sun_path[0] = 0 (already zeroed) marks this as an abstract socket.
+    // Copy the name starting at sun_path[1]. The u8→i8 cast is
+    // intentional: sun_path uses c_char (i8 on Linux) for raw bytes.
+    #[allow(clippy::cast_possible_wrap)]
+    for (i, &b) in name_bytes.iter().enumerate() {
+        addr.sun_path[1 + i] = b as libc::c_char;
+    }
+
+    let addr_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name_bytes.len();
+
+    // addr_len is bounded by MAX_NOTIFY_SOCKET_PATH (108) + offset_of(sun_path).
+    // This fits in u32 on all platforms.
+    let Ok(addr_len_u32) = libc::socklen_t::try_from(addr_len) else {
+        return Err("address length exceeds socklen_t".to_string());
+    };
+
+    // SAFETY: sock.as_raw_fd() returns a valid fd; addr is a properly
+    // constructed sockaddr_un on the stack; addr_len matches the actual
+    // address length.
+    let ret = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            data.as_ptr().cast::<libc::c_void>(),
+            data.len(),
+            0, // flags
+            std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
+            addr_len_u32,
+        )
+    };
+
+    if ret < 0 {
+        Err(format!(
+            "sendto abstract socket failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -243,6 +338,14 @@ impl WatchdogTicker {
     pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
+
+    /// Returns the ping interval in seconds.
+    ///
+    /// Only meaningful when `is_enabled()` is true.
+    #[must_use]
+    pub const fn ping_interval_secs(&self) -> u64 {
+        self.ping_interval_secs
+    }
 }
 
 impl Default for WatchdogTicker {
@@ -298,11 +401,24 @@ mod tests {
 
     #[test]
     fn test_compute_watchdog_interval_minimum_floor() {
-        // 2_000_000 usec = 2s. Half = 1s. Minimum floor = 5s.
+        // 2_000_000 usec = 2s. Half = 1s. Minimum floor = 1s.
         assert_eq!(
             compute_watchdog_interval("2000000"),
             Some(MIN_WATCHDOG_INTERVAL_SECS)
         );
+    }
+
+    #[test]
+    fn test_compute_watchdog_interval_short_watchdog_sec() {
+        // WatchdogSec=6 → 6_000_000 usec. Half = 3s. Floor is 1s, so 3s.
+        // Previously, a 5s floor would have forced 5s which is too close to 6s.
+        assert_eq!(compute_watchdog_interval("6000000"), Some(3));
+    }
+
+    #[test]
+    fn test_compute_watchdog_interval_very_short() {
+        // WatchdogSec=2 → 2_000_000 usec. Half = 1s. Floor = 1s.
+        assert_eq!(compute_watchdog_interval("2000000"), Some(1));
     }
 
     #[test]
@@ -331,6 +447,30 @@ mod tests {
         };
         assert!(truncated.len() <= 256);
         assert_eq!(truncated.len(), 256);
+    }
+
+    #[test]
+    fn test_abstract_socket_name_length_validation() {
+        // Abstract socket name that fits in sun_path (107 bytes after the NUL).
+        let short_name = "a".repeat(107);
+        let path = format!("@{short_name}");
+        assert!(validate_socket_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_socket_path_at_os_limit() {
+        // Exactly 108 bytes total = '@' + 107 chars of name. Passes validation.
+        let path = format!("@{}", "x".repeat(107));
+        assert_eq!(path.len(), 108);
+        assert!(validate_socket_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_socket_path_over_os_limit() {
+        // 109 bytes total exceeds the 108-byte OS limit.
+        let path = format!("@{}", "x".repeat(108));
+        assert_eq!(path.len(), 109);
+        assert!(validate_socket_path(&path).is_err());
     }
 
     #[test]

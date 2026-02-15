@@ -69,7 +69,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use secrecy::ExposeSecret;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -1413,6 +1413,36 @@ async fn async_main(args: Args) -> Result<()> {
                         error = %e,
                         "Failed to write broker health IPC file (non-fatal)"
                     );
+                }
+
+                // TCK-00600: Read worker heartbeat and incorporate its
+                // staleness state into daemon health reporting. The worker
+                // writes `worker_heartbeat.json` after each poll cycle;
+                // the daemon reads it here to surface worker health
+                // alongside broker health. This is observability only —
+                // a stale or missing heartbeat does not affect the broker
+                // admission gate (INV-WHB-005).
+                let worker_hb =
+                    apm2_core::fac::worker_heartbeat::read_heartbeat(&fac_root_for_poller);
+                if worker_hb.found {
+                    if worker_hb.fresh {
+                        trace!(
+                            worker_pid = worker_hb.pid,
+                            worker_cycle_count = worker_hb.cycle_count,
+                            worker_age_secs = worker_hb.age_secs,
+                            worker_health = %worker_hb.health_status,
+                            "Worker heartbeat fresh"
+                        );
+                    } else {
+                        warn!(
+                            worker_pid = worker_hb.pid,
+                            worker_age_secs = worker_hb.age_secs,
+                            "Worker heartbeat stale (age > {}s)",
+                            apm2_core::fac::worker_heartbeat::MAX_HEARTBEAT_AGE_SECS
+                        );
+                    }
+                } else {
+                    debug!("Worker heartbeat file not found (worker may not be running)");
                 }
             }
         });
