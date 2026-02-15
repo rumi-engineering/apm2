@@ -646,8 +646,23 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   `contained: false`.
 - [INV-CONTAIN-002] All `/proc` reads bounded by `MAX_PROC_READ_SIZE` (4 KiB).
 - [INV-CONTAIN-003] Process discovery bounded by `MAX_CHILD_PROCESSES` (2048)
-  and `MAX_PROC_SCAN_ENTRIES` (65536). Overflow returns `Err`.
+  and `MAX_PROC_SCAN_ENTRIES` (65536). Overflow returns
+  `ContainmentError::ProcScanOverflow` (fail-closed). Excessive `PPid`
+  read failures (>50% of scanned PID entries) also return this error.
 - [INV-CONTAIN-004] Cgroup path comparison uses exact prefix matching with
   slash separator to prevent `/foo` matching `/foobar`.
 - [INV-CONTAIN-005] Process comm names bounded by `MAX_COMM_LENGTH` (64).
 - [INV-CONTAIN-006] PID validation rejects 0 and values > `MAX_PID_VALUE`.
+- [INV-CONTAIN-007] `ContainmentTrace` is wired into `FacJobReceiptV1` via
+  the `emit_job_receipt` function. The builder's `.containment()` method
+  populates the receipt's `containment` field from actual verification
+  results.
+- [INV-CONTAIN-008] Bounded test commands (systemd transient units)
+  unconditionally strip sccache env vars (`RUSTC_WRAPPER`, `SCCACHE_*`)
+  because cgroup containment cannot be verified for the transient unit
+  before it starts. The stripping is enforced in two places: (1) the
+  `SYSTEMD_SETENV_ALLOWLIST_EXACT` excludes `RUSTC_WRAPPER` and
+  `SYSTEMD_SETENV_ALLOWLIST_PREFIXES` excludes `SCCACHE_*`, preventing
+  these keys from appearing in `--setenv` args; (2) `env_remove_keys`
+  strips them from the spawned process environment to prevent parent
+  env inheritance.

@@ -897,6 +897,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
@@ -932,6 +933,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1016,6 +1018,7 @@ fn process_job(
                     Some(canonicalizer_tuple_digest),
                     moved_path.as_deref(),
                     policy_hash,
+                    None,
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -1050,6 +1053,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -1101,6 +1105,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -1151,6 +1156,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1192,6 +1198,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1229,6 +1236,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1260,6 +1268,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1291,6 +1300,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1330,6 +1340,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1366,6 +1377,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1452,6 +1464,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1503,6 +1516,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
@@ -1539,6 +1553,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1590,6 +1605,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1680,6 +1696,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1721,6 +1738,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1804,6 +1822,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1844,6 +1863,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1880,6 +1900,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1955,6 +1976,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1991,6 +2013,7 @@ fn process_job(
         Some(canonicalizer_tuple_digest),
         None,
         policy_hash,
+        None,
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
         if let Err(move_err) = move_to_dir_safe(
@@ -2110,6 +2133,7 @@ fn handle_stop_revoke(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2155,6 +2179,7 @@ fn handle_stop_revoke(
                 Some(canonicalizer_tuple_digest),
                 None,
                 policy_hash,
+                None,
             );
             let _ = move_to_dir_safe(
                 claimed_path,
@@ -2184,6 +2209,7 @@ fn handle_stop_revoke(
             Some(canonicalizer_tuple_digest),
             None,
             policy_hash,
+            None,
         );
         let _ = move_to_dir_safe(
             claimed_path,
@@ -2229,6 +2255,7 @@ fn handle_stop_revoke(
             Some(canonicalizer_tuple_digest),
             None,
             policy_hash,
+            None,
         );
         let _ = move_to_dir_safe(
             claimed_path,
@@ -2303,6 +2330,7 @@ fn handle_stop_revoke(
                     Some(canonicalizer_tuple_digest),
                     None,
                     policy_hash,
+                    None,
                 );
                 let _ = move_to_dir_safe(
                     claimed_path,
@@ -2336,6 +2364,7 @@ fn handle_stop_revoke(
                 Some(canonicalizer_tuple_digest),
                 None,
                 policy_hash,
+                None,
             );
             let _ = move_to_dir_safe(
                 claimed_path,
@@ -2370,6 +2399,7 @@ fn handle_stop_revoke(
             Some(canonicalizer_tuple_digest),
             None,
             policy_hash,
+            None,
         );
         let _ = move_to_dir_safe(
             claimed_path,
@@ -2395,6 +2425,7 @@ fn handle_stop_revoke(
         Some(canonicalizer_tuple_digest),
         None,
         policy_hash,
+        None,
     ) {
         // Fail-closed: completion receipt for stop_revoke itself failed.
         // The target is already cancelled (receipt persisted), but the
@@ -2910,6 +2941,7 @@ fn emit_job_receipt(
     canonicalizer_tuple_digest: Option<&str>,
     moved_job_path: Option<&str>,
     policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
@@ -2942,6 +2974,9 @@ fn emit_job_receipt(
     }
     if let Some(path) = moved_job_path {
         builder = builder.moved_job_path(path);
+    }
+    if let Some(trace) = containment {
+        builder = builder.containment(trace.clone());
     }
 
     let receipt = builder
@@ -3378,6 +3413,7 @@ mod tests {
             Some(&tuple_digest),
             None,
             &spec.job_spec_digest,
+            None,
         )
         .expect("emit receipt");
 
@@ -3417,6 +3453,7 @@ mod tests {
             Some(&canonicalizer_tuple_digest),
             None,
             &spec.job_spec_digest,
+            None,
         )
         .expect("emit receipt");
 

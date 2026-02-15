@@ -200,6 +200,7 @@ fn run_gates_inner(
     let mut test_command_environment = compute_nextest_test_environment()?;
     let mut bounded = false;
 
+    let mut env_remove_keys = Vec::new();
     let test_command = if quick {
         None
     } else {
@@ -219,26 +220,35 @@ fn run_gates_inner(
         bounded = true;
         test_command_environment.extend(spec.environment);
 
-        // TCK-00548: Check sccache containment before forwarding
-        // sccache env vars. If containment fails, strip sccache
-        // vars to prevent cache poisoning.
-        let mut setenv_pairs = spec.setenv_pairs;
-        if let Some(reason) = super::bounded_test_runner::check_sccache_containment_for_build() {
-            eprintln!("WARNING: sccache auto-disabled for bounded test: {reason}");
-            let (filtered, removed) =
-                super::bounded_test_runner::strip_sccache_from_setenv(setenv_pairs);
-            setenv_pairs = filtered;
-            if removed > 0 {
-                eprintln!("  removed {removed} sccache-related env var(s) from test environment");
-            }
+        // TCK-00548: sccache env vars (RUSTC_WRAPPER, SCCACHE_*) are
+        // unconditionally stripped from bounded test commands. We cannot
+        // verify cgroup containment for the systemd transient unit
+        // before it starts (the unit PID does not exist yet), so
+        // sccache is never forwarded in bounded test mode. The
+        // stripping happens in two places:
+        //   1. The allowlist in bounded_test_runner excludes RUSTC_WRAPPER and
+        //      SCCACHE_* so they are not included in --setenv args.
+        //   2. env_remove_keys strips them from the spawned process environment to
+        //      prevent inheritance from the parent.
+        test_command_environment.extend(spec.setenv_pairs);
+
+        // Log if sccache env vars were found and stripped.
+        if !spec.env_remove_keys.is_empty() {
+            eprintln!(
+                "INFO: sccache env vars stripped from bounded test (containment cannot be \
+                 verified for systemd transient units): {:?}",
+                spec.env_remove_keys
+            );
         }
-        test_command_environment.extend(setenv_pairs);
+
+        env_remove_keys = spec.env_remove_keys;
         Some(spec.command)
     };
 
     let opts = EvidenceGateOptions {
         test_command,
         test_command_environment,
+        env_remove_keys,
         skip_test_gate: quick,
         skip_merge_conflict_gate: true,
     };

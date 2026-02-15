@@ -55,6 +55,10 @@ apm2 fac review run --pr <N> --type all
   Supports both user-mode (`--user`) and system-mode (`--system`) backends via
   `APM2_FAC_EXECUTION_BACKEND` env var (TCK-00529). On headless VPS without a user
   D-Bus session, auto-mode falls back to system-mode with a dedicated service user.
+  Sccache env vars (`RUSTC_WRAPPER`, `SCCACHE_*`) are unconditionally stripped from
+  bounded test commands because cgroup containment cannot be verified for systemd
+  transient units before they start (TCK-00548). Stripping is enforced via both the
+  setenv allowlist and `env_remove_keys` on the spawned process.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.

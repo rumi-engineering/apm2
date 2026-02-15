@@ -41,6 +41,10 @@ pub struct EvidenceGateOptions {
     pub test_command: Option<Vec<String>>,
     /// Extra environment variables applied when invoking a bounded test runner.
     pub test_command_environment: Vec<(String, String)>,
+    /// Env var keys to remove from the spawned test process environment.
+    /// Prevents parent process env inheritance of `sccache`/`RUSTC_WRAPPER`
+    /// keys that could bypass cgroup containment (TCK-00548).
+    pub env_remove_keys: Vec<String>,
     /// Skip the heavyweight test gate for quick inner-loop validation.
     pub skip_test_gate: bool,
     /// Skip merge-conflict gate when caller already pre-validated it.
@@ -200,6 +204,7 @@ fn run_gate_command_with_heartbeat(
     args: &[&str],
     log_path: &Path,
     extra_env: Option<&[(String, String)]>,
+    env_remove_keys: Option<&[String]>,
 ) -> std::io::Result<GateCommandOutput> {
     let mut command = Command::new(cmd);
     command
@@ -211,6 +216,14 @@ fn run_gate_command_with_heartbeat(
     if let Some(envs) = extra_env {
         for (key, value) in envs {
             command.env(key, value);
+        }
+    }
+
+    // Strip env vars that must not be inherited by the bounded test
+    // process (e.g. RUSTC_WRAPPER, SCCACHE_* — TCK-00548).
+    if let Some(keys) = env_remove_keys {
+        for key in keys {
+            command.env_remove(key);
         }
     }
 
@@ -429,9 +442,19 @@ pub fn run_single_evidence_gate(
     args: &[&str],
     log_path: &Path,
 ) -> (bool, StreamStats) {
-    run_single_evidence_gate_with_env(workspace_root, sha, gate_name, cmd, args, log_path, None)
+    run_single_evidence_gate_with_env(
+        workspace_root,
+        sha,
+        gate_name,
+        cmd,
+        args,
+        log_path,
+        None,
+        None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_single_evidence_gate_with_env(
     workspace_root: &Path,
     sha: &str,
@@ -440,10 +463,18 @@ fn run_single_evidence_gate_with_env(
     args: &[&str],
     log_path: &Path,
     extra_env: Option<&[(String, String)]>,
+    env_remove_keys: Option<&[String]>,
 ) -> (bool, StreamStats) {
     let started = Instant::now();
-    let output =
-        run_gate_command_with_heartbeat(workspace_root, gate_name, cmd, args, log_path, extra_env);
+    let output = run_gate_command_with_heartbeat(
+        workspace_root,
+        gate_name,
+        cmd,
+        args,
+        log_path,
+        extra_env,
+        env_remove_keys,
+    );
     let duration = started.elapsed().as_secs();
     match output {
         Ok(out) => {
@@ -622,6 +653,10 @@ fn resolve_evidence_test_command_environment(
     opts.and_then(|o| {
         (!o.test_command_environment.is_empty()).then_some(o.test_command_environment.as_slice())
     })
+}
+
+fn resolve_evidence_env_remove_keys(opts: Option<&EvidenceGateOptions>) -> Option<&[String]> {
+    opts.and_then(|o| (!o.env_remove_keys.is_empty()).then_some(o.env_remove_keys.as_slice()))
 }
 
 fn allocate_lane_job_logs_dir() -> Result<(PathBuf, LaneLockGuard), String> {
@@ -959,6 +994,7 @@ pub fn run_evidence_gates(
         let test_command =
             resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
         let test_env = resolve_evidence_test_command_environment(opts);
+        let env_remove = resolve_evidence_env_remove_keys(opts);
         let (test_cmd, test_args) = test_command
             .split_first()
             .ok_or_else(|| "test command is empty".to_string())?;
@@ -970,6 +1006,7 @@ pub fn run_evidence_gates(
             &test_args.iter().map(String::as_str).collect::<Vec<_>>(),
             &test_log,
             test_env,
+            env_remove,
         );
         let test_duration = test_started.elapsed().as_secs();
         gate_results.push(build_evidence_gate_result(
@@ -1552,6 +1589,7 @@ pub fn run_evidence_gates_with_status(
                 &test_args.iter().map(String::as_str).collect::<Vec<_>>(),
                 &log_path,
                 Some(&pipeline_test_command.test_env),
+                None, // No env_remove_keys for pipeline test commands
             );
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
