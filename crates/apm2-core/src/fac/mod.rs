@@ -86,6 +86,8 @@ mod ci_import;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
+/// Execution backend selection for FAC jobs (system-mode and user-mode).
+pub mod execution_backend;
 pub mod flake_class;
 mod flock_util;
 /// Garbage-collection planner and execution primitives.
@@ -544,6 +546,12 @@ pub use efficiency_primitives::{
     IterationContext, IterationContextBuilder, MAX_CACHE_ENTRIES, MAX_CHANGED_FILES,
     MAX_CONTEXT_BUDGET_BYTES, MAX_DELTAS, MAX_FINDINGS, MAX_TOOL_OUTPUTS, MAX_ZOOM_SELECTORS,
     ToolOutputCache, ToolOutputCacheConfig, ToolOutputRef, ZoomSelector, ZoomSelectorType,
+};
+// Re-export execution backend types (TCK-00529)
+pub use execution_backend::{
+    DEFAULT_SERVICE_USER, EXECUTION_BACKEND_ENV_VAR, ExecutionBackend, ExecutionBackendError,
+    SERVICE_USER_ENV_VAR, SystemModeConfig, SystemdRunCommand, build_systemd_run_command,
+    probe_user_bus, select_and_validate_backend, select_backend,
 };
 // Re-export lane types (TCK-00515)
 pub use lane::{

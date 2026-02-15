@@ -52,6 +52,9 @@ apm2 fac review run --pr <N> --type all
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
 - **Rust-native bounded tests**: FAC constructs `systemd-run` bounded test execution in Rust with fixed limits:
   `600s` timeout and `48G` `MemoryMax` for evidence and pipeline test execution.
+  Supports both user-mode (`--user`) and system-mode (`--system`) backends via
+  `APM2_FAC_EXECUTION_BACKEND` env var (TCK-00529). On headless VPS without a user
+  D-Bus session, auto-mode falls back to system-mode with a dedicated service user.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.

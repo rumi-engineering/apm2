@@ -1,12 +1,24 @@
 //! Rust-native bounded test runner command construction.
 //!
 //! Replaces shell-wrapper command assembly with deterministic Rust logic.
+//! Supports both user-mode (`systemd-run --user`) and system-mode
+//! (`systemd-run --system`) execution backends. Backend selection and
+//! command construction are delegated to the core
+//! [`apm2_core::fac::execution_backend`] module; this module handles
+//! CLI-specific concerns (setenv allowlisting, memory/cpu string
+//! parsing, environment normalization).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use apm2_core::fac::SystemdUnitProperties;
+use apm2_core::fac::execution_backend::{
+    ExecutionBackend, SystemModeConfig, build_systemd_run_command, probe_user_bus, select_backend,
+};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
+
+use super::timeout_policy::parse_memory_limit;
 
 const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
     "GITHUB_RUN_ID",
@@ -33,6 +45,8 @@ pub struct BoundedTestCommandSpec {
     pub command: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub setenv_pairs: Vec<(String, String)>,
+    /// The execution backend used for this command.
+    pub backend: ExecutionBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +56,37 @@ pub struct BoundedTestLimits<'a> {
     pub memory_max: &'a str,
     pub pids_max: u64,
     pub cpu_quota: &'a str,
+}
+
+/// Parse a CPU quota string (e.g., "200%", "100%") into a u32 percent value.
+fn parse_cpu_quota_percent(cpu_quota: &str) -> Result<u32, String> {
+    let trimmed = cpu_quota.trim().trim_end_matches('%');
+    if trimmed.is_empty() {
+        return Err("cpu_quota cannot be empty".to_string());
+    }
+    trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("invalid cpu_quota value: `{cpu_quota}`"))
+}
+
+/// Convert CLI `BoundedTestLimits` to core `SystemdUnitProperties`.
+///
+/// Parses string-format limits (e.g., "48G", "200%") into numeric types
+/// used by the core command builder.
+fn limits_to_properties(limits: BoundedTestLimits<'_>) -> Result<SystemdUnitProperties, String> {
+    let memory_max_bytes = parse_memory_limit(limits.memory_max)?;
+    let cpu_quota_percent = parse_cpu_quota_percent(limits.cpu_quota)?;
+
+    Ok(SystemdUnitProperties {
+        cpu_quota_percent,
+        memory_max_bytes,
+        tasks_max: u32::try_from(limits.pids_max)
+            .map_err(|_| format!("pids_max {} exceeds u32 range", limits.pids_max))?,
+        io_weight: 100,
+        timeout_start_sec: limits.timeout_seconds,
+        runtime_max_sec: limits.timeout_seconds,
+        kill_mode: "control-group".to_string(),
+    })
 }
 
 pub fn build_bounded_test_command(
@@ -60,61 +105,75 @@ pub fn build_bounded_test_command(
         return Err("systemd-run not found on PATH".to_string());
     }
 
-    let environment = normalized_runtime_environment();
-    let user_bus_path = resolve_user_bus_socket_path(&environment)
-        .ok_or_else(|| "failed to derive D-Bus socket path for bounded runner".to_string())?;
-    if !Path::new(&user_bus_path).exists() {
-        return Err(format!(
-            "user D-Bus socket not found at {user_bus_path}; bounded runner unavailable"
-        ));
-    }
+    // Convert CLI limits to core properties for unified command
+    // construction.
+    let properties = limits_to_properties(limits)?;
 
-    let mut command = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--pipe".to_string(),
-        "--quiet".to_string(),
-        "--wait".to_string(),
-        "--working-directory".to_string(),
-        workspace_root.display().to_string(),
-    ];
+    // Select execution backend: user-mode (requires D-Bus session) or
+    // system-mode (headless VPS). Controlled by APM2_FAC_EXECUTION_BACKEND.
+    let backend =
+        select_backend().map_err(|e| format!("execution backend selection failed: {e}"))?;
 
+    // Build setenv pairs (common to both backends).
     let setenv_pairs = build_systemd_setenv_pairs(collect_inherited_setenv_pairs(), extra_setenv)?;
+
+    // Build the user-mode D-Bus environment for process spawning.
+    let environment = match backend {
+        ExecutionBackend::UserMode => {
+            // Verify user bus is available via the core prober (single
+            // source of truth for bus detection).
+            if !probe_user_bus() {
+                return Err("user D-Bus session bus not found for bounded runner. \
+                     Set APM2_FAC_EXECUTION_BACKEND=system for headless environments"
+                    .to_string());
+            }
+            normalized_runtime_environment()
+        },
+        ExecutionBackend::SystemMode => Vec::new(),
+    };
+
+    // Resolve system-mode config if needed.
+    let system_config = if backend == ExecutionBackend::SystemMode {
+        Some(SystemModeConfig::from_env().map_err(|e| format!("system-mode config error: {e}"))?)
+    } else {
+        None
+    };
+
+    // Delegate to core command builder for deterministic, consistent
+    // systemd-run argument construction. This ensures the CLI and
+    // daemon use identical property sets (INV-EXEC-005).
+    let core_cmd = build_systemd_run_command(
+        backend,
+        &properties,
+        workspace_root,
+        None,
+        system_config.as_ref(),
+        nextest_command,
+    )
+    .map_err(|e| format!("systemd-run command construction failed: {e}"))?;
+
+    // Insert --setenv arguments into the command. The core command
+    // builder does not handle setenv (it is a CLI-specific concern for
+    // forwarding build environment into the transient unit). We insert
+    // them before the property arguments.
+    let mut command = Vec::with_capacity(core_cmd.args.len() + setenv_pairs.len() * 2);
+    let property_start = core_cmd
+        .args
+        .iter()
+        .position(|a| a == "--property")
+        .unwrap_or(core_cmd.args.len());
+
+    // Copy args before properties, then setenv, then the rest.
+    command.extend(core_cmd.args[..property_start].iter().cloned());
     append_systemd_setenv_args(&mut command, &setenv_pairs);
-
-    for property in bounded_unit_properties(limits) {
-        command.push("--property".to_string());
-        command.push(property);
-    }
-
-    command.push("--".to_string());
-    command.extend(nextest_command.iter().cloned());
+    command.extend(core_cmd.args[property_start..].iter().cloned());
 
     Ok(BoundedTestCommandSpec {
         command,
         environment,
         setenv_pairs,
+        backend,
     })
-}
-
-fn bounded_unit_properties(limits: BoundedTestLimits<'_>) -> Vec<String> {
-    vec![
-        "MemoryAccounting=yes".to_string(),
-        "CPUAccounting=yes".to_string(),
-        "TasksAccounting=yes".to_string(),
-        format!("MemoryMax={}", limits.memory_max),
-        format!("TasksMax={}", limits.pids_max),
-        format!("CPUQuota={}", limits.cpu_quota),
-        format!("RuntimeMaxSec={}s", limits.timeout_seconds),
-        // Fail-closed cleanup: tests may intentionally leave TERM-ignoring descendants.
-        // Use SIGKILL for unit stop to prevent false FAIL due stop timeout after
-        // an otherwise successful test command exit.
-        "KillSignal=SIGKILL".to_string(),
-        format!("TimeoutStopSec={}s", limits.kill_after_seconds),
-        "FinalKillSignal=SIGKILL".to_string(),
-        "SendSIGKILL=yes".to_string(),
-        "KillMode=control-group".to_string(),
-    ]
 }
 
 fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String, String)]) {
@@ -180,6 +239,12 @@ fn is_allowlisted_setenv_key(key: &str) -> bool {
             .any(|prefix| key.starts_with(prefix))
 }
 
+/// Build the D-Bus runtime environment for user-mode execution.
+///
+/// Retained for process-spawn environment setup (the subprocess that
+/// runs `systemd-run --user` needs these variables set in its
+/// environment). Bus socket detection is delegated to core's
+/// [`probe_user_bus`].
 fn normalized_runtime_environment() -> Vec<(String, String)> {
     let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -197,32 +262,6 @@ fn normalized_runtime_environment() -> Vec<(String, String)> {
     ]
 }
 
-fn resolve_user_bus_socket_path(environment: &[(String, String)]) -> Option<String> {
-    environment
-        .iter()
-        .find_map(|(key, value)| (key == "DBUS_SESSION_BUS_ADDRESS").then_some(value.as_str()))
-        .and_then(parse_dbus_unix_path)
-        .map(str::to_string)
-        .or_else(|| {
-            environment.iter().find_map(|(key, value)| {
-                (key == "XDG_RUNTIME_DIR").then_some(format!("{value}/bus"))
-            })
-        })
-}
-
-fn parse_dbus_unix_path(address: &str) -> Option<&str> {
-    for endpoint in address.split(';') {
-        for token in endpoint.split(',') {
-            if let Some(path) = token.strip_prefix("unix:path=") {
-                if !path.is_empty() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn default_runtime_dir() -> String {
     let uid = nix::unistd::Uid::effective().as_raw();
     format!("/run/user/{uid}")
@@ -238,9 +277,9 @@ fn command_available(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedTestLimits, append_systemd_setenv_args, bounded_unit_properties,
-        build_bounded_test_command, build_systemd_setenv_pairs, default_runtime_dir,
-        parse_dbus_unix_path, resolve_user_bus_socket_path,
+        BoundedTestLimits, append_systemd_setenv_args, build_bounded_test_command,
+        build_systemd_setenv_pairs, default_runtime_dir, limits_to_properties,
+        parse_cpu_quota_percent,
     };
 
     #[test]
@@ -307,46 +346,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_dbus_unix_path_extracts_unix_path_entry() {
-        assert_eq!(
-            parse_dbus_unix_path("unix:path=/run/user/1000/bus,guid=abc"),
-            Some("/run/user/1000/bus")
-        );
-        assert_eq!(
-            parse_dbus_unix_path("tcp:host=127.0.0.1;unix:path=/tmp/custom-bus,guid=abc"),
-            Some("/tmp/custom-bus")
-        );
-        assert_eq!(parse_dbus_unix_path("unix:abstract=/tmp/dbus"), None);
+    fn parse_cpu_quota_percent_handles_valid_inputs() {
+        assert_eq!(parse_cpu_quota_percent("200%").unwrap(), 200);
+        assert_eq!(parse_cpu_quota_percent("100%").unwrap(), 100);
+        assert_eq!(parse_cpu_quota_percent("50%").unwrap(), 50);
+        assert_eq!(parse_cpu_quota_percent("0%").unwrap(), 0);
     }
 
     #[test]
-    fn resolve_user_bus_socket_prefers_dbus_session_bus_path() {
-        let env = vec![
-            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
-            (
-                "DBUS_SESSION_BUS_ADDRESS".to_string(),
-                "unix:path=/tmp/custom-bus,guid=abc".to_string(),
-            ),
-        ];
-        assert_eq!(
-            resolve_user_bus_socket_path(&env),
-            Some("/tmp/custom-bus".to_string())
-        );
+    fn parse_cpu_quota_percent_rejects_invalid_inputs() {
+        assert!(parse_cpu_quota_percent("").is_err());
+        assert!(parse_cpu_quota_percent("abc%").is_err());
+        assert!(parse_cpu_quota_percent("%").is_err());
     }
 
     #[test]
-    fn bounded_unit_properties_use_sigkill_teardown() {
-        let properties = bounded_unit_properties(BoundedTestLimits {
+    fn limits_to_properties_converts_correctly() {
+        let limits = BoundedTestLimits {
             timeout_seconds: 600,
             kill_after_seconds: 20,
-            memory_max: "48G",
-            pids_max: 1536,
+            memory_max: "1G",
+            pids_max: 512,
             cpu_quota: "200%",
-        });
-
-        assert!(properties.iter().any(|p| p == "KillSignal=SIGKILL"));
-        assert!(properties.iter().any(|p| p == "FinalKillSignal=SIGKILL"));
-        assert!(properties.iter().any(|p| p == "KillMode=control-group"));
+        };
+        let props = limits_to_properties(limits).expect("valid limits");
+        assert_eq!(props.cpu_quota_percent, 200);
+        assert_eq!(props.memory_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(props.tasks_max, 512);
+        assert_eq!(props.io_weight, 100);
+        assert_eq!(props.runtime_max_sec, 600);
+        assert_eq!(props.kill_mode, "control-group");
     }
 
     #[test]
