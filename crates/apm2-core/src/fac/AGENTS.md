@@ -652,6 +652,86 @@ user-mode and system-mode execution backends.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
+## Policy Environment Enforcement (TCK-00526)
+
+The `policy` module provides centralized environment filtering for all FAC job
+execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`,
+`env_denylist_prefixes`, `env_set`, `deny_ambient_cargo_home`, `cargo_home`,
+`cargo_target_dir`) are enforced at runtime by `build_job_environment()`.
+
+### Key Functions
+
+- `build_job_environment(policy, ambient_env, apm2_home) -> BTreeMap<String, String>`:
+  Centralized default-deny environment builder. Algorithm:
+  1. Start with empty env (default-deny).
+  2. Inherit only variables matching `env_allowlist_prefixes`.
+  3. Remove variables matching `env_denylist_prefixes` (denylist wins).
+  4. Strip variables listed in `env_clear` (unconditional).
+  5. Apply `env_set` overrides (force-set key=value pairs).
+  6. Hardcoded containment safety: unconditionally strip `RUSTC_WRAPPER` and
+     all `SCCACHE_*` variables regardless of policy configuration (defense-in-depth,
+     non-configurable). Runs AFTER `env_set` to ensure policy overrides cannot
+     re-introduce these variables.
+  7. Enforce managed `CARGO_HOME` when `deny_ambient_cargo_home` is true.
+  8. Enforce `CARGO_TARGET_DIR` from policy.
+  Output is a deterministic `BTreeMap` (sorted keys).
+
+  The default policy `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `RUSTUP_`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_TEST_THREADS`)
+  instead of a broad `RUST` prefix to prevent `RUSTC_WRAPPER` admission. The
+  default `env_denylist_prefixes` include `RUSTC_WRAPPER` and `SCCACHE_` as
+  additional defense-in-depth.
+
+- `FacPolicyV1::resolve_cargo_home(apm2_home) -> Option<PathBuf>`:
+  Priority: explicit `cargo_home` > managed path (`$APM2_HOME/private/fac/cargo_home`
+  when `deny_ambient_cargo_home` is true) > `None` (ambient allowed).
+
+### Enforcement Sites
+
+- **Shared policy loader** (`fac_review/policy_loader.rs`): Shared module for
+  bounded I/O policy loading (`O_NOFOLLOW` + `Read::take` at `MAX_POLICY_SIZE + 1`)
+  and managed `CARGO_HOME` creation. Both gates and evidence modules delegate here.
+- **Gates** (`fac_review/gates.rs`): `compute_nextest_test_environment()` loads
+  policy via `policy_loader::load_or_create_fac_policy()`, calls
+  `build_job_environment()`, then overlays lane-derived env vars.
+  `ensure_managed_cargo_home()` delegates to `policy_loader`.
+- **Pipeline/Evidence** (`fac_review/evidence.rs`): `build_pipeline_test_command()`
+  loads policy via `policy_loader::load_or_create_fac_policy()` and builds
+  policy-filtered env for bounded test execution. All gate phases (fmt, clippy,
+  doc, script gates) strip `RUSTC_WRAPPER` and `SCCACHE_*` via `env_remove_keys`
+  on `Command` (defense-in-depth alongside policy-level stripping).
+- **Bounded test runner** (`fac_review/bounded_test_runner.rs`):
+  `SYSTEMD_SETENV_ALLOWLIST_EXACT` includes `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
+  `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient
+  units.
+
+### Security Invariants (TCK-00526)
+
+- [INV-ENV-001] Default-deny: ambient environment variables are not inherited unless
+  explicitly allowlisted by `env_allowlist_prefixes`.
+- [INV-ENV-002] Denylist takes priority over allowlist when both match a variable.
+- [INV-ENV-003] `env_clear` unconditionally strips named variables regardless of
+  allowlist/denylist.
+- [INV-ENV-004] `env_set` overrides are applied before hardcoded containment
+  stripping (before CARGO_HOME/TARGET_DIR). Policy-defined values cannot
+  override hardcoded safety strips (INV-ENV-008).
+- [INV-ENV-005] When `deny_ambient_cargo_home` is true, `CARGO_HOME` is always set
+  to the managed path (`$APM2_HOME/private/fac/cargo_home`), preventing reliance on
+  `~/.cargo` state.
+- [INV-ENV-006] Managed `CARGO_HOME` directory is created with 0o700 permissions
+  (CTR-2611) on Unix. Existing directories are verified for correct ownership
+  (current user) and permissions (0o700, no group/other access).
+- [INV-ENV-007] Output environment is deterministic (`BTreeMap` sorted by key).
+- [INV-ENV-008] `RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped by
+  `build_job_environment()` regardless of policy configuration (hardcoded
+  defense-in-depth). This step runs AFTER `env_set` overrides so that even a
+  malicious policy using `env_set` to re-introduce these variables is defeated.
+  This prevents compiler injection even if a custom policy inadvertently
+  re-admits these variables via allowlist prefixes or env_set overrides.
+- [INV-ENV-009] Default `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `RUSTUP_`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_TEST_THREADS`)
+  to prevent broad `RUST` prefix from admitting `RUSTC_WRAPPER`.
+
 ## Receipt Versioning (TCK-00518)
 
 The `FacJobReceiptV1` type supports two canonical byte representations:

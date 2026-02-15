@@ -35,6 +35,7 @@ mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
+mod policy_loader;
 mod prepare;
 mod projection;
 mod projection_store;

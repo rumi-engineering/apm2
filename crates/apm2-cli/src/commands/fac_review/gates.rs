@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use apm2_core::fac::{LaneProfileV1, compute_test_env};
+use apm2_core::fac::{FacPolicyV1, LaneProfileV1, build_job_environment, compute_test_env};
 use sha2::{Digest, Sha256};
 
 use super::bounded_test_runner::{
@@ -267,6 +267,19 @@ fn run_gates_inner(
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
     let timeout_decision = resolve_bounded_test_timeout(&workspace_root, timeout_seconds);
 
+    // TCK-00526: Load FAC policy for environment enforcement.
+    let apm2_home = apm2_core::github::resolve_apm2_home()
+        .ok_or_else(|| "cannot resolve APM2_HOME for env policy enforcement".to_string())?;
+    let fac_root = apm2_home.join("private/fac");
+    let policy = load_or_create_gate_policy(&fac_root)?;
+
+    // TCK-00526: Ensure the managed CARGO_HOME directory exists when the
+    // policy denies ambient cargo home. Created with restrictive permissions
+    // (0o700) to prevent cross-user contamination (CTR-2611).
+    if let Some(cargo_home) = policy.resolve_cargo_home(&apm2_home) {
+        ensure_managed_cargo_home(&cargo_home)?;
+    }
+
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
     ensure_clean_working_tree(&workspace_root, quick || force)?;
@@ -323,8 +336,10 @@ fn run_gates_inner(
     }
 
     // 4. Build test command override for test execution.
+    // TCK-00526: Environment is now built from policy (default-deny with
+    // allowlist), replacing the previous ambient-inherit approach.
     let default_nextest_command = build_nextest_command();
-    let mut test_command_environment = compute_nextest_test_environment()?;
+    let mut test_command_environment = compute_nextest_test_environment(&policy, &apm2_home)?;
     let mut bounded = false;
 
     let mut env_remove_keys = Vec::new();
@@ -573,10 +588,26 @@ fn normalize_quick_test_gate(gates: &mut Vec<GateResult>) {
     );
 }
 
-fn compute_nextest_test_environment() -> Result<Vec<(String, String)>, String> {
+fn compute_nextest_test_environment(
+    policy: &FacPolicyV1,
+    apm2_home: &std::path::Path,
+) -> Result<Vec<(String, String)>, String> {
     let profile = LaneProfileV1::new("lane-00", "b3-256:fac-gates", "boundary-00")
         .map_err(|err| format!("failed to construct FAC gate lane profile: {err}"))?;
-    Ok(compute_test_env(&profile))
+    let lane_env = compute_test_env(&profile);
+
+    // Build policy-filtered environment from the current process environment.
+    let ambient: Vec<(String, String)> = std::env::vars().collect();
+    let mut policy_env = build_job_environment(policy, &ambient, apm2_home);
+
+    // Lane-derived vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
+    // precedence over ambient values but env_set overrides in the policy
+    // are already applied by build_job_environment.
+    for (key, value) in &lane_env {
+        policy_env.insert(key.clone(), value.clone());
+    }
+
+    Ok(policy_env.into_iter().collect())
 }
 
 fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), String> {
@@ -632,6 +663,18 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
     }
 
     Ok(())
+}
+
+/// Load or create the FAC policy. Delegates to the shared `policy_loader`
+/// module for bounded I/O and deduplication (TCK-00526).
+fn load_or_create_gate_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
+    super::policy_loader::load_or_create_fac_policy(fac_root)
+}
+
+/// Ensure the managed `CARGO_HOME` directory exists. Delegates to the shared
+/// `policy_loader` module (TCK-00526).
+fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
+    super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
 
 #[cfg(test)]
