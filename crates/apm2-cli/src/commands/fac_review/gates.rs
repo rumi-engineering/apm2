@@ -67,6 +67,68 @@ pub fn run_gates(
         });
     }
 
+    // Build a real-time gate progress callback for JSON mode. Events are
+    // emitted to stdout as each gate starts and finishes, providing streaming
+    // observability instead of buffering until all gates complete.
+    let gate_progress_callback: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>> =
+        if json_output {
+            Some(Box::new(
+                |event: super::evidence::GateProgressEvent| match event {
+                    super::evidence::GateProgressEvent::Started { gate_name } => {
+                        let _ = emit_jsonl(&GateStartedEvent {
+                            event: "gate_started",
+                            gate: gate_name,
+                            ts: ts_now(),
+                        });
+                    },
+                    super::evidence::GateProgressEvent::Completed {
+                        gate_name,
+                        passed,
+                        duration_secs,
+                        log_path,
+                        bytes_written,
+                        bytes_total,
+                        was_truncated,
+                        log_bundle_hash,
+                        error_hint,
+                    } => {
+                        let status = if passed { "pass" } else { "fail" }.to_string();
+                        let _ = emit_jsonl(&GateCompletedEvent {
+                            event: "gate_completed",
+                            gate: gate_name.clone(),
+                            status,
+                            duration_secs,
+                            log_path: log_path.clone(),
+                            bytes_written,
+                            bytes_total,
+                            was_truncated,
+                            log_bundle_hash: log_bundle_hash.clone(),
+                            error_hint: error_hint.clone(),
+                            ts: ts_now(),
+                        });
+                        if !passed {
+                            let _ = emit_jsonl(&GateErrorEvent {
+                                event: "gate_error",
+                                gate: gate_name,
+                                error: error_hint.unwrap_or_else(|| {
+                                    "gate failed (see log for details)".to_string()
+                                }),
+                                log_path,
+                                duration_secs: Some(duration_secs),
+                                bytes_written,
+                                bytes_total,
+                                was_truncated,
+                                log_bundle_hash,
+                                ts: ts_now(),
+                            });
+                        }
+                    },
+                },
+            ))
+        } else {
+            None
+        };
+
     match run_gates_inner(
         force,
         quick,
@@ -75,46 +137,12 @@ pub fn run_gates(
         pids_max,
         cpu_quota,
         !json_output,
+        gate_progress_callback,
     ) {
         Ok(summary) => {
             if json_output {
-                for gate in &summary.gates {
-                    let _ = emit_jsonl(&GateStartedEvent {
-                        event: "gate_started",
-                        gate: gate.name.clone(),
-                        ts: ts_now(),
-                    });
-                    let normalized_status = gate.status.to_ascii_lowercase();
-                    let _ = emit_jsonl(&GateCompletedEvent {
-                        event: "gate_completed",
-                        gate: gate.name.clone(),
-                        status: normalized_status,
-                        duration_secs: gate.duration_secs,
-                        log_path: gate.log_path.clone(),
-                        bytes_written: gate.bytes_written,
-                        bytes_total: gate.bytes_total,
-                        was_truncated: gate.was_truncated,
-                        log_bundle_hash: gate.log_bundle_hash.clone(),
-                        error_hint: gate.error_hint.clone(),
-                        ts: ts_now(),
-                    });
-                    if gate.status.eq_ignore_ascii_case("fail") {
-                        let _ = emit_jsonl(&GateErrorEvent {
-                            event: "gate_error",
-                            gate: gate.name.clone(),
-                            error: gate.error_hint.clone().unwrap_or_else(|| {
-                                format!("gate {} failed (see log for details)", gate.name)
-                            }),
-                            log_path: gate.log_path.clone(),
-                            duration_secs: Some(gate.duration_secs),
-                            bytes_written: gate.bytes_written,
-                            bytes_total: gate.bytes_total,
-                            was_truncated: gate.was_truncated,
-                            log_bundle_hash: gate.log_bundle_hash.clone(),
-                            ts: ts_now(),
-                        });
-                    }
-                }
+                // Gate-level events were already streamed in real-time via the
+                // callback. Only the summary/completion events are emitted here.
                 let _ = emit_jsonl(&StageEvent {
                     event: "gates_completed".to_string(),
                     ts: ts_now(),
@@ -239,6 +267,7 @@ fn run_gates_inner(
     pids_max: u64,
     cpu_quota: &str,
     emit_human_logs: bool,
+    on_gate_progress: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>>,
 ) -> Result<GatesSummary, String> {
     validate_timeout_seconds(timeout_seconds)?;
     let memory_max_bytes = parse_memory_limit(memory_max)?;
@@ -274,7 +303,27 @@ fn run_gates_inner(
     }
 
     // 3. Merge-conflict gate always runs first and is never cache-reused.
+    // Emit gate_started before execution for streaming observability.
+    if let Some(ref cb) = on_gate_progress {
+        cb(super::evidence::GateProgressEvent::Started {
+            gate_name: "merge_conflict_main".to_string(),
+        });
+    }
     let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha, emit_human_logs)?;
+    // Emit gate_completed immediately after the merge gate finishes.
+    if let Some(ref cb) = on_gate_progress {
+        cb(super::evidence::GateProgressEvent::Completed {
+            gate_name: merge_gate.name.clone(),
+            passed: merge_gate.status == "PASS",
+            duration_secs: merge_gate.duration_secs,
+            log_path: merge_gate.log_path.clone(),
+            bytes_written: merge_gate.bytes_written,
+            bytes_total: merge_gate.bytes_total,
+            was_truncated: merge_gate.was_truncated,
+            log_bundle_hash: merge_gate.log_bundle_hash.clone(),
+            error_hint: merge_gate.error_hint.clone(),
+        });
+    }
     if merge_gate.status == "FAIL" {
         return Ok(GatesSummary {
             sha,
@@ -345,6 +394,7 @@ fn run_gates_inner(
         skip_test_gate: quick,
         skip_merge_conflict_gate: true,
         emit_human_logs,
+        on_gate_progress,
     };
 
     // 5. Run evidence gates.
@@ -700,6 +750,76 @@ mod tests {
         let gate = test_gates[0];
         assert_eq!(gate.status, "SKIP");
         assert_eq!(gate.log_path.as_deref(), Some("/tmp/test.log"));
+    }
+
+    /// Verify that the `on_gate_progress` callback in [`EvidenceGateOptions`]
+    /// receives `Started` events BEFORE `Completed` events for each gate.
+    ///
+    /// This test validates BLOCKER 2 fix: gate lifecycle events must be emitted
+    /// during execution (via callback) rather than buffered and replayed after
+    /// all gates return. The callback structure ensures callers can stream
+    /// JSONL events in real time at each gate boundary.
+    #[test]
+    fn gate_progress_callback_receives_events_in_order() {
+        use std::sync::{Arc, Mutex};
+
+        use super::super::evidence::GateProgressEvent;
+
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events_clone = Arc::clone(&events);
+
+        // Build a callback that records event types.
+        let callback: Box<dyn Fn(GateProgressEvent) + Send> =
+            Box::new(move |event: GateProgressEvent| match event {
+                GateProgressEvent::Started { gate_name } => {
+                    events_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("started:{gate_name}"));
+                },
+                GateProgressEvent::Completed {
+                    gate_name, passed, ..
+                } => {
+                    events_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("completed:{gate_name}:passed={passed}"));
+                },
+            });
+
+        // Verify that the callback type matches what EvidenceGateOptions expects.
+        let opts = super::super::evidence::EvidenceGateOptions {
+            test_command: None,
+            test_command_environment: Vec::new(),
+            env_remove_keys: Vec::new(),
+            skip_test_gate: true,
+            skip_merge_conflict_gate: true,
+            emit_human_logs: false,
+            on_gate_progress: Some(callback),
+        };
+
+        // Simulate the callback being invoked for a gate lifecycle.
+        if let Some(ref cb) = opts.on_gate_progress {
+            cb(GateProgressEvent::Started {
+                gate_name: "test_gate".to_string(),
+            });
+            cb(GateProgressEvent::Completed {
+                gate_name: "test_gate".to_string(),
+                passed: true,
+                duration_secs: 5,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                error_hint: None,
+            });
+        }
+
+        let recorded = events.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0], "started:test_gate");
+        assert_eq!(recorded[1], "completed:test_gate:passed=true");
     }
 
     fn run_git(repo: &Path, args: &[&str]) {

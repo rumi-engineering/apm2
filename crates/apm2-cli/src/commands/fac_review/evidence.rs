@@ -34,6 +34,29 @@ use super::timeout_policy::{
 };
 use super::types::now_iso8601;
 
+/// Progress event emitted by evidence gate execution at each gate boundary.
+///
+/// Callers can provide a callback via [`EvidenceGateOptions::on_gate_progress`]
+/// to receive these events in real time — enabling JSONL streaming of per-gate
+/// lifecycle events during execution rather than after all gates complete.
+#[derive(Debug, Clone)]
+pub enum GateProgressEvent {
+    /// Emitted immediately before a gate starts executing.
+    Started { gate_name: String },
+    /// Emitted immediately after a gate finishes executing.
+    Completed {
+        gate_name: String,
+        passed: bool,
+        duration_secs: u64,
+        log_path: Option<String>,
+        bytes_written: Option<u64>,
+        bytes_total: Option<u64>,
+        was_truncated: Option<bool>,
+        log_bundle_hash: Option<String>,
+        error_hint: Option<String>,
+    },
+}
+
 /// Options for customizing evidence gate execution.
 pub struct EvidenceGateOptions {
     /// Override command for the test phase. When `Some`, the test gate uses
@@ -52,6 +75,13 @@ pub struct EvidenceGateOptions {
     /// Emit human-oriented status/heartbeat lines to stderr.
     /// JSON streaming callers should set this to `false`.
     pub emit_human_logs: bool,
+    /// Optional callback invoked at each gate boundary during execution.
+    ///
+    /// When set, this callback receives [`GateProgressEvent::Started`] before
+    /// each gate begins and [`GateProgressEvent::Completed`] after each gate
+    /// finishes. This enables real-time JSONL streaming of per-gate progress
+    /// instead of buffering all events until `run_evidence_gates` returns.
+    pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
 }
 
 /// Result of a single evidence gate execution.
@@ -73,6 +103,71 @@ pub(super) struct StreamStats {
     bytes_written: u64,
     bytes_total: u64,
     was_truncated: bool,
+}
+
+/// Emit a gate-started progress event via the optional callback in
+/// [`EvidenceGateOptions`].
+fn emit_gate_started(opts: Option<&EvidenceGateOptions>, gate_name: &str) {
+    if let Some(opts) = opts {
+        if let Some(ref cb) = opts.on_gate_progress {
+            cb(GateProgressEvent::Started {
+                gate_name: gate_name.to_string(),
+            });
+        }
+    }
+}
+
+/// Emit a gate-completed progress event via the optional callback in
+/// [`EvidenceGateOptions`].
+fn emit_gate_completed(opts: Option<&EvidenceGateOptions>, result: &EvidenceGateResult) {
+    if let Some(opts) = opts {
+        if let Some(ref cb) = opts.on_gate_progress {
+            emit_gate_completed_via_cb(&**cb, result);
+        }
+    }
+}
+
+/// Emit a gate-started progress event via a bare callback reference.
+fn emit_gate_started_cb(cb: Option<&dyn Fn(GateProgressEvent)>, gate_name: &str) {
+    if let Some(cb) = cb {
+        cb(GateProgressEvent::Started {
+            gate_name: gate_name.to_string(),
+        });
+    }
+}
+
+/// Emit a gate-completed progress event via a bare callback reference.
+fn emit_gate_completed_cb(cb: Option<&dyn Fn(GateProgressEvent)>, result: &EvidenceGateResult) {
+    if let Some(cb) = cb {
+        emit_gate_completed_via_cb(cb, result);
+    }
+}
+
+/// Shared implementation for emitting a gate-completed event.
+fn emit_gate_completed_via_cb(cb: &dyn Fn(GateProgressEvent), result: &EvidenceGateResult) {
+    let error_hint = if result.passed {
+        None
+    } else {
+        result
+            .log_path
+            .as_deref()
+            .and_then(super::jsonl::read_log_error_hint)
+    };
+    cb(GateProgressEvent::Completed {
+        gate_name: result.gate_name.clone(),
+        passed: result.passed,
+        duration_secs: result.duration_secs,
+        log_path: result
+            .log_path
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .map(str::to_string),
+        bytes_written: result.bytes_written,
+        bytes_total: result.bytes_total,
+        was_truncated: result.was_truncated,
+        log_bundle_hash: result.log_bundle_hash.clone(),
+        error_hint,
+    });
 }
 
 /// Canonical list of lane-scoped evidence gate names used by the FAC pipeline.
@@ -926,15 +1021,18 @@ pub fn run_evidence_gates(
     if !skip_merge_conflict_gate {
         // Phase 0: merge conflict gate (always first, including quick mode).
         let merge_log_path = logs_dir.join(format!("{MERGE_CONFLICT_GATE_NAME}.log"));
+        emit_gate_started(opts, MERGE_CONFLICT_GATE_NAME);
         let (merge_passed, merge_duration, merge_line, merge_stats) =
             run_merge_conflict_gate(workspace_root, sha, &merge_log_path, emit_human_logs);
-        gate_results.push(build_evidence_gate_result(
+        let merge_result = build_evidence_gate_result(
             MERGE_CONFLICT_GATE_NAME,
             merge_passed,
             merge_duration,
             Some(&merge_log_path),
             Some(&merge_stats),
-        ));
+        );
+        emit_gate_completed(opts, &merge_result);
+        gate_results.push(merge_result);
         if !merge_passed {
             all_passed = false;
         }
@@ -953,6 +1051,7 @@ pub fn run_evidence_gates(
     // Phase 1: cargo fmt/clippy/doc.
     for &(gate_name, cmd_args) in gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
+        emit_gate_started(opts, gate_name);
         let started = Instant::now();
         let (passed, stream_stats) = run_single_evidence_gate(
             workspace_root,
@@ -964,13 +1063,15 @@ pub fn run_evidence_gates(
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
-        gate_results.push(build_evidence_gate_result(
+        let result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed(opts, &result);
+        gate_results.push(result);
         if !passed {
             all_passed = false;
         }
@@ -989,6 +1090,7 @@ pub fn run_evidence_gates(
             continue;
         }
         let log_path = logs_dir.join(format!("{gate_name}.log"));
+        emit_gate_started(opts, gate_name);
         let started = Instant::now();
         let (passed, stream_stats) = run_single_evidence_gate(
             workspace_root,
@@ -1000,13 +1102,15 @@ pub fn run_evidence_gates(
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
-        gate_results.push(build_evidence_gate_result(
+        let result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed(opts, &result);
+        gate_results.push(result);
         if !passed {
             all_passed = false;
         }
@@ -1037,7 +1141,7 @@ pub fn run_evidence_gates(
             "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
             test_log.display()
         ));
-        gate_results.push(build_evidence_gate_result(
+        let test_result = build_evidence_gate_result(
             "test",
             true,
             0,
@@ -1047,8 +1151,11 @@ pub fn run_evidence_gates(
                 bytes_total: skip_msg.len() as u64,
                 was_truncated: false,
             }),
-        ));
+        );
+        emit_gate_completed(opts, &test_result);
+        gate_results.push(test_result);
     } else {
+        emit_gate_started(opts, "test");
         let test_started = Instant::now();
         let test_command =
             resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
@@ -1069,13 +1176,15 @@ pub fn run_evidence_gates(
             emit_human_logs,
         );
         let test_duration = test_started.elapsed().as_secs();
-        gate_results.push(build_evidence_gate_result(
+        let test_result = build_evidence_gate_result(
             "test",
             passed,
             test_duration,
             Some(&test_log),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed(opts, &test_result);
+        gate_results.push(test_result);
         if !passed {
             all_passed = false;
         }
@@ -1087,18 +1196,21 @@ pub fn run_evidence_gates(
         ));
     }
 
+    emit_gate_started(opts, "workspace_integrity");
     let wi_started = Instant::now();
     let wi_log_path = logs_dir.join("workspace_integrity.log");
     let (wi_passed, wi_line, wi_stream_stats) =
         verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
     let wi_duration = wi_started.elapsed().as_secs();
-    gate_results.push(build_evidence_gate_result(
+    let wi_result = build_evidence_gate_result(
         "workspace_integrity",
         wi_passed,
         wi_duration,
         Some(&wi_log_path),
         Some(&wi_stream_stats),
-    ));
+    );
+    emit_gate_completed(opts, &wi_result);
+    gate_results.push(wi_result);
     if !wi_passed {
         all_passed = false;
     }
@@ -1111,6 +1223,7 @@ pub fn run_evidence_gates(
             continue;
         }
         let log_path = logs_dir.join(format!("{gate_name}.log"));
+        emit_gate_started(opts, gate_name);
         let started = Instant::now();
         let (passed, stream_stats) = run_single_evidence_gate(
             workspace_root,
@@ -1122,13 +1235,15 @@ pub fn run_evidence_gates(
             emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
-        gate_results.push(build_evidence_gate_result(
+        let result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed(opts, &result);
+        gate_results.push(result);
         if !passed {
             all_passed = false;
         }
@@ -1155,6 +1270,7 @@ pub fn run_evidence_gates(
 /// Same as [`run_evidence_gates`] but also updates a PR CI status comment
 /// after each gate completes. Checks the per-SHA gate cache before each gate
 /// and skips execution if the gate already passed for this SHA.
+#[allow(clippy::too_many_arguments)]
 pub fn run_evidence_gates_with_status(
     workspace_root: &Path,
     sha: &str,
@@ -1162,6 +1278,7 @@ pub fn run_evidence_gates_with_status(
     pr_number: u32,
     projection_log: Option<&mut File>,
     emit_human_logs: bool,
+    on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let (logs_dir, _lane_guard) = allocate_lane_job_logs_dir()?;
 
@@ -1213,6 +1330,7 @@ pub fn run_evidence_gates_with_status(
     // Phase 0: merge conflict gate (always first, always recomputed).
     {
         let gate_name = MERGE_CONFLICT_GATE_NAME;
+        emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
         updater.update(&status);
 
@@ -1221,13 +1339,15 @@ pub fn run_evidence_gates_with_status(
             run_merge_conflict_gate(workspace_root, sha, &log_path, emit_human_logs);
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_results.push(build_evidence_gate_result(
+        let merge_result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed_cb(on_gate_progress, &merge_result);
+        gate_results.push(merge_result);
         evidence_lines.push(line);
         let merge_digest = sha256_file_hex(&log_path);
         let merge_attestation =
@@ -1273,6 +1393,7 @@ pub fn run_evidence_gates_with_status(
             reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+                emit_gate_started_cb(on_gate_progress, gate_name);
                 status.set_running(gate_name);
                 updater.update(&status);
                 let stream_stats = write_cached_gate_log_marker(
@@ -1283,13 +1404,15 @@ pub fn run_evidence_gates_with_status(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &cached_result);
+                gate_results.push(cached_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1311,11 +1434,12 @@ pub fn run_evidence_gates_with_status(
                 ));
                 continue;
             }
+            emit_gate_started_cb(on_gate_progress, gate_name);
             status.set_running(gate_name);
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            gate_results.push(build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result(
                 gate_name,
                 false,
                 0,
@@ -1325,7 +1449,9 @@ pub fn run_evidence_gates_with_status(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
-            ));
+            );
+            emit_gate_completed_cb(on_gate_progress, &fail_result);
+            gate_results.push(fail_result);
             gate_cache.set_with_attestation(
                 gate_name,
                 false,
@@ -1357,6 +1483,7 @@ pub fn run_evidence_gates_with_status(
                     .map_or_else(|| "unknown".to_string(), short_digest),
             );
         }
+        emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
@@ -1373,13 +1500,15 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_results.push(build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed_cb(on_gate_progress, &exec_result);
+        gate_results.push(exec_result);
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -1418,6 +1547,7 @@ pub fn run_evidence_gates_with_status(
             reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+                emit_gate_started_cb(on_gate_progress, gate_name);
                 status.set_running(gate_name);
                 updater.update(&status);
                 let stream_stats = write_cached_gate_log_marker(
@@ -1428,13 +1558,15 @@ pub fn run_evidence_gates_with_status(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &cached_result);
+                gate_results.push(cached_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1456,11 +1588,12 @@ pub fn run_evidence_gates_with_status(
                 ));
                 continue;
             }
+            emit_gate_started_cb(on_gate_progress, gate_name);
             status.set_running(gate_name);
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            gate_results.push(build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result(
                 gate_name,
                 false,
                 0,
@@ -1470,7 +1603,9 @@ pub fn run_evidence_gates_with_status(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
-            ));
+            );
+            emit_gate_completed_cb(on_gate_progress, &fail_result);
+            gate_results.push(fail_result);
             gate_cache.set_with_attestation(
                 gate_name,
                 false,
@@ -1502,6 +1637,7 @@ pub fn run_evidence_gates_with_status(
                     .map_or_else(|| "unknown".to_string(), short_digest),
             );
         }
+        emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
@@ -1518,13 +1654,15 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_results.push(build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed_cb(on_gate_progress, &exec_result);
+        gate_results.push(exec_result);
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -1564,6 +1702,7 @@ pub fn run_evidence_gates_with_status(
         let reuse =
             reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
         let log_path = logs_dir.join("test.log");
+        emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
         updater.update(&status);
         if reuse.reusable {
@@ -1576,13 +1715,15 @@ pub fn run_evidence_gates_with_status(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &cached_result);
+                gate_results.push(cached_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1605,7 +1746,7 @@ pub fn run_evidence_gates_with_status(
             } else {
                 status.set_result(gate_name, false, 0);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let fail_result = build_evidence_gate_result(
                     gate_name,
                     false,
                     0,
@@ -1615,7 +1756,9 @@ pub fn run_evidence_gates_with_status(
                         bytes_total: 0,
                         was_truncated: false,
                     }),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &fail_result);
+                gate_results.push(fail_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     false,
@@ -1670,13 +1813,15 @@ pub fn run_evidence_gates_with_status(
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            gate_results.push(build_evidence_gate_result(
+            let test_result = build_evidence_gate_result(
                 gate_name,
                 passed,
                 duration,
                 Some(&log_path),
                 Some(&stream_stats),
-            ));
+            );
+            emit_gate_completed_cb(on_gate_progress, &test_result);
+            gate_results.push(test_result);
             gate_cache.set_with_attestation(
                 gate_name,
                 passed,
@@ -1709,6 +1854,7 @@ pub fn run_evidence_gates_with_status(
         let reuse =
             reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
         let log_path = logs_dir.join("workspace_integrity.log");
+        emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
         updater.update(&status);
         if reuse.reusable {
@@ -1721,13 +1867,15 @@ pub fn run_evidence_gates_with_status(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &cached_result);
+                gate_results.push(cached_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1750,7 +1898,7 @@ pub fn run_evidence_gates_with_status(
             } else {
                 status.set_result(gate_name, false, 0);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let fail_result = build_evidence_gate_result(
                     gate_name,
                     false,
                     0,
@@ -1760,7 +1908,9 @@ pub fn run_evidence_gates_with_status(
                         bytes_total: 0,
                         was_truncated: false,
                     }),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &fail_result);
+                gate_results.push(fail_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     false,
@@ -1785,13 +1935,15 @@ pub fn run_evidence_gates_with_status(
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            gate_results.push(build_evidence_gate_result(
+            let wi_result = build_evidence_gate_result(
                 gate_name,
                 passed,
                 duration,
                 Some(&log_path),
                 Some(&stream_stats),
-            ));
+            );
+            emit_gate_completed_cb(on_gate_progress, &wi_result);
+            gate_results.push(wi_result);
             gate_cache.set_with_attestation(
                 gate_name,
                 passed,
@@ -1825,6 +1977,7 @@ pub fn run_evidence_gates_with_status(
             reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+                emit_gate_started_cb(on_gate_progress, gate_name);
                 status.set_running(gate_name);
                 updater.update(&status);
                 let stream_stats = write_cached_gate_log_marker(
@@ -1835,13 +1988,15 @@ pub fn run_evidence_gates_with_status(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                gate_results.push(build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
-                ));
+                );
+                emit_gate_completed_cb(on_gate_progress, &cached_result);
+                gate_results.push(cached_result);
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1863,11 +2018,12 @@ pub fn run_evidence_gates_with_status(
                 ));
                 continue;
             }
+            emit_gate_started_cb(on_gate_progress, gate_name);
             status.set_running(gate_name);
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            gate_results.push(build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result(
                 gate_name,
                 false,
                 0,
@@ -1877,7 +2033,9 @@ pub fn run_evidence_gates_with_status(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
-            ));
+            );
+            emit_gate_completed_cb(on_gate_progress, &fail_result);
+            gate_results.push(fail_result);
             gate_cache.set_with_attestation(
                 gate_name,
                 false,
@@ -1909,6 +2067,7 @@ pub fn run_evidence_gates_with_status(
                     .map_or_else(|| "unknown".to_string(), short_digest),
             );
         }
+        emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
@@ -1924,13 +2083,15 @@ pub fn run_evidence_gates_with_status(
         let duration = started.elapsed().as_secs();
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        gate_results.push(build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
-        ));
+        );
+        emit_gate_completed_cb(on_gate_progress, &exec_result);
+        gate_results.push(exec_result);
         gate_cache.set_with_attestation(
             gate_name,
             passed,

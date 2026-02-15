@@ -168,6 +168,7 @@ fn execute_strategy(
                 ctx.pr_number,
                 None,
                 emit_human_logs,
+                None,
             )?;
 
             if passed {

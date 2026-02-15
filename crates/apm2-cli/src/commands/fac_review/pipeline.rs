@@ -112,6 +112,7 @@ fn run_pipeline_inner(
         pr_number,
         None,
         !json_output,
+        None,
     ) {
         Ok(value) => value,
         Err(err) => {

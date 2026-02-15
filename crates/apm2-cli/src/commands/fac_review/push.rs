@@ -406,6 +406,7 @@ fn run_blocking_evidence_gates(
                         skip_test_gate: false,
                         skip_merge_conflict_gate: false,
                         emit_human_logs,
+                        on_gate_progress: None,
                     };
                     run_evidence_gates(workspace_root, sha, None, Some(&opts))
                 },
@@ -417,6 +418,7 @@ fn run_blocking_evidence_gates(
                         pr_number,
                         None,
                         emit_human_logs,
+                        None,
                     )
                 },
             )
