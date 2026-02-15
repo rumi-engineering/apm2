@@ -278,6 +278,40 @@ fn load_completion_signal(
     }))
 }
 
+fn summary_is_terminal(summary: &SingleReviewSummary) -> bool {
+    matches!(summary.state.as_str(), "done" | "failed" | "crashed")
+}
+
+fn emit_lane_terminated_event(
+    event_ctx: &ExecutionContext,
+    lane: &str,
+    summary: &SingleReviewSummary,
+    head_sha: &str,
+) -> Result<(), String> {
+    emit_event(
+        event_ctx,
+        &format!("{lane}_terminated"),
+        lane,
+        head_sha,
+        serde_json::json!({
+            "run_id": summary.run_id,
+            "state": summary.state,
+            "verdict": summary.verdict,
+            "terminal_reason": summary.terminal_reason,
+            "duration_secs": summary.duration_secs,
+            "restart_count": summary.restart_count,
+            "tokens_used": summary.tokens_used,
+        }),
+    )
+}
+
+fn lane_is_active(pr_number: u32, lane: &str) -> bool {
+    let Ok(Some(state)) = load_review_run_state_strict(pr_number, lane) else {
+        return false;
+    };
+    !state.status.is_terminal()
+}
+
 // ── run_review_inner ────────────────────────────────────────────────────────
 
 pub fn run_review_inner(
@@ -437,33 +471,60 @@ pub fn run_review_inner(
         .cloned()
         .unwrap_or_else(|| initial_head_sha.clone());
 
-    emit_event(
-        &event_ctx,
-        "sequence_done",
-        "all",
-        &current_head_sha,
-        serde_json::json!({
-            "security_verdict": security_summary
-                .as_ref()
-                .map_or_else(|| "SKIPPED".to_string(), |entry| entry.verdict.clone()),
-            "quality_verdict": quality_summary
-                .as_ref()
-                .map_or_else(|| "SKIPPED".to_string(), |entry| entry.verdict.clone()),
-            "total_secs": total_started.elapsed().as_secs(),
-            "security_tokens": security_summary.as_ref().and_then(|s| s.tokens_used),
-            "quality_tokens": quality_summary.as_ref().and_then(|s| s.tokens_used),
-            "security_run_id": security_summary.as_ref().map(|s| s.run_id.clone()),
-            "quality_run_id": quality_summary.as_ref().map(|s| s.run_id.clone()),
-            "security_state": security_summary.as_ref().map(|s| s.state.clone()),
-            "quality_state": quality_summary.as_ref().map(|s| s.state.clone()),
-            "security_terminal_reason": security_summary
-                .as_ref()
-                .and_then(|s| s.terminal_reason.clone()),
-            "quality_terminal_reason": quality_summary
-                .as_ref()
-                .and_then(|s| s.terminal_reason.clone()),
-        }),
-    )?;
+    if let Some(summary) = security_summary.as_ref()
+        && summary_is_terminal(summary)
+    {
+        emit_lane_terminated_event(&event_ctx, "security", summary, &current_head_sha)?;
+    }
+    if let Some(summary) = quality_summary.as_ref()
+        && summary_is_terminal(summary)
+    {
+        emit_lane_terminated_event(&event_ctx, "quality", summary, &current_head_sha)?;
+    }
+
+    let can_emit_sequence_done = match review_type {
+        ReviewRunType::All => {
+            security_summary.as_ref().is_none_or(summary_is_terminal)
+                && quality_summary.as_ref().is_none_or(summary_is_terminal)
+        },
+        ReviewRunType::Security => {
+            security_summary.as_ref().is_some_and(summary_is_terminal)
+                && !lane_is_active(pr_number, "quality")
+        },
+        ReviewRunType::Quality => {
+            quality_summary.as_ref().is_some_and(summary_is_terminal)
+                && !lane_is_active(pr_number, "security")
+        },
+    };
+    if can_emit_sequence_done {
+        emit_event(
+            &event_ctx,
+            "sequence_done",
+            "all",
+            &current_head_sha,
+            serde_json::json!({
+                "security_verdict": security_summary
+                    .as_ref()
+                    .map_or_else(|| "SKIPPED".to_string(), |entry| entry.verdict.clone()),
+                "quality_verdict": quality_summary
+                    .as_ref()
+                    .map_or_else(|| "SKIPPED".to_string(), |entry| entry.verdict.clone()),
+                "total_secs": total_started.elapsed().as_secs(),
+                "security_tokens": security_summary.as_ref().and_then(|s| s.tokens_used),
+                "quality_tokens": quality_summary.as_ref().and_then(|s| s.tokens_used),
+                "security_run_id": security_summary.as_ref().map(|s| s.run_id.clone()),
+                "quality_run_id": quality_summary.as_ref().map(|s| s.run_id.clone()),
+                "security_state": security_summary.as_ref().map(|s| s.state.clone()),
+                "quality_state": quality_summary.as_ref().map(|s| s.state.clone()),
+                "security_terminal_reason": security_summary
+                    .as_ref()
+                    .and_then(|s| s.terminal_reason.clone()),
+                "quality_terminal_reason": quality_summary
+                    .as_ref()
+                    .and_then(|s| s.terminal_reason.clone()),
+            }),
+        )?;
+    }
 
     Ok(ReviewRunSummary {
         pr_url,
@@ -683,7 +744,7 @@ fn run_single_review(
             final_head_sha: current_head_sha,
         });
     };
-    write_pulse_file(pr_number, review_type, &current_head_sha)?;
+    write_pulse_file(pr_number, review_type, &current_head_sha, Some(&run_id))?;
     let run_key = build_run_key(pr_number, review_type, &current_head_sha);
     persist_review_run_state(
         &mut run_state,
@@ -715,7 +776,7 @@ fn run_single_review(
                     }),
                 )?;
                 current_head_sha.clone_from(&latest_head);
-                write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                write_pulse_file(pr_number, review_type, &current_head_sha, Some(&run_id))?;
                 persist_review_run_state(
                     &mut run_state,
                     ReviewRunStatus::Pending,
@@ -862,6 +923,19 @@ fn run_single_review(
             restart_count,
             Some(child.id()),
         )?;
+        if let Err(err) = super::lifecycle::bind_reviewer_runtime(
+            owner_repo,
+            pr_number,
+            &current_head_sha,
+            review_type,
+            &run_id,
+            child.id(),
+            run_state.proc_start_time,
+        ) {
+            eprintln!(
+                "WARNING: failed to bind reviewer runtime in agent registry for PR #{pr_number} type={review_type} run_id={run_id}: {err}",
+            );
+        }
 
         emit_run_event(
             "run_start",
@@ -920,7 +994,7 @@ fn run_single_review(
                         }),
                     )?;
                     current_head_sha.clone_from(&latest_head);
-                    write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                    write_pulse_file(pr_number, review_type, &current_head_sha, Some(&run_id))?;
                     persist_review_run_state(
                         &mut run_state,
                         ReviewRunStatus::Pending,
@@ -1046,7 +1120,12 @@ fn run_single_review(
                                 }),
                             )?;
                             current_head_sha.clone_from(&latest_head);
-                            write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                            write_pulse_file(
+                                pr_number,
+                                review_type,
+                                &current_head_sha,
+                                Some(&run_id),
+                            )?;
                             persist_review_run_state(
                                 &mut run_state,
                                 ReviewRunStatus::Pending,
@@ -1344,7 +1423,7 @@ fn run_single_review(
                     super::terminate_child(&mut child)?;
                     let old_sha = current_head_sha.clone();
                     current_head_sha.clone_from(&latest_head);
-                    write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                    write_pulse_file(pr_number, review_type, &current_head_sha, Some(&run_id))?;
                     persist_review_run_state(
                         &mut run_state,
                         ReviewRunStatus::Pending,

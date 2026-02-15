@@ -1,15 +1,15 @@
 {
   "schema": "apm2.review.prompt.v1",
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "kind": "review.executable_prompt",
   "meta": {
-    "stable_id": "dcp://apm2.review/prompt/security-review@1",
+    "stable_id": "dcp://apm2.review/prompt/security-review@2",
     "status": "ACTIVE",
     "classification": "INTERNAL",
     "owners": ["security"],
     "provenance": {
       "actor_id": "HOLON-SECURITY-GOVERNANCE",
-      "work_id": "TCK-00604-REVIEW-PROMPT-MIGRATION",
+      "work_id": "TCK-00605-REVIEW-PROMPT-REFACTOR",
       "source_receipts": []
     }
   },
@@ -17,26 +17,31 @@
     "title": "Security Review Prompt",
     "protocol": {
       "id": "SECURITY-REVIEW",
-      "version": "4.0.0",
+      "version": "5.0.0",
       "type": "executable_specification",
-      "purpose": "Evaluate PR security properties from FAC-prepared local inputs, emit structured findings through FAC, and set a SHA-bound decision."
+      "purpose": "Evaluate PR security properties from FAC-prepared local inputs, emit structured findings, and set a verdict. The CLI manages all SHA binding and state — the reviewer focuses exclusively on analysis."
     },
     "inputs": ["OPTIONAL_CONTEXT"],
     "outputs": ["FindingsProjection", "DecisionProjection"],
+    "commands": {
+      "description": "The reviewer uses exactly 3 CLI commands via `cargo run -p apm2-cli --`. This ensures the workspace-built binary is used, not a stale global install. No other commands are needed.",
+      "binary_prefix": "cargo run -p apm2-cli --",
+      "prepare": "cargo run -p apm2-cli -- fac review prepare --json",
+      "finding": "cargo run -p apm2-cli -- fac review finding --type security --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\" --json",
+      "verdict": "cargo run -p apm2-cli -- fac review verdict set --dimension security --verdict <approve|deny> --reason \"...\" --json"
+    },
     "constraints": {
       "forbidden_operations": [
-        "NEVER run git commands that modify worktree state (git reset, git checkout, git clean, git stash, git rebase, git merge, git cherry-pick, git commit, git push, git pull, git fetch).",
-        "NEVER use direct gh or git commands for any purpose. All repository and GitHub interactions MUST go through apm2 fac review commands exclusively.",
-        "If the worktree is dirty or in a conflicted state, STOP and report the issue — do not attempt to fix it.",
-        "All interactions with the repository MUST be read-only."
-      ]
-    },
-    "metadata_contract": {
+        "NEVER use bare `apm2` — always use `cargo run -p apm2-cli --` so the workspace-built binary is used.",
+        "NEVER pass --sha to any command. The CLI auto-derives the SHA from the PR identity.",
+        "All interactions with the repository MUST be read-only. Do not modify any files.",
+        "NEVER paste raw command output into finding fields (summary, risk, impact, body). Finding fields must contain your original analysis text only."
+      ],
       "invariants": [
-        "\"head_sha\" MUST equal reviewed_sha.",
-        "\"pr_number\" MUST match the prepared PR number exactly.",
-        "Set reviewed_sha = headRefOid.",
-        "SHA is auto-derived from prepared inputs — never pass --sha manually."
+        "Every execution path MUST terminate with exactly one verdict set call.",
+        "SHA is managed by the CLI — the reviewer never tracks, stores, or references it.",
+        "ALWAYS use `cargo run -p apm2-cli --` instead of bare `apm2`. The workspace binary contains the code under review; a globally installed binary may be stale and missing fields or fixes from the current PR.",
+        "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them."
       ]
     },
     "references": [
@@ -61,165 +66,112 @@
       {"path": "@documents/skills/rust-standards/references/03_compilation_pipeline.md", "purpose": "Macro expansion security, hidden unsafe, cfg-dependent code drift, dark code testing."},
       {"path": "@documents/skills/rust-standards/references/05_toolchain_cargo_build.md", "purpose": "Build-time code execution, supply chain injection, feature safety, reproducibility."},
       {"path": "@documents/skills/rust-standards/references/09_ownership_borrowing_model.md", "purpose": "Ownership authority, interior mutability protocols, reference invalidation, synchronization."},
-      {"path": "@documents/skills/rust-standards/references/11_lifetimes_variance_hrtb.md", "purpose": "Type variance, PhantomData correctness, auto-trait safety, dropck integrity."},
-      {"path": "@documents/skills/rust-standards/references/13_traits_generics_coherence.md", "purpose": "Trait coherence, blanket impl safety, auto-trait observability, downstream breakage."},
-      {"path": "@documents/skills/rust-standards/references/14_allocator_arena_pool_review.md", "purpose": "Allocator invariants: use-after-free, double-free, alignment, drop discipline, overflow."},
       {"path": "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md", "purpose": "Panic-as-DoS, panic safety for unsafe, unwind boundaries, cascading failures."},
-      {"path": "@documents/skills/rust-standards/references/17_layout_repr_drop.md", "purpose": "Layout contracts, repr safety, drop ordering, partial initialization, resource guards."},
-      {"path": "@documents/skills/rust-standards/references/25_api_design_stdlib_quality.md", "purpose": "API safety and misuse resistance, invariant clarity, hidden DoS vectors, allocation contracts."},
-      {"path": "@documents/skills/rust-standards/references/27_collections_allocation_models.md", "purpose": "Memory DoS prevention, use-after-realloc, size math overflow, bounded stores, iteration."},
-      {"path": "@documents/skills/rust-standards/references/29_unicode_text_graphemes.md", "purpose": "Text security: UTF-8 validity, confusable normalization, identifier confusion attacks."},
       {"path": "@documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md", "purpose": "Verification methodology and tool gates: Miri, Loom, Proptest, Kani for risk anchors."},
-      {"path": "@documents/skills/rust-standards/references/35_cfg_features_build_matrix.md", "purpose": "Dark code coverage, build matrix enforcement, feature-gated security gaps, fail-closed flags."},
-      {"path": "@documents/skills/rust-standards/references/38_ffi_and_abi.md", "purpose": "FFI safety, ABI unwinding boundaries, ownership transfer, pointer validity, safe wrappers."},
-      {"path": "@documents/skills/rust-standards/references/40_time_monotonicity_determinism.md", "purpose": "Monotonic clocks, ordering invariants, consensus safety, distributed timeout protocols."},
-      {"path": "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md", "purpose": "APM2 security contracts: typed IDs, secret redaction, state machines, atomic writes, identity boundaries, fail-closed defaults."}
+      {"path": "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md", "purpose": "APM2 security contracts: typed IDs, secret redaction, state machines, atomic writes, identity boundaries, fail-closed defaults."},
+      {"path": "@documents/skills/modes-of-reasoning/assets/79-adversarial-red-team.json", "purpose": "REQUIRED REASONING MODE: Attacker mindset — systematically discover exploitable weaknesses via attack trees and exploit paths."},
+      {"path": "@documents/skills/modes-of-reasoning/assets/36-assurance-case.json", "purpose": "REQUIRED REASONING MODE: Defender mindset — verify security claims are backed by traceable evidence, not just assertions."},
+      {"path": "@documents/skills/modes-of-reasoning/assets/40-mechanistic.json", "purpose": "REQUIRED REASONING MODE: Causal tracing — trace data flow through trust boundaries to identify where security invariants break."}
     ],
     "decision_tree": {
-      "entrypoint": "STEP_1_DISCOVERY",
+      "entrypoint": "STEP_1_PREPARE",
       "nodes": [
         {
-          "id": "STEP_1_DISCOVERY",
-          "purpose": "Discover FAC command surface and internalize all reference material before execution.",
+          "id": "STEP_1_PREPARE",
+          "purpose": "Discover the CLI surface and materialize local review inputs.",
           "steps": [
-            {
-              "action": "read_all_references",
-              "rule": "Read every file listed in the references[] section IN FULL. Do not summarize, skip, or skim — details matter. Each reference contains threat vectors, invariants, checklists, and anti-patterns that are load-bearing for security review accuracy. Incomplete internalization produces false negatives."
-            },
-            {
-              "action": "read_module_agents",
-              "rule": "For each crate/module touched by the PR diff, read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] whose violation constitutes a security finding."
-            },
-            {"action": "command", "run": "apm2 fac review --help"},
-            {"action": "command", "run": "apm2 fac review prepare --help"},
-            {"action": "command", "run": "apm2 fac review finding --help"},
-            {"action": "command", "run": "apm2 fac review findings --help"},
-            {"action": "command", "run": "apm2 fac review verdict --help"},
-            {"action": "command", "run": "apm2 fac review verdict set --help"}
-          ],
-          "next": "STEP_2_PREPARE_INPUTS"
-        },
-        {
-          "id": "STEP_2_PREPARE_INPUTS",
-          "purpose": "Prepare deterministic local review inputs for the current PR.",
-          "steps": [
+            {"action": "command", "run": "cargo run -p apm2-cli -- fac review prepare --help"},
+            {"action": "command", "run": "cargo run -p apm2-cli -- fac review finding --help"},
+            {"action": "command", "run": "cargo run -p apm2-cli -- fac review verdict set --help"},
             {
               "action": "command",
-              "run": "apm2 fac review prepare --json",
+              "run": "cargo run -p apm2-cli -- fac review prepare --json",
               "capture_as": "prepare_json"
             },
             {
               "action": "parse_json",
               "from": "prepare_json",
-              "extract": ["repo", "pr_number", "pr_url", "head_sha", "diff_path", "commit_history_path", "temp_dir"]
+              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content"]
             },
-            {"action": "Set headRefOid = head_sha. Set reviewed_sha = headRefOid."},
             {
-              "action": "stop_if",
-              "if": "diff_path is empty OR head_sha is empty",
-              "message": "STOP-NO-PREPARED-INPUTS: fac review prepare did not return required fields."
+              "action": "on_failure",
+              "if": "prepare command fails OR diff_path is empty",
+              "then": "Jump to STEP_4_VERDICT with verdict=deny reason='prepare failed: no review inputs available'"
             }
           ],
-          "next": "STEP_3_COLLECT_CONTEXT"
+          "next": "STEP_2_STUDY"
         },
         {
-          "id": "STEP_3_COLLECT_CONTEXT",
-          "purpose": "Collect security context for touched surfaces.",
+          "id": "STEP_2_STUDY",
+          "purpose": "Internalize all reference material and PR context before analysis.",
           "steps": [
-            {"action": "read_file", "path": "$diff_path"},
-            {"action": "read_file", "path": "$commit_history_path"},
             {
-              "action": "command",
-              "run": "rg --files -g 'AGENTS.md' crates/apm2-core crates/apm2-cli",
-              "capture_as": "module_agents_md"
+              "action": "read_all_references",
+              "rule": "Read every file listed in the references[] section IN FULL. Do not summarize, skip, or skim — details matter. Each reference contains threat vectors, invariants, checklists, and anti-patterns that are load-bearing for security review accuracy. Incomplete internalization produces false negatives."
             },
+            {"action": "use_captured", "from": "diff_content", "purpose": "Full PR diff from prepare output"},
+            {"action": "use_captured", "from": "commit_history_content", "purpose": "Commit history from prepare output"},
             {
-              "action": "selective_read",
-              "from": "module_agents_md",
-              "rule": "Read AGENTS.md files adjacent to modules touched by the diff."
+              "action": "read_module_agents",
+              "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] whose violation constitutes a security finding."
             },
             {
               "action": "selective_read",
               "rule": "Read additional RFC/ticket/security docs only when the diff references them or changes trust boundaries."
             }
           ],
-          "next": "STEP_4_ANALYZE"
+          "next": "STEP_3_ANALYZE_AND_EMIT"
         },
         {
-          "id": "STEP_4_ANALYZE",
-          "purpose": "Run threat-focused analysis on changed boundaries.",
-          "threat_axes": [
-            {"axis": "Authentication/Authorization", "focus": "Privilege checks, identity binding, allowlist integrity."},
-            {"axis": "Input/Protocol Validation", "focus": "Parser strictness, canonicalization, downgrade paths."},
-            {"axis": "Filesystem/Process Boundary", "focus": "Path traversal, command injection, unsafe temp-file handling."},
-            {"axis": "Network/IPC Boundary", "focus": "Untrusted payload handling, framing, denial-of-service vectors."},
-            {"axis": "Cryptographic / Integrity Surface", "focus": "Hash/signature usage, replay/drift exposure, deterministic verification."},
-            {"axis": "Concurrency / Resource Exhaustion", "focus": "Deadlock, race, starvation, unbounded memory/cpu growth."},
-            {"axis": "Policy and Gate Strictness", "focus": "Any strictness decrease in policy, gate, or provenance logic."},
-            {"axis": "Authority Lifecycle Continuity (PCAC/AJC)", "focus": "Authority-bearing handlers MUST enforce join -> revalidate -> consume -> effect with fail-closed deny paths and durable lifecycle evidence."}
-          ],
-          "next": "STEP_5_EMIT_FINDINGS"
+          "id": "STEP_3_ANALYZE_AND_EMIT",
+          "purpose": "Apply required reasoning modes to the diff, emit each finding immediately.",
+          "modes_of_reasoning": {
+            "instruction": "Apply ALL three modes below to every changed trust boundary, handler, and data flow in the diff. The rust-standards references encode the invariants — these modes tell you HOW to reason about them.",
+            "modes": [
+              {
+                "mode": "documents/skills/modes-of-reasoning/assets/79-adversarial-red-team.json",
+                "apply": "For each changed surface: enumerate attacker goals, build attack trees, trace exploit paths from untrusted input to privileged effect. Every trust boundary crossing in the diff gets an attack tree."
+              },
+              {
+                "mode": "documents/skills/modes-of-reasoning/assets/36-assurance-case.json",
+                "apply": "For each security claim implied by the code (e.g. 'HMAC prevents tampering', 'capacity cap prevents DoS'): decompose into sub-claims, verify each sub-claim has traceable evidence in the diff or existing code. Unsubstantiated claims are findings."
+              },
+              {
+                "mode": "documents/skills/modes-of-reasoning/assets/40-mechanistic.json",
+                "apply": "For each changed component: trace the causal chain from input through internal state to output/side-effect. Identify where invariants could break under novel conditions not covered by the happy path."
+              }
+            ]
+          },
+          "emit_rule": {
+            "action": "For each finding, classify severity (BLOCKER, MAJOR, MINOR, NIT) and call:",
+            "command": "cargo run -p apm2-cli -- fac review finding --type security --severity <severity> --summary \"<one-line>\" --risk \"<threat and exploit path>\" --impact \"<blast radius and consequences>\" --location \"<file:line or module>\" --body \"<detailed description and required remediation>\" --json",
+            "quality_rules": [
+              "Each finding MUST include: summary, risk (threat + exploit path), impact (blast radius), location, and body (remediation).",
+              "If a handler has authority-bearing side effects but lacks AJC lifecycle enforcement, emit a MAJOR finding.",
+              "For prior-round findings that are now resolved, emit with --severity NIT and note the resolution in --body."
+            ]
+          },
+          "tally": ["blocker_count", "major_count", "minor_count", "nit_count"],
+          "next": "STEP_4_VERDICT"
         },
         {
-          "id": "STEP_5_EMIT_FINDINGS",
-          "purpose": "Emit each finding as a structured record via FAC. Findings accumulate locally per PR/type/SHA.",
-          "steps": [
-            {
-              "action": "classify_findings",
-              "rule": "Classify each issue found during analysis by severity: BLOCKER, MAJOR, MINOR, NIT. Each finding MUST include a summary, risk description, impact assessment, and code location."
-            },
-            {
-              "action": "quality_rule",
-              "rule": "Each finding includes threat, exploit path, blast radius, and required remediation."
-            },
-            {
-              "action": "structural_rule",
-              "rule": "If a handler has authority-bearing side effects but lacks AJC lifecycle enforcement (join -> revalidate -> consume -> effect), emit a MAJOR finding."
-            },
-            {
-              "action": "emit_findings_loop",
-              "rule": "For each finding, call: apm2 fac review finding --type security --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"<one-line summary>\" --risk \"<threat and exploit path>\" --impact \"<blast radius and consequences>\" --location \"<file:line or module>\" --body \"<detailed description and required remediation>\" --json",
-              "note": "SHA is auto-derived from the current PR identity — do NOT pass --sha. Findings accumulate locally and are projected to GitHub when the verdict is set."
-            },
-            {
-              "action": "emit_waived",
-              "rule": "For prior-round findings that are now resolved, emit with --severity NIT and note the resolution in --body."
-            },
-            {
-              "action": "tally",
-              "output": ["blocker_count", "major_count", "minor_count", "nit_count"]
-            }
-          ],
-          "next": "STEP_6_SET_VERDICT"
-        },
-        {
-          "id": "STEP_6_SET_VERDICT",
-          "purpose": "Write SHA-bound verdict for security dimension. This also triggers concatenation of all accumulated findings into a single comment projected to GitHub (best effort).",
+          "id": "STEP_4_VERDICT",
+          "purpose": "Set the verdict. This is the ONLY exit point — every execution path MUST reach this step.",
           "decisions": [
             {
               "if": "blocker_count == 0 AND major_count == 0",
               "then": {
                 "action": "command",
-                "run": "apm2 fac review verdict set --dimension security --verdict approve --reason \"PASS for $head_sha\" --json"
+                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension security --verdict approve --reason \"PASS: no blocker or major findings\" --json"
               }
             },
             {
               "if": "blocker_count > 0 OR major_count > 0",
               "then": {
                 "action": "command",
-                "run": "apm2 fac review verdict set --dimension security --verdict deny --reason \"BLOCKER/MAJOR findings for $head_sha\" --json"
+                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension security --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\" --json"
               }
             }
-          ],
-          "note": "Verdict command removes prepared tmp review inputs by default. Use --keep-prepared-inputs only when debugging.",
-          "next": "STEP_7_VERIFY_AND_STOP"
-        },
-        {
-          "id": "STEP_7_VERIFY_AND_STOP",
-          "purpose": "Verify projection and end deterministically.",
-          "steps": [
-            {"action": "command", "run": "apm2 fac review findings --json"},
-            {"action": "output", "text": "DONE"}
           ],
           "stop": true
         }

@@ -45,6 +45,7 @@ pub struct RestartSummary {
     pub pr_number: u32,
     pub pr_url: String,
     pub head_sha: String,
+    pub refreshed_identity: bool,
     pub strategy: RestartStrategy,
     pub evidence_passed: Option<bool>,
     pub reviews_dispatched: Option<Vec<DispatchReviewResult>>,
@@ -56,21 +57,49 @@ struct PrContext {
     owner_repo: String,
     pr_number: u32,
     head_sha: String,
+    refreshed_identity: bool,
 }
 
-fn resolve_pr_context(repo: &str, pr: Option<u32>) -> Result<PrContext, String> {
+fn resolve_pr_context(
+    repo: &str,
+    pr: Option<u32>,
+    refresh_identity: bool,
+) -> Result<PrContext, String> {
     let (owner_repo, pr_number) = resolve_pr_target(repo, pr)?;
-    let head_sha = resolve_head_sha_for_restart(&owner_repo, pr_number)?;
+    let (head_sha, refreshed_identity) =
+        resolve_head_sha_for_restart(&owner_repo, pr_number, refresh_identity)?;
 
     Ok(PrContext {
         owner_repo,
         pr_number,
         head_sha,
+        refreshed_identity,
     })
 }
 
-fn resolve_head_sha_for_restart(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+fn resolve_head_sha_for_restart(
+    owner_repo: &str,
+    pr_number: u32,
+    refresh_identity: bool,
+) -> Result<(String, bool), String> {
     let head_sha = fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
+    let mut refreshed_identity = false;
+    if refresh_identity {
+        let should_refresh = match projection_store::load_pr_identity(owner_repo, pr_number)? {
+            Some(identity) => !identity.head_sha.eq_ignore_ascii_case(&head_sha),
+            None => true,
+        };
+        if should_refresh {
+            projection_store::save_identity_with_context(
+                owner_repo,
+                pr_number,
+                &head_sha,
+                "restart.refresh_identity",
+            )
+            .map_err(|err| format!("failed to refresh local projection identity: {err}"))?;
+            refreshed_identity = true;
+        }
+    }
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
         if !identity.head_sha.eq_ignore_ascii_case(&head_sha) {
@@ -81,7 +110,7 @@ fn resolve_head_sha_for_restart(owner_repo: &str, pr_number: u32) -> Result<Stri
         }
     }
     validate_expected_head_sha(&head_sha)?;
-    Ok(head_sha.to_ascii_lowercase())
+    Ok((head_sha.to_ascii_lowercase(), refreshed_identity))
 }
 
 fn receipt_approves_head(
@@ -131,7 +160,7 @@ fn execute_strategy(
         RestartStrategy::EvidenceRestart | RestartStrategy::FullRestart => {
             let workspace_root = resolve_worktree_for_sha(&ctx.head_sha)?;
 
-            let passed = run_evidence_gates_with_status(
+            let (passed, _) = run_evidence_gates_with_status(
                 &workspace_root,
                 &ctx.head_sha,
                 &ctx.owner_repo,
@@ -159,8 +188,14 @@ fn dispatch_reviews(
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
-pub fn run_restart(repo: &str, pr: Option<u32>, force: bool, json_output: bool) -> u8 {
-    match run_restart_inner(repo, pr, force) {
+pub fn run_restart(
+    repo: &str,
+    pr: Option<u32>,
+    force: bool,
+    refresh_identity: bool,
+    json_output: bool,
+) -> u8 {
+    match run_restart_inner(repo, pr, force, refresh_identity) {
         Ok(summary) => {
             if json_output {
                 println!(
@@ -172,6 +207,14 @@ pub fn run_restart(repo: &str, pr: Option<u32>, force: bool, json_output: bool) 
                 println!("  Repo:          {}", summary.repo);
                 println!("  PR:            #{}", summary.pr_number);
                 println!("  Head SHA:      {}", summary.head_sha);
+                println!(
+                    "  Identity Refreshed: {}",
+                    if summary.refreshed_identity {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                );
                 println!("  Strategy:      {}", summary.strategy.label());
                 if let Some(passed) = summary.evidence_passed {
                     println!("  Evidence:      {}", if passed { "PASS" } else { "FAIL" });
@@ -217,13 +260,21 @@ pub fn run_restart(repo: &str, pr: Option<u32>, force: bool, json_output: bool) 
     }
 }
 
-fn run_restart_inner(repo: &str, pr: Option<u32>, force: bool) -> Result<RestartSummary, String> {
-    let ctx = resolve_pr_context(repo, pr)?;
+fn run_restart_inner(
+    repo: &str,
+    pr: Option<u32>,
+    force: bool,
+    refresh_identity: bool,
+) -> Result<RestartSummary, String> {
+    let ctx = resolve_pr_context(repo, pr, refresh_identity)?;
 
     eprintln!(
         "fac restart: pr=#{} sha={} repo={}",
         ctx.pr_number, ctx.head_sha, ctx.owner_repo
     );
+    if ctx.refreshed_identity {
+        eprintln!("fac restart: local identity refreshed from authoritative PR head");
+    }
 
     let strategy =
         determine_restart_strategy(&ctx.owner_repo, ctx.pr_number, &ctx.head_sha, force)?;
@@ -240,6 +291,7 @@ fn run_restart_inner(repo: &str, pr: Option<u32>, force: bool) -> Result<Restart
         pr_number: ctx.pr_number,
         pr_url,
         head_sha: ctx.head_sha,
+        refreshed_identity: ctx.refreshed_identity,
         strategy,
         evidence_passed,
         reviews_dispatched,

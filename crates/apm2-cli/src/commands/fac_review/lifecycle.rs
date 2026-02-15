@@ -4,7 +4,7 @@
 //! reducer entrypoint for PR/SHA lifecycle transitions and agent lifecycle
 //! bookkeeping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -23,20 +23,17 @@ use serde_jcs;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::projection::fetch_pr_head_sha_authoritative;
-use super::target::resolve_pr_target;
 use super::types::{
-    TerminationAuthority, apm2_home_dir, ensure_parent_dir,
+    DISPATCH_PENDING_TTL, TerminationAuthority, apm2_home_dir, ensure_parent_dir,
     normalize_decision_dimension as normalize_verdict_dimension, now_iso8601, sanitize_for_path,
     validate_expected_head_sha,
 };
-use super::{dispatch, projection_store, state, verdict_projection};
+use super::{dispatch, findings_store, projection_store, state, verdict_projection};
 use crate::exit_codes::codes as exit_codes;
 
 const MACHINE_SCHEMA: &str = "apm2.fac.lifecycle_machine.v1";
 const PR_STATE_SCHEMA: &str = "apm2.fac.lifecycle_state.v1";
 const AGENT_REGISTRY_SCHEMA: &str = "apm2.fac.agent_registry.v1";
-const RECOVER_SUMMARY_SCHEMA: &str = "apm2.fac.recover_summary.v1";
 const MAX_EVENT_HISTORY: usize = 256;
 const MAX_ACTIVE_AGENTS_PER_PR: usize = 2;
 const MAX_REGISTRY_ENTRIES: usize = 4096;
@@ -44,6 +41,7 @@ const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
 const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_TOKEN_TTL_SECS: i64 = 3600;
+const NO_PID_ACTIVE_TTL_MULTIPLIER: u64 = 2;
 const PR_STATE_INTEGRITY_ROLE: &str = "pr_state";
 const REGISTRY_INTEGRITY_ROLE: &str = "agent_registry";
 const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
@@ -70,6 +68,7 @@ pub enum PrLifecycleState {
     VerdictApprove,
     VerdictDeny,
     MergeReady,
+    Merged,
     Stuck,
     Stale,
     Recovering,
@@ -90,6 +89,7 @@ impl PrLifecycleState {
             Self::VerdictApprove => "verdict_approve",
             Self::VerdictDeny => "verdict_deny",
             Self::MergeReady => "merge_ready",
+            Self::Merged => "merged",
             Self::Stuck => "stuck",
             Self::Stale => "stale",
             Self::Recovering => "recovering",
@@ -324,14 +324,45 @@ impl Default for AgentRegistry {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RecoverSummary {
-    schema: String,
+pub(super) struct BypassReapOutcome {
+    pub before_active_agents: usize,
+    pub after_active_agents: usize,
+    pub reaped_agents: usize,
+    pub auto_verdict_applied: usize,
+    pub auto_verdict_pending: usize,
+    pub auto_verdict_skipped_existing: usize,
+    pub auto_verdict_failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct BypassLifecycleResetOutcome {
+    pub before_state: String,
+    pub after_state: String,
+    pub previous_event_seq: u64,
+    pub current_event_seq: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AutoVerdictCandidate {
     owner_repo: String,
     pr_number: u32,
-    refreshed_identity: bool,
     head_sha: String,
-    reaped_agents: usize,
-    state: String,
+    review_type: String,
+    run_id: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ReapRegistryResult {
+    reaped: usize,
+    auto_verdict_candidates: Vec<AutoVerdictCandidate>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AutoVerdictOutcome {
+    applied: usize,
+    pending: usize,
+    skipped_existing: usize,
+    failed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -342,14 +373,36 @@ pub enum LifecycleEventKind {
     GatesPassed,
     GatesFailed,
     ReviewsDispatched,
-    ReviewerSpawned { review_type: String },
-    VerdictSet { dimension: String, decision: String },
-    AgentCrashed { agent_type: AgentType },
+    ReviewerSpawned {
+        review_type: String,
+    },
+    VerdictSet {
+        dimension: String,
+        decision: String,
+    },
+    VerdictAutoDerived {
+        dimension: String,
+        decision: String,
+        source: String,
+    },
+    MergeFailed {
+        reason: String,
+    },
+    Merged {
+        source: String,
+    },
+    AgentCrashed {
+        agent_type: AgentType,
+    },
     ShaDriftDetected,
     RecoverRequested,
     RecoverCompleted,
-    Quarantined { reason: String },
-    ProjectionFailed { reason: String },
+    Quarantined {
+        reason: String,
+    },
+    ProjectionFailed {
+        reason: String,
+    },
 }
 
 impl LifecycleEventKind {
@@ -362,6 +415,9 @@ impl LifecycleEventKind {
             Self::ReviewsDispatched => "reviews_dispatched",
             Self::ReviewerSpawned { .. } => "reviewer_spawned",
             Self::VerdictSet { .. } => "verdict_set",
+            Self::VerdictAutoDerived { .. } => "verdict_auto_derived",
+            Self::MergeFailed { .. } => "merge_failed",
+            Self::Merged { .. } => "merged",
             Self::AgentCrashed { .. } => "agent_crashed",
             Self::ShaDriftDetected => "sha_drift_detected",
             Self::RecoverRequested => "recover_requested",
@@ -705,7 +761,10 @@ fn verify_pr_lifecycle_record_integrity_without_rotation(
     state: &PrLifecycleRecord,
 ) -> Result<(), String> {
     let Some(stored) = state.integrity_hmac.as_deref() else {
-        return Ok(());
+        return Err(format!(
+            "missing lifecycle integrity_hmac for {} PR #{}",
+            state.owner_repo, state.pr_number
+        ));
     };
     let secret = read_secret_hex_bytes(&pr_state_secret_path(&state.owner_repo, state.pr_number)?)?
         .ok_or_else(|| {
@@ -740,7 +799,7 @@ fn bind_registry_integrity(registry: &mut AgentRegistry) -> Result<(), String> {
 
 fn verify_registry_integrity_without_rotation(registry: &AgentRegistry) -> Result<(), String> {
     let Some(stored) = registry.integrity_hmac.as_deref() else {
-        return Ok(());
+        return Err("missing agent registry integrity_hmac".to_string());
     };
     let secret = read_secret_hex_bytes(&registry_secret_path()?)?
         .ok_or_else(|| "missing agent registry integrity secret".to_string())?;
@@ -856,6 +915,43 @@ fn quarantine_pr_state(owner_repo: &str, pr_number: u32) -> Result<Option<PathBu
     fs::rename(&path, &quarantine).map_err(|err| {
         format!(
             "failed to quarantine lifecycle state {} -> {}: {err}",
+            path.display(),
+            quarantine.display()
+        )
+    })?;
+    Ok(Some(quarantine))
+}
+
+fn registry_quarantine_path() -> Result<PathBuf, String> {
+    let path = registry_path()?;
+    let state_parent = path
+        .parent()
+        .ok_or_else(|| format!("agent registry path has no parent: {}", path.display()))?
+        .join(".quarantine");
+    ensure_parent_dir(&state_parent.join("registry.quarantine"))?;
+    let stamp = Utc::now().timestamp_millis();
+    for attempt in 0..64 {
+        let candidate =
+            state_parent.join(format!("agent_registry.{stamp}.{attempt}.json.quarantine"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "failed to allocate agent registry quarantine path under {}",
+        state_parent.display()
+    ))
+}
+
+fn quarantine_registry() -> Result<Option<PathBuf>, String> {
+    let path = registry_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let quarantine = registry_quarantine_path()?;
+    fs::rename(&path, &quarantine).map_err(|err| {
+        format!(
+            "failed to quarantine agent registry {} -> {}: {err}",
             path.display(),
             quarantine.display()
         )
@@ -1038,10 +1134,9 @@ fn prune_registry_to_entry_limit(registry: &mut AgentRegistry) -> usize {
 }
 
 fn apply_registry_retention(registry: &mut AgentRegistry) {
-    let reaped = reap_registry_stale_entries(registry);
     let stale = prune_registry_stale_non_active_entries(registry);
     let excess = prune_registry_to_entry_limit(registry);
-    if reaped + stale + excess > 0 {
+    if stale + excess > 0 {
         registry.updated_at = now_iso8601();
     }
 }
@@ -1123,7 +1218,7 @@ pub fn load_pr_lifecycle_snapshot(
     }))
 }
 
-fn load_pr_state_for_recover(
+fn load_pr_state_bypass_hmac(
     owner_repo: &str,
     pr_number: u32,
     sha: &str,
@@ -1133,20 +1228,39 @@ fn load_pr_state_for_recover(
         let _ = quarantine_pr_state(owner_repo, pr_number);
         return new_pr_state(owner_repo, pr_number, sha);
     }
-    match load_pr_state_with_recovery(owner_repo, pr_number, sha, true) {
-        Ok(state) => Ok(state),
-        Err(err) => {
-            if is_pr_state_corruption_error(&err) {
-                if let Err(quarantine_err) = quarantine_pr_state(owner_repo, pr_number) {
-                    return Err(format!(
-                        "{err}; failed to quarantine corrupt state: {quarantine_err}"
-                    ));
-                }
-                return new_pr_state(owner_repo, pr_number, sha);
-            }
-            Err(err)
+
+    let path = pr_state_path(owner_repo, pr_number)?;
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return new_pr_state(owner_repo, pr_number, sha);
         },
+        Err(err) => {
+            return Err(format!(
+                "failed to read lifecycle state {}: {err}",
+                path.display()
+            ));
+        },
+    };
+
+    let Ok(mut parsed) = serde_json::from_slice::<PrLifecycleRecord>(&bytes) else {
+        let _ = quarantine_pr_state(owner_repo, pr_number);
+        return new_pr_state(owner_repo, pr_number, sha);
+    };
+
+    if parsed.schema != PR_STATE_SCHEMA {
+        let _ = quarantine_pr_state(owner_repo, pr_number);
+        return new_pr_state(owner_repo, pr_number, sha);
     }
+
+    parsed.owner_repo = owner_repo.to_ascii_lowercase();
+    parsed.pr_number = pr_number;
+    if validate_expected_head_sha(&parsed.current_sha).is_err() {
+        parsed.current_sha = sha.to_ascii_lowercase();
+    } else {
+        parsed.current_sha = parsed.current_sha.to_ascii_lowercase();
+    }
+    Ok(parsed)
 }
 
 fn save_pr_state(state: &PrLifecycleRecord) -> Result<PathBuf, String> {
@@ -1156,6 +1270,10 @@ fn save_pr_state(state: &PrLifecycleRecord) -> Result<PathBuf, String> {
     let path = pr_state_path(&record.owner_repo, record.pr_number)?;
     atomic_write_json(&path, &record)?;
     Ok(path)
+}
+
+fn save_pr_state_bypass_hmac(state: &PrLifecycleRecord) -> Result<PathBuf, String> {
+    save_pr_state(state)
 }
 
 fn load_registry() -> Result<AgentRegistry, String> {
@@ -1185,6 +1303,53 @@ fn load_registry() -> Result<AgentRegistry, String> {
     apply_registry_retention(&mut parsed);
     parsed.updated_at = now_iso8601();
     Ok(parsed)
+}
+
+fn load_registry_bypass_hmac(force: bool) -> Result<AgentRegistry, String> {
+    let path = registry_path()?;
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentRegistry::default());
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to read agent registry {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let mut parsed = match serde_json::from_slice::<AgentRegistry>(&bytes) {
+        Ok(value) => value,
+        Err(err) => {
+            if force {
+                let _ = quarantine_registry();
+                return Ok(AgentRegistry::default());
+            }
+            return Err(format!(
+                "failed to parse agent registry {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    if parsed.schema != AGENT_REGISTRY_SCHEMA {
+        if force {
+            let _ = quarantine_registry();
+            return Ok(AgentRegistry::default());
+        }
+        return Err(format!(
+            "unexpected agent registry schema {} at {}",
+            parsed.schema,
+            path.display()
+        ));
+    }
+    apply_registry_retention(&mut parsed);
+    parsed.updated_at = now_iso8601();
+    Ok(parsed)
+}
+
+fn save_registry_bypass_hmac(registry: &AgentRegistry) -> Result<PathBuf, String> {
+    save_registry(registry)
 }
 
 fn load_registry_without_integrity_mutation() -> Result<AgentRegistry, String> {
@@ -1362,6 +1527,14 @@ fn token_ttl() -> Duration {
     Duration::seconds(secs)
 }
 
+fn no_pid_active_ttl() -> Duration {
+    let secs = DISPATCH_PENDING_TTL
+        .as_secs()
+        .saturating_mul(NO_PID_ACTIVE_TTL_MULTIPLIER);
+    let capped = i64::try_from(secs).unwrap_or(i64::MAX);
+    Duration::seconds(capped)
+}
+
 fn reviewer_agent_type(review_state_type: &str) -> Option<AgentType> {
     match review_state_type {
         "security" => Some(AgentType::ReviewerSecurity),
@@ -1405,19 +1578,119 @@ fn tracked_agent_id(
 
 fn active_agents_for_pr(registry: &AgentRegistry, owner_repo: &str, pr_number: u32) -> usize {
     let owner_repo = owner_repo.to_ascii_lowercase();
+    let mut active_ids = BTreeSet::new();
     registry
         .entries
         .iter()
         .filter(|entry| entry.owner_repo.eq_ignore_ascii_case(&owner_repo))
         .filter(|entry| entry.pr_number == pr_number)
         .filter(|entry| entry.state.is_active())
+        .filter(|entry| active_ids.insert(entry.agent_id.clone()))
         .count()
 }
 
-fn reap_registry_stale_entries(registry: &mut AgentRegistry) -> usize {
-    let mut reaped = 0usize;
-    let stale_without_pid_after = token_ttl() * 2;
+const fn review_type_for_agent_type(agent_type: AgentType) -> Option<&'static str> {
+    match agent_type {
+        AgentType::ReviewerSecurity => Some("security"),
+        AgentType::ReviewerQuality => Some("quality"),
+        _ => None,
+    }
+}
+
+enum NoPidReconcileOutcome {
+    Hydrated,
+    Defer(&'static str),
+    Reap(&'static str),
+}
+
+enum NoPidAgeStatus {
+    NotExpired,
+    Expired,
+    InvalidStartedAt,
+}
+
+fn no_pid_age_status(entry: &TrackedAgent, stale_without_pid_after: Duration) -> NoPidAgeStatus {
+    let Some(started_at) = parse_utc(&entry.started_at) else {
+        return NoPidAgeStatus::InvalidStartedAt;
+    };
+    let Ok(elapsed) = Utc::now().signed_duration_since(started_at).to_std() else {
+        return NoPidAgeStatus::NotExpired;
+    };
+    if elapsed >= stale_without_pid_after.to_std().unwrap_or_default() {
+        NoPidAgeStatus::Expired
+    } else {
+        NoPidAgeStatus::NotExpired
+    }
+}
+
+fn reconcile_active_entry_with_run_state(entry: &mut TrackedAgent) -> NoPidReconcileOutcome {
+    let Some(review_type) = review_type_for_agent_type(entry.agent_type) else {
+        return NoPidReconcileOutcome::Defer("unsupported_agent_type");
+    };
+    let run_state = match state::load_review_run_state(entry.pr_number, review_type) {
+        Ok(state::ReviewRunStateLoad::Present(value)) => value,
+        Ok(state::ReviewRunStateLoad::Missing { .. }) => {
+            return NoPidReconcileOutcome::Defer("run_state_missing");
+        },
+        Ok(state::ReviewRunStateLoad::Corrupt { .. }) => {
+            return NoPidReconcileOutcome::Defer("run_state_corrupt");
+        },
+        Ok(state::ReviewRunStateLoad::Ambiguous { .. }) => {
+            return NoPidReconcileOutcome::Defer("run_state_ambiguous");
+        },
+        Err(_) => return NoPidReconcileOutcome::Defer("run_state_unavailable"),
+    };
+
+    if !run_state.owner_repo.eq_ignore_ascii_case(&entry.owner_repo) {
+        return NoPidReconcileOutcome::Reap("run_state_repo_mismatch");
+    }
+    if !run_state.head_sha.eq_ignore_ascii_case(&entry.sha) {
+        return NoPidReconcileOutcome::Reap("run_state_sha_mismatch");
+    }
+    if run_state.run_id != entry.run_id {
+        return NoPidReconcileOutcome::Reap("run_state_run_id_mismatch");
+    }
+    if run_state.status.is_terminal() {
+        return NoPidReconcileOutcome::Reap("run_state_terminal");
+    }
+
+    let Some(pid) = run_state.pid else {
+        return NoPidReconcileOutcome::Defer("run_state_pid_missing");
+    };
+    if !state::is_process_alive(pid) {
+        return NoPidReconcileOutcome::Reap("run_state_pid_not_alive");
+    }
+    if let Some(expected_start) = run_state.proc_start_time {
+        let observed = state::get_process_start_time(pid);
+        if observed.is_some_and(|value| value != expected_start) {
+            return NoPidReconcileOutcome::Reap("run_state_pid_reused");
+        }
+    }
+
+    entry.pid = Some(pid);
+    entry.proc_start_time = run_state.proc_start_time;
+    entry.state = TrackedAgentState::Running;
+    NoPidReconcileOutcome::Hydrated
+}
+
+fn reap_registry_stale_entries(registry: &mut AgentRegistry) -> ReapRegistryResult {
+    reap_registry_stale_entries_scoped(registry, None)
+}
+
+fn reap_registry_stale_entries_scoped(
+    registry: &mut AgentRegistry,
+    scope: Option<(&str, u32)>,
+) -> ReapRegistryResult {
+    let mut result = ReapRegistryResult::default();
+    let stale_without_pid_after = no_pid_active_ttl();
+    let normalized_scope = scope.map(|(repo, pr_number)| (repo.to_ascii_lowercase(), pr_number));
     for entry in &mut registry.entries {
+        if let Some((scope_repo, scope_pr_number)) = &normalized_scope
+            && (!entry.owner_repo.eq_ignore_ascii_case(scope_repo)
+                || entry.pr_number != *scope_pr_number)
+        {
+            continue;
+        }
         if !entry.state.is_active() {
             continue;
         }
@@ -1433,12 +1706,36 @@ fn reap_registry_stale_entries(registry: &mut AgentRegistry) -> usize {
                 }
             }
         } else {
-            let started_at = parse_utc(&entry.started_at);
-            if started_at
-                .and_then(|value| Utc::now().signed_duration_since(value).to_std().ok())
-                .is_some_and(|value| value >= stale_without_pid_after.to_std().unwrap_or_default())
-            {
-                reap_reason = Some("stale_without_pid");
+            let mut deferred_reap_reason = None;
+            if matches!(
+                entry.agent_type,
+                AgentType::ReviewerSecurity | AgentType::ReviewerQuality
+            ) {
+                match reconcile_active_entry_with_run_state(entry) {
+                    NoPidReconcileOutcome::Hydrated => {},
+                    NoPidReconcileOutcome::Defer(reason) => {
+                        deferred_reap_reason = Some(reason);
+                    },
+                    NoPidReconcileOutcome::Reap(reason) => {
+                        reap_reason = Some(reason);
+                    },
+                }
+            }
+            if entry.pid.is_some() {
+                continue;
+            }
+            if reap_reason.is_none() {
+                match no_pid_age_status(entry, stale_without_pid_after) {
+                    NoPidAgeStatus::NotExpired => {},
+                    NoPidAgeStatus::Expired => {
+                        reap_reason = Some(deferred_reap_reason.unwrap_or("stale_without_pid"));
+                    },
+                    NoPidAgeStatus::InvalidStartedAt => {
+                        reap_reason = Some(
+                            deferred_reap_reason.unwrap_or("stale_without_pid_invalid_started_at"),
+                        );
+                    },
+                }
             }
         }
 
@@ -1446,13 +1743,504 @@ fn reap_registry_stale_entries(registry: &mut AgentRegistry) -> usize {
             entry.state = TrackedAgentState::Reaped;
             entry.completed_at = Some(now_iso8601());
             entry.reap_reason = Some(reason.to_string());
-            reaped = reaped.saturating_add(1);
+            result.reaped = result.reaped.saturating_add(1);
+            if let Some(review_type) = review_type_for_agent_type(entry.agent_type) {
+                result.auto_verdict_candidates.push(AutoVerdictCandidate {
+                    owner_repo: entry.owner_repo.clone(),
+                    pr_number: entry.pr_number,
+                    head_sha: entry.sha.clone(),
+                    review_type: review_type.to_string(),
+                    run_id: entry.run_id.clone(),
+                });
+            }
         }
     }
-    if reaped > 0 {
+    if result.reaped > 0 {
         registry.updated_at = now_iso8601();
     }
-    reaped
+    result
+}
+
+enum AutoVerdictFinalizeResult {
+    Applied,
+    Pending,
+    SkippedExisting,
+}
+
+fn candidate_matches_current_pr_head(candidate: &AutoVerdictCandidate) -> Result<bool, String> {
+    let Some(snapshot) = load_pr_lifecycle_snapshot(&candidate.owner_repo, candidate.pr_number)?
+    else {
+        return Ok(true);
+    };
+    Ok(snapshot
+        .current_sha
+        .eq_ignore_ascii_case(&candidate.head_sha))
+}
+
+fn derive_auto_verdict_decision_from_findings(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    dimension: &str,
+) -> Result<Option<&'static str>, String> {
+    let Some(bundle) = findings_store::load_findings_bundle(owner_repo, pr_number, head_sha)?
+    else {
+        return Ok(None);
+    };
+    let Some(dimension_findings) = findings_store::find_dimension(&bundle, dimension) else {
+        return Ok(None);
+    };
+    if dimension_findings.findings.is_empty() {
+        return Ok(None);
+    }
+
+    let mut saw_major_or_blocker = false;
+    for finding in &dimension_findings.findings {
+        match finding.severity.trim().to_ascii_uppercase().as_str() {
+            "MINOR" | "NIT" => {},
+            // Fail closed for unknown severities.
+            _ => {
+                saw_major_or_blocker = true;
+                break;
+            },
+        }
+    }
+
+    if saw_major_or_blocker {
+        Ok(Some("deny"))
+    } else {
+        Ok(Some("approve"))
+    }
+}
+
+fn resolve_lifecycle_dimension(
+    projected_review_type: &str,
+    fallback_dimension: &str,
+) -> Result<String, String> {
+    match projected_review_type {
+        "quality" => Ok("code-quality".to_string()),
+        "security" => Ok("security".to_string()),
+        _ => Ok(normalize_verdict_dimension(fallback_dimension)?.to_string()),
+    }
+}
+
+fn git_run_checked(current_dir: &Path, args: &[&str]) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .map_err(|err| format!("failed to execute `git {}`: {err}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!(
+        "`git {}` failed: {}",
+        args.join(" "),
+        if stderr.is_empty() {
+            "unknown error"
+        } else {
+            &stderr
+        }
+    ))
+}
+
+fn git_stdout_checked(current_dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .map_err(|err| format!("failed to execute `git {}`: {err}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn resolve_main_worktree(reference_dir: &Path) -> Result<PathBuf, String> {
+    let listing = git_stdout_checked(reference_dir, &["worktree", "list", "--porcelain"])?;
+    if listing.trim().is_empty() {
+        return Ok(reference_dir.to_path_buf());
+    }
+
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+    let mut main_candidate: Option<PathBuf> = None;
+    for line in listing.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take())
+                && branch == "refs/heads/main"
+            {
+                main_candidate = Some(path);
+            }
+            current_path = Some(PathBuf::from(path));
+            continue;
+        }
+        if let Some(branch) = line.strip_prefix("branch ") {
+            current_branch = Some(branch.to_string());
+        }
+    }
+    if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take())
+        && branch == "refs/heads/main"
+    {
+        main_candidate = Some(path);
+    }
+    if let Some(path) = main_candidate {
+        return Ok(path);
+    }
+
+    let active_branch = git_stdout_checked(reference_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if active_branch == "main" {
+        return Ok(reference_dir.to_path_buf());
+    }
+    Err("could not locate a main worktree for auto-merge".to_string())
+}
+
+fn try_fast_forward_main(
+    current_dir: &Path,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<(), String> {
+    let main_worktree = resolve_main_worktree(current_dir)?;
+    let active_branch = git_stdout_checked(&main_worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if active_branch != "main" {
+        return Err(format!(
+            "auto-merge requires a main worktree, found active branch `{active_branch}` at {}",
+            main_worktree.display()
+        ));
+    }
+
+    let main_ref = "refs/heads/main";
+    let branch_ref = format!("refs/heads/{branch}");
+    git_run_checked(
+        &main_worktree,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/main^{commit}",
+        ],
+    )?;
+    let branch_verify = format!("{branch_ref}^{{commit}}");
+    let branch_head = git_stdout_checked(
+        &main_worktree,
+        &["rev-parse", "--verify", "--quiet", &branch_verify],
+    )?;
+    validate_expected_head_sha(&branch_head)?;
+    if !branch_head.eq_ignore_ascii_case(expected_sha) {
+        return Err(format!(
+            "auto-merge refused: branch `{branch}` head {branch_head} does not match lifecycle SHA {expected_sha}"
+        ));
+    }
+
+    let merge_base = Command::new("git")
+        .args(["merge-base", "--is-ancestor", main_ref, &branch_ref])
+        .current_dir(&main_worktree)
+        .output()
+        .map_err(|err| format!("failed to execute git merge-base: {err}"))?;
+    if !merge_base.status.success() {
+        if merge_base.status.code() == Some(1) {
+            return Err(format!(
+                "non-fast-forward merge required: main is not ancestor of `{branch}`"
+            ));
+        }
+        let stderr = String::from_utf8_lossy(&merge_base.stderr)
+            .trim()
+            .to_string();
+        return Err(format!(
+            "failed to validate fast-forward merge precondition: {}",
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
+        ));
+    }
+
+    git_run_checked(&main_worktree, &["merge", "--ff-only", &branch_ref])?;
+    Ok(())
+}
+
+fn maybe_cleanup_worktree_target(worktree: Option<&str>) {
+    let Some(worktree) = worktree else {
+        return;
+    };
+    let worktree_path = PathBuf::from(worktree);
+    let Ok(worktree_real) = std::fs::canonicalize(&worktree_path) else {
+        return;
+    };
+    let target = worktree_real.join("target");
+    if !target.exists() {
+        return;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if target.file_name().and_then(|name| name.to_str()) != Some("target") {
+        return;
+    }
+    if target.parent() != Some(worktree_real.as_path()) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&target);
+}
+
+/// Run auto-merge synchronously when the PR reaches `MergeReady`. Earlier
+/// versions spawned a background thread, but short-lived CLI processes
+/// (reviewer agents) exit immediately after verdict set, killing the thread
+/// before the merge completes. Running synchronously is safe — the caller
+/// is `finalize_projected_verdict` at the tail of verdict set, so a few
+/// seconds of git fast-forward latency does not block any upstream work.
+fn maybe_auto_merge_if_ready(record: &PrLifecycleRecord, source: &str) {
+    if record.pr_state != PrLifecycleState::MergeReady {
+        return;
+    }
+
+    maybe_auto_merge_if_ready_inner(record, source);
+}
+
+fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
+    let identity = match projection_store::load_pr_identity(&record.owner_repo, record.pr_number) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = apply_event(
+                &record.owner_repo,
+                record.pr_number,
+                &record.current_sha,
+                &LifecycleEventKind::MergeFailed {
+                    reason: format!("failed to load identity for auto-merge: {err}"),
+                },
+            );
+            return;
+        },
+    };
+    let Some(identity) = identity else {
+        let _ = apply_event(
+            &record.owner_repo,
+            record.pr_number,
+            &record.current_sha,
+            &LifecycleEventKind::MergeFailed {
+                reason: "missing identity for auto-merge".to_string(),
+            },
+        );
+        return;
+    };
+    let Some(branch) = identity
+        .branch
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        let _ = apply_event(
+            &record.owner_repo,
+            record.pr_number,
+            &record.current_sha,
+            &LifecycleEventKind::MergeFailed {
+                reason: "missing branch in identity for auto-merge".to_string(),
+            },
+        );
+        return;
+    };
+
+    let merge_dir = identity
+        .worktree
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let merge_result = try_fast_forward_main(&merge_dir, branch, &record.current_sha);
+    match merge_result {
+        Ok(()) => {
+            if let Err(err) = apply_event(
+                &record.owner_repo,
+                record.pr_number,
+                &record.current_sha,
+                &LifecycleEventKind::Merged {
+                    source: source.to_string(),
+                },
+            ) {
+                eprintln!(
+                    "WARNING: auto-merge succeeded but failed to persist merged lifecycle event for PR #{}: {err}",
+                    record.pr_number
+                );
+            }
+            maybe_cleanup_worktree_target(identity.worktree.as_deref());
+        },
+        Err(err) => {
+            if let Err(event_err) = apply_event(
+                &record.owner_repo,
+                record.pr_number,
+                &record.current_sha,
+                &LifecycleEventKind::MergeFailed {
+                    reason: err.clone(),
+                },
+            ) {
+                eprintln!(
+                    "WARNING: failed to persist merge_failed lifecycle event for PR #{}: {} (merge error: {err})",
+                    record.pr_number, event_err
+                );
+            }
+        },
+    }
+}
+
+fn finalize_projected_verdict(
+    projected: &verdict_projection::PersistedVerdictProjection,
+    fallback_dimension: &str,
+    run_id: &str,
+    auto_source: Option<&str>,
+) -> Result<(), String> {
+    let lifecycle_dimension =
+        resolve_lifecycle_dimension(&projected.review_state_type, fallback_dimension)?;
+    let reduced = apply_event(
+        &projected.owner_repo,
+        projected.pr_number,
+        &projected.head_sha,
+        &LifecycleEventKind::VerdictSet {
+            dimension: lifecycle_dimension.clone(),
+            decision: projected.decision.clone(),
+        },
+    )?;
+    if let Some(source) = auto_source {
+        apply_event(
+            &projected.owner_repo,
+            projected.pr_number,
+            &projected.head_sha,
+            &LifecycleEventKind::VerdictAutoDerived {
+                dimension: lifecycle_dimension,
+                decision: projected.decision.clone(),
+                source: source.to_string(),
+            },
+        )?;
+    }
+    maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
+
+    let authority = TerminationAuthority::new(
+        &projected.owner_repo,
+        projected.pr_number,
+        &projected.review_state_type,
+        &projected.head_sha,
+        run_id,
+        projected.decision_comment_id,
+        &projected.decision_author,
+        &now_iso8601(),
+        &projected.decision_signature,
+    );
+    let home = apm2_home_dir()?;
+    dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected.decision)?;
+    Ok(())
+}
+
+fn finalize_auto_verdict_candidate(
+    candidate: &AutoVerdictCandidate,
+) -> Result<AutoVerdictFinalizeResult, String> {
+    if !candidate_matches_current_pr_head(candidate)? {
+        return Ok(AutoVerdictFinalizeResult::Pending);
+    }
+
+    let dimension = normalize_verdict_dimension(&candidate.review_type)?.to_string();
+    let existing = verdict_projection::resolve_verdict_for_dimension(
+        &candidate.owner_repo,
+        candidate.pr_number,
+        &candidate.head_sha,
+        &dimension,
+    )?;
+    if existing.is_some() {
+        return Ok(AutoVerdictFinalizeResult::SkippedExisting);
+    }
+
+    let Some(decision) = derive_auto_verdict_decision_from_findings(
+        &candidate.owner_repo,
+        candidate.pr_number,
+        &candidate.head_sha,
+        &dimension,
+    )?
+    else {
+        return Ok(AutoVerdictFinalizeResult::Pending);
+    };
+
+    let projected = verdict_projection::persist_verdict_projection_local_only(
+        &candidate.owner_repo,
+        Some(candidate.pr_number),
+        Some(&candidate.head_sha),
+        &dimension,
+        decision,
+        Some("auto_derived_by_reaper_from_findings"),
+    )?;
+    finalize_projected_verdict(&projected, &dimension, &candidate.run_id, Some("reaper"))?;
+
+    Ok(AutoVerdictFinalizeResult::Applied)
+}
+
+fn finalize_auto_verdict_candidates(candidates: Vec<AutoVerdictCandidate>) -> AutoVerdictOutcome {
+    let mut outcome = AutoVerdictOutcome::default();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let key = format!(
+            "{}::{}::{}::{}",
+            candidate.owner_repo.to_ascii_lowercase(),
+            candidate.pr_number,
+            candidate.head_sha.to_ascii_lowercase(),
+            candidate.review_type.to_ascii_lowercase(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        match finalize_auto_verdict_candidate(&candidate) {
+            Ok(AutoVerdictFinalizeResult::Applied) => {
+                outcome.applied = outcome.applied.saturating_add(1);
+            },
+            Ok(AutoVerdictFinalizeResult::Pending) => {
+                outcome.pending = outcome.pending.saturating_add(1);
+            },
+            Ok(AutoVerdictFinalizeResult::SkippedExisting) => {
+                outcome.skipped_existing = outcome.skipped_existing.saturating_add(1);
+            },
+            Err(err) => {
+                outcome.failed = outcome.failed.saturating_add(1);
+                eprintln!(
+                    "WARNING: auto-verdict finalization failed for PR #{} repo={} type={} sha={}: {err}",
+                    candidate.pr_number,
+                    candidate.owner_repo,
+                    candidate.review_type,
+                    candidate.head_sha
+                );
+            },
+        }
+    }
+    outcome
+}
+
+fn enqueue_auto_verdict_candidates(candidates: Vec<AutoVerdictCandidate>, source: &'static str) {
+    if candidates.is_empty() {
+        return;
+    }
+    let queued = candidates.len();
+    std::thread::spawn(move || {
+        let outcome = finalize_auto_verdict_candidates(candidates);
+        if outcome.failed > 0 {
+            eprintln!(
+                "WARNING: reaper auto-verdict encountered {} errors in deferred worker ({source})",
+                outcome.failed
+            );
+        }
+    });
+    eprintln!(
+        "fac lifecycle: queued {queued} reaper auto-verdict candidate(s) for deferred processing ({source})",
+    );
 }
 
 fn normalize_verdict_decision(decision: &str) -> Result<&'static str, String> {
@@ -1484,6 +2272,7 @@ fn next_state_for_event(
             | S::VerdictApprove
             | S::VerdictDeny
             | S::MergeReady
+            | S::Merged
             | S::Stuck
             | S::Stale
             | S::Recovering => Ok(S::Pushed),
@@ -1538,12 +2327,14 @@ fn next_state_for_event(
             let _ = normalize_verdict_dimension(dimension)?;
             let normalized_decision = normalize_verdict_decision(decision)?;
             match state.pr_state {
-                S::ReviewsDispatched
+                S::GatesPassed
+                | S::ReviewsDispatched
                 | S::ReviewInProgress
                 | S::VerdictPending
                 | S::VerdictApprove
                 | S::VerdictDeny
-                | S::MergeReady => {
+                | S::MergeReady
+                | S::Stuck => {
                     if normalized_decision == "deny" {
                         return Ok(S::VerdictDeny);
                     }
@@ -1573,6 +2364,29 @@ fn next_state_for_event(
                     state.pr_state.as_str()
                 )),
             }
+        },
+        LifecycleEventKind::VerdictAutoDerived {
+            dimension,
+            decision,
+            ..
+        } => {
+            let _ = normalize_verdict_dimension(dimension)?;
+            let _ = normalize_verdict_decision(decision)?;
+            Ok(state.pr_state)
+        },
+        LifecycleEventKind::MergeFailed { .. } => match state.pr_state {
+            S::MergeReady | S::VerdictApprove | S::VerdictPending | S::Stuck => Ok(S::Stuck),
+            _ => Err(format!(
+                "illegal transition: {} + merge_failed",
+                state.pr_state.as_str()
+            )),
+        },
+        LifecycleEventKind::Merged { .. } => match state.pr_state {
+            S::MergeReady | S::Merged => Ok(S::Merged),
+            _ => Err(format!(
+                "illegal transition: {} + merged",
+                state.pr_state.as_str()
+            )),
         },
         LifecycleEventKind::AgentCrashed { .. } => Ok(S::Stuck),
         LifecycleEventKind::ShaDriftDetected => Ok(S::Stale),
@@ -1607,12 +2421,25 @@ fn event_detail(event: &LifecycleEventKind) -> serde_json::Value {
             "dimension": dimension,
             "decision": decision,
         }),
-        LifecycleEventKind::AgentCrashed { agent_type } => serde_json::json!({
-            "agent_type": agent_type.as_str(),
+        LifecycleEventKind::VerdictAutoDerived {
+            dimension,
+            decision,
+            source,
+        } => serde_json::json!({
+            "dimension": dimension,
+            "decision": decision,
+            "source": source,
         }),
-        LifecycleEventKind::Quarantined { reason }
+        LifecycleEventKind::MergeFailed { reason }
+        | LifecycleEventKind::Quarantined { reason }
         | LifecycleEventKind::ProjectionFailed { reason } => serde_json::json!({
             "reason": reason,
+        }),
+        LifecycleEventKind::Merged { source } => serde_json::json!({
+            "source": source,
+        }),
+        LifecycleEventKind::AgentCrashed { agent_type } => serde_json::json!({
+            "agent_type": agent_type.as_str(),
         }),
         _ => serde_json::json!({}),
     }
@@ -1624,13 +2451,16 @@ pub fn ensure_machine_artifact() -> Result<PathBuf, String> {
         return Ok(path);
     }
     let transitions = vec![
-        serde_json::json!({"from":"untracked|pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck|stale|recovering","event":"push_observed","to":"pushed"}),
+        serde_json::json!({"from":"untracked|pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|merged|stuck|stale|recovering","event":"push_observed","to":"pushed"}),
         serde_json::json!({"from":"pushed|gates_failed|recovering","event":"gates_started","to":"gates_running"}),
         serde_json::json!({"from":"gates_running","event":"gates_passed","to":"gates_passed"}),
         serde_json::json!({"from":"gates_running","event":"gates_failed","to":"gates_failed"}),
         serde_json::json!({"from":"gates_passed|reviews_dispatched|review_in_progress|verdict_pending","event":"reviews_dispatched","to":"reviews_dispatched"}),
         serde_json::json!({"from":"reviews_dispatched|review_in_progress|verdict_pending","event":"reviewer_spawned","to":"review_in_progress"}),
-        serde_json::json!({"from":"reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready","event":"verdict_set","to":"verdict_pending|verdict_deny|merge_ready"}),
+        serde_json::json!({"from":"gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready","event":"verdict_set","to":"verdict_pending|verdict_deny|merge_ready"}),
+        serde_json::json!({"from":"*","event":"verdict_auto_derived","to":"self"}),
+        serde_json::json!({"from":"merge_ready|verdict_approve|verdict_pending|stuck","event":"merge_failed","to":"stuck"}),
+        serde_json::json!({"from":"merge_ready|merged","event":"merged","to":"merged"}),
         serde_json::json!({"from":"*","event":"sha_drift_detected","to":"stale"}),
         serde_json::json!({"from":"stale|stuck|quarantined","event":"recover_requested","to":"recovering"}),
         serde_json::json!({"from":"recovering","event":"recover_completed","to":"pushed"}),
@@ -1643,7 +2473,7 @@ pub fn ensure_machine_artifact() -> Result<PathBuf, String> {
             "pr_lifecycle": [
                 "untracked","pushed","gates_running","gates_passed","gates_failed",
                 "reviews_dispatched","review_in_progress","verdict_pending",
-                "verdict_approve","verdict_deny","merge_ready",
+                "verdict_approve","verdict_deny","merge_ready","merged",
                 "stuck","stale","recovering","quarantined"
             ],
             "agent_lifecycle": [
@@ -1671,18 +2501,93 @@ pub fn apply_event(
     Ok(record)
 }
 
+fn reset_lifecycle_record_to_pushed(record: &mut PrLifecycleRecord, head_sha: &str) {
+    let previous_state = record.pr_state.as_str().to_string();
+    record.current_sha = head_sha.to_ascii_lowercase();
+    record.pr_state = PrLifecycleState::Pushed;
+    record.error_budget_used = 0;
+    record.retry_budget_remaining = default_retry_budget();
+    record.verdicts.clear();
+    record.append_event(
+        head_sha,
+        "recover_reset_lifecycle",
+        serde_json::json!({
+            "previous_state": previous_state,
+            "new_state": "pushed",
+            "source": "doctor_fix",
+        }),
+    );
+}
+
+pub(super) fn reap_stale_agents_for_pr_bypass_hmac(
+    owner_repo: &str,
+    pr_number: u32,
+    force: bool,
+) -> Result<BypassReapOutcome, String> {
+    let (before_active_agents, after_active_agents, reaped_agents, auto_candidates) = {
+        let _lock = acquire_registry_lock()?;
+        let mut registry = load_registry_bypass_hmac(force)?;
+        let before_active_agents = active_agents_for_pr(&registry, owner_repo, pr_number);
+        let reap_result =
+            reap_registry_stale_entries_scoped(&mut registry, Some((owner_repo, pr_number)));
+        save_registry_bypass_hmac(&registry)?;
+        let after_active_agents = active_agents_for_pr(&registry, owner_repo, pr_number);
+        (
+            before_active_agents,
+            after_active_agents,
+            reap_result.reaped,
+            reap_result.auto_verdict_candidates,
+        )
+    };
+
+    let auto_outcome = finalize_auto_verdict_candidates(auto_candidates);
+    Ok(BypassReapOutcome {
+        before_active_agents,
+        after_active_agents,
+        reaped_agents,
+        auto_verdict_applied: auto_outcome.applied,
+        auto_verdict_pending: auto_outcome.pending,
+        auto_verdict_skipped_existing: auto_outcome.skipped_existing,
+        auto_verdict_failed: auto_outcome.failed,
+    })
+}
+
+pub(super) fn reset_lifecycle_for_pr_bypass_hmac(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    force: bool,
+) -> Result<BypassLifecycleResetOutcome, String> {
+    validate_expected_head_sha(head_sha)?;
+    let _state_lock = acquire_pr_state_lock(owner_repo, pr_number)?;
+    let mut record = load_pr_state_bypass_hmac(owner_repo, pr_number, head_sha, force)?;
+    let before_state = record.pr_state.as_str().to_string();
+    let previous_event_seq = record.last_event_seq;
+    reset_lifecycle_record_to_pushed(&mut record, head_sha);
+    save_pr_state_bypass_hmac(&record)?;
+    Ok(BypassLifecycleResetOutcome {
+        before_state,
+        after_state: record.pr_state.as_str().to_string(),
+        previous_event_seq,
+        current_event_seq: record.last_event_seq,
+    })
+}
+
 pub fn enforce_pr_capacity(owner_repo: &str, pr_number: u32) -> Result<(), String> {
-    let _lock = acquire_registry_lock()?;
-    let mut registry = load_registry()?;
-    let _ = reap_registry_stale_entries(&mut registry);
-    let active = active_agents_for_pr(&registry, owner_repo, pr_number);
-    if active >= MAX_ACTIVE_AGENTS_PER_PR {
+    let (active, auto_verdict_candidates) = {
+        let _lock = acquire_registry_lock()?;
+        let mut registry = load_registry()?;
+        let reap_result = reap_registry_stale_entries(&mut registry);
+        let active = active_agents_for_pr(&registry, owner_repo, pr_number);
         save_registry(&registry)?;
+        (active, reap_result.auto_verdict_candidates)
+    };
+    enqueue_auto_verdict_candidates(auto_verdict_candidates, "enforce_pr_capacity");
+    if active >= MAX_ACTIVE_AGENTS_PER_PR {
         return Err(format!(
             "at_capacity: PR #{pr_number} already has {active} active agents (max={MAX_ACTIVE_AGENTS_PER_PR})"
         ));
     }
-    save_registry(&registry)?;
     Ok(())
 }
 
@@ -1700,47 +2605,128 @@ pub fn register_agent_spawn(
         return Err("cannot register agent spawn with empty run_id".to_string());
     }
 
-    let _lock = acquire_registry_lock()?;
-    let mut registry = load_registry()?;
-    let _ = reap_registry_stale_entries(&mut registry);
-    let active = active_agents_for_pr(&registry, owner_repo, pr_number);
-    if active >= MAX_ACTIVE_AGENTS_PER_PR {
-        save_registry(&registry)?;
-        return Err(format!(
-            "at_capacity: PR #{pr_number} already has {active} active agents (max={MAX_ACTIVE_AGENTS_PER_PR})"
-        ));
-    }
-
     let token = generate_completion_token();
-    let token_hash = token_hash(&token);
-    let expires_at = (Utc::now() + token_ttl()).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let agent_id = tracked_agent_id(owner_repo, pr_number, run_id, agent_type);
-    registry.entries.retain(|entry| entry.agent_id != agent_id);
-    registry.entries.push(TrackedAgent {
-        agent_id,
-        owner_repo: owner_repo.to_ascii_lowercase(),
-        pr_number,
-        sha: sha.to_ascii_lowercase(),
-        run_id: run_id.to_string(),
-        agent_type,
-        state: if pid.is_some() {
-            TrackedAgentState::Running
+    let mut capacity_error = None;
+    let auto_verdict_candidates = {
+        let _lock = acquire_registry_lock()?;
+        let mut registry = load_registry()?;
+        let reap_result = reap_registry_stale_entries(&mut registry);
+        let active = active_agents_for_pr(&registry, owner_repo, pr_number);
+        let auto_verdict_candidates = reap_result.auto_verdict_candidates;
+        if active >= MAX_ACTIVE_AGENTS_PER_PR {
+            save_registry(&registry)?;
+            capacity_error = Some(format!(
+                "at_capacity: PR #{pr_number} already has {active} active agents (max={MAX_ACTIVE_AGENTS_PER_PR})"
+            ));
         } else {
-            TrackedAgentState::Dispatched
-        },
-        started_at: now_iso8601(),
-        completed_at: None,
-        pid,
-        proc_start_time,
-        completion_token_hash: token_hash,
-        token_expires_at: expires_at,
-        completion_status: None,
-        completion_summary: None,
-        reap_reason: None,
-    });
-    registry.updated_at = now_iso8601();
-    save_registry(&registry)?;
+            let token_hash = token_hash(&token);
+            let expires_at =
+                (Utc::now() + token_ttl()).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let agent_id = tracked_agent_id(owner_repo, pr_number, run_id, agent_type);
+            registry.entries.retain(|entry| entry.agent_id != agent_id);
+            registry.entries.push(TrackedAgent {
+                agent_id,
+                owner_repo: owner_repo.to_ascii_lowercase(),
+                pr_number,
+                sha: sha.to_ascii_lowercase(),
+                run_id: run_id.to_string(),
+                agent_type,
+                state: if pid.is_some() {
+                    TrackedAgentState::Running
+                } else {
+                    TrackedAgentState::Dispatched
+                },
+                started_at: now_iso8601(),
+                completed_at: None,
+                pid,
+                proc_start_time,
+                completion_token_hash: token_hash,
+                token_expires_at: expires_at,
+                completion_status: None,
+                completion_summary: None,
+                reap_reason: None,
+            });
+            registry.updated_at = now_iso8601();
+            save_registry(&registry)?;
+        }
+        auto_verdict_candidates
+    };
+    enqueue_auto_verdict_candidates(auto_verdict_candidates, "register_agent_spawn");
+
+    if let Some(err) = capacity_error {
+        return Err(err);
+    }
     Ok(token)
+}
+
+pub(super) fn bind_reviewer_runtime(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: &str,
+    review_type: &str,
+    run_id: &str,
+    pid: u32,
+    proc_start_time: Option<u64>,
+) -> Result<(), String> {
+    validate_expected_head_sha(sha)?;
+    if run_id.trim().is_empty() {
+        return Err("cannot bind reviewer runtime with empty run_id".to_string());
+    }
+    let Some(agent_type) = reviewer_agent_type(review_type) else {
+        return Ok(());
+    };
+
+    let auto_verdict_candidates = {
+        let _lock = acquire_registry_lock()?;
+        let mut registry = load_registry()?;
+        let reap_result =
+            reap_registry_stale_entries_scoped(&mut registry, Some((owner_repo, pr_number)));
+        let agent_id = tracked_agent_id(owner_repo, pr_number, run_id, agent_type);
+        let mut found = false;
+        for entry in &mut registry.entries {
+            if entry.agent_id != agent_id {
+                continue;
+            }
+            entry.sha = sha.to_ascii_lowercase();
+            entry.state = TrackedAgentState::Running;
+            entry.pid = Some(pid);
+            entry.proc_start_time = proc_start_time.or_else(|| state::get_process_start_time(pid));
+            entry.completed_at = None;
+            entry.reap_reason = None;
+            found = true;
+            break;
+        }
+
+        if !found {
+            let token_hash = token_hash(&generate_completion_token());
+            let expires_at =
+                (Utc::now() + token_ttl()).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            registry.entries.push(TrackedAgent {
+                agent_id,
+                owner_repo: owner_repo.to_ascii_lowercase(),
+                pr_number,
+                sha: sha.to_ascii_lowercase(),
+                run_id: run_id.to_string(),
+                agent_type,
+                state: TrackedAgentState::Running,
+                started_at: now_iso8601(),
+                completed_at: None,
+                pid: Some(pid),
+                proc_start_time: proc_start_time.or_else(|| state::get_process_start_time(pid)),
+                completion_token_hash: token_hash,
+                token_expires_at: expires_at,
+                completion_status: None,
+                completion_summary: None,
+                reap_reason: None,
+            });
+        }
+
+        registry.updated_at = now_iso8601();
+        save_registry(&registry)?;
+        reap_result.auto_verdict_candidates
+    };
+    enqueue_auto_verdict_candidates(auto_verdict_candidates, "bind_reviewer_runtime");
+    Ok(())
 }
 
 fn mark_registered_agent_reaped(
@@ -1971,28 +2957,13 @@ fn run_verdict_set_inner(
         &projected.decision_signature,
     );
     let home = apm2_home_dir()?;
-    let projected_decision = projected.decision.clone();
     let caller_pid = current_process_id();
     let called_by_review_agent = termination_state
         .as_ref()
         .and_then(|state| state.pid)
         .is_some_and(|reviewer_pid| is_descendant_of_pid(caller_pid, reviewer_pid));
     let finalize_verdict = || -> Result<u8, String> {
-        let lifecycle_dimension = match projected.review_state_type.as_str() {
-            "quality" => "code-quality".to_string(),
-            "security" => "security".to_string(),
-            _ => normalize_verdict_dimension(dimension)?.to_string(),
-        };
-        apply_event(
-            &projected.owner_repo,
-            projected.pr_number,
-            &projected.head_sha,
-            &LifecycleEventKind::VerdictSet {
-                dimension: lifecycle_dimension,
-                decision: projected_decision.clone(),
-            },
-        )?;
-        dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected_decision)?;
+        finalize_projected_verdict(&projected, dimension, &run_id, None)?;
         Ok(exit_codes::SUCCESS)
     };
 
@@ -2068,120 +3039,40 @@ pub fn run_verdict_show(
     }
 }
 
-pub fn run_recover(
-    repo: &str,
-    pr_number: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-    json_output: bool,
-) -> u8 {
-    match run_recover_inner(repo, pr_number, force, refresh_identity) {
-        Ok(summary) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Recover");
-                println!("  Repo:              {}", summary.owner_repo);
-                println!("  PR:                #{}", summary.pr_number);
-                println!("  Head SHA:          {}", summary.head_sha);
-                println!("  Reaped Agents:     {}", summary.reaped_agents);
-                println!("  Refreshed Identity:{}", summary.refreshed_identity);
-                println!("  Lifecycle State:   {}", summary.state);
-            }
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_recover_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-fn run_recover_inner(
-    repo: &str,
-    pr_number: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-) -> Result<RecoverSummary, String> {
-    ensure_machine_artifact()?;
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
-    let head_sha = fetch_pr_head_sha_authoritative(&owner_repo, resolved_pr)?;
-    validate_expected_head_sha(&head_sha)?;
-
-    let _lock = acquire_registry_lock()?;
-    let mut registry = load_registry()?;
-    let reaped = reap_registry_stale_entries(&mut registry);
-    save_registry(&registry)?;
-
-    let mut reduced = load_pr_state_for_recover(&owner_repo, resolved_pr, &head_sha, force)?;
-    apply_event_to_record(
-        &mut reduced,
-        &head_sha,
-        &LifecycleEventKind::RecoverRequested,
-    )?;
-    save_pr_state(&reduced)?;
-    apply_event_to_record(
-        &mut reduced,
-        &head_sha,
-        &LifecycleEventKind::RecoverCompleted,
-    )?;
-    save_pr_state(&reduced)?;
-
-    if refresh_identity {
-        projection_store::save_identity_with_context(
-            &owner_repo,
-            resolved_pr,
-            &head_sha,
-            "recover",
-        )
-        .map_err(|err| format!("failed to refresh local projection identity: {err}"))?;
-    }
-
-    Ok(RecoverSummary {
-        schema: RECOVER_SUMMARY_SCHEMA.to_string(),
-        owner_repo,
-        pr_number: resolved_pr,
-        refreshed_identity: refresh_identity,
-        head_sha: head_sha.to_ascii_lowercase(),
-        reaped_agents: reaped,
-        state: reduced.pr_state.as_str().to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        AgentType, LifecycleEventKind, PrLifecycleState, TrackedAgentState, active_agents_for_pr,
-        apply_event, load_registry, register_agent_spawn, register_reviewer_dispatch, token_hash,
+        AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult, LifecycleEventKind,
+        PrLifecycleState, TrackedAgentState, acquire_registry_lock, active_agents_for_pr,
+        apply_event, bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
+        enforce_pr_capacity, finalize_auto_verdict_candidate, load_registry, register_agent_spawn,
+        register_reviewer_dispatch, save_registry, token_hash,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
+    use crate::commands::fac_review::state::{
+        get_process_start_time, load_review_run_completion_receipt, write_review_run_state,
+    };
+    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
+    use crate::commands::fac_review::verdict_projection::resolve_verdict_for_dimension;
 
     static UNIQUE_PR_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static RUN_PR_BASE: OnceLock<u32> = OnceLock::new();
 
     fn next_pr() -> u32 {
-        let seq = UNIQUE_PR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let entropy = now.subsec_nanos() ^ seq.rotate_left(13) ^ std::process::id();
-        1_000_000 + (entropy % 3_000_000_000)
+        let base = *RUN_PR_BASE.get_or_init(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let pid = u128::from(std::process::id());
+            let mixed = now ^ (pid << 32);
+            1_000_000u32 + ((mixed % 3_000_000_000u128) as u32)
+        });
+        base.saturating_add(UNIQUE_PR_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
     fn next_repo(tag: &str, pr: u32) -> String {
@@ -2220,6 +3111,112 @@ mod tests {
         )
         .expect("quality approve");
         assert_eq!(state.pr_state, PrLifecycleState::MergeReady);
+    }
+
+    #[test]
+    fn reducer_allows_verdict_set_from_gates_passed() {
+        let pr = next_pr();
+        let repo = next_repo("gates-passed-verdict", pr);
+        let sha = "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+
+        let verdict = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "deny".to_string(),
+            },
+        )
+        .expect("verdict from gates_passed");
+        assert_eq!(verdict.pr_state, PrLifecycleState::VerdictDeny);
+    }
+
+    #[test]
+    fn reducer_transitions_merge_ready_to_merged_on_merged_event() {
+        let pr = next_pr();
+        let repo = next_repo("merged-transition", pr);
+        let sha = "1111111111111111111111111111111111111111";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("dispatch");
+        let _ = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("security approve");
+        let _ = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "code-quality".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("quality approve");
+        let merged = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::Merged {
+                source: "test".to_string(),
+            },
+        )
+        .expect("merged");
+        assert_eq!(merged.pr_state, PrLifecycleState::Merged);
+    }
+
+    #[test]
+    fn merge_failed_event_moves_state_to_stuck() {
+        let pr = next_pr();
+        let repo = next_repo("merge-failed-transition", pr);
+        let sha = "1212121212121212121212121212121212121212";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("dispatch");
+        let _ = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("security approve");
+        let _ = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "code-quality".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("quality approve");
+        let stuck = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::MergeFailed {
+                reason: "non-fast-forward".to_string(),
+            },
+        )
+        .expect("merge_failed");
+        assert_eq!(stuck.pr_state, PrLifecycleState::Stuck);
     }
 
     #[test]
@@ -2318,6 +3315,350 @@ mod tests {
     }
 
     #[test]
+    fn at_capacity_ignores_duplicate_active_entries_for_same_agent_id() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-dedup", pr);
+        let sha = "2828282828282828282828282828282828282828";
+        let run_id = format!("pr{pr}-security-s1-28282828");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("first");
+
+        {
+            let _lock = acquire_registry_lock().expect("registry lock");
+            let mut registry = load_registry().expect("registry");
+            let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+            let duplicate = registry
+                .entries
+                .iter()
+                .find(|entry| entry.agent_id == entry_id)
+                .cloned()
+                .expect("existing entry to duplicate");
+            registry.entries.push(duplicate);
+            save_registry(&registry).expect("save duplicate");
+        }
+
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-quality-s2-28282828"),
+            AgentType::ReviewerQuality,
+            None,
+            None,
+        )
+        .expect("second unique slot should still be allowed");
+        let err = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-impl-s3-28282828"),
+            AgentType::Implementer,
+            None,
+            None,
+        )
+        .expect_err("third unique slot should fail");
+        assert!(err.contains("at_capacity"));
+    }
+
+    #[test]
+    fn register_agent_spawn_reaps_no_pid_entries_with_invalid_started_at() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-invalid-started-at", pr);
+        let sha = "2929292929292929292929292929292929292929";
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-impl-s1-29292929"),
+            AgentType::Implementer,
+            None,
+            None,
+        )
+        .expect("first");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-orchestrator-s2-29292929"),
+            AgentType::Orchestrator,
+            None,
+            None,
+        )
+        .expect("second");
+
+        {
+            let _lock = acquire_registry_lock().expect("registry lock");
+            let mut registry = load_registry().expect("registry");
+            for entry in &mut registry.entries {
+                if entry.owner_repo.eq_ignore_ascii_case(&repo)
+                    && entry.pr_number == pr
+                    && matches!(
+                        entry.state,
+                        TrackedAgentState::Dispatched | TrackedAgentState::Running
+                    )
+                {
+                    entry.started_at = "not-a-timestamp".to_string();
+                    entry.pid = None;
+                    entry.proc_start_time = None;
+                }
+            }
+            save_registry(&registry).expect("save invalid started_at");
+        }
+
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-gate-s3-29292929"),
+            AgentType::GateExecutor,
+            None,
+            None,
+        )
+        .expect("invalid started_at rows should be reaped before capacity check");
+
+        let registry = load_registry().expect("registry after reaping");
+        let reaped = registry
+            .entries
+            .iter()
+            .filter(|entry| entry.owner_repo.eq_ignore_ascii_case(&repo) && entry.pr_number == pr)
+            .filter(|entry| {
+                entry.state == TrackedAgentState::Reaped
+                    && entry.reap_reason.as_deref() == Some("stale_without_pid_invalid_started_at")
+            })
+            .count();
+        assert!(
+            reaped >= 2,
+            "expected invalid no-pid rows to be reaped, got {reaped}"
+        );
+    }
+
+    #[test]
+    fn enforce_pr_capacity_reaps_stale_no_pid_entries() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-reap-no-pid", pr);
+        let sha = "3333333333333333333333333333333333333333";
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-security-s1-33333333"),
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("first");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &format!("pr{pr}-quality-s2-33333333"),
+            AgentType::ReviewerQuality,
+            None,
+            None,
+        )
+        .expect("second");
+
+        {
+            let _lock = acquire_registry_lock().expect("registry lock");
+            let mut registry = load_registry().expect("registry");
+            let stale_started_at = "2000-01-01T00:00:00Z".to_string();
+            for entry in &mut registry.entries {
+                if entry.owner_repo.eq_ignore_ascii_case(&repo)
+                    && entry.pr_number == pr
+                    && matches!(
+                        entry.state,
+                        TrackedAgentState::Dispatched | TrackedAgentState::Running
+                    )
+                {
+                    entry.started_at = stale_started_at.clone();
+                    entry.pid = None;
+                    entry.proc_start_time = None;
+                }
+            }
+            save_registry(&registry).expect("save stale registry");
+        }
+
+        enforce_pr_capacity(&repo, pr).expect("stale no-pid entries should be reaped");
+
+        let registry = load_registry().expect("registry after reaping");
+        assert_eq!(active_agents_for_pr(&registry, &repo, pr), 0);
+        let reaped = registry
+            .entries
+            .iter()
+            .filter(|entry| entry.owner_repo.eq_ignore_ascii_case(&repo) && entry.pr_number == pr)
+            .filter(|entry| entry.state == TrackedAgentState::Reaped)
+            .count();
+        assert!(
+            reaped >= 2,
+            "expected stale reviewer entries to be reaped, got {reaped}"
+        );
+    }
+
+    #[test]
+    fn enforce_pr_capacity_hydrates_pid_from_run_state_for_no_pid_reviewer() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-hydrate-no-pid", pr);
+        let sha = "4444444444444444444444444444444444444444";
+        let run_id = format!("pr{pr}-security-s1-44444444");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let pid = child.id();
+        let proc_start_time = get_process_start_time(pid);
+        let run_state = ReviewRunState {
+            run_id: run_id.clone(),
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("test-model".to_string()),
+            backend_id: Some("test-backend".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(pid),
+            proc_start_time,
+            integrity_hmac: None,
+        };
+        write_review_run_state(&run_state).expect("write run-state");
+
+        enforce_pr_capacity(&repo, pr).expect("capacity check");
+
+        let registry = load_registry().expect("registry");
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("registry entry");
+        assert_eq!(entry.state, TrackedAgentState::Running);
+        assert_eq!(entry.pid, Some(pid));
+        assert_eq!(entry.proc_start_time, proc_start_time);
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn enforce_pr_capacity_reaps_no_pid_reviewer_when_run_state_is_terminal() {
+        let pr = next_pr();
+        let repo = next_repo("capacity-terminal-run-state", pr);
+        let sha = "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a";
+        let run_id = format!("pr{pr}-security-s1-4a4a4a4a");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerSecurity,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        let run_state = ReviewRunState {
+            run_id: run_id.clone(),
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            status: ReviewRunStatus::Done,
+            terminal_reason: Some("completed".to_string()),
+            model_id: Some("test-model".to_string()),
+            backend_id: Some("test-backend".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: None,
+            proc_start_time: None,
+            integrity_hmac: None,
+        };
+        write_review_run_state(&run_state).expect("write terminal run-state");
+
+        enforce_pr_capacity(&repo, pr).expect("capacity check");
+
+        let registry = load_registry().expect("registry");
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("registry entry");
+        assert_eq!(entry.state, TrackedAgentState::Reaped);
+        assert_eq!(entry.reap_reason.as_deref(), Some("run_state_terminal"));
+    }
+
+    #[test]
+    fn bind_reviewer_runtime_sets_running_pid_for_registered_slot() {
+        let pr = next_pr();
+        let repo = next_repo("bind-runtime", pr);
+        let sha = "5555555555555555555555555555555555555555";
+        let run_id = format!("pr{pr}-quality-s1-55555555");
+        let _ = register_agent_spawn(
+            &repo,
+            pr,
+            sha,
+            &run_id,
+            AgentType::ReviewerQuality,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let pid = child.id();
+        let proc_start_time = get_process_start_time(pid);
+
+        bind_reviewer_runtime(&repo, pr, sha, "quality", &run_id, pid, proc_start_time)
+            .expect("bind runtime");
+
+        let registry = load_registry().expect("registry");
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerQuality);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("registry entry");
+        assert_eq!(entry.state, TrackedAgentState::Running);
+        assert_eq!(entry.pid, Some(pid));
+        assert_eq!(entry.proc_start_time, proc_start_time);
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
     fn helper_functions_are_stable() {
         let id = tracked_agent_id("owner/repo", 99, "run-1", AgentType::Implementer);
         assert!(id.contains("owner/repo"));
@@ -2344,15 +3685,132 @@ mod tests {
         let registry = load_registry().expect("registry");
         assert_eq!(active_agents_for_pr(&registry, &repo, pr), 0);
         let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
-        let entry = registry
+        if let Some(entry) = registry
             .entries
             .iter()
             .find(|value| value.agent_id == entry_id)
-            .expect("spawned registry entry should exist for forensic audit");
-        assert_eq!(entry.state, TrackedAgentState::Reaped);
-        assert_eq!(
-            entry.reap_reason.as_deref(),
-            Some("rollback:lifecycle_reviews_dispatched_failed")
-        );
+        {
+            assert_eq!(entry.state, TrackedAgentState::Reaped);
+            assert_eq!(
+                entry.reap_reason.as_deref(),
+                Some("rollback:lifecycle_reviews_dispatched_failed")
+            );
+        }
+    }
+
+    #[test]
+    fn auto_verdict_derivation_uses_findings_severity_policy() {
+        let pr = next_pr();
+        let repo = next_repo("auto-verdict-derive", pr);
+        let sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+        let none =
+            derive_auto_verdict_decision_from_findings(&repo, pr, sha, "security").expect("none");
+        assert_eq!(none, None);
+
+        let _ = super::findings_store::append_dimension_finding(
+            &repo,
+            pr,
+            sha,
+            "security",
+            "major",
+            "major issue",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "test",
+        )
+        .expect("append major");
+        let deny =
+            derive_auto_verdict_decision_from_findings(&repo, pr, sha, "security").expect("deny");
+        assert_eq!(deny, Some("deny"));
+
+        let pr2 = next_pr();
+        let repo2 = next_repo("auto-verdict-derive-minor", pr2);
+        let _ = super::findings_store::append_dimension_finding(
+            &repo2,
+            pr2,
+            sha,
+            "security",
+            "minor",
+            "minor issue",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "test",
+        )
+        .expect("append minor");
+        let approve = derive_auto_verdict_decision_from_findings(&repo2, pr2, sha, "security")
+            .expect("approve");
+        assert_eq!(approve, Some("approve"));
+    }
+
+    #[test]
+    fn auto_verdict_finalization_persists_local_verdict_and_completion_receipt() {
+        let pr = next_pr();
+        let repo = next_repo("auto-verdict-finalize", pr);
+        let sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let run_id = format!("pr{pr}-security-s1-ffffffff");
+
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("dispatch");
+        let _ = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::ReviewerSpawned {
+                review_type: "security".to_string(),
+            },
+        )
+        .expect("spawned");
+
+        let _ = super::findings_store::append_dimension_finding(
+            &repo,
+            pr,
+            sha,
+            "security",
+            "major",
+            "major issue",
+            None,
+            None,
+            None,
+            None,
+            Some("reviewer"),
+            None,
+            "test",
+        )
+        .expect("append major");
+
+        let result = finalize_auto_verdict_candidate(&AutoVerdictCandidate {
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_type: "security".to_string(),
+            run_id: run_id.clone(),
+        })
+        .expect("auto finalize");
+        assert!(matches!(result, AutoVerdictFinalizeResult::Applied));
+
+        let verdict = resolve_verdict_for_dimension(&repo, pr, sha, "security")
+            .expect("resolve verdict")
+            .expect("verdict present");
+        assert_eq!(verdict, "FAIL");
+
+        let receipt = load_review_run_completion_receipt(pr, "security")
+            .expect("load completion receipt")
+            .expect("completion receipt exists");
+        assert_eq!(receipt.repo, repo);
+        assert_eq!(receipt.head_sha, sha);
+        assert_eq!(receipt.run_id, run_id);
+        assert_eq!(receipt.decision, "deny");
     }
 }

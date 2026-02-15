@@ -321,9 +321,9 @@
         {
           "id": "COMPAT-002",
           "title": "Legacy finding compatibility shim",
-          "severity": "MUST",
-          "description": "`apm2 fac review comment` MUST remain functional as an alias/shim for `apm2 fac review finding` during the migration window.",
-          "rationale": "Existing reviewer prompts reference `review comment`. They must not break until prompts are updated."
+          "severity": "MAY",
+          "description": "`apm2 fac review comment` MAY remain functional as a hidden alias/shim for `apm2 fac review finding`. Reviewer prompts have been migrated to `finding` as of v2.0.0 prompt schema.",
+          "rationale": "Migration complete. The shim exists for any remaining external callers but is not load-bearing."
         },
         {
           "id": "COMPAT-003",

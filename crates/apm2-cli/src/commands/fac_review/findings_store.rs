@@ -296,6 +296,32 @@ fn bind_findings_bundle_integrity(bundle: &mut FindingsBundle) -> Result<(), Str
     Ok(())
 }
 
+fn verify_findings_bundle_integrity_without_rotation(
+    bundle: &FindingsBundle,
+) -> Result<(), String> {
+    let Some(stored) = bundle.integrity_hmac.as_deref() else {
+        return Err(format!(
+            "missing findings bundle integrity_hmac for {} PR #{} sha {}",
+            bundle.owner_repo, bundle.pr_number, bundle.head_sha
+        ));
+    };
+    let secret =
+        read_secret_hex_bytes(&findings_secret_path(&bundle.owner_repo, bundle.pr_number)?)?
+            .ok_or_else(|| {
+                format!(
+                    "missing findings integrity secret for {} PR #{}",
+                    bundle.owner_repo, bundle.pr_number
+                )
+            })?;
+    let payload = findings_bundle_binding_payload(bundle)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    let matches = verify_hmac(stored, &computed)?;
+    if !matches {
+        return Err("findings bundle integrity check failed".to_string());
+    }
+    Ok(())
+}
+
 fn findings_lock_path(owner_repo: &str, pr_number: u32, head_sha: &str) -> Result<PathBuf, String> {
     let bundle_path = findings_bundle_path(owner_repo, pr_number, head_sha)?;
     let parent = bundle_path.parent().ok_or_else(|| {
@@ -352,7 +378,19 @@ pub(super) fn load_findings_bundle(
     let mut bundle = serde_json::from_slice::<FindingsBundle>(&bytes)
         .map_err(|err| format!("failed to parse findings bundle {}: {err}", path.display()))?;
     validate_loaded_bundle_identity(&bundle, owner_repo, pr_number, head_sha)?;
-    bind_findings_bundle_integrity(&mut bundle)?;
+
+    // One-time migration for pre-existing bundles that lack an HMAC.
+    // Bundles created before HMAC integrity was introduced have
+    // integrity_hmac == None. Rather than rejecting them (which would
+    // block auto-verdict derivation and verdict show for active PRs),
+    // compute the HMAC on first load and persist it atomically.
+    if bundle.integrity_hmac.is_none() {
+        bind_findings_bundle_integrity(&mut bundle)?;
+        write_json_atomic(&path, &bundle)?;
+    } else {
+        verify_findings_bundle_integrity_without_rotation(&bundle)?;
+    }
+
     Ok(Some(bundle))
 }
 
@@ -641,7 +679,8 @@ fn upsert_dimension<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        StoredFinding, allocate_finding_id, empty_bundle, validate_loaded_bundle_identity,
+        StoredFinding, allocate_finding_id, compute_hmac, empty_bundle,
+        findings_bundle_binding_payload, validate_loaded_bundle_identity, verify_hmac,
     };
 
     #[test]
@@ -680,5 +719,62 @@ mod tests {
         )
         .expect_err("pr mismatch should fail");
         assert!(err.contains("PR mismatch"));
+    }
+
+    /// Verifies that the HMAC migration path works: a bundle without an HMAC
+    /// can have one computed, and subsequent verification succeeds. This is the
+    /// core invariant for MAJOR-2 (pre-existing bundles migration).
+    #[test]
+    fn hmac_roundtrip_for_bundle_without_existing_hmac() {
+        let bundle = empty_bundle(
+            "guardian-intelligence/apm2",
+            482,
+            "0123456789abcdef0123456789abcdef01234567",
+            "test",
+        );
+        assert!(bundle.integrity_hmac.is_none(), "fresh bundle has no HMAC");
+
+        // Compute HMAC with a known secret.
+        let secret = vec![0xABu8; 32];
+        let payload = findings_bundle_binding_payload(&bundle).expect("binding payload");
+        let hmac = compute_hmac(&secret, &payload).expect("compute HMAC");
+
+        // Verification with the same secret and payload must succeed.
+        let verification_payload = findings_bundle_binding_payload(&bundle).expect("payload");
+        let recomputed = compute_hmac(&secret, &verification_payload).expect("recompute");
+        assert!(
+            verify_hmac(&hmac, &recomputed).expect("verify"),
+            "HMAC must verify for same bundle content"
+        );
+    }
+
+    /// Verifies that HMAC verification rejects tampered content.
+    #[test]
+    fn hmac_rejects_tampered_bundle() {
+        let bundle = empty_bundle(
+            "guardian-intelligence/apm2",
+            482,
+            "0123456789abcdef0123456789abcdef01234567",
+            "test",
+        );
+        let secret = vec![0xCDu8; 32];
+        let payload = findings_bundle_binding_payload(&bundle).expect("payload");
+        let hmac = compute_hmac(&secret, &payload).expect("compute HMAC");
+
+        // Tamper: create a different bundle.
+        let tampered = empty_bundle(
+            "guardian-intelligence/apm2",
+            999,
+            "0123456789abcdef0123456789abcdef01234567",
+            "test",
+        );
+        let tampered_payload =
+            findings_bundle_binding_payload(&tampered).expect("tampered payload");
+        let tampered_hmac = compute_hmac(&secret, &tampered_payload).expect("tampered HMAC");
+
+        assert!(
+            !verify_hmac(&hmac, &tampered_hmac).expect("cross-verify"),
+            "HMAC must reject tampered content"
+        );
     }
 }

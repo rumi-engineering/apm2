@@ -4,16 +4,24 @@
 //! PR management through `github_projection`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 use super::dispatch::dispatch_single_review;
-use super::evidence::{EvidenceGateResult, run_evidence_gates_with_status};
+use super::evidence::{EvidenceGateResult, run_evidence_gates, run_evidence_gates_with_status};
 use super::gate_cache::GateCache;
 use super::projection::{GateResult, sync_gate_status_to_pr};
-use super::types::{DispatchReviewResult, ReviewKind};
+use super::types::{
+    DispatchReviewResult, ReviewKind, apm2_home_dir, ensure_parent_dir, now_iso8601,
+    sanitize_for_path,
+};
 use super::{github_projection, lifecycle, projection_store, state};
 use crate::exit_codes::codes as exit_codes;
 
@@ -336,7 +344,7 @@ fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), 
     github_projection::update_pr(repo, pr_number, title, body)
 }
 
-/// Enable auto-merge (squash) on a PR.
+/// Enable auto-merge (merge commit) on a PR.
 fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
     github_projection::enable_auto_merge(repo, pr_number)
 }
@@ -374,7 +382,7 @@ fn run_blocking_evidence_gates(
     workspace_root: &Path,
     sha: &str,
     owner_repo: &str,
-    pr_number: u32,
+    pr_number: Option<u32>,
 ) -> Result<Vec<EvidenceGateResult>, String> {
     run_blocking_evidence_gates_with(
         workspace_root,
@@ -382,43 +390,31 @@ fn run_blocking_evidence_gates(
         owner_repo,
         pr_number,
         |workspace_root, sha, owner_repo, pr_number| {
-            run_evidence_gates_with_status(workspace_root, sha, owner_repo, pr_number, None)
+            pr_number.map_or_else(
+                || run_evidence_gates(workspace_root, sha, None, None),
+                |pr_number| {
+                    run_evidence_gates_with_status(workspace_root, sha, owner_repo, pr_number, None)
+                },
+            )
         },
-        GateCache::load,
     )
 }
 
-fn run_blocking_evidence_gates_with<F, G>(
+fn run_blocking_evidence_gates_with<F>(
     workspace_root: &Path,
     sha: &str,
     owner_repo: &str,
-    pr_number: u32,
+    pr_number: Option<u32>,
     mut run_with_status_fn: F,
-    mut load_cache_fn: G,
 ) -> Result<Vec<EvidenceGateResult>, String>
 where
-    F: FnMut(&Path, &str, &str, u32) -> Result<bool, String>,
-    G: FnMut(&str) -> Option<GateCache>,
+    F: FnMut(&Path, &str, &str, Option<u32>) -> Result<(bool, Vec<EvidenceGateResult>), String>,
 {
-    let passed = run_with_status_fn(workspace_root, sha, owner_repo, pr_number)?;
-    let mut gate_results = load_cache_fn(sha)
-        .map(|cache| {
-            let mut results = cache
-                .gates
-                .into_iter()
-                .map(|(gate_name, cached)| EvidenceGateResult {
-                    gate_name,
-                    passed: cached.status.eq_ignore_ascii_case("PASS"),
-                    duration_secs: cached.duration_secs,
-                })
-                .collect::<Vec<_>>();
-            results.sort_by(|lhs, rhs| lhs.gate_name.cmp(&rhs.gate_name));
-            results
-        })
-        .unwrap_or_default();
+    let (passed, mut gate_results) =
+        run_with_status_fn(workspace_root, sha, owner_repo, pr_number)?;
 
     if passed {
-        validate_cached_gate_results_for_pass(workspace_root, sha, &gate_results)?;
+        validate_gate_results_for_pass(workspace_root, sha, &gate_results)?;
         return Ok(gate_results);
     }
 
@@ -459,23 +455,17 @@ fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> 
     {
         expected.insert("test_safety_guard".to_string());
     }
-    if workspace_root
-        .join("scripts/ci/review_artifact_lint.sh")
-        .exists()
-    {
-        expected.insert("review_artifact_lint".to_string());
-    }
     expected
 }
 
-fn validate_cached_gate_results_for_pass(
+fn validate_gate_results_for_pass(
     workspace_root: &Path,
     sha: &str,
     gate_results: &[EvidenceGateResult],
 ) -> Result<(), String> {
     if gate_results.is_empty() {
         return Err(format!(
-            "evidence gates reported PASS for sha={sha} but no gate cache artifacts were found; refusing to project empty gate status"
+            "evidence gates reported PASS for sha={sha} but no gate result artifacts were found; refusing to project empty gate status"
         ));
     }
 
@@ -486,7 +476,7 @@ fn validate_cached_gate_results_for_pass(
         .collect::<Vec<_>>();
     if !failed_gates.is_empty() {
         return Err(format!(
-            "evidence gates reported PASS for sha={sha} but cached gate rows include FAIL verdicts: {}; refusing inconsistent gate projection",
+            "evidence gates reported PASS for sha={sha} but reported gate rows include FAIL verdicts: {}; refusing inconsistent gate projection",
             failed_gates.join(",")
         ));
     }
@@ -516,7 +506,7 @@ fn validate_cached_gate_results_for_pass(
             extra.join(",")
         };
         return Err(format!(
-            "evidence gate cache for sha={sha} does not match required gate set (missing={missing_summary}, extra={extra_summary}); refusing gate artifact reuse for push"
+            "evidence gate results for sha={sha} do not match required gate set (missing={missing_summary}, extra={extra_summary}); refusing gate projection"
         ));
     }
     Ok(())
@@ -627,6 +617,7 @@ fn retry_delay_or_fail(
     phase: &str,
     retry_class: PushRetryClass,
     err: &str,
+    emit_logs: bool,
 ) -> Result<Duration, String> {
     if !retry_class.is_retryable() {
         return Err(format!(
@@ -646,11 +637,13 @@ fn retry_delay_or_fail(
     }
 
     let delay = retry_backoff_delay(attempt);
-    eprintln!(
-        "WARNING: {phase} transient failure for {review_type} review (class={}, attempt {attempt}/{retry_budget}): {err}; retrying in {}ms",
-        retry_class.as_str(),
-        delay.as_millis()
-    );
+    if emit_logs {
+        eprintln!(
+            "WARNING: {phase} transient failure for {review_type} review (class={}, attempt {attempt}/{retry_budget}): {err}; retrying in {}ms",
+            retry_class.as_str(),
+            delay.as_millis()
+        );
+    }
     Ok(delay)
 }
 
@@ -660,6 +653,7 @@ fn dispatch_reviews_with<F, R>(
     sha: &str,
     mut dispatch_fn: F,
     mut register_dispatch_fn: R,
+    emit_logs: bool,
 ) -> Result<(), String>
 where
     F: FnMut(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
@@ -696,20 +690,23 @@ where
                         "dispatch",
                         retry_class,
                         &err,
+                        emit_logs,
                     )?;
                     thread::sleep(delay);
                     continue;
                 },
             };
 
-            eprintln!(
-                "fac push: dispatched {} review (mode={}{})",
-                result.review_type,
-                result.mode,
-                result
-                    .pid
-                    .map_or_else(String::new, |pid| format!(", pid={pid}")),
-            );
+            if emit_logs {
+                eprintln!(
+                    "fac push: dispatched {} review (mode={}{})",
+                    result.review_type,
+                    result.mode,
+                    result
+                        .pid
+                        .map_or_else(String::new, |pid| format!(", pid={pid}")),
+                );
+            }
 
             if result.mode.eq_ignore_ascii_case("joined") {
                 break result;
@@ -731,6 +728,7 @@ where
                     "dispatch_contract",
                     PushRetryClass::MissingRunIdTransient,
                     &err,
+                    emit_logs,
                 )?;
                 thread::sleep(delay);
                 continue;
@@ -758,9 +756,11 @@ where
                 dispatch_result.pid.and_then(state::get_process_start_time),
             ) {
                 Ok(Some(_)) => {
-                    eprintln!(
-                        "fac push: registered {review_type} reviewer slot for PR #{pr_number} sha {sha}",
-                    );
+                    if emit_logs {
+                        eprintln!(
+                            "fac push: registered {review_type} reviewer slot for PR #{pr_number} sha {sha}",
+                        );
+                    }
                     break;
                 },
                 Ok(None) => {
@@ -777,6 +777,7 @@ where
                         "lifecycle_registration",
                         retry_class,
                         &err,
+                        emit_logs,
                     )?;
                     thread::sleep(delay);
                 },
@@ -789,7 +790,348 @@ where
 
 // ── run_push entry point ─────────────────────────────────────────────────────
 
-pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
+#[derive(Debug, Clone, Serialize)]
+struct PushSummary {
+    schema: String,
+    repo: String,
+    remote: String,
+    branch: String,
+    pr_number: u32,
+    head_sha: String,
+    identity_persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_warning: Option<String>,
+}
+
+const PUSH_ATTEMPT_SCHEMA: &str = "apm2.fac.push_attempt.v1";
+const PUSH_STAGE_PASS: &str = "pass";
+const PUSH_STAGE_FAIL: &str = "fail";
+const PUSH_STAGE_SKIPPED: &str = "skipped";
+const ERROR_HINT_MAX_CHARS: usize = 200;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PushAttemptStage {
+    pub status: String,
+    pub duration_s: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PushAttemptRecord {
+    pub schema: String,
+    pub ts: String,
+    pub sha: String,
+    pub git_push: PushAttemptStage,
+    pub gate_fmt: PushAttemptStage,
+    pub gate_clippy: PushAttemptStage,
+    pub gate_test: PushAttemptStage,
+    pub gate_doc: PushAttemptStage,
+    pub pr_update: PushAttemptStage,
+    pub dispatch: PushAttemptStage,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PushAttemptFailedStage {
+    pub stage: String,
+    pub duration_s: u64,
+    pub exit_code: Option<i32>,
+    pub error_hint: Option<String>,
+}
+
+impl PushAttemptRecord {
+    fn new(sha: &str) -> Self {
+        Self {
+            schema: PUSH_ATTEMPT_SCHEMA.to_string(),
+            ts: now_iso8601(),
+            sha: sha.to_ascii_lowercase(),
+            git_push: skipped_stage(),
+            gate_fmt: skipped_stage(),
+            gate_clippy: skipped_stage(),
+            gate_test: skipped_stage(),
+            gate_doc: skipped_stage(),
+            pr_update: skipped_stage(),
+            dispatch: skipped_stage(),
+        }
+    }
+
+    fn stage_mut(&mut self, stage: &str) -> Option<&mut PushAttemptStage> {
+        match stage {
+            "git_push" => Some(&mut self.git_push),
+            "gate_fmt" => Some(&mut self.gate_fmt),
+            "gate_clippy" => Some(&mut self.gate_clippy),
+            "gate_test" => Some(&mut self.gate_test),
+            "gate_doc" => Some(&mut self.gate_doc),
+            "pr_update" => Some(&mut self.pr_update),
+            "dispatch" => Some(&mut self.dispatch),
+            _ => None,
+        }
+    }
+
+    fn set_stage_pass(&mut self, stage: &str, duration_s: u64) {
+        if let Some(slot) = self.stage_mut(stage) {
+            *slot = PushAttemptStage {
+                status: PUSH_STAGE_PASS.to_string(),
+                duration_s,
+                exit_code: None,
+                error_hint: None,
+            };
+        }
+    }
+
+    fn set_stage_fail(
+        &mut self,
+        stage: &str,
+        duration_s: u64,
+        exit_code: Option<i32>,
+        error_hint: Option<String>,
+    ) {
+        if let Some(slot) = self.stage_mut(stage) {
+            *slot = PushAttemptStage {
+                status: PUSH_STAGE_FAIL.to_string(),
+                duration_s,
+                exit_code,
+                error_hint,
+            };
+        }
+    }
+
+    pub(super) fn first_failed_stage(&self) -> Option<PushAttemptFailedStage> {
+        for (stage, details) in [
+            ("git_push", &self.git_push),
+            ("gate_fmt", &self.gate_fmt),
+            ("gate_clippy", &self.gate_clippy),
+            ("gate_test", &self.gate_test),
+            ("gate_doc", &self.gate_doc),
+            ("pr_update", &self.pr_update),
+            ("dispatch", &self.dispatch),
+        ] {
+            if details.status == PUSH_STAGE_FAIL {
+                return Some(PushAttemptFailedStage {
+                    stage: stage.to_string(),
+                    duration_s: details.duration_s,
+                    exit_code: details.exit_code,
+                    error_hint: details.error_hint.clone(),
+                });
+            }
+        }
+        None
+    }
+}
+
+fn skipped_stage() -> PushAttemptStage {
+    PushAttemptStage {
+        status: PUSH_STAGE_SKIPPED.to_string(),
+        duration_s: 0,
+        exit_code: None,
+        error_hint: None,
+    }
+}
+
+fn push_attempts_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?
+        .join("fac_projection")
+        .join("repos")
+        .join(sanitize_for_path(owner_repo))
+        .join("push_attempts")
+        .join(format!("{pr_number}.ndjson")))
+}
+
+fn push_attempts_lock_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?
+        .join("fac_projection")
+        .join("repos")
+        .join(sanitize_for_path(owner_repo))
+        .join("push_attempts")
+        .join(format!("{pr_number}.lock")))
+}
+
+fn append_push_attempt_record(
+    owner_repo: &str,
+    pr_number: u32,
+    record: &PushAttemptRecord,
+) -> Result<(), String> {
+    let path = push_attempts_path(owner_repo, pr_number)?;
+    let lock_path = push_attempts_lock_path(owner_repo, pr_number)?;
+    ensure_parent_dir(&path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open push attempt lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "failed to lock push attempt log {}: {err}",
+            lock_path.display()
+        )
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("failed to open push attempt log {}: {err}", path.display()))?;
+    let line = serde_json::to_string(record)
+        .map_err(|err| format!("failed to serialize push attempt record: {err}"))?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        format!(
+            "failed to write push attempt record {}: {err}",
+            path.display()
+        )
+    })?;
+    file.write_all(b"\n").map_err(|err| {
+        format!(
+            "failed to write push attempt newline {}: {err}",
+            path.display()
+        )
+    })?;
+    file.flush().map_err(|err| {
+        format!(
+            "failed to flush push attempt record {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub(super) fn load_latest_push_attempt_for_sha(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: &str,
+) -> Result<Option<PushAttemptRecord>, String> {
+    let path = push_attempts_path(owner_repo, pr_number)?;
+    let lock_path = push_attempts_lock_path(owner_repo, pr_number)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open push attempt lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    FileExt::lock_shared(&lock_file).map_err(|err| {
+        format!(
+            "failed to lock push attempt log {}: {err}",
+            lock_path.display()
+        )
+    })?;
+    let file = std::fs::File::open(&path)
+        .map_err(|err| format!("failed to open push attempt log {}: {err}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut latest = None;
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|err| {
+            format!(
+                "failed to read line from push attempt log {}: {err}",
+                path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<PushAttemptRecord>(&line).map_err(|err| {
+            format!(
+                "failed to parse line {} in push attempt log {}: {err}",
+                line_number + 1,
+                path.display()
+            )
+        })?;
+        if !record.sha.eq_ignore_ascii_case(sha) {
+            continue;
+        }
+        latest = Some(record);
+    }
+    Ok(latest)
+}
+
+fn stage_from_gate_name(gate_name: &str) -> &'static str {
+    match gate_name {
+        "rustfmt" => "gate_fmt",
+        "clippy" => "gate_clippy",
+        "doc" => "gate_doc",
+        // Collapse all non-fmt/clippy/doc gates into test stage in the fixed
+        // push-attempt schema.
+        _ => "gate_test",
+    }
+}
+
+fn normalize_error_hint(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut hint = trimmed
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+    if hint.chars().count() > ERROR_HINT_MAX_CHARS {
+        hint = hint.chars().take(ERROR_HINT_MAX_CHARS).collect();
+    }
+    Some(hint)
+}
+
+fn gate_log_path(gate_name: &str) -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?
+        .join("private/fac/evidence")
+        .join(format!("{gate_name}.log")))
+}
+
+fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
+    let path = gate_log_path(gate_name).ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    normalize_error_hint(&content)
+}
+
+pub fn run_push(
+    repo: &str,
+    remote: &str,
+    branch: Option<&str>,
+    ticket: Option<&Path>,
+    json_output: bool,
+) -> u8 {
+    macro_rules! emit_machine_error {
+        ($error:expr, $message:expr) => {{
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": $error,
+                    "message": $message,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+                        "{\"error\":\"serialization_failure\"}".to_string()
+                    })
+                );
+            }
+        }};
+    }
+
+    macro_rules! human_log {
+        ($($arg:tt)*) => {{
+            if !json_output {
+                eprintln!($($arg)*);
+            }
+        }};
+    }
+
     // Resolve branch name.
     let branch = if let Some(b) = branch {
         b.to_string()
@@ -800,7 +1142,9 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         match output {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => {
-                eprintln!("ERROR: failed to resolve current branch");
+                let message = "failed to resolve current branch";
+                human_log!("ERROR: {message}");
+                emit_machine_error!("fac_push_branch_resolution_failed", message);
                 return exit_codes::GENERIC_ERROR;
             },
         }
@@ -810,33 +1154,84 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
     let sha = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => {
-            eprintln!("ERROR: failed to resolve HEAD SHA");
+            let message = "failed to resolve HEAD SHA";
+            human_log!("ERROR: {message}");
+            emit_machine_error!("fac_push_head_resolution_failed", message);
             return exit_codes::GENERIC_ERROR;
         },
     };
 
-    eprintln!("fac push: sha={sha} branch={branch}");
+    human_log!("fac push: sha={sha} branch={branch}");
+    let mut attempt = PushAttemptRecord::new(&sha);
+    let mut attempt_pr_number = find_existing_pr(repo, &branch);
+
+    macro_rules! finish_with_attempt {
+        ($code:expr) => {{
+            if let Err(err) = append_push_attempt_record(repo, attempt_pr_number, &attempt) {
+                human_log!("WARNING: failed to append push attempt log: {err}");
+            }
+            if json_output && $code != exit_codes::SUCCESS {
+                let payload = serde_json::json!({
+                    "error": "fac_push_failed",
+                    "message": "fac push failed",
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+                        "{\"error\":\"serialization_failure\"}".to_string()
+                    })
+                );
+            }
+            return $code;
+        }};
+        ($code:expr, $error:expr, $message:expr) => {{
+            if let Err(err) = append_push_attempt_record(repo, attempt_pr_number, &attempt) {
+                human_log!("WARNING: failed to append push attempt log: {err}");
+            }
+            if json_output && $code != exit_codes::SUCCESS {
+                let payload = serde_json::json!({
+                    "error": $error,
+                    "message": $message,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+                        "{\"error\":\"serialization_failure\"}".to_string()
+                    })
+                );
+            }
+            return $code;
+        }};
+    }
+
+    macro_rules! fail_with_attempt {
+        ($error_code:expr, $message:expr) => {{
+            let message = $message;
+            human_log!("ERROR: {}", message);
+            finish_with_attempt!(exit_codes::GENERIC_ERROR, $error_code, message);
+        }};
+    }
 
     // Resolve metadata deterministically from TCK identity.
     let worktree_dir = match std::env::current_dir() {
         Ok(path) => path,
         Err(err) => {
-            eprintln!("ERROR: failed to resolve current worktree path: {err}");
-            return exit_codes::GENERIC_ERROR;
+            fail_with_attempt!(
+                "fac_push_worktree_resolution_failed",
+                format!("failed to resolve current worktree path: {err}")
+            );
         },
     };
     let repo_root = match resolve_repo_root() {
         Ok(path) => path,
         Err(err) => {
-            eprintln!("ERROR: {err}");
-            return exit_codes::GENERIC_ERROR;
+            fail_with_attempt!("fac_push_repo_root_resolution_failed", err);
         },
     };
     let commit_history = match collect_commit_history(remote, &branch) {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("ERROR: {err}");
-            return exit_codes::GENERIC_ERROR;
+            fail_with_attempt!("fac_push_commit_history_failed", err);
         },
     };
 
@@ -844,72 +1239,201 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         match resolve_pr_metadata(&branch, &worktree_dir, &repo_root, &commit_history, ticket) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("ERROR: {err}");
-                eprintln!(
-                    "ERROR: expected ticket file under documents/work/tickets/TCK-xxxxx.yaml"
+                fail_with_attempt!(
+                    "fac_push_ticket_resolution_failed",
+                    format!(
+                        "{err}; expected ticket file under documents/work/tickets/TCK-xxxxx.yaml"
+                    )
                 );
-                return exit_codes::GENERIC_ERROR;
             },
         };
-    eprintln!(
+    human_log!(
         "fac push: metadata title={} body={}",
         metadata.title,
         metadata.ticket_path.display()
     );
 
     // Step 1: git push (always force; local branch truth is authoritative).
+    let git_push_started = Instant::now();
     let push_output = Command::new("git")
         .args(["push", "--force", remote, &branch])
         .output();
     match push_output {
         Ok(o) if o.status.success() => {
-            eprintln!("fac push: git push --force succeeded");
+            attempt.set_stage_pass("git_push", git_push_started.elapsed().as_secs());
+            human_log!("fac push: git push --force succeeded");
         },
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!("ERROR: git push --force failed: {stderr}");
-            return exit_codes::GENERIC_ERROR;
+            attempt.set_stage_fail(
+                "git_push",
+                git_push_started.elapsed().as_secs(),
+                o.status.code(),
+                normalize_error_hint(&stderr),
+            );
+            fail_with_attempt!(
+                "fac_push_git_push_failed",
+                format!("git push --force failed: {stderr}")
+            );
         },
         Err(e) => {
-            eprintln!("ERROR: failed to execute git push --force: {e}");
-            return exit_codes::GENERIC_ERROR;
+            attempt.set_stage_fail(
+                "git_push",
+                git_push_started.elapsed().as_secs(),
+                None,
+                normalize_error_hint(&e.to_string()),
+            );
+            fail_with_attempt!(
+                "fac_push_git_push_exec_failed",
+                format!("failed to execute git push --force: {e}")
+            );
         },
     }
 
-    // Step 2: create or update PR (projection best-effort; local truth remains
-    // authoritative).
+    // Step 2: run evidence gates synchronously with cache-aware status path.
+    let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => {
+            fail_with_attempt!(
+                "fac_push_head_reresolution_failed",
+                "failed to re-resolve HEAD SHA before gates"
+            );
+        },
+    };
+    if !current_head.eq_ignore_ascii_case(&sha) {
+        fail_with_attempt!(
+            "fac_push_head_drift_detected",
+            format!(
+                "HEAD drift detected before gate execution (captured={sha}, current={current_head}); refusing mixed-SHA gate run"
+            )
+        );
+    }
+
+    let existing_pr_number = find_existing_pr(repo, &branch);
+    attempt_pr_number = existing_pr_number;
+    human_log!("fac push: running evidence gates (blocking, cache-aware)");
+    let gates_started = Instant::now();
+    let gate_results = match run_blocking_evidence_gates(
+        &worktree_dir,
+        &sha,
+        repo,
+        (existing_pr_number > 0).then_some(existing_pr_number),
+    ) {
+        Ok(results) => {
+            for gate in &results {
+                let stage = stage_from_gate_name(&gate.gate_name);
+                if gate.passed {
+                    attempt.set_stage_pass(stage, gate.duration_secs);
+                } else {
+                    let hint = latest_gate_error_hint(&gate.gate_name).or_else(|| {
+                        normalize_error_hint(&format!("gate {} failed", gate.gate_name))
+                    });
+                    attempt.set_stage_fail(stage, gate.duration_secs, None, hint);
+                }
+            }
+            results
+        },
+        Err(err) => {
+            let mut mapped_any = false;
+            if let Some(cache) = GateCache::load(&sha) {
+                for (gate_name, gate_result) in cache.gates {
+                    let stage = stage_from_gate_name(&gate_name);
+                    mapped_any = true;
+                    if gate_result.status.eq_ignore_ascii_case("PASS") {
+                        attempt.set_stage_pass(stage, gate_result.duration_secs);
+                    } else {
+                        let hint = latest_gate_error_hint(&gate_name)
+                            .or_else(|| normalize_error_hint(&format!("gate {gate_name} failed")));
+                        attempt.set_stage_fail(stage, gate_result.duration_secs, None, hint);
+                    }
+                }
+            }
+            if !mapped_any {
+                let duration = gates_started.elapsed().as_secs();
+                for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
+                    attempt.set_stage_fail(stage, duration, None, normalize_error_hint(&err));
+                }
+            }
+            if existing_pr_number > 0 {
+                if let Err(state_err) = lifecycle::apply_event(
+                    repo,
+                    existing_pr_number,
+                    &sha,
+                    &lifecycle::LifecycleEventKind::PushObserved,
+                ) {
+                    human_log!(
+                        "WARNING: failed to record push_observed lifecycle event for PR #{existing_pr_number}: {state_err}",
+                    );
+                }
+                if let Err(state_err) = lifecycle::apply_event(
+                    repo,
+                    existing_pr_number,
+                    &sha,
+                    &lifecycle::LifecycleEventKind::GatesStarted,
+                ) {
+                    human_log!(
+                        "WARNING: failed to record gates_started lifecycle event for PR #{existing_pr_number}: {state_err}",
+                    );
+                }
+                if let Err(state_err) = lifecycle::apply_event(
+                    repo,
+                    existing_pr_number,
+                    &sha,
+                    &lifecycle::LifecycleEventKind::GatesFailed,
+                ) {
+                    human_log!(
+                        "WARNING: failed to record gates_failed lifecycle event for PR #{existing_pr_number}: {state_err}",
+                    );
+                }
+            }
+            fail_with_attempt!("fac_push_gates_failed", err);
+        },
+    };
+    human_log!("fac push: evidence gates PASSED");
+
+    // Step 3: create or update PR.
+    let pr_update_started = Instant::now();
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
         match create_pr(repo, &metadata.title, &metadata.body) {
             Ok(num) => {
-                eprintln!("fac push: created PR #{num}");
+                attempt.set_stage_pass("pr_update", pr_update_started.elapsed().as_secs());
+                human_log!("fac push: created PR #{num}");
                 num
             },
             Err(e) => {
-                let authoritative_pr = find_existing_pr(repo, &branch);
-                if authoritative_pr > 0 {
-                    eprintln!(
-                        "WARNING: failed to create PR projection ({e}); recovered authoritative PR mapping #{authoritative_pr} from remote"
-                    );
-                    authoritative_pr
-                } else {
-                    eprintln!("ERROR: {e}");
-                    eprintln!(
-                        "ERROR: unable to resolve authoritative PR mapping for branch `{branch}` after create failure; refusing local fallback to prevent wrong-PR association"
-                    );
-                    return exit_codes::GENERIC_ERROR;
-                }
+                attempt.set_stage_fail(
+                    "pr_update",
+                    pr_update_started.elapsed().as_secs(),
+                    None,
+                    normalize_error_hint(&e),
+                );
+                fail_with_attempt!(
+                    "fac_push_pr_create_failed",
+                    format!(
+                        "{e}; unable to resolve authoritative PR mapping for branch `{branch}` after create failure; refusing local fallback to prevent wrong-PR association"
+                    )
+                );
             },
         }
     } else {
         if let Err(err) = update_pr(repo, pr_number, &metadata.title, &metadata.body) {
-            eprintln!(
-                "WARNING: failed to update PR projection for #{pr_number}: {err} (continuing with local authoritative flow)"
+            attempt.set_stage_fail(
+                "pr_update",
+                pr_update_started.elapsed().as_secs(),
+                None,
+                normalize_error_hint(&err),
+            );
+            fail_with_attempt!(
+                "fac_push_pr_update_failed",
+                format!("failed to update PR projection for #{pr_number}: {err}")
             );
         }
-        eprintln!("fac push: using PR #{pr_number}");
+        attempt.set_stage_pass("pr_update", pr_update_started.elapsed().as_secs());
+        human_log!("fac push: using PR #{pr_number}");
         pr_number
     };
+    attempt_pr_number = pr_number;
 
     if let Err(err) = lifecycle::apply_event(
         repo,
@@ -917,62 +1441,33 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         &sha,
         &lifecycle::LifecycleEventKind::PushObserved,
     ) {
-        eprintln!("ERROR: failed to record push lifecycle event: {err}");
-        return exit_codes::GENERIC_ERROR;
-    }
-
-    // Step 3: run evidence gates synchronously with cache-aware status path.
-    let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
-            eprintln!("ERROR: failed to re-resolve HEAD SHA before gates");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-    if !current_head.eq_ignore_ascii_case(&sha) {
-        eprintln!(
-            "ERROR: HEAD drift detected before gate execution (captured={sha}, current={current_head}); refusing mixed-SHA gate run"
+        fail_with_attempt!(
+            "fac_push_lifecycle_push_observed_failed",
+            format!("failed to record push lifecycle event: {err}")
         );
-        return exit_codes::GENERIC_ERROR;
     }
-
     if let Err(err) = lifecycle::apply_event(
         repo,
         pr_number,
         &sha,
         &lifecycle::LifecycleEventKind::GatesStarted,
     ) {
-        eprintln!("ERROR: failed to record gates_started lifecycle event: {err}");
-        return exit_codes::GENERIC_ERROR;
+        fail_with_attempt!(
+            "fac_push_lifecycle_gates_started_failed",
+            format!("failed to record gates_started lifecycle event: {err}")
+        );
     }
-    eprintln!("fac push: running evidence gates (blocking, cache-aware)");
-    let gate_results = match run_blocking_evidence_gates(&worktree_dir, &sha, repo, pr_number) {
-        Ok(results) => {
-            if let Err(err) = lifecycle::apply_event(
-                repo,
-                pr_number,
-                &sha,
-                &lifecycle::LifecycleEventKind::GatesPassed,
-            ) {
-                eprintln!("ERROR: failed to record gates_passed lifecycle event: {err}");
-                return exit_codes::GENERIC_ERROR;
-            }
-            results
-        },
-        Err(err) => {
-            if let Err(state_err) = lifecycle::apply_event(
-                repo,
-                pr_number,
-                &sha,
-                &lifecycle::LifecycleEventKind::GatesFailed,
-            ) {
-                eprintln!("WARNING: failed to record gates_failed lifecycle event: {state_err}");
-            }
-            eprintln!("ERROR: {err}");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-    eprintln!("fac push: evidence gates PASSED");
+    if let Err(err) = lifecycle::apply_event(
+        repo,
+        pr_number,
+        &sha,
+        &lifecycle::LifecycleEventKind::GatesPassed,
+    ) {
+        fail_with_attempt!(
+            "fac_push_lifecycle_gates_passed_failed",
+            format!("failed to record gates_passed lifecycle event: {err}")
+        );
+    }
 
     // Step 4: sync gate status section to PR body (best-effort).
     let gate_status_rows = gate_results
@@ -984,44 +1479,86 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         })
         .collect::<Vec<_>>();
     if let Err(err) = sync_gate_status_to_pr(repo, pr_number, gate_status_rows, &sha) {
-        eprintln!("WARNING: failed to sync gate status section in PR body: {err}");
+        human_log!("WARNING: failed to sync gate status section in PR body: {err}");
     } else {
-        eprintln!("fac push: synced gate status section in PR body for PR #{pr_number}");
+        human_log!("fac push: synced gate status section in PR body for PR #{pr_number}");
     }
 
     // Step 5: enable auto-merge.
     if let Err(e) = enable_auto_merge(repo, pr_number) {
-        eprintln!("WARNING: auto-merge enable failed: {e}");
+        human_log!("WARNING: auto-merge enable failed: {e}");
     } else {
-        eprintln!("fac push: auto-merge enabled on PR #{pr_number}");
+        human_log!("fac push: auto-merge enabled on PR #{pr_number}");
     }
 
     // Step 6: dispatch reviews.
-    if let Err(e) = dispatch_reviews_with(
+    //
+    // Intentional: dispatch failures are non-fatal for `fac push`. Push owns
+    // publication and gate validation; reviewer liveness and retry are handled
+    // by restart/recover lifecycle surfaces.
+    let dispatch_started = Instant::now();
+    let dispatch_warning = if let Err(e) = dispatch_reviews_with(
         repo,
         pr_number,
         &sha,
         dispatch_single_review,
         lifecycle::register_reviewer_dispatch,
+        !json_output,
     ) {
-        eprintln!("ERROR: {e}");
-        eprintln!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
-        return exit_codes::GENERIC_ERROR;
-    }
+        attempt.set_stage_fail(
+            "dispatch",
+            dispatch_started.elapsed().as_secs(),
+            None,
+            normalize_error_hint(&e),
+        );
+        human_log!("WARNING: review dispatch failed: {e}");
+        human_log!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
+        Some(e)
+    } else {
+        attempt.set_stage_pass("dispatch", dispatch_started.elapsed().as_secs());
+        None
+    };
+    let has_dispatch_warning = dispatch_warning.is_some();
 
-    // Step 7: persist projection identity only after full local lifecycle stage
-    // succeeds for this SHA (prevents stale identity drift on force-push).
+    // Step 7: persist projection identity only after gates + dispatch attempt.
+    let mut identity_persisted = false;
     if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {
-        eprintln!("WARNING: failed to persist local projection identity: {err}");
-    }
-    if let Err(err) =
+        human_log!("WARNING: failed to persist local projection identity: {err}");
+    } else if let Err(err) =
         projection_store::save_pr_body_snapshot(repo, pr_number, &metadata.body, "push")
     {
-        eprintln!("WARNING: failed to persist local PR body snapshot: {err}");
+        human_log!("WARNING: failed to persist local PR body snapshot: {err}");
+    } else {
+        identity_persisted = true;
     }
 
-    eprintln!("fac push: done (PR #{pr_number})");
-    eprintln!("  if review dispatch stalls: apm2 fac restart --pr {pr_number}");
+    if json_output {
+        let payload = PushSummary {
+            schema: "apm2.fac.push.summary.v1".to_string(),
+            repo: repo.to_string(),
+            remote: remote.to_string(),
+            branch,
+            pr_number,
+            head_sha: sha,
+            identity_persisted,
+            dispatch_warning,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+
+    if let Err(err) = append_push_attempt_record(repo, pr_number, &attempt) {
+        human_log!("WARNING: failed to append push attempt log: {err}");
+    }
+
+    human_log!("fac push: done (PR #{pr_number})");
+    if has_dispatch_warning {
+        human_log!("  review dispatch warning surfaced; rerun: apm2 fac restart --pr {pr_number}");
+    } else {
+        human_log!("  if review dispatch stalls: apm2 fac restart --pr {pr_number}");
+    }
     exit_codes::SUCCESS
 }
 
@@ -1044,6 +1581,30 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn push_attempt_record_returns_first_failed_stage_in_order() {
+        let mut record = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        record.set_stage_pass("git_push", 2);
+        record.set_stage_fail("gate_test", 15, Some(1), Some("timeout".to_string()));
+        record.set_stage_fail("dispatch", 4, None, Some("at_capacity".to_string()));
+
+        let failed = record.first_failed_stage().expect("failed stage");
+        assert_eq!(failed.stage, "gate_test");
+        assert_eq!(failed.duration_s, 15);
+        assert_eq!(failed.exit_code, Some(1));
+        assert_eq!(failed.error_hint.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn normalize_error_hint_uses_last_non_empty_line_and_caps_length() {
+        let hint = normalize_error_hint("line1\n\nline2 final detail").expect("hint");
+        assert_eq!(hint, "line2 final detail");
+
+        let long = "x".repeat(400);
+        let capped = normalize_error_hint(&long).expect("capped");
+        assert_eq!(capped.chars().count(), 200);
+    }
+
     fn parse_yaml_from_markdown_fence(markdown: &str) -> serde_yaml::Value {
         let content = markdown
             .strip_prefix("```yaml\n")
@@ -1052,12 +1613,15 @@ mod tests {
         serde_yaml::from_str(content).expect("valid yaml")
     }
 
-    fn seed_required_pass_cache(sha: &str, workspace_root: &Path) -> GateCache {
-        let mut cache = GateCache::new(sha);
-        for gate in expected_gate_names_for_workspace(workspace_root) {
-            cache.set_with_attestation(&gate, true, 1, None, false, Some("digest".to_string()));
-        }
-        cache
+    fn seed_required_pass_results(workspace_root: &Path) -> Vec<EvidenceGateResult> {
+        expected_gate_names_for_workspace(workspace_root)
+            .into_iter()
+            .map(|gate_name| EvidenceGateResult {
+                gate_name,
+                passed: true,
+                duration_secs: 1,
+            })
+            .collect()
     }
 
     #[test]
@@ -1335,21 +1899,20 @@ mod tests {
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_returns_cached_results_for_pass() {
+    fn run_blocking_evidence_gates_with_returns_reported_results_for_pass() {
         let sha = "c".repeat(40);
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path();
-        let cache = seed_required_pass_cache(&sha, workspace_root);
+        let results = seed_required_pass_results(workspace_root);
 
         let result = run_blocking_evidence_gates_with(
             workspace_root,
             &sha,
             "guardian-intelligence/apm2",
-            615,
-            |_, _, _, _| Ok(true),
-            |_| Some(cache.clone()),
+            Some(615),
+            |_, _, _, _| Ok((true, results.clone())),
         )
-        .expect("pass should return cached rows");
+        .expect("pass should return reported rows");
 
         assert_eq!(
             result.len(),
@@ -1359,80 +1922,101 @@ mod tests {
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_fails_closed_when_pass_without_cache_artifacts() {
+    fn run_blocking_evidence_gates_with_fails_closed_when_pass_without_gate_artifacts() {
         let sha = "d".repeat(40);
         let err = run_blocking_evidence_gates_with(
             Path::new("/tmp"),
             &sha,
             "guardian-intelligence/apm2",
-            616,
-            |_, _, _, _| Ok(true),
-            |_| None,
+            Some(616),
+            |_, _, _, _| Ok((true, Vec::new())),
         )
-        .expect_err("missing cache on PASS must fail closed");
-        assert!(err.contains("no gate cache artifacts"));
+        .expect_err("missing gate artifacts on PASS must fail closed");
+        assert!(err.contains("no gate result artifacts"));
         assert!(err.contains(&sha));
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_reports_failed_cached_gate_names() {
+    fn run_blocking_evidence_gates_with_reports_failed_gate_names() {
         let sha = "e".repeat(40);
-        let mut cache = GateCache::new(&sha);
-        cache.set_with_attestation("rustfmt", false, 1, None, false, None);
-        cache.set_with_attestation("clippy", true, 2, None, false, None);
-
         let err = run_blocking_evidence_gates_with(
             Path::new("/tmp"),
             &sha,
             "guardian-intelligence/apm2",
-            617,
-            |_, _, _, _| Ok(false),
-            |_| Some(cache.clone()),
+            Some(617),
+            |_, _, _, _| {
+                Ok((
+                    false,
+                    vec![
+                        EvidenceGateResult {
+                            gate_name: "rustfmt".to_string(),
+                            passed: false,
+                            duration_secs: 1,
+                        },
+                        EvidenceGateResult {
+                            gate_name: "clippy".to_string(),
+                            passed: true,
+                            duration_secs: 2,
+                        },
+                    ],
+                ))
+            },
         )
-        .expect_err("failed gate should surface cached failing names");
+        .expect_err("failed gate should surface reported failing names");
         assert!(err.contains("rustfmt"));
         assert!(!err.contains("clippy"));
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_rejects_pass_when_cached_row_is_fail() {
+    fn run_blocking_evidence_gates_with_rejects_pass_when_reported_row_is_fail() {
         let sha = "f".repeat(40);
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path();
-        let mut cache = seed_required_pass_cache(&sha, workspace_root);
-        cache.set_with_attestation("rustfmt", false, 1, None, false, Some("digest".to_string()));
+        let mut results = seed_required_pass_results(workspace_root);
+        let rustfmt = results
+            .iter_mut()
+            .find(|result| result.gate_name == "rustfmt")
+            .expect("rustfmt row");
+        rustfmt.passed = false;
 
         let err = run_blocking_evidence_gates_with(
             workspace_root,
             &sha,
             "guardian-intelligence/apm2",
-            618,
-            |_, _, _, _| Ok(true),
-            |_| Some(cache.clone()),
+            Some(618),
+            |_, _, _, _| Ok((true, results.clone())),
         )
-        .expect_err("pass path must fail when cached gate row is FAIL");
-        assert!(err.contains("cached gate rows include FAIL"));
+        .expect_err("pass path must fail when reported gate row is FAIL");
+        assert!(err.contains("reported gate rows include FAIL"));
         assert!(err.contains("rustfmt"));
     }
 
     #[test]
-    fn run_blocking_evidence_gates_with_rejects_incomplete_cache_on_pass() {
+    fn run_blocking_evidence_gates_with_rejects_incomplete_results_on_pass() {
         let sha = "1".repeat(40);
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path();
-        let mut cache = GateCache::new(&sha);
-        cache.set_with_attestation("rustfmt", true, 1, None, false, Some("digest".to_string()));
-        cache.set_with_attestation("clippy", true, 1, None, false, Some("digest".to_string()));
+        let incomplete_results = vec![
+            EvidenceGateResult {
+                gate_name: "rustfmt".to_string(),
+                passed: true,
+                duration_secs: 1,
+            },
+            EvidenceGateResult {
+                gate_name: "clippy".to_string(),
+                passed: true,
+                duration_secs: 1,
+            },
+        ];
 
         let err = run_blocking_evidence_gates_with(
             workspace_root,
             &sha,
             "guardian-intelligence/apm2",
-            619,
-            |_, _, _, _| Ok(true),
-            |_| Some(cache.clone()),
+            Some(619),
+            |_, _, _, _| Ok((true, incomplete_results.clone())),
         )
-        .expect_err("pass path must fail on incomplete cache");
+        .expect_err("pass path must fail on incomplete reported gate set");
         assert!(err.contains("required gate set"));
         assert!(err.contains("missing="));
     }
@@ -1463,6 +2047,7 @@ mod tests {
                 registered.push((review_type.to_string(), run_id.map(str::to_string)));
                 Ok(Some(format!("{review_type}-token")))
             },
+            false,
         );
 
         assert!(result.is_ok());
@@ -1499,6 +2084,7 @@ mod tests {
                 })
             },
             |_, _, _, review_type, _, _, _| Ok(Some(format!("{review_type}-token"))),
+            false,
         )
         .expect_err("expected dispatch failure");
 
@@ -1531,6 +2117,7 @@ mod tests {
                 })
             },
             |_, _, _, review_type, _, _, _| Ok(Some(format!("{review_type}-token"))),
+            false,
         )
         .expect_err("expected fail-fast integrity failure");
 
@@ -1562,6 +2149,7 @@ mod tests {
                 register_calls += 1;
                 Err("at_capacity: PR #42 already has 2 active agents (max=2)".to_string())
             },
+            false,
         )
         .expect_err("at_capacity must fail fast and not retry");
 
@@ -1609,6 +2197,7 @@ mod tests {
                 register_calls += 1;
                 Ok(Some("token".to_string()))
             },
+            false,
         );
 
         assert!(result.is_ok());
@@ -1648,6 +2237,7 @@ mod tests {
                 }
                 Ok(Some("token".to_string()))
             },
+            false,
         );
 
         assert!(result.is_ok());
@@ -1704,6 +2294,7 @@ mod tests {
                 }
                 Ok(Some("token".to_string()))
             },
+            false,
         );
 
         assert!(result.is_ok());

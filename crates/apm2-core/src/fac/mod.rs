@@ -77,8 +77,7 @@ pub mod broker;
 pub mod broker_health;
 pub mod builtin_profiles;
 pub mod builtin_roles;
-/// Canonicalizer tuple commitment schema and helper functions.
-pub mod canonicalizer_tuple;
+mod canonicalizer_tuple;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
@@ -188,6 +187,7 @@ pub use builtin_profiles::{
     LOCAL_INFERENCE_PROFILE_ID, all_builtin_profiles, claude_code_profile, codex_cli_profile,
     gemini_cli_profile, get_builtin_profile, local_inference_profile,
 };
+// Re-export canonicalizer tuple types
 pub use canonicalizer_tuple::{CANONICALIZER_TUPLE_SCHEMA, CanonicalizerTupleV1};
 // Re-export changeset bundle types
 pub use changeset_bundle::{
@@ -326,8 +326,8 @@ pub use receipt::{
     GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
     SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
     compute_job_receipt_content_hash, compute_job_receipt_content_hash_v2, deserialize_job_receipt,
+    persist_content_addressed_receipt, persist_content_addressed_receipt_v2,
 };
-pub use receipt::{persist_content_addressed_receipt, persist_content_addressed_receipt_v2};
 pub use repo_mirror::{
     CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,
     RepoMirrorError, RepoMirrorManager,

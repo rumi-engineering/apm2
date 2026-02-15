@@ -239,7 +239,6 @@ fn discover_logs(pr_number: Option<u32>) -> Result<LogsSummary, String> {
             "test",
             "test_safety_guard",
             "workspace_integrity",
-            "review_artifact_lint",
         ];
         for gate in &gate_names {
             let path = evidence_dir.join(format!("{gate}.log"));

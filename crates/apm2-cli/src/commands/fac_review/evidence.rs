@@ -8,9 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::{LaneProfileV1, compute_test_env};
-use apm2_daemon::telemetry::is_cgroup_v2_available;
 use sha2::{Digest, Sha256};
 
+use super::bounded_test_runner::{
+    BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
+};
 use super::ci_status::{CiStatus, ThrottledUpdater};
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
@@ -216,10 +218,7 @@ fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize)
     );
     let _ = writeln!(file, "{TEST_TIMEOUT_SLA_MESSAGE}");
     let _ = writeln!(file, "Check:");
-    let _ = writeln!(
-        file,
-        "  journalctl --user -u 'apm2-ci-bounded*' --since '10 minutes ago'"
-    );
+    let _ = writeln!(file, "  journalctl --user --since '10 minutes ago'");
     let _ = writeln!(
         file,
         "  apm2 fac gates --memory-max 24G  # default is 24G; increase if needed"
@@ -424,15 +423,6 @@ struct PipelineTestCommand {
 }
 
 fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestCommand, String> {
-    let bounded_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
-    let bounded_runner = bounded_script.is_file() && is_cgroup_v2_available();
-    if !bounded_runner {
-        return Err(
-            "nextest is required for FAC evidence gates; bounded runner script not found"
-                .to_string(),
-        );
-    }
-
     let memory_max_bytes = parse_memory_limit(DEFAULT_TEST_MEMORY_MAX)?;
     if memory_max_bytes > max_memory_bytes() {
         return Err(format!(
@@ -446,27 +436,24 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
         resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
     let profile = LaneProfileV1::new("lane-00", "b3-256:fac-review", "boundary-00")
         .map_err(|err| format!("failed to construct FAC pipeline lane profile: {err}"))?;
-    let test_env = compute_test_env(&profile);
-    let mut command = vec![
-        bounded_script.display().to_string(),
-        "--timeout-seconds".to_string(),
-        timeout_decision.effective_seconds.to_string(),
-        "--kill-after-seconds".to_string(),
-        DEFAULT_TEST_KILL_AFTER_SECONDS.to_string(),
-        "--heartbeat-seconds".to_string(),
-        MONOTONIC_HEARTBEAT_TICK_SECS.to_string(),
-        "--memory-max".to_string(),
-        DEFAULT_TEST_MEMORY_MAX.to_string(),
-        "--pids-max".to_string(),
-        DEFAULT_TEST_PIDS_MAX.to_string(),
-        "--cpu-quota".to_string(),
-        DEFAULT_TEST_CPU_QUOTA.to_string(),
-        "--".to_string(),
-    ];
-    command.extend(build_nextest_command());
+    let mut test_env = compute_test_env(&profile);
+    let bounded_spec = build_systemd_bounded_test_command(
+        workspace_root,
+        BoundedTestLimits {
+            timeout_seconds: timeout_decision.effective_seconds,
+            kill_after_seconds: DEFAULT_TEST_KILL_AFTER_SECONDS,
+            memory_max: DEFAULT_TEST_MEMORY_MAX,
+            pids_max: DEFAULT_TEST_PIDS_MAX,
+            cpu_quota: DEFAULT_TEST_CPU_QUOTA,
+        },
+        &build_nextest_command(),
+        &test_env,
+    )
+    .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
+    test_env.extend(bounded_spec.environment);
 
     Ok(PipelineTestCommand {
-        command,
+        command: bounded_spec.command,
         bounded_runner: true,
         effective_timeout_seconds: timeout_decision.effective_seconds,
         test_env,
@@ -524,7 +511,7 @@ pub fn run_evidence_gates(
     let pre_test_script_gates: &[(&str, &str)] =
         &[("test_safety_guard", "scripts/ci/test_safety_guard.sh")];
 
-    // Script gates that run AFTER tests.
+    // Script gates that run AFTER tests (ordering dependency on test).
     let post_test_script_gates: &[(&str, &str)] =
         &[("review_artifact_lint", "scripts/ci/review_artifact_lint.sh")];
 
@@ -737,7 +724,7 @@ pub fn run_evidence_gates_with_status(
     owner_repo: &str,
     pr_number: u32,
     projection_log: Option<&mut File>,
-) -> Result<bool, String> {
+) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let evidence_dir = apm2_home_dir()?.join("private/fac/evidence");
     // TCK-00536: create evidence directory with mode 0700 at create-time.
     crate::commands::fac_permissions::ensure_dir_with_mode(&evidence_dir)
@@ -780,11 +767,13 @@ pub fn run_evidence_gates_with_status(
     let pre_test_script_gates: &[(&str, &str)] =
         &[("test_safety_guard", "scripts/ci/test_safety_guard.sh")];
 
+    // Script gates that run AFTER tests (ordering dependency on test).
     let post_test_script_gates: &[(&str, &str)] =
         &[("review_artifact_lint", "scripts/ci/review_artifact_lint.sh")];
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
+    let mut gate_results = Vec::new();
 
     // Phase 0: merge conflict gate (always first, always recomputed).
     {
@@ -795,6 +784,11 @@ pub fn run_evidence_gates_with_status(
         let (passed, duration, line) = run_merge_conflict_gate(workspace_root, sha, &evidence_dir);
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         evidence_lines.push(line);
         let merge_log = evidence_dir.join(format!("{gate_name}.log"));
         let merge_digest = sha256_file_hex(&merge_log);
@@ -816,7 +810,7 @@ pub fn run_evidence_gates_with_status(
                     let _ = writeln!(file, "{line}");
                 }
             }
-            return Ok(false);
+            return Ok((false, gate_results));
         }
     }
 
@@ -850,6 +844,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -889,6 +888,11 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -948,6 +952,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -987,6 +996,11 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -1039,6 +1053,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1054,6 +1073,20 @@ pub fn run_evidence_gates_with_status(
                     sha,
                     gate_name
                 );
+                status.set_result(gate_name, false, 0);
+                updater.update(&status);
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: false,
+                    duration_secs: 0,
+                });
+                all_passed = false;
+                evidence_lines.push(format!(
+                    "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                ));
             }
         } else {
             eprintln!(
@@ -1088,6 +1121,11 @@ pub fn run_evidence_gates_with_status(
 
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
+            gate_results.push(EvidenceGateResult {
+                gate_name: gate_name.to_string(),
+                passed,
+                duration_secs: duration,
+            });
             gate_cache.set_with_attestation(
                 gate_name,
                 passed,
@@ -1133,6 +1171,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1154,6 +1197,11 @@ pub fn run_evidence_gates_with_status(
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
             let log_path = evidence_dir.join("workspace_integrity.log");
+            gate_results.push(EvidenceGateResult {
+                gate_name: gate_name.to_string(),
+                passed,
+                duration_secs: duration,
+            });
             gate_cache.set_with_attestation(
                 gate_name,
                 passed,
@@ -1198,6 +1246,11 @@ pub fn run_evidence_gates_with_status(
                         .as_deref()
                         .map_or_else(|| "unknown".to_string(), short_digest),
                 ));
+                gate_results.push(EvidenceGateResult {
+                    gate_name: gate_name.to_string(),
+                    passed: true,
+                    duration_secs: cached.duration_secs,
+                });
                 gate_cache.set_with_attestation(
                     gate_name,
                     true,
@@ -1237,6 +1290,11 @@ pub fn run_evidence_gates_with_status(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
+        gate_results.push(EvidenceGateResult {
+            gate_name: gate_name.to_string(),
+            passed,
+            duration_secs: duration,
+        });
         gate_cache.set_with_attestation(
             gate_name,
             passed,
@@ -1265,9 +1323,9 @@ pub fn run_evidence_gates_with_status(
     updater.force_update(&status);
 
     // Persist gate cache so future pipeline runs can reuse results.
-    if let Err(err) = gate_cache.save() {
-        eprintln!("warning: failed to persist attested gate cache: {err}");
-    }
+    gate_cache
+        .save()
+        .map_err(|err| format!("failed to persist attested gate cache: {err}"))?;
 
     if let Some(file) = projection_log {
         for line in &evidence_lines {
@@ -1275,7 +1333,7 @@ pub fn run_evidence_gates_with_status(
         }
     }
 
-    Ok(all_passed)
+    Ok((all_passed, gate_results))
 }
 
 #[cfg(test)]
@@ -1350,9 +1408,24 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_test_command_fails_without_bounded_runner_script() {
+    fn pipeline_test_command_uses_rust_bounded_runner_or_surfaces_preflight_error() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let err = build_pipeline_test_command(temp_dir.path()).expect_err("bounded script missing");
-        assert!(err.contains("bounded runner script not found"));
+        match build_pipeline_test_command(temp_dir.path()) {
+            Ok(command) => {
+                let joined = command.command.join(" ");
+                assert!(joined.contains("systemd-run"));
+                assert!(joined.contains("cargo nextest run --workspace"));
+                assert!(!joined.contains("run_bounded_tests.sh"));
+            },
+            Err(err) => {
+                assert!(
+                    err.contains("bounded test runner unavailable")
+                        || err.contains("systemd-run not found")
+                        || err.contains("cgroup v2")
+                        || err.contains("D-Bus socket"),
+                    "unexpected error: {err}"
+                );
+            },
+        }
     }
 }

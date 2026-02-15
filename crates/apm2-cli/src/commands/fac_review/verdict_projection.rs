@@ -1,7 +1,6 @@
 //! Verdict projection and decision-authority helpers.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -178,6 +177,27 @@ pub struct PersistedVerdictProjection {
     pub decision_signature: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionMode {
+    Full,
+    LocalOnly,
+}
+
+fn local_only_author_login_with_fallback(
+    resolved: Result<String, String>,
+    pr_number: u32,
+) -> (String, bool) {
+    match resolved {
+        Ok(login) => (login, true),
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to resolve trusted reviewer identity for local-only verdict projection on PR #{pr_number}: {err}; using fallback identity"
+            );
+            ("fac-local-auto-verdict".to_string(), false)
+        },
+    }
+}
+
 pub(super) fn resolve_verdict_for_dimension(
     owner_repo: &str,
     pr_number: u32,
@@ -321,12 +341,67 @@ pub fn persist_verdict_projection(
     reason: Option<&str>,
     json_output: bool,
 ) -> Result<PersistedVerdictProjection, String> {
+    persist_verdict_projection_impl(
+        repo,
+        pr_number,
+        sha,
+        dimension,
+        decision,
+        reason,
+        ProjectionMode::Full,
+        true,
+        json_output,
+    )
+}
+
+pub(super) fn persist_verdict_projection_local_only(
+    repo: &str,
+    pr_number: Option<u32>,
+    sha: Option<&str>,
+    dimension: &str,
+    decision: &str,
+    reason: Option<&str>,
+) -> Result<PersistedVerdictProjection, String> {
+    persist_verdict_projection_impl(
+        repo,
+        pr_number,
+        sha,
+        dimension,
+        decision,
+        reason,
+        ProjectionMode::LocalOnly,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_verdict_projection_impl(
+    repo: &str,
+    pr_number: Option<u32>,
+    sha: Option<&str>,
+    dimension: &str,
+    decision: &str,
+    reason: Option<&str>,
+    projection_mode: ProjectionMode,
+    emit_report: bool,
+    json_output: bool,
+) -> Result<PersistedVerdictProjection, String> {
     let normalized_dimension = normalize_decision_dimension(dimension)?;
     let normalized_decision = normalize_decision_value(decision)
         .ok_or_else(|| format!("invalid verdict decision `{decision}` (expected approve|deny)"))?;
 
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
-    let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
+    let (expected_author_login, persist_trusted_reviewer_id) = match projection_mode {
+        ProjectionMode::Full => (
+            resolve_expected_author_login(&owner_repo, resolved_pr)?,
+            true,
+        ),
+        ProjectionMode::LocalOnly => local_only_author_login_with_fallback(
+            resolve_expected_author_login(&owner_repo, resolved_pr),
+            resolved_pr,
+        ),
+    };
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let home = super::types::apm2_home_dir()?;
     let _projection_lock = acquire_projection_lock_for_home(&home, &owner_repo, resolved_pr)?;
@@ -390,10 +465,26 @@ pub fn persist_verdict_projection(
     let payload = projection_record_to_payload(&record);
     record.decision_signature = signature_for_payload(&payload)?;
 
-    let (projected_comment_id, projected_comment_url) =
-        project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
-    record.decision_comment_id = projected_comment_id;
-    record.decision_comment_url = projected_comment_url;
+    match projection_mode {
+        ProjectionMode::Full => {
+            let (projected_comment_id, projected_comment_url) =
+                project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
+            record.decision_comment_id = projected_comment_id;
+            record.decision_comment_url = projected_comment_url;
+        },
+        ProjectionMode::LocalOnly => {
+            if record.decision_comment_id == 0 {
+                record.decision_comment_id = allocate_local_comment_id(
+                    resolved_pr,
+                    max_cached_issue_comment_id(&owner_repo, resolved_pr),
+                );
+            }
+            if record.decision_comment_url.trim().is_empty() {
+                record.decision_comment_url =
+                    local_comment_url(&owner_repo, resolved_pr, record.decision_comment_id);
+            }
+        },
+    }
 
     save_decision_projection_for_home(&home, &record)?;
     let _ = projection_store::save_identity_with_context(
@@ -402,14 +493,18 @@ pub fn persist_verdict_projection(
         &head_sha,
         "verdict.set",
     );
-    let _ = projection_store::save_trusted_reviewer_id(
-        &owner_repo,
-        resolved_pr,
-        &expected_author_login,
-    );
+    if persist_trusted_reviewer_id {
+        let _ = projection_store::save_trusted_reviewer_id(
+            &owner_repo,
+            resolved_pr,
+            &expected_author_login,
+        );
+    }
 
-    let report = build_show_report_from_record(&head_sha, &record);
-    emit_show_report(&report, json_output)?;
+    if emit_report {
+        let report = build_show_report_from_record(&head_sha, &record);
+        emit_show_report(&report, json_output)?;
+    }
 
     Ok(PersistedVerdictProjection {
         owner_repo,
@@ -742,6 +837,36 @@ fn bind_decision_projection_record_integrity(
     Ok(())
 }
 
+fn verify_decision_projection_record_integrity_without_rotation(
+    home: &Path,
+    record: &DecisionProjectionRecord,
+) -> Result<(), String> {
+    let Some(stored) = record.integrity_hmac.as_deref() else {
+        return Err(format!(
+            "missing decision projection integrity_hmac for {} PR #{} sha {}",
+            record.owner_repo, record.pr_number, record.head_sha
+        ));
+    };
+    let secret = read_secret_hex_bytes(&projection_secret_path(
+        home,
+        &record.owner_repo,
+        record.pr_number,
+    ))?
+    .ok_or_else(|| {
+        format!(
+            "missing decision projection integrity secret for {} PR #{}",
+            record.owner_repo, record.pr_number
+        )
+    })?;
+    let payload = projection_record_binding_payload(record)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    let matches = verify_hmac(stored, &computed)?;
+    if !matches {
+        return Err("decision projection integrity check failed".to_string());
+    }
+    Ok(())
+}
+
 fn acquire_projection_lock_for_home(
     home: &Path,
     owner_repo: &str,
@@ -875,14 +1000,14 @@ fn load_decision_projection_for_home(
     validate_expected_head_sha(head_sha)?;
 
     let sha_path = projection_record_sha_path_for_home(home, owner_repo, pr_number, head_sha);
-    if let Some(mut record) = load_projection_record_from_path(&sha_path)? {
+    if let Some(record) = load_projection_record_from_path(&sha_path)? {
         validate_projection_record_identity(&record, owner_repo, pr_number)?;
         validate_projection_record_sha(&record, head_sha)?;
-        bind_decision_projection_record_integrity(home, &mut record)?;
+        verify_decision_projection_record_integrity_without_rotation(home, &record)?;
         return Ok(Some(record));
     }
 
-    let Some(mut record) = load_projection_record_from_path(&projection_record_path_for_home(
+    let Some(record) = load_projection_record_from_path(&projection_record_path_for_home(
         home, owner_repo, pr_number,
     ))?
     else {
@@ -895,7 +1020,7 @@ fn load_decision_projection_for_home(
         return Ok(None);
     }
     validate_projection_record_sha(&record, head_sha)?;
-    bind_decision_projection_record_integrity(home, &mut record)?;
+    verify_decision_projection_record_integrity_without_rotation(home, &record)?;
     Ok(Some(record))
 }
 
@@ -1258,89 +1383,95 @@ pub fn resolve_completion_signal_from_projection_for_home(
     }))
 }
 
-fn summarize_single_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+#[derive(Debug, Clone, Serialize)]
+struct DecisionCommentFinding {
+    finding_id: String,
+    #[serde(rename = "type")]
+    finding_type: String,
+    severity: String,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    risk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    impact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reviewer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_pointer: Option<String>,
+    timestamp: String,
 }
 
-fn append_dimension_findings_section(
-    out: &mut String,
+#[derive(Debug, Clone, Serialize)]
+struct DecisionCommentProjectionPayload {
+    schema: String,
+    pr: u32,
+    sha: String,
+    updated_at: String,
+    dimensions: BTreeMap<String, DecisionEntry>,
+    findings: Vec<DecisionCommentFinding>,
+}
+
+fn normalize_optional_findings_text(value: Option<&str>) -> Option<String> {
+    let raw = value?;
+    if raw.trim().is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn collect_projected_findings(
     bundle: Option<&findings_store::FindingsBundle>,
-    dimension: &str,
-) {
-    let _ = writeln!(out, "### {dimension}");
-    let Some(bundle) = bundle else {
-        out.push_str("- No findings recorded for this SHA.\n\n");
-        return;
-    };
-    let Some(stored_dimension) = findings_store::find_dimension(bundle, dimension) else {
-        out.push_str("- No findings recorded for this dimension.\n\n");
-        return;
-    };
-    if stored_dimension.findings.is_empty() {
-        out.push_str("- No findings recorded for this dimension.\n\n");
-        return;
-    }
-
-    for finding in &stored_dimension.findings {
-        let _ = write!(
-            out,
-            "- [{}] {}",
-            finding.severity,
-            summarize_single_line(&finding.summary)
-        );
-        if let Some(location) = finding.location.as_deref() {
-            let normalized = summarize_single_line(location);
-            if !normalized.is_empty() {
-                let _ = write!(out, " (location: {normalized})");
-            }
-        }
-        out.push('\n');
-        if let Some(details) = finding.details.as_deref() {
-            let normalized = summarize_single_line(details);
-            if !normalized.is_empty() {
-                let _ = writeln!(out, "  details: {normalized}");
-            }
-        }
-        if let Some(risk) = finding.risk.as_deref() {
-            let normalized = summarize_single_line(risk);
-            if !normalized.is_empty() {
-                let _ = writeln!(out, "  risk: {normalized}");
-            }
-        }
-        if let Some(impact) = finding.impact.as_deref() {
-            let normalized = summarize_single_line(impact);
-            if !normalized.is_empty() {
-                let _ = writeln!(out, "  impact: {normalized}");
-            }
-        }
-    }
-    out.push('\n');
-}
-
-fn render_findings_markdown(
-    owner_repo: &str,
-    pr_number: u32,
-    head_sha: &str,
     payload: &DecisionComment,
-) -> Result<String, String> {
-    let bundle = findings_store::load_findings_bundle(owner_repo, pr_number, head_sha)?;
-    let mut out = String::new();
-    out.push_str("## FAC Findings\n\n");
-    let active_dimensions = payload
+) -> Vec<DecisionCommentFinding> {
+    let mut projected = Vec::new();
+    let mut active_dimensions = payload
         .dimensions
         .keys()
         .map(|value| normalize_decision_dimension(value).unwrap_or(value))
+        .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
-
-    if active_dimensions.is_empty() {
-        out.push_str("- No verdict dimensions set yet.\n");
-        return Ok(out);
+    if let Some(bundle) = bundle {
+        for dimension in &bundle.dimensions {
+            let normalized = normalize_decision_dimension(&dimension.dimension)
+                .map_or_else(|_| dimension.dimension.clone(), ToString::to_string);
+            active_dimensions.insert(normalized);
+        }
     }
 
     for dimension in active_dimensions {
-        append_dimension_findings_section(&mut out, bundle.as_ref(), dimension);
+        let Some(bundle) = bundle else {
+            continue;
+        };
+        let Some(stored_dimension) = findings_store::find_dimension(bundle, &dimension) else {
+            continue;
+        };
+        for finding in &stored_dimension.findings {
+            projected.push(DecisionCommentFinding {
+                finding_id: finding.finding_id.clone(),
+                finding_type: dimension.clone(),
+                severity: finding.severity.clone(),
+                summary: finding.summary.clone(),
+                risk: normalize_optional_findings_text(finding.risk.as_deref()),
+                impact: normalize_optional_findings_text(finding.impact.as_deref()),
+                location: normalize_optional_findings_text(finding.location.as_deref()),
+                body: normalize_optional_findings_text(finding.details.as_deref()),
+                reviewer_id: normalize_optional_findings_text(finding.reviewer_id.as_deref()),
+                evidence_digest: normalize_optional_findings_text(Some(&finding.evidence_digest)),
+                evidence_pointer: normalize_optional_findings_text(Some(
+                    &finding.raw_evidence_pointer,
+                )),
+                timestamp: finding.created_at.clone(),
+            });
+        }
     }
-    Ok(out)
+    projected
 }
 
 fn render_decision_comment_body(
@@ -1349,11 +1480,29 @@ fn render_decision_comment_body(
     head_sha: &str,
     payload: &DecisionComment,
 ) -> Result<String, String> {
-    let yaml = serde_yaml::to_string(payload)
+    let findings_bundle = match findings_store::load_findings_bundle(
+        owner_repo, pr_number, head_sha,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to load findings for verdict projection on PR #{pr_number}: {err}"
+            );
+            None
+        },
+    };
+    let projection_payload = DecisionCommentProjectionPayload {
+        schema: payload.schema.clone(),
+        pr: payload.pr,
+        sha: payload.sha.clone(),
+        updated_at: payload.updated_at.clone(),
+        dimensions: payload.dimensions.clone(),
+        findings: collect_projected_findings(findings_bundle.as_ref(), payload),
+    };
+    let yaml = serde_yaml::to_string(&projection_payload)
         .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
-    let findings = render_findings_markdown(owner_repo, pr_number, head_sha, payload)?;
     Ok(format!(
-        "<!-- {DECISION_MARKER} -->\n```yaml\n# {DECISION_MARKER}\n{yaml}```\n\n{findings}\n"
+        "<!-- {DECISION_MARKER} -->\n```yaml\n# {DECISION_MARKER}\n{yaml}```\n"
     ))
 }
 
@@ -1397,13 +1546,67 @@ fn dimension_to_state_review_type(dimension: &str) -> &str {
 }
 
 #[cfg(test)]
+pub(super) fn seed_decision_projection_for_home_for_tests(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+    reviewer_login: &str,
+    comment_id: u64,
+) -> Result<(), String> {
+    validate_expected_head_sha(head_sha)?;
+    let normalized_head_sha = head_sha.to_ascii_lowercase();
+    let now = now_iso8601();
+    let mut dimensions = BTreeMap::new();
+    dimensions.insert(
+        review_type_to_dimension(review_type)?.to_string(),
+        DecisionEntry {
+            decision: "approve".to_string(),
+            reason: "test decision authority".to_string(),
+            set_by: reviewer_login.to_string(),
+            set_at: now.clone(),
+        },
+    );
+    let payload = DecisionComment {
+        schema: DECISION_SCHEMA.to_string(),
+        pr: pr_number,
+        sha: normalized_head_sha.clone(),
+        updated_at: now.clone(),
+        dimensions: dimensions.clone(),
+    };
+    let record = DecisionProjectionRecord {
+        schema: PROJECTION_VERDICT_SCHEMA.to_string(),
+        owner_repo: owner_repo.to_ascii_lowercase(),
+        pr_number,
+        head_sha: normalized_head_sha,
+        updated_at: now.clone(),
+        decision_comment_id: comment_id,
+        decision_comment_url: local_comment_url(owner_repo, pr_number, comment_id),
+        decision_signature: signature_for_payload(&payload)?,
+        integrity_hmac: None,
+        dimensions,
+    };
+    save_decision_projection_for_home(home, &record)?;
+
+    let reviewer = ProjectionReviewerIdentity {
+        schema: PROJECTION_REVIEWER_SCHEMA.to_string(),
+        reviewer_id: reviewer_login.to_string(),
+        updated_at: now,
+    };
+    let reviewer_path =
+        projection_pr_dir_for_home(home, owner_repo, pr_number).join("reviewer.json");
+    write_json_atomic(&reviewer_path, &reviewer)
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
     use super::{
         DECISION_SCHEMA, DecisionComment, DecisionEntry, DecisionProjectionRecord,
-        build_show_report_from_record, missing_projection_report,
+        build_show_report_from_record, missing_projection_report, render_decision_comment_body,
         resolve_completion_signal_from_projection_for_home,
     };
 
@@ -1487,6 +1690,41 @@ mod tests {
     }
 
     #[test]
+    fn decision_comment_body_is_yaml_only_with_structured_findings_array() {
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "all checks passed".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-14T00:00:00Z".to_string(),
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: 615,
+            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            updated_at: "2026-02-14T00:00:00Z".to_string(),
+            dimensions,
+        };
+
+        let body = render_decision_comment_body(
+            "example/repo",
+            615,
+            "0123456789abcdef0123456789abcdef01234567",
+            &payload,
+        )
+        .expect("render decision comment");
+
+        assert!(body.contains("<!-- apm2-review-verdict:v1 -->"));
+        assert!(body.contains("```yaml"));
+        assert!(body.contains("findings:"));
+        assert!(!body.contains("## FAC Findings"));
+        assert!(!body.contains("### security"));
+    }
+
+    #[test]
     fn partial_projection_report_stays_pending_without_fail_closed() {
         let head_sha = "0123456789abcdef0123456789abcdef01234567";
         let mut dimensions = BTreeMap::new();
@@ -1555,5 +1793,23 @@ mod tests {
         let report = build_show_report_from_record(head_sha, &record);
         assert!(report.fail_closed);
         assert!(!report.errors.is_empty());
+    }
+
+    #[test]
+    fn local_only_author_login_uses_resolved_identity() {
+        let (login, persist_identity) =
+            super::local_only_author_login_with_fallback(Ok("fac-bot".to_string()), 441);
+        assert_eq!(login, "fac-bot");
+        assert!(persist_identity);
+    }
+
+    #[test]
+    fn local_only_author_login_fallback_disables_reviewer_identity_persist() {
+        let (login, persist_identity) = super::local_only_author_login_with_fallback(
+            Err("failed to read reviewer identity".to_string()),
+            441,
+        );
+        assert_eq!(login, "fac-local-auto-verdict");
+        assert!(!persist_identity);
     }
 }
