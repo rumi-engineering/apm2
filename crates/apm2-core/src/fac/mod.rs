@@ -236,7 +236,7 @@ pub use echo_trap::{
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
-pub use gc::{GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc};
+pub use gc::{GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc, plan_quarantine_prune};
 pub use gc_receipt::{
     DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
     MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,

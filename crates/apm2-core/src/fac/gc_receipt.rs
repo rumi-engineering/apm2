@@ -98,13 +98,14 @@ pub struct GcAction {
     pub dirs_deleted: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GcActionKind {
     LaneTarget,
     LaneLog,
     GateCache,
     QuarantinePrune,
+    DeniedPrune,
     CargoCache,
 }
 
@@ -233,5 +234,7 @@ mod tests {
     fn test_gc_action_kind_serializes_snake_case() {
         let v = serde_json::to_string(&GcActionKind::QuarantinePrune).expect("serialize");
         assert_eq!(v, "\"quarantine_prune\"");
+        let denied = serde_json::to_string(&GcActionKind::DeniedPrune).expect("serialize");
+        assert_eq!(denied, "\"denied_prune\"");
     }
 }

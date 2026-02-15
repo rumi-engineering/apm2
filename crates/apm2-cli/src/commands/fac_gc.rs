@@ -1,6 +1,11 @@
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+
 use apm2_core::fac::{
-    DEFAULT_MIN_FREE_BYTES, GcActionKind, GcPlan, GcReceiptV1, LaneManager, check_disk_space,
-    execute_gc, persist_gc_receipt, plan_gc,
+    DEFAULT_MIN_FREE_BYTES, FacPolicyV1, GcActionKind, GcPlan, GcReceiptV1, LaneManager,
+    MAX_POLICY_SIZE, check_disk_space, deserialize_policy, execute_gc, persist_gc_receipt,
+    persist_policy, plan_gc,
 };
 use serde_json;
 use serde_json::json;
@@ -33,7 +38,23 @@ pub fn run_gc(args: &GcArgs) -> u8 {
 
     let fac_root = lane_manager.fac_root().to_path_buf();
 
-    let plan = match plan_gc(&fac_root, &lane_manager) {
+    let policy = match load_or_create_policy(&fac_root) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("ERROR: cannot load fac policy: {error}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    let quarantine_ttl_secs = u64::from(policy.quarantine_ttl_days).saturating_mul(24 * 3600);
+    let denied_ttl_secs = u64::from(policy.denied_ttl_days).saturating_mul(24 * 3600);
+
+    let plan = match plan_gc(
+        &fac_root,
+        &lane_manager,
+        quarantine_ttl_secs,
+        denied_ttl_secs,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("ERROR: planning failed: {error:?}");
@@ -54,7 +75,7 @@ pub fn run_gc(args: &GcArgs) -> u8 {
             for target in &plan.targets {
                 println!(
                     "{} {} {}",
-                    gc_target_kind_to_str(&target.kind),
+                    gc_target_kind_to_str(target.kind),
                     target.estimated_bytes,
                     target.path.display(),
                 );
@@ -145,7 +166,7 @@ fn gc_plan_to_json(plan: &GcPlan) -> serde_json::Value {
     for target in &plan.targets {
         entries.push(serde_json::json!({
             "path": target.path.to_string_lossy(),
-            "kind": gc_target_kind_to_str(&target.kind),
+            "kind": gc_target_kind_to_str(target.kind),
             "estimated_bytes": target.estimated_bytes,
             "allowed_parent": target.allowed_parent.to_string_lossy(),
         }));
@@ -153,12 +174,63 @@ fn gc_plan_to_json(plan: &GcPlan) -> serde_json::Value {
     serde_json::json!({ "targets": entries, "count": plan.targets.len() })
 }
 
-const fn gc_target_kind_to_str(kind: &GcActionKind) -> &'static str {
+const fn gc_target_kind_to_str(kind: GcActionKind) -> &'static str {
     match kind {
         GcActionKind::LaneTarget => "lane_target",
         GcActionKind::LaneLog => "lane_log",
         GcActionKind::GateCache => "gate_cache",
         GcActionKind::QuarantinePrune => "quarantine_prune",
+        GcActionKind::DeniedPrune => "denied_prune",
         GcActionKind::CargoCache => "cargo_cache",
     }
+}
+
+const POLICY_DIR: &str = "policy";
+const FAC_POLICY_FILE: &str = "fac_policy.v1.json";
+
+fn load_or_create_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
+    let policy_dir = fac_root.join(POLICY_DIR);
+    let policy_path = policy_dir.join(FAC_POLICY_FILE);
+
+    if policy_path.exists() {
+        let bytes = read_bounded(&policy_path, MAX_POLICY_SIZE)?;
+        deserialize_policy(&bytes).map_err(|error| format!("cannot load fac policy: {error}"))
+    } else {
+        let default_policy = FacPolicyV1::default_policy();
+        persist_policy(fac_root, &default_policy)
+            .map_err(|error| format!("cannot persist default fac policy: {error}"))?;
+        Ok(default_policy)
+    }
+}
+
+fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot stat {}: {error}", path.display()))?;
+    if metadata.len() > max_size as u64 {
+        return Err(format!(
+            "file {} exceeds max {} bytes",
+            path.display(),
+            max_size
+        ));
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let read_limit = metadata.len() as usize;
+    let mut limited_reader = file.take((max_size.saturating_add(1)) as u64);
+    let mut bytes = Vec::with_capacity(read_limit);
+    limited_reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > max_size {
+        return Err(format!(
+            "file {} exceeds max {} bytes",
+            path.display(),
+            max_size
+        ));
+    }
+
+    Ok(bytes)
 }

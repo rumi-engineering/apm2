@@ -70,8 +70,9 @@ use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 pub use crate::commands::fac_broker::{BrokerArgs, BrokerSubcommand};
+use crate::commands::fac_quarantine::QuarantineSubcommand;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
-use crate::commands::{fac_broker, fac_gc, fac_pr, fac_review};
+use crate::commands::{fac_broker, fac_gc, fac_pr, fac_quarantine, fac_review};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -247,6 +248,8 @@ pub enum FacSubcommand {
     Broker(BrokerArgs),
     /// Garbage collect stale FAC artifacts under `~/.apm2/private/fac`.
     Gc(fac_gc::GcArgs),
+    /// Manage quarantined and denied jobs.
+    Quarantine(fac_quarantine::QuarantineArgs),
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -1518,6 +1521,7 @@ pub fn run_fac(
             | FacSubcommand::Broker(_)
             | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
+            | FacSubcommand::Quarantine(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -1856,6 +1860,7 @@ pub fn run_fac(
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
+        FacSubcommand::Quarantine(args) => fac_quarantine::run_quarantine(args),
     }
 }
 
@@ -1955,6 +1960,10 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         FacSubcommand::Doctor(args) => args.json,
         FacSubcommand::Recover(args) => args.json,
         FacSubcommand::Logs(args) => args.json,
+        FacSubcommand::Quarantine(args) => match &args.subcommand {
+            QuarantineSubcommand::List(list_args) => list_args.json,
+            QuarantineSubcommand::Prune(_) => false,
+        },
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Wait(wait_args) => matches!(wait_args.format, ReviewFormatArg::Json),
             ReviewSubcommand::Status(status_args) => status_args.json,
