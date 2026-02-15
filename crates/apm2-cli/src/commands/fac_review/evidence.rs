@@ -682,6 +682,10 @@ fn attach_log_bundle_hash(
     Ok(())
 }
 
+/// Maximum bytes to read from a single log file during bundle hashing.
+/// Matches the stream cap used when writing evidence logs.
+const LOG_BUNDLE_PER_FILE_MAX_BYTES: u64 = LOG_STREAM_MAX_BYTES;
+
 fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
     let mut log_paths: Vec<PathBuf> = fs::read_dir(logs_dir)
         .map_err(|err| {
@@ -692,7 +696,16 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
         })?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file())
+        .filter(|path| {
+            // Use symlink_metadata to detect symlinks: is_file() on
+            // symlink_metadata returns true only for real regular files,
+            // never for symlinks (even those pointing to regular files).
+            // This rejects symlink-based DoS vectors (e.g., /dev/zero).
+            fs::symlink_metadata(path).is_ok_and(|meta| {
+                let ft = meta.file_type();
+                ft.is_file() && !ft.is_symlink()
+            })
+        })
         .collect();
 
     log_paths.sort_by_key(|path| path.file_name().map(std::ffi::OsStr::to_owned));
@@ -707,8 +720,25 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        let bytes = fs::read(&path)
+
+        // Bounded read: check file size before allocating, then cap with
+        // Read::take to prevent memory exhaustion from oversized files.
+        let file = fs::File::open(&path)
+            .map_err(|err| format!("failed to open evidence log file {}: {err}", path.display()))?;
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if file_size > LOG_BUNDLE_PER_FILE_MAX_BYTES {
+            return Err(format!(
+                "evidence log file {} exceeds per-file cap ({} > {} bytes)",
+                path.display(),
+                file_size,
+                LOG_BUNDLE_PER_FILE_MAX_BYTES,
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(LOG_BUNDLE_PER_FILE_MAX_BYTES)
+            .read_to_end(&mut bytes)
             .map_err(|err| format!("failed to read evidence log file {}: {err}", path.display()))?;
+
         let filename_len = u32::try_from(filename.len())
             .map_err(|_| "log filename too long for serialization".to_string())?;
         let content_len = u32::try_from(bytes.len())
