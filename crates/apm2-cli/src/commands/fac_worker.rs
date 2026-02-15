@@ -174,6 +174,7 @@ const DEFAULT_AUTHORITY_CLOCK: &str = "local";
 
 /// Outcome of processing a single job spec file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum JobOutcome {
     /// Job was quarantined due to malformed spec or digest mismatch.
     Quarantined { reason: String },
@@ -182,6 +183,9 @@ enum JobOutcome {
     /// Job was successfully claimed and executed.
     Completed { job_id: String },
     /// Job was aborted due to unrecoverable internal error.
+    /// NOTE: currently unused because cleanup failures no longer change
+    /// job outcome (BLOCKER fix for f-685-code_quality-0). Retained for
+    /// future use by execution substrate error paths.
     Aborted { reason: String },
     /// Job was skipped (already claimed or missing).
     Skipped { reason: String },
@@ -1825,6 +1829,96 @@ fn process_job(
         eprintln!("{:?}", lane_systemd_properties.to_dbus_properties());
     }
 
+    // Step 6b: Persist a RUNNING lease for this lane/job (INV-LANE-CLEANUP-001).
+    //
+    // The lane cleanup state machine in `run_lane_cleanup` requires a RUNNING
+    // lease to be present. Without it, cleanup fails its precondition and
+    // marks the lane CORRUPT, which deterministically exhausts lane capacity.
+    //
+    // Synchronization: this lease is bound to the current PID and the flock-
+    // guarded lane lock held by `_lane_guard`. Only this process can write to
+    // the lane directory while the lock is held.
+    let lane_profile_hash = lane_profile
+        .compute_hash()
+        .unwrap_or_else(|_| "b3-256:unknown".to_string());
+    let lane_lease = match LaneLeaseV1::new(
+        &acquired_lane_id,
+        &spec.job_id,
+        std::process::id(),
+        LaneState::Running,
+        &current_timestamp_epoch_secs().to_string(),
+        &lane_profile_hash,
+        &lane_profile.node_fingerprint,
+    ) {
+        Ok(lease) => lease,
+        Err(e) => {
+            let reason = format!("failed to create lane lease: {e}");
+            let moved_path = move_to_dir_safe(
+                &claimed_path,
+                &queue_root.join(DENIED_DIR),
+                &claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                budget_trace.as_ref(),
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                None,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+            return JobOutcome::Denied { reason };
+        },
+    };
+    if let Err(e) = lane_lease.persist(&lane_dir) {
+        let reason = format!("failed to persist lane lease: {e}");
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            budget_trace.as_ref(),
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
+
     // Step 7: Execute job under containment.
     //
     // For the default-mode MVP, execution validates that the job is structurally
@@ -1834,7 +1928,12 @@ fn process_job(
     //
     // We verify that the claimed file is still present and intact before
     // marking as completed.
+    //
+    // INVARIANT: A RUNNING lease is now persisted for `acquired_lane_id`.
+    // Every early return from this point MUST remove the lease via
+    // `LaneLeaseV1::remove(&lane_dir)` to prevent stale lease accumulation.
     if !claimed_path.exists() {
+        let _ = LaneLeaseV1::remove(&lane_dir);
         return JobOutcome::Skipped {
             reason: "claimed file disappeared during execution".to_string(),
         };
@@ -1842,6 +1941,7 @@ fn process_job(
 
     // Handle stop_revoke jobs: kill the target unit and cancel the target job.
     if spec.kind == "stop_revoke" {
+        let _ = LaneLeaseV1::remove(&lane_dir);
         return handle_stop_revoke(
             spec,
             &claimed_path,
@@ -1864,6 +1964,7 @@ fn process_job(
     let mirror_manager = RepoMirrorManager::new(fac_root);
     if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
         let reason = format!("mirror ensure failed: {e}");
+        let _ = LaneLeaseV1::remove(&lane_dir);
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -1905,6 +2006,7 @@ fn process_job(
         &lanes_root,
     ) {
         let reason = format!("lane workspace checkout failed: {e}");
+        let _ = LaneLeaseV1::remove(&lane_dir);
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -1937,7 +2039,11 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    let deny_with_reason = |reason: &str| -> JobOutcome {
+    // Lease-aware denial helper: removes the RUNNING lease before emitting
+    // a deny receipt and moving the job to denied/. This ensures the lane
+    // cleanup state machine never encounters a stale lease after denial.
+    let deny_with_reason_and_lease_cleanup = |reason: &str| -> JobOutcome {
+        let _ = LaneLeaseV1::remove(&lane_dir);
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -1977,18 +2083,20 @@ fn process_job(
             "patch_injection requires inline patch bytes (CAS backend not yet implemented)";
 
         let Some(patch_value) = &spec.source.patch else {
-            return deny_with_reason(inline_patch_error);
+            return deny_with_reason_and_lease_cleanup(inline_patch_error);
         };
         let Some(patch_obj) = patch_value.as_object() else {
-            return deny_with_reason(inline_patch_error);
+            return deny_with_reason_and_lease_cleanup(inline_patch_error);
         };
         let Some(bytes_b64) = patch_obj.get("bytes").and_then(|value| value.as_str()) else {
-            return deny_with_reason(inline_patch_error);
+            return deny_with_reason_and_lease_cleanup(inline_patch_error);
         };
         let patch_bytes = match STANDARD.decode(bytes_b64) {
             Ok(bytes) => bytes,
             Err(err) => {
-                return deny_with_reason(&format!("invalid base64 in patch.bytes: {err}"));
+                return deny_with_reason_and_lease_cleanup(&format!(
+                    "invalid base64 in patch.bytes: {err}"
+                ));
             },
         };
         if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
@@ -1998,7 +2106,7 @@ fn process_job(
             if expected_bytes.len() != actual_bytes.len()
                 || !bool::from(expected_bytes.ct_eq(actual_bytes))
             {
-                return deny_with_reason(&format!(
+                return deny_with_reason_and_lease_cleanup(&format!(
                     "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
                 ));
             }
@@ -2006,18 +2114,21 @@ fn process_job(
 
         let blob_store = BlobStore::new(fac_root);
         if let Err(error) = blob_store.store(&patch_bytes) {
-            return deny_with_reason(&format!("failed to store patch in blob store: {error}"));
+            return deny_with_reason_and_lease_cleanup(&format!(
+                "failed to store patch in blob store: {error}"
+            ));
         }
 
         let patch_outcome = match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
             Ok(patch_outcome) => patch_outcome,
             Err(err) => {
-                return deny_with_reason(&format!("patch apply failed: {err}"));
+                return deny_with_reason_and_lease_cleanup(&format!("patch apply failed: {err}"));
             },
         };
         patch_digest = Some(patch_outcome.patch_digest);
     } else if spec.source.kind != "mirror_commit" {
         let reason = format!("unsupported source kind: {}", spec.source.kind);
+        let _ = LaneLeaseV1::remove(&lane_dir);
         let moved_path = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(DENIED_DIR),
@@ -2073,7 +2184,7 @@ fn process_job(
                 verdict.mismatches.len(),
             );
             if !verdict.contained {
-                return deny_with_reason(&format!(
+                return deny_with_reason_and_lease_cleanup(&format!(
                     "containment verification failed: contained=false processes_checked={} mismatches={}",
                     verdict.processes_checked,
                     verdict.mismatches.len()
@@ -2085,22 +2196,18 @@ fn process_job(
         },
         Err(err) => {
             eprintln!("worker: ERROR: containment check failed: {err}");
-            return deny_with_reason(&format!("containment verification failed: {err}"));
+            return deny_with_reason_and_lease_cleanup(&format!(
+                "containment verification failed: {err}"
+            ));
         },
     };
 
-    if let Err(reason) =
-        execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
-    {
-        return match reason {
-            LaneCleanupError::CorruptMarkerPersistenceFailed { reason } => {
-                JobOutcome::Aborted { reason }
-            },
-            LaneCleanupError::CleanupFailed { reason } => deny_with_reason(&reason),
-        };
-    }
-
     // Step 9: Write authoritative GateReceipt and move to completed.
+    //
+    // BLOCKER FIX (f-685-code_quality-0): Job completion is now recorded
+    // BEFORE lane cleanup. This ensures that infrastructure failures in
+    // the cleanup phase cannot negate a successful job execution. The job
+    // outcome is decoupled from lane lifecycle management.
     let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
     let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
     let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
@@ -2133,6 +2240,7 @@ fn process_job(
         containment_trace.as_ref(),
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
+        let _ = LaneLeaseV1::remove(&lane_dir);
         if let Err(move_err) = move_to_dir_safe(
             &claimed_path,
             &queue_root.join(PENDING_DIR),
@@ -2154,9 +2262,27 @@ fn process_job(
         &queue_root.join(COMPLETED_DIR),
         &claimed_file_name,
     ) {
+        let _ = LaneLeaseV1::remove(&lane_dir);
         return JobOutcome::Skipped {
             reason: format!("move to completed failed: {e}"),
         };
+    }
+
+    // Step 10: Post-completion lane cleanup.
+    //
+    // Lane cleanup runs AFTER the job is officially completed (Step 9).
+    // Cleanup failures are logged and result in lane corruption markers,
+    // but they do NOT change the already-recorded job outcome. This
+    // decouples infrastructure lifecycle from job execution integrity.
+    if let Err(cleanup_err) =
+        execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
+    {
+        eprintln!(
+            "worker: WARNING: post-completion lane cleanup failed for {acquired_lane_id}: {cleanup_err}"
+        );
+        // Lane is already marked corrupt by execute_lane_cleanup on failure.
+        // The job outcome remains Completed — infrastructure failures do not
+        // retroactively negate successful execution.
     }
 
     // Lane guard is dropped here (RAII), releasing the lane lock.
@@ -2167,18 +2293,63 @@ fn process_job(
     }
 }
 
-/// Try to acquire a non-corrupt worker lane lock in order.
-fn is_lane_stale_recovery_eligible(lease: &LaneLeaseV1) -> bool {
-    matches!(lease.state, LaneState::Running | LaneState::Cleanup) && !is_process_alive(lease.pid)
+/// Result of a process liveness check via `kill(pid, 0)`.
+///
+/// Distinguishes three outcomes to prevent EPERM-based false negatives
+/// from causing lane reuse while a process is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    /// Process exists and is owned by the current user (kill -0 succeeded).
+    Alive,
+    /// Process does not exist (ESRCH).
+    Dead,
+    /// Process exists but is not owned by the current user (EPERM).
+    /// Treat as busy/corrupt — do NOT assume the lane is idle.
+    PermissionDenied,
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+/// Check whether a process is alive using `kill(pid, 0)` with proper
+/// errno discrimination.
+///
+/// BLOCKER FIX (f-685-code_quality-1): The previous implementation used
+/// `status.success()` which conflated ESRCH (no such process) with EPERM
+/// (operation not permitted). EPERM means the process EXISTS but belongs
+/// to a different user — treating this as "dead" could cause lane reuse
+/// while the previous process is still running.
+///
+/// This implementation uses `libc::kill` directly and checks errno:
+/// - Success (0): process is alive and we can signal it
+/// - ESRCH (3): process does not exist — safe to reclaim the lane
+/// - EPERM (1): process exists but we lack permission — NOT safe
+#[allow(unsafe_code)]
+fn check_process_liveness(pid: u32) -> ProcessLiveness {
+    // Guard against signaling pid 0 (entire process group) or negative
+    // PIDs (which signal process groups by absolute value).
+    if pid == 0 {
+        return ProcessLiveness::Dead;
+    }
+
+    // Safety: kill(pid, 0) with signal 0 performs an existence check
+    // without delivering any signal. This is a standard POSIX operation.
+    // The pid is validated above to be non-zero. The cast from u32 to
+    // i32 (pid_t) is safe because valid PIDs fit in i32; wrapping of
+    // very large u32 values would produce a negative pid_t which kill()
+    // would reject with ESRCH, which is safe (treated as dead).
+    #[allow(clippy::cast_possible_wrap)]
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+
+    if ret == 0 {
+        ProcessLiveness::Alive
+    } else {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::ESRCH {
+            ProcessLiveness::Dead
+        } else {
+            // EPERM: process exists but we lack permission to signal it.
+            // Any other errno: fail-closed — assume process may exist.
+            ProcessLiveness::PermissionDenied
+        }
+    }
 }
 
 fn acquire_worker_lane(
@@ -2212,23 +2383,64 @@ fn acquire_worker_lane(
                                 state = lease.state
                             );
                         },
-                        state @ (LaneState::Running | LaneState::Cleanup)
-                            if !is_lane_stale_recovery_eligible(&lease) =>
-                        {
-                            let reason =
-                                format!("stale lease state '{}' for pid {state}", lease.pid);
-                            eprintln!(
-                                "worker: WARNING: marking stale lease lane as corrupt: {lane_id} ({reason})"
-                            );
-                            if let Err(err) = persist_corrupt_marker_with_retries(
-                                lane_mgr.fac_root(),
-                                lane_id,
-                                &reason,
-                                None,
-                            ) {
-                                eprintln!(
-                                    "worker: ERROR: failed to persist stale-lease corrupt marker for lane {lane_id}: {err} ({reason})"
-                                );
+                        LaneState::Running | LaneState::Cleanup => {
+                            // Check process liveness with proper errno
+                            // discrimination (BLOCKER fix for EPERM vs ESRCH).
+                            match check_process_liveness(lease.pid) {
+                                ProcessLiveness::Dead => {
+                                    // Process is confirmed dead (ESRCH). Safe to
+                                    // recover this lane by removing the stale lease.
+                                    eprintln!(
+                                        "worker: stale lease recovery for lane {lane_id}: pid {} is dead, reclaiming",
+                                        lease.pid
+                                    );
+                                    let _ = LaneLeaseV1::remove(&lane_dir);
+                                    return Some((guard, lane_id.clone()));
+                                },
+                                ProcessLiveness::Alive => {
+                                    // Process is still running. We have the flock
+                                    // but the process is alive — this is unexpected
+                                    // (flock should prevent concurrent acquisition).
+                                    // Mark as corrupt to be safe.
+                                    let reason = format!(
+                                        "lane has RUNNING lease for pid {} which is still alive (unexpected with flock held)",
+                                        lease.pid
+                                    );
+                                    eprintln!(
+                                        "worker: WARNING: marking lane as corrupt: {lane_id} ({reason})"
+                                    );
+                                    if let Err(err) = persist_corrupt_marker_with_retries(
+                                        lane_mgr.fac_root(),
+                                        lane_id,
+                                        &reason,
+                                        None,
+                                    ) {
+                                        eprintln!(
+                                            "worker: ERROR: failed to persist corrupt marker for lane {lane_id}: {err}"
+                                        );
+                                    }
+                                },
+                                ProcessLiveness::PermissionDenied => {
+                                    // Process exists but we lack permission to
+                                    // signal it (EPERM). The lane is NOT idle.
+                                    // Mark as corrupt because we cannot determine
+                                    // whether the process is still using the lane.
+                                    let reason = format!(
+                                        "lane has RUNNING lease for pid {} which exists but is not signalable (EPERM), marking corrupt",
+                                        lease.pid
+                                    );
+                                    eprintln!("worker: WARNING: {lane_id}: {reason}");
+                                    if let Err(err) = persist_corrupt_marker_with_retries(
+                                        lane_mgr.fac_root(),
+                                        lane_id,
+                                        &reason,
+                                        None,
+                                    ) {
+                                        eprintln!(
+                                            "worker: ERROR: failed to persist corrupt marker for lane {lane_id}: {err}"
+                                        );
+                                    }
+                                },
                             }
                         },
                         _ => {
@@ -2417,12 +2629,28 @@ fn persist_corrupt_marker_with_retries(
     Err(last_error.unwrap_or_else(|| "failed to persist corrupt marker".to_string()))
 }
 
+/// Persist a corrupt marker with full crash-safe durability.
+///
+/// Durability chain (MAJOR FIX for f-685-code_quality-2):
+/// 1. `marker.persist()` -> `atomic_write()` which: a. Creates a temp file in
+///    the same directory b. Writes all marker data to the temp file c. Calls
+///    `file.sync_all()` to fsync the temp file data to disk d. Calls
+///    `temp.persist(target)` to atomically rename the temp file
+/// 2. This function then fsyncs the parent directory to ensure the directory
+///    entry (rename result) is committed to storage media.
+///
+/// Together, steps 1c (fsync data) + 1d (atomic rename) + 2 (fsync dir)
+/// ensure that a crash at any point either leaves no marker or leaves a
+/// complete, valid marker. The lane will never appear IDLE when it should
+/// be CORRUPT after a power loss.
 fn persist_corrupt_marker_with_durability(
     fac_root: &Path,
     marker: &LaneCorruptMarkerV1,
 ) -> Result<(), String> {
     marker.persist(fac_root).map_err(|e| e.to_string())?;
 
+    // Fsync the parent directory to ensure the rename (from atomic_write)
+    // is committed to the storage media's directory entry table.
     let lane_dir = fac_root.join("lanes").join(&marker.lane_id);
     let dir = fs::OpenOptions::new()
         .read(true)
@@ -4397,8 +4625,56 @@ mod tests {
         );
     }
 
+    /// Find a PID that is guaranteed to not exist (returns ESRCH on kill -0).
+    ///
+    /// Starts from a high PID and walks down until one is confirmed dead.
+    /// Falls back to PID 0 which `check_process_liveness` treats as Dead.
+    fn find_dead_pid() -> u32 {
+        // Walk from a high PID downward to find one that returns ESRCH.
+        // Typical Linux pid_max is 32768 or 4194304; we start well above
+        // the common range to minimize collision risk with running processes.
+        for pid_candidate in (100_000..200_000).rev() {
+            if matches!(check_process_liveness(pid_candidate), ProcessLiveness::Dead) {
+                return pid_candidate;
+            }
+        }
+        // Fallback: PID 0 is special-cased as Dead in check_process_liveness.
+        0
+    }
+
     #[test]
-    fn test_acquire_worker_lane_skips_running_lease_and_marks_corrupt() {
+    fn test_acquire_worker_lane_recovers_dead_running_lease() {
+        // When a lane has a RUNNING lease for a DEAD process, the lane
+        // should be recovered (stale lease removed) and acquired, not
+        // marked corrupt.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let dead_pid = find_dead_pid();
+        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Running, dead_pid);
+
+        let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
+        let (_guard, acquired_lane_id) =
+            acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
+        // Lane-00 should be recovered (dead process), not skipped.
+        assert_eq!(acquired_lane_id, "lane-00");
+
+        // No corrupt marker should exist — the lane was recovered.
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, "lane-00")
+                .expect("marker load")
+                .is_none(),
+            "recovered lane should NOT have a corrupt marker"
+        );
+    }
+
+    #[test]
+    fn test_acquire_worker_lane_marks_alive_running_lease_corrupt() {
+        // When a lane has a RUNNING lease for an ALIVE process (current PID),
+        // acquiring the flock is unexpected. The lane should be marked corrupt.
         let dir = tempfile::tempdir().expect("tempdir");
         let fac_root = dir.path().join("private").join("fac");
         fs::create_dir_all(&fac_root).expect("create fac root");
@@ -4412,48 +4688,40 @@ mod tests {
             acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
         assert_eq!(acquired_lane_id, "lane-01");
 
-        assert!(
-            LaneCorruptMarkerV1::load(&fac_root, "lane-00")
-                .expect("marker load")
-                .is_some(),
-            "stale running lease should be marked corrupt"
-        );
         let marker = LaneCorruptMarkerV1::load(&fac_root, "lane-00")
             .expect("marker load")
-            .expect("marker should exist");
+            .expect("marker should exist for alive-process lease");
         assert!(
-            marker.reason.contains("stale lease state") && marker.reason.contains("RUNNING"),
-            "marker reason should include stale running lease state"
+            marker.reason.contains("still alive"),
+            "marker reason should mention process is still alive, got: {}",
+            marker.reason
         );
     }
 
     #[test]
-    fn test_acquire_worker_lane_skips_cleanup_lease_and_marks_corrupt() {
+    fn test_acquire_worker_lane_recovers_dead_cleanup_lease() {
+        // When a lane has a CLEANUP lease for a DEAD process, the lane
+        // should be recovered and acquired.
         let dir = tempfile::tempdir().expect("tempdir");
         let fac_root = dir.path().join("private").join("fac");
         fs::create_dir_all(&fac_root).expect("create fac root");
         let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
         lane_mgr.ensure_directories().expect("ensure lanes");
 
-        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Cleanup, std::process::id());
+        let dead_pid = find_dead_pid();
+        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Cleanup, dead_pid);
 
         let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
         let (_guard, acquired_lane_id) =
             acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
-        assert_eq!(acquired_lane_id, "lane-01");
+        // Lane-00 should be recovered (dead process).
+        assert_eq!(acquired_lane_id, "lane-00");
 
         assert!(
             LaneCorruptMarkerV1::load(&fac_root, "lane-00")
-                .expect("load lease")
-                .is_some(),
-            "stale cleanup lease should be marked corrupt"
-        );
-        let marker = LaneCorruptMarkerV1::load(&fac_root, "lane-00")
-            .expect("marker load")
-            .expect("marker should exist");
-        assert!(
-            marker.reason.contains("stale lease state") && marker.reason.contains("CLEANUP"),
-            "marker reason should include stale cleanup lease state"
+                .expect("marker load")
+                .is_none(),
+            "recovered lane should NOT have a corrupt marker"
         );
     }
 
