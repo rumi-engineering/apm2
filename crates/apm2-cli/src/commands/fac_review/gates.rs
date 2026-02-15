@@ -8,9 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use apm2_core::fac::{
-    FacPolicyV1, LaneProfileV1, build_job_environment, compute_test_env, persist_policy,
-};
+use apm2_core::fac::{FacPolicyV1, LaneProfileV1, build_job_environment, compute_test_env};
 use sha2::{Digest, Sha256};
 
 use super::bounded_test_runner::{
@@ -667,62 +665,16 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
     Ok(())
 }
 
-/// Load or create the FAC policy from `$APM2_HOME/private/fac/policy/`.
-///
-/// If a persisted policy exists it is read and validated; otherwise the
-/// default policy is created, persisted, and returned.
+/// Load or create the FAC policy. Delegates to the shared `policy_loader`
+/// module for bounded I/O and deduplication (TCK-00526).
 fn load_or_create_gate_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
-    let policy_path = fac_root.join("policy/fac_policy.v1.json");
-    if policy_path.exists() {
-        let bytes = fs::read(&policy_path)
-            .map_err(|e| format!("cannot read FAC policy at {}: {e}", policy_path.display()))?;
-        if bytes.len() > apm2_core::fac::policy::MAX_POLICY_SIZE {
-            return Err(format!(
-                "FAC policy file exceeds max size: {} > {}",
-                bytes.len(),
-                apm2_core::fac::policy::MAX_POLICY_SIZE,
-            ));
-        }
-        apm2_core::fac::deserialize_policy(&bytes).map_err(|e| format!("invalid FAC policy: {e}"))
-    } else {
-        let default_policy = FacPolicyV1::default_policy();
-        persist_policy(fac_root, &default_policy)
-            .map_err(|e| format!("cannot persist default FAC policy: {e}"))?;
-        Ok(default_policy)
-    }
+    super::policy_loader::load_or_create_fac_policy(fac_root)
 }
 
-/// Ensure the managed `CARGO_HOME` directory exists with restrictive
-/// permissions (0o700 on Unix). This is a one-time setup for FAC-managed
-/// cargo home isolation.
+/// Ensure the managed `CARGO_HOME` directory exists. Delegates to the shared
+/// `policy_loader` module (TCK-00526).
 fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
-    if cargo_home.exists() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(cargo_home)
-            .map_err(|e| {
-                format!(
-                    "cannot create managed CARGO_HOME at {}: {e}",
-                    cargo_home.display()
-                )
-            })?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(cargo_home).map_err(|e| {
-            format!(
-                "cannot create managed CARGO_HOME at {}: {e}",
-                cargo_home.display()
-            )
-        })?;
-    }
-    Ok(())
+    super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
 
 #[cfg(test)]

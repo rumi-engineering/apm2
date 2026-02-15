@@ -243,7 +243,18 @@ impl FacPolicyV1 {
             ],
             env_allowlist_prefixes: vec![
                 "CARGO_".to_string(),
-                "RUST".to_string(),
+                // SAFETY: The previous broad "RUST" prefix admitted RUSTC_WRAPPER,
+                // enabling wrapper-controlled compiler execution that bypasses
+                // containment (TCK-00548). Specific prefixes are enumerated to
+                // cover RUSTFLAGS, RUSTDOCFLAGS, RUSTUP_*, and RUST_BACKTRACE
+                // without admitting RUSTC_WRAPPER or RUSTC (which could be
+                // spoofed). See env_denylist_prefixes for defense-in-depth.
+                "RUSTFLAGS".to_string(),
+                "RUSTDOCFLAGS".to_string(),
+                "RUSTUP_".to_string(),
+                "RUST_BACKTRACE".to_string(),
+                "RUST_LOG".to_string(),
+                "RUST_TEST_THREADS".to_string(),
                 "PATH".to_string(),
                 "HOME".to_string(),
                 "USER".to_string(),
@@ -260,6 +271,11 @@ impl FacPolicyV1 {
                 "GITHUB_TOKEN".to_string(),
                 "NPM_TOKEN".to_string(),
                 "DOCKER_".to_string(),
+                // Defense-in-depth: explicitly deny wrapper/cache injection
+                // variables even if a custom policy re-introduces a broad
+                // "RUST" allowlist prefix (TCK-00526, TCK-00548).
+                "RUSTC_WRAPPER".to_string(),
+                "SCCACHE_".to_string(),
             ],
             env_set: vec![EnvSetEntry {
                 key: "CARGO_TARGET_DIR".to_string(),
@@ -356,10 +372,12 @@ impl FacPolicyV1 {
 ///    match at least one `env_allowlist_prefixes` entry.
 /// 3. Remove any variable matching `env_denylist_prefixes` (denylist wins).
 /// 4. Remove all variables listed in `env_clear` (unconditional strip).
-/// 5. Apply `env_set` overrides (force-set specific key=value pairs).
-/// 6. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
+/// 5. Hardcoded safety: unconditionally strip `RUSTC_WRAPPER` and `SCCACHE_*`
+///    regardless of policy configuration (containment invariant, TCK-00548).
+/// 6. Apply `env_set` overrides (force-set specific key=value pairs).
+/// 7. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
 ///    the ambient environment, replace it with the managed path.
-/// 7. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
+/// 8. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
 ///
 /// The result is a deterministic `BTreeMap<String, String>` of environment
 /// variables suitable for passing to `Command::envs()` after clearing the
@@ -403,12 +421,20 @@ pub fn build_job_environment(
         env.remove(key);
     }
 
-    // Step 5: Force-set policy overrides.
+    // Step 5: Hardcoded containment safety — unconditionally strip
+    // RUSTC_WRAPPER and SCCACHE_* regardless of policy configuration.
+    // These variables enable wrapper-controlled compiler execution that
+    // bypasses cgroup containment (TCK-00548). This is a non-configurable
+    // safety invariant: even a misconfigured policy cannot re-admit them.
+    env.remove("RUSTC_WRAPPER");
+    env.retain(|key, _| !key.starts_with("SCCACHE_"));
+
+    // Step 6: Force-set policy overrides.
     for entry in &policy.env_set {
         env.insert(entry.key.clone(), entry.value.clone());
     }
 
-    // Step 6: Enforce managed CARGO_HOME when ambient is denied.
+    // Step 7: Enforce managed CARGO_HOME when ambient is denied.
     if let Some(cargo_home) = policy.resolve_cargo_home(apm2_home) {
         env.insert(
             "CARGO_HOME".to_string(),
@@ -416,7 +442,7 @@ pub fn build_job_environment(
         );
     }
 
-    // Step 7: Enforce CARGO_TARGET_DIR from policy.
+    // Step 8: Enforce CARGO_TARGET_DIR from policy.
     if let Some(ref target_dir) = policy.cargo_target_dir {
         env.insert("CARGO_TARGET_DIR".to_string(), target_dir.clone());
     }
@@ -920,5 +946,162 @@ mod tests {
         policy.cargo_home = None;
         let result = policy.resolve_cargo_home(Path::new("/home/user/.apm2"));
         assert_eq!(result, None);
+    }
+
+    // ── RUSTC_WRAPPER / SCCACHE_* denial regression tests (TCK-00526) ──
+
+    #[test]
+    fn test_default_policy_denies_rustc_wrapper_prefix() {
+        let policy = FacPolicyV1::default_policy();
+        // The "RUST" broad prefix must NOT be in allowlist — specific
+        // prefixes (RUSTFLAGS, RUSTDOCFLAGS, RUSTUP_, etc.) are used.
+        assert!(
+            !policy
+                .env_allowlist_prefixes
+                .iter()
+                .any(|p| "RUSTC_WRAPPER".starts_with(p.as_str())),
+            "RUSTC_WRAPPER must not be admitted by any allowlist prefix, got: {:?}",
+            policy.env_allowlist_prefixes
+        );
+    }
+
+    #[test]
+    fn test_default_policy_denylist_includes_rustc_wrapper_and_sccache() {
+        let policy = FacPolicyV1::default_policy();
+        assert!(
+            policy
+                .env_denylist_prefixes
+                .iter()
+                .any(|p| "RUSTC_WRAPPER".starts_with(p.as_str())),
+            "RUSTC_WRAPPER must be covered by denylist, got: {:?}",
+            policy.env_denylist_prefixes
+        );
+        assert!(
+            policy
+                .env_denylist_prefixes
+                .iter()
+                .any(|p| "SCCACHE_CACHE_SIZE".starts_with(p.as_str())),
+            "SCCACHE_* must be covered by denylist, got: {:?}",
+            policy.env_denylist_prefixes
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_strips_rustc_wrapper_from_ambient() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient = vec![
+            ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
+            ("RUSTFLAGS".to_string(), "-Copt-level=2".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert!(
+            !env.contains_key("RUSTC_WRAPPER"),
+            "RUSTC_WRAPPER must be stripped from gate environment"
+        );
+        // RUSTFLAGS should still be allowed.
+        assert_eq!(
+            env.get("RUSTFLAGS").map(String::as_str),
+            Some("-Copt-level=2")
+        );
+    }
+
+    #[test]
+    fn test_build_job_environment_strips_sccache_vars_from_ambient() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient = vec![
+            ("SCCACHE_DIR".to_string(), "/tmp/sccache".to_string()),
+            ("SCCACHE_CACHE_SIZE".to_string(), "100G".to_string()),
+            ("SCCACHE_IDLE_TIMEOUT".to_string(), "3600".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert!(
+            !env.contains_key("SCCACHE_DIR"),
+            "SCCACHE_DIR must be stripped"
+        );
+        assert!(
+            !env.contains_key("SCCACHE_CACHE_SIZE"),
+            "SCCACHE_CACHE_SIZE must be stripped"
+        );
+        assert!(
+            !env.contains_key("SCCACHE_IDLE_TIMEOUT"),
+            "SCCACHE_IDLE_TIMEOUT must be stripped"
+        );
+    }
+
+    /// Regression: Even if a custom policy re-introduces a broad "RUST"
+    /// allowlist prefix, the hardcoded safety step must still strip
+    /// `RUSTC_WRAPPER` and `SCCACHE_*`.
+    #[test]
+    fn test_build_job_environment_strips_wrapper_even_with_broad_rust_prefix() {
+        let mut policy = FacPolicyV1::default_policy();
+        // Re-introduce the broad "RUST" prefix (simulating a misconfigured
+        // custom policy).
+        policy.env_allowlist_prefixes.push("RUST".to_string());
+        // Remove RUSTC_WRAPPER from denylist to test the hardcoded safety.
+        policy
+            .env_denylist_prefixes
+            .retain(|p| p != "RUSTC_WRAPPER");
+        policy.env_denylist_prefixes.retain(|p| p != "SCCACHE_");
+
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient = vec![
+            ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
+            ("SCCACHE_DIR".to_string(), "/tmp/sccache".to_string()),
+            ("RUSTFLAGS".to_string(), "-Copt-level=2".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert!(
+            !env.contains_key("RUSTC_WRAPPER"),
+            "RUSTC_WRAPPER must be stripped by hardcoded safety even with broad RUST prefix"
+        );
+        assert!(
+            !env.contains_key("SCCACHE_DIR"),
+            "SCCACHE_DIR must be stripped by hardcoded safety"
+        );
+        // RUSTFLAGS should still pass through.
+        assert_eq!(
+            env.get("RUSTFLAGS").map(String::as_str),
+            Some("-Copt-level=2")
+        );
+    }
+
+    #[test]
+    fn test_default_policy_allowlist_admits_safe_rust_vars() {
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient = vec![
+            ("RUSTFLAGS".to_string(), "-Copt-level=2".to_string()),
+            ("RUSTDOCFLAGS".to_string(), "--cfg docsrs".to_string()),
+            ("RUSTUP_HOME".to_string(), "/home/user/.rustup".to_string()),
+            (
+                "RUSTUP_TOOLCHAIN".to_string(),
+                "nightly-2025-01-01".to_string(),
+            ),
+            ("RUST_BACKTRACE".to_string(), "1".to_string()),
+            ("RUST_LOG".to_string(), "info".to_string()),
+            ("RUST_TEST_THREADS".to_string(), "4".to_string()),
+        ];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+        assert_eq!(
+            env.get("RUSTFLAGS").map(String::as_str),
+            Some("-Copt-level=2")
+        );
+        assert_eq!(
+            env.get("RUSTDOCFLAGS").map(String::as_str),
+            Some("--cfg docsrs")
+        );
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some("/home/user/.rustup")
+        );
+        assert_eq!(
+            env.get("RUSTUP_TOOLCHAIN").map(String::as_str),
+            Some("nightly-2025-01-01")
+        );
+        assert_eq!(env.get("RUST_BACKTRACE").map(String::as_str), Some("1"));
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
+        assert_eq!(env.get("RUST_TEST_THREADS").map(String::as_str), Some("4"));
     }
 }
