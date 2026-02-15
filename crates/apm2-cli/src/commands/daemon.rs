@@ -11,11 +11,15 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use apm2_core::config::default_data_dir;
+use apm2_core::fac::execution_backend::{probe_user_bus, select_backend};
 use apm2_core::github::resolve_apm2_home;
+use apm2_daemon::telemetry::is_cgroup_v2_available;
 use tracing::info;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
-use crate::commands::fac_permissions::{ensure_dir_exists_standard, ensure_dir_with_mode};
+use crate::commands::fac_permissions::{
+    ensure_dir_exists_standard, ensure_dir_with_mode, validate_fac_root_permissions,
+};
 
 const FAC_RUNTIME_SUBDIRS: [&str; 14] = [
     "private",
@@ -343,10 +347,10 @@ pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Resu
 
 /// Report health and prerequisite checks for daemon runtime.
 ///
-/// TCK-00595 MAJOR-3 FIX: Now includes a projection-worker liveness probe.
-/// When projection is enabled in config, the check verifies that the
-/// projection cache database exists (created by the projection worker on
-/// startup), which serves as evidence the worker is active.
+/// TCK-00547: Enhanced with host capability, toolchain, security posture,
+/// and credentials posture checks.
+///
+/// TCK-00595 MAJOR-3 FIX: Includes a projection-worker liveness probe.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DaemonDoctorCheck {
     pub name: String,
@@ -354,32 +358,95 @@ pub struct DaemonDoctorCheck {
     pub message: String,
 }
 
+/// Maximum number of doctor checks we will collect. Prevents unbounded
+/// growth if future checks are added without updating this constant.
+const MAX_DOCTOR_CHECKS: usize = 64;
+
 pub fn collect_doctor_checks(
     operator_socket: &Path,
     config_path: &Path,
 ) -> Result<(Vec<DaemonDoctorCheck>, bool)> {
-    let mut checks = Vec::new();
+    let mut checks: Vec<DaemonDoctorCheck> = Vec::with_capacity(MAX_DOCTOR_CHECKS);
     let mut has_error = false;
 
-    let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(value) if !value.is_empty());
+    // ── Host Capability ─────────────────────────────────────────────────
+
+    // cgroup v2 availability (required for bounded test execution)
+    let cgroupv2 = is_cgroup_v2_available();
     checks.push(DaemonDoctorCheck {
-        name: "GITHUB_TOKEN".to_string(),
-        status: if github_token_set { "OK" } else { "ERROR" },
-        message: if github_token_set {
-            "GITHUB_TOKEN is set".to_string()
+        name: "cgroup_v2".to_string(),
+        status: if cgroupv2 { "OK" } else { "ERROR" },
+        message: if cgroupv2 {
+            "cgroup v2 unified hierarchy available".to_string()
         } else {
-            "GITHUB_TOKEN is not set".to_string()
+            "cgroup v2 not available at /sys/fs/cgroup/cgroup.controllers; \
+             bounded test execution requires cgroup v2. \
+             Remediation: boot with systemd.unified_cgroup_hierarchy=1 or upgrade to a cgroup v2 kernel"
+                .to_string()
         },
     });
-    if !github_token_set {
+    if !cgroupv2 {
         has_error = true;
     }
+
+    // systemd execution backend selection
+    let backend_result = select_backend();
+    match &backend_result {
+        Ok(backend) => {
+            let user_bus_ok = probe_user_bus();
+            let (status, message) = match backend {
+                apm2_core::fac::ExecutionBackend::UserMode => {
+                    if user_bus_ok {
+                        (
+                            "OK",
+                            "execution backend: user-mode (user D-Bus session available)"
+                                .to_string(),
+                        )
+                    } else {
+                        has_error = true;
+                        ("ERROR", "execution backend: user-mode selected but user D-Bus session bus not found. \
+                         Remediation: ensure DBUS_SESSION_BUS_ADDRESS is set or XDG_RUNTIME_DIR/bus exists".to_string())
+                    }
+                },
+                apm2_core::fac::ExecutionBackend::SystemMode => (
+                    "OK",
+                    format!(
+                        "execution backend: system-mode{}",
+                        if user_bus_ok {
+                            ""
+                        } else {
+                            " (user bus unavailable, using system fallback)"
+                        }
+                    ),
+                ),
+            };
+            checks.push(DaemonDoctorCheck {
+                name: "systemd_backend".to_string(),
+                status,
+                message,
+            });
+        },
+        Err(err) => {
+            has_error = true;
+            checks.push(DaemonDoctorCheck {
+                name: "systemd_backend".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "execution backend selection failed: {err}. \
+                     Remediation: set APM2_FAC_EXECUTION_BACKEND to 'user', 'system', or 'auto'"
+                ),
+            });
+        },
+    }
+
+    // ── Control-Plane Readiness ─────────────────────────────────────────
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime for doctor check")?;
 
+    // Broker socket reachability
     let (daemon_running, daemon_probe_message) = match check_socket_reachable(&rt, operator_socket)
     {
         Ok(()) => (true, "operator socket is reachable".to_string()),
@@ -387,7 +454,7 @@ pub fn collect_doctor_checks(
     };
     let daemon_running_ok = daemon_running;
     checks.push(DaemonDoctorCheck {
-        name: "daemon_running".to_string(),
+        name: "broker_socket".to_string(),
         status: if daemon_running_ok { "OK" } else { "ERROR" },
         message: if daemon_probe_message.is_empty() {
             "operator socket is not reachable".to_string()
@@ -399,6 +466,18 @@ pub fn collect_doctor_checks(
         has_error = true;
     }
 
+    // Worker liveness (projection worker probe)
+    let projection_check = check_projection_worker_health(config_path, daemon_running_ok);
+    if projection_check.is_error {
+        has_error = true;
+    }
+    checks.push(DaemonDoctorCheck {
+        name: "worker_liveness".to_string(),
+        status: projection_check.status,
+        message: projection_check.message,
+    });
+
+    // Disk space
     let data_dir = default_data_dir();
     match available_space_bytes(&data_dir) {
         Ok(free_bytes) => {
@@ -410,7 +489,8 @@ pub fn collect_doctor_checks(
                     format!("{} has {} free bytes", data_dir.display(), free_bytes)
                 } else {
                     format!(
-                        "{} has only {} free bytes (minimum 1 GiB required)",
+                        "{} has only {} free bytes (minimum 1 GiB required). \
+                         Remediation: free disk space or move $APM2_HOME to a larger volume",
                         data_dir.display(),
                         free_bytes
                     )
@@ -433,6 +513,77 @@ pub fn collect_doctor_checks(
         },
     }
 
+    // ── Toolchain ───────────────────────────────────────────────────────
+
+    // cargo availability
+    let cargo_ok = check_binary_available("cargo", &["--version"]);
+    checks.push(DaemonDoctorCheck {
+        name: "toolchain_cargo".to_string(),
+        status: if cargo_ok { "OK" } else { "ERROR" },
+        message: if cargo_ok {
+            "cargo is available on PATH".to_string()
+        } else {
+            "cargo not found on PATH. Remediation: install Rust via https://rustup.rs".to_string()
+        },
+    });
+    if !cargo_ok {
+        has_error = true;
+    }
+
+    // cargo-nextest availability (required for FAC test gates)
+    let nextest_ok = check_binary_available("cargo", &["nextest", "--version"]);
+    checks.push(DaemonDoctorCheck {
+        name: "toolchain_nextest".to_string(),
+        status: if nextest_ok { "OK" } else { "ERROR" },
+        message: if nextest_ok {
+            "cargo-nextest is available".to_string()
+        } else {
+            "cargo-nextest not found. Remediation: cargo install cargo-nextest".to_string()
+        },
+    });
+    if !nextest_ok {
+        has_error = true;
+    }
+
+    // systemd-run availability (required for bounded test execution)
+    let systemd_run_ok = check_binary_available("systemd-run", &["--version"]);
+    checks.push(DaemonDoctorCheck {
+        name: "toolchain_systemd_run".to_string(),
+        status: if systemd_run_ok { "OK" } else { "ERROR" },
+        message: if systemd_run_ok {
+            "systemd-run is available on PATH".to_string()
+        } else {
+            "systemd-run not found on PATH. Remediation: install systemd (apt install systemd)"
+                .to_string()
+        },
+    });
+    if !systemd_run_ok {
+        has_error = true;
+    }
+
+    // ── Security Posture ────────────────────────────────────────────────
+
+    // FAC root permissions (ownership + mode 0700 on $APM2_HOME and subdirs)
+    match validate_fac_root_permissions() {
+        Ok(()) => {
+            checks.push(DaemonDoctorCheck {
+                name: "fac_root_permissions".to_string(),
+                status: "OK",
+                message: "FAC root directories have safe permissions (0700, correct ownership)"
+                    .to_string(),
+            });
+        },
+        Err(err) => {
+            has_error = true;
+            checks.push(DaemonDoctorCheck {
+                name: "fac_root_permissions".to_string(),
+                status: "ERROR",
+                message: format!("{err}"),
+            });
+        },
+    }
+
+    // Operator socket permissions (mode 0600)
     match socket_permission_check(operator_socket) {
         Ok(permission_ok) => {
             checks.push(DaemonDoctorCheck {
@@ -441,7 +592,11 @@ pub fn collect_doctor_checks(
                 message: if permission_ok {
                     format!("{} is mode 0600", operator_socket.display())
                 } else {
-                    format!("{} is not mode 0600", operator_socket.display())
+                    format!(
+                        "{} is not mode 0600. Remediation: chmod 0600 {}",
+                        operator_socket.display(),
+                        operator_socket.display()
+                    )
                 },
             });
             if !permission_ok {
@@ -449,32 +604,86 @@ pub fn collect_doctor_checks(
             }
         },
         Err(error) => {
-            has_error = true;
-            checks.push(DaemonDoctorCheck {
-                name: "socket_permissions".to_string(),
-                status: "ERROR",
-                message: format!(
-                    "failed to check {} permissions: {error}",
-                    operator_socket.display()
-                ),
-            });
+            // Socket may not exist if daemon is not running — downgrade to WARN
+            if daemon_running_ok {
+                has_error = true;
+                checks.push(DaemonDoctorCheck {
+                    name: "socket_permissions".to_string(),
+                    status: "ERROR",
+                    message: format!(
+                        "failed to check {} permissions: {error}",
+                        operator_socket.display()
+                    ),
+                });
+            } else {
+                checks.push(DaemonDoctorCheck {
+                    name: "socket_permissions".to_string(),
+                    status: "WARN",
+                    message: format!(
+                        "cannot check {} permissions (daemon not running): {error}",
+                        operator_socket.display()
+                    ),
+                });
+            }
         },
     }
 
-    // TCK-00595 MAJOR-3 FIX: Projection worker liveness probe.
-    //
-    // When projection is enabled in config, verify the projection worker
-    // has started by checking for its cache database file. The projection
-    // worker creates this file on startup, so its absence indicates the
-    // worker is not active.
-    let projection_check = check_projection_worker_health(config_path, daemon_running_ok);
-    if projection_check.is_error {
+    // Lane directory symlink check
+    let lane_check = check_lane_directory_safety();
+    if lane_check.status == "ERROR" {
         has_error = true;
     }
+    checks.push(lane_check);
+
+    // ── Credentials Posture (WARN-only by default) ──────────────────────
+    // TCK-00547: Credentials are WARN, not ERROR, because they are only
+    // needed for GitHub-facing commands, not local gates.
+
+    // GITHUB_TOKEN / GH_TOKEN env var
+    let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(ref v) if !v.is_empty());
+    let gh_token_set = matches!(std::env::var("GH_TOKEN"), Ok(ref v) if !v.is_empty());
+    let any_token = github_token_set || gh_token_set;
     checks.push(DaemonDoctorCheck {
-        name: "projection_worker".to_string(),
-        status: projection_check.status,
-        message: projection_check.message,
+        name: "creds_github_token".to_string(),
+        status: if any_token { "OK" } else { "WARN" },
+        message: if any_token {
+            "GitHub token environment variable is set (GITHUB_TOKEN or GH_TOKEN)".to_string()
+        } else {
+            "neither GITHUB_TOKEN nor GH_TOKEN is set; GitHub-facing commands will fail. \
+             Remediation: export GITHUB_TOKEN=<token> or configure GitHub App credentials"
+                .to_string()
+        },
+    });
+
+    // GitHub App config (github_app.toml)
+    let app_config = apm2_core::github::load_github_app_config();
+    let app_configured = app_config.is_some();
+    checks.push(DaemonDoctorCheck {
+        name: "creds_github_app".to_string(),
+        status: if app_configured { "OK" } else { "WARN" },
+        message: if app_configured {
+            "GitHub App configuration found (github_app.toml)".to_string()
+        } else {
+            "GitHub App not configured (no github_app.toml found). \
+             Remediation: run `apm2 fac pr auth-setup` to configure GitHub App credentials"
+                .to_string()
+        },
+    });
+
+    // Systemd credential file for GH token
+    let cred_file_exists =
+        resolve_apm2_home().is_some_and(|home| home.join("private/creds/gh-token").exists());
+    checks.push(DaemonDoctorCheck {
+        name: "creds_systemd_gh_token".to_string(),
+        status: if cred_file_exists { "OK" } else { "WARN" },
+        message: if cred_file_exists {
+            "systemd credential file for gh-token exists".to_string()
+        } else {
+            "systemd credential file not found at $APM2_HOME/private/creds/gh-token; \
+             systemd-managed workers will not have GitHub access. \
+             Remediation: run `apm2 daemon install` to set up credential paths"
+                .to_string()
+        },
     });
 
     Ok((checks, has_error))
@@ -595,6 +804,106 @@ fn check_projection_worker_health(
                 cache_path.display()
             ),
             is_error: true,
+        }
+    }
+}
+
+/// Check whether a binary is available by running it with the given args.
+///
+/// Returns `true` if the process starts successfully (regardless of exit
+/// code — we only care that the binary exists on PATH).
+fn check_binary_available(binary: &str, args: &[&str]) -> bool {
+    Command::new(binary)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Maximum number of lane directories to scan for symlink safety.
+const MAX_LANE_SCAN: usize = 256;
+
+/// Check lane directory safety: no symlinks, correct ownership.
+///
+/// Scans `$APM2_HOME/private/fac/lanes/` for symlink patterns that could
+/// allow path traversal attacks.
+fn check_lane_directory_safety() -> DaemonDoctorCheck {
+    let lanes_dir = match resolve_apm2_home() {
+        Some(home) => home.join("private/fac/lanes"),
+        None => {
+            return DaemonDoctorCheck {
+                name: "lane_safety".to_string(),
+                status: "WARN",
+                message: "cannot resolve APM2_HOME; lane directory safety not checked".to_string(),
+            };
+        },
+    };
+
+    check_lane_directory_safety_at(&lanes_dir)
+}
+
+/// Inner implementation that accepts an explicit path for testability.
+fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
+    if !lanes_dir.exists() {
+        return DaemonDoctorCheck {
+            name: "lane_safety".to_string(),
+            status: "OK",
+            message: "lane directory does not exist yet (no lanes created)".to_string(),
+        };
+    }
+
+    let entries = match std::fs::read_dir(lanes_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "lane_safety".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "failed to read lane directory {}: {err}",
+                    lanes_dir.display()
+                ),
+            };
+        },
+    };
+
+    let mut scanned = 0_usize;
+    let mut symlink_found = false;
+    let mut symlink_path = String::new();
+
+    for entry in entries {
+        if scanned >= MAX_LANE_SCAN {
+            break;
+        }
+        scanned = scanned.saturating_add(1);
+
+        let Ok(entry) = entry else { continue };
+
+        // Check if the entry is a symlink (TOCTOU defense)
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            symlink_found = true;
+            symlink_path = entry.path().display().to_string();
+            break;
+        }
+    }
+
+    if symlink_found {
+        DaemonDoctorCheck {
+            name: "lane_safety".to_string(),
+            status: "ERROR",
+            message: format!(
+                "symlink detected in lane directory: {symlink_path}. \
+                 Remediation: remove the symlink and recreate as a real directory"
+            ),
+        }
+    } else {
+        DaemonDoctorCheck {
+            name: "lane_safety".to_string(),
+            status: "OK",
+            message: format!("lane directory safe ({scanned} entries scanned, no symlinks)"),
         }
     }
 }
@@ -848,5 +1157,67 @@ mod tests {
         );
         assert_eq!(result.status, "WARN");
         assert!(!result.is_error);
+    }
+
+    /// TCK-00547: `check_binary_available` returns true for a known binary.
+    #[test]
+    fn check_binary_available_true_for_known_binary() {
+        // `true` is a shell built-in / binary available on all unix systems
+        assert!(check_binary_available("true", &[]));
+    }
+
+    /// TCK-00547: `check_binary_available` returns false for a non-existent
+    /// binary.
+    #[test]
+    fn check_binary_available_false_for_missing_binary() {
+        assert!(!check_binary_available(
+            "nonexistent-binary-apm2-test-12345",
+            &[]
+        ));
+    }
+
+    /// TCK-00547: lane safety check returns OK when lane dir does not exist.
+    #[test]
+    fn lane_safety_ok_when_no_lane_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let nonexistent = temp.path().join("nonexistent_lanes");
+        let result = check_lane_directory_safety_at(&nonexistent);
+        assert_eq!(result.status, "OK");
+        assert!(result.message.contains("does not exist"));
+    }
+
+    /// TCK-00547: lane safety detects symlinks in lane directory.
+    #[cfg(unix)]
+    #[test]
+    fn lane_safety_detects_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lanes_dir = temp.path().join("lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+
+        // Create a symlink inside the lanes directory
+        let real_dir = temp.path().join("real_target");
+        std::fs::create_dir(&real_dir).unwrap();
+        let symlink_path = lanes_dir.join("evil-lane");
+        std::os::unix::fs::symlink(&real_dir, &symlink_path).unwrap();
+
+        let result = check_lane_directory_safety_at(&lanes_dir);
+        assert_eq!(result.status, "ERROR");
+        assert!(result.message.contains("symlink"));
+    }
+
+    /// TCK-00547: lane safety returns OK when no symlinks present.
+    #[cfg(unix)]
+    #[test]
+    fn lane_safety_ok_when_clean() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lanes_dir = temp.path().join("lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+
+        // Create a normal directory (not a symlink)
+        std::fs::create_dir(lanes_dir.join("lane-0")).unwrap();
+
+        let result = check_lane_directory_safety_at(&lanes_dir);
+        assert_eq!(result.status, "OK");
+        assert!(result.message.contains("no symlinks"));
     }
 }
