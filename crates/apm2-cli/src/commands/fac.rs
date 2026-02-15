@@ -2781,7 +2781,10 @@ fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
         if display_headers.is_empty() {
             println!("  (no receipts indexed)");
         } else {
-            println!("  {:<12} {:<44} {:<12} Timestamp", "Job ID", "Content Hash", "Outcome");
+            println!(
+                "  {:<12} {:<44} {:<12} Timestamp",
+                "Job ID", "Content Hash", "Outcome"
+            );
             println!("  {}", "-".repeat(80));
             for h in display_headers {
                 println!(
