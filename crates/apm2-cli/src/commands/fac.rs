@@ -1479,7 +1479,7 @@ impl ServiceScope {
 
 const SERVICE_SCOPES: [ServiceScope; 2] = [ServiceScope::User, ServiceScope::System];
 
-fn run_services_status(json_output: bool) -> u8 {
+fn run_services_status(_json_output: bool) -> u8 {
     let current_boot_micros = read_boot_time_micros();
     let mut services = Vec::with_capacity(SERVICES_UNIT_NAMES.len());
     let mut degraded = false;
@@ -1511,42 +1511,17 @@ fn run_services_status(json_output: bool) -> u8 {
             degraded = true;
         }
 
-        if json_output {
-            services.push(status.clone());
-        } else {
-            print_services_status_line(&status, healthy);
-            services.push(status);
-        }
+        services.push(status);
     }
 
-    if json_output {
-        let response = ServicesStatusResponse {
-            services: services.clone(),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&response) {
-            println!("{json}");
-        } else {
-            println!("{{\"services\":[]}}");
-            degraded = true;
-        }
-    } else if services.is_empty() {
-        println!("No managed FAC services configured");
-        degraded = true;
+    let response = ServicesStatusResponse {
+        services: services.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&response) {
+        println!("{json}");
     } else {
-        println!();
-        println!(
-            "Summary: {}/{} service entries healthy",
-            services
-                .iter()
-                .filter(|svc| {
-                    svc.error.is_none()
-                        && svc.load_state == "loaded"
-                        && svc.active_state == "active"
-                        && svc.enabled == "enabled"
-                })
-                .count(),
-            services.len()
-        );
+        println!("{{\"services\":[]}}");
+        degraded = true;
     }
 
     if degraded {
@@ -1700,23 +1675,6 @@ fn parse_uptime_microseconds(raw_seconds: &str) -> Option<u128> {
     )
 }
 
-fn print_services_status_line(status: &ServiceStatusResponse, healthy: bool) {
-    if let Some(error) = status.error.as_deref() {
-        println!("● {}/{}: degraded", status.unit, status.scope);
-        println!("  error:      {error}");
-        return;
-    }
-
-    let health_status = if healthy { "healthy" } else { "degraded" };
-    println!("● {} ({}) {}", status.unit, status.scope, health_status);
-    println!("  LoadState:  {}", status.load_state);
-    println!("  ActiveState:{}", status.active_state);
-    println!("  SubState:   {}", status.sub_state);
-    println!("  Enabled:    {}", status.enabled);
-    println!("  PID:        {}", status.main_pid);
-    println!("  Uptime:     {}s", status.uptime_seconds);
-}
-
 // =============================================================================
 // Command Execution
 // =============================================================================
@@ -1765,9 +1723,7 @@ pub fn run_fac(
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
-            if !machine_output {
-                eprintln!("WARNING: Could not auto-start daemon: {e}");
-            }
+            eprintln!("WARNING: Could not auto-start daemon: {e}");
         }
     }
 
@@ -1853,7 +1809,6 @@ pub fn run_fac(
                         },
                     };
                 let repo_hint = fac_review::derive_repo().ok();
-                let mut tracked_pr_warning = None;
                 let tracked_prs =
                     match fac_review::collect_tracked_pr_summaries(repo_hint.as_deref()) {
                         Ok(value) => value,
@@ -1863,51 +1818,20 @@ pub fn run_fac(
                             checks.push(crate::commands::daemon::DaemonDoctorCheck {
                                 name: "tracked_pr_summary".to_string(),
                                 status: "WARN",
-                                message: message.clone(),
+                                message,
                             });
-                            tracked_pr_warning = Some(message);
                             Vec::new()
                         },
                     };
-                if !output_json && let Some(message) = tracked_pr_warning.as_deref() {
-                    eprintln!("WARNING: {message}");
-                }
-
-                if output_json {
-                    let payload = serde_json::json!({
-                        "schema": "apm2.fac.doctor.system.v1",
-                        "checks": checks,
-                        "tracked_prs": tracked_prs,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("{:<28} {:<6} Message", "Check", "Status");
-                    println!("{}", "-".repeat(78));
-                    for check in &checks {
-                        println!("{:<28} {:<6} {}", check.name, check.status, check.message);
-                    }
-                    println!();
-                    println!("Tracked PRs");
-                    if tracked_prs.is_empty() {
-                        println!("  none");
-                    } else {
-                        for pr in &tracked_prs {
-                            println!(
-                                "  #{} {} state={} action={} active_agents={} last_activity_seconds_ago={}",
-                                pr.pr_number,
-                                pr.owner_repo,
-                                pr.lifecycle_state,
-                                pr.recommended_action.action,
-                                pr.active_agents,
-                                pr.last_activity_seconds_ago
-                                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
-                            );
-                        }
-                    }
-                }
+                let payload = serde_json::json!({
+                    "schema": "apm2.fac.doctor.system.v1",
+                    "checks": checks,
+                    "tracked_prs": tracked_prs,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
 
                 if has_critical_error {
                     exit_codes::GENERIC_ERROR
@@ -2015,9 +1939,6 @@ pub fn run_fac(
         },
         FacSubcommand::Recover(args) => {
             let output_json = resolve_json(args.json);
-            if !output_json {
-                eprintln!("DEPRECATED: use `apm2 fac doctor --pr <N> --fix` instead.");
-            }
             let repo = match derive_fac_repo_or_exit(output_json) {
                 Ok(value) => value,
                 Err(code) => return code,
@@ -2101,11 +2022,6 @@ pub fn run_fac(
             },
             ReviewSubcommand::Status(status_args) => {
                 let output_json = resolve_json(status_args.json);
-                if !output_json {
-                    eprintln!(
-                        "DEPRECATED: use `apm2 fac doctor --pr <N> --json` instead. This command will be removed in a future release."
-                    );
-                }
                 fac_review::run_status(
                     status_args.pr,
                     status_args.review_type.map(ReviewStatusTypeArg::as_str),
@@ -2392,28 +2308,10 @@ fn run_work_status(args: &WorkStatusArgs, operator_socket: &Path, json_output: b
         Ok(response) => {
             let response = fac_work_status_from_daemon(response);
 
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("Work Status");
-                println!("  Work ID:            {}", response.work_id);
-                println!("  Status:             {}", response.status);
-                if let Some(actor) = &response.actor_id {
-                    println!("  Actor ID:           {actor}");
-                }
-                if let Some(role) = &response.role {
-                    println!("  Role:               {role}");
-                }
-                if let Some(session_id) = &response.latest_episode_id {
-                    println!("  Session ID:         {session_id}");
-                }
-                if let Some(lease_id) = &response.latest_receipt_hash {
-                    println!("  Lease ID:           {lease_id}");
-                }
-            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+            );
 
             exit_codes::SUCCESS
         },
@@ -2423,6 +2321,13 @@ fn run_work_status(args: &WorkStatusArgs, operator_socket: &Path, json_output: b
 
 /// Execute the work list command.
 fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    #[derive(Debug, Serialize)]
+    struct WorkListJson<'a> {
+        claimable_only: bool,
+        total: usize,
+        items: &'a [WorkStatusResponse],
+    }
+
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2452,32 +2357,16 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
                 .map(fac_work_status_from_daemon)
                 .collect();
 
-            if json_output {
-                #[derive(Debug, Serialize)]
-                struct WorkListJson<'a> {
-                    claimable_only: bool,
-                    total: usize,
-                    items: &'a [WorkStatusResponse],
-                }
+            let output = WorkListJson {
+                claimable_only: args.claimable_only,
+                total: rows.len(),
+                items: &rows,
+            };
 
-                let output = WorkListJson {
-                    claimable_only: args.claimable_only,
-                    total: rows.len(),
-                    items: &rows,
-                };
-
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("Work List");
-                println!("  Claimable Only: {}", args.claimable_only);
-                println!("  Total:          {}", rows.len());
-                for row in &rows {
-                    println!("  - {} [{}]", row.work_id, row.status);
-                }
-            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+            );
 
             exit_codes::SUCCESS
         },
@@ -3696,40 +3585,21 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
     let filtered_count =
         summary.idle + summary.leased + summary.running + summary.cleanup + summary.corrupt;
 
-    if json_output {
-        let response = LaneStatusResponse {
-            lanes: filtered.into_iter().cloned().collect(),
-            total: filtered_count,
-            summary,
-        };
-        match serde_json::to_string_pretty(&response) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "serialization_error",
-                    &format!("Failed to serialize lane status: {e}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        }
-    } else {
-        // Human-readable table output
-        println!("{:<12} {:<10} {:<32} STARTED", "LANE", "STATE", "JOB");
-        println!("{}", "-".repeat(72));
-        for status in &filtered {
-            println!("{status}");
-        }
-        println!();
-        println!(
-            "Total: {}  (idle: {}, running: {}, leased: {}, cleanup: {}, corrupt: {})",
-            filtered_count,
-            summary.idle,
-            summary.running,
-            summary.leased,
-            summary.cleanup,
-            summary.corrupt,
-        );
+    let response = LaneStatusResponse {
+        lanes: filtered.into_iter().cloned().collect(),
+        total: filtered_count,
+        summary,
+    };
+    match serde_json::to_string_pretty(&response) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            return output_error(
+                json_output,
+                "serialization_error",
+                &format!("Failed to serialize lane status: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
     }
 
     exit_codes::SUCCESS
@@ -3831,15 +3701,12 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
     // to prevent deleting directories of a still-running process.
     if status.state == LaneState::Running && args.force {
         if let Some(pid) = status.pid {
-            if !json_output {
-                println!("Force-killing process {} for lane {}...", pid, args.lane_id);
-            }
             if !kill_process_best_effort(pid) {
                 let corrupt_reason = format!(
                     "failed to kill process {} for lane {} -- process may still be running or PID was reused",
                     pid, args.lane_id
                 );
-                persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason, json_output);
+                persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason);
                 return output_error(
                     json_output,
                     "kill_failed",
@@ -3878,18 +3745,8 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
             }) => {
                 total_files = total_files.saturating_add(files_deleted);
                 total_dirs = total_dirs.saturating_add(dirs_deleted);
-                if !json_output {
-                    println!(
-                        "  Deleted {}/{}: {} files, {} dirs",
-                        args.lane_id, subdir, files_deleted, dirs_deleted
-                    );
-                }
             },
-            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {
-                if !json_output {
-                    println!("  {}/{}: already absent", args.lane_id, subdir);
-                }
-            },
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
             Err(e) => {
                 let receipt = RefusedDeleteReceipt {
                     root: subdir_path.clone(),
@@ -3898,10 +3755,6 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
                     mark_corrupt: true,
                 };
                 refused_receipts.push(receipt);
-
-                if !json_output {
-                    eprintln!("  ERROR deleting {}/{}: {e}", args.lane_id, subdir);
-                }
             },
         }
     }
@@ -3916,29 +3769,25 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
 
         // Persist CORRUPT state to the lease file so that lane_status
         // reflects the corruption even after restart.
-        persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason, json_output);
+        persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason);
 
-        if json_output {
-            let response = serde_json::json!({
-                "lane_id": args.lane_id,
-                "status": "CORRUPT",
-                "reason": corrupt_reason,
-                "refused_receipts": refused_receipts.iter().map(|r| {
-                    serde_json::json!({
-                        "root": r.root.display().to_string(),
-                        "allowed_parent": r.allowed_parent.display().to_string(),
-                        "reason": r.reason,
-                        "mark_corrupt": r.mark_corrupt,
-                    })
-                }).collect::<Vec<_>>(),
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&response).unwrap_or_default()
-            );
-        } else {
-            eprintln!("Lane {} marked CORRUPT: {corrupt_reason}", args.lane_id);
-        }
+        let response = serde_json::json!({
+            "lane_id": args.lane_id,
+            "status": "CORRUPT",
+            "reason": corrupt_reason,
+            "refused_receipts": refused_receipts.iter().map(|r| {
+                serde_json::json!({
+                    "root": r.root.display().to_string(),
+                    "allowed_parent": r.allowed_parent.display().to_string(),
+                    "reason": r.reason,
+                    "mark_corrupt": r.mark_corrupt,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_default()
+        );
 
         return exit_codes::GENERIC_ERROR;
     }
@@ -3960,30 +3809,21 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
     // ensure_directories is idempotent (mkdir -p semantics) and only
     // creates directories that don't already exist.
     if let Err(e) = manager.ensure_directories() {
-        if !json_output {
-            eprintln!("Warning: failed to re-create lane directories: {e}");
-        }
+        eprintln!("WARNING: failed to re-create lane directories: {e}");
     }
 
     // Lock is released here when _lock_guard drops.
 
-    if json_output {
-        let response = serde_json::json!({
-            "lane_id": args.lane_id,
-            "status": "IDLE",
-            "files_deleted": total_files,
-            "dirs_deleted": total_dirs,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_default()
-        );
-    } else {
-        println!(
-            "Lane {} reset to IDLE ({} files, {} dirs deleted)",
-            args.lane_id, total_files, total_dirs
-        );
-    }
+    let response = serde_json::json!({
+        "lane_id": args.lane_id,
+        "status": "IDLE",
+        "files_deleted": total_files,
+        "dirs_deleted": total_dirs,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
 
     exit_codes::SUCCESS
 }
@@ -3994,7 +3834,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
 /// This is best-effort: if the lease write fails, a warning is printed
 /// but the overall CORRUPT error flow continues (fail-closed: the lane
 /// is already in a bad state).
-fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, json_output: bool) {
+fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
     let lane_dir = manager.lane_dir(lane_id);
     // Truncate reason to avoid exceeding string length limits.
     // Use char_indices to find a safe UTF-8 boundary instead of byte
@@ -4021,15 +3861,11 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, jso
     ) {
         Ok(lease) => {
             if let Err(e) = lease.persist(&lane_dir) {
-                if !json_output {
-                    eprintln!("  Warning: failed to persist CORRUPT lease for lane {lane_id}: {e}");
-                }
+                eprintln!("WARNING: failed to persist CORRUPT lease for lane {lane_id}: {e}");
             }
         },
         Err(e) => {
-            if !json_output {
-                eprintln!("  Warning: failed to create CORRUPT lease for lane {lane_id}: {e}");
-            }
+            eprintln!("WARNING: failed to create CORRUPT lease for lane {lane_id}: {e}");
         },
     }
 }
@@ -4350,31 +4186,22 @@ fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
     })
 }
 
-/// Output an error in the appropriate format.
-fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
-    if json_output {
-        let error = ErrorResponse {
-            error: code.to_string(),
-            message: message.to_string(),
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&error).unwrap_or_else(|_| {
-                "{\"error\":\"serialization_failure\",\"message\":\"failed to serialize error response\"}".to_string()
-            })
-        );
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "error": code,
-                "message": message,
-            }))
-            .unwrap_or_else(|_| {
-                "{\"error\":\"serialization_failure\",\"message\":\"failed to serialize error response\"}".to_string()
-            })
-        );
-    }
+/// Output an error as pretty-printed JSON to stdout.
+///
+/// TCK-00606 S12: FAC commands are JSON-only. The `json_output` parameter
+/// is retained for call-site compatibility but is always `true` at runtime.
+fn output_error(_json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
+    let error = ErrorResponse {
+        error: code.to_string(),
+        message: message.to_string(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&error).unwrap_or_else(|_| {
+            "{\"error\":\"serialization_failure\",\"message\":\"failed to serialize error response\"}"
+                .to_string()
+        })
+    );
     exit_code
 }
 

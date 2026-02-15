@@ -100,6 +100,22 @@ ticket_meta:
       unstructured eprintln, human-readable println) is a best-effort goal
       scoped to `fac` subcommands. Follow-up tickets will address residual
       text output paths in non-FAC areas of the codebase.
+
+      S4 field clarification (implementation diverges from original spec):
+        - S4(c) lane status: the implementation uses LaneStatusV1 fields
+          { lane_id, state, job_id, pid, started_at, toolchain_fingerprint,
+          lane_profile_hash, lock_held, pid_alive } which are derived from
+          lock state + lease record + PID liveness. These fields are more
+          operationally useful than the originally specified { lane_id,
+          state, pid, lease_holder, lease_expires_at, workspace_path }.
+          The struct is defined in apm2-core and shared across CLI and
+          daemon — changing field names would break the core API.
+        - S4(d) lane reset: the implementation returns { lane_id, status,
+          files_deleted, dirs_deleted } on success and { lane_id, status,
+          reason, refused_receipts } on failure/corruption. These fields
+          are more informative than the originally specified { lane_id,
+          reset, force, cleanup_result }. The implementation captures
+          actual deletion counts and refused-delete receipts for auditing.
     in_scope:
       - id: S1_GATES_JSON_AND_JSONL
         title: "`fac gates` — add --json flag to GatesArgs, stream JSONL progress by default"

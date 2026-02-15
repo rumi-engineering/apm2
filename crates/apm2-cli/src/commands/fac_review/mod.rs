@@ -480,16 +480,9 @@ pub fn run_doctor(
                     repairs_applied.extend(summary.into_doctor_repairs());
                 },
                 Err(err) => {
-                    let payload = serde_json::json!({
-                        "error": "fac_doctor_fix_failed",
-                        "message": err,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-                            "{\"error\":\"serialization_failure\"}".to_string()
-                        })
-                    );
+                    if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_failed", &err) {
+                        eprintln!("WARNING: failed to emit doctor fix error: {emit_err}");
+                    }
                     return exit_codes::GENERIC_ERROR;
                 },
             }
@@ -3441,7 +3434,7 @@ pub(super) fn dispatch_reviews_with_lifecycle(
 fn run_status_inner(
     pr_number: Option<u32>,
     review_type_filter: Option<&str>,
-    json_output: bool,
+    _json_output: bool,
 ) -> Result<bool, String> {
     let normalized_review_type = review_type_filter.map(|value| value.trim().to_ascii_lowercase());
     if let Some(value) = normalized_review_type.as_deref() {
@@ -3591,107 +3584,22 @@ fn run_status_inner(
         annotate_verdict_finalized_status_entry(entry, current_head_sha.as_deref());
     }
 
-    if json_output {
-        let payload = serde_json::json!({
-            "schema": "apm2.fac.review.status.v1",
-            "filter_pr": filter_pr,
-            "filter_review_type": normalized_review_type,
-            "fail_closed": fail_closed,
-            "entries": entries,
-            "recent_events": filtered_events,
-            "pulse_security": pulse_security,
-            "pulse_quality": pulse_quality,
-            "current_head_sha": current_head_sha,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload)
-                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-        );
-        return Ok(fail_closed);
-    }
-
-    println!("FAC Review Status");
-    if let Some(number) = filter_pr {
-        println!("  Filter PR: #{number}");
-        if let Some(review_type) = normalized_review_type.as_deref() {
-            println!("  Filter Type: {review_type}");
-        }
-        println!(
-            "  Current Head SHA: {}",
-            current_head_sha.as_deref().unwrap_or("-")
-        );
-    }
-    if entries.is_empty() {
-        println!("  Run State: no-run-state");
-    } else {
-        println!("  Run States:");
-        for entry in &entries {
-            println!(
-                "    - pr=#{} type={} state={} run_id={} seq={} head_sha={} terminal_reason={}",
-                entry["pr_number"].as_u64().unwrap_or(0),
-                entry["review_type"].as_str().unwrap_or("-"),
-                entry["state"].as_str().unwrap_or("-"),
-                entry["run_id"].as_str().unwrap_or("-"),
-                entry["sequence_number"].as_u64().unwrap_or(0),
-                entry["head_sha"].as_str().unwrap_or("-"),
-                entry["terminal_reason"].as_str().unwrap_or("-"),
-            );
-            if let Some(note) = entry["state_explanation"].as_str() {
-                println!("      note={note}");
-            }
-            if let Some(next_action) = entry["next_action"].as_str() {
-                println!("      next_action={next_action}");
-            }
-        }
-    }
-
-    println!("  Recent Events:");
-    if filtered_events.is_empty() {
-        println!("    (none)");
-    } else {
-        for event in filtered_events.iter().rev().take(20).rev() {
-            println!(
-                "    [{}] {} {} pr=#{} run_id={} event_sha={}",
-                event["ts"].as_str().unwrap_or("-"),
-                event["event"].as_str().unwrap_or("-"),
-                event["review_type"].as_str().unwrap_or("-"),
-                event["pr_number"].as_u64().unwrap_or(0),
-                event["run_id"].as_str().unwrap_or("-"),
-                event["head_sha"].as_str().unwrap_or("-"),
-            );
-        }
-    }
-    println!("  Pulse Files:");
-    if filter_pr.is_none() {
-        println!("    (set --pr to inspect PR-scoped pulse files)");
-    } else if let Some(review_type) = normalized_review_type.as_deref() {
-        let value = if review_type == "security" {
-            pulse_security
-                .as_ref()
-                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
-        } else {
-            pulse_quality
-                .as_ref()
-                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
-        };
-        println!("    {review_type}: {value}");
-    } else {
-        println!(
-            "    security: {}",
-            pulse_security
-                .as_ref()
-                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
-        );
-        println!(
-            "    quality:  {}",
-            pulse_quality
-                .as_ref()
-                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
-        );
-    }
-    println!("  Fail Closed: {}", if fail_closed { "yes" } else { "no" });
-
+    let payload = serde_json::json!({
+        "schema": "apm2.fac.review.status.v1",
+        "filter_pr": filter_pr,
+        "filter_review_type": normalized_review_type,
+        "fail_closed": fail_closed,
+        "entries": entries,
+        "recent_events": filtered_events,
+        "pulse_security": pulse_security,
+        "pulse_quality": pulse_quality,
+        "current_head_sha": current_head_sha,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+    );
     Ok(fail_closed)
 }
 
