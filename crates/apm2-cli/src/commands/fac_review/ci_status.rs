@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::types::now_iso8601;
-use super::{github_projection, projection_store};
+use super::{fenced_yaml, github_projection, projection_store};
 
 // ── Marker ───────────────────────────────────────────────────────────────────
 
@@ -122,8 +122,11 @@ impl CiStatus {
 
     /// Serialize to the YAML block used in PR comments.
     fn to_comment_body(&self) -> String {
-        let yaml = serde_yaml::to_string(self).unwrap_or_else(|_| "# serialization error\n".into());
-        format!("<!-- {STATUS_MARKER} -->\n```yaml\n# {STATUS_MARKER}\n{yaml}```\n")
+        fenced_yaml::render_marked_yaml_comment(STATUS_MARKER, self).unwrap_or_else(|_| {
+            format!(
+                "<!-- {STATUS_MARKER} -->\n```yaml\n# {STATUS_MARKER}\nerror: serialization_failure\n```\n"
+            )
+        })
     }
 }
 
@@ -291,7 +294,7 @@ impl ThrottledUpdater {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{fenced_yaml, *};
 
     // ── CiStatus data model ─────────────────────────────────────────────
 
@@ -363,9 +366,8 @@ mod tests {
         s.set_result("clippy", false, 30);
 
         let body = s.to_comment_body();
-        let start = body.find("```yaml\n").expect("yaml block start") + "```yaml\n".len();
-        let end = body[start..].find("\n```").expect("yaml block end") + start;
-        let yaml_payload = &body[start..end];
+        let yaml_payload =
+            fenced_yaml::parse::extract_fenced_yaml(&body).expect("yaml block payload");
         let yaml_str = yaml_payload
             .strip_prefix("# apm2-ci-status:v1\n")
             .unwrap_or(yaml_payload);

@@ -16,9 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use super::dispatch::dispatch_single_review;
 use super::evidence::{
-    EvidenceGateResult, LANE_EVIDENCE_GATES, run_evidence_gates, run_evidence_gates_with_status,
+    EvidenceGateOptions, EvidenceGateResult, LANE_EVIDENCE_GATES, run_evidence_gates,
+    run_evidence_gates_with_status,
 };
 use super::gate_cache::GateCache;
+use super::jsonl::{
+    GateCompletedEvent, GateErrorEvent, StageEvent, emit_jsonl, read_log_error_hint, ts_now,
+};
 use super::projection::{GateResult, sync_gate_status_to_pr};
 use super::types::{
     DispatchReviewResult, ReviewKind, apm2_home_dir, ensure_parent_dir, now_iso8601,
@@ -136,19 +140,19 @@ fn parse_commit_history(raw: &str) -> Vec<CommitSummary> {
 fn resolve_commit_history_base_ref(remote: &str) -> Result<String, String> {
     let candidate = format!("{remote}/main");
     let candidate_commit = format!("{candidate}^{{commit}}");
-    let remote_status = Command::new("git")
+    let remote_probe = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", &candidate_commit])
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve commit history base ref: {err}"))?;
-    if remote_status.success() {
+    if remote_probe.status.success() {
         return Ok(candidate);
     }
 
-    let local_status = Command::new("git")
+    let local_probe = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", "main^{commit}"])
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve commit history base ref: {err}"))?;
-    if local_status.success() {
+    if local_probe.status.success() {
         return Ok("main".to_string());
     }
 
@@ -385,6 +389,7 @@ fn run_blocking_evidence_gates(
     sha: &str,
     owner_repo: &str,
     pr_number: Option<u32>,
+    emit_human_logs: bool,
 ) -> Result<Vec<EvidenceGateResult>, String> {
     run_blocking_evidence_gates_with(
         workspace_root,
@@ -393,9 +398,28 @@ fn run_blocking_evidence_gates(
         pr_number,
         |workspace_root, sha, owner_repo, pr_number| {
             pr_number.map_or_else(
-                || run_evidence_gates(workspace_root, sha, None, None),
+                || {
+                    let opts = EvidenceGateOptions {
+                        test_command: None,
+                        test_command_environment: Vec::new(),
+                        env_remove_keys: Vec::new(),
+                        skip_test_gate: false,
+                        skip_merge_conflict_gate: false,
+                        emit_human_logs,
+                        on_gate_progress: None,
+                    };
+                    run_evidence_gates(workspace_root, sha, None, Some(&opts))
+                },
                 |pr_number| {
-                    run_evidence_gates_with_status(workspace_root, sha, owner_repo, pr_number, None)
+                    run_evidence_gates_with_status(
+                        workspace_root,
+                        sha,
+                        owner_repo,
+                        pr_number,
+                        None,
+                        emit_human_logs,
+                        None,
+                    )
                 },
             )
         },
@@ -802,6 +826,7 @@ where
 #[derive(Debug, Clone, Serialize)]
 struct PushSummary {
     schema: String,
+    status: String,
     repo: String,
     remote: String,
     branch: String,
@@ -810,13 +835,16 @@ struct PushSummary {
     identity_persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dispatch_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 const PUSH_ATTEMPT_SCHEMA: &str = "apm2.fac.push_attempt.v1";
 const PUSH_STAGE_PASS: &str = "pass";
 const PUSH_STAGE_FAIL: &str = "fail";
 const PUSH_STAGE_SKIPPED: &str = "skipped";
-const ERROR_HINT_MAX_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PushAttemptStage {
@@ -1080,21 +1108,7 @@ fn stage_from_gate_name(gate_name: &str) -> &'static str {
 }
 
 fn normalize_error_hint(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut hint = trimmed
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(trimmed)
-        .trim()
-        .to_string();
-    if hint.chars().count() > ERROR_HINT_MAX_CHARS {
-        hint = hint.chars().take(ERROR_HINT_MAX_CHARS).collect();
-    }
-    Some(hint)
+    super::jsonl::normalize_error_hint(value)
 }
 
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
@@ -1189,10 +1203,7 @@ fn gate_log_path(gate_name: &str) -> Result<PathBuf, String> {
 
 fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
     let path = gate_log_path(gate_name).ok()?;
-    let mut file = super::evidence::open_nofollow(&path).ok()?;
-    let mut content = String::new();
-    std::io::Read::read_to_string(&mut file, &mut content).ok()?;
-    normalize_error_hint(&content)
+    read_log_error_hint(&path)
 }
 
 /// Resolve a failure hint from the per-gate evidence result's exact log path,
@@ -1201,13 +1212,8 @@ fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
 /// job's log file.
 fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     if let Some(ref log_path) = result.log_path {
-        if let Ok(mut file) = super::evidence::open_nofollow(log_path) {
-            let mut content = String::new();
-            if std::io::Read::read_to_string(&mut file, &mut content).is_ok() {
-                if let Some(hint) = normalize_error_hint(&content) {
-                    return Some(hint);
-                }
-            }
+        if let Some(hint) = read_log_error_hint(log_path) {
+            return Some(hint);
         }
     }
     // Fallback: global discovery across all lane/job directories.
@@ -1224,16 +1230,14 @@ pub fn run_push(
     macro_rules! emit_machine_error {
         ($error:expr, $message:expr) => {{
             if json_output {
-                let payload = serde_json::json!({
-                    "error": $error,
-                    "message": $message,
+                let _ = emit_jsonl(&StageEvent {
+                    event: "push_error".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "error": $error,
+                        "message": $message,
+                    }),
                 });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-                        "{\"error\":\"serialization_failure\"}".to_string()
-                    })
-                );
             }
         }};
     }
@@ -1245,6 +1249,16 @@ pub fn run_push(
             }
         }};
     }
+
+    let emit_stage = |event: &str, extra: serde_json::Value| {
+        if json_output {
+            let _ = emit_jsonl(&StageEvent {
+                event: event.to_string(),
+                ts: ts_now(),
+                extra,
+            });
+        }
+    };
 
     // Resolve branch name.
     let branch = if let Some(b) = branch {
@@ -1275,9 +1289,47 @@ pub fn run_push(
         },
     };
 
+    emit_stage(
+        "push_started",
+        serde_json::json!({
+            "repo": repo,
+            "remote": remote,
+            "branch": branch.as_str(),
+            "sha": sha.as_str(),
+        }),
+    );
     human_log!("fac push: sha={sha} branch={branch}");
     let mut attempt = PushAttemptRecord::new(&sha);
     let mut attempt_pr_number = find_existing_pr(repo, &branch);
+    let emit_push_summary = |status: &str,
+                             pr_number: u32,
+                             identity_persisted: bool,
+                             dispatch_warning: Option<&str>,
+                             error: Option<&str>,
+                             message: Option<&str>| {
+        if !json_output {
+            return;
+        }
+        let payload = PushSummary {
+            schema: "apm2.fac.push.summary.v1".to_string(),
+            status: status.to_string(),
+            repo: repo.to_string(),
+            remote: remote.to_string(),
+            branch: branch.clone(),
+            pr_number,
+            head_sha: sha.clone(),
+            identity_persisted,
+            dispatch_warning: dispatch_warning.map(ToString::to_string),
+            error: error.map(ToString::to_string),
+            message: message.map(ToString::to_string),
+        };
+        let extra = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+        let _ = emit_jsonl(&StageEvent {
+            event: "push_summary".to_string(),
+            ts: ts_now(),
+            extra,
+        });
+    };
 
     macro_rules! finish_with_attempt {
         ($code:expr) => {{
@@ -1285,15 +1337,23 @@ pub fn run_push(
                 human_log!("WARNING: failed to append push attempt log: {err}");
             }
             if json_output && $code != exit_codes::SUCCESS {
-                let payload = serde_json::json!({
-                    "error": "fac_push_failed",
-                    "message": "fac push failed",
+                let _ = emit_jsonl(&StageEvent {
+                    event: "push_error".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "error": "fac_push_failed",
+                        "message": "fac push failed",
+                    }),
                 });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-                        "{\"error\":\"serialization_failure\"}".to_string()
-                    })
+            }
+            if $code != exit_codes::SUCCESS {
+                emit_push_summary(
+                    "fail",
+                    attempt_pr_number,
+                    false,
+                    None,
+                    Some("fac_push_failed"),
+                    Some("fac push failed"),
                 );
             }
             return $code;
@@ -1303,15 +1363,23 @@ pub fn run_push(
                 human_log!("WARNING: failed to append push attempt log: {err}");
             }
             if json_output && $code != exit_codes::SUCCESS {
-                let payload = serde_json::json!({
-                    "error": $error,
-                    "message": $message,
+                let _ = emit_jsonl(&StageEvent {
+                    event: "push_error".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "error": $error,
+                        "message": $message,
+                    }),
                 });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-                        "{\"error\":\"serialization_failure\"}".to_string()
-                    })
+            }
+            if $code != exit_codes::SUCCESS {
+                emit_push_summary(
+                    "fail",
+                    attempt_pr_number,
+                    false,
+                    None,
+                    Some($error),
+                    Some($message.as_ref()),
                 );
             }
             return $code;
@@ -1374,16 +1442,33 @@ pub fn run_push(
         .output();
     match push_output {
         Ok(o) if o.status.success() => {
-            attempt.set_stage_pass("git_push", git_push_started.elapsed().as_secs());
+            let duration_secs = git_push_started.elapsed().as_secs();
+            attempt.set_stage_pass("git_push", duration_secs);
+            emit_stage(
+                "git_push_completed",
+                serde_json::json!({
+                    "status": "pass",
+                    "duration_secs": duration_secs,
+                }),
+            );
             human_log!("fac push: git push --force succeeded");
         },
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
+            let duration_secs = git_push_started.elapsed().as_secs();
             attempt.set_stage_fail(
                 "git_push",
-                git_push_started.elapsed().as_secs(),
+                duration_secs,
                 o.status.code(),
                 normalize_error_hint(&stderr),
+            );
+            emit_stage(
+                "git_push_completed",
+                serde_json::json!({
+                    "status": "fail",
+                    "duration_secs": duration_secs,
+                    "error": stderr.trim(),
+                }),
             );
             fail_with_attempt!(
                 "fac_push_git_push_failed",
@@ -1391,11 +1476,20 @@ pub fn run_push(
             );
         },
         Err(e) => {
+            let duration_secs = git_push_started.elapsed().as_secs();
             attempt.set_stage_fail(
                 "git_push",
-                git_push_started.elapsed().as_secs(),
+                duration_secs,
                 None,
                 normalize_error_hint(&e.to_string()),
+            );
+            emit_stage(
+                "git_push_completed",
+                serde_json::json!({
+                    "status": "error",
+                    "duration_secs": duration_secs,
+                    "error": e.to_string(),
+                }),
             );
             fail_with_attempt!(
                 "fac_push_git_push_exec_failed",
@@ -1426,28 +1520,79 @@ pub fn run_push(
     let existing_pr_number = find_existing_pr(repo, &branch);
     attempt_pr_number = existing_pr_number;
     human_log!("fac push: running evidence gates (blocking, cache-aware)");
+    emit_stage("gates_started", serde_json::json!({}));
     let gates_started = Instant::now();
     let gate_results = match run_blocking_evidence_gates(
         &worktree_dir,
         &sha,
         repo,
         (existing_pr_number > 0).then_some(existing_pr_number),
+        !json_output,
     ) {
         Ok(results) => {
             for gate in &results {
                 let stage = stage_from_gate_name(&gate.gate_name);
+                let log_path = gate
+                    .log_path
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string);
+                let error_hint = if gate.passed {
+                    None
+                } else {
+                    gate_error_hint_from_result(gate).or_else(|| {
+                        normalize_error_hint(&format!("gate {} failed", gate.gate_name))
+                    })
+                };
                 if gate.passed {
                     attempt.set_stage_pass(stage, gate.duration_secs);
                 } else {
-                    let hint = gate_error_hint_from_result(gate).or_else(|| {
-                        normalize_error_hint(&format!("gate {} failed", gate.gate_name))
+                    attempt.set_stage_fail(stage, gate.duration_secs, None, error_hint.clone());
+                }
+                if json_output {
+                    let status = if gate.passed { "pass" } else { "fail" }.to_string();
+                    let _ = emit_jsonl(&GateCompletedEvent {
+                        event: "gate_completed",
+                        gate: gate.gate_name.clone(),
+                        status,
+                        duration_secs: gate.duration_secs,
+                        log_path: log_path.clone(),
+                        bytes_written: gate.bytes_written,
+                        bytes_total: gate.bytes_total,
+                        was_truncated: gate.was_truncated,
+                        log_bundle_hash: gate.log_bundle_hash.clone(),
+                        error_hint: error_hint.clone(),
+                        ts: ts_now(),
                     });
-                    attempt.set_stage_fail(stage, gate.duration_secs, None, hint);
+                    if !gate.passed {
+                        let _ = emit_jsonl(&GateErrorEvent {
+                            event: "gate_error",
+                            gate: gate.gate_name.clone(),
+                            error: error_hint
+                                .clone()
+                                .unwrap_or_else(|| "gate failed".to_string()),
+                            log_path,
+                            duration_secs: Some(gate.duration_secs),
+                            bytes_written: gate.bytes_written,
+                            bytes_total: gate.bytes_total,
+                            was_truncated: gate.was_truncated,
+                            log_bundle_hash: gate.log_bundle_hash.clone(),
+                            ts: ts_now(),
+                        });
+                    }
                 }
             }
             results
         },
         Err(err) => {
+            emit_stage(
+                "gates_completed",
+                serde_json::json!({
+                    "passed": false,
+                    "duration_secs": gates_started.elapsed().as_secs(),
+                    "error": err.as_str(),
+                }),
+            );
             let mut mapped_any = false;
             if let Some(cache) = GateCache::load(&sha) {
                 for (gate_name, gate_result) in cache.gates {
@@ -1460,12 +1605,65 @@ pub fn run_push(
                             .or_else(|| normalize_error_hint(&format!("gate {gate_name} failed")));
                         attempt.set_stage_fail(stage, gate_result.duration_secs, None, hint);
                     }
+                    if json_output {
+                        let normalized_status = gate_result.status.to_ascii_lowercase();
+                        let log_path = gate_result.log_path.clone();
+                        let error_hint = if gate_result.status.eq_ignore_ascii_case("PASS") {
+                            None
+                        } else {
+                            gate_result.log_path.as_deref().and_then(|path| {
+                                read_log_error_hint(std::path::Path::new(path))
+                                    .or_else(|| latest_gate_error_hint(&gate_name))
+                            })
+                        };
+                        let _ = emit_jsonl(&GateCompletedEvent {
+                            event: "gate_completed",
+                            gate: gate_name.clone(),
+                            status: normalized_status,
+                            duration_secs: gate_result.duration_secs,
+                            log_path: log_path.clone(),
+                            bytes_written: gate_result.bytes_written,
+                            bytes_total: gate_result.bytes_total,
+                            was_truncated: gate_result.was_truncated,
+                            log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                            error_hint: error_hint.clone(),
+                            ts: ts_now(),
+                        });
+                        if gate_result.status.eq_ignore_ascii_case("FAIL") {
+                            let _ = emit_jsonl(&GateErrorEvent {
+                                event: "gate_error",
+                                gate: gate_name.clone(),
+                                error: error_hint.unwrap_or_else(|| "gate failed".to_string()),
+                                log_path,
+                                duration_secs: Some(gate_result.duration_secs),
+                                bytes_written: gate_result.bytes_written,
+                                bytes_total: gate_result.bytes_total,
+                                was_truncated: gate_result.was_truncated,
+                                log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                                ts: ts_now(),
+                            });
+                        }
+                    }
                 }
             }
             if !mapped_any {
                 let duration = gates_started.elapsed().as_secs();
                 for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
                     attempt.set_stage_fail(stage, duration, None, normalize_error_hint(&err));
+                }
+                if json_output {
+                    let _ = emit_jsonl(&GateErrorEvent {
+                        event: "gate_error",
+                        gate: "unknown".to_string(),
+                        error: normalize_error_hint(&err).unwrap_or_else(|| err.clone()),
+                        log_path: None,
+                        duration_secs: Some(duration),
+                        bytes_written: None,
+                        bytes_total: None,
+                        was_truncated: None,
+                        log_bundle_hash: None,
+                        ts: ts_now(),
+                    });
                 }
             }
             if existing_pr_number > 0 {
@@ -1503,6 +1701,13 @@ pub fn run_push(
             fail_with_attempt!("fac_push_gates_failed", err);
         },
     };
+    emit_stage(
+        "gates_completed",
+        serde_json::json!({
+            "passed": true,
+            "duration_secs": gates_started.elapsed().as_secs(),
+        }),
+    );
     human_log!("fac push: evidence gates PASSED");
 
     // Step 3: create or update PR.
@@ -1548,6 +1753,13 @@ pub fn run_push(
         pr_number
     };
     attempt_pr_number = pr_number;
+    emit_stage(
+        "pr_updated",
+        serde_json::json!({
+            "pr_number": pr_number,
+            "url": format!("https://github.com/{repo}/pull/{pr_number}"),
+        }),
+    );
 
     if let Err(err) = lifecycle::apply_event(
         repo,
@@ -1611,6 +1823,7 @@ pub fn run_push(
     // publication and gate validation; reviewer liveness and retry are handled
     // by restart/recover lifecycle surfaces.
     let dispatch_started = Instant::now();
+    emit_stage("dispatch_started", serde_json::json!({}));
     let dispatch_warning = if let Err(e) = dispatch_reviews_with(
         repo,
         pr_number,
@@ -1633,6 +1846,14 @@ pub fn run_push(
         None
     };
     let has_dispatch_warning = dispatch_warning.is_some();
+    emit_stage(
+        "dispatch_completed",
+        serde_json::json!({
+            "status": if has_dispatch_warning { "warn" } else { "pass" },
+            "duration_secs": dispatch_started.elapsed().as_secs(),
+            "warning": dispatch_warning.as_deref(),
+        }),
+    );
 
     // Step 7: persist projection identity only after gates + dispatch attempt.
     let mut identity_persisted = false;
@@ -1646,22 +1867,14 @@ pub fn run_push(
         identity_persisted = true;
     }
 
-    if json_output {
-        let payload = PushSummary {
-            schema: "apm2.fac.push.summary.v1".to_string(),
-            repo: repo.to_string(),
-            remote: remote.to_string(),
-            branch,
-            pr_number,
-            head_sha: sha,
-            identity_persisted,
-            dispatch_warning,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-        );
-    }
+    emit_push_summary(
+        "pass",
+        pr_number,
+        identity_persisted,
+        dispatch_warning.as_deref(),
+        None,
+        None,
+    );
 
     if let Err(err) = append_push_attempt_record(repo, pr_number, &attempt) {
         human_log!("WARNING: failed to append push attempt log: {err}");

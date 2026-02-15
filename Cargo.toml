@@ -71,7 +71,7 @@ nix = { version = "0.30", features = ["signal", "process", "fs", "dir", "term", 
 wait-timeout = "0.2"
 directories = "6"
 humantime = "2.1"
-ctrlc = "3.4"
+ctrlc = { version = "3.4", features = ["termination"] }
 regex = "1.10"
 once_cell = "1.19"
 sysinfo = "0.31"

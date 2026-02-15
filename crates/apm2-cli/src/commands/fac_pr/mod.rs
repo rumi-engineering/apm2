@@ -24,19 +24,16 @@ struct PrErrorResponse {
     message: String,
 }
 
-fn output_pr_error(json_output: bool, code: &str, message: &str) {
-    if json_output {
-        let resp = PrErrorResponse {
-            error: code.to_string(),
-            message: message.to_string(),
-        };
-        eprintln!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        eprintln!("Error: {message}");
-    }
+fn output_pr_error(_json_output: bool, code: &str, message: &str) {
+    let resp = PrErrorResponse {
+        error: code.to_string(),
+        message: message.to_string(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&resp)
+            .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+    );
 }
 
 // ── CLI argument types ─────────────────────────────────────────────────────
@@ -62,6 +59,10 @@ pub struct PrAuthCheckCliArgs {
     /// Repository in owner/repo format.
     #[arg(long, default_value = "guardian-intelligence/apm2")]
     pub repo: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -90,14 +91,19 @@ pub struct PrAuthSetupCliArgs {
     /// Keep the source key file instead of deleting it.
     #[arg(long, default_value_t = false)]
     pub keep_private_key_file: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 
 /// Dispatch `apm2 fac pr` subcommands.
-pub fn run_pr(args: &PrArgs, json_output: bool) -> u8 {
+pub fn run_pr(args: &PrArgs, parent_json_output: bool) -> u8 {
+    let resolve_json = |subcommand_json: bool| -> bool { parent_json_output || subcommand_json };
     match &args.subcommand {
-        PrSubcommand::AuthCheck(a) => auth_check::run_pr_auth_check(&a.repo, json_output),
-        PrSubcommand::AuthSetup(a) => auth_setup::run_pr_auth_setup(a, json_output),
+        PrSubcommand::AuthCheck(a) => auth_check::run_pr_auth_check(&a.repo, resolve_json(a.json)),
+        PrSubcommand::AuthSetup(a) => auth_setup::run_pr_auth_setup(a, resolve_json(a.json)),
     }
 }
