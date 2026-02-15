@@ -228,6 +228,14 @@ pub enum FacSubcommand {
     /// atomically claims and executes valid jobs.
     Worker(WorkerArgs),
 
+    /// Job lifecycle management (cancel).
+    ///
+    /// Provides cancellation semantics for pending, claimed, and running jobs.
+    /// Cancelling a pending job moves it to `cancelled/` with a receipt.
+    /// Cancelling a claimed/running job enqueues a `stop_revoke` job that
+    /// kills the active systemd unit and marks the target job cancelled.
+    Job(JobArgs),
+
     /// GitHub App credential management and PR operations.
     ///
     /// Provides `auth-setup` for bootstrapping credentials and
@@ -540,6 +548,41 @@ pub struct WorkerArgs {
     /// Print computed systemd unit properties for each selected job.
     #[arg(long, default_value_t = false)]
     pub print_unit: bool,
+}
+
+/// Arguments for `apm2 fac job`.
+#[derive(Debug, Args)]
+pub struct JobArgs {
+    #[command(subcommand)]
+    pub subcommand: JobSubcommand,
+}
+
+/// Job lifecycle subcommands.
+#[derive(Debug, Subcommand)]
+pub enum JobSubcommand {
+    /// Cancel a pending, claimed, or running job.
+    ///
+    /// If the job is pending: atomically moves it to `cancelled/` and emits a
+    /// cancellation receipt.
+    ///
+    /// If the job is claimed or running: enqueues a highest-priority
+    /// `stop_revoke` job that kills the active systemd unit
+    /// (`KillMode=control-group`) and moves the target job to `cancelled/`.
+    ///
+    /// Cancellation never deletes evidence or logs; it only stops execution
+    /// and writes receipts.
+    Cancel(CancelArgs),
+}
+
+/// Arguments for `apm2 fac job cancel`.
+#[derive(Debug, Args)]
+pub struct CancelArgs {
+    /// The job ID to cancel.
+    pub job_id: String,
+
+    /// Reason for cancellation (recorded in receipt).
+    #[arg(long, default_value = "operator-initiated cancellation")]
+    pub reason: String,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -1523,6 +1566,7 @@ pub fn run_fac(
             | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
             | FacSubcommand::Quarantine(_)
+            | FacSubcommand::Job(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -1939,6 +1983,11 @@ pub fn run_fac(
             json_output,
             args.print_unit,
         ),
+        FacSubcommand::Job(args) => match &args.subcommand {
+            JobSubcommand::Cancel(cancel_args) => {
+                crate::commands::fac_job::run_cancel(cancel_args, json_output)
+            },
+        },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
@@ -1991,7 +2040,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Restart(_)
         | FacSubcommand::Worker(_)
         | FacSubcommand::Pipeline(_)
-        | FacSubcommand::Pr(_) => false,
+        | FacSubcommand::Pr(_)
+        | FacSubcommand::Job(_) => false,
     }
 }
 

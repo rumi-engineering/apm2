@@ -58,8 +58,21 @@ pub const MAX_JOB_SPEC_SIZE: usize = 65_536;
 /// Digest prefix for BLAKE3-256 hashes.
 const B3_256_PREFIX: &str = "b3-256:";
 
-const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control"];
+const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control", "stop_revoke"];
 const VALID_SOURCE_KINDS: &[&str] = &["mirror_commit", "patch_injection"];
+
+/// Audited policy exception marker: `stop_revoke` jobs bypass RFC-0028 channel
+/// context token and RFC-0029 queue admission.
+///
+/// **Justification**: Control-lane cancellation originates from the local
+/// operator (same trust domain) and requires filesystem-level access proof
+/// (queue directory ownership).  A broker-issued token adds no authority
+/// beyond what filesystem capability already provides.  All structural and
+/// digest validation is still enforced; only the token requirement is waived.
+///
+/// See [`validate_job_spec_control_lane`] for the full policy exception
+/// documentation.
+pub const CONTROL_LANE_EXCEPTION_AUDITED: bool = true;
 
 /// Maps job kind to RFC-0029 budget admission keys.
 #[must_use]
@@ -67,7 +80,7 @@ pub fn job_kind_to_budget_key(kind: &str) -> (RiskTier, BoundaryIntentClass) {
     match kind {
         "gates" | "warm" => (RiskTier::Tier0, BoundaryIntentClass::Actuate),
         "bulk" => (RiskTier::Tier1, BoundaryIntentClass::Actuate),
-        "control" => (RiskTier::Tier1, BoundaryIntentClass::Govern),
+        "control" | "stop_revoke" => (RiskTier::Tier1, BoundaryIntentClass::Govern),
         _ => (RiskTier::Tier2Plus, BoundaryIntentClass::Actuate),
     }
 }
@@ -294,7 +307,7 @@ pub struct FacJobSpecV1 {
     /// Computed with `actuation.channel_context_token = null`.
     pub job_spec_digest: String,
 
-    /// Job kind: `"gates"`, `"warm"`, `"bulk"`, `"control"`.
+    /// Job kind: `"gates"`, `"warm"`, `"bulk"`, `"control"`, `"stop_revoke"`.
     pub kind: String,
 
     /// RFC-0029 queue lane for admission/scheduling.
@@ -317,6 +330,11 @@ pub struct FacJobSpecV1 {
 
     /// Execution constraints.
     pub constraints: JobConstraints,
+
+    /// For `stop_revoke` jobs: the job ID of the target job to cancel.
+    /// MUST be present when `kind == "stop_revoke"`, absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_target_job_id: Option<String>,
 }
 
 impl FacJobSpecV1 {
@@ -398,6 +416,15 @@ impl FacJobSpecV1 {
             }
         }
 
+        self.validate_field_lengths()?;
+        self.validate_temporal_and_priority()?;
+        self.validate_cancel_target()?;
+
+        Ok(())
+    }
+
+    /// Validates field length bounds for all string fields.
+    fn validate_field_lengths(&self) -> Result<(), JobSpecError> {
         check_length("job_id", &self.job_id, MAX_JOB_ID_LENGTH)?;
         check_length("kind", &self.kind, MAX_KIND_LENGTH)?;
         check_length("queue_lane", &self.queue_lane, MAX_QUEUE_LANE_LENGTH)?;
@@ -428,6 +455,11 @@ impl FacJobSpecV1 {
             &self.source.head_sha,
             MAX_HEAD_SHA_LENGTH,
         )?;
+        Ok(())
+    }
+
+    /// Validates temporal format and priority bounds.
+    fn validate_temporal_and_priority(&self) -> Result<(), JobSpecError> {
         if self.enqueue_time.len() < 20 || !self.enqueue_time.contains('T') {
             return Err(JobSpecError::InvalidFormat {
                 field: "enqueue_time",
@@ -440,7 +472,43 @@ impl FacJobSpecV1 {
                 value: self.priority,
             });
         }
+        Ok(())
+    }
 
+    /// Validates `cancel_target_job_id`: required for `stop_revoke`, forbidden
+    /// otherwise.
+    ///
+    /// Enforces strict character validation (`[A-Za-z0-9_-]`) to prevent glob
+    /// injection, path traversal, and shell metacharacter abuse.
+    fn validate_cancel_target(&self) -> Result<(), JobSpecError> {
+        if self.kind == "stop_revoke" {
+            match &self.cancel_target_job_id {
+                Some(target) if !target.is_empty() => {
+                    check_length("cancel_target_job_id", target, MAX_JOB_ID_LENGTH)?;
+                    // Strict charset: only alphanumeric, underscore, and hyphen.
+                    // Prevents glob expansion, path traversal, shell injection.
+                    if !target
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    {
+                        return Err(JobSpecError::InvalidFormat {
+                            field: "cancel_target_job_id",
+                            value: target.clone(),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(JobSpecError::EmptyField {
+                        field: "cancel_target_job_id",
+                    });
+                },
+            }
+        } else if self.cancel_target_job_id.is_some() {
+            return Err(JobSpecError::InvalidFormat {
+                field: "cancel_target_job_id",
+                value: "cancel_target_job_id must be absent for non-stop_revoke jobs".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -558,6 +626,99 @@ pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
     Ok(())
 }
 
+/// Validates a `stop_revoke` job spec for the control lane.
+///
+/// Performs the same structural and digest validation as [`validate_job_spec`]
+/// but does NOT require `actuation.channel_context_token`.  Control-lane
+/// `stop_revoke` jobs are operator-initiated local commands; the worker MUST
+/// verify local-origin authority (queue directory ownership) instead of an
+/// RFC-0028 token.
+///
+/// # `AUDITED_CONTROL_LANE_EXCEPTION`: RFC-0028/0029 bypass justification
+///
+/// Control-lane cancellation (`stop_revoke`) uses local operator authority
+/// proof instead of the standard RFC-0028 channel context token and RFC-0029
+/// queue admission flow.  This is an **explicit, audited policy exception**
+/// justified by the following trust model:
+///
+/// 1. **Same trust domain**: Cancellation originates from the local operator
+///    (the same user who owns the queue root directory).  The operator already
+///    has filesystem-level privilege over the queue, so a broker-issued token
+///    would add no additional authority — it would prove what filesystem access
+///    already proves.
+///
+/// 2. **Capability-based proof**: The worker verifies authority by attempting a
+///    probe write to the queue root directory.  Only callers with write access
+///    to the directory succeed.  This is a stronger proof than a token for
+///    local operations because it demonstrates *current* filesystem capability,
+///    not a cached authorization.
+///
+/// 3. **Digest integrity preserved**: All structural and digest validation
+///    (schema, field bounds, BLAKE3 digest, `request_id` binding) is still
+///    enforced.  The only bypass is the token requirement.
+///
+/// 4. **Fail-closed on all deny paths**: Every deny path in the control-lane
+///    flow emits an explicit refusal receipt before moving the job to
+///    `denied/`.  No evidence is dropped.
+///
+/// See [`CONTROL_LANE_EXCEPTION_AUDITED`] for the compile-time marker.
+///
+/// # Errors
+///
+/// Returns the first validation failure.  Workers MUST deny the job on any
+/// error (fail-closed).
+pub fn validate_job_spec_control_lane(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
+    if spec.kind != "stop_revoke" {
+        return Err(JobSpecError::InvalidFormat {
+            field: "kind",
+            value: format!(
+                "validate_job_spec_control_lane only accepts stop_revoke, got {}",
+                spec.kind
+            ),
+        });
+    }
+
+    spec.validate_structure()?;
+
+    if parse_b3_256_digest(&spec.job_spec_digest).is_none() {
+        return Err(JobSpecError::InvalidDigest {
+            field: "job_spec_digest",
+            value: spec.job_spec_digest.clone(),
+        });
+    }
+    if parse_b3_256_digest(&spec.actuation.request_id).is_none() {
+        return Err(JobSpecError::InvalidDigest {
+            field: "actuation.request_id",
+            value: spec.actuation.request_id.clone(),
+        });
+    }
+
+    // Recompute digest
+    let computed_digest = spec.compute_digest()?;
+
+    // Constant-time comparison of declared vs computed digest (INV-JS-002)
+    if !constant_time_str_eq(&spec.job_spec_digest, &computed_digest) {
+        return Err(JobSpecError::DigestMismatch {
+            declared: spec.job_spec_digest.clone(),
+            computed: computed_digest,
+        });
+    }
+
+    // Verify request_id == job_spec_digest (constant-time)
+    if !constant_time_str_eq(&spec.actuation.request_id, &spec.job_spec_digest) {
+        return Err(JobSpecError::RequestIdMismatch {
+            request_id: spec.actuation.request_id.clone(),
+            job_spec_digest: spec.job_spec_digest.clone(),
+        });
+    }
+
+    // Token is deliberately NOT required for control-lane stop_revoke jobs.
+    // Local-origin authority is verified by the worker via queue directory
+    // ownership checks.
+
+    Ok(())
+}
+
 /// Deserializes a `FacJobSpecV1` from JSON bytes with bounded size check.
 ///
 /// Enforces [`MAX_JOB_SPEC_SIZE`] before JSON parsing to prevent
@@ -595,6 +756,7 @@ pub struct FacJobSpecV1Builder {
     source: JobSource,
     lane_requirements: LaneRequirements,
     constraints: JobConstraints,
+    cancel_target_job_id: Option<String>,
 }
 
 impl FacJobSpecV1Builder {
@@ -626,7 +788,15 @@ impl FacJobSpecV1Builder {
                 test_timeout_seconds: None,
                 memory_max_bytes: None,
             },
+            cancel_target_job_id: None,
         }
+    }
+
+    /// Sets the cancel target job ID (for `stop_revoke` jobs).
+    #[must_use]
+    pub fn cancel_target_job_id(mut self, target: impl Into<String>) -> Self {
+        self.cancel_target_job_id = Some(target.into());
+        self
     }
 
     /// Sets the priority (0 = highest, 100 = lowest).
@@ -702,6 +872,7 @@ impl FacJobSpecV1Builder {
             source: self.source,
             lane_requirements: self.lane_requirements,
             constraints: self.constraints,
+            cancel_target_job_id: self.cancel_target_job_id,
         };
 
         // Compute digest (with token nulled and digest/request_id empty)
@@ -1180,6 +1351,104 @@ mod tests {
         assert_eq!(
             job_kind_to_budget_key("bulk"),
             (RiskTier::Tier1, BoundaryIntentClass::Actuate)
+        );
+    }
+
+    #[test]
+    fn cancel_target_rejects_special_characters() {
+        // MAJOR 5: cancel_target_job_id must only allow [A-Za-z0-9_-].
+        let bad_targets = vec![
+            "../evil", "job*glob", "a;b", "a b", "a/b", "a\x00b", "a.b", "a{b}", "a?b",
+        ];
+        for target in bad_targets {
+            let result = FacJobSpecV1Builder::new(
+                "sr-1",
+                "stop_revoke",
+                "control",
+                "2026-02-12T00:00:00Z",
+                "L1",
+                sample_source(),
+            )
+            .cancel_target_job_id(target)
+            .build();
+            assert!(
+                matches!(
+                    result,
+                    Err(JobSpecError::InvalidFormat {
+                        field: "cancel_target_job_id",
+                        ..
+                    })
+                ),
+                "target {target:?} should be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_target_accepts_valid_ids() {
+        let valid_targets = vec!["abc-123", "ABC_def", "job-42", "a", "Z-0_x"];
+        for target in valid_targets {
+            let result = FacJobSpecV1Builder::new(
+                "sr-1",
+                "stop_revoke",
+                "control",
+                "2026-02-12T00:00:00Z",
+                "L1",
+                sample_source(),
+            )
+            .cancel_target_job_id(target)
+            .build();
+            assert!(
+                result.is_ok(),
+                "target {target:?} should be accepted, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_control_lane_accepts_stop_revoke_without_token() {
+        // validate_job_spec_control_lane does NOT require a channel context token.
+        let spec = FacJobSpecV1Builder::new(
+            "sr-1",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            sample_source(),
+        )
+        .cancel_target_job_id("target-123")
+        .build()
+        .expect("valid stop_revoke spec");
+
+        // Should succeed without token.
+        assert!(spec.actuation.channel_context_token.is_none());
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            result.is_ok(),
+            "control-lane validation should accept tokenless stop_revoke: {result:?}"
+        );
+
+        // Regular validate_job_spec should reject (missing token).
+        let result_full = validate_job_spec(&spec);
+        assert!(
+            matches!(result_full, Err(JobSpecError::MissingToken { .. })),
+            "full validation should reject tokenless spec: {result_full:?}"
+        );
+    }
+
+    #[test]
+    fn validate_control_lane_rejects_non_stop_revoke() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::InvalidFormat { field: "kind", .. })
+            ),
+            "control-lane validation should reject non-stop_revoke kind: {result:?}"
         );
     }
 }
