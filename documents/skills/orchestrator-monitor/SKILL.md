@@ -66,16 +66,8 @@ decision_tree:
             Discovery phase is mandatory. Run this exact help checklist before command execution:
             (1) `apm2 fac --help`
             (2) `apm2 fac pr --help`
-            (3) `apm2 fac review --help`
             (4) `apm2 fac doctor --help`
             (5) `apm2 fac review findings --help`
-            (6) `apm2 fac review tail --help`
-            (7) `apm2 fac watch --help`
-            (8) `apm2 fac logs --help`
-            (9) `apm2 fac gates --help`
-            (10) `apm2 fac push --help`
-            (11) `apm2 fac restart --help`
-            (12) `apm2 fac review terminate --help`
         - id: RESOLVE_PR_SCOPE
           action: "If explicit PR numbers were provided, use them. Otherwise run `apm2 fac doctor --json` (no --pr filter) to discover all tracked PRs from FAC review entries/recent events. This global view is for PR discovery ONLY — capacity enforcement is always per-PR."
         - id: ENFORCE_SCOPE_BOUND
@@ -111,14 +103,11 @@ decision_tree:
       purpose: "Apply bounded actions while preventing duplicate workers per PR."
       steps[5]:
         - id: READY_TO_MERGE_ACTION
-          action: "For READY_TO_MERGE PRs, keep monitoring. `apm2 fac push` already enables auto-merge on each implementor push."
+          action: "For READY_TO_MERGE PRs, check main branch and check if the commit was merged, if not, check again shortly until the commit is merged.
         - id: REVIEW_MONITOR_ACTION
           action: |
             For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
-            Do NOT manually dispatch reviews. Instead, monitor with lane-scoped
-            `apm2 fac doctor --pr <N> --json`
-            and per-PR logs from `apm2 fac logs --pr <N> --json`.
-            If reviews have not started within 2 minutes of the push, use `apm2 fac restart --pr <PR_NUMBER>` as recovery.
+            Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac doctor --pr <N> --json`
         - id: FIX_AGENT_ACTION
           action: |
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent
@@ -141,13 +130,7 @@ decision_tree:
             (2) if a review for the current SHA is already active on a given PR, do not restart it.
             Note: backpressure is always scoped per-PR — a saturated PR does not block dispatch for other PRs.
         - id: IDLE_AGENT_RECOVERY
-          action: "If an implementor has no progress signal for >=120 seconds, replace with a fresh agent."
-        - id: SATURATION_CHECK
-          action: |
-            CRITICAL: The 2-agent capacity cap is PER PR, not global. Each PR independently supports up to 2 concurrent review agents.
-            Before any restart/dispatch action for PR N, run `apm2 fac doctor --pr <N> --json` and check `.agents.active_agents` vs `.agents.max_active_agents_per_pr`.
-            A PR with 2 active agents is at capacity, but this does NOT block dispatch for other PRs.
-            Multiple PRs may each have 2 active agents simultaneously — this is expected and correct.
+          action: "If an implementor has no progress signal for >=180 seconds, replace with a fresh agent."
       next: SYNC_TICK_FACTS
 
     - id: SYNC_TICK_FACTS
@@ -241,7 +224,7 @@ operational_playbook:
 
     - trigger: "Review posted with PASS verdict and no findings"
       observed_via: "`apm2 fac doctor --pr <N> --json` shows state=done, terminal_reason=pass for both lanes"
-      action: "PR is READY_TO_MERGE. Verify main branch has the PR merged in. No further action needed."
+      action: "PR is READY_TO_MERGE. Verify main branch has the PR merged in and only proceed to the next ticket once"
 
     - trigger: "Implementor agent pushed a new commit"
       observed_via: "Agent reports `apm2 fac push` completed, or head SHA changed in `apm2 fac doctor --pr <N> --json`"
@@ -280,15 +263,10 @@ operational_playbook:
       action: "Check for corrupt state files (state=corrupt-state). Kill any stale reviewer processes (`ps aux | grep apm2.*fac.*review`). Run `apm2 fac doctor --pr <N> --fix` to repair state, then `apm2 fac restart --pr <N>`. Do not manually delete state files."
 
 invariants[15]:
-  - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. They are frequently stale, cached, or out of sync with actual gate results. Always use `apm2 fac doctor --pr <N> --json` as the authoritative orchestration source, with `apm2 fac logs` and `apm2 fac gates` for diagnostics. Never make orchestration decisions based on GitHub API responses alone."
+  - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. They are frequently stale, cached, or out of sync with actual gate results. Always use `apm2 fac doctor --pr <N> --json` as the authoritative orchestration source, with `apm2 fac logs` for line-by-line diagnostics. Never make orchestration decisions based on GitHub API responses alone."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch (2 review agents: security + quality) per PR at any time."
-  - "Agent capacity cap of 2 is PER PR — never treat it as a global system limit. Multiple PRs may each have 2 active agents concurrently."
-  - "Use `apm2 fac restart` for review reruns and classify as BLOCKED if recovery remains ambiguous."
-  - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
-  - "Fix subagents must prove worktree health and mainline sync before editing."
-  - "Fix subagents resolve merge conflicts to zero before making code changes."
   - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
   - "Implementor handoff prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
