@@ -1629,14 +1629,18 @@ impl LaneManager {
             ))
         })?;
 
-        let gitdir_indirection_error = || {
-            invalid_workspace_path(
-                "workspace .git indirection points outside lane boundary".to_string(),
-            )
-        };
-
         let canonical_git_dir = if git_metadata.is_file() {
-            return Err(gitdir_indirection_error());
+            // NIT FIX: .git as a file is the standard git worktree pattern
+            // (contains a `gitdir: <path>` pointer). Lane workspaces must use
+            // a full .git directory, not a worktree .git file, because the
+            // referenced gitdir may reside outside the lane boundary and the
+            // cleanup state machine cannot safely validate or control it.
+            return Err(invalid_workspace_path(
+                "workspace .git is a file (git worktree), not a directory; \
+                 lane workspaces require a full .git directory — \
+                 git worktree .git files are not supported"
+                    .to_string(),
+            ));
         } else if git_metadata.is_dir() {
             let git_dir_metadata = git_path.symlink_metadata().map_err(|e| {
                 invalid_workspace_path(format!(

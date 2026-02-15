@@ -388,17 +388,40 @@ deletion primitive for lane cleanup and reset operations.
 Lane cleanup is part of the authoritative execution lifecycle and uses
 `LaneCorruptMarkerV1` for durable fault marking.
 
+**Lifecycle invariant**: A RUNNING `LaneLeaseV1` must be persisted before
+any execution begins. The lease is created after lane acquisition and lane
+profile loading, binding the current PID, job ID, and lane profile hash.
+This ensures the cleanup state machine in `run_lane_cleanup` can verify
+its RUNNING-state precondition. On every terminal path (denial, skip,
+completion), the lease is removed or transitioned coherently.
+
+**Cleanup ordering**: Lane cleanup runs AFTER job completion (receipt
+emission + move to completed/). Cleanup failures do not change the job
+outcome; they only mark the lane as Corrupt. This decouples job execution
+integrity from infrastructure lifecycle management.
+
+**Process liveness**: Stale lease detection uses `libc::kill(pid, 0)` with
+errno discrimination: ESRCH = dead (safe to recover), EPERM = alive but
+unpermissioned (mark corrupt), success = alive (mark corrupt if flock held
+by another worker).
+
 ### Security Invariants (TCK-00569)
 
 - [INV-LANE-CLEANUP-001] Every lane cleanup attempt emits a
   `LaneCleanupReceiptV1`, including failures.
 - [INV-LANE-CLEANUP-002] Cleanup failure must persist `LaneCorruptMarkerV1` with
-  `reason` and optional `cleanup_receipt_digest` before returning the lane to
-  denied state.
+  `reason` and optional `cleanup_receipt_digest` before transitioning the lane to
+  Corrupt state.
 - [INV-LANE-CLEANUP-003] `LaneStatusV1` must expose `corrupt_reason` derived
   from any persistent corrupt marker.
 - [INV-LANE-CLEANUP-004] Lane log retention is enforced by oldest-first file
   pruning to `MAX_LOG_QUOTA_BYTES`.
+- [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
+  job execution and removed on every terminal path.
+- [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)
+  must precede lane cleanup. Cleanup failure must not negate a completed job.
+- [INV-LANE-CLEANUP-007] Corrupt marker persistence uses crash-safe durability:
+  fsync temp file, atomic rename, fsync directory.
 
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 

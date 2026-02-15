@@ -207,3 +207,12 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   containing characters outside `[A-Za-z0-9_-]` to prevent command injection via unit names.
 - **Control-lane refusal receipts** (`fac_worker.rs`): All deny paths in the control-lane
   `stop_revoke` flow emit explicit refusal receipts before moving jobs to `denied/`.
+- **RUNNING lease lifecycle** (`fac_worker.rs`): A RUNNING `LaneLeaseV1` is persisted after lane
+  acquisition and lane profile loading, before any execution. Every early-return path removes the
+  lease. This satisfies the `run_lane_cleanup` RUNNING-state precondition (INV-LANE-CLEANUP-005).
+- **Completion-before-cleanup** (`fac_worker.rs`): Lane cleanup runs AFTER job completion receipt
+  emission and move to `completed/`. Cleanup failures log warnings and mark lanes corrupt but do
+  not retroactively negate a completed job outcome (INV-LANE-CLEANUP-006).
+- **Process liveness** (`fac_worker.rs`): Stale lease detection uses `libc::kill(pid, 0)` with
+  errno discrimination (ESRCH vs EPERM) instead of shell `kill -0` with `status.success()`.
+  EPERM means the process exists but is unpermissioned; the lane is marked corrupt, not idle.
