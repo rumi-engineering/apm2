@@ -214,6 +214,8 @@ pub enum FacJobOutcome {
     Denied,
     /// The job was quarantined due to malformed input.
     Quarantined,
+    /// The job was cancelled via `apm2 fac job cancel`.
+    Cancelled,
 }
 
 /// Stable machine-readable denial reason codes.
@@ -247,6 +249,8 @@ pub enum DenialReasonCode {
     ValidationFailed,
     /// Disk pressure preflight rejected job due to insufficient free space.
     InsufficientDiskSpace,
+    /// Job was cancelled by an operator via `apm2 fac job cancel`.
+    Cancelled,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -697,7 +701,7 @@ impl FacJobReceiptV1 {
                     return Err(FacJobReceiptError::MissingField("eio29_queue_admission"));
                 }
             },
-            FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
+            FacJobOutcome::Denied | FacJobOutcome::Quarantined | FacJobOutcome::Cancelled => {
                 if self.denial_reason.is_none() {
                     return Err(FacJobReceiptError::MissingField("denial_reason"));
                 }
@@ -1001,7 +1005,7 @@ impl FacJobReceiptV1Builder {
                 // RFC-0029 budget admission is currently deferred and optional
                 // for completed outcomes.
             },
-            FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
+            FacJobOutcome::Denied | FacJobOutcome::Quarantined | FacJobOutcome::Cancelled => {
                 if self.denial_reason.is_none() {
                     return Err(FacJobReceiptError::MissingField("denial_reason"));
                 }
@@ -1924,7 +1928,7 @@ pub mod tests {
                         reason: None,
                     });
             },
-            FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
+            FacJobOutcome::Denied | FacJobOutcome::Quarantined | FacJobOutcome::Cancelled => {
                 if let Some(reason) = denial_reason {
                     builder = builder.denial_reason(reason);
                 }

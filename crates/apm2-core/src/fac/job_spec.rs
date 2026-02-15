@@ -58,7 +58,7 @@ pub const MAX_JOB_SPEC_SIZE: usize = 65_536;
 /// Digest prefix for BLAKE3-256 hashes.
 const B3_256_PREFIX: &str = "b3-256:";
 
-const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control"];
+const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control", "stop_revoke"];
 const VALID_SOURCE_KINDS: &[&str] = &["mirror_commit", "patch_injection"];
 
 /// Maps job kind to RFC-0029 budget admission keys.
@@ -67,7 +67,7 @@ pub fn job_kind_to_budget_key(kind: &str) -> (RiskTier, BoundaryIntentClass) {
     match kind {
         "gates" | "warm" => (RiskTier::Tier0, BoundaryIntentClass::Actuate),
         "bulk" => (RiskTier::Tier1, BoundaryIntentClass::Actuate),
-        "control" => (RiskTier::Tier1, BoundaryIntentClass::Govern),
+        "control" | "stop_revoke" => (RiskTier::Tier1, BoundaryIntentClass::Govern),
         _ => (RiskTier::Tier2Plus, BoundaryIntentClass::Actuate),
     }
 }
@@ -294,7 +294,7 @@ pub struct FacJobSpecV1 {
     /// Computed with `actuation.channel_context_token = null`.
     pub job_spec_digest: String,
 
-    /// Job kind: `"gates"`, `"warm"`, `"bulk"`, `"control"`.
+    /// Job kind: `"gates"`, `"warm"`, `"bulk"`, `"control"`, `"stop_revoke"`.
     pub kind: String,
 
     /// RFC-0029 queue lane for admission/scheduling.
@@ -317,6 +317,11 @@ pub struct FacJobSpecV1 {
 
     /// Execution constraints.
     pub constraints: JobConstraints,
+
+    /// For `stop_revoke` jobs: the job ID of the target job to cancel.
+    /// MUST be present when `kind == "stop_revoke"`, absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_target_job_id: Option<String>,
 }
 
 impl FacJobSpecV1 {
@@ -398,6 +403,15 @@ impl FacJobSpecV1 {
             }
         }
 
+        self.validate_field_lengths()?;
+        self.validate_temporal_and_priority()?;
+        self.validate_cancel_target()?;
+
+        Ok(())
+    }
+
+    /// Validates field length bounds for all string fields.
+    fn validate_field_lengths(&self) -> Result<(), JobSpecError> {
         check_length("job_id", &self.job_id, MAX_JOB_ID_LENGTH)?;
         check_length("kind", &self.kind, MAX_KIND_LENGTH)?;
         check_length("queue_lane", &self.queue_lane, MAX_QUEUE_LANE_LENGTH)?;
@@ -428,6 +442,11 @@ impl FacJobSpecV1 {
             &self.source.head_sha,
             MAX_HEAD_SHA_LENGTH,
         )?;
+        Ok(())
+    }
+
+    /// Validates temporal format and priority bounds.
+    fn validate_temporal_and_priority(&self) -> Result<(), JobSpecError> {
         if self.enqueue_time.len() < 20 || !self.enqueue_time.contains('T') {
             return Err(JobSpecError::InvalidFormat {
                 field: "enqueue_time",
@@ -440,7 +459,29 @@ impl FacJobSpecV1 {
                 value: self.priority,
             });
         }
+        Ok(())
+    }
 
+    /// Validates `cancel_target_job_id`: required for `stop_revoke`, forbidden
+    /// otherwise.
+    fn validate_cancel_target(&self) -> Result<(), JobSpecError> {
+        if self.kind == "stop_revoke" {
+            match &self.cancel_target_job_id {
+                Some(target) if !target.is_empty() => {
+                    check_length("cancel_target_job_id", target, MAX_JOB_ID_LENGTH)?;
+                },
+                _ => {
+                    return Err(JobSpecError::EmptyField {
+                        field: "cancel_target_job_id",
+                    });
+                },
+            }
+        } else if self.cancel_target_job_id.is_some() {
+            return Err(JobSpecError::InvalidFormat {
+                field: "cancel_target_job_id",
+                value: "cancel_target_job_id must be absent for non-stop_revoke jobs".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -595,6 +636,7 @@ pub struct FacJobSpecV1Builder {
     source: JobSource,
     lane_requirements: LaneRequirements,
     constraints: JobConstraints,
+    cancel_target_job_id: Option<String>,
 }
 
 impl FacJobSpecV1Builder {
@@ -626,7 +668,15 @@ impl FacJobSpecV1Builder {
                 test_timeout_seconds: None,
                 memory_max_bytes: None,
             },
+            cancel_target_job_id: None,
         }
+    }
+
+    /// Sets the cancel target job ID (for `stop_revoke` jobs).
+    #[must_use]
+    pub fn cancel_target_job_id(mut self, target: impl Into<String>) -> Self {
+        self.cancel_target_job_id = Some(target.into());
+        self
     }
 
     /// Sets the priority (0 = highest, 100 = lowest).
@@ -702,6 +752,7 @@ impl FacJobSpecV1Builder {
             source: self.source,
             lane_requirements: self.lane_requirements,
             constraints: self.constraints,
+            cancel_target_job_id: self.cancel_target_job_id,
         };
 
         // Compute digest (with token nulled and digest/request_id empty)
