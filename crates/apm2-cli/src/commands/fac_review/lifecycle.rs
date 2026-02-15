@@ -1994,28 +1994,21 @@ fn maybe_cleanup_worktree_target(worktree: Option<&str>) {
     if target.parent() != Some(worktree_real.as_path()) {
         return;
     }
-    std::thread::spawn(move || {
-        let _ = std::fs::remove_dir_all(&target);
-    });
+    let _ = std::fs::remove_dir_all(&target);
 }
 
-/// Spawn auto-merge on a background thread (fire-and-forget) so git operations
-/// do not block the verdict set response. Large repos or slow filesystems can
-/// cause `try_fast_forward_main` to take several seconds, which may cause
-/// reviewer agents to hit internal timeouts if run synchronously.
-///
-/// The merge result is logged via lifecycle events but never blocks the caller.
-/// This follows the same pattern as `maybe_cleanup_worktree_target`.
+/// Run auto-merge synchronously when the PR reaches `MergeReady`. Earlier
+/// versions spawned a background thread, but short-lived CLI processes
+/// (reviewer agents) exit immediately after verdict set, killing the thread
+/// before the merge completes. Running synchronously is safe — the caller
+/// is `finalize_projected_verdict` at the tail of verdict set, so a few
+/// seconds of git fast-forward latency does not block any upstream work.
 fn maybe_auto_merge_if_ready(record: &PrLifecycleRecord, source: &str) {
     if record.pr_state != PrLifecycleState::MergeReady {
         return;
     }
 
-    let record = record.clone();
-    let source = source.to_string();
-    std::thread::spawn(move || {
-        maybe_auto_merge_if_ready_inner(&record, &source);
-    });
+    maybe_auto_merge_if_ready_inner(record, source);
 }
 
 fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
@@ -2340,7 +2333,8 @@ fn next_state_for_event(
                 | S::VerdictPending
                 | S::VerdictApprove
                 | S::VerdictDeny
-                | S::MergeReady => {
+                | S::MergeReady
+                | S::Stuck => {
                     if normalized_decision == "deny" {
                         return Ok(S::VerdictDeny);
                     }
