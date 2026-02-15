@@ -1303,21 +1303,32 @@ pub fn build_review_run_id(
     format!("pr{pr_number}-{review_type}-s{sequence_number}-{head}")
 }
 
+/// Hard cap on directory entries scanned when listing PR numbers.
+/// Prevents unbounded memory allocation if the review-runs directory
+/// contains an adversarial number of entries (denial-of-service mitigation).
+const MAX_REVIEW_DIR_ENTRIES: usize = 10_000;
+
 pub fn list_review_pr_numbers() -> Result<Vec<u32>, String> {
     let root = review_runs_dir_path()?;
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut numbers = fs::read_dir(&root)
-        .map_err(|err| format!("failed to read reviews root {}: {err}", root.display()))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-        })
-        .collect::<Vec<_>>();
+    let mut numbers = Vec::new();
+    let entries = fs::read_dir(&root)
+        .map_err(|err| format!("failed to read reviews root {}: {err}", root.display()))?;
+    for (i, entry) in entries.enumerate() {
+        if i >= MAX_REVIEW_DIR_ENTRIES {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if let Some(pr) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        {
+            numbers.push(pr);
+        }
+    }
     numbers.sort_unstable();
     numbers.dedup();
     Ok(numbers)
