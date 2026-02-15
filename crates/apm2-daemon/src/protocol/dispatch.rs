@@ -1520,13 +1520,20 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
 
-/// Estimated metadata overhead per `WorkClaim` for byte accounting in
-/// control-plane queue enqueue budget checks (TCK-00568).
+/// Wire-framing overhead added on top of JSON-serialized `WorkClaim`
+/// size for queue-byte accounting (TCK-00568).
 ///
-/// Covers serialized struct framing, timestamps, and other non-string
-/// fields. This is an upper-bound estimate — it is acceptable to
-/// slightly overcount but not undercount.
-pub const CLAIM_METADATA_OVERHEAD_BYTES: usize = 256;
+/// Accounts for envelope headers, length-prefix framing, and encoding
+/// differences between JSON and binary wire formats. This is an
+/// upper-bound adjustment — it is acceptable to overcount.
+pub const CLAIM_WIRE_FRAMING_OVERHEAD_BYTES: usize = 128;
+
+/// Fallback byte estimate used when `WorkClaim` serialization fails
+/// (TCK-00568).
+///
+/// Set conservatively high so that a serialization failure does not
+/// silently undercount and bypass byte quotas (fail-closed).
+pub const CLAIM_SERIALIZATION_FALLBACK_BYTES: usize = 8192;
 
 /// Maximum supported delegation depth for `DelegateSublease` lineage.
 ///
@@ -4867,6 +4874,32 @@ pub struct WorkClaim {
     /// `ClaimWork` and bound to the policy resolution context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permeability_receipt: Option<apm2_core::policy::permeability::PermeabilityReceipt>,
+}
+
+impl WorkClaim {
+    /// Returns a deterministic upper-bound byte estimate for queue-byte
+    /// accounting (TCK-00568).
+    ///
+    /// Uses JSON serialization of the full claim to capture ALL fields
+    /// (`policy_resolution`, `executor_custody_domains`,
+    /// `author_custody_domains`, `permeability_receipt`), then adds a
+    /// fixed framing overhead to ensure the result is a conservative
+    /// upper bound that never undercounts actual payload size.
+    ///
+    /// SECURITY: Lossy estimates that omit variable-length fields enable
+    /// attackers to bypass byte quotas. Serialization-based measurement
+    /// is the canonical defence.
+    pub fn estimate_serialized_bytes(&self) -> u64 {
+        // Serialize to JSON bytes — this is deterministic for the same
+        // field values and captures every field including nested structs.
+        let json_len = serde_json::to_vec(self)
+            .map(|v| v.len())
+            .unwrap_or(CLAIM_SERIALIZATION_FALLBACK_BYTES);
+        // Add fixed overhead for wire framing, envelope metadata, and
+        // any non-JSON representation differences (e.g., bincode would
+        // be smaller but we account for the largest plausible encoding).
+        (json_len + CLAIM_WIRE_FRAMING_OVERHEAD_BYTES) as u64
+    }
 }
 
 mod work_role_serde {
@@ -8580,6 +8613,10 @@ impl PrivilegedDispatcher {
     /// Called when a new profile is loaded (startup or hot-reload). Replaces
     /// limits and resets counters to start a fresh budget window with the
     /// new limits.
+    ///
+    /// TODO(TCK-00584): Wire this method into daemon startup and hot-reload
+    /// profile loading so that `EconomicsProfile::control_plane_limits`
+    /// values are applied to the active broker state at runtime.
     pub fn set_control_plane_limits(
         &self,
         limits: apm2_core::fac::broker_rate_limits::ControlPlaneLimits,
@@ -10770,11 +10807,9 @@ impl PrivilegedDispatcher {
 
         // TCK-00568: Control-plane queue enqueue rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE state mutation (register_claim).
-        // Estimate claim size from serialized fields for byte accounting.
-        let estimated_claim_bytes = (claim.work_id.len()
-            + claim.lease_id.len()
-            + claim.actor_id.len()
-            + CLAIM_METADATA_OVERHEAD_BYTES) as u64;
+        // SECURITY: Use serialization-based byte estimate that accounts for ALL
+        // WorkClaim fields (policy_resolution, custody domains, permeability_receipt).
+        let estimated_claim_bytes = claim.estimate_serialized_bytes();
         if let Err(e) = self.admit_queue_enqueue(estimated_claim_bytes) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -35366,6 +35401,177 @@ mod tests {
                 },
                 other => panic!("Expected rejection for invalid risk tier, got: {other:?}"),
             }
+        }
+    }
+
+    // ========================================================================
+    // WorkClaim byte estimation regression tests (TCK-00568 security MAJOR fix)
+    // ========================================================================
+
+    mod work_claim_byte_estimation {
+        use super::*;
+
+        fn minimal_claim() -> WorkClaim {
+            WorkClaim {
+                work_id: "W-001".to_string(),
+                lease_id: "L-001".to_string(),
+                actor_id: "A-001".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "ref-001".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            }
+        }
+
+        #[test]
+        fn estimate_includes_policy_resolution_bytes() {
+            let mut claim = minimal_claim();
+            let base_estimate = claim.estimate_serialized_bytes();
+
+            // Inflate policy_resolved_ref with a large string.
+            claim.policy_resolution.policy_resolved_ref = "x".repeat(4096);
+            let inflated_estimate = claim.estimate_serialized_bytes();
+
+            // The estimate MUST grow by at least the net string growth
+            // (4096 - len("ref-001") = 4089). Use 4000 as a conservative
+            // threshold to avoid brittleness from JSON framing variance.
+            assert!(
+                inflated_estimate >= base_estimate + 4000,
+                "estimate did not account for policy_resolution growth: \
+                 base={base_estimate}, inflated={inflated_estimate}"
+            );
+        }
+
+        #[test]
+        fn estimate_includes_custody_domain_vectors() {
+            let mut claim = minimal_claim();
+            let base_estimate = claim.estimate_serialized_bytes();
+
+            // Add 100 custody domains of 100 bytes each (10 KB total).
+            let domains: Vec<String> = (0..100).map(|i| format!("domain-{i:0>94}")).collect();
+            claim.executor_custody_domains = domains.clone();
+            claim.author_custody_domains = domains;
+            let inflated_estimate = claim.estimate_serialized_bytes();
+
+            // Should grow by at least 20KB (100 * 100 * 2 domains).
+            assert!(
+                inflated_estimate >= base_estimate + 20_000,
+                "estimate did not account for custody domain growth: \
+                 base={base_estimate}, inflated={inflated_estimate}"
+            );
+        }
+
+        #[test]
+        fn estimate_includes_permeability_receipt() {
+            use apm2_core::policy::permeability::{
+                AuthorityVector, PermeabilityReceiptBuilder,
+            };
+
+            let mut claim = minimal_claim();
+            let base_estimate = claim.estimate_serialized_bytes();
+
+            // Attach a permeability receipt with non-trivial string fields.
+            let parent = AuthorityVector::top();
+            let overlay = AuthorityVector::bottom();
+            let receipt = PermeabilityReceiptBuilder::new(
+                "R-".to_string() + &"z".repeat(256),
+                parent,
+                overlay,
+            )
+            .delegator_actor_id("delegator-".to_string() + &"a".repeat(256))
+            .delegate_actor_id("delegate-".to_string() + &"b".repeat(256))
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(2_000_000)
+            .policy_root_hash([0u8; 32])
+            .build()
+            .expect("receipt build must succeed");
+            claim.permeability_receipt = Some(receipt);
+            let inflated_estimate = claim.estimate_serialized_bytes();
+
+            // Receipt adds non-trivial bytes — at minimum 500+ for the
+            // string fields alone, plus hashes, authority vectors, etc.
+            assert!(
+                inflated_estimate > base_estimate + 500,
+                "estimate did not account for permeability_receipt: \
+                 base={base_estimate}, inflated={inflated_estimate}"
+            );
+        }
+
+        #[test]
+        fn estimate_is_upper_bound_of_json_serialization() {
+            let claim = minimal_claim();
+            let json_bytes = serde_json::to_vec(&claim).unwrap();
+            let estimate = claim.estimate_serialized_bytes();
+
+            // Estimate must be >= actual JSON length (upper bound invariant).
+            assert!(
+                estimate >= json_bytes.len() as u64,
+                "estimate ({estimate}) is less than actual JSON size ({})",
+                json_bytes.len()
+            );
+        }
+
+        #[test]
+        fn estimate_never_undercounts_large_claims() {
+            // Construct a maximally large claim to prove the estimator
+            // does not undercount even adversarial payloads.
+            let claim = WorkClaim {
+                work_id: "W-".to_string() + &"x".repeat(1024),
+                lease_id: "L-".to_string() + &"y".repeat(1024),
+                actor_id: "A-".to_string() + &"z".repeat(1024),
+                role: WorkRole::GateExecutor,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "ref-".to_string() + &"p".repeat(4096),
+                    resolved_policy_hash: [0xFFu8; 32],
+                    capability_manifest_hash: [0xFFu8; 32],
+                    context_pack_hash: [0xFFu8; 32],
+                    role_spec_hash: [0xFFu8; 32],
+                    context_pack_recipe_hash: [0xFFu8; 32],
+                    resolved_risk_tier: 4,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: Some([0xFFu8; 32]),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                executor_custody_domains: (0..200)
+                    .map(|i| format!("exec-domain-{i:0>200}"))
+                    .collect(),
+                author_custody_domains: (0..200)
+                    .map(|i| format!("author-domain-{i:0>200}"))
+                    .collect(),
+                permeability_receipt: None,
+            };
+
+            let json_bytes = serde_json::to_vec(&claim).unwrap();
+            let estimate = claim.estimate_serialized_bytes();
+
+            // Upper-bound invariant: estimate >= actual serialized size.
+            assert!(
+                estimate >= json_bytes.len() as u64,
+                "SECURITY: estimate ({estimate}) undercounts actual JSON size ({}) \
+                 for large claim payload",
+                json_bytes.len()
+            );
+            // Sanity: the estimate should be in the right ballpark
+            // (not wildly over — within 2x of actual).
+            assert!(
+                estimate <= (json_bytes.len() as u64) * 2,
+                "estimate ({estimate}) is unreasonably large compared to actual ({})",
+                json_bytes.len()
+            );
         }
     }
 }
