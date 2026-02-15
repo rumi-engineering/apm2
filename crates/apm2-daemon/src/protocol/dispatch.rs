@@ -35,8 +35,8 @@ use apm2_core::channel::{
     BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource,
     ChannelViolationClass, DeclassificationIntentScope, DisclosurePolicyBinding,
     LeakageBudgetReceipt, LeakageEstimatorFamily, RedundancyDeclassificationReceipt,
-    TimingChannelBudget, derive_channel_source_witness, issue_channel_context_token,
-    validate_channel_boundary,
+    TimingChannelBudget, TokenBindingV1, derive_channel_source_witness,
+    issue_channel_context_token_with_token_binding, validate_channel_boundary,
 };
 use apm2_core::credentials::{
     AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
@@ -47,7 +47,7 @@ use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
     AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, AuditorLaunchProjectionV1,
-    CHANGESET_PUBLISHED_PREFIX, DenyCondition, DenyReasonCode,
+    CHANGESET_PUBLISHED_PREFIX, DEFAULT_ENVELOPE_TTL_TICKS, DenyCondition, DenyReasonCode,
     FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID, OrchestratorLaunchProjectionV1, ProjectionUncertainty,
     REVIEW_BLOCKED_RECORDED_PREFIX, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
     ReceiptKind, RiskTier, SelectionDecision, builtin_profiles, digest_first_projection,
@@ -7296,6 +7296,21 @@ pub struct PrivilegedDispatcher {
     divergence_watchdog:
         Option<Arc<crate::projection::DivergenceWatchdog<crate::projection::SystemTimeSource>>>,
 
+    /// TCK-00565: Boundary identifier for token binding contract.
+    ///
+    /// Loaded from FAC node identity at daemon startup. Used to populate
+    /// `TokenBindingV1.boundary_id` when issuing channel context tokens.
+    /// Defaults to `"apm2.fac.local"` when node identity is not configured.
+    token_binding_boundary_id: String,
+
+    /// TCK-00565: FAC policy root digest for token binding contract.
+    ///
+    /// Set at startup from the admitted policy and updated if the policy is
+    /// reloaded. Used to populate `TokenBindingV1.fac_policy_hash` when
+    /// issuing channel context tokens. Defaults to all-zeros (which will
+    /// cause fail-closed denial at the worker) until a policy is admitted.
+    token_binding_policy_digest: [u8; 32],
+
     /// INV-BRK-HEALTH-GATE-001: Fail-closed health gate for token issuance.
     ///
     /// Starts `false` (fail-closed). Continuously re-evaluated by the
@@ -7911,6 +7926,7 @@ impl PrivilegedDispatcher {
             declared_leakage_budget_bits: boundary_flow.claimed_leakage_budget_bits,
             timing_budget_policy_max_ticks: Some(boundary_flow.timing_budget_policy_max_ticks),
             declared_timing_budget_ticks: boundary_flow.claimed_timing_budget_ticks,
+            token_binding: None,
         }
     }
 
@@ -7991,14 +8007,51 @@ impl PrivilegedDispatcher {
             return Err(defects);
         }
 
-        issue_channel_context_token(&check, lease_id, request_id, issued_at_secs, signer).map_err(
-            |error| {
-                vec![ChannelBoundaryDefect::new(
-                    ChannelViolationClass::MissingChannelMetadata,
-                    format!("failed to issue channel context token: {error}"),
-                )]
-            },
+        // TCK-00565: Build TokenBindingV1 so the daemon dispatch path issues
+        // tokens with the full binding contract (policy hash, canonicalizer
+        // tuple digest, boundary_id, issued/expiry ticks). Without this,
+        // workers would reject the token as MissingTokenBinding.
+        //
+        // Policy hash and canonicalizer digest come from the validated
+        // boundary check (which embeds the boundary_flow policy binding).
+        // boundary_id comes from the daemon's node identity (set at startup).
+        let current_tick = self
+            .holonic_clock
+            .now_mono_tick()
+            .map(|t| t.value())
+            .unwrap_or(0);
+        let (policy_hash, ct_digest) =
+            check
+                .boundary_flow_policy_binding
+                .as_ref()
+                .map_or(([0u8; 32], [0u8; 32]), |b| {
+                    (
+                        b.admitted_policy_root_digest,
+                        b.admitted_canonicalizer_tuple_digest,
+                    )
+                });
+        let token_binding = TokenBindingV1 {
+            fac_policy_hash: policy_hash,
+            canonicalizer_tuple_digest: ct_digest,
+            boundary_id: self.token_binding_boundary_id.clone(),
+            issued_at_tick: current_tick,
+            expiry_tick: current_tick.saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
+        };
+
+        issue_channel_context_token_with_token_binding(
+            &check,
+            lease_id,
+            request_id,
+            issued_at_secs,
+            signer,
+            token_binding,
         )
+        .map_err(|error| {
+            vec![ChannelBoundaryDefect::new(
+                ChannelViolationClass::MissingChannelMetadata,
+                format!("failed to issue channel context token: {error}"),
+            )]
+        })
     }
 
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
@@ -8085,6 +8138,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
+            token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
         }
     }
@@ -8173,6 +8228,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
+            token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
         }
     }
@@ -8278,6 +8335,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
+            token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
         }
     }
@@ -8361,6 +8420,8 @@ impl PrivilegedDispatcher {
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
             alias_reconciliation_gate,
             divergence_watchdog: None,
+            token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
+            token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
         }
     }
@@ -8387,6 +8448,24 @@ impl PrivilegedDispatcher {
     /// in `set_admission_health_gate`.
     pub fn admission_health_gate_passed(&self) -> bool {
         self.admission_health_gate.load(Ordering::Acquire)
+    }
+
+    /// Sets the boundary ID for TCK-00565 token binding contract.
+    ///
+    /// Called at daemon startup after loading node identity. Tokens issued
+    /// through the dispatch path will include this `boundary_id` in their
+    /// `TokenBindingV1`.
+    pub fn set_token_binding_boundary_id(&mut self, boundary_id: String) {
+        self.token_binding_boundary_id = boundary_id;
+    }
+
+    /// Sets the FAC policy root digest for TCK-00565 token binding contract.
+    ///
+    /// Called at daemon startup after admitting the FAC policy. Tokens
+    /// issued through the dispatch path will include this digest in their
+    /// `TokenBindingV1.fac_policy_hash`.
+    pub const fn set_token_binding_policy_digest(&mut self, digest: [u8; 32]) {
+        self.token_binding_policy_digest = digest;
     }
 
     /// Sets the daemon state for process management (TCK-00342).
@@ -18850,6 +18929,66 @@ mod tests {
             assert!(
                 result.is_err(),
                 "re-closed health gate must deny token issuance"
+            );
+        }
+
+        /// TCK-00565: Daemon dispatch flow path MUST emit tokens with
+        /// `TokenBindingV1` (policy hash, canonicalizer tuple digest,
+        /// `boundary_id`, issued/expiry ticks). Without this, workers deny
+        /// the token as `MissingTokenBinding`.
+        #[test]
+        fn test_daemon_flow_path_emits_token_with_binding() {
+            let mut dispatcher = PrivilegedDispatcher::new();
+            dispatcher.set_admission_health_gate(true);
+            // Set a non-default boundary_id to verify it flows through.
+            dispatcher.set_token_binding_boundary_id("test-boundary-42".to_string());
+
+            let signer = apm2_core::crypto::Signer::generate();
+            let issued_at_secs = std::time::UNIX_EPOCH
+                .elapsed()
+                .expect("current time should be after unix epoch")
+                .as_secs();
+            let token = dispatcher
+                .validate_channel_boundary_and_issue_context_token_with_flow(
+                    &signer,
+                    "lease-binding",
+                    "REQ-BINDING",
+                    issued_at_secs,
+                    &ToolClass::Execute,
+                    true,
+                    true,
+                    true,
+                    true,
+                    BoundaryFlowRuntimeState::allow_all(true),
+                )
+                .expect("open health gate with flow should issue token");
+
+            // Decode the token and verify TokenBindingV1 is present.
+            let decoded = decode_channel_context_token(
+                &token,
+                &signer.verifying_key(),
+                "lease-binding",
+                issued_at_secs,
+                "REQ-BINDING",
+            )
+            .expect("issued token should decode");
+
+            let binding = decoded
+                .token_binding
+                .expect("daemon flow path must emit TokenBindingV1");
+            assert_eq!(
+                binding.boundary_id, "test-boundary-42",
+                "token must carry the configured boundary_id"
+            );
+            assert!(
+                binding.expiry_tick > binding.issued_at_tick,
+                "expiry_tick must be greater than issued_at_tick"
+            );
+            // The canonicalizer_tuple_digest must be non-zero (computed
+            // from CanonicalizerTupleV1::from_current()).
+            assert_ne!(
+                binding.canonicalizer_tuple_digest, [0u8; 32],
+                "canonicalizer tuple digest must be non-zero"
             );
         }
     }

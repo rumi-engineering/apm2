@@ -66,7 +66,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use apm2_core::channel::{
-    ChannelBoundaryDefect, decode_channel_context_token, validate_channel_boundary,
+    ChannelBoundaryDefect, ExpectedTokenBinding, decode_channel_context_token_with_binding,
+    validate_channel_boundary,
 };
 use apm2_core::crypto::Signer;
 use apm2_core::economics::admission::{
@@ -83,7 +84,7 @@ use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
-    validate_job_spec, validate_job_spec_control_lane,
+    parse_b3_256_digest, validate_job_spec, validate_job_spec_control_lane,
 };
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
@@ -92,8 +93,8 @@ use apm2_core::fac::{
     ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1,
     GateReceipt, GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
     QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, SystemdUnitProperties,
-    compute_policy_hash, deserialize_policy, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, run_preflight,
+    compute_policy_hash, deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -152,8 +153,13 @@ const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
 
-/// Default boundary ID for local-mode evaluation windows.
-const DEFAULT_BOUNDARY_ID: &str = "local";
+/// Last-resort fallback boundary ID when node identity cannot be loaded.
+///
+/// Production deployments use `load_or_default_boundary_id()` which reads
+/// the actual boundary from `$APM2_HOME/private/fac/identity/boundary_id`.
+/// This constant is only used when `resolve_apm2_home()` fails (no home
+/// directory available at all).
+const FALLBACK_BOUNDARY_ID: &str = "local";
 
 /// Default authority clock for local-mode evaluation windows.
 const DEFAULT_AUTHORITY_CLOCK: &str = "local";
@@ -264,6 +270,13 @@ pub fn run_fac_worker(
         },
     };
 
+    // TCK-00565 MAJOR-1 fix: Load the actual boundary_id from FAC node identity
+    // instead of using a hardcoded constant. Falls back to FALLBACK_BOUNDARY_ID
+    // only when APM2 home cannot be resolved (no-home edge case).
+    let boundary_id = resolve_apm2_home()
+        .and_then(|home| load_or_default_boundary_id(&home).ok())
+        .unwrap_or_else(|| FALLBACK_BOUNDARY_ID.to_string());
+
     // Ensure queue directories exist
     if let Err(e) = ensure_queue_dirs(&queue_root) {
         output_worker_error(
@@ -357,12 +370,12 @@ pub fn run_fac_worker(
     let tick_end = current_tick.saturating_add(1);
     let eval_window = broker
         .build_evaluation_window(
-            DEFAULT_BOUNDARY_ID,
+            &boundary_id,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
             tick_end,
         )
-        .unwrap_or_else(|_| make_default_eval_window());
+        .unwrap_or_else(|_| make_default_eval_window(&boundary_id));
 
     // Advance freshness to keep startup checks in sync with the first
     // admission window.
@@ -370,7 +383,7 @@ pub fn run_fac_worker(
 
     let startup_envelope = broker
         .issue_time_authority_envelope_default_ttl(
-            DEFAULT_BOUNDARY_ID,
+            &boundary_id,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
             tick_end,
@@ -530,6 +543,7 @@ pub fn run_fac_worker(
                     candidates.len(),
                     print_unit,
                     &current_tuple_digest,
+                    &boundary_id,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -824,6 +838,7 @@ fn process_job(
     _candidates_count: usize,
     print_unit: bool,
     canonicalizer_tuple_digest: &str,
+    boundary_id: &str,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -949,6 +964,11 @@ fn process_job(
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -1161,12 +1181,54 @@ fn process_job(
     // Use monotonic wall-clock seconds for token temporal validation.
     let current_time_secs = current_timestamp_epoch_secs();
 
-    let boundary_check = match decode_channel_context_token(
+    // TCK-00565: Build expected token binding for fail-closed validation.
+    // Parse the canonicalizer tuple digest from the b3-256 hex string to raw bytes.
+    // Fail-closed: if the digest cannot be parsed, deny the job immediately —
+    // never fall through with None (which would skip token binding validation).
+    let Some(ct_digest_bytes) = parse_b3_256_digest(canonicalizer_tuple_digest) else {
+        let reason = format!(
+            "invalid canonicalizer tuple digest: cannot parse b3-256 hex: {canonicalizer_tuple_digest}"
+        );
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::InvalidCanonicalizerDigest),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    };
+    let expected_binding = ExpectedTokenBinding {
+        fac_policy_hash: policy_digest,
+        canonicalizer_tuple_digest: &ct_digest_bytes,
+        boundary_id,
+        current_tick: broker.current_tick(),
+    };
+
+    let boundary_check = match decode_channel_context_token_with_binding(
         token,
         verifying_key,
         &spec.actuation.lease_id,
         current_time_secs,
         &spec.actuation.request_id,
+        Some(&expected_binding),
     ) {
         Ok(check) => check,
         Err(e) => {
@@ -1299,7 +1361,10 @@ fn process_job(
 
     // Validate boundary check defects.
     let defects = validate_channel_boundary(&boundary_check);
-    let boundary_trace = build_channel_boundary_trace(&defects);
+    // TCK-00565: Include decoded token binding in the boundary trace for receipt
+    // audit.
+    let boundary_trace =
+        build_channel_boundary_trace_with_binding(&defects, boundary_check.token_binding.as_ref());
     if !defects.is_empty() {
         let reason = format!(
             "channel boundary violations: {}",
@@ -1389,17 +1454,12 @@ fn process_job(
     broker.advance_freshness_horizon(tick_end);
 
     let eval_window = broker
-        .build_evaluation_window(
-            DEFAULT_BOUNDARY_ID,
-            DEFAULT_AUTHORITY_CLOCK,
-            current_tick,
-            tick_end,
-        )
-        .unwrap_or_else(|_| make_default_eval_window());
+        .build_evaluation_window(boundary_id, DEFAULT_AUTHORITY_CLOCK, current_tick, tick_end)
+        .unwrap_or_else(|_| make_default_eval_window(boundary_id));
 
     let envelope = broker
         .issue_time_authority_envelope_default_ttl(
-            DEFAULT_BOUNDARY_ID,
+            boundary_id,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
             tick_end,
@@ -2955,7 +3015,10 @@ fn compute_job_spec_digest_preview(bytes: &[u8]) -> String {
     format!("b3-256:{}", hash.to_hex())
 }
 
-fn build_channel_boundary_trace(defects: &[ChannelBoundaryDefect]) -> ChannelBoundaryTrace {
+fn build_channel_boundary_trace_with_binding(
+    defects: &[ChannelBoundaryDefect],
+    binding: Option<&apm2_core::channel::TokenBindingV1>,
+) -> ChannelBoundaryTrace {
     let mut defect_classes = Vec::new();
     for defect in defects.iter().take(MAX_BOUNDARY_DEFECT_CLASSES) {
         defect_classes.push(strip_json_string_quotes(&serialize_to_json_string(
@@ -2964,10 +3027,27 @@ fn build_channel_boundary_trace(defects: &[ChannelBoundaryDefect]) -> ChannelBou
     }
 
     let defect_count = u32::try_from(defects.len()).unwrap_or(u32::MAX);
+
+    let (policy_hash, tuple_digest, boundary_id, issued_at_tick, expiry_tick) =
+        binding.map_or((None, None, None, None, None), |b| {
+            (
+                Some(hex::encode(b.fac_policy_hash)),
+                Some(hex::encode(b.canonicalizer_tuple_digest)),
+                Some(b.boundary_id.clone()),
+                Some(b.issued_at_tick),
+                Some(b.expiry_tick),
+            )
+        });
+
     ChannelBoundaryTrace {
         passed: defects.is_empty(),
         defect_count,
         defect_classes,
+        token_fac_policy_hash: policy_hash,
+        token_canonicalizer_tuple_digest: tuple_digest,
+        token_boundary_id: boundary_id,
+        token_issued_at_tick: issued_at_tick,
+        token_expiry_tick: expiry_tick,
     }
 }
 
@@ -3031,9 +3111,9 @@ fn current_timestamp_epoch_secs() -> u64 {
 }
 
 /// Creates a default evaluation window for local-only queue admission.
-fn make_default_eval_window() -> HtfEvaluationWindow {
+fn make_default_eval_window(boundary_id: &str) -> HtfEvaluationWindow {
     HtfEvaluationWindow {
-        boundary_id: DEFAULT_BOUNDARY_ID.to_string(),
+        boundary_id: boundary_id.to_string(),
         authority_clock: DEFAULT_AUTHORITY_CLOCK.to_string(),
         tick_start: 0,
         tick_end: 1,
@@ -3358,6 +3438,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),

@@ -264,6 +264,10 @@ pub enum DenialReasonCode {
     /// authority.  The queue root or a subdirectory is not owned by the
     /// current uid or has group/world-accessible mode bits.
     UnsafeQueuePermissions,
+    /// Canonicalizer tuple digest could not be parsed from b3-256 hex string.
+    /// Fail-closed: unparseable digest cannot be used for token binding
+    /// validation.
+    InvalidCanonicalizerDigest,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -276,6 +280,22 @@ pub struct ChannelBoundaryTrace {
     pub defect_count: u32,
     /// Bound and stringified defect classes.
     pub defect_classes: Vec<String>,
+    /// TCK-00565: Hex-encoded FAC policy hash from decoded token binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_fac_policy_hash: Option<String>,
+    /// TCK-00565: Hex-encoded canonicalizer tuple digest from decoded token
+    /// binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_canonicalizer_tuple_digest: Option<String>,
+    /// TCK-00565: Boundary identifier from decoded token binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_boundary_id: Option<String>,
+    /// TCK-00565: Issued-at tick from decoded token binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_issued_at_tick: Option<u64>,
+    /// TCK-00565: Expiry tick from decoded token binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expiry_tick: Option<u64>,
 }
 
 /// Trace of the RFC-0029 queue admission decision.
@@ -1932,6 +1952,11 @@ pub mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         });
 
         match outcome {
@@ -2180,6 +2205,11 @@ pub mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         })
         .try_build();
 
@@ -2203,6 +2233,11 @@ pub mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         })
         .eio29_queue_admission(QueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -2234,6 +2269,11 @@ pub mod tests {
             passed: false,
             defect_count: 1,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         })
         .eio29_queue_admission(QueueAdmissionTrace {
             verdict: "deny".to_string(),
@@ -2266,6 +2306,11 @@ pub mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         })
         .eio29_queue_admission(QueueAdmissionTrace {
             verdict: "deny".to_string(),
@@ -2295,6 +2340,11 @@ pub mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         })
         .eio29_queue_admission(QueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -2368,6 +2418,10 @@ pub mod tests {
                 DenialReasonCode::InsufficientDiskSpace,
                 "\"insufficient_disk_space\"",
             ),
+            (
+                DenialReasonCode::InvalidCanonicalizerDigest,
+                "\"invalid_canonicalizer_digest\"",
+            ),
         ];
 
         for (variant, expected) in map {
@@ -2393,6 +2447,11 @@ pub mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         })
         .eio29_queue_admission(QueueAdmissionTrace {
             verdict: "deny".to_string(),

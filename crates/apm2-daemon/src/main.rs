@@ -1129,7 +1129,11 @@ async fn async_main(args: Args) -> Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("adapter rotation initialization failed: {e}"))?
         }
-        .with_daemon_state(Arc::clone(&state)),
+        .with_daemon_state(Arc::clone(&state))
+        // TCK-00565: Wire boundary_id from node identity into the dispatcher
+        // so that tokens issued through the daemon dispatch path include the
+        // correct boundary_id in their TokenBindingV1.
+        .with_token_binding_config(boundary_id.clone(), [0u8; 32]),
     );
 
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
