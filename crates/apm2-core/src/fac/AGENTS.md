@@ -255,6 +255,47 @@ health gate to refuse job admission when broker health is degraded.
   active on ALL production admission/token issuance paths through the
   `FacBroker` API.
 
+## broker_health_ipc Submodule (TCK-00600)
+
+The `broker_health_ipc` submodule implements a file-based IPC endpoint for
+exposing broker health, version, and readiness to the CLI. The daemon writes
+`broker_health.json` after each poller-loop health evaluation; `apm2 fac
+services status` reads it to determine broker health independently of systemd
+unit state.
+
+### Key Types
+
+- `BrokerHealthIpcV1`: Schema-versioned health status payload with daemon
+  version, readiness flag, PID, epoch timestamp, uptime, health status string,
+  and optional reason. Uses `deny_unknown_fields` for forward-compatibility
+  safety.
+- `BrokerHealthIpcStatus`: Read result with freshness evaluation. Carries
+  `found`, `fresh`, `ready`, `version`, `pid`, `age_secs`, `uptime_secs`,
+  `health_status`, and optional `error`. Stale status (age > 180s) forces
+  `ready=false` and `health_status="stale"`.
+
+### Core Functions
+
+- `write_broker_health(fac_root, version, ready, uptime_secs, health_status,
+  reason)`: Atomic write (temp+rename) to `<fac_root>/broker_health.json`.
+  Called by the daemon's poller loop after each health gate evaluation.
+- `read_broker_health(fac_root)`: Bounded read with O_NOFOLLOW + O_NONBLOCK +
+  fstat regular-file check + staleness detection. Returns
+  `BrokerHealthIpcStatus` (never errors; missing/corrupt files return defaults).
+
+### Security Invariants (TCK-00600)
+
+- [INV-BHI-001] Health status files are bounded to `MAX_BROKER_HEALTH_FILE_SIZE`
+  (4 KiB) when read, preventing OOM from crafted files.
+- [INV-BHI-002] Health status file reads use bounded I/O with `O_NOFOLLOW |
+  O_NONBLOCK | O_CLOEXEC` (Linux) per CTR-1603 and RS-31. Non-regular files
+  (FIFOs, devices, sockets) are rejected via fstat after open.
+- [INV-BHI-003] Health status writes use atomic write (temp + rename) to prevent
+  partial reads.
+- [INV-BHI-004] Health status is not authoritative for admission or security
+  decisions. It is an observability signal only. The authoritative broker health
+  gate is in `broker_health.rs`.
+
 ## broker_rate_limits Submodule (TCK-00568)
 
 The `broker_rate_limits` submodule implements RFC-0029 control-plane budget
@@ -780,8 +821,11 @@ systemd process monitoring provides.
 
 - [INV-WHB-001] Heartbeat file writes use atomic temp+rename to prevent partial
   reads.
-- [INV-WHB-002] Heartbeat file reads are bounded by `MAX_HEARTBEAT_FILE_SIZE`
-  (8 KiB) before deserialization.
+- [INV-WHB-002] Heartbeat file reads use `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`
+  (Linux) to refuse symlinks at the kernel level and avoid blocking on FIFOs.
+  Non-regular files are rejected via fstat after open. Reads are bounded by
+  `MAX_HEARTBEAT_FILE_SIZE` (8 KiB) using `Read::take()` before deserialization
+  (CTR-1603, RS-31). On non-Linux, falls back to `symlink_metadata` check.
 - [INV-WHB-003] Schema mismatch or parse failure returns a default
   `HeartbeatStatus` with `found: false` (fail-open for observability, not
   authority).

@@ -1228,6 +1228,10 @@ async fn async_main(args: Args) -> Result<()> {
         .expect("default BrokerState is always valid");
         let mut health_checker = apm2_core::fac::BrokerHealthChecker::new();
         let boundary_id = boundary_id.clone();
+        // TCK-00600: Clone fac_root into the poller task so we can write
+        // broker_health.json after each health evaluation.
+        let fac_root_for_poller = fac_root.clone();
+        let daemon_start = std::time::Instant::now();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -1383,6 +1387,31 @@ async fn async_main(args: Args) -> Result<()> {
                     warn!(
                         "Admission health gate CLOSED by poller \
                          (INV-BRK-HEALTH-GATE-001)"
+                    );
+                }
+
+                // TCK-00600: Write broker health IPC file after each health
+                // evaluation. This file is read by `apm2 fac services status`
+                // to report broker readiness and version independently of
+                // systemd unit state. Fail-open: a write failure is logged but
+                // does not affect the admission gate (INV-BHI-004).
+                let health_status_str = if gate_healthy { "healthy" } else { "unhealthy" };
+                let uptime_secs = daemon_start.elapsed().as_secs();
+                if let Err(e) = apm2_core::fac::broker_health_ipc::write_broker_health(
+                    &fac_root_for_poller,
+                    env!("CARGO_PKG_VERSION"),
+                    gate_healthy,
+                    uptime_secs,
+                    health_status_str,
+                    if gate_healthy {
+                        None
+                    } else {
+                        Some("admission health gate closed")
+                    },
+                ) {
+                    warn!(
+                        error = %e,
+                        "Failed to write broker health IPC file (non-fatal)"
                     );
                 }
             }
