@@ -4315,21 +4315,21 @@ mod tests {
         previous: Option<std::ffi::OsString>,
     }
 
-    #[allow(unsafe_code)] // env var mutation is required for test setup.
+    #[allow(unsafe_code)] // env var mutation is required for test setup and teardown.
     fn set_apm2_home(home: &std::path::Path) {
         // SAFETY: tests intentionally mutate process-wide environment state and
-        // restore it in Drop, matching the project's existing environment test
-        // harness pattern.
+        // restore it in Drop, matching the project's existing environment
+        // test harness pattern.
         unsafe {
             std::env::set_var("APM2_HOME", home);
         }
     }
 
-    #[allow(unsafe_code)] // env var mutation is required for test setup.
+    #[allow(unsafe_code)] // env var restoration is required for test cleanup.
     fn restore_apm2_home(previous: Option<&std::ffi::OsString>) {
         // SAFETY: tests intentionally mutate process-wide environment state and
-        // restore it in Drop, matching the project's existing environment test
-        // harness pattern.
+        // restore it in Drop, matching the project's existing environment
+        // test harness pattern.
         unsafe {
             match previous {
                 Some(previous) => std::env::set_var("APM2_HOME", previous),
