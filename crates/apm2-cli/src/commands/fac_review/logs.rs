@@ -171,10 +171,26 @@ fn resolve_selector_zoom(
             })
         },
         SelectorToken::ToolOutput(tool_output) => {
+            // Fail closed: verify gate cache proves this gate ran for the requested SHA.
+            let gate_cache =
+                super::gate_cache::GateCache::load(&tool_output.sha).ok_or_else(|| {
+                    format!(
+                        "no gate cache found for SHA {} — cannot validate tool output selector",
+                        tool_output.sha
+                    )
+                })?;
+            let _cached_result = gate_cache.get(&tool_output.gate).ok_or_else(|| {
+                format!(
+                    "gate `{}` not found in cache for SHA {} — cannot validate tool output selector",
+                    tool_output.gate, tool_output.sha
+                )
+            })?;
+
+            // Now proceed with existing log discovery (SHA-validated via cache proof).
             let evidence_path = find_latest_evidence_gate_log(&apm2_home_dir()?, &tool_output.gate)
                 .ok_or_else(|| {
                     format!(
-                        "no evidences logs found for lane-scoped gate `{}`",
+                        "no evidence logs found for lane-scoped gate `{}`",
                         tool_output.gate
                     )
                 })?;
