@@ -34,17 +34,30 @@ const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
     "NEXTEST_TEST_THREADS",
     "CARGO_HOME",
     "RUSTUP_TOOLCHAIN",
-    "RUSTC_WRAPPER",
     "RUSTDOCFLAGS",
 ];
 
-const SYSTEMD_SETENV_ALLOWLIST_PREFIXES: &[&str] = &["SCCACHE_"];
+/// `RUSTC_WRAPPER` and `SCCACHE_*` are intentionally EXCLUDED from the
+/// allowlist. In bounded test mode we cannot verify cgroup containment
+/// for the systemd transient unit before it starts, so sccache env vars
+/// are never forwarded. This prevents cache poisoning from sccache
+/// daemons running outside the job's cgroup (MAJOR-1, MAJOR-3 fix per
+/// TCK-00548 review findings).
+const SYSTEMD_SETENV_ALLOWLIST_PREFIXES: &[&str] = &[];
+
+/// Env var keys that are explicitly stripped from the spawned bounded
+/// test process environment to prevent inheritance from the parent.
+const SCCACHE_ENV_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedTestCommandSpec {
     pub command: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub setenv_pairs: Vec<(String, String)>,
+    /// Env var keys to remove from the spawned process environment.
+    /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
+    /// that could bypass the bounded test's cgroup containment.
+    pub env_remove_keys: Vec<String>,
     /// The execution backend used for this command.
     pub backend: ExecutionBackend,
 }
@@ -168,10 +181,26 @@ pub fn build_bounded_test_command(
     append_systemd_setenv_args(&mut command, &setenv_pairs);
     command.extend(core_cmd.args[property_start..].iter().cloned());
 
+    // Collect sccache-related env var keys to strip from the spawned
+    // process environment. This prevents the bounded test unit from
+    // inheriting sccache configuration from the parent process, which
+    // could bypass cgroup containment (TCK-00548 MAJOR-3).
+    let mut env_remove_keys: Vec<String> = SCCACHE_ENV_STRIP_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    // Also strip any SCCACHE_* vars from parent env.
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SCCACHE_") && !env_remove_keys.contains(&key) {
+            env_remove_keys.push(key);
+        }
+    }
+
     Ok(BoundedTestCommandSpec {
         command,
         environment,
         setenv_pairs,
+        env_remove_keys,
         backend,
     })
 }
@@ -274,6 +303,12 @@ fn command_available(command: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+// NOTE: `check_sccache_containment_for_build()` was removed as part of
+// TCK-00548 review findings (MAJOR-1, MAJOR-3). It checked containment
+// against the CLI process PID (wrong PID — the bounded test unit does
+// not exist yet). The fix unconditionally strips sccache env vars from
+// bounded test commands via the allowlist and env_remove_keys instead.
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -317,11 +352,14 @@ mod tests {
         let inherited = vec![
             ("NEXTEST_TEST_THREADS".to_string(), "8".to_string()),
             ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
-            ("SCCACHE_CACHE_SIZE".to_string(), "100G".to_string()),
+            (
+                "RUSTFLAGS".to_string(),
+                "-Cforce-frame-pointers".to_string(),
+            ),
         ];
         let extra = vec![
             ("NEXTEST_TEST_THREADS".to_string(), "4".to_string()),
-            ("SCCACHE_CACHE_SIZE".to_string(), "200G".to_string()),
+            ("RUSTFLAGS".to_string(), "-Copt-level=1".to_string()),
             ("CARGO_BUILD_JOBS".to_string(), String::new()),
         ];
 
@@ -332,8 +370,44 @@ mod tests {
             vec![
                 ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
                 ("NEXTEST_TEST_THREADS".to_string(), "4".to_string()),
-                ("SCCACHE_CACHE_SIZE".to_string(), "200G".to_string()),
+                ("RUSTFLAGS".to_string(), "-Copt-level=1".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn sccache_env_vars_rejected_from_setenv_allowlist() {
+        // TCK-00548: RUSTC_WRAPPER and SCCACHE_* must NOT be in the
+        // allowlist. They are unconditionally stripped from bounded
+        // test commands because cgroup containment cannot be verified
+        // for systemd transient units before they start.
+        let err = build_systemd_setenv_pairs(
+            Vec::new(),
+            &[("RUSTC_WRAPPER".to_string(), "sccache".to_string())],
+        )
+        .expect_err("RUSTC_WRAPPER should be rejected");
+        assert!(
+            err.contains("RUSTC_WRAPPER"),
+            "error should mention key: {err}"
+        );
+
+        let err2 = build_systemd_setenv_pairs(
+            Vec::new(),
+            &[("SCCACHE_CACHE_SIZE".to_string(), "100G".to_string())],
+        )
+        .expect_err("SCCACHE_* should be rejected");
+        assert!(
+            err2.contains("SCCACHE_"),
+            "error should mention key: {err2}"
+        );
+    }
+
+    #[test]
+    fn sccache_env_strip_keys_are_populated() {
+        // Verify SCCACHE_ENV_STRIP_KEYS contains RUSTC_WRAPPER.
+        assert!(
+            super::SCCACHE_ENV_STRIP_KEYS.contains(&"RUSTC_WRAPPER"),
+            "RUSTC_WRAPPER must be in SCCACHE_ENV_STRIP_KEYS"
         );
     }
 

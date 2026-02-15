@@ -609,3 +609,60 @@ still enforced; only the token requirement is waived.
   except the token requirement.
 - All deny paths in the control-lane flow emit explicit refusal receipts before
   moving jobs to `denied/`.
+
+## containment Submodule (TCK-00548)
+
+The `containment` submodule implements cgroup membership verification for
+child processes during FAC job execution. It verifies that child processes
+(rustc, nextest, cc, ld, sccache) share the same cgroup hierarchy as the
+job unit, preventing cache poisoning via escaped sccache daemons.
+
+### Key Types
+
+- `ContainmentVerdict`: Full verdict with `contained` flag, reference cgroup,
+  mismatch list, sccache detection, and auto-disable status.
+- `ContainmentMismatch`: Single escaped process with PID, name, expected and
+  actual cgroup paths.
+- `ContainmentTrace`: Lightweight trace for inclusion in `FacJobReceiptV1`.
+- `ContainmentError`: Fail-closed error taxonomy for proc read failures,
+  parse failures, and resource bounds.
+
+### Core Capabilities
+
+- `read_cgroup_path(pid)`: Reads the cgroup v2 path from `/proc/<pid>/cgroup`.
+- `discover_children(parent_pid)`: BFS discovery of all descendant processes
+  via `/proc/*/status` PPid scanning, bounded by `MAX_CHILD_PROCESSES` (2048).
+- `verify_containment(reference_pid, sccache_enabled)`: Full containment
+  check with sccache auto-disable logic.
+- `check_sccache_containment(reference_pid, sccache_enabled)`: Convenience
+  function returning `Option<String>` reason if sccache should be disabled.
+- `is_cgroup_contained(child_path, reference_path)`: Exact or subtree
+  prefix matching with slash separator enforcement.
+
+### Security Invariants (TCK-00548)
+
+- [INV-CONTAIN-001] Fail-closed: unreadable `/proc` entries result in
+  mismatch verdict. Default `ContainmentVerdict::default()` has
+  `contained: false`.
+- [INV-CONTAIN-002] All `/proc` reads bounded by `MAX_PROC_READ_SIZE` (4 KiB).
+- [INV-CONTAIN-003] Process discovery bounded by `MAX_CHILD_PROCESSES` (2048)
+  and `MAX_PROC_SCAN_ENTRIES` (131072). Overflow returns
+  `ContainmentError::ProcScanOverflow` (fail-closed). Excessive `PPid`
+  read failures (>50% of scanned PID entries) also return this error.
+- [INV-CONTAIN-004] Cgroup path comparison uses exact prefix matching with
+  slash separator to prevent `/foo` matching `/foobar`.
+- [INV-CONTAIN-005] Process comm names bounded by `MAX_COMM_LENGTH` (64).
+- [INV-CONTAIN-006] PID validation rejects 0 and values > `MAX_PID_VALUE`.
+- [INV-CONTAIN-007] `ContainmentTrace` is wired into `FacJobReceiptV1` via
+  the `emit_job_receipt` function. The builder's `.containment()` method
+  populates the receipt's `containment` field from actual verification
+  results.
+- [INV-CONTAIN-008] Bounded test commands (systemd transient units)
+  unconditionally strip sccache env vars (`RUSTC_WRAPPER`, `SCCACHE_*`)
+  because cgroup containment cannot be verified for the transient unit
+  before it starts. The stripping is enforced in two places: (1) the
+  `SYSTEMD_SETENV_ALLOWLIST_EXACT` excludes `RUSTC_WRAPPER` and
+  `SYSTEMD_SETENV_ALLOWLIST_PREFIXES` excludes `SCCACHE_*`, preventing
+  these keys from appearing in `--setenv` args; (2) `env_remove_keys`
+  strips them from the spawned process environment to prevent parent
+  env inheritance.

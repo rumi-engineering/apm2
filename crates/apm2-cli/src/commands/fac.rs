@@ -247,6 +247,12 @@ pub enum FacSubcommand {
     Gc(fac_gc::GcArgs),
     /// Manage quarantined and denied jobs.
     Quarantine(fac_quarantine::QuarantineArgs),
+    /// Verify containment of child processes within cgroup boundary.
+    ///
+    /// Checks that child processes (rustc, nextest, cc, etc.) share the
+    /// same cgroup as the reference process. When sccache is enabled and
+    /// containment fails, reports that sccache should be auto-disabled.
+    Verify(VerifyArgs),
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -583,6 +589,47 @@ pub struct CancelArgs {
     /// Reason for cancellation (recorded in receipt).
     #[arg(long, default_value = "operator-initiated cancellation")]
     pub reason: String,
+}
+
+/// Arguments for `apm2 fac verify`.
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    #[command(subcommand)]
+    pub subcommand: VerifySubcommand,
+}
+
+/// Verify subcommands.
+#[derive(Debug, Subcommand)]
+pub enum VerifySubcommand {
+    /// Verify cgroup containment of child processes.
+    ///
+    /// Checks that child processes (rustc, nextest, cc, ld, sccache)
+    /// share the same cgroup hierarchy as the reference process. When
+    /// sccache is enabled and containment fails, reports that sccache
+    /// should be auto-disabled.
+    Containment(ContainmentArgs),
+}
+
+/// Arguments for `apm2 fac verify containment`.
+#[derive(Debug, Args)]
+pub struct ContainmentArgs {
+    /// PID of the reference process (job unit main process).
+    ///
+    /// All child processes will be checked against this PID's cgroup.
+    /// If not specified, uses the current process PID.
+    #[arg(long)]
+    pub pid: Option<u32>,
+
+    /// Whether sccache is currently enabled for the build.
+    ///
+    /// When true and containment fails, the verdict reports that
+    /// sccache should be auto-disabled.
+    #[arg(long, default_value_t = false)]
+    pub sccache_enabled: bool,
+
+    /// Output in JSON format.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -1567,6 +1614,7 @@ pub fn run_fac(
             | FacSubcommand::Gc(_)
             | FacSubcommand::Quarantine(_)
             | FacSubcommand::Job(_)
+            | FacSubcommand::Verify(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -1992,6 +2040,11 @@ pub fn run_fac(
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
         FacSubcommand::Quarantine(args) => fac_quarantine::run_quarantine(args),
+        FacSubcommand::Verify(args) => match &args.subcommand {
+            VerifySubcommand::Containment(containment_args) => {
+                run_verify_containment(containment_args)
+            },
+        },
     }
 }
 
@@ -2042,6 +2095,9 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Pipeline(_)
         | FacSubcommand::Pr(_)
         | FacSubcommand::Job(_) => false,
+        FacSubcommand::Verify(args) => match &args.subcommand {
+            VerifySubcommand::Containment(containment_args) => containment_args.json,
+        },
     }
 }
 
@@ -4138,6 +4194,85 @@ fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
     };
 
     output_error(json_output, &code, &message, exit_code)
+}
+
+// =============================================================================
+// Verify Containment (TCK-00548)
+// =============================================================================
+
+/// Runs the `apm2 fac verify containment` command.
+fn run_verify_containment(args: &ContainmentArgs) -> u8 {
+    let pid = args.pid.unwrap_or_else(std::process::id);
+
+    let verdict = match apm2_core::fac::verify_containment(pid, args.sccache_enabled) {
+        Ok(v) => v,
+        Err(e) => {
+            if args.json {
+                let err_json = serde_json::json!({
+                    "error": e.to_string(),
+                    "contained": false,
+                    "pid": pid,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&err_json).unwrap_or_default()
+                );
+            } else {
+                eprintln!("containment verification failed: {e}");
+            }
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    if args.json {
+        match serde_json::to_string_pretty(&verdict) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("failed to serialize verdict: {e}");
+                return exit_codes::GENERIC_ERROR;
+            },
+        }
+    } else {
+        if verdict.contained {
+            println!(
+                "PASS: all {} child process(es) contained in cgroup '{}'",
+                verdict.processes_checked, verdict.reference_cgroup
+            );
+        } else {
+            println!(
+                "FAIL: {} mismatch(es) out of {} child process(es)",
+                verdict.mismatches.len(),
+                verdict.processes_checked
+            );
+            println!("  reference cgroup: {}", verdict.reference_cgroup);
+            for m in &verdict.mismatches {
+                println!(
+                    "  PID {} ({}): expected '{}', actual '{}'",
+                    m.pid, m.process_name, m.expected_cgroup, m.actual_cgroup
+                );
+            }
+        }
+
+        if verdict.sccache_detected {
+            println!("  sccache process detected: yes");
+        }
+        if verdict.sccache_auto_disabled {
+            if let Some(reason) = &verdict.sccache_disabled_reason {
+                println!("  sccache auto-disabled: {reason}");
+            }
+        }
+
+        println!(
+            "  critical processes found: {}",
+            verdict.critical_processes_found
+        );
+    }
+
+    if verdict.contained {
+        exit_codes::SUCCESS
+    } else {
+        exit_codes::VALIDATION_ERROR
+    }
 }
 
 // =============================================================================
