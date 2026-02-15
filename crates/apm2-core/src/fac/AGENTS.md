@@ -492,6 +492,11 @@ by another worker).
   must precede lane cleanup. Cleanup failure must not negate a completed job.
 - [INV-LANE-CLEANUP-007] Corrupt marker persistence uses crash-safe durability:
   fsync temp file, atomic rename, fsync directory.
+- [INV-LANE-CLEANUP-007a] Receipt persistence (`LaneCleanupReceiptV1::persist`)
+  uses the atomic write protocol (CTR-2607): `NamedTempFile` with restrictive
+  permissions (0o600 on Unix), `sync_all()` for durability, then atomic rename.
+  This matches the durable write pattern used by `LaneCorruptMarkerV1::persist`
+  via `atomic_write` in `lane.rs`.
 - [INV-LANE-CLEANUP-008] Git commands in lane cleanup use config isolation to
   prevent LPE via malicious `.git/config` entries. `build_isolated_git_command()`
   sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, and overrides
