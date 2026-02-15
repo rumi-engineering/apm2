@@ -198,6 +198,49 @@ impl EcosystemConfig {
 
 All parsing methods return `Result` - untrusted input cannot trigger panics (RSK-0701).
 
+### Environment-Based Auto-Config (TCK-00595)
+
+```rust
+impl EcosystemConfig {
+    /// Build a default config with environment-based auto-detection.
+    /// Enables config-less CLI startup.
+    pub fn from_env() -> Self;
+}
+```
+
+`from_env()` constructs a usable config without an `ecosystem.toml` by:
+1. Using XDG-standard default paths for all daemon paths.
+2. Auto-detecting GitHub owner/repo from `git remote get-url origin` (CWD).
+3. Using the unified token resolution chain for projection auth.
+
+Projection is enabled only when BOTH GitHub coordinates AND a token are detected.
+
+### Unified Token Resolution (TCK-00595 MAJOR FIX)
+
+```rust
+pub fn resolve_github_token(env_var_name: &str) -> Option<secrecy::SecretString>;
+```
+
+Resolves a GitHub token from a three-tier fallback chain:
+1. Environment variable named by `env_var_name` (e.g., `GITHUB_TOKEN`).
+2. Systemd credential directory: `$CREDENTIALS_DIRECTORY/gh-token` (populated by
+   `LoadCredential=gh-token:...` in the systemd unit file).
+3. APM2 credential file: `$APM2_HOME/private/creds/gh-token`.
+
+This ensures the daemon resolves tokens under systemd (where env vars may not be
+set) and under direct invocation (where env vars are the primary source).
+
+**Security:**
+- [INV-CFG-18] Token resolution never panics; returns `None` on all failure paths.
+- [INV-CFG-19] Token is trimmed of whitespace from file reads.
+- [INV-CFG-20] Empty values are treated as absent.
+- [INV-CFG-21] Returns `SecretString` — token is redacted in Debug/Display output.
+- [INV-CFG-22] Credential files are opened with `O_NOFOLLOW` on Unix (rejects symlinks).
+- [INV-CFG-23] Credential files are bounded to 4 KiB (`MAX_CREDENTIAL_FILE_SIZE`); oversized files are rejected.
+
+**IMPORTANT:** This is for the **short-lived CLI only**. The long-lived daemon
+must NOT use CWD auto-detection (see MAJOR-1 fix in `apm2-daemon/src/main.rs`).
+
 ## Examples
 
 ### Minimal Configuration

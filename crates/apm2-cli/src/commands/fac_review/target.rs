@@ -35,32 +35,10 @@ pub fn derive_repo_from_origin() -> Result<String, String> {
         ));
     }
     let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_owner_repo_from_remote_url(&remote).ok_or_else(|| {
+    let (owner, repo) = apm2_core::github::parse_github_remote_url(&remote).ok_or_else(|| {
         format!("unsupported origin remote URL format for repository derivation: `{remote}`")
-    })
-}
-
-fn parse_owner_repo_from_remote_url(remote: &str) -> Option<String> {
-    let trimmed = remote.trim().trim_end_matches('/');
-    let path = if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("http://github.com/") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        rest
-    } else {
-        return None;
-    };
-    let normalized = path.trim_end_matches(".git").trim_end_matches('/');
-    let mut parts = normalized.split('/');
-    let owner = parts.next()?;
-    let repo = parts.next()?;
-    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
+    })?;
+    Ok(format!("{owner}/{repo}"))
 }
 
 pub fn current_branch() -> Result<String, String> {
@@ -95,7 +73,7 @@ pub(super) fn current_head_sha() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_owner_repo_from_remote_url, resolve_pr_target};
+    use super::resolve_pr_target;
 
     #[test]
     fn resolve_pr_target_accepts_pr_only() {
@@ -104,27 +82,6 @@ mod tests {
         assert_eq!(pr, 42);
     }
 
-    #[test]
-    fn parse_owner_repo_from_remote_url_accepts_https() {
-        assert_eq!(
-            parse_owner_repo_from_remote_url("https://github.com/acme-sandbox/pr-target-alpha.git"),
-            Some("acme-sandbox/pr-target-alpha".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_owner_repo_from_remote_url_accepts_ssh() {
-        assert_eq!(
-            parse_owner_repo_from_remote_url("git@github.com:acme-sandbox/pr-target-alpha.git"),
-            Some("acme-sandbox/pr-target-alpha".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_owner_repo_from_remote_url_rejects_non_github() {
-        assert_eq!(
-            parse_owner_repo_from_remote_url("https://example.com/test-org/test-repo.git"),
-            None
-        );
-    }
+    // URL parsing tests are covered by
+    // apm2_core::github::parse_github_remote_url tests.
 }
