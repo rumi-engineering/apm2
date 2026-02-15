@@ -45,9 +45,8 @@
 //! - CTR-2003: Fail-closed security defaults
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use secrecy::zeroize::Zeroizing;
@@ -55,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::signer::{KeyId, ReceiptSigner, SignerError};
+use crate::fs_safe;
 
 // =============================================================================
 // Constants
@@ -470,42 +470,47 @@ impl KeyManifest {
     ///
     /// Returns an empty manifest if the file doesn't exist. Fails closed
     /// on parse errors per CTR-2003.
+    ///
+    /// TCK-00537: Uses [`fs_safe::bounded_read_json`] for symlink refusal
+    /// (`O_NOFOLLOW`), bounded reads (size cap), and regular-file verification.
     fn load() -> Result<Self, KeychainError> {
         let path = Self::path().ok_or(KeychainError::NoHomeDirectory)?;
-
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content)
-                .map_err(|e| KeychainError::Manifest(format!("failed to parse manifest: {e}"))),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                // File doesn't exist yet - return empty manifest
-                Ok(Self::default())
-            },
-            Err(e) => Err(KeychainError::Manifest(format!(
-                "failed to read manifest: {e}"
-            ))),
-        }
+        Self::load_from_path(&path)
     }
 
     /// Saves the manifest to disk.
     ///
-    /// Creates the parent directory if it doesn't exist.
+    /// TCK-00537: Uses [`fs_safe::atomic_write_json`] for crash-safe
+    /// persistence with fsync + atomic rename. Parent directory is created
+    /// with mode 0700 (restrictive permissions).
     fn save(&self) -> Result<(), KeychainError> {
         let path = Self::path().ok_or(KeychainError::NoHomeDirectory)?;
+        Self::save_to_path(&path, self)
+    }
 
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                KeychainError::Manifest(format!("failed to create manifest directory: {e}"))
-            })?;
+    /// Loads a manifest from a specific path using safe I/O primitives.
+    ///
+    /// Returns an empty manifest if the file doesn't exist. Fails closed
+    /// on parse errors.
+    fn load_from_path(path: &Path) -> Result<Self, KeychainError> {
+        match fs_safe::bounded_read_json(path, fs_safe::DEFAULT_MAX_FILE_SIZE) {
+            Ok(manifest) => Ok(manifest),
+            Err(fs_safe::FsSafeError::Io { source, .. })
+                if source.kind() == ErrorKind::NotFound =>
+            {
+                // File doesn't exist yet - return empty manifest
+                Ok(Self::default())
+            },
+            Err(e) => Err(KeychainError::Manifest(format!(
+                "failed to load manifest: {e}"
+            ))),
         }
+    }
 
-        let content = serde_json::to_string_pretty(&self)
-            .map_err(|e| KeychainError::Manifest(format!("failed to serialize manifest: {e}")))?;
-
-        fs::write(&path, content)
-            .map_err(|e| KeychainError::Manifest(format!("failed to write manifest: {e}")))?;
-
-        Ok(())
+    /// Saves a manifest to a specific path using atomic write.
+    fn save_to_path(path: &Path, manifest: &Self) -> Result<(), KeychainError> {
+        fs_safe::atomic_write_json(path, manifest)
+            .map_err(|e| KeychainError::Manifest(format!("failed to write manifest: {e}")))
     }
 }
 
@@ -590,43 +595,26 @@ impl OsKeychain {
     }
 
     /// Loads manifest from a specific path.
-    fn load_manifest_from_path(path: &PathBuf) -> Result<KeyManifest, KeychainError> {
-        match fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content)
-                .map_err(|e| KeychainError::Manifest(format!("failed to parse manifest: {e}"))),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(KeyManifest::default()),
-            Err(e) => Err(KeychainError::Manifest(format!(
-                "failed to read manifest: {e}"
-            ))),
-        }
+    ///
+    /// TCK-00537: Delegates to [`KeyManifest::load_from_path`] which uses
+    /// safe I/O primitives (symlink refusal, bounded reads).
+    fn load_manifest_from_path(path: &Path) -> Result<KeyManifest, KeychainError> {
+        KeyManifest::load_from_path(path)
     }
 
     /// Saves the current cache to the manifest file.
+    ///
+    /// TCK-00537: Uses [`fs_safe::atomic_write_json`] for crash-safe
+    /// persistence. Parent directories are created with mode 0700.
     fn save_manifest(&self, cache: &HashMap<String, KeyInfo>) -> Result<(), KeychainError> {
         let manifest = KeyManifest {
             keys: cache.clone(),
         };
 
-        if let Some(ref path) = self.manifest_path {
-            // Use custom path
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    KeychainError::Manifest(format!("failed to create manifest directory: {e}"))
-                })?;
-            }
-
-            let content = serde_json::to_string_pretty(&manifest).map_err(|e| {
-                KeychainError::Manifest(format!("failed to serialize manifest: {e}"))
-            })?;
-
-            fs::write(path, content)
-                .map_err(|e| KeychainError::Manifest(format!("failed to write manifest: {e}")))?;
-
-            Ok(())
-        } else {
-            // Use default path
-            manifest.save()
-        }
+        self.manifest_path.as_ref().map_or_else(
+            || manifest.save(),
+            |path| KeyManifest::save_to_path(path, &manifest),
+        )
     }
 
     /// Gets the keyring entry for a key.
@@ -1335,6 +1323,8 @@ pub fn generate_and_store_key(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -1584,6 +1574,97 @@ mod tests {
         assert_eq!(loaded.key_id.as_str(), "test-key-123");
         assert_eq!(loaded.version, 42);
         assert_eq!(loaded.created_at, 1_700_000_000);
+    }
+
+    // =========================================================================
+    // TCK-00537: Safe I/O primitive migration tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_atomic_write_roundtrip() {
+        // Verify that save_to_path (atomic_write_json) and load_from_path
+        // (bounded_read_json) round-trip correctly.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("atomic_manifest.json");
+
+        let mut manifest = KeyManifest::default();
+        let key_id = KeyId::new("atomic-key").unwrap();
+        manifest.keys.insert(
+            "atomic-key".to_string(),
+            KeyInfo {
+                key_id,
+                version: 7,
+                created_at: 1_700_000_000,
+            },
+        );
+
+        // Save via atomic_write_json
+        KeyManifest::save_to_path(&manifest_path, &manifest).unwrap();
+
+        // Load via bounded_read_json (with O_NOFOLLOW + size cap)
+        let loaded = KeyManifest::load_from_path(&manifest_path).unwrap();
+
+        assert_eq!(loaded.keys.len(), 1);
+        let info = loaded.keys.get("atomic-key").unwrap();
+        assert_eq!(info.version, 7);
+        assert_eq!(info.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_manifest_load_rejects_symlink() {
+        // TCK-00537: Symlink refusal via safe_open (O_NOFOLLOW).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real_path = temp_dir.path().join("real_manifest.json");
+        let link_path = temp_dir.path().join("symlink_manifest.json");
+
+        // Write a valid manifest to the real path
+        let mut manifest = KeyManifest::default();
+        manifest.keys.insert(
+            "key".to_string(),
+            KeyInfo {
+                key_id: KeyId::new("key").unwrap(),
+                version: 1,
+                created_at: 1_700_000_000,
+            },
+        );
+        KeyManifest::save_to_path(&real_path, &manifest).unwrap();
+
+        // Create symlink
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+
+        // Loading via symlink should fail (O_NOFOLLOW refusal)
+        let result = KeyManifest::load_from_path(&link_path);
+        assert!(result.is_err(), "load_from_path should refuse symlinks");
+    }
+
+    #[test]
+    fn test_manifest_atomic_overwrite_consistency() {
+        // TCK-00537: Verify that atomic_write_json overwrites produce
+        // consistent state (no partial writes).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("overwrite_manifest.json");
+
+        for i in 0..5u32 {
+            let mut manifest = KeyManifest::default();
+            manifest.keys.insert(
+                format!("key-{i}"),
+                KeyInfo {
+                    key_id: KeyId::new(format!("key-{i}")).unwrap(),
+                    version: i,
+                    created_at: 1_700_000_000 + u64::from(i),
+                },
+            );
+            KeyManifest::save_to_path(&manifest_path, &manifest).unwrap();
+
+            let loaded = KeyManifest::load_from_path(&manifest_path).unwrap();
+            assert_eq!(
+                loaded.keys.len(),
+                1,
+                "iteration {i}: expected exactly 1 key"
+            );
+            let info = loaded.keys.get(&format!("key-{i}")).unwrap();
+            assert_eq!(info.version, i, "iteration {i}: version mismatch");
+        }
     }
 
     #[test]
