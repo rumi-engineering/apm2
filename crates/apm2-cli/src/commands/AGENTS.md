@@ -148,7 +148,12 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 - The daemon doctor `worker_liveness` probe must mirror daemon cache-path derivation exactly:
   - if `ledger_db_path` is set, cache path is `ledger_db_path.with_extension("projection_cache.db")`
   - otherwise, cache path is `{state_file_parent}/projection_cache.db`
-- When daemon is running, doctor probes runtime `--state-file` / `--ledger-db` overrides from `/proc/<pid>/cmdline` (resolved against daemon cwd) before evaluating cache presence. This prevents false negatives when runtime paths differ from static config.
+- When daemon is running, doctor probes runtime `--state-file` / `--ledger-db` overrides from `/proc/<pid>/cmdline` (resolved against daemon cwd) before evaluating cache presence. If runtime does not override `--ledger-db`, doctor must fall back to `daemon.ledger_db` from config to match daemon startup precedence. This prevents false negatives when runtime and static paths differ.
+
+#### Systemd Template Invariants (TCK-00608)
+
+- Worker unit templates must invoke `apm2 fac worker --poll-interval-secs <N>`; `--poll-interval` is invalid and will fail argument parsing.
+- User-mode daemon and worker templates must allow writes to both `%h/.apm2` and `%h/.local/share/apm2` when `ProtectHome=read-only` is enabled, because default ledger/CAS/state paths are XDG data-dir based.
 
 ### Process Management (process.rs)
 

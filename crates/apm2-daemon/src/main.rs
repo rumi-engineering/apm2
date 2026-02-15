@@ -183,8 +183,10 @@ impl DaemonConfig {
             .clone()
             .unwrap_or_else(|| config.daemon.state_file.clone());
 
-        // Ledger DB path from args (config fallback not yet standard)
-        let ledger_db_path = args.ledger_db.clone();
+        let ledger_db_path = args
+            .ledger_db
+            .clone()
+            .or_else(|| config.daemon.ledger_db.clone());
 
         // TCK-00383: CAS path from CLI args, falling back to config file
         let cas_path = args
@@ -203,6 +205,84 @@ impl DaemonConfig {
             metrics_port: args.metrics_port,
             metrics_disabled: args.no_metrics,
         })
+    }
+}
+
+#[cfg(test)]
+mod daemon_config_tests {
+    use super::*;
+
+    fn args_with_config(config: PathBuf) -> Args {
+        Args {
+            config,
+            no_daemon: true,
+            pid_file: None,
+            operator_socket: None,
+            session_socket: None,
+            state_file: None,
+            ledger_db: None,
+            cas_path: None,
+            log_level: "info".to_string(),
+            log_file: None,
+            metrics_port: DEFAULT_METRICS_PORT,
+            no_metrics: false,
+        }
+    }
+
+    #[test]
+    fn daemon_config_uses_default_ledger_db_when_not_overridden() {
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let args = args_with_config(temp.path().join("missing-ecosystem.toml"));
+
+        let daemon_config = DaemonConfig::new(&args).expect("daemon config should load");
+        assert_eq!(
+            daemon_config.ledger_db_path,
+            Some(apm2_core::config::default_data_dir().join("ledger.db"))
+        );
+    }
+
+    #[test]
+    fn daemon_config_uses_ledger_db_from_config_when_cli_absent() {
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\n\
+             operator_socket = \"/tmp/apm2/operator.sock\"\n\
+             session_socket = \"/tmp/apm2/session.sock\"\n\
+             ledger_db = \"/tmp/apm2/from-config.db\"\n",
+        )
+        .expect("write config");
+
+        let args = args_with_config(config_path);
+        let daemon_config = DaemonConfig::new(&args).expect("daemon config should load");
+        assert_eq!(
+            daemon_config.ledger_db_path,
+            Some(PathBuf::from("/tmp/apm2/from-config.db"))
+        );
+    }
+
+    #[test]
+    fn daemon_config_prefers_cli_ledger_db_over_config() {
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\n\
+             operator_socket = \"/tmp/apm2/operator.sock\"\n\
+             session_socket = \"/tmp/apm2/session.sock\"\n\
+             ledger_db = \"/tmp/apm2/from-config.db\"\n",
+        )
+        .expect("write config");
+
+        let mut args = args_with_config(config_path);
+        args.ledger_db = Some(PathBuf::from("/tmp/apm2/from-cli.db"));
+
+        let daemon_config = DaemonConfig::new(&args).expect("daemon config should load");
+        assert_eq!(
+            daemon_config.ledger_db_path,
+            Some(PathBuf::from("/tmp/apm2/from-cli.db"))
+        );
     }
 }
 
