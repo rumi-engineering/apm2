@@ -14,6 +14,7 @@ test suite and may only run behind an explicit feature gate.
 1. Set `APM2_HOME` to a test-local temporary directory.
 2. Use mock GitHub adapters and preserve EVID-HEF-0012 constraints.
 3. Gate execution behind `#[ignore]` or an explicit feature flag.
+4. Use bounded FAC policy of `--timeout-seconds 600` and `--memory-max 48G`.
 
 ## Gated Replacement Harness
 

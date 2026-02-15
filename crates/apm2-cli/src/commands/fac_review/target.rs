@@ -107,16 +107,16 @@ mod tests {
     #[test]
     fn parse_owner_repo_from_remote_url_accepts_https() {
         assert_eq!(
-            parse_owner_repo_from_remote_url("https://github.com/test-org/test-repo.git"),
-            Some("test-org/test-repo".to_string())
+            parse_owner_repo_from_remote_url("https://github.com/acme-sandbox/pr-target-alpha.git"),
+            Some("acme-sandbox/pr-target-alpha".to_string())
         );
     }
 
     #[test]
     fn parse_owner_repo_from_remote_url_accepts_ssh() {
         assert_eq!(
-            parse_owner_repo_from_remote_url("git@github.com:test-org/test-repo.git"),
-            Some("test-org/test-repo".to_string())
+            parse_owner_repo_from_remote_url("git@github.com:acme-sandbox/pr-target-alpha.git"),
+            Some("acme-sandbox/pr-target-alpha".to_string())
         );
     }
 

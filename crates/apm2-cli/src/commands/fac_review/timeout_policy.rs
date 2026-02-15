@@ -11,7 +11,7 @@ pub const DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 600;
 pub const MAX_MANUAL_TIMEOUT_SECONDS: u64 = 600;
 pub const TEST_TIMEOUT_SLA_MESSAGE: &str =
     "Bounded FAC test timeout is fixed at 600s for all runs.";
-pub const DEFAULT_TEST_MEMORY_MAX: &str = "24G";
+pub const DEFAULT_TEST_MEMORY_MAX: &str = "48G";
 
 #[must_use]
 pub const fn max_memory_bytes() -> u64 {

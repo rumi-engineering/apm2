@@ -8,6 +8,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
 use fs2::FileExt;
 use hmac::{Hmac, Mac};
@@ -60,9 +62,9 @@ pub struct ReviewRunCompletionReceipt {
 }
 
 type HmacSha256 = Hmac<Sha256>;
-const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
+const RUN_SECRET_MAX_FILE_BYTES: u64 = 1024;
 const RUN_SECRET_LEN_BYTES: usize = 32;
-const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
+const RUN_SECRET_MAX_ENCODED_CHARS: usize = 1024;
 pub const TERMINATION_RECEIPT_SCHEMA: &str = "apm2.review.termination_receipt.v1";
 pub const COMPLETION_RECEIPT_SCHEMA: &str = "apm2.review.completion_receipt.v1";
 
@@ -242,7 +244,7 @@ pub fn rotate_run_secret_for_home(
     let mut secret = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret);
     let path = review_run_secret_path_for_home(home, pr_number, review_type);
-    let encoded = hex::encode(secret);
+    let encoded = STANDARD.encode(secret);
     write_secret_atomic(&path, &encoded)?;
     Ok(secret.to_vec())
 }
@@ -283,7 +285,8 @@ pub fn read_run_secret_for_home(
             path.display()
         ));
     }
-    let secret = hex::decode(encoded)
+    let secret = STANDARD
+        .decode(encoded)
         .map_err(|err| format!("failed to decode run secret {}: {err}", path.display()))?;
     if secret.len() != RUN_SECRET_LEN_BYTES {
         return Err(format!(
@@ -1619,6 +1622,8 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::{
         ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
         get_process_start_time, load_review_run_state_for_home,
@@ -1716,7 +1721,7 @@ mod tests {
         let home = temp.path();
         let path = review_run_secret_path_for_home(home, 441, "security");
         std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
-        std::fs::write(&path, "a".repeat(129)).expect("write oversized run secret");
+        std::fs::write(&path, "a".repeat(1025)).expect("write oversized run secret");
 
         let err = read_run_secret_for_home(home, 441, "security")
             .expect_err("oversized run secret must fail closed");
@@ -1732,7 +1737,11 @@ mod tests {
         let home = temp.path();
         let path = review_run_secret_path_for_home(home, 441, "security");
         std::fs::create_dir_all(path.parent().expect("run secret parent")).expect("create dir");
-        std::fs::write(&path, hex::encode([0u8; 16])).expect("write short run secret");
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+        )
+        .expect("write short run secret");
 
         let err = read_run_secret_for_home(home, 441, "security")
             .expect_err("non-32-byte run secret must fail closed");
