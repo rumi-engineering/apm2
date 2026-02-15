@@ -68,8 +68,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
-pub use crate::commands::fac_broker::{BrokerArgs, BrokerSubcommand};
-use crate::commands::fac_quarantine::QuarantineSubcommand;
+pub use crate::commands::fac_broker::BrokerArgs;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
 use crate::commands::{fac_broker, fac_gc, fac_pr, fac_quarantine, fac_review};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
@@ -110,8 +109,8 @@ const SERVICE_STATUS_PROPERTIES: [&str; 6] = [
 /// FAC command group.
 #[derive(Debug, Args)]
 pub struct FacCommand {
-    /// Output format (text or json).
-    #[arg(long, default_value = "false")]
+    /// Emit JSON/JSONL output.
+    #[arg(long, default_value_t = true)]
     pub json: bool,
 
     /// Path to ledger database (defaults to `$APM2_DATA_DIR/ledger.db`).
@@ -286,6 +285,10 @@ pub struct GatesArgs {
     /// CPU quota for bounded test execution.
     #[arg(long, default_value = "200%")]
     pub cpu_quota: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -297,6 +300,7 @@ pub struct WorkArgs {
 
 /// Arguments for `apm2 fac doctor`.
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DoctorArgs {
     /// Target pull request number.
     #[arg(long)]
@@ -317,6 +321,43 @@ pub struct DoctorArgs {
     /// produce WARN; with it, they produce ERROR and cause a non-zero exit.
     #[arg(long, default_value_t = false)]
     pub full: bool,
+
+    /// Wait until doctor recommends an action other than `wait`.
+    #[arg(long, default_value_t = false)]
+    pub wait_for_recommended_action: bool,
+
+    /// Poll cadence while waiting for recommended action.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=10))]
+    pub poll_interval_seconds: u64,
+
+    /// Maximum wait time while waiting for recommended action.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(5..=180))]
+    pub wait_timeout_seconds: u64,
+
+    /// Exit only when doctor returns one of these actions (comma-separated).
+    #[arg(long, value_delimiter = ',', value_enum)]
+    pub exit_on: Vec<DoctorExitActionArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DoctorExitActionArg {
+    Fix,
+    Escalate,
+    Merge,
+    DispatchImplementor,
+    RestartReviews,
+}
+
+impl DoctorExitActionArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fix => "fix",
+            Self::Escalate => "escalate",
+            Self::Merge => "merge",
+            Self::DispatchImplementor => "dispatch_implementor",
+            Self::RestartReviews => "restart_reviews",
+        }
+    }
 }
 
 /// Arguments for `apm2 fac services`.
@@ -356,6 +397,10 @@ pub enum WorkSubcommand {
 pub struct WorkStatusArgs {
     /// Work identifier to query.
     pub work_id: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac work list`.
@@ -364,6 +409,10 @@ pub struct WorkListArgs {
     /// Return only claimable work items.
     #[arg(long, default_value_t = false)]
     pub claimable_only: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac episode`.
@@ -393,6 +442,10 @@ pub struct EpisodeInspectArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts`.
@@ -424,7 +477,7 @@ pub enum ReceiptSubcommand {
     /// Forces a full scan of all receipt files and rebuilds the
     /// non-authoritative index used for fast job/receipt lookup.
     /// The index is a cache — this command is safe to run at any time.
-    Reindex,
+    Reindex(ReceiptReindexArgs),
 }
 
 /// Arguments for `apm2 fac receipts show`.
@@ -432,6 +485,10 @@ pub enum ReceiptSubcommand {
 pub struct ReceiptShowArgs {
     /// Receipt hash (hex-encoded BLAKE3).
     pub receipt_hash: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts list`.
@@ -440,6 +497,10 @@ pub struct ReceiptListArgs {
     /// Maximum number of entries to display.
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts status`.
@@ -447,6 +508,18 @@ pub struct ReceiptListArgs {
 pub struct ReceiptStatusArgs {
     /// Job ID to look up.
     pub job_id: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac receipts reindex`.
+#[derive(Debug, Args)]
+pub struct ReceiptReindexArgs {
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac context`.
@@ -479,6 +552,10 @@ pub struct ContextRebuildArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac resume`.
@@ -490,6 +567,10 @@ pub struct ResumeArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac lane`.
@@ -523,6 +604,10 @@ pub struct LaneStatusArgs {
     /// CORRUPT).
     #[arg(long)]
     pub state: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac lane reset`.
@@ -534,6 +619,10 @@ pub struct LaneResetArgs {
     /// Force reset even if lane is RUNNING. Kills the lane's process first.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac worker`.
@@ -554,6 +643,10 @@ pub struct WorkerArgs {
     /// Print computed systemd unit properties for each selected job.
     #[arg(long, default_value_t = false)]
     pub print_unit: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac job`.
@@ -589,6 +682,10 @@ pub struct CancelArgs {
     /// Reason for cancellation (recorded in receipt).
     #[arg(long, default_value = "operator-initiated cancellation")]
     pub reason: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac verify`.
@@ -647,6 +744,10 @@ pub struct PushArgs {
     /// id.
     #[arg(long)]
     pub ticket: Option<PathBuf>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac restart`.
@@ -664,6 +765,10 @@ pub struct RestartArgs {
     /// restart strategy resolution.
     #[arg(long, default_value_t = false)]
     pub refresh_identity: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac recover`.
@@ -733,6 +838,10 @@ pub struct PipelineArgs {
     /// Commit SHA to run pipeline against.
     #[arg(long)]
     pub sha: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review`.
@@ -807,6 +916,10 @@ pub struct ReviewRunArgs {
     /// This does not bypass merge-conflict checks against `main`.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review wait`.
@@ -835,6 +948,10 @@ pub struct ReviewWaitArgs {
     /// Output format (`text` or `json`).
     #[arg(long, default_value = "text", value_enum)]
     pub format: ReviewFormatArg,
+
+    /// Emit JSON output for this command (alias for --format json).
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review dispatch`.
@@ -863,6 +980,10 @@ pub struct ReviewDispatchArgs {
     /// This does not bypass merge-conflict checks against `main`.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Review lane filter for `apm2 fac review status`.
@@ -976,6 +1097,14 @@ pub struct ReviewFindingArgs {
     #[arg(long)]
     pub reviewer_id: Option<String>,
 
+    /// Optional model identifier that produced the finding.
+    #[arg(long)]
+    pub model_id: Option<String>,
+
+    /// Optional backend identifier that produced the finding.
+    #[arg(long)]
+    pub backend_id: Option<String>,
+
     /// Optional evidence pointer (selector or local path hint).
     #[arg(long)]
     pub evidence_pointer: Option<String>,
@@ -1068,6 +1197,14 @@ pub struct ReviewVerdictSetArgs {
     #[arg(long)]
     pub reason: Option<String>,
 
+    /// Optional model identifier that produced this verdict.
+    #[arg(long)]
+    pub model_id: Option<String>,
+
+    /// Optional backend identifier that produced this verdict.
+    #[arg(long)]
+    pub backend_id: Option<String>,
+
     /// Keep prepared review input files under FAC private storage after verdict
     /// is written.
     #[arg(long, default_value_t = false)]
@@ -1108,6 +1245,10 @@ pub struct ReviewProjectArgs {
     /// Output format (`text` or `json`).
     #[arg(long, default_value = "text", value_enum)]
     pub format: ReviewFormatArg,
+
+    /// Emit JSON output for this command (alias for --format json).
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review tail`.
@@ -1120,6 +1261,10 @@ pub struct ReviewTailArgs {
     /// Follow mode (stream appended events).
     #[arg(long, default_value_t = false)]
     pub follow: bool,
+
+    /// Emit JSON output for this command (no-op; output is already NDJSON).
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review terminate`.
@@ -1271,8 +1416,8 @@ pub struct ResumeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorResponse {
-    /// Error code.
-    pub code: String,
+    /// Stable machine-readable error code.
+    pub error: String,
     /// Error message.
     pub message: String,
 }
@@ -1587,8 +1732,10 @@ pub fn run_fac(
     session_socket: &Path,
     config_path: &Path,
 ) -> u8 {
-    let json_output = cmd.json;
-    let machine_output = json_output || subcommand_requests_machine_output(&cmd.subcommand);
+    // TCK-00606 S12 invariant: FAC commands are machine-output only.
+    let machine_output = subcommand_requests_machine_output(&cmd.subcommand);
+    let json_output = machine_output;
+    let resolve_json = |_subcommand_json: bool| -> bool { machine_output };
 
     if let Err(err) = crate::commands::fac_permissions::validate_fac_root_permissions() {
         return output_error(
@@ -1632,33 +1779,63 @@ pub fn run_fac(
             &args.memory_max,
             args.pids_max,
             &args.cpu_quota,
-            json_output,
+            resolve_json(args.json),
         ),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
-                run_work_status(status_args, operator_socket, json_output)
+                run_work_status(status_args, operator_socket, resolve_json(status_args.json))
             },
             WorkSubcommand::List(list_args) => {
-                run_work_list(list_args, operator_socket, json_output)
+                run_work_list(list_args, operator_socket, resolve_json(list_args.json))
             },
         },
         FacSubcommand::Doctor(args) => {
+            let output_json = resolve_json(args.json);
+            if args.wait_for_recommended_action && args.pr.is_none() {
+                return output_error(
+                    output_json,
+                    "fac_doctor_wait_requires_pr",
+                    "`--wait-for-recommended-action` requires `--pr <N>`",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
             if args.fix && args.pr.is_none() {
                 return output_error(
-                    json_output || args.json,
+                    output_json,
                     "fac_doctor_fix_requires_pr",
                     "`apm2 fac doctor --fix` requires `--pr <N>`",
                     exit_codes::GENERIC_ERROR,
                 );
             }
+            if args.wait_for_recommended_action && args.fix {
+                return output_error(
+                    output_json,
+                    "fac_doctor_wait_incompatible_fix",
+                    "`--wait-for-recommended-action` is incompatible with `--fix`",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
             if let Some(pr) = args.pr {
-                let repo = match derive_fac_repo_or_exit(json_output || args.json) {
+                let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
-                fac_review::run_doctor(&repo, pr, args.fix, json_output || args.json)
+                let exit_on = args
+                    .exit_on
+                    .iter()
+                    .map(|value| value.as_str().to_string())
+                    .collect::<Vec<_>>();
+                fac_review::run_doctor(
+                    &repo,
+                    pr,
+                    args.fix,
+                    output_json,
+                    args.wait_for_recommended_action,
+                    args.poll_interval_seconds,
+                    args.wait_timeout_seconds,
+                    &exit_on,
+                )
             } else {
-                let output_json = json_output || args.json;
                 let (mut checks, has_critical_error) =
                     match crate::commands::daemon::collect_doctor_checks(
                         operator_socket,
@@ -1741,16 +1918,17 @@ pub fn run_fac(
         },
         FacSubcommand::Services(args) => match &args.subcommand {
             ServicesSubcommand::Status(status_args) => {
-                run_services_status(json_output || status_args.json)
+                run_services_status(resolve_json(status_args.json))
             },
         },
         FacSubcommand::RoleLaunch(args) => {
+            let output_json = resolve_json(false);
             match role_launch::handle_role_launch(
                 args,
                 &ledger_path,
                 &cas_path,
                 session_socket,
-                json_output,
+                output_json,
             ) {
                 Ok(()) => exit_codes::SUCCESS,
                 Err(error) => error
@@ -1758,7 +1936,7 @@ pub fn run_fac(
                     .map_or_else(
                         || {
                             output_error(
-                                json_output,
+                                output_json,
                                 "role_launch_error",
                                 &format!("role launch failed: {error}"),
                                 exit_codes::GENERIC_ERROR,
@@ -1769,29 +1947,46 @@ pub fn run_fac(
             }
         },
         FacSubcommand::Episode(args) => match &args.subcommand {
-            EpisodeSubcommand::Inspect(inspect_args) => {
-                run_episode_inspect(inspect_args, &ledger_path, &cas_path, json_output)
-            },
+            EpisodeSubcommand::Inspect(inspect_args) => run_episode_inspect(
+                inspect_args,
+                &ledger_path,
+                &cas_path,
+                resolve_json(inspect_args.json),
+            ),
         },
         FacSubcommand::Receipts(args) => match &args.subcommand {
             ReceiptSubcommand::Show(show_args) => {
-                run_receipt_show(show_args, &cas_path, json_output)
+                run_receipt_show(show_args, &cas_path, resolve_json(show_args.json))
             },
-            ReceiptSubcommand::List(list_args) => run_receipt_list(list_args, json_output),
-            ReceiptSubcommand::Status(status_args) => run_receipt_status(status_args, json_output),
-            ReceiptSubcommand::Reindex => run_receipt_reindex(json_output),
+            ReceiptSubcommand::List(list_args) => {
+                run_receipt_list(list_args, resolve_json(list_args.json))
+            },
+            ReceiptSubcommand::Status(status_args) => {
+                run_receipt_status(status_args, resolve_json(status_args.json))
+            },
+            ReceiptSubcommand::Reindex(reindex_args) => {
+                run_receipt_reindex(resolve_json(reindex_args.json))
+            },
         },
         FacSubcommand::Context(args) => match &args.subcommand {
-            ContextSubcommand::Rebuild(rebuild_args) => {
-                run_context_rebuild(rebuild_args, &ledger_path, &cas_path, json_output)
+            ContextSubcommand::Rebuild(rebuild_args) => run_context_rebuild(
+                rebuild_args,
+                &ledger_path,
+                &cas_path,
+                resolve_json(rebuild_args.json),
+            ),
+        },
+        FacSubcommand::Resume(args) => run_resume(args, &ledger_path, resolve_json(args.json)),
+        FacSubcommand::Lane(args) => match &args.subcommand {
+            LaneSubcommand::Status(status_args) => {
+                run_lane_status(status_args, resolve_json(status_args.json))
+            },
+            LaneSubcommand::Reset(reset_args) => {
+                run_lane_reset(reset_args, resolve_json(reset_args.json))
             },
         },
-        FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
-        FacSubcommand::Lane(args) => match &args.subcommand {
-            LaneSubcommand::Status(status_args) => run_lane_status(status_args, json_output),
-            LaneSubcommand::Reset(reset_args) => run_lane_reset(reset_args, json_output),
-        },
         FacSubcommand::Push(args) => {
+            let output_json = resolve_json(args.json);
             let repo = match derive_fac_repo_or_exit(machine_output) {
                 Ok(value) => value,
                 Err(code) => return code,
@@ -1801,10 +1996,11 @@ pub fn run_fac(
                 &args.remote,
                 args.branch.as_deref(),
                 args.ticket.as_deref(),
-                json_output,
+                output_json,
             )
         },
         FacSubcommand::Restart(args) => {
+            let output_json = resolve_json(args.json);
             let repo = match derive_fac_repo_or_exit(machine_output) {
                 Ok(value) => value,
                 Err(code) => return code,
@@ -1814,11 +2010,11 @@ pub fn run_fac(
                 args.pr,
                 args.force,
                 args.refresh_identity,
-                json_output,
+                output_json,
             )
         },
         FacSubcommand::Recover(args) => {
-            let output_json = json_output || args.json;
+            let output_json = resolve_json(args.json);
             if !output_json {
                 eprintln!("DEPRECATED: use `apm2 fac doctor --pr <N> --fix` instead.");
             }
@@ -1838,7 +2034,8 @@ pub fn run_fac(
             )
         },
         FacSubcommand::Logs(args) => {
-            let repo = match derive_fac_repo_or_exit(json_output || args.json) {
+            let output_json = resolve_json(args.json);
+            let repo = match derive_fac_repo_or_exit(output_json) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
@@ -1847,18 +2044,20 @@ pub fn run_fac(
                 &repo,
                 args.selector_type.as_deref(),
                 args.selector.as_deref(),
-                json_output || args.json,
+                output_json,
             )
         },
         FacSubcommand::Pipeline(args) => {
-            let repo = match derive_fac_repo_or_exit(json_output) {
+            let output_json = resolve_json(args.json);
+            let repo = match derive_fac_repo_or_exit(output_json) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            fac_review::run_pipeline(&repo, args.pr, &args.sha)
+            fac_review::run_pipeline(&repo, args.pr, &args.sha, output_json)
         },
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => {
+                let output_json = resolve_json(run_args.json);
                 let repo = match derive_fac_repo_or_exit(machine_output) {
                     Ok(value) => value,
                     Err(code) => return code,
@@ -1869,18 +2068,24 @@ pub fn run_fac(
                     run_args.review_type,
                     run_args.expected_head_sha.as_deref(),
                     run_args.force,
-                    json_output,
+                    output_json,
                 )
             },
-            ReviewSubcommand::Wait(wait_args) => fac_review::run_wait(
-                wait_args.pr,
-                wait_args.review_type.map(ReviewStatusTypeArg::as_str),
-                wait_args.wait_for_sha.as_deref(),
-                wait_args.timeout_seconds,
-                wait_args.poll_interval_seconds,
-                matches!(wait_args.format, ReviewFormatArg::Json),
-            ),
+            ReviewSubcommand::Wait(wait_args) => {
+                let output_json = resolve_json(
+                    wait_args.json || matches!(wait_args.format, ReviewFormatArg::Json),
+                );
+                fac_review::run_wait(
+                    wait_args.pr,
+                    wait_args.review_type.map(ReviewStatusTypeArg::as_str),
+                    wait_args.wait_for_sha.as_deref(),
+                    wait_args.timeout_seconds,
+                    wait_args.poll_interval_seconds,
+                    output_json,
+                )
+            },
             ReviewSubcommand::Dispatch(dispatch_args) => {
+                let output_json = resolve_json(dispatch_args.json);
                 let repo = match derive_fac_repo_or_exit(machine_output) {
                     Ok(value) => value,
                     Err(code) => return code,
@@ -1891,11 +2096,11 @@ pub fn run_fac(
                     dispatch_args.review_type,
                     dispatch_args.expected_head_sha.as_deref(),
                     dispatch_args.force,
-                    json_output,
+                    output_json,
                 )
             },
             ReviewSubcommand::Status(status_args) => {
-                let output_json = json_output || status_args.json;
+                let output_json = resolve_json(status_args.json);
                 if !output_json {
                     eprintln!(
                         "DEPRECATED: use `apm2 fac doctor --pr <N> --json` instead. This command will be removed in a future release."
@@ -1908,7 +2113,8 @@ pub fn run_fac(
                 )
             },
             ReviewSubcommand::Prepare(prepare_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || prepare_args.json) {
+                let output_json = resolve_json(prepare_args.json);
+                let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -1916,11 +2122,12 @@ pub fn run_fac(
                     &repo,
                     prepare_args.pr,
                     prepare_args.sha.as_deref(),
-                    json_output || prepare_args.json,
+                    output_json,
                 )
             },
             ReviewSubcommand::Finding(finding_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || finding_args.json) {
+                let output_json = resolve_json(finding_args.json);
+                let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -1936,12 +2143,15 @@ pub fn run_fac(
                     finding_args.impact.as_deref(),
                     finding_args.location.as_deref(),
                     finding_args.reviewer_id.as_deref(),
+                    finding_args.model_id.as_deref(),
+                    finding_args.backend_id.as_deref(),
                     finding_args.evidence_pointer.as_deref(),
-                    json_output || finding_args.json,
+                    output_json,
                 )
             },
             ReviewSubcommand::Comment(comment_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || comment_args.json) {
+                let output_json = resolve_json(comment_args.json);
+                let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -1952,11 +2162,12 @@ pub fn run_fac(
                     comment_args.review_type,
                     comment_args.severity,
                     comment_args.body.as_deref(),
-                    json_output || comment_args.json,
+                    output_json,
                 )
             },
             ReviewSubcommand::Findings(findings_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || findings_args.json) {
+                let output_json = resolve_json(findings_args.json);
+                let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -1965,12 +2176,13 @@ pub fn run_fac(
                     findings_args.pr,
                     findings_args.sha.as_deref(),
                     findings_args.refresh,
-                    json_output || findings_args.json,
+                    output_json,
                 )
             },
             ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
                 ReviewVerdictSubcommand::Show(show_args) => {
-                    let repo = match derive_fac_repo_or_exit(json_output || show_args.json) {
+                    let output_json = resolve_json(show_args.json);
+                    let repo = match derive_fac_repo_or_exit(output_json) {
                         Ok(value) => value,
                         Err(code) => return code,
                     };
@@ -1978,11 +2190,12 @@ pub fn run_fac(
                         &repo,
                         show_args.pr,
                         show_args.sha.as_deref(),
-                        json_output || show_args.json,
+                        output_json,
                     )
                 },
                 ReviewVerdictSubcommand::Set(set_args) => {
-                    let repo = match derive_fac_repo_or_exit(json_output || set_args.json) {
+                    let output_json = resolve_json(set_args.json);
+                    let repo = match derive_fac_repo_or_exit(output_json) {
                         Ok(value) => value,
                         Err(code) => return code,
                     };
@@ -1993,26 +2206,34 @@ pub fn run_fac(
                         &set_args.dimension,
                         set_args.verdict,
                         set_args.reason.as_deref(),
+                        set_args.model_id.as_deref(),
+                        set_args.backend_id.as_deref(),
                         set_args.keep_prepared_inputs,
-                        json_output || set_args.json,
+                        output_json,
                     )
                 },
             },
-            ReviewSubcommand::Project(project_args) => fac_review::run_project(
-                project_args.pr,
-                project_args.head_sha.as_deref(),
-                project_args.since_epoch,
-                project_args.after_seq,
-                project_args.emit_errors,
-                project_args.fail_on_terminal,
-                matches!(project_args.format, ReviewFormatArg::Json),
-                json_output,
-            ),
+            ReviewSubcommand::Project(project_args) => {
+                let format_json =
+                    project_args.json || matches!(project_args.format, ReviewFormatArg::Json);
+                let output_json = resolve_json(format_json);
+                fac_review::run_project(
+                    project_args.pr,
+                    project_args.head_sha.as_deref(),
+                    project_args.since_epoch,
+                    project_args.after_seq,
+                    project_args.emit_errors,
+                    project_args.fail_on_terminal,
+                    output_json,
+                    output_json,
+                )
+            },
             ReviewSubcommand::Tail(tail_args) => {
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },
             ReviewSubcommand::Terminate(term_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || term_args.json) {
+                let output_json = resolve_json(term_args.json);
+                let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -2020,7 +2241,7 @@ pub fn run_fac(
                     &repo,
                     term_args.pr,
                     term_args.review_type.as_str(),
-                    json_output || term_args.json,
+                    output_json,
                 )
             },
         },
@@ -2028,21 +2249,21 @@ pub fn run_fac(
             args.once,
             args.poll_interval_secs,
             args.max_jobs,
-            json_output,
+            resolve_json(args.json),
             args.print_unit,
         ),
         FacSubcommand::Job(args) => match &args.subcommand {
             JobSubcommand::Cancel(cancel_args) => {
-                crate::commands::fac_job::run_cancel(cancel_args, json_output)
+                crate::commands::fac_job::run_cancel(cancel_args, resolve_json(cancel_args.json))
             },
         },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
-        FacSubcommand::Gc(args) => fac_gc::run_gc(args),
-        FacSubcommand::Quarantine(args) => fac_quarantine::run_quarantine(args),
+        FacSubcommand::Gc(args) => fac_gc::run_gc(args, json_output),
+        FacSubcommand::Quarantine(args) => fac_quarantine::run_quarantine(args, json_output),
         FacSubcommand::Verify(args) => match &args.subcommand {
             VerifySubcommand::Containment(containment_args) => {
-                run_verify_containment(containment_args)
+                run_verify_containment(containment_args, resolve_json(containment_args.json))
             },
         },
     }
@@ -2050,39 +2271,10 @@ pub fn run_fac(
 
 const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool {
     match subcommand {
-        FacSubcommand::Doctor(args) => args.json,
-        FacSubcommand::Recover(args) => args.json,
-        FacSubcommand::Logs(args) => args.json,
-        FacSubcommand::Quarantine(args) => match &args.subcommand {
-            QuarantineSubcommand::List(list_args) => list_args.json,
-            QuarantineSubcommand::Prune(_) => false,
-        },
-        FacSubcommand::Review(args) => match &args.subcommand {
-            ReviewSubcommand::Wait(wait_args) => matches!(wait_args.format, ReviewFormatArg::Json),
-            ReviewSubcommand::Status(status_args) => status_args.json,
-            ReviewSubcommand::Prepare(prepare_args) => prepare_args.json,
-            ReviewSubcommand::Finding(finding_args) => finding_args.json,
-            ReviewSubcommand::Comment(comment_args) => comment_args.json,
-            ReviewSubcommand::Findings(findings_args) => findings_args.json,
-            ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
-                ReviewVerdictSubcommand::Show(show_args) => show_args.json,
-                ReviewVerdictSubcommand::Set(set_args) => set_args.json,
-            },
-            ReviewSubcommand::Project(project_args) => {
-                matches!(project_args.format, ReviewFormatArg::Json)
-            },
-            ReviewSubcommand::Terminate(term_args) => term_args.json,
-            ReviewSubcommand::Run(_)
-            | ReviewSubcommand::Dispatch(_)
-            | ReviewSubcommand::Tail(_) => false,
-        },
-        FacSubcommand::Broker(args) => match &args.subcommand {
-            BrokerSubcommand::Status(status_args) => status_args.json,
-        },
         FacSubcommand::Gates(_)
         | FacSubcommand::Work(_)
+        | FacSubcommand::Doctor(_)
         | FacSubcommand::Services(_)
-        | FacSubcommand::Gc(_)
         | FacSubcommand::RoleLaunch(_)
         | FacSubcommand::Episode(_)
         | FacSubcommand::Receipts(_)
@@ -2091,13 +2283,17 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Lane(_)
         | FacSubcommand::Push(_)
         | FacSubcommand::Restart(_)
-        | FacSubcommand::Worker(_)
+        | FacSubcommand::Recover(_)
+        | FacSubcommand::Logs(_)
         | FacSubcommand::Pipeline(_)
+        | FacSubcommand::Review(_)
+        | FacSubcommand::Worker(_)
+        | FacSubcommand::Job(_)
         | FacSubcommand::Pr(_)
-        | FacSubcommand::Job(_) => false,
-        FacSubcommand::Verify(args) => match &args.subcommand {
-            VerifySubcommand::Containment(containment_args) => containment_args.json,
-        },
+        | FacSubcommand::Broker(_)
+        | FacSubcommand::Gc(_)
+        | FacSubcommand::Quarantine(_)
+        | FacSubcommand::Verify(_) => true,
     }
 }
 
@@ -4158,15 +4354,26 @@ fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
 fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
     if json_output {
         let error = ErrorResponse {
-            code: code.to_string(),
+            error: code.to_string(),
             message: message.to_string(),
         };
-        eprintln!(
+        println!(
             "{}",
-            serde_json::to_string_pretty(&error).unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string_pretty(&error).unwrap_or_else(|_| {
+                "{\"error\":\"serialization_failure\",\"message\":\"failed to serialize error response\"}".to_string()
+            })
         );
     } else {
-        eprintln!("Error: {message}");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error": code,
+                "message": message,
+            }))
+            .unwrap_or_else(|_| {
+                "{\"error\":\"serialization_failure\",\"message\":\"failed to serialize error response\"}".to_string()
+            })
+        );
     }
     exit_code
 }
@@ -4201,13 +4408,14 @@ fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
 // =============================================================================
 
 /// Runs the `apm2 fac verify containment` command.
-fn run_verify_containment(args: &ContainmentArgs) -> u8 {
+fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
+    let use_json = json_output || args.json;
     let pid = args.pid.unwrap_or_else(std::process::id);
 
     let verdict = match apm2_core::fac::verify_containment(pid, args.sccache_enabled) {
         Ok(v) => v,
         Err(e) => {
-            if args.json {
+            if use_json {
                 let err_json = serde_json::json!({
                     "error": e.to_string(),
                     "contained": false,
@@ -4218,17 +4426,32 @@ fn run_verify_containment(args: &ContainmentArgs) -> u8 {
                     serde_json::to_string_pretty(&err_json).unwrap_or_default()
                 );
             } else {
-                eprintln!("containment verification failed: {e}");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "error": e.to_string(),
+                        "contained": false,
+                        "pid": pid,
+                    }))
+                    .unwrap_or_default()
+                );
             }
             return exit_codes::GENERIC_ERROR;
         },
     };
 
-    if args.json {
+    if use_json {
         match serde_json::to_string_pretty(&verdict) {
             Ok(json) => println!("{json}"),
             Err(e) => {
-                eprintln!("failed to serialize verdict: {e}");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "error": "fac_verify_containment_serialization_failed",
+                        "message": e.to_string(),
+                    }))
+                    .unwrap_or_default()
+                );
                 return exit_codes::GENERIC_ERROR;
             },
         }
@@ -4752,16 +4975,18 @@ mod tests {
             pr: Some(615),
             force: false,
             refresh_identity: false,
+            json: false,
         });
-        assert!(!subcommand_requests_machine_output(&restart));
+        assert!(subcommand_requests_machine_output(&restart));
 
         let worker = FacSubcommand::Worker(WorkerArgs {
             once: true,
             poll_interval_secs: 1,
             max_jobs: 1,
             print_unit: false,
+            json: false,
         });
-        assert!(!subcommand_requests_machine_output(&worker));
+        assert!(subcommand_requests_machine_output(&worker));
     }
 
     #[test]
@@ -4786,6 +5011,73 @@ mod tests {
             FacSubcommand::Doctor(args) => {
                 assert!(args.full);
                 assert!(args.pr.is_none());
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_flags_parse() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--poll-interval-seconds",
+            "2",
+            "--wait-timeout-seconds",
+            "30",
+            "--exit-on",
+            "fix,merge",
+        ])
+        .expect("doctor wait flags should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(args.wait_for_recommended_action);
+                assert_eq!(args.poll_interval_seconds, 2);
+                assert_eq!(args.wait_timeout_seconds, 30);
+                assert_eq!(
+                    args.exit_on,
+                    vec![DoctorExitActionArg::Fix, DoctorExitActionArg::Merge]
+                );
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_exit_on_rejects_unknown_action() {
+        let err = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--exit-on",
+            "wait",
+        ])
+        .expect_err("unknown --exit-on action should fail parsing");
+        let rendered = err.to_string();
+        assert!(rendered.contains("wait"));
+    }
+
+    #[test]
+    fn test_doctor_wait_exit_on_accepts_escalate_action() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--exit-on",
+            "escalate",
+        ])
+        .expect("escalate should parse as a valid doctor exit action");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.exit_on, vec![DoctorExitActionArg::Escalate]);
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
@@ -4899,6 +5191,53 @@ mod tests {
                 },
             },
             other => panic!("expected services subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_receipts_leaf_json_flags_parse() {
+        let list = FacLogsCliHarness::try_parse_from(["fac", "receipts", "list", "--json"])
+            .expect("receipts list --json should parse");
+        match list.subcommand {
+            FacSubcommand::Receipts(args) => match args.subcommand {
+                ReceiptSubcommand::List(list_args) => assert!(list_args.json),
+                other => panic!("expected receipts list subcommand, got {other:?}"),
+            },
+            other => panic!("expected receipts command, got {other:?}"),
+        }
+
+        let status =
+            FacLogsCliHarness::try_parse_from(["fac", "receipts", "status", "job-123", "--json"])
+                .expect("receipts status --json should parse");
+        match status.subcommand {
+            FacSubcommand::Receipts(args) => match args.subcommand {
+                ReceiptSubcommand::Status(status_args) => assert!(status_args.json),
+                other => panic!("expected receipts status subcommand, got {other:?}"),
+            },
+            other => panic!("expected receipts command, got {other:?}"),
+        }
+
+        let reindex = FacLogsCliHarness::try_parse_from(["fac", "receipts", "reindex", "--json"])
+            .expect("receipts reindex --json should parse");
+        match reindex.subcommand {
+            FacSubcommand::Receipts(args) => match args.subcommand {
+                ReceiptSubcommand::Reindex(reindex_args) => assert!(reindex_args.json),
+                other => panic!("expected receipts reindex subcommand, got {other:?}"),
+            },
+            other => panic!("expected receipts command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_job_cancel_json_flag_parses() {
+        let parsed =
+            FacLogsCliHarness::try_parse_from(["fac", "job", "cancel", "job-123", "--json"])
+                .expect("job cancel --json should parse");
+        match parsed.subcommand {
+            FacSubcommand::Job(args) => match args.subcommand {
+                JobSubcommand::Cancel(cancel_args) => assert!(cancel_args.json),
+            },
+            other => panic!("expected job command, got {other:?}"),
         }
     }
 

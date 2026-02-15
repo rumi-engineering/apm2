@@ -38,11 +38,31 @@
         "NEVER paste raw command output into finding fields (summary, risk, impact, body). Finding fields must contain your original analysis text only."
       ],
       "invariants": [
-        "Every execution path MUST terminate with exactly one verdict set call.",
-        "SHA is managed by the CLI — the reviewer never tracks, stores, or references it.",
-        "ALWAYS use `cargo run -p apm2-cli --` instead of bare `apm2`. The workspace binary contains the code under review; a globally installed binary may be stale and missing fields or fixes from the current PR.",
-        "Deployment invariant: this CLI serves Anveio on the current VPS only; do NOT file compatibility findings that require broad enterprise/custom-remote support or GitHub-as-authority fallback.",
-        "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them."
+        {
+          "id": "INV-CQ-001",
+          "description": "Every execution path MUST terminate with exactly one verdict set call.",
+          "criticality": "PROCESS"
+        },
+        {
+          "id": "INV-CQ-002",
+          "description": "SHA is managed by the CLI — the reviewer never tracks, stores, or references it.",
+          "criticality": "PROCESS"
+        },
+        {
+          "id": "INV-CQ-003",
+          "description": "ALWAYS use `cargo run -p apm2-cli --` instead of bare `apm2`. The workspace binary contains the code under review; a globally installed binary may be stale and missing fields or fixes from the current PR.",
+          "criticality": "PROCESS"
+        },
+        {
+          "id": "INV-CQ-004",
+          "description": "Deployment invariant: this CLI serves Anveio on the current VPS only; do NOT file compatibility findings that require broad enterprise/custom-remote support or GitHub-as-authority fallback.",
+          "criticality": "PROCESS"
+        },
+        {
+          "id": "INV-CQ-005",
+          "description": "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them.",
+          "criticality": "PROCESS"
+        }
       ]
     },
     "references": [
@@ -78,6 +98,22 @@
       {"path": "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md", "purpose": "APM2-specific: typed IDs, secret redaction, state machines, atomic writes, identity boundaries."},
       {"path": "@documents/skills/rust-standards/references/03_compilation_pipeline.md", "purpose": "Phase-aware reasoning; macro expansion, dark code, drop/borrow checking semantics."},
       {"path": "@documents/skills/rust-standards/references/04_qcp_classification.md", "purpose": "QCP risk escalation and proof-burden multiplier logic."},
+      {"path": "@documents/skills/rust-standards/references/00_operating_mode.md", "purpose": "Rust-standards operating mode and review posture."},
+      {"path": "@documents/skills/rust-standards/references/02_inputs_and_stop_conditions.md", "purpose": "Review inputs, stop conditions, and triage policy."},
+      {"path": "@documents/skills/rust-standards/references/05_toolchain_cargo_build.md", "purpose": "Toolchain contracts (CTR-02XX), build reproducibility, dependency resolution invariants."},
+      {"path": "@documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md", "purpose": "Unsafe soundness obligations (UNSAFE-*), proof-of-safety comment contracts, lint discipline."},
+      {"path": "@documents/skills/rust-standards/references/19_unsafe_rust_obligations.md", "purpose": "Comprehensive unsafe invariants (INV-0001..INV-0903), aliasing/provenance/drop contracts."},
+      {"path": "@documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md", "purpose": "Concurrency contracts (CTR-10XX), atomic ordering, lock discipline, data-race prevention."},
+      {"path": "@documents/skills/rust-standards/references/23_async_pin_cancellation.md", "purpose": "Async/Pin contracts (CTR-11XX), cancellation safety, poll discipline."},
+      {"path": "@documents/skills/rust-standards/references/30_paths_filesystem_os.md", "purpose": "Filesystem path contracts (CTR-15XX), symlink traversal, atomic write invariants."},
+      {"path": "@documents/skills/rust-standards/references/31_io_protocol_boundaries.md", "purpose": "I/O boundary contracts (CTR-16XX), serde safety, protocol framing, trust boundaries."},
+      {"path": "@documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md", "purpose": "Testing evidence contracts (CTR-1701, INV-17XX), fuzz coverage, Miri obligations."},
+      {"path": "@documents/skills/rust-standards/references/34_security_adjacent_rust.md", "purpose": "Security-adjacent contracts (CTR-19XX, RSK-19XX), secret handling, timing channels, webhook validation."},
+      {"path": "@documents/skills/rust-standards/references/36_msrv_editions_maintenance.md", "purpose": "MSRV/edition contracts (CTR-21XX), edition migration discipline."},
+      {"path": "@documents/skills/rust-standards/references/39_hazard_catalog_checklists.md", "purpose": "Cross-reference hazard catalog — comprehensive invariant index across all modules."},
+      {"path": "@documents/skills/rust-standards/references/42_distributed_security_invariants.md", "purpose": "Distributed security invariants (CTR-27XX, INV-2701), consensus integrity, replication safety."},
+      {"path": "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md", "purpose": "PCAC/AJC integration patterns, authority continuity contracts."},
+      {"path": "@documents/skills/rust-standards/references/43_apm2_scp_dcp_map.md", "purpose": "APM2 SCP/DCP mapping — system and domain context provider contracts."},
       {"path": "@documents/skills/modes-of-reasoning/assets/06-constraint-satisfiability.json", "purpose": "REQUIRED REASONING MODE: Encode invariants as constraints — verify all contracts and invariants still hold after the change."},
       {"path": "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json", "purpose": "REQUIRED REASONING MODE: Type-level reasoning — verify types encode the right invariants and invalid states cannot be constructed."},
       {"path": "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json", "purpose": "REQUIRED REASONING MODE: Counterexample search — find concrete inputs or states that violate claimed properties."}

@@ -2171,6 +2171,14 @@ fn finalize_auto_verdict_candidate(
         return Ok(AutoVerdictFinalizeResult::Pending);
     };
 
+    let (model_id, backend_id) =
+        state::load_review_run_state_strict(candidate.pr_number, &candidate.review_type)?
+            .filter(|state| {
+                state.run_id == candidate.run_id
+                    && state.head_sha.eq_ignore_ascii_case(&candidate.head_sha)
+            })
+            .map_or((None, None), |state| (state.model_id, state.backend_id));
+
     let projected = verdict_projection::persist_verdict_projection_local_only(
         &candidate.owner_repo,
         Some(candidate.pr_number),
@@ -2178,6 +2186,8 @@ fn finalize_auto_verdict_candidate(
         &dimension,
         decision,
         Some("auto_derived_by_reaper_from_findings"),
+        model_id.as_deref(),
+        backend_id.as_deref(),
     )?;
     finalize_projected_verdict(&projected, &dimension, &candidate.run_id, Some("reaper"))?;
 
@@ -2873,6 +2883,8 @@ pub fn run_verdict_set(
     dimension: &str,
     verdict: VerdictValueArg,
     reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> u8 {
@@ -2883,6 +2895,8 @@ pub fn run_verdict_set(
         dimension,
         verdict,
         reason,
+        model_id,
+        backend_id,
         keep_prepared_inputs,
         json_output,
     ) {
@@ -2914,6 +2928,8 @@ fn run_verdict_set_inner(
     dimension: &str,
     verdict: VerdictValueArg,
     reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
@@ -2924,6 +2940,8 @@ fn run_verdict_set_inner(
         dimension,
         verdict.as_str(),
         reason,
+        model_id,
+        backend_id,
         json_output,
     )?;
     if !keep_prepared_inputs {
@@ -3721,6 +3739,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             "test",
         )
         .expect("append major");
@@ -3737,6 +3757,8 @@ mod tests {
             "security",
             "minor",
             "minor issue",
+            None,
+            None,
             None,
             None,
             None,
@@ -3785,6 +3807,8 @@ mod tests {
             None,
             None,
             Some("reviewer"),
+            None,
+            None,
             None,
             "test",
         )

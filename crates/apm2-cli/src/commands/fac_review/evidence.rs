@@ -49,6 +49,9 @@ pub struct EvidenceGateOptions {
     pub skip_test_gate: bool,
     /// Skip merge-conflict gate when caller already pre-validated it.
     pub skip_merge_conflict_gate: bool,
+    /// Emit human-oriented status/heartbeat lines to stderr.
+    /// JSON streaming callers should set this to `false`.
+    pub emit_human_logs: bool,
 }
 
 /// Result of a single evidence gate execution.
@@ -197,6 +200,7 @@ fn stream_pipe_to_file<R: Read>(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_gate_command_with_heartbeat(
     workspace_root: &Path,
     gate_name: &str,
@@ -205,6 +209,7 @@ fn run_gate_command_with_heartbeat(
     log_path: &Path,
     extra_env: Option<&[(String, String)]>,
     env_remove_keys: Option<&[String]>,
+    emit_human_logs: bool,
 ) -> std::io::Result<GateCommandOutput> {
     let mut command = Command::new(cmd);
     command
@@ -280,7 +285,7 @@ fn run_gate_command_with_heartbeat(
         }
 
         let elapsed = started.elapsed();
-        if elapsed >= next_heartbeat {
+        if emit_human_logs && elapsed >= next_heartbeat {
             let elapsed_secs = elapsed.as_secs();
             eprintln!(
                 "ts={} gate={} status=RUNNING tick={} elapsed_secs={}",
@@ -329,13 +334,16 @@ pub fn emit_evidence_line(
     duration_secs: u64,
     log_path: &Path,
     projection_log: Option<&mut File>,
+    emit_to_stderr: bool,
 ) {
     let ts = now_iso8601();
     let line = format!(
         "ts={ts} sha={sha} gate={gate} status={status} duration_secs={duration_secs} log={}",
         log_path.display()
     );
-    eprintln!("{line}");
+    if emit_to_stderr {
+        eprintln!("{line}");
+    }
     if let Some(file) = projection_log {
         let _ = writeln!(file, "{line}");
     }
@@ -369,6 +377,7 @@ fn run_merge_conflict_gate(
     workspace_root: &Path,
     sha: &str,
     log_path: &Path,
+    emit_human_logs: bool,
 ) -> (bool, u64, String, StreamStats) {
     let gate_name = MERGE_CONFLICT_GATE_NAME;
     let started = Instant::now();
@@ -387,11 +396,19 @@ fn run_merge_conflict_gate(
                 bytes_total: log.len() as u64,
                 was_truncated: false,
             };
-            if !passed {
+            if emit_human_logs && !passed {
                 eprintln!("{}", render_merge_conflict_summary(&report));
             }
             let gate_status = if passed { "PASS" } else { "FAIL" };
-            emit_evidence_line(sha, gate_name, gate_status, duration, log_path, None);
+            emit_evidence_line(
+                sha,
+                gate_name,
+                gate_status,
+                duration,
+                log_path,
+                None,
+                emit_human_logs,
+            );
             let ts = now_iso8601();
             (
                 passed,
@@ -415,8 +432,18 @@ fn run_merge_conflict_gate(
                 bytes_total: message.len() as u64,
                 was_truncated: false,
             };
-            emit_evidence_line(sha, gate_name, "FAIL", duration, log_path, None);
-            eprintln!("merge_conflict_main: FAIL reason={err}");
+            emit_evidence_line(
+                sha,
+                gate_name,
+                "FAIL",
+                duration,
+                log_path,
+                None,
+                emit_human_logs,
+            );
+            if emit_human_logs {
+                eprintln!("merge_conflict_main: FAIL reason={err}");
+            }
             let ts = now_iso8601();
             let sanitized_err = err.split_whitespace().collect::<Vec<_>>().join("_");
             (
@@ -441,6 +468,7 @@ pub fn run_single_evidence_gate(
     cmd: &str,
     args: &[&str],
     log_path: &Path,
+    emit_human_logs: bool,
 ) -> (bool, StreamStats) {
     run_single_evidence_gate_with_env(
         workspace_root,
@@ -451,6 +479,7 @@ pub fn run_single_evidence_gate(
         log_path,
         None,
         None,
+        emit_human_logs,
     )
 }
 
@@ -464,6 +493,7 @@ fn run_single_evidence_gate_with_env(
     log_path: &Path,
     extra_env: Option<&[(String, String)]>,
     env_remove_keys: Option<&[String]>,
+    emit_human_logs: bool,
 ) -> (bool, StreamStats) {
     let started = Instant::now();
     let output = run_gate_command_with_heartbeat(
@@ -474,6 +504,7 @@ fn run_single_evidence_gate_with_env(
         log_path,
         extra_env,
         env_remove_keys,
+        emit_human_logs,
     );
     let duration = started.elapsed().as_secs();
     match output {
@@ -485,7 +516,15 @@ fn run_single_evidence_gate_with_env(
                 append_short_test_failure_hint(log_path, combined_output_bytes);
             }
             let status = if passed { "PASS" } else { "FAIL" };
-            emit_evidence_line(sha, gate_name, status, duration, log_path, None);
+            emit_evidence_line(
+                sha,
+                gate_name,
+                status,
+                duration,
+                log_path,
+                None,
+                emit_human_logs,
+            );
             (passed, out.stream_stats)
         },
         Err(e) => {
@@ -493,7 +532,15 @@ fn run_single_evidence_gate_with_env(
                 log_path,
                 format!("execution error: {e}\n").as_bytes(),
             );
-            emit_evidence_line(sha, gate_name, "FAIL", duration, log_path, None);
+            emit_evidence_line(
+                sha,
+                gate_name,
+                "FAIL",
+                duration,
+                log_path,
+                None,
+                emit_human_logs,
+            );
             (
                 false,
                 StreamStats {
@@ -538,6 +585,7 @@ fn verify_workspace_integrity_gate(
     workspace_root: &Path,
     sha: &str,
     log_path: &Path,
+    emit_human_logs: bool,
 ) -> (bool, String, StreamStats) {
     let script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
     let snapshot = workspace_integrity_snapshot(workspace_root);
@@ -584,6 +632,7 @@ fn verify_workspace_integrity_gate(
             snapshot_str,
         ],
         &log_path,
+        emit_human_logs,
     );
     let stream_stats = passed.1;
     let passed = passed.0;
@@ -840,6 +889,7 @@ pub fn run_evidence_gates(
     projection_log: Option<&mut File>,
     opts: Option<&EvidenceGateOptions>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
+    let emit_human_logs = opts.is_none_or(|o| o.emit_human_logs);
     let (logs_dir, _lane_guard) = allocate_lane_job_logs_dir()?;
 
     let gates: &[(&str, &[&str])] = &[
@@ -877,7 +927,7 @@ pub fn run_evidence_gates(
         // Phase 0: merge conflict gate (always first, including quick mode).
         let merge_log_path = logs_dir.join(format!("{MERGE_CONFLICT_GATE_NAME}.log"));
         let (merge_passed, merge_duration, merge_line, merge_stats) =
-            run_merge_conflict_gate(workspace_root, sha, &merge_log_path);
+            run_merge_conflict_gate(workspace_root, sha, &merge_log_path, emit_human_logs);
         gate_results.push(build_evidence_gate_result(
             MERGE_CONFLICT_GATE_NAME,
             merge_passed,
@@ -911,6 +961,7 @@ pub fn run_evidence_gates(
             cmd_args[0],
             &cmd_args[1..],
             &log_path,
+            emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
         gate_results.push(build_evidence_gate_result(
@@ -946,6 +997,7 @@ pub fn run_evidence_gates(
             "bash",
             &[full_path.to_str().unwrap_or("")],
             &log_path,
+            emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
         gate_results.push(build_evidence_gate_result(
@@ -975,10 +1027,12 @@ pub fn run_evidence_gates(
         let skip_msg = b"quick mode enabled: skipped heavyweight test gate\n";
         let _ = crate::commands::fac_permissions::write_fac_file_with_mode(&test_log, skip_msg);
         let ts = now_iso8601();
-        eprintln!(
-            "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
-            test_log.display()
-        );
+        if emit_human_logs {
+            eprintln!(
+                "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+                test_log.display()
+            );
+        }
         evidence_lines.push(format!(
             "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
             test_log.display()
@@ -1012,6 +1066,7 @@ pub fn run_evidence_gates(
             &test_log,
             test_env,
             env_remove,
+            emit_human_logs,
         );
         let test_duration = test_started.elapsed().as_secs();
         gate_results.push(build_evidence_gate_result(
@@ -1035,7 +1090,7 @@ pub fn run_evidence_gates(
     let wi_started = Instant::now();
     let wi_log_path = logs_dir.join("workspace_integrity.log");
     let (wi_passed, wi_line, wi_stream_stats) =
-        verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path);
+        verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
     let wi_duration = wi_started.elapsed().as_secs();
     gate_results.push(build_evidence_gate_result(
         "workspace_integrity",
@@ -1064,6 +1119,7 @@ pub fn run_evidence_gates(
             "bash",
             &[full_path.to_str().unwrap_or("")],
             &log_path,
+            emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
         gate_results.push(build_evidence_gate_result(
@@ -1105,6 +1161,7 @@ pub fn run_evidence_gates_with_status(
     owner_repo: &str,
     pr_number: u32,
     projection_log: Option<&mut File>,
+    emit_human_logs: bool,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let (logs_dir, _lane_guard) = allocate_lane_job_logs_dir()?;
 
@@ -1161,7 +1218,7 @@ pub fn run_evidence_gates_with_status(
 
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let (passed, duration, line, stream_stats) =
-            run_merge_conflict_gate(workspace_root, sha, &log_path);
+            run_merge_conflict_gate(workspace_root, sha, &log_path, emit_human_logs);
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
         gate_results.push(build_evidence_gate_result(
@@ -1288,16 +1345,18 @@ pub fn run_evidence_gates_with_status(
             continue;
         }
 
-        eprintln!(
-            "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
-            now_iso8601(),
-            sha,
-            gate_name,
-            reuse.reason,
-            attestation_digest
-                .as_deref()
-                .map_or_else(|| "unknown".to_string(), short_digest),
-        );
+        if emit_human_logs {
+            eprintln!(
+                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+                now_iso8601(),
+                sha,
+                gate_name,
+                reuse.reason,
+                attestation_digest
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), short_digest),
+            );
+        }
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
@@ -1308,6 +1367,7 @@ pub fn run_evidence_gates_with_status(
             cmd_args[0],
             &cmd_args[1..],
             &log_path,
+            emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
 
@@ -1430,16 +1490,18 @@ pub fn run_evidence_gates_with_status(
             continue;
         }
 
-        eprintln!(
-            "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
-            now_iso8601(),
-            sha,
-            gate_name,
-            reuse.reason,
-            attestation_digest
-                .as_deref()
-                .map_or_else(|| "unknown".to_string(), short_digest),
-        );
+        if emit_human_logs {
+            eprintln!(
+                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+                now_iso8601(),
+                sha,
+                gate_name,
+                reuse.reason,
+                attestation_digest
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), short_digest),
+            );
+        }
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
@@ -1450,6 +1512,7 @@ pub fn run_evidence_gates_with_status(
             "bash",
             &[full_path.to_str().unwrap_or("")],
             &log_path,
+            emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
 
@@ -1571,16 +1634,18 @@ pub fn run_evidence_gates_with_status(
                 ));
             }
         } else {
-            eprintln!(
-                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
-                now_iso8601(),
-                sha,
-                gate_name,
-                reuse.reason,
-                attestation_digest
-                    .as_deref()
-                    .map_or_else(|| "unknown".to_string(), short_digest),
-            );
+            if emit_human_logs {
+                eprintln!(
+                    "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
+                );
+            }
             let started = Instant::now();
             let (test_cmd, test_args) = pipeline_test_command
                 .command
@@ -1600,6 +1665,7 @@ pub fn run_evidence_gates_with_status(
                 &log_path,
                 Some(&pipeline_test_command.test_env),
                 pipeline_env_remove,
+                emit_human_logs,
             );
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
@@ -1715,7 +1781,7 @@ pub fn run_evidence_gates_with_status(
         } else {
             let started = Instant::now();
             let (passed, line, stream_stats) =
-                verify_workspace_integrity_gate(workspace_root, sha, &log_path);
+                verify_workspace_integrity_gate(workspace_root, sha, &log_path, emit_human_logs);
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
@@ -1831,16 +1897,18 @@ pub fn run_evidence_gates_with_status(
             continue;
         }
 
-        eprintln!(
-            "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
-            now_iso8601(),
-            sha,
-            gate_name,
-            reuse.reason,
-            attestation_digest
-                .as_deref()
-                .map_or_else(|| "unknown".to_string(), short_digest),
-        );
+        if emit_human_logs {
+            eprintln!(
+                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+                now_iso8601(),
+                sha,
+                gate_name,
+                reuse.reason,
+                attestation_digest
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), short_digest),
+            );
+        }
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
@@ -1851,6 +1919,7 @@ pub fn run_evidence_gates_with_status(
             "bash",
             &[full_path.to_str().unwrap_or("")],
             &log_path,
+            emit_human_logs,
         );
         let duration = started.elapsed().as_secs();
         status.set_result(gate_name, passed, duration);
@@ -2615,6 +2684,7 @@ mod tests {
                         "echo",
                         &[&format!("hello from lane {idx}")],
                         &log_path,
+                        true,
                     );
                     (passed, log_path)
                 })
@@ -2691,6 +2761,7 @@ mod tests {
             "bash",
             &["-c", &script],
             &log_path,
+            true,
         );
 
         // The command itself succeeds (dd returns 0).

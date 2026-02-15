@@ -20,6 +20,10 @@ use super::gate_attestation::{
     gate_command_for_attestation,
 };
 use super::gate_cache::GateCache;
+use super::jsonl::{
+    GateCompletedEvent, GateErrorEvent, GateStartedEvent, StageEvent, emit_jsonl, emit_jsonl_error,
+    ts_now,
+};
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::timeout_policy::{
     MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, max_memory_bytes, parse_memory_limit,
@@ -47,6 +51,22 @@ pub fn run_gates(
     cpu_quota: &str,
     json_output: bool,
 ) -> u8 {
+    let overall_started = Instant::now();
+    if json_output {
+        let _ = emit_jsonl(&StageEvent {
+            event: "gates_started".to_string(),
+            ts: ts_now(),
+            extra: serde_json::json!({
+                "quick": quick,
+                "force": force,
+                "timeout_seconds": timeout_seconds,
+                "memory_max": memory_max,
+                "pids_max": pids_max,
+                "cpu_quota": cpu_quota,
+            }),
+        });
+    }
+
     match run_gates_inner(
         force,
         quick,
@@ -54,13 +74,52 @@ pub fn run_gates(
         memory_max,
         pids_max,
         cpu_quota,
+        !json_output,
     ) {
         Ok(summary) => {
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
+                for gate in &summary.gates {
+                    let _ = emit_jsonl(&GateStartedEvent {
+                        event: "gate_started",
+                        gate: gate.name.clone(),
+                        ts: ts_now(),
+                    });
+                    let normalized_status = gate.status.to_ascii_lowercase();
+                    let _ = emit_jsonl(&GateCompletedEvent {
+                        event: "gate_completed",
+                        gate: gate.name.clone(),
+                        status: normalized_status,
+                        duration_secs: gate.duration_secs,
+                        ts: ts_now(),
+                    });
+                    if !gate.status.eq_ignore_ascii_case("pass") {
+                        let _ = emit_jsonl(&GateErrorEvent {
+                            event: "gate_error",
+                            gate: gate.name.clone(),
+                            error: format!(
+                                "gate {} finished with status {}",
+                                gate.name, gate.status
+                            ),
+                            ts: ts_now(),
+                        });
+                    }
+                }
+                let _ = emit_jsonl(&StageEvent {
+                    event: "gates_completed".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "passed": summary.passed,
+                        "duration_secs": overall_started.elapsed().as_secs(),
+                        "gate_count": summary.gates.len(),
+                    }),
+                });
+                let summary_value =
+                    serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}));
+                let _ = emit_jsonl(&StageEvent {
+                    event: "gates_summary".to_string(),
+                    ts: ts_now(),
+                    extra: summary_value,
+                });
             } else {
                 println!("FAC Gates");
                 println!("  SHA:     {}", summary.sha);
@@ -102,14 +161,24 @@ pub fn run_gates(
         },
         Err(err) => {
             if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_gates_failed",
-                    "message": err,
+                let _ = emit_jsonl_error("gate_error", &err);
+                let _ = emit_jsonl(&StageEvent {
+                    event: "gates_completed".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "passed": false,
+                        "duration_secs": overall_started.elapsed().as_secs(),
+                        "error": err,
+                    }),
                 });
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
+                let _ = emit_jsonl(&StageEvent {
+                    event: "gates_summary".to_string(),
+                    ts: ts_now(),
+                    extra: serde_json::json!({
+                        "passed": false,
+                        "error": err,
+                    }),
+                });
             } else {
                 eprintln!("ERROR: {err}");
             }
@@ -146,6 +215,7 @@ fn run_gates_inner(
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    emit_human_logs: bool,
 ) -> Result<GatesSummary, String> {
     validate_timeout_seconds(timeout_seconds)?;
     let memory_max_bytes = parse_memory_limit(memory_max)?;
@@ -181,7 +251,7 @@ fn run_gates_inner(
     }
 
     // 3. Merge-conflict gate always runs first and is never cache-reused.
-    let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha)?;
+    let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha, emit_human_logs)?;
     if merge_gate.status == "FAIL" {
         return Ok(GatesSummary {
             sha,
@@ -233,7 +303,7 @@ fn run_gates_inner(
         test_command_environment.extend(spec.setenv_pairs);
 
         // Log if sccache env vars were found and stripped.
-        if !spec.env_remove_keys.is_empty() {
+        if emit_human_logs && !spec.env_remove_keys.is_empty() {
             eprintln!(
                 "INFO: sccache env vars stripped from bounded test (containment cannot be \
                  verified for systemd transient units): {:?}",
@@ -251,6 +321,7 @@ fn run_gates_inner(
         env_remove_keys,
         skip_test_gate: quick,
         skip_merge_conflict_gate: true,
+        emit_human_logs,
     };
 
     // 5. Run evidence gates.
@@ -337,11 +408,13 @@ fn run_gates_inner(
         );
     }
 
-    eprintln!(
-        "fac gates (mode={}): completed in {total_secs}s — {}",
-        if quick { "quick" } else { "full" },
-        if passed { "PASS" } else { "FAIL" }
-    );
+    if emit_human_logs {
+        eprintln!(
+            "fac gates (mode={}): completed in {total_secs}s — {}",
+            if quick { "quick" } else { "full" },
+            if passed { "PASS" } else { "FAIL" }
+        );
+    }
 
     Ok(GatesSummary {
         sha,
@@ -385,12 +458,16 @@ fn validate_timeout_seconds(timeout_seconds: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn evaluate_merge_conflict_gate(workspace_root: &Path, sha: &str) -> Result<GateResult, String> {
+fn evaluate_merge_conflict_gate(
+    workspace_root: &Path,
+    sha: &str,
+    emit_human_logs: bool,
+) -> Result<GateResult, String> {
     let started = Instant::now();
     let report = check_merge_conflicts_against_main(workspace_root, sha)?;
     let duration = started.elapsed().as_secs();
     let passed = !report.has_conflicts();
-    if !passed {
+    if emit_human_logs && !passed {
         eprintln!("{}", render_merge_conflict_summary(&report));
     }
     Ok(GateResult {

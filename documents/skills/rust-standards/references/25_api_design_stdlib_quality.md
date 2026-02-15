@@ -57,6 +57,14 @@ impl SpawnConfigBuilder {
 }
 ```
 
+[CONTRACT: CTR-1207] CLI Flag Naming Consistency.
+- When the same semantic concept (e.g., JSON output, PR number, review type, force mode, timeout) appears across multiple CLI subcommands, the flag name, type, and default MUST be identical.
+- REJECT IF: two subcommands use different flag names for the same concept (e.g., `--json` vs `--format json`, `--pr` vs `--pull-request`, `--type` vs `--review-type` without alias).
+- REJECT IF: the same flag name has different types or defaults across subcommands (e.g., `--json` is `bool` in one and `String` in another; `--timeout` defaults to 60 in one and 120 in another without documented reason).
+- Severity: MAJOR. Agents infer flag availability by analogy across subcommands. Naming divergence is a hallucination vector — when `--json` works on 18 of 20 subcommands, agents will pass `--json` to the remaining 2 and fail.
+- ENFORCE BY: shared Args composition (clap `flatten`), or if not structurally possible, naming conventions documented in the module's AGENTS.md with a canonical flag table.
+[PROVENANCE] APM2 CLI design standard. CLI is an API surface consumed by LLM agents; consistency is a correctness property, not a cosmetic preference.
+
 [CONTRACT: CTR-1206] Authoritative Apply Pattern.
 - REJECT IF: security-sensitive configurations can be partially or inconsistently applied.
 - ENFORCE BY: a single authoritative function that consumes a config and returns a fully prepared resource (e.g., `Command`, `Socket`).

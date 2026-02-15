@@ -17,6 +17,7 @@ mod detection;
 mod dispatch;
 mod events;
 mod evidence;
+mod fenced_yaml;
 mod finding;
 mod findings;
 mod findings_store;
@@ -26,6 +27,7 @@ mod gates;
 mod github_auth;
 mod github_projection;
 mod github_reads;
+mod jsonl;
 mod lifecycle;
 mod liveness;
 mod logs;
@@ -49,6 +51,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -438,14 +442,20 @@ fn emit_run_ndjson_since(
 
 /// Run doctor diagnostics for a specific PR.
 ///
-/// `json_output` is accepted for CLI flag consistency but doctor `--pr` always
-/// emits JSON — it is primarily a machine-readable diagnostic surface consumed
-/// by orchestrator agents. The parameter is kept explicit (not prefixed with
-/// `_`) to document this intentional design choice.
-pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, json_output: bool) -> u8 {
-    // Doctor --pr always emits JSON regardless of the flag value; this is
-    // intentional — the output is consumed by automation, not humans.
-    let _ = json_output;
+/// Doctor remains machine-oriented by default. In wait mode, JSON output
+/// streams NDJSON heartbeats plus a final result event; text mode prints
+/// periodic status lines to stderr and emits the final summary JSON to stdout.
+#[allow(clippy::too_many_arguments)]
+pub fn run_doctor(
+    repo: &str,
+    pr_number: u32,
+    fix: bool,
+    json_output: bool,
+    wait_for_recommended_action: bool,
+    poll_interval_seconds: u64,
+    wait_timeout_seconds: u64,
+    exit_on: &[String],
+) -> u8 {
     let mut repairs_applied = Vec::new();
     if fix {
         let pre_repair = run_doctor_inner(repo, pr_number, Vec::new(), false);
@@ -486,25 +496,181 @@ pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, json_output: bool) -> u
         }
     }
 
-    let summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&summary)
-            .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-    );
-    let has_critical_health = summary
-        .health
-        .iter()
-        .any(|item| item.severity.eq_ignore_ascii_case("high"));
-    let requires_intervention = matches!(
-        summary.recommended_action.action.as_str(),
-        "fix" | "escalate"
-    );
-    if has_critical_health || requires_intervention {
-        exit_codes::GENERIC_ERROR
-    } else {
-        exit_codes::SUCCESS
+    if !wait_for_recommended_action {
+        let summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+        let has_critical_health = summary
+            .health
+            .iter()
+            .any(|item| item.severity.eq_ignore_ascii_case("high"));
+        let requires_intervention = matches!(
+            summary.recommended_action.action.as_str(),
+            "fix" | "escalate"
+        );
+        if has_critical_health || requires_intervention {
+            return exit_codes::GENERIC_ERROR;
+        }
+        return exit_codes::SUCCESS;
     }
+
+    let exit_actions = match normalize_doctor_exit_actions(exit_on) {
+        Ok(value) => value,
+        Err(err) => {
+            return emit_doctor_wait_error(
+                json_output,
+                "fac_doctor_invalid_exit_on",
+                &err,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let interrupted = doctor_interrupt_flag();
+    interrupted.store(false, Ordering::SeqCst);
+
+    let poll_interval = Duration::from_secs(poll_interval_seconds.max(1));
+    let wait_timeout = Duration::from_secs(wait_timeout_seconds);
+    let started = Instant::now();
+    let mut tick = 0_u64;
+    let mut summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
+
+    loop {
+        if exit_actions.contains(summary.recommended_action.action.as_str()) {
+            emit_doctor_wait_result(&summary, json_output, tick);
+            return exit_codes::SUCCESS;
+        }
+
+        if interrupted.load(Ordering::SeqCst) {
+            summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
+            emit_doctor_wait_result(&summary, json_output, tick);
+            return exit_codes::SUCCESS;
+        }
+
+        if started.elapsed() >= wait_timeout {
+            emit_doctor_wait_result(&summary, json_output, tick);
+            return exit_codes::SUCCESS;
+        }
+
+        if json_output {
+            if let Err(err) = jsonl::emit_jsonl(&jsonl::DoctorPollEvent {
+                event: "doctor_poll",
+                tick,
+                action: summary.recommended_action.action.clone(),
+                ts: jsonl::ts_now(),
+            }) {
+                eprintln!("WARNING: failed to emit doctor poll event: {err}");
+            }
+        } else {
+            eprintln!(
+                "doctor wait: tick={tick} action={} elapsed={}s",
+                summary.recommended_action.action,
+                started.elapsed().as_secs()
+            );
+        }
+
+        thread::sleep(poll_interval);
+        tick = tick.saturating_add(1);
+        summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
+    }
+}
+
+const DOCTOR_WAIT_EXIT_ACTIONS: [&str; 5] = [
+    "fix",
+    "escalate",
+    "merge",
+    "dispatch_implementor",
+    "restart_reviews",
+];
+
+fn normalize_doctor_exit_actions(
+    exit_on: &[String],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    if exit_on.is_empty() {
+        let defaults = DOCTOR_WAIT_EXIT_ACTIONS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        return Ok(defaults);
+    }
+
+    let mut set = std::collections::BTreeSet::new();
+    for value in exit_on {
+        let normalized = value.trim().to_ascii_lowercase();
+        if !DOCTOR_WAIT_EXIT_ACTIONS.contains(&normalized.as_str()) {
+            return Err(format!(
+                "invalid --exit-on action `{value}` (expected one of: {})",
+                DOCTOR_WAIT_EXIT_ACTIONS.join(", ")
+            ));
+        }
+        set.insert(normalized);
+    }
+    Ok(set)
+}
+
+fn emit_doctor_wait_result(summary: &DoctorPrSummary, json_output: bool, tick: u64) {
+    if json_output {
+        let summary_value = match serde_json::to_value(summary) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("WARNING: failed to serialize doctor summary: {err}");
+                serde_json::json!({
+                    "error": "serialization_failure",
+                })
+            },
+        };
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::DoctorResultEvent {
+            event: "doctor_result",
+            tick,
+            action: summary.recommended_action.action.clone(),
+            ts: jsonl::ts_now(),
+            summary: summary_value,
+        }) {
+            eprintln!("WARNING: failed to emit doctor result event: {err}");
+        }
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(summary)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    }
+}
+
+fn emit_doctor_wait_error(json_output: bool, error: &str, message: &str, exit_code: u8) -> u8 {
+    if json_output {
+        let _ = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_error".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "error": error,
+                "message": message,
+            }),
+        });
+    } else {
+        eprintln!("ERROR: {message}");
+    }
+    exit_code
+}
+
+fn doctor_interrupt_flag() -> Arc<AtomicBool> {
+    static INTERRUPTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    Arc::clone(INTERRUPTED.get_or_init(|| {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let handler_flag = Arc::clone(&interrupted);
+        if ctrlc::set_handler(move || {
+            handler_flag.store(true, Ordering::SeqCst);
+        })
+        .is_err()
+        {
+            // Another subsystem may have already installed a process-global
+            // Ctrl-C handler. Keep doctor functional and fall back to timeout.
+        }
+        interrupted
+    }))
 }
 
 /// Maximum number of tracked PRs to include in doctor summaries.
@@ -692,7 +858,7 @@ fn run_doctor_inner(
                     severity: "high",
                     message: "retry budget exhausted".to_string(),
                     remediation:
-                        "manual investigation required; stop retries until state is repaired"
+                        "manual investigation required; repair lifecycle state before retrying"
                             .to_string(),
                 });
             } else if snapshot.retry_budget_remaining == 0 {
@@ -2673,6 +2839,8 @@ pub fn run_finding(
     impact: Option<&str>,
     location: Option<&str>,
     reviewer_id: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     evidence_pointer: Option<&str>,
     json_output: bool,
 ) -> u8 {
@@ -2688,6 +2856,8 @@ pub fn run_finding(
         impact,
         location,
         reviewer_id,
+        model_id,
+        backend_id,
         evidence_pointer,
         json_output,
     ) {
@@ -2779,6 +2949,8 @@ pub fn run_verdict_set(
     dimension: &str,
     verdict: VerdictValueArg,
     reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> u8 {
@@ -2789,6 +2961,8 @@ pub fn run_verdict_set(
         dimension,
         verdict,
         reason,
+        model_id,
+        backend_id,
         keep_prepared_inputs,
         json_output,
     )
@@ -3246,8 +3420,8 @@ pub fn run_restart(
     restart::run_restart(repo, pr, force, refresh_identity, json_output)
 }
 
-pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str) -> u8 {
-    pipeline::run_pipeline(repo, pr_number, sha)
+pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) -> u8 {
+    pipeline::run_pipeline(repo, pr_number, sha, json_output)
 }
 
 pub fn run_logs(
@@ -5488,6 +5662,21 @@ mod tests {
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
         assert_eq!(action.action, "dispatch_implementor");
+    }
+
+    #[test]
+    fn test_normalize_doctor_exit_actions_defaults_include_escalate() {
+        let normalized = super::normalize_doctor_exit_actions(&[]).expect("normalize defaults");
+        assert!(normalized.contains("escalate"));
+        assert!(normalized.contains("fix"));
+    }
+
+    #[test]
+    fn test_normalize_doctor_exit_actions_accepts_user_supplied_escalate() {
+        let normalized = super::normalize_doctor_exit_actions(&["escalate".to_string()])
+            .expect("escalate should be accepted");
+        assert_eq!(normalized.len(), 1);
+        assert!(normalized.contains("escalate"));
     }
 
     #[test]

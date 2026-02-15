@@ -153,6 +153,7 @@ fn determine_restart_strategy(
 fn execute_strategy(
     strategy: RestartStrategy,
     ctx: &PrContext,
+    emit_human_logs: bool,
 ) -> Result<(Option<bool>, Option<Vec<DispatchReviewResult>>), String> {
     match strategy {
         RestartStrategy::Noop => Ok((None, None)),
@@ -166,6 +167,7 @@ fn execute_strategy(
                 &ctx.owner_repo,
                 ctx.pr_number,
                 None,
+                emit_human_logs,
             )?;
 
             if passed {
@@ -195,44 +197,13 @@ pub fn run_restart(
     refresh_identity: bool,
     json_output: bool,
 ) -> u8 {
-    match run_restart_inner(repo, pr, force, refresh_identity) {
+    match run_restart_inner(repo, pr, force, refresh_identity, json_output) {
         Ok(summary) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Restart");
-                println!("  Repo:          {}", summary.repo);
-                println!("  PR:            #{}", summary.pr_number);
-                println!("  Head SHA:      {}", summary.head_sha);
-                println!(
-                    "  Identity Refreshed: {}",
-                    if summary.refreshed_identity {
-                        "yes"
-                    } else {
-                        "no"
-                    }
-                );
-                println!("  Strategy:      {}", summary.strategy.label());
-                if let Some(passed) = summary.evidence_passed {
-                    println!("  Evidence:      {}", if passed { "PASS" } else { "FAIL" });
-                }
-                if let Some(ref reviews) = summary.reviews_dispatched {
-                    for r in reviews {
-                        println!(
-                            "  Review:        {} ({}{}{})",
-                            r.review_type,
-                            r.mode,
-                            r.pid.map_or_else(String::new, |p| format!(", pid={p}")),
-                            r.log_file
-                                .as_ref()
-                                .map_or_else(String::new, |l| format!(", log={l}")),
-                        );
-                    }
-                }
-            }
+            let _ = json_output;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+            );
 
             let failed = summary.evidence_passed == Some(false);
             if failed {
@@ -242,19 +213,16 @@ pub fn run_restart(
             }
         },
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_restart_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let _ = json_output;
+            let payload = serde_json::json!({
+                "error": "fac_restart_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -265,22 +233,27 @@ fn run_restart_inner(
     pr: Option<u32>,
     force: bool,
     refresh_identity: bool,
+    json_output: bool,
 ) -> Result<RestartSummary, String> {
     let ctx = resolve_pr_context(repo, pr, refresh_identity)?;
 
-    eprintln!(
-        "fac restart: pr=#{} sha={} repo={}",
-        ctx.pr_number, ctx.head_sha, ctx.owner_repo
-    );
-    if ctx.refreshed_identity {
-        eprintln!("fac restart: local identity refreshed from authoritative PR head");
+    if !json_output {
+        eprintln!(
+            "fac restart: pr=#{} sha={} repo={}",
+            ctx.pr_number, ctx.head_sha, ctx.owner_repo
+        );
+        if ctx.refreshed_identity {
+            eprintln!("fac restart: local identity refreshed from authoritative PR head");
+        }
     }
 
     let strategy =
         determine_restart_strategy(&ctx.owner_repo, ctx.pr_number, &ctx.head_sha, force)?;
-    eprintln!("fac restart: strategy={}", strategy.label());
+    if !json_output {
+        eprintln!("fac restart: strategy={}", strategy.label());
+    }
 
-    let (evidence_passed, reviews_dispatched) = execute_strategy(strategy, &ctx)?;
+    let (evidence_passed, reviews_dispatched) = execute_strategy(strategy, &ctx, !json_output)?;
     let pr_url = format!(
         "https://github.com/{}/pull/{}",
         ctx.owner_repo, ctx.pr_number
