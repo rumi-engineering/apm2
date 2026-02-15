@@ -260,6 +260,10 @@ pub enum DenialReasonCode {
     AmbiguousJobState,
     /// The `stop_revoke` handler failed to stop and/or transition the target.
     StopRevokeFailed,
+    /// Queue directory ownership or permissions are unsafe for control-lane
+    /// authority.  The queue root or a subdirectory is not owned by the
+    /// current uid or has group/world-accessible mode bits.
+    UnsafeQueuePermissions,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
