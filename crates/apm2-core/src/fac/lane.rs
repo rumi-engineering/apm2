@@ -63,8 +63,16 @@ pub const LANE_LEASE_V1_SCHEMA: &str = "apm2.fac.lane_lease.v1";
 /// Schema identifier for corrupt marker files.
 pub const LANE_CORRUPT_MARKER_SCHEMA: &str = "apm2.fac.lane_corrupt.v1";
 
+const CLEANUP_STEP_GIT_RESET: &str = "git_reset";
+const CLEANUP_STEP_GIT_CLEAN: &str = "git_clean";
+const CLEANUP_STEP_TEMP_PRUNE: &str = "temp_prune";
+const CLEANUP_STEP_LOG_QUOTA: &str = "log_quota";
+
 /// Maximum log directory size in bytes (100 MB).
 const MAX_LOG_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Maximum directory recursion depth while enforcing log quota.
+const MAX_LOG_QUOTA_DIR_DEPTH: usize = 8;
 
 /// Default lane count when not configured via environment.
 pub const DEFAULT_LANE_COUNT: usize = 3;
@@ -119,20 +127,92 @@ pub enum LaneCleanupOutcome {
 #[derive(Debug, Error)]
 pub enum LaneCleanupError {
     /// A git command failed to execute or returned a non-zero status.
-    #[error("git command failed in workspace: {0}")]
-    GitCommandFailed(String),
+    #[error("git command failed in workspace during {step}: {reason}")]
+    GitCommandFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+    },
 
     /// Temporary directory prune failed.
-    #[error("temp directory prune failed: {0}")]
-    TempPruneFailed(String),
+    #[error("temp directory prune failed during {step}: {reason}")]
+    TempPruneFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+    },
 
     /// Log quota enforcement failed.
-    #[error("log quota enforcement failed: {0}")]
-    LogQuotaFailed(String),
+    #[error("log quota enforcement failed during {step}: {reason}")]
+    LogQuotaFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+    },
 
     /// Filesystem error while running cleanup.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Current lane state is invalid for cleanup.
+    #[error("invalid cleanup state: {0}")]
+    InvalidState(String),
+}
+
+impl LaneCleanupError {
+    /// Failed step identifier for receipt emission.
+    #[must_use]
+    pub const fn failure_step(&self) -> Option<&'static str> {
+        match self {
+            Self::GitCommandFailed { step, .. }
+            | Self::TempPruneFailed { step, .. }
+            | Self::LogQuotaFailed { step, .. } => Some(*step),
+            Self::Io(_) | Self::InvalidState(_) => None,
+        }
+    }
+}
+
+/// Execute a lane cleanup run using only a FAC root path.
+///
+/// This is the canonical cleanup runner that performs state transitions.
+///
+/// Steps:
+/// 1. `Running` -> `Cleanup`
+/// 2. `git reset --hard HEAD`
+/// 3. `git clean -ffdx`
+/// 4. prune `tmp/`
+/// 5. enforce log quota
+/// 6. `Cleanup` -> idle (remove lease)
+///
+/// On failure, the lane transitions to `Corrupt` and persists a
+/// `LaneCorruptMarkerV1`.
+///
+/// # Errors
+///
+/// Returns:
+/// - `Err(LaneCleanupError::InvalidState)` if lane management context cannot be
+///   constructed from `fac_root`.
+/// - `Err(LaneCleanupError::Io)` on filesystem errors.
+/// - Cleanup-step specific variants when `git`/`tmp` cleanup or log quota
+///   enforcement fails.
+pub fn run_lane_cleanup(
+    lane_id: &str,
+    fac_root: &Path,
+    workspace_path: &Path,
+) -> Result<LaneCleanupOutcome, LaneCleanupError> {
+    let manager = LaneManager::new(fac_root.to_path_buf())
+        .map_err(|e| LaneCleanupError::InvalidState(e.to_string()))?;
+    manager.run_lane_cleanup(lane_id, workspace_path)?;
+    Ok(LaneCleanupOutcome::Success)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1091,15 +1171,17 @@ impl LaneManager {
         }
     }
 
-    /// Derive the status of a lane from lock state, lease record, and PID
-    /// liveness.
+    /// Derive the status of a lane from lock state, lease record, PID
+    /// liveness, and corrupt marker.
     ///
     /// # Stale Lease Detection Rules (RFC-0019 §4.4)
     ///
+    /// - Lock held + corrupt marker → CORRUPT
+    /// - Lock held + lease missing/invalid → LEASED
+    /// - Lock free + lease missing/invalid → IDLE
     /// - Lock free + lease RUNNING + PID alive → CORRUPT (INV-LANE-004)
     /// - Lock free + PID dead → stale lease (IDLE)
     /// - Lock held + lease RUNNING + PID alive → RUNNING
-    /// - No lease → IDLE
     ///
     /// # Errors
     ///
@@ -1111,43 +1193,43 @@ impl LaneManager {
         let corrupt_reason = corrupt_marker.as_ref().map(|marker| marker.reason.clone());
         let lock_held = self.is_lock_held(lane_id)?;
 
-        let lease = LaneLeaseV1::load(&lane_dir)?;
+        let lease = match LaneLeaseV1::load(&lane_dir) {
+            Ok(lease) => lease,
+            Err(_err) if lock_held => None,
+            Err(err) => return Err(err),
+        };
         let is_corrupt = corrupt_marker.is_some();
+        let pid_alive = lease.as_ref().map(|lease| is_pid_alive(lease.pid));
+        let state = derive_lane_state(
+            lock_held,
+            lease.as_ref(),
+            pid_alive.unwrap_or(false),
+            is_corrupt,
+        );
+        let (job_id, pid, started_at, lane_profile_hash, toolchain_fingerprint) = lease
+            .as_ref()
+            .map_or((None, None, None, None, None), |lease| {
+                (
+                    Some(lease.job_id.clone()),
+                    Some(lease.pid),
+                    Some(lease.started_at.clone()),
+                    Some(lease.lane_profile_hash.clone()),
+                    Some(lease.toolchain_fingerprint.clone()),
+                )
+            });
 
-        match lease {
-            None => Ok(LaneStatusV1 {
-                lane_id: lane_id.to_string(),
-                state: if is_corrupt {
-                    LaneState::Corrupt
-                } else {
-                    LaneState::Idle
-                },
-                job_id: None,
-                pid: None,
-                started_at: None,
-                toolchain_fingerprint: None,
-                lane_profile_hash: None,
-                lock_held,
-                pid_alive: None,
-                corrupt_reason,
-            }),
-            Some(lease) => {
-                let pid_alive = is_pid_alive(lease.pid);
-                let state = derive_lane_state(lock_held, &lease, pid_alive, is_corrupt);
-                Ok(LaneStatusV1 {
-                    lane_id: lane_id.to_string(),
-                    state,
-                    job_id: Some(lease.job_id),
-                    pid: Some(lease.pid),
-                    started_at: Some(lease.started_at),
-                    toolchain_fingerprint: Some(lease.toolchain_fingerprint),
-                    lane_profile_hash: Some(lease.lane_profile_hash),
-                    lock_held,
-                    pid_alive: Some(pid_alive),
-                    corrupt_reason,
-                })
-            },
-        }
+        Ok(LaneStatusV1 {
+            lane_id: lane_id.to_string(),
+            state,
+            job_id,
+            pid,
+            started_at,
+            toolchain_fingerprint,
+            lane_profile_hash,
+            lock_held,
+            pid_alive,
+            corrupt_reason,
+        })
     }
 
     /// Get the status of all lanes.
@@ -1192,14 +1274,22 @@ impl LaneManager {
             .current_dir(workspace_path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
-            .map_err(|e| LaneCleanupError::GitCommandFailed(format!("git reset spawn: {e}")))?;
+            .map_err(|e| LaneCleanupError::GitCommandFailed {
+                step: CLEANUP_STEP_GIT_RESET,
+                reason: format!("git reset spawn: {e}"),
+                steps_completed: steps_completed.clone(),
+            })?;
         if !reset_output.status.success() {
-            return Err(LaneCleanupError::GitCommandFailed(format!(
-                "git reset: {}",
-                String::from_utf8_lossy(&reset_output.stderr)
-            )));
+            return Err(LaneCleanupError::GitCommandFailed {
+                step: CLEANUP_STEP_GIT_RESET,
+                reason: format!(
+                    "git reset: {}",
+                    String::from_utf8_lossy(&reset_output.stderr)
+                ),
+                steps_completed: steps_completed.clone(),
+            });
         }
-        steps_completed.push("git_reset".to_string());
+        steps_completed.push(CLEANUP_STEP_GIT_RESET.to_string());
 
         // Step 2: git clean -ffdx (remove untracked files).
         let clean_output = Command::new("git")
@@ -1207,26 +1297,39 @@ impl LaneManager {
             .current_dir(workspace_path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
-            .map_err(|e| LaneCleanupError::GitCommandFailed(format!("git clean spawn: {e}")))?;
+            .map_err(|e| LaneCleanupError::GitCommandFailed {
+                step: CLEANUP_STEP_GIT_CLEAN,
+                reason: format!("git clean spawn: {e}"),
+                steps_completed: steps_completed.clone(),
+            })?;
         if !clean_output.status.success() {
-            return Err(LaneCleanupError::GitCommandFailed(format!(
-                "git clean: {}",
-                String::from_utf8_lossy(&clean_output.stderr)
-            )));
+            return Err(LaneCleanupError::GitCommandFailed {
+                step: CLEANUP_STEP_GIT_CLEAN,
+                reason: format!(
+                    "git clean: {}",
+                    String::from_utf8_lossy(&clean_output.stderr)
+                ),
+                steps_completed: steps_completed.clone(),
+            });
         }
-        steps_completed.push("git_clean".to_string());
+        steps_completed.push(CLEANUP_STEP_GIT_CLEAN.to_string());
 
         // Step 3: Prune temp directory.
         let tmp_dir = lanes_dir.join("tmp");
         if tmp_dir.exists() {
-            safe_rmtree_v1(&tmp_dir, &lanes_dir)
-                .map_err(|e| LaneCleanupError::TempPruneFailed(format!("{e}")))?;
+            safe_rmtree_v1(&tmp_dir, &lanes_dir).map_err(|e| {
+                LaneCleanupError::TempPruneFailed {
+                    step: CLEANUP_STEP_TEMP_PRUNE,
+                    reason: format!("{e}"),
+                    steps_completed: steps_completed.clone(),
+                }
+            })?;
         }
-        steps_completed.push("temp_prune".to_string());
+        steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
 
         // Step 4: Enforce log quota.
         Self::enforce_log_quota(&lanes_dir.join("logs"))?;
-        steps_completed.push("log_quota".to_string());
+        steps_completed.push(CLEANUP_STEP_LOG_QUOTA.to_string());
 
         Ok(steps_completed)
     }
@@ -1238,7 +1341,7 @@ impl LaneManager {
 
         let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
         let mut total_size: u64 = 0;
-        Self::collect_log_entries(logs_dir, &mut entries, &mut total_size)?;
+        Self::collect_log_entries(logs_dir, &mut entries, &mut total_size, 0)?;
 
         if total_size <= MAX_LOG_QUOTA_BYTES {
             return Ok(());
@@ -1263,10 +1366,11 @@ impl LaneManager {
                 },
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {},
                 Err(err) => {
-                    return Err(LaneCleanupError::LogQuotaFailed(format!(
-                        "cannot remove log file {}: {err}",
-                        path.display()
-                    )));
+                    return Err(LaneCleanupError::LogQuotaFailed {
+                        step: CLEANUP_STEP_LOG_QUOTA,
+                        reason: format!("cannot remove log file {}: {err}", path.display()),
+                        steps_completed: Vec::new(),
+                    });
                 },
             }
         }
@@ -1278,34 +1382,49 @@ impl LaneManager {
         base: &Path,
         entries: &mut Vec<(PathBuf, u64, SystemTime)>,
         total_size: &mut u64,
+        depth: usize,
     ) -> Result<(), LaneCleanupError> {
-        for entry in fs::read_dir(base).map_err(|e| {
-            LaneCleanupError::LogQuotaFailed(format!(
-                "cannot read logs directory {}: {e}",
-                base.display()
-            ))
+        if depth > MAX_LOG_QUOTA_DIR_DEPTH {
+            return Err(LaneCleanupError::LogQuotaFailed {
+                step: CLEANUP_STEP_LOG_QUOTA,
+                reason: format!(
+                    "log directory recursion depth exceeded at {} (max {})",
+                    base.display(),
+                    MAX_LOG_QUOTA_DIR_DEPTH
+                ),
+                steps_completed: Vec::new(),
+            });
+        }
+
+        for entry in fs::read_dir(base).map_err(|e| LaneCleanupError::LogQuotaFailed {
+            step: CLEANUP_STEP_LOG_QUOTA,
+            reason: format!("cannot read logs directory {}: {e}", base.display()),
+            steps_completed: Vec::new(),
         })? {
-            let entry = entry.map_err(|e| {
-                LaneCleanupError::LogQuotaFailed(format!("cannot read log directory entry: {e}"))
+            let entry = entry.map_err(|e| LaneCleanupError::LogQuotaFailed {
+                step: CLEANUP_STEP_LOG_QUOTA,
+                reason: format!("cannot read log directory entry: {e}"),
+                steps_completed: Vec::new(),
             })?;
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|e| {
-                LaneCleanupError::LogQuotaFailed(format!(
-                    "cannot stat log entry {}: {e}",
-                    path.display()
-                ))
-            })?;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|e| LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("cannot stat log entry {}: {e}", path.display()),
+                    steps_completed: Vec::new(),
+                })?;
 
             if metadata.is_dir() {
-                Self::collect_log_entries(&path, entries, total_size)?;
+                Self::collect_log_entries(&path, entries, total_size, depth + 1)?;
                 continue;
             }
 
             if !(metadata.is_file() || metadata.file_type().is_symlink()) {
-                return Err(LaneCleanupError::LogQuotaFailed(format!(
-                    "unsupported log entry type in {}",
-                    path.display()
-                )));
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("unsupported log entry type in {}", path.display()),
+                    steps_completed: Vec::new(),
+                });
             }
 
             let size = metadata.len();
@@ -1331,9 +1450,9 @@ impl LaneManager {
 /// - Lock held + lease RUNNING → RUNNING
 /// - Lock held + lease state other → use lease state
 /// - Lock free + lease state != RUNNING → use lease state (or IDLE if terminal)
-const fn derive_lane_state(
+fn derive_lane_state(
     lock_held: bool,
-    lease: &LaneLeaseV1,
+    lease: Option<&LaneLeaseV1>,
     pid_alive: bool,
     has_corrupt_marker: bool,
 ) -> LaneState {
@@ -1341,20 +1460,41 @@ const fn derive_lane_state(
         return LaneState::Corrupt;
     }
 
-    match (lock_held, lease.state, pid_alive) {
-        // Lock held: trust the lease state unconditionally
-        (true, state, _) => state,
+    match (lock_held, lease) {
+        // Locked lane with no (or failed) lease state is still in LEASED
+        // transitional state until lease metadata is refreshed.
+        (true, None) => LaneState::Leased,
 
         // Lock free + active state (RUNNING/LEASED/CLEANUP) + PID alive →
         // ambiguous ownership → CORRUPT (fail-closed, INV-LANE-004).
         // Lock free + CORRUPT → remains CORRUPT regardless of PID.
-        (false, LaneState::Running | LaneState::Leased | LaneState::Cleanup, true)
-        | (false, LaneState::Corrupt, _) => LaneState::Corrupt,
+        (false, Some(lease))
+            if matches!(
+                lease.state,
+                LaneState::Running | LaneState::Leased | LaneState::Cleanup
+            ) && pid_alive =>
+        {
+            LaneState::Corrupt
+        },
+        (false, Some(lease)) if lease.state == LaneState::Corrupt => LaneState::Corrupt,
 
         // Lock free + active state + PID dead → stale lease → IDLE.
         // Lock free + IDLE → IDLE.
-        (false, LaneState::Running | LaneState::Leased | LaneState::Cleanup, false)
-        | (false, LaneState::Idle, _) => LaneState::Idle,
+        (false, Some(lease))
+            if matches!(
+                lease.state,
+                LaneState::Running | LaneState::Leased | LaneState::Cleanup
+            ) =>
+        {
+            LaneState::Idle
+        },
+
+        // For lease-present cases not handled above, use lease state. Lock-held
+        // lanes use this path when lease state is available.
+        (true | false, Some(lease)) => lease.state,
+
+        // Lock free + no lease: idle.
+        (false, None) => LaneState::Idle,
     }
 }
 
@@ -2301,12 +2441,50 @@ mod tests {
     fn derive_state_lock_held_running() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(true, &lease, true, false),
+            derive_lane_state(true, Some(&lease), true, false),
             LaneState::Running
         );
         assert_eq!(
-            derive_lane_state(true, &lease, false, false),
+            derive_lane_state(true, Some(&lease), false, false),
             LaneState::Running
+        );
+    }
+
+    #[test]
+    fn derive_state_lock_held_no_lease_is_leased() {
+        assert_eq!(
+            derive_lane_state(true, None, false, false),
+            LaneState::Leased,
+            "locked lane without lease should remain LEASED"
+        );
+    }
+
+    #[test]
+    fn derive_state_lock_free_no_lease_is_idle() {
+        assert_eq!(
+            derive_lane_state(false, None, false, false),
+            LaneState::Idle,
+            "unlocked lane without lease should be IDLE"
+        );
+    }
+
+    #[test]
+    fn enforce_log_quota_rejects_deep_directory_traversal() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+
+        let mut depth_dir = logs_dir.clone();
+        for level in 0..(MAX_LOG_QUOTA_DIR_DEPTH + 2) {
+            depth_dir = depth_dir.join(format!("level_{level}"));
+        }
+        fs::create_dir_all(&depth_dir).expect("create deep logs directory");
+        fs::write(depth_dir.join("deep.log"), b"payload").expect("write deep log file");
+
+        let err = LaneManager::enforce_log_quota(&logs_dir).unwrap_err();
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        assert!(
+            format!("{err}").contains("recursion depth exceeded"),
+            "expected recursion-depth guard failure, got {err}"
         );
     }
 
@@ -2314,7 +2492,7 @@ mod tests {
     fn derive_state_lock_free_running_pid_alive_is_corrupt() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, &lease, true, false),
+            derive_lane_state(false, Some(&lease), true, false),
             LaneState::Corrupt,
             "lock free + RUNNING + PID alive → CORRUPT (fail-closed)"
         );
@@ -2324,7 +2502,7 @@ mod tests {
     fn derive_state_lock_free_running_pid_dead_is_idle() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, &lease, false, false),
+            derive_lane_state(false, Some(&lease), false, false),
             LaneState::Idle,
             "lock free + RUNNING + PID dead → IDLE (stale lease)"
         );
@@ -2334,11 +2512,11 @@ mod tests {
     fn derive_state_lock_free_corrupt_stays_corrupt() {
         let lease = make_lease(LaneState::Corrupt);
         assert_eq!(
-            derive_lane_state(false, &lease, false, false),
+            derive_lane_state(false, Some(&lease), false, false),
             LaneState::Corrupt
         );
         assert_eq!(
-            derive_lane_state(false, &lease, true, false),
+            derive_lane_state(false, Some(&lease), true, false),
             LaneState::Corrupt
         );
     }
@@ -2347,11 +2525,11 @@ mod tests {
     fn test_derive_lane_state_corrupt_marker() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, &lease, false, true),
+            derive_lane_state(false, Some(&lease), false, true),
             LaneState::Corrupt
         );
         assert_eq!(
-            derive_lane_state(true, &lease, false, true),
+            derive_lane_state(true, Some(&lease), false, true),
             LaneState::Corrupt
         );
     }
@@ -2360,7 +2538,7 @@ mod tests {
     fn derive_state_lock_free_leased_pid_alive_is_corrupt() {
         let lease = make_lease(LaneState::Leased);
         assert_eq!(
-            derive_lane_state(false, &lease, true, false),
+            derive_lane_state(false, Some(&lease), true, false),
             LaneState::Corrupt,
             "lock free + LEASED + PID alive → CORRUPT (fail-closed)"
         );
@@ -2370,7 +2548,7 @@ mod tests {
     fn derive_state_lock_free_leased_pid_dead_is_idle() {
         let lease = make_lease(LaneState::Leased);
         assert_eq!(
-            derive_lane_state(false, &lease, false, false),
+            derive_lane_state(false, Some(&lease), false, false),
             LaneState::Idle
         );
     }
@@ -2379,11 +2557,11 @@ mod tests {
     fn derive_state_lock_free_idle_is_idle() {
         let lease = make_lease(LaneState::Idle);
         assert_eq!(
-            derive_lane_state(false, &lease, false, false),
+            derive_lane_state(false, Some(&lease), false, false),
             LaneState::Idle
         );
         assert_eq!(
-            derive_lane_state(false, &lease, true, false),
+            derive_lane_state(false, Some(&lease), true, false),
             LaneState::Idle
         );
     }
@@ -2409,6 +2587,28 @@ mod tests {
         let status = manager.lane_status(lane_id).expect("lane status");
         assert_eq!(status.state, LaneState::Corrupt);
         assert_eq!(status.corrupt_reason.as_deref(), Some("cleanup failed"));
+    }
+
+    #[test]
+    fn lane_status_with_unreadable_lease_and_lock_held_is_leased() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease_path = lane_dir.join("lease.v1.json");
+        fs::write(&lease_path, b"{invalid lease json").expect("write corrupted lease");
+
+        let _guard = manager
+            .try_lock(lane_id)
+            .expect("try_lock")
+            .expect("acquire lock");
+
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Leased);
     }
 
     // ── PID Liveness ───────────────────────────────────────────────────
