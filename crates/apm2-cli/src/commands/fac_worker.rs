@@ -93,8 +93,8 @@ use apm2_core::fac::{
     ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1,
     GateReceipt, GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
     QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, SystemdUnitProperties,
-    compute_policy_hash, deserialize_policy, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, run_preflight,
+    compute_policy_hash, deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -153,8 +153,13 @@ const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
 
-/// Default boundary ID for local-mode evaluation windows.
-const DEFAULT_BOUNDARY_ID: &str = "local";
+/// Last-resort fallback boundary ID when node identity cannot be loaded.
+///
+/// Production deployments use `load_or_default_boundary_id()` which reads
+/// the actual boundary from `$APM2_HOME/private/fac/identity/boundary_id`.
+/// This constant is only used when `resolve_apm2_home()` fails (no home
+/// directory available at all).
+const FALLBACK_BOUNDARY_ID: &str = "local";
 
 /// Default authority clock for local-mode evaluation windows.
 const DEFAULT_AUTHORITY_CLOCK: &str = "local";
@@ -265,6 +270,13 @@ pub fn run_fac_worker(
         },
     };
 
+    // TCK-00565 MAJOR-1 fix: Load the actual boundary_id from FAC node identity
+    // instead of using a hardcoded constant. Falls back to FALLBACK_BOUNDARY_ID
+    // only when APM2 home cannot be resolved (no-home edge case).
+    let boundary_id = resolve_apm2_home()
+        .and_then(|home| load_or_default_boundary_id(&home).ok())
+        .unwrap_or_else(|| FALLBACK_BOUNDARY_ID.to_string());
+
     // Ensure queue directories exist
     if let Err(e) = ensure_queue_dirs(&queue_root) {
         output_worker_error(
@@ -358,12 +370,12 @@ pub fn run_fac_worker(
     let tick_end = current_tick.saturating_add(1);
     let eval_window = broker
         .build_evaluation_window(
-            DEFAULT_BOUNDARY_ID,
+            &boundary_id,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
             tick_end,
         )
-        .unwrap_or_else(|_| make_default_eval_window());
+        .unwrap_or_else(|_| make_default_eval_window(&boundary_id));
 
     // Advance freshness to keep startup checks in sync with the first
     // admission window.
@@ -371,7 +383,7 @@ pub fn run_fac_worker(
 
     let startup_envelope = broker
         .issue_time_authority_envelope_default_ttl(
-            DEFAULT_BOUNDARY_ID,
+            &boundary_id,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
             tick_end,
@@ -531,6 +543,7 @@ pub fn run_fac_worker(
                     candidates.len(),
                     print_unit,
                     &current_tuple_digest,
+                    &boundary_id,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -825,6 +838,7 @@ fn process_job(
     _candidates_count: usize,
     print_unit: bool,
     canonicalizer_tuple_digest: &str,
+    boundary_id: &str,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -1204,7 +1218,7 @@ fn process_job(
     let expected_binding = ExpectedTokenBinding {
         fac_policy_hash: policy_digest,
         canonicalizer_tuple_digest: &ct_digest_bytes,
-        boundary_id: DEFAULT_BOUNDARY_ID,
+        boundary_id,
         current_tick: broker.current_tick(),
     };
 
@@ -1440,17 +1454,12 @@ fn process_job(
     broker.advance_freshness_horizon(tick_end);
 
     let eval_window = broker
-        .build_evaluation_window(
-            DEFAULT_BOUNDARY_ID,
-            DEFAULT_AUTHORITY_CLOCK,
-            current_tick,
-            tick_end,
-        )
-        .unwrap_or_else(|_| make_default_eval_window());
+        .build_evaluation_window(boundary_id, DEFAULT_AUTHORITY_CLOCK, current_tick, tick_end)
+        .unwrap_or_else(|_| make_default_eval_window(boundary_id));
 
     let envelope = broker
         .issue_time_authority_envelope_default_ttl(
-            DEFAULT_BOUNDARY_ID,
+            boundary_id,
             DEFAULT_AUTHORITY_CLOCK,
             current_tick,
             tick_end,
@@ -3102,9 +3111,9 @@ fn current_timestamp_epoch_secs() -> u64 {
 }
 
 /// Creates a default evaluation window for local-only queue admission.
-fn make_default_eval_window() -> HtfEvaluationWindow {
+fn make_default_eval_window(boundary_id: &str) -> HtfEvaluationWindow {
     HtfEvaluationWindow {
-        boundary_id: DEFAULT_BOUNDARY_ID.to_string(),
+        boundary_id: boundary_id.to_string(),
         authority_clock: DEFAULT_AUTHORITY_CLOCK.to_string(),
         tick_start: 0,
         tick_end: 1,

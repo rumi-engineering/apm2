@@ -1874,6 +1874,24 @@ impl DispatcherState {
         self
     }
 
+    /// Configures TCK-00565 token binding fields on the dispatcher.
+    ///
+    /// Sets the `boundary_id` and policy digest used when issuing tokens
+    /// through the daemon dispatch path. Without this, tokens use the
+    /// default `boundary_id` and a zero policy digest (fail-closed).
+    #[must_use]
+    pub fn with_token_binding_config(
+        mut self,
+        boundary_id: String,
+        policy_digest: [u8; 32],
+    ) -> Self {
+        self.privileged_dispatcher
+            .set_token_binding_boundary_id(boundary_id);
+        self.privileged_dispatcher
+            .set_token_binding_policy_digest(policy_digest);
+        self
+    }
+
     /// Sets privileged PCAC rollout policy for authority-bearing handlers.
     #[must_use]
     pub fn with_privileged_pcac_policy(mut self, policy: PrivilegedPcacPolicy) -> Self {
