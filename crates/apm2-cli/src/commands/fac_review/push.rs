@@ -1189,7 +1189,9 @@ fn gate_log_path(gate_name: &str) -> Result<PathBuf, String> {
 
 fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
     let path = gate_log_path(gate_name).ok()?;
-    let content = std::fs::read_to_string(path).ok()?;
+    let mut file = super::evidence::open_nofollow(&path).ok()?;
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut content).ok()?;
     normalize_error_hint(&content)
 }
 
@@ -1199,9 +1201,12 @@ fn latest_gate_error_hint(gate_name: &str) -> Option<String> {
 /// job's log file.
 fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     if let Some(ref log_path) = result.log_path {
-        if let Ok(content) = std::fs::read_to_string(log_path) {
-            if let Some(hint) = normalize_error_hint(&content) {
-                return Some(hint);
+        if let Ok(mut file) = super::evidence::open_nofollow(log_path) {
+            let mut content = String::new();
+            if std::io::Read::read_to_string(&mut file, &mut content).is_ok() {
+                if let Some(hint) = normalize_error_hint(&content) {
+                    return Some(hint);
+                }
             }
         }
     }

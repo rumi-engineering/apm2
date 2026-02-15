@@ -708,7 +708,7 @@ const LOG_BUNDLE_PER_FILE_MAX_BYTES: u64 = LOG_STREAM_MAX_BYTES + 4096;
 /// Open a file for reading with `O_NOFOLLOW` to atomically reject symlinks at
 /// the kernel level. This eliminates TOCTOU races between metadata checks and
 /// file opens — the kernel refuses to follow symlinks in a single syscall.
-fn open_nofollow(path: &Path) -> Result<fs::File, String> {
+pub(super) fn open_nofollow(path: &Path) -> Result<fs::File, String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
