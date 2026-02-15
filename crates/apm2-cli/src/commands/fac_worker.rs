@@ -154,6 +154,8 @@ const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
+const CORRUPT_MARKER_PERSIST_RETRIES: usize = 3;
+const CORRUPT_MARKER_PERSIST_RETRY_DELAY_MS: u64 = 25;
 
 /// Last-resort fallback boundary ID when node identity cannot be loaded.
 ///
@@ -1699,7 +1701,7 @@ fn process_job(
     let _ = lane_mgr.ensure_directories();
 
     let lane_ids = LaneManager::default_lane_ids();
-    let Some((_lane_guard, acquired_lane_id)) = acquire_worker_lane(&lane_mgr, &lane_ids) else {
+    let Some((lane_guard, acquired_lane_id)) = acquire_worker_lane(&lane_mgr, &lane_ids) else {
         // No lane available -> move back to pending for retry.
         if let Err(move_err) = move_to_dir_safe(
             &claimed_path,
@@ -2077,6 +2079,9 @@ fn process_job(
     if let Err(reason) =
         execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
     {
+        // Keep the lane lock in place on cleanup failure so the lane cannot be
+        // reused while corruption evidence is persisted.
+        std::mem::forget(lane_guard);
         return deny_with_reason(&reason);
     }
 
@@ -2191,41 +2196,112 @@ fn execute_lane_cleanup(
 ) -> Result<(), String> {
     match lane_mgr.run_lane_cleanup(lane_id, lane_workspace) {
         Ok(steps_completed) => {
-            if let Err(err) = emit_lane_cleanup_receipt(
+            if let Err(receipt_err) = emit_lane_cleanup_receipt(
                 fac_root,
                 lane_id,
                 LaneCleanupOutcome::Success,
-                steps_completed,
+                steps_completed.clone(),
                 None,
             ) {
-                eprintln!("worker: WARNING: lane cleanup receipt emission failed: {err}");
+                let failure_reason = format!("lane cleanup receipt emission failed: {receipt_err}");
+                handle_cleanup_corruption(
+                    fac_root,
+                    lane_id,
+                    &failure_reason,
+                    steps_completed,
+                    Some("receipt_persistence"),
+                )?;
+                return Err(failure_reason);
             }
             Ok(())
         },
         Err(err) => {
             let reason = format!("lane cleanup failed: {err}");
-            let failed_receipt_digest = emit_lane_cleanup_receipt(
+            let steps_completed = err.steps_completed().to_vec();
+            let failure_step = err.failure_step().map(std::string::ToString::to_string);
+
+            let failure_reason = failure_step.as_deref().map_or_else(
+                || reason.clone(),
+                |step| format!("{reason} (failure_step={step})"),
+            );
+
+            handle_cleanup_corruption(
                 fac_root,
                 lane_id,
-                LaneCleanupOutcome::Failed,
-                Vec::new(),
-                Some(&reason),
-            )
-            .ok();
-
-            let marker = LaneCorruptMarkerV1 {
-                schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
-                lane_id: lane_id.to_string(),
-                reason: reason.clone(),
-                cleanup_receipt_digest: failed_receipt_digest,
-                detected_at: current_timestamp_epoch_secs().to_string(),
-            };
-            if let Err(marker_err) = marker.persist(fac_root) {
-                eprintln!("worker: WARNING: failed to persist corrupt lane marker: {marker_err}");
-            }
-            Err(reason)
+                &failure_reason,
+                steps_completed,
+                failure_step.as_deref(),
+            )?;
+            Err(failure_reason)
         },
     }
+}
+
+fn handle_cleanup_corruption(
+    fac_root: &Path,
+    lane_id: &str,
+    reason: &str,
+    steps_completed: Vec<String>,
+    failure_step: Option<&str>,
+) -> Result<(), String> {
+    let failure_reason = failure_step.map_or_else(
+        || reason.to_string(),
+        |step| format!("{reason} failed_step={step}"),
+    );
+    let failed_receipt_digest = emit_lane_cleanup_receipt(
+        fac_root,
+        lane_id,
+        LaneCleanupOutcome::Failed,
+        steps_completed,
+        Some(&failure_reason),
+    )
+    .ok();
+    if failed_receipt_digest.is_none() {
+        eprintln!("worker: WARNING: failed to emit lane cleanup failure receipt for {lane_id}");
+    }
+
+    persist_corrupt_marker_with_retries(fac_root, lane_id, reason, failed_receipt_digest)?;
+    Ok(())
+}
+
+fn persist_corrupt_marker_with_retries(
+    fac_root: &Path,
+    lane_id: &str,
+    reason: &str,
+    cleanup_receipt_digest: Option<String>,
+) -> Result<(), String> {
+    let marker = LaneCorruptMarkerV1 {
+        schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+        lane_id: lane_id.to_string(),
+        reason: reason.to_string(),
+        cleanup_receipt_digest,
+        detected_at: current_timestamp_epoch_secs().to_string(),
+    };
+
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=CORRUPT_MARKER_PERSIST_RETRIES {
+        match marker.persist(fac_root) {
+            Ok(()) => return Ok(()),
+            Err(marker_err) => {
+                last_error = Some(marker_err.to_string());
+                eprintln!(
+                    "worker: WARNING: failed to persist corrupt lane marker for {lane_id} (attempt {attempt}/{CORRUPT_MARKER_PERSIST_RETRIES}): {marker_err}"
+                );
+                if attempt < CORRUPT_MARKER_PERSIST_RETRIES {
+                    std::thread::sleep(Duration::from_millis(
+                        CORRUPT_MARKER_PERSIST_RETRY_DELAY_MS,
+                    ));
+                }
+                if attempt == CORRUPT_MARKER_PERSIST_RETRIES {
+                    return Err(format!(
+                        "worker: FAILED to persist corrupt lane marker for {lane_id} after {CORRUPT_MARKER_PERSIST_RETRIES} attempts: {marker_err}",
+                    ));
+                }
+            },
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "unknown error".to_string()))
 }
 
 // =============================================================================
@@ -3349,6 +3425,7 @@ fn print_json<T: Serialize>(value: &T) {
 #[cfg(test)]
 mod tests {
     use apm2_core::fac::LaneState;
+    use apm2_core::fac::lane::LaneLeaseV1;
 
     use super::*;
 
@@ -4036,6 +4113,21 @@ mod tests {
         );
     }
 
+    fn persist_running_lease(manager: &LaneManager, lane_id: &str) {
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease = LaneLeaseV1::new(
+            lane_id,
+            "job_cleanup",
+            std::process::id(),
+            LaneState::Running,
+            "2026-02-12T03:15:00Z",
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("create lease");
+        lease.persist(&lane_dir).expect("persist lease");
+    }
+
     #[test]
     fn test_execute_lane_cleanup_success_emits_success_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4046,6 +4138,7 @@ mod tests {
 
         let lane_id = "lane-00";
         let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
+        persist_running_lease(&lane_mgr, lane_id);
         init_test_workspace_git_repo(&workspace);
 
         execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
@@ -4089,6 +4182,7 @@ mod tests {
 
         let lane_id = "lane-00";
         let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
+        persist_running_lease(&lane_mgr, lane_id);
 
         let err = execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
             .expect_err("cleanup should fail when workspace is not a git repo");

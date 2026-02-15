@@ -135,6 +135,8 @@ pub enum LaneCleanupError {
         reason: String,
         /// Ordered list of completed steps before failure.
         steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
     },
 
     /// Temporary directory prune failed.
@@ -146,6 +148,8 @@ pub enum LaneCleanupError {
         reason: String,
         /// Ordered list of completed steps before failure.
         steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
     },
 
     /// Log quota enforcement failed.
@@ -157,6 +161,8 @@ pub enum LaneCleanupError {
         reason: String,
         /// Ordered list of completed steps before failure.
         steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
     },
 
     /// Filesystem error while running cleanup.
@@ -171,12 +177,29 @@ pub enum LaneCleanupError {
 impl LaneCleanupError {
     /// Failed step identifier for receipt emission.
     #[must_use]
-    pub const fn failure_step(&self) -> Option<&'static str> {
+    pub fn failure_step(&self) -> Option<&str> {
         match self {
-            Self::GitCommandFailed { step, .. }
-            | Self::TempPruneFailed { step, .. }
-            | Self::LogQuotaFailed { step, .. } => Some(*step),
+            Self::GitCommandFailed { failure_step, .. }
+            | Self::TempPruneFailed { failure_step, .. }
+            | Self::LogQuotaFailed { failure_step, .. } => failure_step.as_deref(),
             Self::Io(_) | Self::InvalidState(_) => None,
+        }
+    }
+
+    /// Completed steps before the failure (for receipt evidence).
+    #[must_use]
+    pub fn steps_completed(&self) -> &[String] {
+        match self {
+            Self::GitCommandFailed {
+                steps_completed, ..
+            }
+            | Self::TempPruneFailed {
+                steps_completed, ..
+            }
+            | Self::LogQuotaFailed {
+                steps_completed, ..
+            } => steps_completed.as_slice(),
+            Self::Io(_) | Self::InvalidState(_) => &[],
         }
     }
 }
@@ -188,13 +211,13 @@ impl LaneCleanupError {
 /// Steps:
 /// 1. `Running` -> `Cleanup`
 /// 2. `git reset --hard HEAD`
-/// 3. `git clean -ffdx`
+/// 3. `git clean -ffdxq`
 /// 4. prune `tmp/`
 /// 5. enforce log quota
-/// 6. `Cleanup` -> idle (remove lease)
+/// 6. `Cleanup` -> idle (remove lease) on success
 ///
-/// On failure, the lane transitions to `Corrupt` and persists a
-/// `LaneCorruptMarkerV1`.
+/// On failure, the lease remains `Cleanup`; the worker is expected to persist
+/// the corrupt marker as durable evidence of failed cleanup.
 ///
 /// # Errors
 ///
@@ -1248,7 +1271,7 @@ impl LaneManager {
 
     /// Run lane cleanup:
     /// 1) Reset workspace (`git reset --hard HEAD`)
-    /// 2) Remove untracked files (`git clean -ffdx`)
+    /// 2) Remove untracked files (`git clean -ffdxq`)
     /// 3) Remove temporary directory (`tmp`) via safe deletion
     /// 4) Enforce log quota by pruning oldest logs to 100 MiB
     ///
@@ -1257,6 +1280,7 @@ impl LaneManager {
     /// Returns `LaneCleanupError::GitCommandFailed` on git failures, and
     /// `LaneCleanupError::TempPruneFailed` or
     /// `LaneCleanupError::LogQuotaFailed` for cleanup actions.
+    #[allow(clippy::too_many_lines)]
     pub fn run_lane_cleanup(
         &self,
         lane_id: &str,
@@ -1268,17 +1292,49 @@ impl LaneManager {
         let mut steps_completed = Vec::new();
         let lanes_dir = self.fac_root.join("lanes").join(lane_id);
 
+        let lease = LaneLeaseV1::load(&lanes_dir).map_err(|e| {
+            LaneCleanupError::Io(io::Error::other(format!(
+                "failed to load lane lease for cleanup: {e}"
+            )))
+        })?;
+        let mut lease = lease.ok_or_else(|| {
+            LaneCleanupError::InvalidState("cleanup requires a RUNNING lease".to_string())
+        })?;
+        if lease.state != LaneState::Running {
+            return Err(LaneCleanupError::InvalidState(format!(
+                "cleanup requires lane {lane_id} in RUNNING state, found {}",
+                lease.state
+            )));
+        }
+
+        let persist_lease_state = |lease: &mut LaneLeaseV1, state: LaneState| {
+            lease.state = state;
+            lease.persist(&lanes_dir).map_err(|e| {
+                LaneCleanupError::Io(io::Error::other(format!(
+                    "failed to persist lane lease state to {state} for {lane_id}: {e}"
+                )))
+            })
+        };
+
+        persist_lease_state(&mut lease, LaneState::Cleanup)?;
+
         // Step 1: git reset (restore workspace to HEAD).
         let reset_output = Command::new("git")
             .args(["reset", "--hard", "HEAD"])
             .current_dir(workspace_path)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(|e| LaneCleanupError::GitCommandFailed {
-                step: CLEANUP_STEP_GIT_RESET,
-                reason: format!("git reset spawn: {e}"),
-                steps_completed: steps_completed.clone(),
-            })?;
+            .output();
+        let reset_output = match reset_output {
+            Ok(reset_output) => reset_output,
+            Err(err) => {
+                return Err(LaneCleanupError::GitCommandFailed {
+                    step: CLEANUP_STEP_GIT_RESET,
+                    reason: format!("git reset spawn: {err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_GIT_RESET.to_string()),
+                });
+            },
+        };
         if !reset_output.status.success() {
             return Err(LaneCleanupError::GitCommandFailed {
                 step: CLEANUP_STEP_GIT_RESET,
@@ -1287,21 +1343,28 @@ impl LaneManager {
                     String::from_utf8_lossy(&reset_output.stderr)
                 ),
                 steps_completed: steps_completed.clone(),
+                failure_step: Some(CLEANUP_STEP_GIT_RESET.to_string()),
             });
         }
         steps_completed.push(CLEANUP_STEP_GIT_RESET.to_string());
 
-        // Step 2: git clean -ffdx (remove untracked files).
+        // Step 2: git clean -ffdxq (remove untracked files).
         let clean_output = Command::new("git")
-            .args(["clean", "-ffdx"])
+            .args(["clean", "-ffdxq"])
             .current_dir(workspace_path)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(|e| LaneCleanupError::GitCommandFailed {
-                step: CLEANUP_STEP_GIT_CLEAN,
-                reason: format!("git clean spawn: {e}"),
-                steps_completed: steps_completed.clone(),
-            })?;
+            .output();
+        let clean_output = match clean_output {
+            Ok(clean_output) => clean_output,
+            Err(err) => {
+                return Err(LaneCleanupError::GitCommandFailed {
+                    step: CLEANUP_STEP_GIT_CLEAN,
+                    reason: format!("git clean spawn: {err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_GIT_CLEAN.to_string()),
+                });
+            },
+        };
         if !clean_output.status.success() {
             return Err(LaneCleanupError::GitCommandFailed {
                 step: CLEANUP_STEP_GIT_CLEAN,
@@ -1310,6 +1373,7 @@ impl LaneManager {
                     String::from_utf8_lossy(&clean_output.stderr)
                 ),
                 steps_completed: steps_completed.clone(),
+                failure_step: Some(CLEANUP_STEP_GIT_CLEAN.to_string()),
             });
         }
         steps_completed.push(CLEANUP_STEP_GIT_CLEAN.to_string());
@@ -1322,26 +1386,39 @@ impl LaneManager {
                     step: CLEANUP_STEP_TEMP_PRUNE,
                     reason: format!("{e}"),
                     steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_TEMP_PRUNE.to_string()),
                 }
             })?;
         }
         steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
 
         // Step 4: Enforce log quota.
-        Self::enforce_log_quota(&lanes_dir.join("logs"))?;
+        if let Err(err) = Self::enforce_log_quota(&lanes_dir.join("logs"), &steps_completed) {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
+            return Err(err);
+        }
         steps_completed.push(CLEANUP_STEP_LOG_QUOTA.to_string());
+        if let Err(e) = LaneLeaseV1::remove(&lanes_dir) {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
+            return Err(LaneCleanupError::Io(io::Error::other(format!(
+                "failed to remove lane lease after cleanup: {e}"
+            ))));
+        }
 
         Ok(steps_completed)
     }
 
-    fn enforce_log_quota(logs_dir: &Path) -> Result<(), LaneCleanupError> {
+    fn enforce_log_quota(
+        logs_dir: &Path,
+        steps_completed: &[String],
+    ) -> Result<(), LaneCleanupError> {
         if !logs_dir.exists() {
             return Ok(());
         }
 
         let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
         let mut total_size: u64 = 0;
-        Self::collect_log_entries(logs_dir, &mut entries, &mut total_size, 0)?;
+        Self::collect_log_entries(logs_dir, &mut entries, &mut total_size, 0, steps_completed)?;
 
         if total_size <= MAX_LOG_QUOTA_BYTES {
             return Ok(());
@@ -1369,7 +1446,8 @@ impl LaneManager {
                     return Err(LaneCleanupError::LogQuotaFailed {
                         step: CLEANUP_STEP_LOG_QUOTA,
                         reason: format!("cannot remove log file {}: {err}", path.display()),
-                        steps_completed: Vec::new(),
+                        steps_completed: steps_completed.to_vec(),
+                        failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
                     });
                 },
             }
@@ -1383,6 +1461,7 @@ impl LaneManager {
         entries: &mut Vec<(PathBuf, u64, SystemTime)>,
         total_size: &mut u64,
         depth: usize,
+        steps_completed: &[String],
     ) -> Result<(), LaneCleanupError> {
         if depth > MAX_LOG_QUOTA_DIR_DEPTH {
             return Err(LaneCleanupError::LogQuotaFailed {
@@ -1392,30 +1471,34 @@ impl LaneManager {
                     base.display(),
                     MAX_LOG_QUOTA_DIR_DEPTH
                 ),
-                steps_completed: Vec::new(),
+                steps_completed: steps_completed.to_vec(),
+                failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
             });
         }
 
         for entry in fs::read_dir(base).map_err(|e| LaneCleanupError::LogQuotaFailed {
             step: CLEANUP_STEP_LOG_QUOTA,
             reason: format!("cannot read logs directory {}: {e}", base.display()),
-            steps_completed: Vec::new(),
+            steps_completed: steps_completed.to_vec(),
+            failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
         })? {
             let entry = entry.map_err(|e| LaneCleanupError::LogQuotaFailed {
                 step: CLEANUP_STEP_LOG_QUOTA,
                 reason: format!("cannot read log directory entry: {e}"),
-                steps_completed: Vec::new(),
+                steps_completed: steps_completed.to_vec(),
+                failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
             })?;
             let path = entry.path();
             let metadata =
                 fs::symlink_metadata(&path).map_err(|e| LaneCleanupError::LogQuotaFailed {
                     step: CLEANUP_STEP_LOG_QUOTA,
                     reason: format!("cannot stat log entry {}: {e}", path.display()),
-                    steps_completed: Vec::new(),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
                 })?;
 
             if metadata.is_dir() {
-                Self::collect_log_entries(&path, entries, total_size, depth + 1)?;
+                Self::collect_log_entries(&path, entries, total_size, depth + 1, steps_completed)?;
                 continue;
             }
 
@@ -1423,7 +1506,8 @@ impl LaneManager {
                 return Err(LaneCleanupError::LogQuotaFailed {
                     step: CLEANUP_STEP_LOG_QUOTA,
                     reason: format!("unsupported log entry type in {}", path.display()),
-                    steps_completed: Vec::new(),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
                 });
             }
 
@@ -1900,6 +1984,89 @@ const fn validate_string_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_git_workspace(path: &Path) {
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+        fs::create_dir_all(path).expect("create workspace");
+
+        let init_output = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("init git repo");
+        assert!(
+            init_output.status.success(),
+            "git init should succeed, got {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        let set_name_output = std::process::Command::new("git")
+            .args(["config", "user.name", "apm2 test"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("set git user name");
+        assert!(
+            set_name_output.status.success(),
+            "git config user.name should succeed, got {}",
+            String::from_utf8_lossy(&set_name_output.stderr)
+        );
+
+        let set_email_output = std::process::Command::new("git")
+            .args(["config", "user.email", "test@apm2.local"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("set git user email");
+        assert!(
+            set_email_output.status.success(),
+            "git config user.email should succeed, got {}",
+            String::from_utf8_lossy(&set_email_output.stderr)
+        );
+
+        fs::write(path.join("README.md"), b"seed").expect("write seed file");
+        let add_output = std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git add");
+        assert!(
+            add_output.status.success(),
+            "git add should succeed, got {}",
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+
+        let commit_output = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git commit");
+        assert!(
+            commit_output.status.success(),
+            "git commit should succeed, got {}",
+            String::from_utf8_lossy(&commit_output.stderr)
+        );
+    }
+
+    fn persist_running_lease(manager: &LaneManager, lane_id: &str) {
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease = LaneLeaseV1::new(
+            lane_id,
+            "job_cleanup",
+            std::process::id(),
+            LaneState::Running,
+            "2026-02-12T03:15:00Z",
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("create lease");
+        lease.persist(&lane_dir).expect("persist lease");
+    }
 
     // ── Lane ID Validation ─────────────────────────────────────────────
 
@@ -2480,7 +2647,7 @@ mod tests {
         fs::create_dir_all(&depth_dir).expect("create deep logs directory");
         fs::write(depth_dir.join("deep.log"), b"payload").expect("write deep log file");
 
-        let err = LaneManager::enforce_log_quota(&logs_dir).unwrap_err();
+        let err = LaneManager::enforce_log_quota(&logs_dir, &[]).unwrap_err();
         assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
         assert!(
             format!("{err}").contains("recursion depth exceeded"),
@@ -2571,7 +2738,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let fac_root = root.path().join("private").join("fac");
         fs::create_dir_all(&fac_root).expect("create fac root");
-        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+        let manager = LaneManager::new(fac_root).expect("create manager");
         manager.ensure_directories().expect("ensure dirs");
 
         let lane_id = "lane-00";
@@ -2582,11 +2749,116 @@ mod tests {
             cleanup_receipt_digest: None,
             detected_at: "2026-02-15T00:00:00Z".to_string(),
         };
-        marker.persist(&fac_root).expect("persist marker");
+        marker.persist(manager.fac_root()).expect("persist marker");
 
         let status = manager.lane_status(lane_id).expect("lane status");
         assert_eq!(status.state, LaneState::Corrupt);
         assert_eq!(status.corrupt_reason.as_deref(), Some("cleanup failed"));
+    }
+
+    #[test]
+    fn run_lane_cleanup_transitions_to_corrupt_on_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let workspace = manager.lane_dir(lane_id).join("workspace");
+        let guard = manager
+            .try_lock(lane_id)
+            .expect("try_lock")
+            .expect("acquire lock");
+
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect_err("cleanup fails when workspace is not a repo");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_GIT_RESET,
+        );
+
+        let status_during = manager.lane_status(lane_id).expect("status during failure");
+        assert_eq!(status_during.state, LaneState::Cleanup);
+
+        drop(guard);
+        let status_after = manager.lane_status(lane_id).expect("status after release");
+        assert_eq!(status_after.state, LaneState::Corrupt);
+    }
+
+    #[test]
+    fn run_lane_cleanup_transitions_to_idle_on_success() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let steps_completed = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("lane cleanup should succeed");
+        assert_eq!(
+            steps_completed,
+            vec![
+                CLEANUP_STEP_GIT_RESET.to_string(),
+                CLEANUP_STEP_GIT_CLEAN.to_string(),
+                CLEANUP_STEP_TEMP_PRUNE.to_string(),
+                CLEANUP_STEP_LOG_QUOTA.to_string(),
+            ],
+            "all steps should be reported",
+        );
+
+        let status = manager.lane_status(lane_id).expect("status");
+        assert_eq!(status.state, LaneState::Idle);
+        assert!(LaneLeaseV1::load(&lane_dir).expect("load lease").is_none());
+    }
+
+    #[test]
+    fn run_lane_cleanup_preserves_steps_for_log_quota_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+        let mut depth_dir = logs_dir;
+        for level in 0..(MAX_LOG_QUOTA_DIR_DEPTH + 2) {
+            depth_dir = depth_dir.join(format!("level_{level}"));
+        }
+        fs::create_dir_all(&depth_dir).expect("create deep logs directory");
+        fs::write(depth_dir.join("deep.log"), b"payload").expect("write deep log file");
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect_err("cleanup should fail from log quota traversal depth check");
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        assert_eq!(
+            err.steps_completed(),
+            [
+                CLEANUP_STEP_GIT_RESET.to_string(),
+                CLEANUP_STEP_GIT_CLEAN.to_string(),
+                CLEANUP_STEP_TEMP_PRUNE.to_string(),
+            ]
+            .as_slice()
+        );
+        assert_eq!(err.failure_step(), Some(CLEANUP_STEP_LOG_QUOTA));
     }
 
     #[test]
@@ -2602,13 +2874,14 @@ mod tests {
         let lease_path = lane_dir.join("lease.v1.json");
         fs::write(&lease_path, b"{invalid lease json").expect("write corrupted lease");
 
-        let _guard = manager
+        let guard = manager
             .try_lock(lane_id)
             .expect("try_lock")
             .expect("acquire lock");
 
         let status = manager.lane_status(lane_id).expect("lane status");
         assert_eq!(status.state, LaneState::Leased);
+        drop(guard);
     }
 
     // ── PID Liveness ───────────────────────────────────────────────────
@@ -2638,7 +2911,7 @@ mod tests {
         let fac_root = root.path().join("private").join("fac");
         // Manually create to make it absolute
         fs::create_dir_all(&fac_root).expect("create fac root");
-        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+        let manager = LaneManager::new(fac_root).expect("create manager");
 
         manager.ensure_directories().expect("ensure dirs");
 
@@ -2659,7 +2932,7 @@ mod tests {
             );
         }
         assert!(
-            fac_root.join("locks").join("lanes").exists(),
+            manager.fac_root().join("locks").join("lanes").exists(),
             "lock dir should exist"
         );
     }
@@ -2701,7 +2974,7 @@ mod tests {
         manager.ensure_directories().expect("ensure dirs");
 
         let lane_id = "lane-00";
-        let _guard = manager
+        let guard = manager
             .try_lock(lane_id)
             .expect("try_lock")
             .expect("acquire");
@@ -2712,6 +2985,7 @@ mod tests {
             second.is_none(),
             "should not acquire lock when already held"
         );
+        drop(guard);
     }
 
     #[test]
@@ -2754,7 +3028,7 @@ mod tests {
         lease.persist(&lane_dir).expect("persist lease");
 
         // Acquire lock
-        let _guard = manager
+        let guard = manager
             .try_lock(lane_id)
             .expect("try_lock")
             .expect("acquire");
@@ -2765,6 +3039,7 @@ mod tests {
         assert_eq!(status.pid, Some(pid));
         assert!(status.lock_held);
         assert_eq!(status.pid_alive, Some(true));
+        drop(guard);
     }
 
     #[test]
@@ -2942,10 +3217,11 @@ mod tests {
             let lid = lane_id.to_string();
             handles.push(std::thread::spawn(move || {
                 b.wait();
-                if let Ok(Some(_guard)) = m.try_lock(&lid) {
+                if let Ok(Some(guard)) = m.try_lock(&lid) {
                     count.fetch_add(1, Ordering::SeqCst);
                     // Hold the lock briefly
                     std::thread::sleep(Duration::from_millis(50));
+                    drop(guard);
                 }
             }));
         }
