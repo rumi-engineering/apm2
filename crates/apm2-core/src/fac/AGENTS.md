@@ -646,7 +646,7 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   `contained: false`.
 - [INV-CONTAIN-002] All `/proc` reads bounded by `MAX_PROC_READ_SIZE` (4 KiB).
 - [INV-CONTAIN-003] Process discovery bounded by `MAX_CHILD_PROCESSES` (2048)
-  and `MAX_PROC_SCAN_ENTRIES` (65536). Overflow returns
+  and `MAX_PROC_SCAN_ENTRIES` (131072). Overflow returns
   `ContainmentError::ProcScanOverflow` (fail-closed). Excessive `PPid`
   read failures (>50% of scanned PID entries) also return this error.
 - [INV-CONTAIN-004] Cgroup path comparison uses exact prefix matching with
