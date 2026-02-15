@@ -2800,14 +2800,17 @@ fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
     exit_codes::SUCCESS
 }
 
-/// Truncate a string to `max_len`, appending ".." if truncated.
+/// Truncate a string to at most `max_len` characters, appending ".." if
+/// truncated. Uses char-aware truncation to avoid panicking on multi-byte
+/// UTF-8 boundaries.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else if max_len > 2 {
-        format!("{}..", &s[..max_len - 2])
+        let truncated: String = s.chars().take(max_len - 2).collect();
+        format!("{truncated}..")
     } else {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     }
 }
 
@@ -4689,5 +4692,43 @@ mod tests {
             },
             other => panic!("expected services subcommand, got {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // truncate_str UTF-8 safety tests (MINOR finding fix)
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_str_ascii_no_truncation() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_ascii_truncated() {
+        assert_eq!(truncate_str("hello world", 7), "hello..");
+    }
+
+    #[test]
+    fn test_truncate_str_multibyte_no_panic() {
+        // Multi-byte UTF-8 characters should not cause panic.
+        let s = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}"; // 4 emoji characters
+        let result = truncate_str(s, 3);
+        assert_eq!(result.chars().count(), 3); // 1 char + ".."
+        assert!(result.ends_with(".."));
+    }
+
+    #[test]
+    fn test_truncate_str_exact_length() {
+        assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn test_truncate_str_max_len_two() {
+        assert_eq!(truncate_str("abcdef", 2), "ab");
+    }
+
+    #[test]
+    fn test_truncate_str_max_len_zero() {
+        assert_eq!(truncate_str("abc", 0), "");
     }
 }

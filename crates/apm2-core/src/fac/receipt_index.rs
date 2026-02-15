@@ -38,7 +38,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::receipt::{FacJobOutcome, FacJobReceiptV1, MAX_JOB_RECEIPT_SIZE};
+use super::receipt::{
+    FacJobOutcome, FacJobReceiptV1, MAX_JOB_RECEIPT_SIZE, compute_job_receipt_content_hash,
+    compute_job_receipt_content_hash_v2,
+};
 
 // =============================================================================
 // Constants
@@ -614,8 +617,9 @@ fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
 /// # Security
 ///
 /// The index is non-authoritative; this function reads the receipt from the
-/// content-addressed store and verifies it. The index only provides the
-/// content hash hint.
+/// content-addressed store and **verifies content-hash integrity** before
+/// returning. The index only provides the content hash hint. On hash mismatch,
+/// the receipt is treated as corrupted and the fallback directory scan is used.
 #[must_use]
 pub fn lookup_job_receipt(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
     // Try the index first — O(1) lookup.
@@ -623,10 +627,11 @@ pub fn lookup_job_receipt(receipts_dir: &Path, job_id: &str) -> Option<FacJobRec
         if let Some(digest) = index.latest_digest_for_job(job_id) {
             let receipt_path = receipts_dir.join(format!("{digest}.json"));
             if let Some(receipt) = load_receipt_bounded(&receipt_path) {
-                if receipt.job_id == job_id {
+                if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
                     return Some(receipt);
                 }
-                // Index was stale — fall through to scan.
+                // Index was stale or integrity check failed — fall through to
+                // scan.
             }
         }
     }
@@ -648,6 +653,55 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
     let mut headers: Vec<ReceiptHeaderV1> = index.header_index.into_values().collect();
     headers.sort_by(|a, b| b.timestamp_secs.cmp(&a.timestamp_secs));
     headers
+}
+
+/// Check whether a receipt exists for the given job ID using the index.
+///
+/// This is a lightweight O(1) check that only consults the in-memory index
+/// without loading the full receipt from disk. Falls back to a bounded
+/// directory scan if the index is unavailable.
+///
+/// This is used by the worker to skip jobs that already have receipts,
+/// avoiding redundant processing and unnecessary directory scans.
+#[must_use]
+pub fn has_receipt_for_job(receipts_dir: &Path, job_id: &str) -> bool {
+    // Try the index first — O(1) check with disk verification.
+    if let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) {
+        if let Some(digest) = index.latest_digest_for_job(job_id) {
+            // Verify the receipt file actually exists on disk.
+            let receipt_path = receipts_dir.join(format!("{digest}.json"));
+            if receipt_path.is_file() {
+                return true;
+            }
+            // Index references missing file — stale, fall through.
+        }
+    }
+
+    // Fallback: bounded directory scan.
+    scan_receipt_for_job(receipts_dir, job_id).is_some()
+}
+
+/// Verify content-addressed integrity of a loaded receipt against its
+/// expected digest from the index.
+///
+/// Tries both v1 and v2 hash schemes (receipts may use either). Returns
+/// `true` if either hash matches the expected digest.
+fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) -> bool {
+    // Try v1 hash first (most common for existing receipts).
+    let v1_hash = compute_job_receipt_content_hash(receipt);
+    if v1_hash == expected_digest {
+        return true;
+    }
+    // Try v2 hash (includes unsafe_direct).
+    let v2_hash = compute_job_receipt_content_hash_v2(receipt);
+    if v2_hash == expected_digest {
+        return true;
+    }
+    // Also check the receipt's own content_hash field.
+    if !receipt.content_hash.is_empty() && receipt.content_hash == expected_digest {
+        return true;
+    }
+    false
 }
 
 /// Load a single receipt file with bounded read and `O_NOFOLLOW`.
@@ -1171,5 +1225,122 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let headers = list_receipt_headers(tmp.path());
         assert!(headers.is_empty());
+    }
+
+    // =========================================================================
+    // has_receipt_for_job tests (BLOCKER: consumer wiring)
+    // =========================================================================
+
+    #[test]
+    fn test_has_receipt_for_job_found_via_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let r1 = make_receipt("job-exists", "hash-exists", 1000);
+        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
+        std::fs::write(receipts_dir.join("hash-exists.json"), &bytes).expect("write");
+
+        // Build the index.
+        let index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+        index.persist(receipts_dir).expect("persist");
+
+        assert!(
+            has_receipt_for_job(receipts_dir, "job-exists"),
+            "should find receipt via index"
+        );
+    }
+
+    #[test]
+    fn test_has_receipt_for_job_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !has_receipt_for_job(tmp.path(), "no-such-job"),
+            "should not find receipt for nonexistent job"
+        );
+    }
+
+    #[test]
+    fn test_has_receipt_for_job_fallback_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write receipt file but do NOT build the index.
+        let r1 = make_receipt("job-scan", "hash-scan", 2000);
+        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
+        std::fs::write(receipts_dir.join("hash-scan.json"), &bytes).expect("write");
+
+        assert!(
+            has_receipt_for_job(receipts_dir, "job-scan"),
+            "should find receipt via fallback scan"
+        );
+    }
+
+    // =========================================================================
+    // verify_receipt_integrity tests (MAJOR: content-addressed integrity)
+    // =========================================================================
+
+    #[test]
+    fn test_verify_receipt_integrity_matching_content_hash() {
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let receipt = make_receipt("job-verify", "placeholder", 3000);
+        // Compute the v1 content hash and use it as the digest.
+        let hash = compute_job_receipt_content_hash(&receipt);
+        let receipt_with_hash = FacJobReceiptV1 {
+            content_hash: hash.clone(),
+            ..receipt
+        };
+
+        assert!(
+            verify_receipt_integrity(&receipt_with_hash, &hash),
+            "should verify against v1 content hash"
+        );
+    }
+
+    #[test]
+    fn test_verify_receipt_integrity_fails_on_mismatch() {
+        let receipt = make_receipt("job-tampered", "original-hash", 3000);
+        assert!(
+            !verify_receipt_integrity(
+                &receipt,
+                "b3-256:0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            "should reject mismatched digest"
+        );
+    }
+
+    #[test]
+    fn test_lookup_verifies_integrity() {
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with a correct content hash.
+        let mut receipt = make_receipt("job-integrity", "placeholder", 4000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        // Write the receipt file named by its hash.
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        // Build the index with the correct hash.
+        let mut index = ReceiptIndexV1::new();
+        let header = ReceiptHeaderV1 {
+            content_hash: hash.clone(),
+            job_id: "job-integrity".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 4000,
+            queue_lane: None,
+            unsafe_direct: false,
+        };
+        index.upsert(header).expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        // Lookup should succeed with integrity verification.
+        let found = lookup_job_receipt(receipts_dir, "job-integrity");
+        assert!(found.is_some(), "should find receipt with valid integrity");
+        assert_eq!(found.unwrap().content_hash, hash);
     }
 }

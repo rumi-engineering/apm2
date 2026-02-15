@@ -494,12 +494,33 @@ queue_lane, etc.).
 ### Consumer Helpers (TCK-00560)
 
 - `lookup_job_receipt(receipts_dir, job_id)`: Index-first O(1) job receipt lookup
-  with bounded directory scan fallback. Primary consumer entry point.
+  with bounded directory scan fallback. Verifies content-addressed integrity
+  (BLAKE3 hash) before returning — on mismatch, treats as index corruption and
+  falls back to directory scan. Primary consumer entry point.
+- `has_receipt_for_job(receipts_dir, job_id)`: Lightweight O(1) index check for
+  receipt existence without loading full receipt. Falls back to bounded directory
+  scan. Used by the worker for duplicate detection.
 - `list_receipt_headers(receipts_dir)`: List all indexed headers sorted by
   timestamp (most recent first). No directory scanning.
 - CLI: `apm2 fac receipts list` — list indexed receipts.
 - CLI: `apm2 fac receipts status <job_id>` — look up latest receipt for a job.
 - CLI: `apm2 fac receipts reindex` — force full rebuild from receipt store.
+
+### Production Consumer Wiring (TCK-00560)
+
+All receipt-touching hot paths consult the index first:
+
+- **Worker duplicate detection** (`fac_worker::process_job`): Before processing
+  any job, `has_receipt_for_job` checks the index for an existing receipt. Jobs
+  with receipts are skipped, avoiding redundant processing and directory scans.
+- **Receipt persistence** (`persist_content_addressed_receipt`,
+  `persist_content_addressed_receipt_v2`): Both call `incremental_update` after
+  writing the receipt file, keeping the index current.
+- **CLI receipt list** (`apm2 fac receipts list`): Uses `list_receipt_headers`
+  (index-only, no directory scan).
+- **CLI receipt status** (`apm2 fac receipts status`): Uses `lookup_job_receipt`
+  (index-first with fallback).
+- **CLI receipt reindex** (`apm2 fac receipts reindex`): Full rebuild from store.
 
 ### Security Invariants (TCK-00560)
 
@@ -519,3 +540,6 @@ queue_lane, etc.).
   and atomic rename. No predictable temp paths.
 - [INV-IDX-007] Individual receipt file reads during rebuild use open-once with
   `O_NOFOLLOW` + bounded streaming reads (no stat-then-read TOCTOU).
+- [INV-IDX-008] `lookup_job_receipt` verifies content-addressed integrity by
+  recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
+  index key. Hash mismatch triggers fallback to directory scan (fail-closed).
