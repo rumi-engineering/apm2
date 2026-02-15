@@ -1870,44 +1870,44 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
+    let deny_with_reason = |reason: &str| -> JobOutcome {
+        let moved_path = move_to_dir_safe(
+            &claimed_path,
+            &queue_root.join(DENIED_DIR),
+            &claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            budget_trace.as_ref(),
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            None,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        JobOutcome::Denied {
+            reason: reason.to_string(),
+        }
+    };
+
     if spec.source.kind == "patch_injection" {
         let inline_patch_error =
             "patch_injection requires inline patch bytes (CAS backend not yet implemented)";
-
-        let deny_with_reason = |reason: &str| -> JobOutcome {
-            let moved_path = move_to_dir_safe(
-                &claimed_path,
-                &queue_root.join(DENIED_DIR),
-                &claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            if let Err(receipt_err) = emit_job_receipt(
-                fac_root,
-                spec,
-                FacJobOutcome::Denied,
-                Some(DenialReasonCode::ValidationFailed),
-                reason,
-                Some(&boundary_trace),
-                Some(&queue_trace),
-                budget_trace.as_ref(),
-                None,
-                Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
-                policy_hash,
-                None,
-            ) {
-                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-            }
-            JobOutcome::Denied {
-                reason: reason.to_string(),
-            }
-        };
 
         let Some(patch_value) = &spec.source.patch else {
             return deny_with_reason(inline_patch_error);
@@ -1994,27 +1994,33 @@ fn process_job(
     let sccache_active = std::env::var("RUSTC_WRAPPER")
         .ok()
         .is_some_and(|v| v.contains("sccache"));
-    let containment_trace =
-        match apm2_core::fac::containment::verify_containment(std::process::id(), sccache_active) {
-            Ok(verdict) => {
-                eprintln!(
-                    "worker: containment check: contained={} processes_checked={} mismatches={}",
-                    verdict.contained,
+    let containment_trace = match apm2_core::fac::containment::verify_containment(
+        std::process::id(),
+        sccache_active,
+    ) {
+        Ok(verdict) => {
+            eprintln!(
+                "worker: containment check: contained={} processes_checked={} mismatches={}",
+                verdict.contained,
+                verdict.processes_checked,
+                verdict.mismatches.len(),
+            );
+            if !verdict.contained {
+                return deny_with_reason(&format!(
+                    "containment verification failed: contained=false processes_checked={} mismatches={}",
                     verdict.processes_checked,
-                    verdict.mismatches.len(),
-                );
-                Some(apm2_core::fac::containment::ContainmentTrace::from_verdict(
-                    &verdict,
-                ))
-            },
-            Err(err) => {
-                // Fail-closed: containment check error is logged but does not
-                // prevent job completion. The receipt will record None for
-                // containment, which reviewers can flag.
-                eprintln!("worker: WARNING: containment check failed: {err}");
-                None
-            },
-        };
+                    verdict.mismatches.len()
+                ));
+            }
+            Some(apm2_core::fac::containment::ContainmentTrace::from_verdict(
+                &verdict,
+            ))
+        },
+        Err(err) => {
+            eprintln!("worker: ERROR: containment check failed: {err}");
+            return deny_with_reason(&format!("containment verification failed: {err}"));
+        },
+    };
 
     // Step 9: Write authoritative GateReceipt and move to completed.
     let evidence_hash = compute_evidence_hash(&candidate.raw_bytes);
