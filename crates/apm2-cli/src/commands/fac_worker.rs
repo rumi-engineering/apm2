@@ -934,23 +934,8 @@ fn process_job(
     // RFC-0028 token and RFC-0029 admission path.  Instead, the worker
     // verifies local-origin authority by checking queue directory ownership.
     if is_control_lane {
-        // Verify local-origin authority: the worker must have write
-        // access to the queue root directory.  This capability-based
-        // proof confirms the stop_revoke spec was placed by a process
-        // with local privilege over the queue.
-        {
-            let probe_path = queue_root.join(".stop-revoke-authority-probe");
-            if let Err(e) = fs::write(&probe_path, b"probe") {
-                let reason = format!(
-                    "stop_revoke local-origin authority denied: cannot write to queue root: {e}"
-                );
-                let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
-                return JobOutcome::Denied { reason };
-            }
-            let _ = fs::remove_file(&probe_path);
-        }
-
         // Construct synthetic traces for the control lane (no real token).
+        // Built early so all deny paths below can include them in receipts.
         let boundary_trace = ChannelBoundaryTrace {
             passed: true,
             defect_count: 0,
@@ -963,10 +948,78 @@ fn process_job(
         };
         let budget_trace: Option<FacBudgetAdmissionTrace> = None;
 
+        // Verify local-origin authority: the worker must have write
+        // access to the queue root directory.  This capability-based
+        // proof confirms the stop_revoke spec was placed by a process
+        // with local privilege over the queue.
+        {
+            let probe_path = queue_root.join(".stop-revoke-authority-probe");
+            if let Err(e) = fs::write(&probe_path, b"probe") {
+                let reason = format!(
+                    "stop_revoke local-origin authority denied: cannot write to queue root: {e}"
+                );
+                // MAJOR-3 fix: Emit explicit refusal receipt before moving to denied/.
+                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                    .map(|p| {
+                        p.strip_prefix(queue_root)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .ok();
+                if let Err(receipt_err) = emit_job_receipt(
+                    fac_root,
+                    spec,
+                    FacJobOutcome::Denied,
+                    Some(DenialReasonCode::ValidationFailed),
+                    &reason,
+                    Some(&boundary_trace),
+                    Some(&queue_trace),
+                    budget_trace.as_ref(),
+                    None,
+                    Some(canonicalizer_tuple_digest),
+                    moved_path.as_deref(),
+                    policy_hash,
+                ) {
+                    eprintln!(
+                        "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
+                    );
+                }
+                return JobOutcome::Denied { reason };
+            }
+            let _ = fs::remove_file(&probe_path);
+        }
+
         // PCAC lifecycle: check if authority was already consumed.
         if is_authority_consumed(queue_root, &spec.job_id) {
             let reason = format!("authority already consumed for job {}", spec.job_id);
-            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            // MAJOR-3 fix: Emit explicit refusal receipt before moving to denied/.
+            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::AuthorityAlreadyConsumed),
+                &reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                budget_trace.as_ref(),
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
+                );
+            }
             return JobOutcome::Denied { reason };
         }
 
@@ -987,11 +1040,37 @@ fn process_job(
         // PCAC consume.
         if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
             let reason = format!("PCAC consume failed: {e}");
-            let _ = move_to_dir_safe(
+            // MAJOR-3 fix: Emit explicit refusal receipt before moving to denied/.
+            let moved_path = move_to_dir_safe(
                 &claimed_path,
                 &queue_root.join(DENIED_DIR),
                 &claimed_file_name,
-            );
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::PcacConsumeFailed),
+                &reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                budget_trace.as_ref(),
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
+                );
+            }
             return JobOutcome::Denied { reason };
         }
 
@@ -1957,19 +2036,43 @@ fn handle_stop_revoke(
     let target_job_id = match &spec.cancel_target_job_id {
         Some(id) if !id.is_empty() => id.as_str(),
         _ => {
+            let reason = "stop_revoke job missing cancel_target_job_id".to_string();
             eprintln!(
                 "worker: stop_revoke job {} missing cancel_target_job_id",
                 spec.job_id
             );
-            // Move the stop_revoke job to denied (malformed).
-            let _ = move_to_dir_safe(
+            // MAJOR-3 fix: Emit explicit refusal receipt before moving to denied/.
+            let moved_path = move_to_dir_safe(
                 claimed_path,
                 &queue_root.join(DENIED_DIR),
                 claimed_file_name,
-            );
-            return JobOutcome::Denied {
-                reason: "stop_revoke job missing cancel_target_job_id".to_string(),
-            };
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::MalformedSpec),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
+                );
+            }
+            return JobOutcome::Denied { reason };
         },
     };
 
@@ -2257,6 +2360,18 @@ fn find_target_job_in_dir(dir: &Path, target_job_id: &str) -> Option<PathBuf> {
 ///
 /// Returns `Ok(())` if any stop command succeeded, or `Err` with details.
 fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String> {
+    // MAJOR-1 fix: Sanitize queue_lane to only allow [A-Za-z0-9_-].
+    // Fail-closed: reject lanes containing unsafe characters to prevent
+    // command injection via crafted unit names.
+    if lane.is_empty()
+        || !lane
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(format!(
+            "unsafe queue_lane value {lane:?}: only [A-Za-z0-9_-] allowed"
+        ));
+    }
     let unit_name = format!("apm2-fac-job-{lane}-{target_job_id}");
     let mut last_err = String::new();
 
@@ -3268,5 +3383,41 @@ mod tests {
         let h1 = compute_evidence_hash(b"data-a");
         let h2 = compute_evidence_hash(b"data-b");
         assert_ne!(h1, h2, "different inputs must produce different hashes");
+    }
+
+    /// MAJOR-1 regression: `stop_target_unit_exact` must reject unsafe lane
+    /// characters to prevent command injection via crafted unit names.
+    #[test]
+    fn test_stop_target_unit_exact_rejects_unsafe_lane() {
+        for unsafe_lane in &["../evil", "lane;rm", "a b", "lane/path", "lane*glob", ""] {
+            let result = stop_target_unit_exact(unsafe_lane, "job-123");
+            assert!(
+                result.is_err(),
+                "should reject unsafe lane {unsafe_lane:?}: {result:?}"
+            );
+            let err_msg = result.unwrap_err();
+            assert!(
+                err_msg.contains("unsafe queue_lane"),
+                "error should mention unsafe lane: {err_msg}"
+            );
+        }
+    }
+
+    /// MAJOR-1 regression: `stop_target_unit_exact` must accept valid lanes.
+    #[test]
+    fn test_stop_target_unit_exact_accepts_valid_lane() {
+        // This will fail to actually stop a unit (no systemd in test), but it
+        // should NOT fail due to lane sanitization.
+        for valid_lane in &["control", "default-0", "lane_1", "A-Z-test"] {
+            let result = stop_target_unit_exact(valid_lane, "job-123");
+            // We expect Err from systemctl (not installed or unit not found),
+            // but NOT an "unsafe queue_lane" error.
+            if let Err(ref e) = result {
+                assert!(
+                    !e.contains("unsafe queue_lane"),
+                    "valid lane {valid_lane:?} should not be rejected: {e}"
+                );
+            }
+        }
     }
 }

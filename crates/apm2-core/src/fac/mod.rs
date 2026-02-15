@@ -32,6 +32,22 @@
 //! `GateLeaseIssued` event for the same `work_id`/changeset. This ensures all
 //! leases operate under a locked policy configuration.
 //!
+//! # Control-Lane Exception (Audited)
+//!
+//! `stop_revoke` jobs bypass the standard RFC-0028 channel context token and
+//! RFC-0029 queue admission flow.  This is an **explicit, audited policy
+//! exception** marked by [`CONTROL_LANE_EXCEPTION_AUDITED`].
+//!
+//! **Justification**: Control-lane cancellation originates from the local
+//! operator (same trust domain as the queue owner) and requires
+//! filesystem-level access proof (queue directory write capability).  A
+//! broker-issued token would add no additional authority beyond what
+//! filesystem capability already proves.  All structural and digest
+//! validation is still enforced; only the token requirement is waived.
+//!
+//! See [`job_spec::validate_job_spec_control_lane`] for the full policy
+//! exception documentation.
+//!
 //! # Example
 //!
 //! ```rust
@@ -256,12 +272,12 @@ pub use harness_sandbox::{
 };
 // Re-export job spec types (TCK-00512)
 pub use job_spec::{
-    Actuation, FacJobSpecV1, FacJobSpecV1Builder, JOB_SPEC_SCHEMA_ID, JobConstraints, JobSource,
-    JobSpecError, LaneRequirements, MAX_CHANNEL_CONTEXT_TOKEN_LENGTH, MAX_DECODED_SOURCE_LENGTH,
-    MAX_HEAD_SHA_LENGTH, MAX_JOB_ID_LENGTH, MAX_JOB_SPEC_SIZE, MAX_KIND_LENGTH,
-    MAX_LEASE_ID_LENGTH, MAX_QUEUE_LANE_LENGTH, MAX_REPO_ID_LENGTH, MAX_REQUEST_ID_LENGTH,
-    MAX_SOURCE_KIND_LENGTH, deserialize_job_spec, validate_job_spec,
-    validate_job_spec_control_lane,
+    Actuation, CONTROL_LANE_EXCEPTION_AUDITED, FacJobSpecV1, FacJobSpecV1Builder,
+    JOB_SPEC_SCHEMA_ID, JobConstraints, JobSource, JobSpecError, LaneRequirements,
+    MAX_CHANNEL_CONTEXT_TOKEN_LENGTH, MAX_DECODED_SOURCE_LENGTH, MAX_HEAD_SHA_LENGTH,
+    MAX_JOB_ID_LENGTH, MAX_JOB_SPEC_SIZE, MAX_KIND_LENGTH, MAX_LEASE_ID_LENGTH,
+    MAX_QUEUE_LANE_LENGTH, MAX_REPO_ID_LENGTH, MAX_REQUEST_ID_LENGTH, MAX_SOURCE_KIND_LENGTH,
+    deserialize_job_spec, validate_job_spec, validate_job_spec_control_lane,
 };
 // Re-export key policy types
 pub use key_policy::{
