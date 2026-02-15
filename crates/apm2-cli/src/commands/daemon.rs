@@ -40,9 +40,15 @@ const FAC_RUNTIME_SUBDIRS: [&str; 14] = [
 
 const USER_SYSTEMD_DIR: &str = ".config/systemd/user";
 
+/// TCK-00595: Systemd user service template for `apm2 daemon install`.
+///
+/// `%exe_path%` is replaced at install-time with the resolved binary path.
+/// Uses `Restart=always` + `WatchdogSec=300` for crash resilience.
+/// `LoadCredential` reads the GH token from the systemd credential store,
+/// ensuring tokens are never persisted in unit files (security policy).
 const DAEMON_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
-Description=APM2 Daemon — Forge Admission Cycle broker\n\
+Description=APM2 Daemon — Forge Admission Cycle\n\
 Documentation=https://github.com/guardian-intelligence/apm2\n\
 After=network-online.target\n\
 Wants=network-online.target\n\
@@ -169,7 +175,17 @@ pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
     Ok(())
 }
 
-/// Install the systemd user service for apm2-daemon.
+/// Install the systemd user service for apm2-daemon (TCK-00595).
+///
+/// Writes four unit files to `~/.config/systemd/user/`:
+/// - `apm2-daemon.service` — main broker with Restart=always + `WatchdogSec`
+/// - `apm2-daemon.socket` — operator socket activation (mode 0600)
+/// - `apm2-worker.service` — FAC worker (depends on daemon)
+/// - `apm2-worker@.service` — template for scaled workers
+///
+/// Then runs `systemctl --user daemon-reload && enable && start`.
+/// Optionally enables linger via `loginctl enable-linger` so services
+/// survive user logout.
 pub fn install(enable_linger: bool) -> Result<()> {
     let exe_path = std::env::current_exe()
         .map_err(|e| anyhow!("failed to resolve current executable: {e}"))?;
@@ -290,12 +306,17 @@ fn run_user_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the daemon is running, starting it when necessary.
+/// Ensure the daemon is running, starting it when necessary (TCK-00595).
 ///
-/// TCK-00595 MAJOR-2 FIX: The `config_path` parameter threads the caller's
-/// effective config file into the spawn path. When the direct-spawn fallback
-/// is used (systemctl unavailable), the daemon is launched with
-/// `--config <same-path>` so it binds to the same sockets the caller expects.
+/// Called by all `apm2 fac` subcommands so the daemon auto-starts without
+/// manual intervention. Resolution order:
+///
+/// 1. Probe the operator socket — if reachable, daemon is already up.
+/// 2. Try `systemctl --user start apm2-daemon.service`.
+/// 3. Fallback: spawn the daemon binary directly with `--config <path>`.
+///
+/// The `config_path` parameter threads the caller's `--config` flag into
+/// the spawn path so the daemon binds to the same sockets the CLI expects.
 pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
