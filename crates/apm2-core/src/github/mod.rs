@@ -230,5 +230,144 @@ fn validate_repository_segment(segment: &str, name: &str) -> Result<(), GitHubEr
     Ok(())
 }
 
+/// Maximum length for a git remote URL to parse.
+const MAX_REMOTE_URL_LENGTH: usize = 2048;
+
+/// Validates that a GitHub owner or repo segment contains only safe
+/// characters (`[a-zA-Z0-9._-]`) and is within 100 chars.
+fn is_valid_github_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 100
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+}
+
+/// Parse a GitHub remote URL into `(owner, repo)`.
+///
+/// Supports common URL formats:
+/// - `git@github.com:owner/repo.git`
+/// - `ssh://git@github.com/owner/repo.git`
+/// - `https://github.com/owner/repo.git`
+/// - `https://github.com/owner/repo`
+/// - `http://github.com/owner/repo`
+///
+/// Owner and repo segments are validated to contain only `[a-zA-Z0-9._-]`.
+///
+/// Returns `None` if the URL cannot be parsed or contains invalid segments.
+#[must_use]
+pub fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
+    // Bounded input to prevent DoS on extremely long strings
+    if url.len() > MAX_REMOTE_URL_LENGTH || url.is_empty() {
+        return None;
+    }
+
+    // git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2
+            && is_valid_github_segment(parts[0])
+            && is_valid_github_segment(parts[1])
+        {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+        return None;
+    }
+
+    // ssh://, https://, http://
+    for prefix in &[
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    ] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            // Strip optional trailing slash before .git check
+            let rest = rest.strip_suffix('/').unwrap_or(rest);
+            let rest = rest.strip_suffix(".git").unwrap_or(rest);
+            // Split into at most 3 parts to detect extra segments
+            let parts: Vec<&str> = rest.splitn(3, '/').collect();
+            // Require exact owner/repo shape — reject extra path segments
+            if parts.len() == 2
+                && is_valid_github_segment(parts[0])
+                && is_valid_github_segment(parts[1])
+            {
+                return Some((parts[0].to_string(), parts[1].to_string()));
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
+/// Detect GitHub owner and repo from the `origin` remote of the current
+/// working directory.
+///
+/// Runs `git remote get-url origin` and parses the output. This is intended
+/// for **short-lived CLI** processes only. The long-lived daemon should NOT
+/// use this — it must use explicit config to avoid cross-repository pollution.
+///
+/// # Security
+///
+/// This function executes a PATH-resolved `git` binary. In environments where
+/// PATH can be manipulated by an attacker, a malicious binary could execute
+/// arbitrary code. This is an accepted risk for the **CLI-only** context:
+/// - The CLI already runs with the invoking user's full privileges.
+/// - The daemon MUST NOT call this function (use explicit config instead).
+/// - A 5-second timeout bounds execution to prevent hang-based `DoS`.
+///
+/// Returns `None` if:
+/// - Not in a git repo
+/// - No `origin` remote
+/// - Remote URL is not a recognized GitHub format
+/// - `git` binary is unavailable or times out
+#[must_use]
+pub fn detect_github_owner_repo_from_cwd() -> Option<(String, String)> {
+    use wait_timeout::ChildExt;
+
+    // Spawn git with piped stdout, bounded by a 5-second timeout to prevent
+    // hang-based DoS from a malicious or unresponsive git binary.
+    let mut child = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let timeout = std::time::Duration::from_secs(5);
+    let status = match child.wait_timeout(timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            // Timed out — kill the process and return None
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        },
+        Err(_) => return None,
+    };
+
+    if !status.success() {
+        return None;
+    }
+
+    // Read stdout from the completed process
+    let mut stdout_buf = Vec::with_capacity(MAX_REMOTE_URL_LENGTH);
+    if let Some(stdout) = child.stdout.take() {
+        use std::io::Read;
+        // Bounded read to prevent memory DoS
+        stdout
+            .take(MAX_REMOTE_URL_LENGTH as u64)
+            .read_to_end(&mut stdout_buf)
+            .ok()?;
+    } else {
+        return None;
+    }
+
+    let url = String::from_utf8(stdout_buf).ok()?;
+    let url = url.trim();
+    parse_github_remote_url(url)
+}
+
 #[cfg(test)]
 mod tests;

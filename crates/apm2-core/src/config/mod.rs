@@ -98,6 +98,58 @@ impl EcosystemConfig {
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(ConfigError::Serialize)
     }
+
+    /// Build a default config with environment-based auto-detection.
+    ///
+    /// TCK-00595: Enables config-less startup for the CLI layer. When no
+    /// `ecosystem.toml` exists, this method constructs a usable config by:
+    ///
+    /// 1. Using XDG-standard default paths for all daemon paths.
+    /// 2. Auto-detecting GitHub owner/repo from `git remote get-url origin`.
+    /// 3. Using `$GITHUB_TOKEN` (or `$GH_TOKEN`) for projection auth, with
+    ///    fallback to systemd credentials and APM2 credential files.
+    ///
+    /// The projection worker is enabled only when both the GitHub token
+    /// and owner/repo are successfully detected. Otherwise, the config
+    /// defaults to projection-disabled.
+    ///
+    /// **This is for the short-lived CLI only.** The long-lived daemon
+    /// must NOT use auto-detection from CWD (see MAJOR-1 in daemon/main.rs).
+    ///
+    /// # Security
+    ///
+    /// This calls `detect_github_owner_repo_from_cwd()` which executes a
+    /// PATH-resolved `git` binary. This is acceptable for the CLI context
+    /// (runs with user privileges), but the daemon MUST use explicit config.
+    /// See security review finding f-686-security-*.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        // Detect GitHub owner/repo from CWD git remote
+        let github_coords = crate::github::detect_github_owner_repo_from_cwd();
+
+        // Check for GitHub token via unified resolution chain (TCK-00595 MAJOR FIX):
+        // env vars -> $CREDENTIALS_DIRECTORY/gh-token ->
+        // $APM2_HOME/private/creds/gh-token
+        let github_token_env = if resolve_github_token("GITHUB_TOKEN").is_some() {
+            Some("GITHUB_TOKEN".to_string())
+        } else if resolve_github_token("GH_TOKEN").is_some() {
+            Some("GH_TOKEN".to_string())
+        } else {
+            None
+        };
+
+        // Enable projection only when we have both coordinates and a token
+        if let (Some((owner, repo)), Some(token_env)) = (&github_coords, &github_token_env) {
+            config.daemon.projection.enabled = true;
+            config.daemon.projection.github_owner.clone_from(owner);
+            config.daemon.projection.github_repo.clone_from(repo);
+            config.daemon.projection.github_token_env = Some(format!("${token_env}"));
+        }
+
+        config
+    }
 }
 
 /// Daemon configuration.
@@ -845,6 +897,104 @@ const fn default_instances() -> u32 {
     1
 }
 
+/// Maximum credential file size (4 KiB). Any file larger than this is
+/// rejected to prevent unbounded memory allocation from attacker-controlled
+/// file content (SECURITY BLOCKER fix).
+const MAX_CREDENTIAL_FILE_SIZE: u64 = 4096;
+
+/// Resolve a GitHub token value from available sources (TCK-00595 MAJOR FIX).
+///
+/// Resolution order:
+/// 1. Environment variable named by `env_var_name` (e.g., `GITHUB_TOKEN`).
+/// 2. Systemd credential directory: `$CREDENTIALS_DIRECTORY/gh-token`. This is
+///    where `LoadCredential=gh-token:...` in the unit file places the token
+///    when running under systemd.
+/// 3. APM2 credential file: `$APM2_HOME/private/creds/gh-token` (direct file
+///    fallback for non-systemd environments).
+///
+/// Returns the token as a `SecretString`, or `None` if no source provides a
+/// value. The caller must use `.expose_secret()` to access the raw token.
+///
+/// # Security
+///
+/// - Credential files are opened with `O_NOFOLLOW` on Unix to prevent
+///   symlink-based credential exfiltration attacks.
+/// - File size is bounded to 4 KiB (`MAX_CREDENTIAL_FILE_SIZE`) to prevent
+///   unbounded deserialization / memory exhaustion.
+#[must_use]
+pub fn resolve_github_token(env_var_name: &str) -> Option<secrecy::SecretString> {
+    // 1. Standard env var
+    if let Ok(val) = std::env::var(env_var_name) {
+        if !val.is_empty() {
+            return Some(secrecy::SecretString::from(val));
+        }
+    }
+
+    // 2. Systemd credential directory ($CREDENTIALS_DIRECTORY/gh-token)
+    if let Ok(cred_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
+        let cred_path = std::path::Path::new(&cred_dir).join("gh-token");
+        if let Some(secret) = read_credential_file_bounded(&cred_path) {
+            return Some(secret);
+        }
+    }
+
+    // 3. APM2 credential file fallback ($APM2_HOME/private/creds/gh-token)
+    if let Some(apm2_home) = crate::github::resolve_apm2_home() {
+        let cred_path = apm2_home.join("private/creds/gh-token");
+        if let Some(secret) = read_credential_file_bounded(&cred_path) {
+            return Some(secret);
+        }
+    }
+
+    None
+}
+
+/// Read a credential file with bounded size and symlink protection.
+///
+/// Returns `None` if the file does not exist, is too large, is a symlink
+/// (on Unix), or contains only whitespace.
+fn read_credential_file_bounded(path: &std::path::Path) -> Option<secrecy::SecretString> {
+    use std::io::Read;
+
+    // Open with O_NOFOLLOW on Unix to reject symlinks
+    let mut file = open_nofollow(path).ok()?;
+
+    // Check file size before reading to prevent unbounded allocation
+    let metadata = file.metadata().ok()?;
+    if metadata.len() > MAX_CREDENTIAL_FILE_SIZE {
+        return None;
+    }
+
+    // Safe: we verified metadata.len() <= MAX_CREDENTIAL_FILE_SIZE (4096) above,
+    // which always fits in usize on any supported platform (>= 16-bit).
+    let len: usize = usize::try_from(metadata.len()).ok()?;
+    let mut contents = String::with_capacity(len);
+    file.read_to_string(&mut contents).ok()?;
+
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(secrecy::SecretString::from(trimmed.to_string()))
+}
+
+/// Open a file for reading, rejecting symlinks on Unix via `O_NOFOLLOW`.
+#[cfg(unix)]
+fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Open a file for reading (non-Unix fallback — no symlink guard available).
+#[cfg(not(unix))]
+fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// Configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -1186,6 +1336,119 @@ mod tests {
         assert!(
             result.is_ok(),
             "empty sinks config must be accepted (no projection): {result:?}"
+        );
+    }
+
+    /// TCK-00595: `from_env()` produces a valid default config with XDG paths.
+    #[test]
+    fn test_from_env_produces_defaults() {
+        // from_env() should never panic regardless of environment state.
+        let config = EcosystemConfig::from_env();
+        // Operator and session sockets should be non-empty paths
+        assert!(
+            !config.daemon.operator_socket.as_os_str().is_empty(),
+            "operator_socket must have a default path"
+        );
+        assert!(
+            !config.daemon.session_socket.as_os_str().is_empty(),
+            "session_socket must have a default path"
+        );
+    }
+
+    /// TCK-00595 MAJOR FIX: `resolve_github_token` does not panic when
+    /// called with any env var name, including ones that do not exist.
+    #[test]
+    fn test_resolve_github_token_no_panic_on_missing_var() {
+        // Env var that does not exist — function should return None or
+        // fall through to credential file checks without panicking.
+        let result = resolve_github_token("APM2_TEST_TOKEN_NONEXISTENT_VAR_12345");
+        // We cannot guarantee None because $CREDENTIALS_DIRECTORY or
+        // $APM2_HOME/private/creds/gh-token might exist in the test env.
+        // The key assertion is: no panic.
+        let _ = result;
+    }
+
+    /// TCK-00595 MAJOR FIX: `resolve_github_token` returns the env var
+    /// value when the env var is set (tested via a known-set variable).
+    #[test]
+    fn test_resolve_github_token_reads_env_var() {
+        // PATH is always set on any unix system — use it as a proxy to
+        // verify the env var reading path works (not a real token, just
+        // verifying the function reads env vars correctly).
+        let result = resolve_github_token("PATH");
+        assert!(
+            result.is_some(),
+            "resolve_github_token should return Some for a set env var"
+        );
+    }
+
+    /// TCK-00595 SECURITY BLOCKER FIX: `resolve_github_token` returns
+    /// `SecretString` so tokens are not leaked via Debug/Display.
+    #[test]
+    fn test_resolve_github_token_returns_secret_string() {
+        use secrecy::ExposeSecret;
+        // Use PATH as a known-set env var.
+        let result = resolve_github_token("PATH");
+        if let Some(secret) = result {
+            // Verify we can expose the secret and it's non-empty.
+            let exposed = secret.expose_secret();
+            assert!(!exposed.is_empty());
+            // Verify Debug does NOT leak the secret value.
+            let debug_str = format!("{secret:?}");
+            assert!(
+                !debug_str.contains(exposed),
+                "SecretString Debug must redact the secret value"
+            );
+        }
+    }
+
+    /// TCK-00595 SECURITY BLOCKER FIX: `read_credential_file_bounded`
+    /// rejects files larger than `MAX_CREDENTIAL_FILE_SIZE`.
+    #[test]
+    fn test_read_credential_file_bounded_rejects_oversize() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = dir.path().join("oversize-cred");
+        // Write a file that exceeds the 4 KiB bound.
+        #[allow(clippy::cast_possible_truncation)]
+        // MAX_CREDENTIAL_FILE_SIZE is 4096, fits in usize
+        let oversize = "x".repeat((super::MAX_CREDENTIAL_FILE_SIZE + 1) as usize);
+        std::fs::write(&file_path, &oversize).expect("write oversize file");
+        assert!(
+            super::read_credential_file_bounded(&file_path).is_none(),
+            "read_credential_file_bounded must reject files > MAX_CREDENTIAL_FILE_SIZE"
+        );
+    }
+
+    /// TCK-00595 SECURITY BLOCKER FIX: `read_credential_file_bounded`
+    /// rejects symlinks (on Unix, via `O_NOFOLLOW`).
+    #[cfg(unix)]
+    #[test]
+    fn test_read_credential_file_bounded_rejects_symlinks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real_file = dir.path().join("real-cred");
+        std::fs::write(&real_file, "secret-token").expect("write real file");
+        let symlink_path = dir.path().join("symlink-cred");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+        assert!(
+            super::read_credential_file_bounded(&symlink_path).is_none(),
+            "read_credential_file_bounded must reject symlinks"
+        );
+    }
+
+    /// TCK-00595 SECURITY FIX: `read_credential_file_bounded` reads valid
+    /// credential files that are within the size bound.
+    #[test]
+    fn test_read_credential_file_bounded_reads_valid_file() {
+        use secrecy::ExposeSecret;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = dir.path().join("valid-cred");
+        std::fs::write(&file_path, "  my-secret-token  \n").expect("write valid file");
+        let result = super::read_credential_file_bounded(&file_path);
+        assert!(result.is_some(), "should read valid credential file");
+        assert_eq!(
+            result.unwrap().expose_secret(),
+            "my-secret-token",
+            "should trim whitespace from credential file"
         );
     }
 }

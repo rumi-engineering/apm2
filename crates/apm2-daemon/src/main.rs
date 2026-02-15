@@ -67,6 +67,7 @@ use axum::Router;
 use axum::routing::get;
 use clap::Parser;
 use rusqlite::Connection;
+use secrecy::ExposeSecret;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -1444,33 +1445,38 @@ async fn async_main(args: Args) -> Result<()> {
 
                     // Strip leading $ if present
                     let env_var = token_env.strip_prefix('$').unwrap_or(token_env);
-                    let Ok(token) = std::env::var(env_var) else {
+                    // TCK-00595 MAJOR FIX: Use unified token resolution that
+                    // checks env var, then $CREDENTIALS_DIRECTORY/gh-token
+                    // (systemd LoadCredential), then $APM2_HOME/private/creds/gh-token.
+                    let Some(token) = apm2_core::config::resolve_github_token(env_var) else {
                         // TCK-00322 MAJOR FIX: Missing token is fatal when enabled
                         error!(
                             env_var = %env_var,
-                            "GitHub token env var not set. \
-                             projection.enabled=true requires a valid token. \
-                             Either set the env var or disable projection."
+                            "GitHub token not found. Checked: ${env_var} env var, \
+                             $CREDENTIALS_DIRECTORY/gh-token, $APM2_HOME/private/creds/gh-token. \
+                             projection.enabled=true requires a valid token."
                         );
                         return Err(anyhow::anyhow!(
-                            "projection.enabled=true but github_token_env ({env_var}) is not set"
+                            "projection.enabled=true but GitHub token not resolvable \
+                             (checked env var {env_var}, systemd credentials, APM2 cred file)"
                         ));
                     };
 
-                    github_config = match github_config.clone().with_api_token(&token) {
-                        Ok(cfg_with_token) => cfg_with_token,
-                        Err(e) => {
-                            // Invalid token format is fatal when projection is enabled
-                            error!(
-                                env_var = %env_var,
-                                error = %e,
-                                "Invalid GitHub token. Projection enabled but cannot proceed."
-                            );
-                            return Err(anyhow::anyhow!(
-                                "projection.enabled=true but GitHub token is invalid: {e}"
-                            ));
-                        },
-                    };
+                    github_config =
+                        match github_config.clone().with_api_token(token.expose_secret()) {
+                            Ok(cfg_with_token) => cfg_with_token,
+                            Err(e) => {
+                                // Invalid token format is fatal when projection is enabled
+                                error!(
+                                    env_var = %env_var,
+                                    error = %e,
+                                    "Invalid GitHub token. Projection enabled but cannot proceed."
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "projection.enabled=true but GitHub token is invalid: {e}"
+                                ));
+                            },
+                        };
 
                     config = config.with_github(github_config.clone());
 
@@ -1756,19 +1762,22 @@ async fn async_main(args: Args) -> Result<()> {
                 ));
             }
 
-            // Resolve GitHub token from environment variable
+            // Resolve GitHub token via unified resolution chain (TCK-00595 MAJOR FIX):
+            // env var -> $CREDENTIALS_DIRECTORY/gh-token ->
+            // $APM2_HOME/private/creds/gh-token
             let token_env_raw = dw_config
                 .github_token_env
                 .as_deref()
                 .unwrap_or("GITHUB_TOKEN");
             let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
             let github_token =
-                secrecy::SecretString::from(std::env::var(token_env).map_err(|_| {
+                apm2_core::config::resolve_github_token(token_env).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "divergence_watchdog.enabled=true but GitHub token env var \
-                         ({token_env}) is not set"
+                        "divergence_watchdog.enabled=true but GitHub token not resolvable \
+                         (checked env var {token_env}, $CREDENTIALS_DIRECTORY/gh-token, \
+                         $APM2_HOME/private/creds/gh-token)"
                     )
-                })?);
+                })?;
 
             // Build watchdog configuration
             let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);

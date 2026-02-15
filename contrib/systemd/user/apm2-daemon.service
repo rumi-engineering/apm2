@@ -1,21 +1,26 @@
+# TCK-00595: systemd user service unit for apm2-daemon.
+# Install via: apm2 daemon install --enable-linger
+# The install command dynamically resolves ExecStart from the current binary.
+# This reference file uses %h/.cargo/bin/apm2 as the default cargo install path.
 [Unit]
-Description=APM2 Daemon — Forge Admission Cycle broker
-Documentation=https://github.com/guardian-intelligence/apm2
+Description=APM2 Daemon — Forge Admission Cycle
 After=network-online.target
 Wants=network-online.target
 Requires=apm2-daemon.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/apm2 daemon --no-daemon
-ExecStop=/usr/local/bin/apm2 kill
+ExecStart=%h/.cargo/bin/apm2 daemon --no-daemon
+ExecStop=%h/.cargo/bin/apm2 kill
 Restart=always
 RestartSec=5
 WatchdogSec=300
-WorkingDirectory=%h
+WorkingDirectory=%h/.apm2
 Environment=APM2_HOME=%h/.apm2
 Environment=RUST_LOG=info
 Environment=XDG_RUNTIME_DIR=%t
+# GITHUB_TOKEN is inherited from user session or read via LoadCredential.
+# Never persist tokens in unit files (security policy).
 LoadCredential=gh-token:%h/.apm2/private/creds/gh-token
 Sockets=apm2-daemon.socket
 ProtectSystem=strict

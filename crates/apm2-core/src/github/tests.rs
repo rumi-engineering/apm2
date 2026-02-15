@@ -1,6 +1,167 @@
 //! Integration tests for the GitHub module.
 
 #[cfg(test)]
+mod remote_url_tests {
+    use crate::github::parse_github_remote_url;
+
+    #[test]
+    fn parse_ssh_scp_url() {
+        let result = parse_github_remote_url("git@github.com:guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ssh_scp_no_suffix() {
+        let result = parse_github_remote_url("git@github.com:owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn parse_https_url() {
+        let result = parse_github_remote_url("https://github.com/guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_https_no_suffix() {
+        let result = parse_github_remote_url("https://github.com/guardian-intelligence/apm2");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ssh_protocol_url() {
+        let result = parse_github_remote_url("ssh://git@github.com/guardian-intelligence/apm2.git");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_http_url() {
+        let result = parse_github_remote_url("http://github.com/guardian-intelligence/apm2");
+        assert_eq!(
+            result,
+            Some(("guardian-intelligence".to_string(), "apm2".to_string()))
+        );
+    }
+
+    #[test]
+    fn reject_invalid_url() {
+        assert_eq!(parse_github_remote_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn reject_empty_url() {
+        assert_eq!(parse_github_remote_url(""), None);
+    }
+
+    #[test]
+    fn reject_empty_owner() {
+        assert_eq!(parse_github_remote_url("git@github.com:/repo.git"), None);
+    }
+
+    #[test]
+    fn reject_no_repo() {
+        assert_eq!(parse_github_remote_url("git@github.com:owner"), None);
+    }
+
+    #[test]
+    fn reject_oversized_url() {
+        let long_url = format!("https://github.com/{}/repo", "a".repeat(3000));
+        assert_eq!(parse_github_remote_url(&long_url), None);
+    }
+
+    #[test]
+    fn reject_injection_characters() {
+        assert_eq!(
+            parse_github_remote_url("git@github.com:owner/../etc.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_url_with_dots_and_underscores() {
+        let result = parse_github_remote_url("https://github.com/my.org/my_repo.git");
+        assert_eq!(result, Some(("my.org".to_string(), "my_repo".to_string())));
+    }
+
+    // --- Negative tests for extra path segments (MAJOR fix) ---
+
+    #[test]
+    fn reject_https_extra_path_segments() {
+        // Must reject URLs with extra path beyond owner/repo
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/tree/main"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_https_extra_path_blob() {
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/blob/main/README.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_https_extra_path_pulls() {
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/pulls"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_ssh_extra_path_segments() {
+        assert_eq!(
+            parse_github_remote_url("ssh://git@github.com/owner/repo/extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn reject_http_extra_path_segments() {
+        assert_eq!(
+            parse_github_remote_url("http://github.com/owner/repo/extra/path"),
+            None
+        );
+    }
+
+    #[test]
+    fn accept_https_trailing_slash() {
+        // Trailing slash should still parse correctly
+        let result = parse_github_remote_url("https://github.com/owner/repo/");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn accept_scp_trailing_slash() {
+        let result = parse_github_remote_url("git@github.com:owner/repo/");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn reject_https_extra_with_git_suffix() {
+        // Must not accept extra segments even with .git at the end
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo/extra.git"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod validation_tests {
     use crate::github::{
         GitHubError, MAX_API_ENDPOINT_LEN, MAX_REPOSITORY_LEN, validate_api_endpoint,

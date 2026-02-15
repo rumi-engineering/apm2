@@ -1216,6 +1216,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3741,6 +3742,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -3812,6 +3818,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
