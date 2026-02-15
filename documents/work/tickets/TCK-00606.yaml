@@ -1,0 +1,465 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00606"
+    title: "FAC CLI JSON parity — every fac subcommand outputs JSON by default, long-running commands stream JSONL"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_CLI"]
+  dependencies:
+    tickets: []
+  root_cause_analysis:
+    summary: |
+      LLM agents interacting with the `apm2 fac` CLI uniformly assume that
+      every subcommand accepts `--json` and produces structured output. This
+      is rational inference — most FAC commands already have `--json` — but
+      several commands silently ignore the flag or don't accept it at all,
+      causing agent workflows to break or produce unparseable output.
+
+      Two distinct problems:
+
+      1. MISSING --json FLAG ON SEVERAL FAC COMMANDS
+         The following FAC subcommands return `false` from
+         `subcommand_requests_machine_output()` and either lack a `--json`
+         arg entirely or silently ignore the parent `FacCommand.json`:
+
+         - `fac gates` — has no `--json` on GatesArgs; uses parent json flag
+           via `json_output` local, but is listed in the hard-coded `false`
+           arm of `subcommand_requests_machine_output()`, so the parent
+           flag doesn't propagate correctly in all call paths.
+         - `fac push` — PushArgs has no `--json` flag. Output is a mix of
+           println! and eprintln! text with no structured alternative. The
+           parent `FacCommand.json` is threaded through some paths but not
+           all, and `subcommand_requests_machine_output` returns false.
+         - `fac restart` — RestartArgs has no `--json` flag. Output is text-
+           only. Agent must parse human prose to determine restart outcome.
+         - `fac lane status` — LaneStatusArgs has no `--json` flag. Output
+           is a text table. Agent cannot programmatically read lane state.
+         - `fac lane reset` — LaneResetArgs has no `--json` flag.
+         - `fac worker` — WorkerArgs has no `--json` flag. Long-running
+           process with text-only log output.
+         - `fac pipeline` — PipelineArgs has no `--json` flag. Internal but
+           still needs structured output for orchestration.
+         - `fac review run` — ReviewRunArgs has no `--json` flag. Long-
+           running review orchestration with text-only progress output.
+         - `fac review dispatch` — ReviewDispatchArgs has no `--json` flag.
+           Returns dispatch result as text.
+         - `fac review tail` — ReviewTailArgs has no `--json` flag (already
+           NDJSON by nature, but no explicit flag).
+         - `fac pr auth-setup` / `fac pr auth-check` — no `--json` flag.
+         - `fac episode inspect` — uses parent json flag but not listed in
+           machine_output detection.
+         - `fac receipt show` — uses parent json flag but not listed.
+         - `fac context rebuild` — uses parent json flag but not listed.
+         - `fac resume` — uses parent json flag but not listed.
+
+         When an agent calls `apm2 fac push --json`, clap rejects the flag
+         because PushArgs doesn't define it. The parent FacCommand.json
+         exists but is consumed before subcommand dispatch — the agent
+         cannot know which commands accept it at the parent level vs the
+         subcommand level. This inconsistency is the hallucination vector.
+
+      2. LONG-RUNNING COMMANDS OUTPUT NOTHING UNTIL COMPLETION
+         `fac gates` runs 5+ sequential gates (fmt, clippy, doc, test,
+         merge-conflicts) taking 2-10 minutes total. The text path prints
+         progress inline, but the JSON path produces a single JSON blob
+         only on completion. An agent waiting for gates gets zero signal
+         for minutes, then either a full JSON object or an error.
+
+         Same problem for `fac push` (git push + gates + PR + dispatch),
+         `fac review run` (full review orchestration), `fac worker`
+         (continuous job processing), and `fac pipeline` (background
+         evidence + review).
+
+         These commands should stream JSONL (one JSON object per line)
+         by default, with each event representing a meaningful progress
+         checkpoint. The final line is the summary/result object. This
+         gives agents real-time observability without polling.
+
+      Root causes:
+      1. ORGANIC FLAG GROWTH: --json was added per-subcommand over time.
+         Commands that predated the convention or were considered "human-
+         only" (push, restart, lane) never got it.
+      2. DUAL-LEVEL FLAG CONFUSION: FacCommand.json exists at the parent
+         level but subcommand_requests_machine_output() only checks
+         subcommand-level flags. Some commands use the parent flag, some
+         don't, some use both with `json_output || args.json`.
+      3. BATCH-ONLY JSON: The existing JSON pattern assumes commands are
+         short-lived and can buffer the entire response. Long-running
+         commands were left as text-only because the pattern didn't fit.
+  scope:
+    in_scope:
+      - id: S1_GATES_JSON_AND_JSONL
+        title: "`fac gates` — add --json flag to GatesArgs, stream JSONL progress by default"
+        detail: |
+          Current state: GatesArgs has no --json flag. The parent
+          FacCommand.json is threaded to run_gates() as json_output, but
+          subcommand_requests_machine_output() returns false for Gates.
+          Gates run 5+ sequential checks (merge_conflicts, fmt, clippy,
+          doc, test) taking 2-10 minutes. In JSON mode, nothing is emitted
+          until all gates finish.
+
+          Required changes:
+          (a) Add `#[arg(long, default_value_t = false)] pub json: bool`
+              to GatesArgs.
+          (b) Update subcommand_requests_machine_output() to return
+              args.json for FacSubcommand::Gates.
+          (c) Resolve the effective json flag as `json_output || args.json`
+              at the dispatch site (already the pattern for doctor, logs).
+          (d) In run_gates_inner(), when JSON mode is active, emit one
+              JSONL line to stdout as each gate completes:
+              ```
+              {"event":"gate_started","gate":"fmt","ts":"..."}
+              {"event":"gate_completed","gate":"fmt","status":"pass","duration_secs":3,"ts":"..."}
+              {"event":"gate_started","gate":"clippy","ts":"..."}
+              {"event":"gate_completed","gate":"clippy","status":"pass","duration_secs":12,"ts":"..."}
+              ...
+              {"event":"gates_summary","sha":"abc123","passed":true,"bounded":true,...,"gates":[...]}
+              ```
+              The final line is the existing GatesSummary struct serialized
+              as compact JSON (not pretty-printed — JSONL requires one
+              object per line).
+          (e) In text mode, preserve existing behavior (human table).
+          (f) Error events are also JSONL:
+              `{"event":"gate_error","gate":"test","error":"...","ts":"..."}`
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (GatesArgs, dispatch, machine_output)
+          - crates/apm2-cli/src/commands/fac_review/gates.rs (run_gates, run_gates_inner)
+
+      - id: S2_PUSH_JSON_AND_JSONL
+        title: "`fac push` — add --json flag, stream JSONL for multi-stage pipeline"
+        detail: |
+          Current state: PushArgs has no --json flag. Output is a mix of
+          println!/eprintln! across ~1500 lines in push.rs. The push
+          pipeline has 4+ stages (git push, gates, PR create/update,
+          dispatch) each taking significant time.
+
+          Required changes:
+          (a) Add `#[arg(long, default_value_t = false)] pub json: bool`
+              to PushArgs.
+          (b) Update subcommand_requests_machine_output() for Push.
+          (c) When JSON mode is active, stream JSONL progress:
+              ```
+              {"event":"push_started","branch":"...","remote":"...","ts":"..."}
+              {"event":"git_push_completed","status":"pass","duration_secs":2,"ts":"..."}
+              {"event":"gates_started","ts":"..."}
+              {"event":"gate_completed","gate":"fmt","status":"pass","duration_secs":3,"ts":"..."}
+              ... (gate events as in S1)
+              {"event":"gates_completed","passed":true,"duration_secs":120,"ts":"..."}
+              {"event":"pr_updated","pr_number":615,"url":"...","ts":"..."}
+              {"event":"dispatch_completed","status":"pass","ts":"..."}
+              {"event":"push_summary","sha":"...","pr_number":615,"passed":true,...}
+              ```
+          (d) If dispatch fails but push+gates+PR succeed, the summary
+              still reports overall success with a `dispatch_warning` field
+              (ties into TCK-00605 P1_PUSH_EXIT_CODE_SEPARATION).
+          (e) In text mode, preserve existing behavior.
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (PushArgs, dispatch, machine_output)
+          - crates/apm2-cli/src/commands/fac_review/push.rs
+
+      - id: S3_RESTART_JSON
+        title: "`fac restart` — add --json flag with structured outcome"
+        detail: |
+          Current state: RestartArgs has no --json flag. Output is text
+          describing which stages were restarted.
+
+          Required changes:
+          (a) Add `#[arg(long, default_value_t = false)] pub json: bool`
+              to RestartArgs.
+          (b) Update subcommand_requests_machine_output() for Restart.
+          (c) Define RestartResponse struct:
+              { pr_number, sha, strategy, stages_restarted: [...],
+                gates_skipped: bool, dispatch_result, duration_secs }
+          (d) Output as single JSON object (restart is fast enough to not
+              need JSONL streaming).
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (RestartArgs, dispatch, machine_output)
+          - crates/apm2-cli/src/commands/fac_review/restart.rs
+
+      - id: S4_LANE_JSON
+        title: "`fac lane status` and `fac lane reset` — add --json flag"
+        detail: |
+          Current state: LaneStatusArgs and LaneResetArgs have no --json
+          flag. Lane status outputs a text table; lane reset outputs a
+          confirmation message.
+
+          Required changes:
+          (a) Add `#[arg(long, default_value_t = false)] pub json: bool`
+              to both LaneStatusArgs and LaneResetArgs.
+          (b) Update subcommand_requests_machine_output() for Lane.
+          (c) Lane status JSON: array of lane objects with { lane_id,
+              state, pid, lease_holder, lease_expires_at, workspace_path }.
+          (d) Lane reset JSON: { lane_id, reset, force, cleanup_result }.
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (LaneStatusArgs, LaneResetArgs, dispatch, machine_output)
+
+      - id: S5_REVIEW_RUN_DISPATCH_JSON
+        title: "`fac review run` and `fac review dispatch` — add --json flag"
+        detail: |
+          Current state: ReviewRunArgs and ReviewDispatchArgs have no
+          --json flag. `review run` is long-running (full review
+          orchestration). `review dispatch` is a fire-and-forget spawn.
+
+          Required changes:
+          (a) Add `#[arg(long, default_value_t = false)] pub json: bool`
+              to both ReviewRunArgs and ReviewDispatchArgs.
+          (b) Update subcommand_requests_machine_output() for both.
+          (c) `review dispatch` JSON: single object with { pr_number,
+              review_type, dispatched_pids: [...], sha, model }.
+              Dispatch is fast — no JSONL needed.
+          (d) `review run` JSON: JSONL stream — this is a long-running
+              orchestration. Events should mirror the existing NDJSON
+              telemetry stream that `review tail` reads, with a final
+              summary line.
+          (e) `review tail` already outputs NDJSON. Add explicit --json
+              flag to ReviewTailArgs for consistency (noop since output
+              is already JSONL, but prevents clap rejection when agents
+              pass --json).
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (ReviewRunArgs, ReviewDispatchArgs, ReviewTailArgs, machine_output)
+          - crates/apm2-cli/src/commands/fac_review/mod.rs (dispatch, run)
+
+      - id: S6_WORKER_PIPELINE_JSONL
+        title: "`fac worker` and `fac pipeline` — add --json flag, stream JSONL"
+        detail: |
+          Current state: WorkerArgs and PipelineArgs have no --json flag.
+          Worker is a continuous long-running process. Pipeline is an
+          internal background process.
+
+          Required changes:
+          (a) Add `#[arg(long, default_value_t = false)] pub json: bool`
+              to WorkerArgs and PipelineArgs.
+          (b) Update subcommand_requests_machine_output() for both.
+          (c) Worker JSONL: one line per job processed:
+              { event: "job_started"|"job_completed"|"job_failed",
+                job_id, duration_secs, exit_code, ... }
+          (d) Pipeline JSONL: stage progress events similar to push.
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (WorkerArgs, PipelineArgs, machine_output)
+          - crates/apm2-cli/src/commands/fac_worker.rs
+
+      - id: S7_PR_AUTH_JSON
+        title: "`fac pr auth-setup` and `fac pr auth-check` — add --json flag"
+        detail: |
+          Current state: PrArgs routes to fac_pr module. Auth-setup and
+          auth-check output text instructions/status.
+
+          Required changes:
+          (a) Add --json flag to auth-setup and auth-check args.
+          (b) Auth-check JSON: { authenticated, login, token_expires_at,
+              permissions: { ... } }.
+          (c) Auth-setup JSON: { setup_completed, steps: [...] }.
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac_pr/mod.rs
+          - crates/apm2-cli/src/commands/fac_pr/auth_setup.rs
+          - crates/apm2-cli/src/commands/fac_pr/auth_check.rs
+
+      - id: S8_REMAINING_SUBCOMMANDS_MACHINE_OUTPUT
+        title: "Fix subcommand_requests_machine_output() for all remaining commands"
+        detail: |
+          Several commands already use the parent FacCommand.json flag via
+          the json_output local but are listed in the `false` arm of
+          subcommand_requests_machine_output(). This means the parent
+          flag doesn't suppress human-formatted stderr/warning output
+          in those code paths.
+
+          Commands that use parent json but return false from machine_output:
+          - Gates, Work, Services, Gc, RoleLaunch, Episode, Receipt,
+            Context, Resume, Lane, Push, Restart, Worker, Pipeline, Pr.
+
+          After S1-S7 add per-subcommand --json flags, update
+          subcommand_requests_machine_output() to check the subcommand-
+          level flag for every arm. No arm should unconditionally return
+          false. Commands with both parent and subcommand --json flags
+          resolve as `parent_json || subcommand_json`.
+
+          Affected file:
+          - crates/apm2-cli/src/commands/fac.rs (subcommand_requests_machine_output)
+
+      - id: S9_DEFAULT_JSON_OUTPUT
+        title: "Make JSON the default output for all fac commands"
+        detail: |
+          After S1-S8 ensure every fac subcommand has a --json flag and
+          machine_output detection, flip the default so agents don't need
+          to remember to pass --json.
+
+          Approach:
+          (a) Change FacCommand.json default from "false" to "true".
+          (b) Add `#[arg(long, default_value_t = false)] pub text: bool`
+              to FacCommand for human-readable opt-in.
+          (c) Effective format = if text { text } else { json }.
+          (d) Per-subcommand --json flags remain as aliases / overrides
+              but are effectively noops when the parent defaults to json.
+          (e) JSONL-streaming commands (gates, push, review run, worker,
+              pipeline) stream compact JSONL by default. The `--text`
+              flag switches them to their existing human-formatted output.
+
+          This is the terminal state: every `apm2 fac` invocation produces
+          machine-parseable output without any flag. Agents work correctly
+          out of the box. Humans pass `--text` when they want a table.
+
+          Affected file:
+          - crates/apm2-cli/src/commands/fac.rs (FacCommand)
+
+    out_of_scope:
+      - "Non-FAC commands (process management, creds, daemon). Those are a separate ticket."
+      - "Changing the semantic content of any command's output — only the wire format changes."
+      - "Adding new subcommands."
+      - "Changing exit codes or error semantics."
+      - "Modifying the NDJSON telemetry file format under ~/.apm2/ — only stdout output changes."
+      - "Pretty-printing JSONL — JSONL lines are compact (one object per line); pretty JSON is only for single-object responses."
+  plan:
+    steps:
+      - id: STEP_01
+        title: "Define JSONL event types and streaming helper"
+        detail: |
+          Create a small helper module or function for JSONL output:
+          - `fn emit_jsonl(event: &impl Serialize)` — serializes to compact
+            JSON + newline, writes to stdout, flushes.
+          - Define event envelope: every JSONL line has `event` (string),
+            `ts` (ISO-8601 timestamp), plus event-specific fields.
+          - Define shared event types: GateStarted, GateCompleted,
+            GateError, StageStarted, StageCompleted, for reuse across
+            gates/push/pipeline.
+          - Place in a shared location accessible to fac_review submodules
+            (e.g. fac_review/jsonl.rs or a function in fac_review/types.rs).
+      - id: STEP_02
+        title: "Gates: add --json to GatesArgs and stream JSONL progress"
+        detail: |
+          (a) Add json: bool to GatesArgs.
+          (b) Thread the flag through run_gates() and run_gates_inner().
+          (c) At each gate boundary in run_gates_inner(), emit JSONL
+              gate_started/gate_completed events.
+          (d) Final line: GatesSummary serialized as compact JSONL.
+          (e) Update subcommand_requests_machine_output() for Gates.
+      - id: STEP_03
+        title: "Push: add --json to PushArgs and stream JSONL progress"
+        detail: |
+          (a) Add json: bool to PushArgs.
+          (b) Identify the stage boundaries in push.rs (git push, gates,
+              PR update, dispatch).
+          (c) Emit JSONL stage events at each boundary.
+          (d) Final line: PushSummary with overall result.
+          (e) Update subcommand_requests_machine_output() for Push.
+      - id: STEP_04
+        title: "Restart: add --json to RestartArgs"
+        detail: |
+          (a) Add json: bool to RestartArgs.
+          (b) Define RestartResponse struct.
+          (c) Single JSON object output (not JSONL — restart is fast).
+          (d) Update subcommand_requests_machine_output() for Restart.
+      - id: STEP_05
+        title: "Lane: add --json to LaneStatusArgs and LaneResetArgs"
+        detail: |
+          (a) Add json: bool to both.
+          (b) Define LaneStatusResponse (array of lane entries) and
+              LaneResetResponse.
+          (c) Update subcommand_requests_machine_output() for Lane.
+      - id: STEP_06
+        title: "Review run/dispatch/tail: add --json flags"
+        detail: |
+          (a) Add json: bool to ReviewRunArgs, ReviewDispatchArgs,
+              ReviewTailArgs.
+          (b) Review dispatch: single JSON object response.
+          (c) Review run: JSONL stream (mirrors telemetry events).
+          (d) Review tail: --json is a noop (already NDJSON) but prevents
+              clap rejection.
+          (e) Update subcommand_requests_machine_output() for all three.
+      - id: STEP_07
+        title: "Worker/pipeline: add --json flags with JSONL"
+        detail: |
+          (a) Add json: bool to WorkerArgs and PipelineArgs.
+          (b) Worker: JSONL line per job lifecycle event.
+          (c) Pipeline: JSONL stage events.
+          (d) Update subcommand_requests_machine_output() for both.
+      - id: STEP_08
+        title: "PR auth-setup/auth-check: add --json flags"
+        detail: |
+          (a) Add json: bool to auth-setup and auth-check args.
+          (b) Define response structs.
+          (c) Update subcommand_requests_machine_output() for Pr.
+      - id: STEP_09
+        title: "Audit subcommand_requests_machine_output() — no false arms"
+        detail: |
+          After STEP_02-STEP_08, verify that every arm of
+          subcommand_requests_machine_output() checks a subcommand-level
+          json flag. Remove the catch-all false arm entirely — every
+          variant must be explicitly handled.
+      - id: STEP_10
+        title: "Flip default: FacCommand.json = true, add --text opt-in"
+        detail: |
+          (a) Change FacCommand.json default_value from "false" to "true".
+          (b) Add text: bool to FacCommand.
+          (c) Resolve format as: if text { text } else { json }.
+          (d) Verify all text-mode paths still work when --text is passed.
+      - id: STEP_11
+        title: "cargo fmt, clippy, doc, test"
+        detail: "Mandatory pre-commit checks."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Every `apm2 fac` subcommand accepts `--json` without clap rejection."
+      - "When `--json` is active, every fac command outputs valid JSON or valid JSONL to stdout."
+      - "Short-lived commands (restart, lane status/reset, review dispatch, review findings, review verdict, doctor, etc.) output a single pretty-printed JSON object."
+      - "Long-running commands (gates, push, review run, worker, pipeline) stream compact JSONL to stdout — one JSON object per line, flushed after each event."
+      - "Every JSONL stream has a final summary line that contains the complete result (GatesSummary, PushSummary, etc.)."
+      - "JSONL events include an `event` field (string discriminator) and a `ts` field (ISO-8601 timestamp)."
+      - "Error events in JSONL streams are JSON objects with `event: \"..._error\"` — not bare text on stderr."
+      - "subcommand_requests_machine_output() has no catch-all `false` arm — every FacSubcommand variant is explicitly handled."
+      - "FacCommand.json defaults to true — agents get structured output without passing any flag."
+      - "FacCommand.text (or equivalent) allows human-readable opt-in."
+      - "`fac gates --json` streams per-gate JSONL events (gate_started, gate_completed) followed by a gates_summary line."
+      - "`fac push --json` streams per-stage JSONL events (git_push, gates, pr_update, dispatch) followed by a push_summary line."
+      - "`fac restart --json` outputs a single RestartResponse JSON object."
+      - "`fac lane status --json` outputs a JSON array of lane objects."
+      - "`fac lane reset --json` outputs a single LaneResetResponse JSON object."
+      - "`fac review run --json` streams JSONL review progress events."
+      - "`fac review dispatch --json` outputs a single DispatchResponse JSON object."
+      - "`fac review tail --json` is accepted without error (already NDJSON)."
+      - "`fac worker --json` streams per-job JSONL lifecycle events."
+      - "`fac pr auth-check --json` outputs a structured auth status JSON object."
+      - "`fac pr auth-setup --json` outputs a structured setup result JSON object."
+      - "In text mode (--text), all existing human-readable output is preserved unchanged."
+      - "All response and event structs derive Serialize (and Deserialize where appropriate)."
+      - "All evidence gates and tests pass."
+  notes:
+    context: |
+      This ticket addresses a usability bug that affects every LLM agent
+      interacting with the `apm2 fac` CLI. Agents uniformly assume `--json`
+      exists on all fac subcommands because it exists on most of them. The
+      inconsistency is the bug, not the agent behavior.
+
+      The JSONL streaming dimension solves a second problem: long-running
+      commands (gates, push, review run, worker) produce no output for
+      minutes in JSON mode, giving agents zero signal about progress. JSONL
+      gives real-time per-stage observability without requiring a separate
+      polling mechanism.
+
+      Design invariants:
+      - JSONL uses compact serialization (one object per line, no pretty-print).
+        Single-object responses use pretty-print for human debuggability.
+      - Every JSONL stream ends with a summary line. Consumers can ignore
+        intermediate events and read only the last line for the final result.
+      - stderr is reserved for diagnostics that should never be parsed.
+        All structured output goes to stdout.
+      - The `--text` flag is the escape hatch for human operators. It is
+        never the default.
+
+      Priority: P1 — constant source of agent workflow failures.
+      Complexity: Medium — the pattern is well-established but needs to be
+      extended to ~15 subcommands and a new JSONL streaming helper.
