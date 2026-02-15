@@ -8,7 +8,9 @@ Wants=network-online.target
 Requires=apm2-daemon.socket
 
 [Service]
-Type=simple
+# TCK-00600: Type=notify — daemon sends READY=1 after socket bind, WATCHDOG=1
+# periodically. systemd restarts if watchdog is not pinged within WatchdogSec.
+Type=notify
 ExecStart=/usr/local/bin/apm2 daemon --no-daemon
 ExecStop=/usr/local/bin/apm2 kill
 Restart=always

@@ -46,6 +46,10 @@ const USER_SYSTEMD_DIR: &str = ".config/systemd/user";
 /// Uses `Restart=always` + `WatchdogSec=300` for crash resilience.
 /// `LoadCredential` reads the GH token from the systemd credential store,
 /// ensuring tokens are never persisted in unit files (security policy).
+/// TCK-00600: Type=notify so systemd waits for READY=1 before considering
+/// the daemon started. The daemon calls `sd_notify::notify_ready()` after
+/// socket bind. `WatchdogSec=300` restarts the daemon if it fails to send
+/// `WATCHDOG=1` within 5 minutes (the daemon pings every ~150s).
 const DAEMON_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 Daemon — Forge Admission Cycle\n\
@@ -55,7 +59,7 @@ Wants=network-online.target\n\
 Requires=apm2-daemon.socket\n\
 \n\
 [Service]\n\
-Type=simple\n\
+Type=notify\n\
 ExecStart=%exe_path% daemon --no-daemon\n\
 ExecStop=%exe_path% kill\n\
 Restart=always\n\
@@ -77,6 +81,10 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
+/// TCK-00600: Type=notify so systemd waits for READY=1 before considering
+/// the worker started. The worker calls `sd_notify::notify_ready()` after
+/// broker connection. `WatchdogSec=300` restarts the worker if it fails to
+/// send `WATCHDOG=1` within 5 minutes (the worker pings every ~150s).
 const WORKER_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker\n\
@@ -86,7 +94,7 @@ Wants=apm2-daemon.service\n\
 Requires=apm2-daemon.service\n\
 \n\
 [Service]\n\
-Type=simple\n\
+Type=notify\n\
 ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
 Restart=always\n\
 RestartSec=5\n\
@@ -105,6 +113,7 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
+/// TCK-00600: Type=notify for template-instance workers too.
 const WORKER_TEMPLATE_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker (%i)\n\
@@ -114,7 +123,7 @@ Wants=apm2-daemon.service\n\
 Requires=apm2-daemon.service\n\
 \n\
 [Service]\n\
-Type=simple\n\
+Type=notify\n\
 ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
 Restart=always\n\
 RestartSec=5\n\

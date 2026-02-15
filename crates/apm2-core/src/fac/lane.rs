@@ -42,10 +42,13 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::safe_rmtree::safe_rmtree_v1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -56,6 +59,29 @@ pub const LANE_PROFILE_V1_SCHEMA: &str = "apm2.fac.lane_profile.v1";
 
 /// Schema identifier for lane lease v1.
 pub const LANE_LEASE_V1_SCHEMA: &str = "apm2.fac.lane_lease.v1";
+
+/// Schema identifier for corrupt marker files.
+pub const LANE_CORRUPT_MARKER_SCHEMA: &str = "apm2.fac.lane_corrupt.v1";
+
+const CLEANUP_STEP_GIT_RESET: &str = "git_reset";
+const CLEANUP_STEP_GIT_CLEAN: &str = "git_clean";
+const CLEANUP_STEP_TEMP_PRUNE: &str = "temp_prune";
+const CLEANUP_STEP_LOG_QUOTA: &str = "log_quota";
+const CLEANUP_STEP_WORKSPACE_VALIDATION: &str = "workspace_path_validation";
+
+/// Maximum log directory size in bytes (100 MB).
+const MAX_LOG_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of collected log entries during quota enforcement.
+const MAX_LOG_ENTRIES: usize = 10_000;
+
+/// Maximum directory recursion depth while enforcing log quota.
+const MAX_LOG_QUOTA_DIR_DEPTH: usize = 8;
+
+/// Maximum number of directory entries read per directory during log quota
+/// enforcement. Prevents directory-flood `DoS` where an attacker creates
+/// millions of subdirectories. Matches INV-RMTREE-009 from `safe_rmtree_v1`.
+const MAX_DIR_ENTRIES: usize = 10_000;
 
 /// Default lane count when not configured via environment.
 pub const DEFAULT_LANE_COUNT: usize = 3;
@@ -95,6 +121,174 @@ pub const LANE_COUNT_ENV_VAR: &str = "APM2_FAC_LANE_COUNT";
 
 /// Lane ID prefix for generated lane IDs.
 pub const LANE_ID_PREFIX: &str = "lane-";
+
+/// Cleanup outcome for lane cleanup execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneCleanupOutcome {
+    /// Cleanup completed successfully.
+    Success,
+    /// Cleanup failed and lane is marked corrupt.
+    Failed,
+}
+
+/// Errors that can occur while executing lane cleanup.
+#[derive(Debug, Error)]
+pub enum LaneCleanupError {
+    /// A git command failed to execute or returned a non-zero status.
+    #[error("git command failed in workspace during {step}: {reason}")]
+    GitCommandFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
+    },
+
+    /// Temporary directory prune failed.
+    #[error("temp directory prune failed during {step}: {reason}")]
+    TempPruneFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
+    },
+
+    /// Log quota enforcement failed.
+    #[error("log quota enforcement failed during {step}: {reason}")]
+    LogQuotaFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
+    },
+
+    /// Filesystem error while running cleanup.
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Current lane state is invalid for cleanup.
+    #[error("invalid cleanup state: {0}")]
+    InvalidState(String),
+}
+
+impl LaneCleanupError {
+    /// Failed step identifier for receipt emission.
+    #[must_use]
+    pub fn failure_step(&self) -> Option<&str> {
+        match self {
+            Self::GitCommandFailed { failure_step, .. }
+            | Self::TempPruneFailed { failure_step, .. }
+            | Self::LogQuotaFailed { failure_step, .. } => failure_step.as_deref(),
+            Self::Io(_) | Self::InvalidState(_) => None,
+        }
+    }
+
+    /// Completed steps before the failure (for receipt evidence).
+    #[must_use]
+    pub fn steps_completed(&self) -> &[String] {
+        match self {
+            Self::GitCommandFailed {
+                steps_completed, ..
+            }
+            | Self::TempPruneFailed {
+                steps_completed, ..
+            }
+            | Self::LogQuotaFailed {
+                steps_completed, ..
+            } => steps_completed.as_slice(),
+            Self::Io(_) | Self::InvalidState(_) => &[],
+        }
+    }
+}
+
+/// Build a `Command` for git with config isolation to prevent LPE via
+/// malicious `.git/config` entries (e.g., `core.fsmonitor`, `core.pager`).
+///
+/// SEC-CTRL-LANE-CLEANUP-001: Git config isolation for lane cleanup.
+///
+/// A malicious job can modify `.git/config` in the workspace. When the worker
+/// executes `git reset` or `git clean` during cleanup, configs like
+/// `core.fsmonitor` can trigger arbitrary code execution with worker
+/// privileges. This function isolates the git environment by:
+///
+/// 1. Setting `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`
+///    to prevent loading global/system config files.
+/// 2. Passing `-c` overrides for dangerous config keys that could trigger
+///    arbitrary code execution (`core.fsmonitor`, `core.pager`, `core.editor`).
+/// 3. Setting `GIT_TERMINAL_PROMPT=0` to prevent interactive prompts.
+///
+/// The caller is responsible for appending the subcommand args (e.g.,
+/// `["reset", "--hard", "HEAD"]`) and for adding `--no-optional-locks`
+/// where appropriate.
+fn build_isolated_git_command(workspace_path: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    // Disable global and system config files to prevent loading attacker-
+    // planted config from outside the workspace.
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_SYSTEM", "/dev/null");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Override dangerous config keys that can execute arbitrary commands.
+    // These -c flags override any per-repo .git/config values.
+    // --no-optional-locks is a top-level git flag that reduces surface area
+    // by preventing git from taking optional locks (e.g., for gc).
+    cmd.args([
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "core.editor=:",
+    ]);
+    cmd.current_dir(workspace_path);
+    cmd
+}
+
+/// Execute a lane cleanup run using only a FAC root path.
+///
+/// This is the canonical cleanup runner that performs state transitions.
+///
+/// Steps:
+/// 1. `Running` -> `Cleanup`
+/// 2. `git reset --hard HEAD`
+/// 3. `git clean -ffdxq`
+/// 4. prune `tmp/`
+/// 5. enforce log quota
+/// 6. `Cleanup` -> idle (remove lease) on success
+///
+/// On failure, the lease remains `Cleanup`; the worker is expected to persist
+/// the corrupt marker as durable evidence of failed cleanup.
+///
+/// # Errors
+///
+/// Returns:
+/// - `Err(LaneCleanupError::InvalidState)` if lane management context cannot be
+///   constructed from `fac_root`.
+/// - `Err(LaneCleanupError::Io)` on filesystem errors.
+/// - Cleanup-step specific variants when `git`/`tmp` cleanup or log quota
+///   enforcement fails.
+pub fn run_lane_cleanup(
+    lane_id: &str,
+    fac_root: &Path,
+    workspace_path: &Path,
+) -> Result<LaneCleanupOutcome, LaneCleanupError> {
+    let manager = LaneManager::new(fac_root.to_path_buf())
+        .map_err(|e| LaneCleanupError::InvalidState(e.to_string()))?;
+    manager.run_lane_cleanup(lane_id, workspace_path)?;
+    Ok(LaneCleanupOutcome::Success)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error Types
@@ -702,15 +896,119 @@ pub struct LaneStatusV1 {
     pub toolchain_fingerprint: Option<String>,
     /// Lane profile hash.
     pub lane_profile_hash: Option<String>,
+    /// Corrupt reason if lane is in CORRUPT state.
+    pub corrupt_reason: Option<String>,
     /// Whether the lock file is currently held.
     pub lock_held: bool,
     /// Whether the PID in the lease is still alive.
     pub pid_alive: Option<bool>,
 }
 
+/// Persistent marker indicating a lane is corrupt and cannot accept new jobs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneCorruptMarkerV1 {
+    /// Schema identifier.
+    pub schema: String,
+    /// Lane identifier.
+    pub lane_id: String,
+    /// Human-readable reason for corruption.
+    pub reason: String,
+    /// Optional digest of the cleanup receipt that marked this lane corrupt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_receipt_digest: Option<String>,
+    /// ISO-8601 / epoch marker used to record when the lane became corrupt.
+    pub detected_at: String,
+}
+
+impl LaneCorruptMarkerV1 {
+    fn marker_path(fac_root: &Path, lane_id: &str) -> PathBuf {
+        fac_root.join("lanes").join(lane_id).join("corrupt.v1.json")
+    }
+
+    /// Persist this marker to the lane directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::Io` for serialization or write failures, or
+    /// `LaneError::InvalidRecord` if the marker schema is invalid.
+    pub fn persist(&self, fac_root: &Path) -> Result<(), LaneError> {
+        let path = Self::marker_path(fac_root, &self.lane_id);
+        let bytes =
+            serde_json::to_vec_pretty(self).map_err(|e| LaneError::Serialization(e.to_string()))?;
+        atomic_write(&path, &bytes)
+    }
+
+    /// Load the marker for a lane, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::Io` for filesystem read failures and
+    /// `LaneError::InvalidRecord` for malformed marker data.
+    pub fn load(fac_root: &Path, lane_id: &str) -> Result<Option<Self>, LaneError> {
+        let path = Self::marker_path(fac_root, lane_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = bounded_read_file(&path, MAX_LEASE_FILE_SIZE)?;
+        let marker: Self = serde_json::from_slice(&bytes).map_err(|e| {
+            LaneError::Serialization(format!("failed to parse corrupt marker: {e}"))
+        })?;
+
+        if marker.schema != LANE_CORRUPT_MARKER_SCHEMA {
+            return Err(LaneError::InvalidRecord {
+                lane_id: lane_id.to_string(),
+                reason: format!(
+                    "schema mismatch: expected '{LANE_CORRUPT_MARKER_SCHEMA}', got '{}'",
+                    marker.schema
+                ),
+            });
+        }
+
+        validate_lane_id(lane_id)?;
+        if marker.lane_id != lane_id {
+            return Err(LaneError::InvalidRecord {
+                lane_id: lane_id.to_string(),
+                reason: format!(
+                    "lane_id mismatch: expected '{lane_id}', got '{}'",
+                    marker.lane_id
+                ),
+            });
+        }
+        validate_string_field("reason", &marker.reason, MAX_STRING_LENGTH)?;
+        validate_string_field("detected_at", &marker.detected_at, MAX_STRING_LENGTH)?;
+
+        Ok(Some(marker))
+    }
+
+    /// Remove the marker for a lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::Io` if removal fails for reasons other than
+    /// `NotFound`.
+    pub fn remove(fac_root: &Path, lane_id: &str) -> Result<(), LaneError> {
+        let path = Self::marker_path(fac_root, lane_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(LaneError::io(
+                format!("removing corrupt marker at {}", path.display()),
+                e,
+            )),
+        }
+    }
+}
+
 impl fmt::Display for LaneStatusV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:<12} {:<10}", self.lane_id, self.state)?;
+        if self.state == LaneState::Corrupt {
+            if let Some(reason) = &self.corrupt_reason {
+                write!(f, " corrupt_reason={reason}")?;
+            }
+        }
         if let Some(ref job_id) = self.job_id {
             // Truncate job_id for display using Unicode-safe boundaries.
             let display_id = job_id.chars().take(30).collect::<String>();
@@ -946,15 +1244,19 @@ impl LaneManager {
         }
     }
 
-    /// Derive the status of a lane from lock state, lease record, and PID
-    /// liveness.
+    /// Derive the status of a lane from lock state, lease record, PID
+    /// liveness, and corrupt marker.
     ///
     /// # Stale Lease Detection Rules (RFC-0019 §4.4)
     ///
+    /// - Lock held + corrupt marker → CORRUPT
+    /// - Lock free + corrupt marker (even with no lease) → CORRUPT until marker
+    ///   is cleared explicitly via `LaneCorruptMarkerV1::remove()`
+    /// - Lock held + lease missing/invalid → LEASED
+    /// - Lock free + lease missing/invalid → IDLE
     /// - Lock free + lease RUNNING + PID alive → CORRUPT (INV-LANE-004)
     /// - Lock free + PID dead → stale lease (IDLE)
     /// - Lock held + lease RUNNING + PID alive → RUNNING
-    /// - No lease → IDLE
     ///
     /// # Errors
     ///
@@ -962,38 +1264,61 @@ impl LaneManager {
     pub fn lane_status(&self, lane_id: &str) -> Result<LaneStatusV1, LaneError> {
         validate_lane_id(lane_id)?;
         let lane_dir = self.lane_dir(lane_id);
+        let corrupt_marker = LaneCorruptMarkerV1::load(&self.fac_root, lane_id)?;
+        let corrupt_reason = corrupt_marker.as_ref().map(|marker| marker.reason.clone());
         let lock_held = self.is_lock_held(lane_id)?;
 
-        let lease = LaneLeaseV1::load(&lane_dir)?;
+        let lease = match LaneLeaseV1::load(&lane_dir) {
+            Ok(lease) => lease,
+            Err(_err) if lock_held => None,
+            Err(err) => return Err(err),
+        };
+        let is_corrupt = corrupt_marker.is_some();
+        let pid_alive = lease.as_ref().map(|lease| is_pid_alive(lease.pid));
+        let state = derive_lane_state(
+            lock_held,
+            lease.as_ref(),
+            pid_alive.unwrap_or(false),
+            is_corrupt,
+        );
+        let (job_id, pid, started_at, lane_profile_hash, toolchain_fingerprint) = lease
+            .as_ref()
+            .map_or((None, None, None, None, None), |lease| {
+                (
+                    Some(lease.job_id.clone()),
+                    Some(lease.pid),
+                    Some(lease.started_at.clone()),
+                    Some(lease.lane_profile_hash.clone()),
+                    Some(lease.toolchain_fingerprint.clone()),
+                )
+            });
 
-        match lease {
-            None => Ok(LaneStatusV1 {
-                lane_id: lane_id.to_string(),
-                state: LaneState::Idle,
-                job_id: None,
-                pid: None,
-                started_at: None,
-                toolchain_fingerprint: None,
-                lane_profile_hash: None,
-                lock_held,
-                pid_alive: None,
-            }),
-            Some(lease) => {
-                let pid_alive = is_pid_alive(lease.pid);
-                let state = derive_lane_state(lock_held, &lease, pid_alive);
-                Ok(LaneStatusV1 {
-                    lane_id: lane_id.to_string(),
-                    state,
-                    job_id: Some(lease.job_id),
-                    pid: Some(lease.pid),
-                    started_at: Some(lease.started_at),
-                    toolchain_fingerprint: Some(lease.toolchain_fingerprint),
-                    lane_profile_hash: Some(lease.lane_profile_hash),
-                    lock_held,
-                    pid_alive: Some(pid_alive),
-                })
-            },
-        }
+        Ok(LaneStatusV1 {
+            lane_id: lane_id.to_string(),
+            state,
+            job_id,
+            pid,
+            started_at,
+            toolchain_fingerprint,
+            lane_profile_hash,
+            lock_held,
+            pid_alive,
+            corrupt_reason,
+        })
+    }
+
+    /// Clear a corrupt marker for a lane.
+    ///
+    /// This is used by operator recovery workflows when a marker is known to
+    /// have been resolved externally.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::InvalidLaneId` for malformed lane IDs, or
+    /// `LaneError::Io` for filesystem errors.
+    pub fn clear_corrupt_marker(&self, lane_id: &str) -> Result<(), LaneError> {
+        validate_lane_id(lane_id)?;
+        LaneCorruptMarkerV1::remove(&self.fac_root, lane_id)
     }
 
     /// Get the status of all lanes.
@@ -1009,6 +1334,441 @@ impl LaneManager {
         }
         Ok(statuses)
     }
+
+    /// Run lane cleanup:
+    /// 1) Reset workspace (`git reset --hard HEAD`)
+    /// 2) Remove untracked files (`git clean -ffdxq`)
+    /// 3) Remove temporary directory (`tmp`) via safe deletion
+    /// 4) Enforce log quota by pruning oldest logs to 100 MiB
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneCleanupError::GitCommandFailed` on git failures, and
+    /// `LaneCleanupError::TempPruneFailed` or
+    /// `LaneCleanupError::LogQuotaFailed` for cleanup actions.
+    #[allow(clippy::too_many_lines)]
+    pub fn run_lane_cleanup(
+        &self,
+        lane_id: &str,
+        workspace_path: &Path,
+    ) -> Result<Vec<String>, LaneCleanupError> {
+        validate_lane_id(lane_id).map_err(|e| {
+            LaneCleanupError::Io(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        })?;
+        let mut steps_completed = Vec::new();
+        let lanes_dir = self.fac_root.join("lanes").join(lane_id);
+
+        let lease = LaneLeaseV1::load(&lanes_dir).map_err(|e| {
+            LaneCleanupError::Io(io::Error::other(format!(
+                "failed to load lane lease for cleanup: {e}"
+            )))
+        })?;
+        let mut lease = lease.ok_or_else(|| {
+            LaneCleanupError::InvalidState("cleanup requires a RUNNING lease".to_string())
+        })?;
+        if lease.state != LaneState::Running {
+            return Err(LaneCleanupError::InvalidState(format!(
+                "cleanup requires lane {lane_id} in RUNNING state, found {}",
+                lease.state
+            )));
+        }
+
+        let persist_lease_state = |lease: &mut LaneLeaseV1, state: LaneState| {
+            lease.state = state;
+            lease.persist(&lanes_dir).map_err(|e| {
+                LaneCleanupError::Io(io::Error::other(format!(
+                    "failed to persist lane lease state to {state} for {lane_id}: {e}"
+                )))
+            })
+        };
+
+        persist_lease_state(&mut lease, LaneState::Cleanup)?;
+
+        let workspace_path = match Self::validate_workspace_path(
+            &lanes_dir,
+            workspace_path,
+            &steps_completed,
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(err);
+            },
+        };
+
+        // Step 1: git reset (restore workspace to HEAD).
+        //
+        // SEC-CTRL-LANE-CLEANUP-001: Git config isolation.
+        // A malicious job can modify .git/config (e.g., core.fsmonitor,
+        // core.pager) in the workspace. We isolate the git environment by:
+        // 1. Setting GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_SYSTEM=/dev/null to
+        //    prevent loading global/system config files.
+        // 2. Passing -c overrides for dangerous config keys that could trigger
+        //    arbitrary code execution (core.fsmonitor, core.pager, core.editor).
+        // 3. Using --no-optional-locks to reduce surface area.
+        let reset_output = build_isolated_git_command(&workspace_path)
+            .args(["reset", "--hard", "HEAD"])
+            .output();
+        let reset_output = match reset_output {
+            Ok(reset_output) => reset_output,
+            Err(err) => {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(LaneCleanupError::GitCommandFailed {
+                    step: CLEANUP_STEP_GIT_RESET,
+                    reason: format!("git reset spawn: {err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_GIT_RESET.to_string()),
+                });
+            },
+        };
+        if !reset_output.status.success() {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
+            return Err(LaneCleanupError::GitCommandFailed {
+                step: CLEANUP_STEP_GIT_RESET,
+                reason: format!(
+                    "git reset: {}",
+                    String::from_utf8_lossy(&reset_output.stderr)
+                ),
+                steps_completed: steps_completed.clone(),
+                failure_step: Some(CLEANUP_STEP_GIT_RESET.to_string()),
+            });
+        }
+        steps_completed.push(CLEANUP_STEP_GIT_RESET.to_string());
+
+        // Step 2: git clean -ffdxq (remove untracked files).
+        //
+        // SEC-CTRL-LANE-CLEANUP-001: Same git config isolation as Step 1.
+        let clean_output = build_isolated_git_command(&workspace_path)
+            .args(["clean", "-ffdxq"])
+            .output();
+        let clean_output = match clean_output {
+            Ok(clean_output) => clean_output,
+            Err(err) => {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(LaneCleanupError::GitCommandFailed {
+                    step: CLEANUP_STEP_GIT_CLEAN,
+                    reason: format!("git clean spawn: {err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_GIT_CLEAN.to_string()),
+                });
+            },
+        };
+        if !clean_output.status.success() {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
+            return Err(LaneCleanupError::GitCommandFailed {
+                step: CLEANUP_STEP_GIT_CLEAN,
+                reason: format!(
+                    "git clean: {}",
+                    String::from_utf8_lossy(&clean_output.stderr)
+                ),
+                steps_completed: steps_completed.clone(),
+                failure_step: Some(CLEANUP_STEP_GIT_CLEAN.to_string()),
+            });
+        }
+        steps_completed.push(CLEANUP_STEP_GIT_CLEAN.to_string());
+
+        // Step 3: Prune temp directory.
+        let tmp_dir = lanes_dir.join("tmp");
+        if tmp_dir.exists() {
+            if let Err(err) = safe_rmtree_v1(&tmp_dir, &lanes_dir) {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(LaneCleanupError::TempPruneFailed {
+                    step: CLEANUP_STEP_TEMP_PRUNE,
+                    reason: format!("{err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_TEMP_PRUNE.to_string()),
+                });
+            }
+        }
+        steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
+
+        // Step 4: Enforce log quota.
+        if let Err(err) = Self::enforce_log_quota(&lanes_dir.join("logs"), &steps_completed) {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
+            return Err(err);
+        }
+        steps_completed.push(CLEANUP_STEP_LOG_QUOTA.to_string());
+        if let Err(e) = LaneLeaseV1::remove(&lanes_dir) {
+            persist_lease_state(&mut lease, LaneState::Corrupt)?;
+            return Err(LaneCleanupError::Io(io::Error::other(format!(
+                "failed to remove lane lease after cleanup: {e}"
+            ))));
+        }
+
+        Ok(steps_completed)
+    }
+
+    fn enforce_log_quota(
+        logs_dir: &Path,
+        steps_completed: &[String],
+    ) -> Result<(), LaneCleanupError> {
+        if !logs_dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        let mut total_size: u64 = 0;
+        Self::collect_log_entries(logs_dir, &mut entries, &mut total_size, 0, steps_completed)?;
+
+        if total_size <= MAX_LOG_QUOTA_BYTES {
+            return Ok(());
+        }
+
+        entries.sort_by(|a, b| {
+            let time_ord = a.2.cmp(&b.2);
+            if time_ord.is_eq() {
+                a.0.cmp(&b.0)
+            } else {
+                time_ord
+            }
+        });
+
+        for (path, size, _) in entries {
+            if total_size <= MAX_LOG_QUOTA_BYTES {
+                break;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    total_size = total_size.saturating_sub(size);
+                },
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+                Err(err) => {
+                    return Err(LaneCleanupError::LogQuotaFailed {
+                        step: CLEANUP_STEP_LOG_QUOTA,
+                        reason: format!("cannot remove log file {}: {err}", path.display()),
+                        steps_completed: steps_completed.to_vec(),
+                        failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                    });
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_log_entries(
+        base: &Path,
+        entries: &mut Vec<(PathBuf, u64, SystemTime)>,
+        total_size: &mut u64,
+        depth: usize,
+        steps_completed: &[String],
+    ) -> Result<(), LaneCleanupError> {
+        if depth > MAX_LOG_QUOTA_DIR_DEPTH {
+            return Err(LaneCleanupError::LogQuotaFailed {
+                step: CLEANUP_STEP_LOG_QUOTA,
+                reason: format!(
+                    "log directory recursion depth exceeded at {} (max {})",
+                    base.display(),
+                    MAX_LOG_QUOTA_DIR_DEPTH
+                ),
+                steps_completed: steps_completed.to_vec(),
+                failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+            });
+        }
+
+        // Bound per-directory breadth to prevent directory-flood DoS
+        // (INV-RMTREE-009). An attacker can create millions of entries in the
+        // logs directory; without this cap the worker would spin reading all of
+        // them and starve.
+        let mut dir_entry_count: usize = 0;
+
+        for entry in fs::read_dir(base).map_err(|e| LaneCleanupError::LogQuotaFailed {
+            step: CLEANUP_STEP_LOG_QUOTA,
+            reason: format!("cannot read logs directory {}: {e}", base.display()),
+            steps_completed: steps_completed.to_vec(),
+            failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+        })? {
+            dir_entry_count += 1;
+            if dir_entry_count > MAX_DIR_ENTRIES {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!(
+                        "log directory {} contains more than {MAX_DIR_ENTRIES} entries \
+                         (directory-flood DoS prevention)",
+                        base.display()
+                    ),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
+
+            let entry = entry.map_err(|e| LaneCleanupError::LogQuotaFailed {
+                step: CLEANUP_STEP_LOG_QUOTA,
+                reason: format!("cannot read log directory entry: {e}"),
+                steps_completed: steps_completed.to_vec(),
+                failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+            })?;
+            let path = entry.path();
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|e| LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("cannot stat log entry {}: {e}", path.display()),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                })?;
+
+            if metadata.is_dir() {
+                Self::collect_log_entries(&path, entries, total_size, depth + 1, steps_completed)?;
+                continue;
+            }
+
+            if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("unsupported log entry type in {}", path.display()),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
+
+            if entries.len() + 1 > MAX_LOG_ENTRIES {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("log directory contains more than {MAX_LOG_ENTRIES} entries"),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
+
+            let size = metadata.len();
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            entries.push((path, size, mtime));
+            *total_size = total_size.saturating_add(size);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_workspace_path(
+        lanes_dir: &Path,
+        workspace_path: &Path,
+        steps_completed: &[String],
+        step: &'static str,
+    ) -> Result<PathBuf, LaneCleanupError> {
+        let invalid_workspace_path = |reason: String| LaneCleanupError::GitCommandFailed {
+            step,
+            reason,
+            steps_completed: steps_completed.to_vec(),
+            failure_step: Some(step.to_string()),
+        };
+
+        let metadata = workspace_path.symlink_metadata().map_err(|e| {
+            invalid_workspace_path(format!(
+                "cannot stat workspace path {}: {e}",
+                workspace_path.display()
+            ))
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} is a symlink, which is not allowed",
+                workspace_path.display()
+            )));
+        }
+
+        if !metadata.is_dir() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} is not a directory",
+                workspace_path.display()
+            )));
+        }
+
+        let git_path = workspace_path.join(".git");
+        let git_metadata = git_path.symlink_metadata().map_err(|e| {
+            invalid_workspace_path(format!(
+                "workspace path {} must contain .git metadata: {e}",
+                workspace_path.display()
+            ))
+        })?;
+
+        if git_metadata.file_type().is_symlink() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has a symlink .git entry, which is not allowed",
+                workspace_path.display()
+            )));
+        }
+
+        let canonical_workspace = workspace_path.canonicalize().map_err(|e| {
+            invalid_workspace_path(format!(
+                "workspace path {} must canonicalize successfully: {e}",
+                workspace_path.display()
+            ))
+        })?;
+
+        let canonical_lanes_dir = lanes_dir.canonicalize().map_err(|e| {
+            invalid_workspace_path(format!(
+                "lane directory {} must canonicalize successfully: {e}",
+                lanes_dir.display()
+            ))
+        })?;
+
+        let canonical_git_dir = if git_metadata.is_file() {
+            // NIT FIX: .git as a file is the standard git worktree pattern
+            // (contains a `gitdir: <path>` pointer). Lane workspaces must use
+            // a full .git directory, not a worktree .git file, because the
+            // referenced gitdir may reside outside the lane boundary and the
+            // cleanup state machine cannot safely validate or control it.
+            return Err(invalid_workspace_path(
+                "workspace .git is a file (git worktree), not a directory; \
+                 lane workspaces require a full .git directory — \
+                 git worktree .git files are not supported"
+                    .to_string(),
+            ));
+        } else if git_metadata.is_dir() {
+            let git_dir_metadata = git_path.symlink_metadata().map_err(|e| {
+                invalid_workspace_path(format!(
+                    "workspace path {} resolved gitdir could not be statted: {e}",
+                    workspace_path.display()
+                ))
+            })?;
+
+            if git_dir_metadata.file_type().is_symlink() {
+                return Err(invalid_workspace_path(format!(
+                    "workspace path {} has a symlink gitdir entry, which is not allowed",
+                    workspace_path.display()
+                )));
+            }
+
+            if !git_dir_metadata.is_dir() {
+                return Err(invalid_workspace_path(format!(
+                    "workspace path {} resolved gitdir is not a directory",
+                    workspace_path.display()
+                )));
+            }
+
+            git_path.canonicalize().map_err(|e| {
+                invalid_workspace_path(format!(
+                    "workspace path {} resolved gitdir could not be canonicalized: {e}",
+                    workspace_path.display()
+                ))
+            })?
+        } else {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has invalid .git metadata",
+                workspace_path.display()
+            )));
+        };
+
+        if !canonical_git_dir.starts_with(&canonical_lanes_dir) {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has gitdir outside lane directory {}",
+                canonical_git_dir.display(),
+                canonical_lanes_dir.display()
+            )));
+        }
+
+        if !canonical_workspace.starts_with(&canonical_lanes_dir) {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} is outside lane directory {}",
+                canonical_workspace.display(),
+                lanes_dir.display()
+            )));
+        }
+
+        Ok(canonical_workspace)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1020,25 +1780,57 @@ impl LaneManager {
 ///
 /// Stale lease detection rules (RFC-0019 §4.4, fail-closed):
 /// - Lock free + lease RUNNING + PID alive → CORRUPT
+/// - Lock free + corrupt marker (including missing lease) → CORRUPT until
+///   marker is cleared explicitly via `LaneCorruptMarkerV1::remove()`
 /// - Lock free + lease RUNNING + PID dead → IDLE (stale lease)
 /// - Lock held + lease RUNNING → RUNNING
 /// - Lock held + lease state other → use lease state
 /// - Lock free + lease state != RUNNING → use lease state (or IDLE if terminal)
-const fn derive_lane_state(lock_held: bool, lease: &LaneLeaseV1, pid_alive: bool) -> LaneState {
-    match (lock_held, lease.state, pid_alive) {
-        // Lock held: trust the lease state unconditionally
-        (true, state, _) => state,
+fn derive_lane_state(
+    lock_held: bool,
+    lease: Option<&LaneLeaseV1>,
+    pid_alive: bool,
+    has_corrupt_marker: bool,
+) -> LaneState {
+    if has_corrupt_marker {
+        return LaneState::Corrupt;
+    }
+
+    match (lock_held, lease) {
+        // Locked lane with no (or failed) lease state is still in LEASED
+        // transitional state until lease metadata is refreshed.
+        (true, None) => LaneState::Leased,
 
         // Lock free + active state (RUNNING/LEASED/CLEANUP) + PID alive →
         // ambiguous ownership → CORRUPT (fail-closed, INV-LANE-004).
         // Lock free + CORRUPT → remains CORRUPT regardless of PID.
-        (false, LaneState::Running | LaneState::Leased | LaneState::Cleanup, true)
-        | (false, LaneState::Corrupt, _) => LaneState::Corrupt,
+        (false, Some(lease))
+            if matches!(
+                lease.state,
+                LaneState::Running | LaneState::Leased | LaneState::Cleanup
+            ) && pid_alive =>
+        {
+            LaneState::Corrupt
+        },
+        (false, Some(lease)) if lease.state == LaneState::Corrupt => LaneState::Corrupt,
 
         // Lock free + active state + PID dead → stale lease → IDLE.
         // Lock free + IDLE → IDLE.
-        (false, LaneState::Running | LaneState::Leased | LaneState::Cleanup, false)
-        | (false, LaneState::Idle, _) => LaneState::Idle,
+        (false, Some(lease))
+            if matches!(
+                lease.state,
+                LaneState::Running | LaneState::Leased | LaneState::Cleanup
+            ) =>
+        {
+            LaneState::Idle
+        },
+
+        // For lease-present cases not handled above, use lease state. Lock-held
+        // lanes use this path when lease state is available.
+        (true | false, Some(lease)) => lease.state,
+
+        // Lock free + no lease: idle.
+        (false, None) => LaneState::Idle,
     }
 }
 
@@ -1444,6 +2236,89 @@ const fn validate_string_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_git_workspace(path: &Path) {
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+        fs::create_dir_all(path).expect("create workspace");
+
+        let init_output = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("init git repo");
+        assert!(
+            init_output.status.success(),
+            "git init should succeed, got {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        let set_name_output = std::process::Command::new("git")
+            .args(["config", "user.name", "apm2 test"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("set git user name");
+        assert!(
+            set_name_output.status.success(),
+            "git config user.name should succeed, got {}",
+            String::from_utf8_lossy(&set_name_output.stderr)
+        );
+
+        let set_email_output = std::process::Command::new("git")
+            .args(["config", "user.email", "test@apm2.local"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("set git user email");
+        assert!(
+            set_email_output.status.success(),
+            "git config user.email should succeed, got {}",
+            String::from_utf8_lossy(&set_email_output.stderr)
+        );
+
+        fs::write(path.join("README.md"), b"seed").expect("write seed file");
+        let add_output = std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git add");
+        assert!(
+            add_output.status.success(),
+            "git add should succeed, got {}",
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+
+        let commit_output = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git commit");
+        assert!(
+            commit_output.status.success(),
+            "git commit should succeed, got {}",
+            String::from_utf8_lossy(&commit_output.stderr)
+        );
+    }
+
+    fn persist_running_lease(manager: &LaneManager, lane_id: &str) {
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease = LaneLeaseV1::new(
+            lane_id,
+            "job_cleanup",
+            std::process::id(),
+            LaneState::Running,
+            "2026-02-12T03:15:00Z",
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("create lease");
+        lease.persist(&lane_dir).expect("persist lease");
+    }
 
     // ── Lane ID Validation ─────────────────────────────────────────────
 
@@ -1936,6 +2811,62 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_corrupt_marker_persist_load_remove() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+
+        let lane_id = "lane-00";
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "cleanup failed unexpectedly".to_string(),
+            cleanup_receipt_digest: Some(
+                "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            ),
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+
+        marker.persist(&fac_root).expect("persist marker");
+        let loaded = LaneCorruptMarkerV1::load(&fac_root, lane_id).expect("load marker");
+        assert_eq!(loaded, Some(marker));
+
+        LaneCorruptMarkerV1::remove(&fac_root, lane_id).expect("remove marker");
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, lane_id)
+                .expect("load after remove")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lane_manager_clear_corrupt_marker() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let lane_id = "lane-00";
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "test recovery".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        marker.persist(manager.fac_root()).expect("persist marker");
+
+        manager.clear_corrupt_marker(lane_id).expect("clear marker");
+
+        assert!(
+            LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
+                .expect("load marker")
+                .is_none()
+        );
+    }
+
     // ── Lane State Derivation ──────────────────────────────────────────
 
     fn make_lease(state: LaneState) -> LaneLeaseV1 {
@@ -1954,15 +2885,59 @@ mod tests {
     #[test]
     fn derive_state_lock_held_running() {
         let lease = make_lease(LaneState::Running);
-        assert_eq!(derive_lane_state(true, &lease, true), LaneState::Running);
-        assert_eq!(derive_lane_state(true, &lease, false), LaneState::Running);
+        assert_eq!(
+            derive_lane_state(true, Some(&lease), true, false),
+            LaneState::Running
+        );
+        assert_eq!(
+            derive_lane_state(true, Some(&lease), false, false),
+            LaneState::Running
+        );
+    }
+
+    #[test]
+    fn derive_state_lock_held_no_lease_is_leased() {
+        assert_eq!(
+            derive_lane_state(true, None, false, false),
+            LaneState::Leased,
+            "locked lane without lease should remain LEASED"
+        );
+    }
+
+    #[test]
+    fn derive_state_lock_free_no_lease_is_idle() {
+        assert_eq!(
+            derive_lane_state(false, None, false, false),
+            LaneState::Idle,
+            "unlocked lane without lease should be IDLE"
+        );
+    }
+
+    #[test]
+    fn enforce_log_quota_rejects_deep_directory_traversal() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+
+        let mut depth_dir = logs_dir.clone();
+        for level in 0..(MAX_LOG_QUOTA_DIR_DEPTH + 2) {
+            depth_dir = depth_dir.join(format!("level_{level}"));
+        }
+        fs::create_dir_all(&depth_dir).expect("create deep logs directory");
+        fs::write(depth_dir.join("deep.log"), b"payload").expect("write deep log file");
+
+        let err = LaneManager::enforce_log_quota(&logs_dir, &[]).unwrap_err();
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        assert!(
+            format!("{err}").contains("recursion depth exceeded"),
+            "expected recursion-depth guard failure, got {err}"
+        );
     }
 
     #[test]
     fn derive_state_lock_free_running_pid_alive_is_corrupt() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, &lease, true),
+            derive_lane_state(false, Some(&lease), true, false),
             LaneState::Corrupt,
             "lock free + RUNNING + PID alive → CORRUPT (fail-closed)"
         );
@@ -1972,7 +2947,7 @@ mod tests {
     fn derive_state_lock_free_running_pid_dead_is_idle() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, &lease, false),
+            derive_lane_state(false, Some(&lease), false, false),
             LaneState::Idle,
             "lock free + RUNNING + PID dead → IDLE (stale lease)"
         );
@@ -1981,15 +2956,39 @@ mod tests {
     #[test]
     fn derive_state_lock_free_corrupt_stays_corrupt() {
         let lease = make_lease(LaneState::Corrupt);
-        assert_eq!(derive_lane_state(false, &lease, false), LaneState::Corrupt);
-        assert_eq!(derive_lane_state(false, &lease, true), LaneState::Corrupt);
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), false, false),
+            LaneState::Corrupt
+        );
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), true, false),
+            LaneState::Corrupt
+        );
+    }
+
+    #[test]
+    fn test_derive_lane_state_corrupt_marker() {
+        let lease = make_lease(LaneState::Running);
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), false, true),
+            LaneState::Corrupt
+        );
+        assert_eq!(
+            derive_lane_state(true, Some(&lease), false, true),
+            LaneState::Corrupt
+        );
+        assert_eq!(
+            derive_lane_state(false, None, false, true),
+            LaneState::Corrupt,
+            "corrupt marker remains authoritative when lease is absent"
+        );
     }
 
     #[test]
     fn derive_state_lock_free_leased_pid_alive_is_corrupt() {
         let lease = make_lease(LaneState::Leased);
         assert_eq!(
-            derive_lane_state(false, &lease, true),
+            derive_lane_state(false, Some(&lease), true, false),
             LaneState::Corrupt,
             "lock free + LEASED + PID alive → CORRUPT (fail-closed)"
         );
@@ -1998,14 +2997,320 @@ mod tests {
     #[test]
     fn derive_state_lock_free_leased_pid_dead_is_idle() {
         let lease = make_lease(LaneState::Leased);
-        assert_eq!(derive_lane_state(false, &lease, false), LaneState::Idle);
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), false, false),
+            LaneState::Idle
+        );
     }
 
     #[test]
     fn derive_state_lock_free_idle_is_idle() {
         let lease = make_lease(LaneState::Idle);
-        assert_eq!(derive_lane_state(false, &lease, false), LaneState::Idle);
-        assert_eq!(derive_lane_state(false, &lease, true), LaneState::Idle);
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), false, false),
+            LaneState::Idle
+        );
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), true, false),
+            LaneState::Idle
+        );
+    }
+
+    #[test]
+    fn test_lane_status_shows_corrupt_reason() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "cleanup failed".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        marker.persist(manager.fac_root()).expect("persist marker");
+
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Corrupt);
+        assert_eq!(status.corrupt_reason.as_deref(), Some("cleanup failed"));
+    }
+
+    #[test]
+    fn run_lane_cleanup_transitions_to_corrupt_on_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let workspace = manager.lane_dir(lane_id).join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let guard = manager
+            .try_lock(lane_id)
+            .expect("try_lock")
+            .expect("acquire lock");
+
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect_err("cleanup fails when workspace is not a repo");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
+
+        let status_during = manager.lane_status(lane_id).expect("status during failure");
+        assert_eq!(status_during.state, LaneState::Corrupt);
+
+        drop(guard);
+        let status_after = manager.lane_status(lane_id).expect("status after release");
+        assert_eq!(status_after.state, LaneState::Corrupt);
+    }
+
+    #[test]
+    fn run_lane_cleanup_transitions_to_idle_on_success() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let steps_completed = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("lane cleanup should succeed");
+        assert_eq!(
+            steps_completed,
+            vec![
+                CLEANUP_STEP_GIT_RESET.to_string(),
+                CLEANUP_STEP_GIT_CLEAN.to_string(),
+                CLEANUP_STEP_TEMP_PRUNE.to_string(),
+                CLEANUP_STEP_LOG_QUOTA.to_string(),
+            ],
+            "all steps should be reported",
+        );
+
+        let status = manager.lane_status(lane_id).expect("status");
+        assert_eq!(status.state, LaneState::Idle);
+        assert!(LaneLeaseV1::load(&lane_dir).expect("load lease").is_none());
+    }
+
+    #[test]
+    fn run_lane_cleanup_preserves_steps_for_log_quota_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+        let mut depth_dir = logs_dir;
+        for level in 0..(MAX_LOG_QUOTA_DIR_DEPTH + 2) {
+            depth_dir = depth_dir.join(format!("level_{level}"));
+        }
+        fs::create_dir_all(&depth_dir).expect("create deep logs directory");
+        fs::write(depth_dir.join("deep.log"), b"payload").expect("write deep log file");
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect_err("cleanup should fail from log quota traversal depth check");
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        assert_eq!(
+            err.steps_completed(),
+            [
+                CLEANUP_STEP_GIT_RESET.to_string(),
+                CLEANUP_STEP_GIT_CLEAN.to_string(),
+                CLEANUP_STEP_TEMP_PRUNE.to_string(),
+            ]
+            .as_slice()
+        );
+        assert_eq!(err.failure_step(), Some(CLEANUP_STEP_LOG_QUOTA));
+    }
+
+    #[test]
+    fn run_lane_cleanup_rejects_workspace_outside_lane_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let foreign_workspace = root.path().join("foreign_workspace");
+        init_git_workspace(&foreign_workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &foreign_workspace)
+            .expect_err("workspace outside lane directory should be rejected");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Corrupt);
+    }
+
+    #[test]
+    fn run_lane_cleanup_rejects_gitdir_indirection_outside_lane_directory() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let foreign_git_dir = root.path().join("foreign_git");
+        fs::create_dir_all(&foreign_git_dir).expect("create foreign git dir");
+        fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", foreign_git_dir.display()),
+        )
+        .expect("write gitdir file");
+
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect_err("gitdir indirection outside lane directory should be rejected");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lane_cleanup_rejects_workspace_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        let workspace_link = lane_dir.join("workspace_link");
+        symlink(&workspace, &workspace_link).expect("create workspace symlink");
+
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace_link)
+            .expect_err("symlink workspace path should be rejected");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
+    }
+
+    #[test]
+    fn collect_log_entries_rejects_too_many_entries() {
+        let logs_dir = tempfile::tempdir().expect("tempdir");
+        for idx in 0..=MAX_LOG_ENTRIES {
+            fs::write(logs_dir.path().join(format!("log_{idx}")), b"entry").expect("write log");
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size = 0;
+        let steps_completed = Vec::new();
+        let err = LaneManager::collect_log_entries(
+            logs_dir.path(),
+            &mut entries,
+            &mut total_size,
+            0,
+            &steps_completed,
+        )
+        .expect_err("collecting too many log entries should fail");
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        assert_eq!(entries.len(), MAX_LOG_ENTRIES);
+        assert!(total_size > 0);
+    }
+
+    #[test]
+    fn collect_log_entries_rejects_dir_entry_flood() {
+        // Regression test for directory-flood DoS prevention
+        // (f-685-security-1771184894734689-0). The read_dir iteration must
+        // be bounded by MAX_DIR_ENTRIES, including subdirectories.
+        let logs_dir = tempfile::tempdir().expect("tempdir");
+        // Create MAX_DIR_ENTRIES + 1 subdirectories (all count toward the
+        // per-directory breadth limit).
+        for idx in 0..=MAX_DIR_ENTRIES {
+            fs::create_dir(logs_dir.path().join(format!("subdir_{idx}"))).expect("create subdir");
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size = 0;
+        let steps_completed = Vec::new();
+        let err = LaneManager::collect_log_entries(
+            logs_dir.path(),
+            &mut entries,
+            &mut total_size,
+            0,
+            &steps_completed,
+        )
+        .expect_err("directory-flood should be rejected");
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("directory-flood DoS prevention"),
+            "error reason should mention DoS prevention, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn lane_status_with_unreadable_lease_and_lock_held_is_leased() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease_path = lane_dir.join("lease.v1.json");
+        fs::write(&lease_path, b"{invalid lease json").expect("write corrupted lease");
+
+        let guard = manager
+            .try_lock(lane_id)
+            .expect("try_lock")
+            .expect("acquire lock");
+
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Leased);
+        drop(guard);
     }
 
     // ── PID Liveness ───────────────────────────────────────────────────
@@ -2035,7 +3340,7 @@ mod tests {
         let fac_root = root.path().join("private").join("fac");
         // Manually create to make it absolute
         fs::create_dir_all(&fac_root).expect("create fac root");
-        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+        let manager = LaneManager::new(fac_root).expect("create manager");
 
         manager.ensure_directories().expect("ensure dirs");
 
@@ -2056,7 +3361,7 @@ mod tests {
             );
         }
         assert!(
-            fac_root.join("locks").join("lanes").exists(),
+            manager.fac_root().join("locks").join("lanes").exists(),
             "lock dir should exist"
         );
     }
@@ -2098,7 +3403,7 @@ mod tests {
         manager.ensure_directories().expect("ensure dirs");
 
         let lane_id = "lane-00";
-        let _guard = manager
+        let guard = manager
             .try_lock(lane_id)
             .expect("try_lock")
             .expect("acquire");
@@ -2109,6 +3414,7 @@ mod tests {
             second.is_none(),
             "should not acquire lock when already held"
         );
+        drop(guard);
     }
 
     #[test]
@@ -2151,7 +3457,7 @@ mod tests {
         lease.persist(&lane_dir).expect("persist lease");
 
         // Acquire lock
-        let _guard = manager
+        let guard = manager
             .try_lock(lane_id)
             .expect("try_lock")
             .expect("acquire");
@@ -2162,6 +3468,7 @@ mod tests {
         assert_eq!(status.pid, Some(pid));
         assert!(status.lock_held);
         assert_eq!(status.pid_alive, Some(true));
+        drop(guard);
     }
 
     #[test]
@@ -2339,10 +3646,11 @@ mod tests {
             let lid = lane_id.to_string();
             handles.push(std::thread::spawn(move || {
                 b.wait();
-                if let Ok(Some(_guard)) = m.try_lock(&lid) {
+                if let Ok(Some(guard)) = m.try_lock(&lid) {
                     count.fetch_add(1, Ordering::SeqCst);
                     // Hold the lock briefly
                     std::thread::sleep(Duration::from_millis(50));
+                    drop(guard);
                 }
             }));
         }
@@ -2355,6 +3663,108 @@ mod tests {
             acquired_count.load(Ordering::SeqCst),
             1,
             "exactly one thread should have acquired the lock"
+        );
+    }
+
+    #[test]
+    fn build_isolated_git_command_sets_config_isolation() {
+        // SEC-CTRL-LANE-CLEANUP-001: Verify that the isolated git command
+        // sets the expected environment variables and config overrides to
+        // prevent LPE via malicious .git/config entries.
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let cmd = build_isolated_git_command(&workspace);
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().to_string(),
+                    v?.to_string_lossy().to_string(),
+                ))
+            })
+            .collect();
+
+        // Verify GIT_CONFIG_GLOBAL=/dev/null
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v == "/dev/null"),
+            "GIT_CONFIG_GLOBAL must be set to /dev/null, got: {envs:?}"
+        );
+        // Verify GIT_CONFIG_SYSTEM=/dev/null
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_CONFIG_SYSTEM" && v == "/dev/null"),
+            "GIT_CONFIG_SYSTEM must be set to /dev/null, got: {envs:?}"
+        );
+        // Verify GIT_TERMINAL_PROMPT=0
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v == "0"),
+            "GIT_TERMINAL_PROMPT must be set to 0, got: {envs:?}"
+        );
+
+        // Verify -c config overrides and --no-optional-locks in the args.
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let args_str = args.join(" ");
+        assert!(
+            args_str.contains("core.fsmonitor="),
+            "must override core.fsmonitor, got args: {args_str}"
+        );
+        assert!(
+            args_str.contains("core.pager=cat"),
+            "must override core.pager, got args: {args_str}"
+        );
+        assert!(
+            args_str.contains("core.editor=:"),
+            "must override core.editor, got args: {args_str}"
+        );
+        assert!(
+            args_str.contains("--no-optional-locks"),
+            "must include --no-optional-locks, got args: {args_str}"
+        );
+    }
+
+    #[test]
+    fn run_lane_cleanup_uses_config_isolated_git_commands() {
+        // SEC-CTRL-LANE-CLEANUP-001: End-to-end test that lane cleanup
+        // succeeds even when the workspace has a malicious core.fsmonitor
+        // config. If config isolation were not applied, git reset/clean
+        // would try to execute the malicious command and fail (since the
+        // configured command does not exist).
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        // Plant a malicious core.fsmonitor in the workspace's .git/config.
+        // Without config isolation, git reset would try to execute this
+        // nonexistent command and fail.
+        let git_config_path = workspace.join(".git").join("config");
+        let mut config_content = fs::read_to_string(&git_config_path).unwrap_or_default();
+        config_content.push_str("\n[core]\n\tfsmonitor = /nonexistent/malicious-command\n");
+        fs::write(&git_config_path, &config_content).expect("plant malicious git config");
+
+        // Cleanup should succeed because config isolation overrides the
+        // malicious core.fsmonitor with an empty value.
+        let steps = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("lane cleanup should succeed despite malicious git config");
+        assert!(
+            steps.contains(&CLEANUP_STEP_GIT_RESET.to_string()),
+            "git reset should have completed"
+        );
+        assert!(
+            steps.contains(&CLEANUP_STEP_GIT_CLEAN.to_string()),
+            "git clean should have completed"
         );
     }
 }

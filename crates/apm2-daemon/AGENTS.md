@@ -244,6 +244,27 @@ The daemon handles Unix signals for graceful shutdown:
 - [CTR-D018] Graceful shutdown stops all running processes with 10-second timeout.
 - [CTR-D019] Socket file and PID file are cleaned up on shutdown.
 
+## Systemd Watchdog Integration (TCK-00600)
+
+The daemon integrates with systemd's Type=notify protocol via
+`apm2_core::fac::sd_notify`:
+
+- **READY=1**: Sent after `SocketManager::bind()` succeeds in `async_main`.
+- **WATCHDOG=1**: Sent periodically by a `WatchdogTicker` in the background
+  poller task (10-second loop). The ticker reads `WATCHDOG_USEC` from the
+  environment and pings at half the watchdog interval (~150s for WatchdogSec=300).
+- **STOPPING=1**: Sent at the start of the shutdown sequence.
+- **STATUS=**: Sent with human-readable status after initialization.
+
+When running outside systemd (no `NOTIFY_SOCKET`), all notify calls are
+silent no-ops.
+
+**Contracts:**
+- [CTR-D020] `notify_ready()` is called exactly once, after socket bind.
+- [CTR-D021] `notify_stopping()` is called exactly once, at shutdown start.
+- [CTR-D022] Watchdog pings are driven by the existing background poller,
+  not a dedicated task.
+
 ## Public API
 
 ### State Access
