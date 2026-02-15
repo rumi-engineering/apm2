@@ -27,7 +27,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -1519,6 +1519,14 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// Per SEC-SCP-FAC-0020: caller-controlled free-form predicates must be
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
+
+/// Estimated metadata overhead per `WorkClaim` for byte accounting in
+/// control-plane queue enqueue budget checks (TCK-00568).
+///
+/// Covers serialized struct framing, timestamps, and other non-string
+/// fields. This is an upper-bound estimate — it is acceptable to
+/// slightly overcount but not undercount.
+pub const CLAIM_METADATA_OVERHEAD_BYTES: usize = 256;
 
 /// Maximum supported delegation depth for `DelegateSublease` lineage.
 ///
@@ -7336,57 +7344,30 @@ pub struct PrivilegedDispatcher {
     ///   load(Acquire) in token issuance paths.
     admission_health_gate: AtomicBool,
 
-    /// TCK-00568: Atomic token issuance counter for control-plane rate
-    /// limiting.
+    /// TCK-00568: Control-plane budget tracker under a unified mutex.
     ///
-    /// Tracks the number of tokens issued in the current budget window.
-    /// Checked and incremented atomically via CAS loop in the token
-    /// issuance path (INV-CPRL-002: check before mutate). Reset to 0
-    /// via `reset_token_issuance_counter()` at tick boundaries.
+    /// All control-plane rate limit counters (token issuance, queue enqueue
+    /// ops/bytes, bundle export bytes) and their configured limits are held
+    /// together in a single `Mutex<ControlPlaneBudget>`. This eliminates
+    /// the BLOCKER-level race condition from round 1 where separate atomic
+    /// counters could wrap to `u64::MAX` if `reset_control_plane_counters`
+    /// ran between an increment and its rollback.
     ///
     /// # Synchronization Protocol (RS-21)
     ///
-    /// - **Protected data**: Current token issuance count.
-    /// - **Writers**: CAS loop in
+    /// - **Protected data**: All control-plane counters and limits.
+    /// - **Writers**: `admit_queue_enqueue()`, `admit_bundle_export()`,
     ///   `validate_channel_boundary_and_issue_context_token_with_flow()`
-    ///   (concurrent from multiple session handlers).
-    /// - **Reset writers**: `reset_token_issuance_counter()` called at tick
-    ///   advancement boundaries.
-    /// - **Ordering**: `Relaxed` for CAS (monotonic counter, no dependent data
-    ///   to synchronize — only the counter value itself matters).
-    token_issuance_counter: AtomicU64,
-
-    /// TCK-00568: Maximum token issuances allowed per budget window.
-    ///
-    /// Set at construction time from the economics profile or defaults.
-    /// Zero means disabled (fail-closed, all issuances denied).
-    token_issuance_limit: u64,
-
-    /// TCK-00568: Atomic queue enqueue operation counter for control-plane
-    /// rate limiting. Reset at tick boundaries.
-    ///
-    /// # Synchronization Protocol (RS-21)
-    ///
-    /// Same pattern as `token_issuance_counter`. `Relaxed` ordering for
-    /// monotonic counter CAS.
-    queue_enqueue_ops_counter: AtomicU64,
-
-    /// TCK-00568: Atomic queue bytes counter for control-plane rate
-    /// limiting. Reset at tick boundaries.
-    queue_bytes_counter: AtomicU64,
-
-    /// TCK-00568: Maximum queue enqueue operations per budget window.
-    queue_enqueue_ops_limit: u64,
-
-    /// TCK-00568: Maximum queue bytes per budget window.
-    queue_bytes_limit: u64,
-
-    /// TCK-00568: Atomic bundle export bytes counter for control-plane
-    /// rate limiting. Reset at tick boundaries.
-    bundle_export_bytes_counter: AtomicU64,
-
-    /// TCK-00568: Maximum bundle export bytes per budget window.
-    bundle_export_bytes_limit: u64,
+    ///   (concurrent from multiple session/operator handlers).
+    /// - **Reset writers**: `reset_control_plane_counters()` called at tick
+    ///   advancement boundaries by the daemon health poller.
+    /// - **Lock acquisition**: All operations acquire the mutex, perform
+    ///   check-then-increment atomically, and release. No `.await` is held
+    ///   across the lock. Lock contention is bounded by the short critical
+    ///   section (counter read + compare + write).
+    /// - **Happens-before**: Lock acquire/release provides full happens-before
+    ///   ordering between all counter operations and resets.
+    control_plane_budget: Mutex<apm2_core::fac::broker_rate_limits::ControlPlaneBudget>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -7894,6 +7875,31 @@ impl BoundaryFlowRuntimeState {
     }
 }
 
+/// Converts a `ControlPlaneBudgetError` from the core budget tracker into a
+/// structured `ProtocolError::BudgetExceeded` with the denial receipt.
+fn budget_error_to_protocol_error(
+    err: apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError,
+) -> ProtocolError {
+    match err {
+        apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::BudgetExceeded {
+            reason,
+            receipt,
+        } => ProtocolError::BudgetExceeded { reason, receipt },
+        apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::CounterOverflow {
+            dimension,
+            receipt,
+        } => ProtocolError::BudgetExceeded {
+            reason: format!("counter overflow: {dimension}"),
+            receipt,
+        },
+        apm2_core::fac::broker_rate_limits::ControlPlaneBudgetError::InvalidLimits { detail } => {
+            ProtocolError::Serialization {
+                reason: format!("invalid control-plane limits: {detail}"),
+            }
+        },
+    }
+}
+
 impl PrivilegedDispatcher {
     /// Builds a channel-boundary check from daemon-classified tool context.
     ///
@@ -8048,40 +8054,21 @@ impl PrivilegedDispatcher {
 
         // TCK-00568: Control-plane token issuance rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE any state mutation or
-        // token issuance. Uses a CAS loop for atomic check-and-increment
-        // so concurrent issuance requests from multiple session handlers
-        // are correctly bounded.
-        if self.token_issuance_limit == 0 {
-            return Err(vec![ChannelBoundaryDefect::new(
-                ChannelViolationClass::MissingChannelMetadata,
-                "admission denied: token issuance disabled (limit=0, INV-CPRL-001)".to_string(),
-            )]);
-        }
-        loop {
-            let current = self.token_issuance_counter.load(Ordering::Relaxed);
-            let next = current.checked_add(1).ok_or_else(|| {
-                vec![ChannelBoundaryDefect::new(
-                    ChannelViolationClass::MissingChannelMetadata,
-                    "admission denied: token issuance counter overflow (INV-CPRL-004)".to_string(),
-                )]
-            })?;
-            if next > self.token_issuance_limit {
+        // token issuance. Acquires the unified control-plane budget mutex
+        // for atomic check-and-increment (fixes BLOCKER race condition
+        // from round 1 where separate atomic counters could wrap to
+        // u64::MAX on concurrent reset).
+        {
+            let mut budget = self
+                .control_plane_budget
+                .lock()
+                .expect("control_plane_budget mutex poisoned");
+            if let Err(e) = budget.admit_token_issuance() {
                 return Err(vec![ChannelBoundaryDefect::new(
                     ChannelViolationClass::MissingChannelMetadata,
-                    format!(
-                        "admission denied: token issuance rate exceeded ({current}/{}, INV-CPRL-001)",
-                        self.token_issuance_limit
-                    ),
+                    format!("admission denied: {e}"),
                 )]);
             }
-            if self
-                .token_issuance_counter
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-            // CAS failed (concurrent writer); retry with fresh load.
         }
 
         let check = self.build_channel_boundary_check_with_flow(
@@ -8231,20 +8218,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
-            token_issuance_counter: AtomicU64::new(0),
-            token_issuance_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_token_issuance,
-            queue_enqueue_ops_counter: AtomicU64::new(0),
-            queue_bytes_counter: AtomicU64::new(0),
-            queue_enqueue_ops_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_queue_enqueue_ops,
-            queue_bytes_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_queue_bytes,
-            bundle_export_bytes_counter: AtomicU64::new(0),
-            bundle_export_bytes_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_bundle_export_bytes,
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8335,20 +8314,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
-            token_issuance_counter: AtomicU64::new(0),
-            token_issuance_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_token_issuance,
-            queue_enqueue_ops_counter: AtomicU64::new(0),
-            queue_bytes_counter: AtomicU64::new(0),
-            queue_enqueue_ops_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_queue_enqueue_ops,
-            queue_bytes_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_queue_bytes,
-            bundle_export_bytes_counter: AtomicU64::new(0),
-            bundle_export_bytes_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_bundle_export_bytes,
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8456,20 +8427,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
-            token_issuance_counter: AtomicU64::new(0),
-            token_issuance_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_token_issuance,
-            queue_enqueue_ops_counter: AtomicU64::new(0),
-            queue_bytes_counter: AtomicU64::new(0),
-            queue_enqueue_ops_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_queue_enqueue_ops,
-            queue_bytes_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_queue_bytes,
-            bundle_export_bytes_counter: AtomicU64::new(0),
-            bundle_export_bytes_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_bundle_export_bytes,
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8555,20 +8518,12 @@ impl PrivilegedDispatcher {
             token_binding_boundary_id: apm2_core::fac::DEFAULT_BOUNDARY_ID.to_string(),
             token_binding_policy_digest: [0u8; 32],
             admission_health_gate: AtomicBool::new(false),
-            token_issuance_counter: AtomicU64::new(0),
-            token_issuance_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_token_issuance,
-            queue_enqueue_ops_counter: AtomicU64::new(0),
-            queue_bytes_counter: AtomicU64::new(0),
-            queue_enqueue_ops_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_queue_enqueue_ops,
-            queue_bytes_limit: apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                .max_queue_bytes,
-            bundle_export_bytes_counter: AtomicU64::new(0),
-            bundle_export_bytes_limit:
-                apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default()
-                    .max_bundle_export_bytes,
+            control_plane_budget: Mutex::new(
+                apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(
+                    apm2_core::fac::broker_rate_limits::ControlPlaneLimits::default(),
+                )
+                .expect("default ControlPlaneLimits always valid"),
+            ),
         }
     }
 
@@ -8601,141 +8556,85 @@ impl PrivilegedDispatcher {
     ///
     /// Called at tick advancement boundaries by the daemon tick driver.
     /// Concurrent requests that are in-flight will observe the reset on
-    /// their next CAS iteration.
+    /// their next lock acquisition.
     pub fn reset_control_plane_counters(&self) {
-        self.token_issuance_counter.store(0, Ordering::Relaxed);
-        self.queue_enqueue_ops_counter.store(0, Ordering::Relaxed);
-        self.queue_bytes_counter.store(0, Ordering::Relaxed);
-        self.bundle_export_bytes_counter.store(0, Ordering::Relaxed);
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        budget.reset();
     }
 
     /// Returns the current token issuance count (observability).
     #[must_use]
     pub fn token_issuance_count(&self) -> u64 {
-        self.token_issuance_counter.load(Ordering::Relaxed)
+        self.control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned")
+            .tokens_issued()
+    }
+
+    /// Updates the control-plane limits from an `EconomicsProfile`
+    /// (TCK-00568).
+    ///
+    /// Called when a new profile is loaded (startup or hot-reload). Replaces
+    /// limits and resets counters to start a fresh budget window with the
+    /// new limits.
+    pub fn set_control_plane_limits(
+        &self,
+        limits: apm2_core::fac::broker_rate_limits::ControlPlaneLimits,
+    ) {
+        if let Err(e) = limits.validate() {
+            warn!(
+                error = %e,
+                "Ignoring invalid control-plane limits (fail-closed, keeping current limits)"
+            );
+            return;
+        }
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        // Replace the budget with the new limits and reset counters.
+        *budget = apm2_core::fac::broker_rate_limits::ControlPlaneBudget::new(limits)
+            .expect("limits already validated");
     }
 
     /// Checks queue enqueue admission against control-plane budget
     /// (TCK-00568).
     ///
-    /// Atomically increments the queue operation counter and byte counter.
-    /// Returns `Ok(())` on admission, or `Err` with a `ProtocolError` if
-    /// the budget would be exceeded.
+    /// Acquires the control-plane budget mutex and performs a unified
+    /// check-then-increment for both the operation count and byte count.
+    /// Returns `Ok(())` on admission, or `Err` with a structured
+    /// `ProtocolError::BudgetExceeded` if the budget would be exceeded.
     ///
     /// INV-CPRL-002: Budget check occurs BEFORE any state mutation.
     pub fn admit_queue_enqueue(&self, bytes: u64) -> Result<(), ProtocolError> {
-        // Check ops limit (CAS loop).
-        if self.queue_enqueue_ops_limit == 0 {
-            return Err(ProtocolError::Serialization {
-                reason: "queue enqueue denied: ops limit disabled (INV-CPRL-001)".to_string(),
-            });
-        }
-        loop {
-            let current_ops = self.queue_enqueue_ops_counter.load(Ordering::Relaxed);
-            let next_ops =
-                current_ops
-                    .checked_add(1)
-                    .ok_or_else(|| ProtocolError::Serialization {
-                        reason: "queue enqueue denied: ops counter overflow (INV-CPRL-004)"
-                            .to_string(),
-                    })?;
-            if next_ops > self.queue_enqueue_ops_limit {
-                return Err(ProtocolError::Serialization {
-                    reason: format!(
-                        "queue enqueue denied: ops rate exceeded ({current_ops}/{})",
-                        self.queue_enqueue_ops_limit
-                    ),
-                });
-            }
-            if self
-                .queue_enqueue_ops_counter
-                .compare_exchange_weak(current_ops, next_ops, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        // Check bytes limit (CAS loop).
-        if self.queue_bytes_limit == 0 {
-            return Err(ProtocolError::Serialization {
-                reason: "queue enqueue denied: bytes limit disabled (INV-CPRL-001)".to_string(),
-            });
-        }
-        loop {
-            let current_bytes = self.queue_bytes_counter.load(Ordering::Relaxed);
-            let next_bytes =
-                current_bytes
-                    .checked_add(bytes)
-                    .ok_or_else(|| ProtocolError::Serialization {
-                        reason: "queue enqueue denied: bytes counter overflow (INV-CPRL-004)"
-                            .to_string(),
-                    })?;
-            if next_bytes > self.queue_bytes_limit {
-                // Roll back the ops counter that was already incremented.
-                self.queue_enqueue_ops_counter
-                    .fetch_sub(1, Ordering::Relaxed);
-                return Err(ProtocolError::Serialization {
-                    reason: format!(
-                        "queue enqueue denied: bytes exceeded ({current_bytes}/{})",
-                        self.queue_bytes_limit
-                    ),
-                });
-            }
-            if self
-                .queue_bytes_counter
-                .compare_exchange_weak(
-                    current_bytes,
-                    next_bytes,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        Ok(())
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        budget
+            .admit_queue_enqueue(bytes)
+            .map_err(budget_error_to_protocol_error)
     }
 
     /// Checks bundle export admission against control-plane budget
     /// (TCK-00568).
     ///
-    /// Atomically increments the bundle export byte counter. Returns
-    /// `Ok(())` on admission, or `Err` if the budget would be exceeded.
+    /// Acquires the control-plane budget mutex and performs a unified
+    /// check-then-increment. Returns `Ok(())` on admission, or `Err`
+    /// with a structured `ProtocolError::BudgetExceeded`.
     ///
     /// INV-CPRL-002: Budget check occurs BEFORE any state mutation.
     pub fn admit_bundle_export(&self, bytes: u64) -> Result<(), ProtocolError> {
-        if self.bundle_export_bytes_limit == 0 {
-            return Err(ProtocolError::Serialization {
-                reason: "bundle export denied: limit disabled (INV-CPRL-001)".to_string(),
-            });
-        }
-        loop {
-            let current = self.bundle_export_bytes_counter.load(Ordering::Relaxed);
-            let next = current
-                .checked_add(bytes)
-                .ok_or_else(|| ProtocolError::Serialization {
-                    reason: "bundle export denied: counter overflow (INV-CPRL-004)".to_string(),
-                })?;
-            if next > self.bundle_export_bytes_limit {
-                return Err(ProtocolError::Serialization {
-                    reason: format!(
-                        "bundle export denied: bytes exceeded ({current}/{})",
-                        self.bundle_export_bytes_limit
-                    ),
-                });
-            }
-            if self
-                .bundle_export_bytes_counter
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-        Ok(())
+        let mut budget = self
+            .control_plane_budget
+            .lock()
+            .expect("control_plane_budget mutex poisoned");
+        budget
+            .admit_bundle_export(bytes)
+            .map_err(budget_error_to_protocol_error)
     }
 
     /// Sets the boundary ID for TCK-00565 token binding contract.
@@ -10872,8 +10771,10 @@ impl PrivilegedDispatcher {
         // TCK-00568: Control-plane queue enqueue rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE state mutation (register_claim).
         // Estimate claim size from serialized fields for byte accounting.
-        let estimated_claim_bytes =
-            (claim.work_id.len() + claim.lease_id.len() + claim.actor_id.len() + 256) as u64; // 256 bytes overhead for struct metadata
+        let estimated_claim_bytes = (claim.work_id.len()
+            + claim.lease_id.len()
+            + claim.actor_id.len()
+            + CLAIM_METADATA_OVERHEAD_BYTES) as u64;
         if let Err(e) = self.admit_queue_enqueue(estimated_claim_bytes) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
