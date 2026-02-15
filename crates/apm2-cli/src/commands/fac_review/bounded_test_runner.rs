@@ -116,9 +116,9 @@ fn bounded_unit_properties(limits: BoundedTestLimits<'_>) -> Vec<String> {
 }
 
 fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String, String)]) {
-    for (key, value) in setenv_pairs {
+    for (key, _value) in setenv_pairs {
         command.push("--setenv".to_string());
-        command.push(format!("{key}={value}"));
+        command.push(key.clone());
     }
 }
 
@@ -236,9 +236,9 @@ fn command_available(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedTestLimits, bounded_unit_properties, build_bounded_test_command,
-        build_systemd_setenv_pairs, default_runtime_dir, parse_dbus_unix_path,
-        resolve_user_bus_socket_path,
+        BoundedTestLimits, append_systemd_setenv_args, bounded_unit_properties,
+        build_bounded_test_command, build_systemd_setenv_pairs, default_runtime_dir,
+        parse_dbus_unix_path, resolve_user_bus_socket_path,
     };
 
     #[test]
@@ -337,7 +337,7 @@ mod tests {
         let properties = bounded_unit_properties(BoundedTestLimits {
             timeout_seconds: 600,
             kill_after_seconds: 20,
-            memory_max: "24G",
+            memory_max: "48G",
             pids_max: 1536,
             cpu_quota: "200%",
         });
@@ -345,5 +345,13 @@ mod tests {
         assert!(properties.iter().any(|p| p == "KillSignal=SIGKILL"));
         assert!(properties.iter().any(|p| p == "FinalKillSignal=SIGKILL"));
         assert!(properties.iter().any(|p| p == "KillMode=control-group"));
+    }
+
+    #[test]
+    fn append_systemd_setenv_args_passes_names_only() {
+        let mut command = Vec::new();
+        append_systemd_setenv_args(&mut command, &[("TOKEN".to_string(), "abcd".to_string())]);
+        assert_eq!(command, vec!["--setenv".to_string(), "TOKEN".to_string()]);
+        assert!(command.iter().all(|arg: &String| !arg.contains('=')));
     }
 }

@@ -262,7 +262,7 @@ pub struct GatesArgs {
     pub timeout_seconds: u64,
 
     /// Memory ceiling for bounded test execution.
-    #[arg(long, default_value = "24G")]
+    #[arg(long, default_value = "48G")]
     pub memory_max: String,
 
     /// PID/task ceiling for bounded test execution.

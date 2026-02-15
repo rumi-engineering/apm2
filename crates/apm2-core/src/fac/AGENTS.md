@@ -437,6 +437,9 @@ default worker flow and future system-mode execution backends.
 - [INV-SYS-001] Unit limits are generated from persisted lane profile defaults
   or authoritative overrides only; no duplicated ad-hoc calculations in caller
   sites.
+- [INV-SYS-001a] Lane-default resource caps enforce a `48 GiB` memory ceiling
+  before job constraints; lane constraints cannot raise `MemoryMax` above this
+  profile floor.
 - [INV-SYS-002] `JobConstraints` values are applied with lane ceiling semantics
   (`min`) so a job cannot increase resource or timeout limits above lane
   defaults.

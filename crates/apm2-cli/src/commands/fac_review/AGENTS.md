@@ -50,7 +50,8 @@ apm2 fac review run --pr <N> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
-- **Rust-native bounded tests**: FAC constructs `systemd-run` bounded test execution in Rust with a fixed 600s timeout policy.
+- **Rust-native bounded tests**: FAC constructs `systemd-run` bounded test execution in Rust with fixed limits:
+  `600s` timeout and `48G` `MemoryMax` for evidence and pipeline test execution.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.
