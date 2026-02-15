@@ -81,21 +81,7 @@ pub fn build_bounded_test_command(
     let setenv_pairs = build_systemd_setenv_pairs(collect_inherited_setenv_pairs(), extra_setenv)?;
     append_systemd_setenv_args(&mut command, &setenv_pairs);
 
-    let properties = [
-        "MemoryAccounting=yes".to_string(),
-        "CPUAccounting=yes".to_string(),
-        "TasksAccounting=yes".to_string(),
-        format!("MemoryMax={}", limits.memory_max),
-        format!("TasksMax={}", limits.pids_max),
-        format!("CPUQuota={}", limits.cpu_quota),
-        format!("RuntimeMaxSec={}s", limits.timeout_seconds),
-        "KillSignal=SIGTERM".to_string(),
-        format!("TimeoutStopSec={}s", limits.kill_after_seconds),
-        "FinalKillSignal=SIGKILL".to_string(),
-        "SendSIGKILL=yes".to_string(),
-        "KillMode=control-group".to_string(),
-    ];
-    for property in properties {
+    for property in bounded_unit_properties(limits) {
         command.push("--property".to_string());
         command.push(property);
     }
@@ -107,6 +93,26 @@ pub fn build_bounded_test_command(
         command,
         environment,
     })
+}
+
+fn bounded_unit_properties(limits: BoundedTestLimits<'_>) -> Vec<String> {
+    vec![
+        "MemoryAccounting=yes".to_string(),
+        "CPUAccounting=yes".to_string(),
+        "TasksAccounting=yes".to_string(),
+        format!("MemoryMax={}", limits.memory_max),
+        format!("TasksMax={}", limits.pids_max),
+        format!("CPUQuota={}", limits.cpu_quota),
+        format!("RuntimeMaxSec={}s", limits.timeout_seconds),
+        // Fail-closed cleanup: tests may intentionally leave TERM-ignoring descendants.
+        // Use SIGKILL for unit stop to prevent false FAIL due stop timeout after
+        // an otherwise successful test command exit.
+        "KillSignal=SIGKILL".to_string(),
+        format!("TimeoutStopSec={}s", limits.kill_after_seconds),
+        "FinalKillSignal=SIGKILL".to_string(),
+        "SendSIGKILL=yes".to_string(),
+        "KillMode=control-group".to_string(),
+    ]
 }
 
 fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String, String)]) {
@@ -230,8 +236,9 @@ fn command_available(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedTestLimits, build_bounded_test_command, build_systemd_setenv_pairs,
-        default_runtime_dir, parse_dbus_unix_path, resolve_user_bus_socket_path,
+        BoundedTestLimits, bounded_unit_properties, build_bounded_test_command,
+        build_systemd_setenv_pairs, default_runtime_dir, parse_dbus_unix_path,
+        resolve_user_bus_socket_path,
     };
 
     #[test]
@@ -323,5 +330,20 @@ mod tests {
             resolve_user_bus_socket_path(&env),
             Some("/tmp/custom-bus".to_string())
         );
+    }
+
+    #[test]
+    fn bounded_unit_properties_use_sigkill_teardown() {
+        let properties = bounded_unit_properties(BoundedTestLimits {
+            timeout_seconds: 600,
+            kill_after_seconds: 20,
+            memory_max: "24G",
+            pids_max: 1536,
+            cpu_quota: "200%",
+        });
+
+        assert!(properties.iter().any(|p| p == "KillSignal=SIGKILL"));
+        assert!(properties.iter().any(|p| p == "FinalKillSignal=SIGKILL"));
+        assert!(properties.iter().any(|p| p == "KillMode=control-group"));
     }
 }
