@@ -1030,6 +1030,60 @@ systemd process monitoring provides.
 - [INV-WHB-005] The heartbeat file is not authoritative for admission or
   security decisions. It is an observability signal only.
 
+## warm Submodule (TCK-00525)
+
+The `warm` submodule implements lane-scoped prewarming with content-addressed
+receipts. Warm reduces cold-start probability for subsequent gates by
+pre-populating build caches in the lane target namespace.
+
+### Key Types
+
+- `WarmReceiptV1`: Content-addressed receipt capturing per-phase exit codes,
+  durations, tool versions, and BLAKE3 content hash. All fields use bounded
+  deserialization (SEC-CTRL-FAC-0016).
+- `WarmPhaseResult`: Per-phase execution result with bounded string fields.
+- `WarmPhase`: Selectable warm phase enum (Fetch, Build, Nextest, Clippy, Doc).
+- `WarmToolVersions`: Tool version snapshot with bounded optional string fields.
+- `WarmError`: Error taxonomy covering invalid phases, bounds violations,
+  execution failures, timeouts, and hash mismatches.
+
+### Core Capabilities
+
+- `execute_warm(phases, ...)`: Execute warm phases and produce a `WarmReceiptV1`.
+- `execute_warm_phase(phase, ...)`: Execute a single phase with timeout
+  enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
+- `collect_tool_versions()`: Bounded stdout collection from version probe
+  commands (`MAX_VERSION_OUTPUT_BYTES`).
+- `WarmReceiptV1::verify_content_hash()`: Constant-time hash verification
+  via `subtle::ConstantTimeEq`.
+- `WarmReceiptV1::persist(receipts_dir)`: Atomic write (temp+rename) with
+  size validation.
+
+### Security Invariants (TCK-00525)
+
+- [INV-WARM-001] All string fields bounded by `MAX_*` constants during both
+  construction and deserialization (SEC-CTRL-FAC-0016).
+- [INV-WARM-002] Warm uses lane target namespace (`CARGO_TARGET_DIR`).
+- [INV-WARM-003] Warm uses FAC-managed `CARGO_HOME`.
+- [INV-WARM-004] Phase count bounded by `MAX_WARM_PHASES` during both
+  construction and deserialization.
+- [INV-WARM-005] Content hash uses domain-separated BLAKE3 with
+  length-prefixed injective framing.
+- [INV-WARM-006] Content hash verification uses constant-time comparison
+  via `subtle::ConstantTimeEq` (INV-PC-001 consistency).
+- [INV-WARM-007] Phase execution enforces `MAX_PHASE_TIMEOUT_SECS` via
+  `Child::try_wait` polling + `Child::kill` on timeout.
+- [INV-WARM-008] Tool version collection uses bounded stdout reads
+  (`Read::take(MAX_VERSION_OUTPUT_BYTES)`) to prevent OOM.
+- [INV-WARM-009] GateReceipt `payload_hash` and `evidence_bundle_hash` bind to
+  the serialized `WarmReceiptV1` output (not the input job spec), providing
+  verifiable evidence binding.
+- [INV-WARM-010] GateReceipt `passed` reflects warm receipt persistence success.
+  Persistence failure produces `passed=false` (fail-closed measurement
+  integrity).
+- [INV-WARM-011] Warm execution inherits systemd transient unit containment
+  from the worker (TCK-00529/TCK-00511 cgroup + namespace isolation).
+
 ## Control-Lane Exception (TCK-00533)
 
 `stop_revoke` jobs bypass the standard RFC-0028 channel context token and

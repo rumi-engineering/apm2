@@ -3385,7 +3385,7 @@ fn execute_warm_job(
     policy_hash: &str,
     containment_trace: Option<&apm2_core::fac::containment::ContainmentTrace>,
     lane_mgr: &LaneManager,
-    raw_bytes: &[u8],
+    _raw_bytes: &[u8],
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmPhase, execute_warm};
 
@@ -3545,22 +3545,32 @@ fn execute_warm_job(
     };
 
     // Persist the warm receipt to the FAC receipts directory.
+    // [Finding #8] GateReceipt emission depends on successful persistence.
+    // If the warm receipt cannot be persisted, the GateReceipt is emitted
+    // with passed=false to reflect the incomplete measurement.
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
-    if let Err(e) = receipt.persist(&receipts_dir) {
-        eprintln!(
-            "worker: WARNING: warm receipt persistence failed for {}: {e}",
-            spec.job_id
-        );
-        // Non-fatal: the job receipt will still be emitted.
-    } else {
-        eprintln!(
-            "worker: warm receipt persisted for {} (hash: {})",
-            spec.job_id, receipt.content_hash
-        );
-    }
+    let persist_ok = match receipt.persist(&receipts_dir) {
+        Ok(_) => {
+            eprintln!(
+                "worker: warm receipt persisted for {} (hash: {})",
+                spec.job_id, receipt.content_hash
+            );
+            true
+        },
+        Err(e) => {
+            eprintln!(
+                "worker: warm receipt persistence failed for {}: {e}",
+                spec.job_id
+            );
+            false
+        },
+    };
 
-    // Emit the gate receipt and job receipt.
-    let evidence_hash = compute_evidence_hash(raw_bytes);
+    // [Finding #1/#4] Compute payload_hash from the serialized WarmReceiptV1,
+    // not from the input job spec bytes. This binds the GateReceipt to the
+    // actual warm execution output.
+    let receipt_json = serde_json::to_vec(&receipt).unwrap_or_default();
+    let warm_receipt_hash = compute_evidence_hash(&receipt_json);
     let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
     let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
     let gate_receipt =
@@ -3570,10 +3580,10 @@ fn execute_warm_job(
             .receipt_version(1)
             .payload_kind("warm-receipt")
             .payload_schema_version(1)
-            .payload_hash(evidence_hash)
-            .evidence_bundle_hash(evidence_hash)
+            .payload_hash(warm_receipt_hash)
+            .evidence_bundle_hash(warm_receipt_hash)
             .job_spec_digest(&spec.job_spec_digest)
-            .passed(true)
+            .passed(persist_ok)
             .build_and_sign(signer);
 
     if let Err(receipt_err) = emit_job_receipt(
