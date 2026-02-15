@@ -221,7 +221,7 @@ fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize)
     let _ = writeln!(file, "  journalctl --user --since '10 minutes ago'");
     let _ = writeln!(
         file,
-        "  apm2 fac gates --memory-max 24G  # default is 24G; increase if needed"
+        "  apm2 fac gates --memory-max 48G  # default is 48G; increase if needed"
     );
 }
 
@@ -451,6 +451,7 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
     )
     .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
     test_env.extend(bounded_spec.environment);
+    test_env.extend(bounded_spec.setenv_pairs);
 
     Ok(PipelineTestCommand {
         command: bounded_spec.command,

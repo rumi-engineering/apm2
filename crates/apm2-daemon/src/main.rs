@@ -205,12 +205,14 @@ impl DaemonConfig {
     }
 }
 
-/// Write PID file.
+/// Write PID file atomically.
+///
+/// TCK-00537: Uses [`apm2_daemon::fs_safe::atomic_write`] for crash-safe
+/// PID file creation (temp + fsync + rename). Parent directory is created
+/// with mode 0700 (restrictive permissions).
 fn write_pid_file(pid_path: &PathBuf) -> Result<()> {
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(pid_path, std::process::id().to_string())?;
+    apm2_daemon::fs_safe::atomic_write(pid_path, std::process::id().to_string().as_bytes())
+        .context("failed to write PID file atomically")?;
     info!("PID file written to {:?}", pid_path);
     Ok(())
 }
@@ -247,58 +249,42 @@ fn remove_pid_file(pid_path: &PathBuf) {
 /// - The key file cannot be read or written
 /// - The key file contains invalid data (not 32 bytes)
 /// - File permissions cannot be set
-fn load_or_create_persistent_signer(key_path: &PathBuf) -> Result<apm2_core::crypto::Signer> {
+fn load_or_create_persistent_signer(
+    key_path: &std::path::Path,
+) -> Result<apm2_core::crypto::Signer> {
     use apm2_core::crypto::Signer;
 
-    // Ensure parent directory exists
-    if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent).context("failed to create signer key directory")?;
-    }
+    match apm2_daemon::fs_safe::bounded_read(key_path, 4096) {
+        Ok(key_bytes) => {
+            // TCK-00537: Load uses safe_open (symlink refusal + bounded read).
+            if key_bytes.len() != 32 {
+                anyhow::bail!(
+                    "invalid signer key file: expected 32 bytes, got {}",
+                    key_bytes.len()
+                );
+            }
 
-    if key_path.exists() {
-        // Load existing key
-        let key_bytes = std::fs::read(key_path).context("failed to read signer key file")?;
-
-        if key_bytes.len() != 32 {
-            anyhow::bail!(
-                "invalid signer key file: expected 32 bytes, got {}",
-                key_bytes.len()
-            );
-        }
-
-        Signer::from_bytes(&key_bytes)
-            .map_err(|e| anyhow::anyhow!("failed to parse signer key: {e}"))
-    } else {
-        // Generate new key and save it
-        let signer = Signer::generate();
-        let key_bytes = signer.secret_key_bytes();
-
-        // Write key file with secure permissions
-        // TCK-00322 BLOCKER FIX: Set mode 0600 to protect private key
-        #[cfg(unix)]
+            Signer::from_bytes(&key_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to parse signer key: {e}"))
+        },
+        Err(apm2_daemon::fs_safe::FsSafeError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            // Generate new key and save it
+            let signer = Signer::generate();
+            let key_bytes = signer.secret_key_bytes();
 
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(key_path)
-                .context("failed to create signer key file")?;
+            // TCK-00537: Use atomic_write for crash-safe key persistence.
+            // atomic_write creates temp file with 0600 permissions
+            // (NamedTempFile default), fsync, then rename.
+            apm2_daemon::fs_safe::atomic_write(key_path, &*key_bytes)
+                .context("failed to write signer key atomically")?;
 
-            file.write_all(&*key_bytes)
-                .context("failed to write signer key")?;
-        }
+            info!(key_path = %key_path.display(), "Generated new persistent projection signer key");
 
-        #[cfg(not(unix))]
-        {
-            std::fs::write(key_path, &*key_bytes).context("failed to write signer key")?;
-        }
-
-        info!(key_path = %key_path.display(), "Generated new persistent projection signer key");
-
-        Ok(signer)
+            Ok(signer)
+        },
+        Err(e) => Err(anyhow::anyhow!("failed to read signer key file: {e}")),
     }
 }
 
@@ -353,26 +339,18 @@ fn load_or_create_ledger_signing_key(
         }
     }
 
-    match std::fs::symlink_metadata(&key_path) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                anyhow::bail!(
-                    "ledger signer key path '{}' must not be a symlink",
-                    key_path.display()
-                );
-            }
-            if !file_type.is_file() {
-                anyhow::bail!(
-                    "ledger signer key path '{}' must be a regular file",
-                    key_path.display()
-                );
-            }
-
+    // TCK-00537: Use fs_safe primitives for symlink refusal (O_NOFOLLOW),
+    // bounded reads, and regular-file verification.
+    match apm2_daemon::fs_safe::bounded_read(&key_path, 4096) {
+        Ok(key_bytes) => {
+            // Validate permissions on the opened file handle (post-open, not
+            // path-based — safe_open already refused symlinks).
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
 
+                let metadata = std::fs::symlink_metadata(&key_path)
+                    .context("failed to stat ledger signer key file")?;
                 let mode = metadata.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
                     anyhow::bail!(
@@ -383,26 +361,6 @@ fn load_or_create_ledger_signing_key(
                 }
             }
 
-            let key_bytes = {
-                #[cfg(unix)]
-                {
-                    use std::io::Read;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let mut file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(nix::libc::O_NOFOLLOW)
-                        .open(&key_path)
-                        .context("failed to open ledger signer key file")?;
-                    let mut buf = Vec::new();
-                    file.read_to_end(&mut buf)
-                        .context("failed to read ledger signer key file")?;
-                    buf
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::read(&key_path).context("failed to read ledger signer key file")?
-                }
-            };
             if key_bytes.len() != 32 {
                 anyhow::bail!(
                     "invalid ledger signer key file: expected 32 bytes, got {}",
@@ -417,37 +375,24 @@ fn load_or_create_ledger_signing_key(
             info!(key_path = %key_path.display(), "Loaded persistent ledger signing key");
             Ok(ed25519_dalek::SigningKey::from_bytes(&key_seed))
         },
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+        Err(apm2_daemon::fs_safe::FsSafeError::Io { source, .. })
+            if source.kind() == ErrorKind::NotFound =>
+        {
             use rand::rngs::OsRng;
 
             let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
             let key_bytes = signing_key.to_bytes();
 
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&key_path)
-                    .context("failed to create ledger signer key file")?;
-                file.write_all(&key_bytes)
-                    .context("failed to write ledger signer key")?;
-            }
-
-            #[cfg(not(unix))]
-            {
-                std::fs::write(&key_path, &key_bytes)
-                    .context("failed to write ledger signer key")?;
-            }
+            // TCK-00537: Use atomic_write for crash-safe key persistence.
+            // atomic_write creates parent dir with 0700 and temp file with
+            // 0600 permissions, fsync, then atomic rename.
+            apm2_daemon::fs_safe::atomic_write(&key_path, &key_bytes)
+                .context("failed to write ledger signer key atomically")?;
 
             info!(key_path = %key_path.display(), "Generated new persistent ledger signing key");
             Ok(signing_key)
         },
-        Err(error) => Err(error).context("failed to read ledger signer key metadata"),
+        Err(e) => Err(anyhow::anyhow!("failed to read ledger signer key: {e}")),
     }
 }
 

@@ -674,13 +674,17 @@ impl DurableCas {
     }
 
     /// Recovers total size from persistent storage or recalculates it.
+    ///
+    /// TCK-00537: Uses [`crate::fs_safe::bounded_read`] for symlink refusal
+    /// (`O_NOFOLLOW`), bounded reads, and regular-file verification on the
+    /// total-size metadata file.
     fn recover_total_size(&self) -> Result<(), DurableCasError> {
         let size_file = self.metadata_path.join(TOTAL_SIZE_FILE);
 
-        // Try to read persisted size
-        if size_file.exists() {
-            if let Ok(content) = fs::read_to_string(&size_file) {
-                if let Ok(size) = content.trim().parse::<usize>() {
+        // Try to read persisted size via safe I/O primitives
+        if let Ok(content) = crate::fs_safe::bounded_read(&size_file, 256) {
+            if let Ok(text) = std::str::from_utf8(&content) {
+                if let Ok(size) = text.trim().parse::<usize>() {
                     self.current_total_size.store(size, Ordering::Relaxed);
                     return Ok(());
                 }

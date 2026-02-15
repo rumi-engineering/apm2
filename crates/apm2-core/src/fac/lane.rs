@@ -78,8 +78,8 @@ pub const MAX_PROFILE_FILE_SIZE: u64 = 1024 * 1024;
 /// Maximum allowed test timeout in seconds for FAC execution paths.
 pub const MAX_TEST_TIMEOUT_SECONDS: u64 = 240;
 
-/// Maximum allowed memory cap in bytes for FAC execution paths (24 GiB).
-pub const MAX_MEMORY_MAX_BYTES: u64 = 25_769_803_776;
+/// Maximum allowed memory cap in bytes for FAC execution paths (48 GiB).
+pub const MAX_MEMORY_MAX_BYTES: u64 = 51_539_607_552;
 
 /// Poll interval for lane lock acquisition.
 pub const LANE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -256,7 +256,7 @@ impl Default for ResourceProfile {
     fn default() -> Self {
         Self {
             cpu_quota_percent: 200,
-            memory_max_bytes: 25_769_803_776, // 24 GiB
+            memory_max_bytes: 51_539_607_552, // 48 GiB
             pids_max: 1536,
             io_weight: 100,
         }
