@@ -4444,6 +4444,7 @@ mod tests {
             &LaneResetArgs {
                 lane_id: lane_id.to_string(),
                 force: false,
+                json: false,
             },
             false,
         );
