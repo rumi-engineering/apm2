@@ -95,6 +95,11 @@ ticket_meta:
          short-lived and can buffer the entire response. Long-running
          commands were left as text-only because the pattern didn't fit.
   scope:
+    scope_clarification: |
+      Removing non-machine-parseable output (dead text-mode branches,
+      unstructured eprintln, human-readable println) is a best-effort goal
+      scoped to `fac` subcommands. Follow-up tickets will address residual
+      text output paths in non-FAC areas of the codebase.
     in_scope:
       - id: S1_GATES_JSON_AND_JSONL
         title: "`fac gates` — add --json flag to GatesArgs, stream JSONL progress by default"

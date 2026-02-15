@@ -10,16 +10,10 @@ use crate::exit_codes::codes as exit_codes;
 pub fn run_pr_auth_check(_repo: &str, json_output: bool) -> u8 {
     match local_auth_material_check() {
         Ok(info) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else if info.login.is_empty() {
-                println!("GitHub App auth material is configured.");
-            } else {
-                println!("GitHub App auth material is configured: {}", info.login);
-            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())
+            );
             exit_codes::SUCCESS
         },
         Err(error) => {

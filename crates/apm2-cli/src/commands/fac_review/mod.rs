@@ -651,7 +651,16 @@ fn emit_doctor_wait_error(json_output: bool, error: &str, message: &str, exit_co
             }),
         });
     } else {
-        eprintln!("ERROR: {message}");
+        // JSON-only: emit the error as a structured JSON object.
+        let payload = serde_json::json!({
+            "error": error,
+            "message": message,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
     }
     exit_code
 }
@@ -2418,19 +2427,15 @@ pub fn run_review(
     let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
         Ok(value) => value,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_run_target_resolution_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_run_target_resolution_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -2446,69 +2451,24 @@ pub fn run_review(
             let success = summary.security.as_ref().is_none_or(|entry| entry.success)
                 && summary.quality.as_ref().is_none_or(|entry| entry.success);
 
-            if json_output {
-                let mut run_ids = Vec::new();
-                if let Some(entry) = &summary.security {
-                    run_ids.push(entry.run_id.clone());
-                }
-                if let Some(entry) = &summary.quality {
-                    run_ids.push(entry.run_id.clone());
-                }
-                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids, true);
-                let payload = serde_json::json!({
-                    "schema": "apm2.fac.review.run.v1",
-                    "summary": summary,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Review");
-                println!("  PR:           {}", summary.pr_url);
-                println!("  PR Number:    {}", summary.pr_number);
-                println!("  Head (start): {}", summary.initial_head_sha);
-                println!("  Head (final): {}", summary.final_head_sha);
-                println!("  Total secs:   {}", summary.total_secs);
-                if let Some(security) = &summary.security {
-                    let tok = security
-                        .tokens_used
-                        .map_or_else(String::new, |n| format!(", tokens={n}"));
-                    println!(
-                        "  Security:     {} (run_id={}, state={}, verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
-                        if security.success { "PASS" } else { "FAIL" },
-                        security.run_id,
-                        security.state,
-                        security.verdict,
-                        security.model,
-                        security.backend,
-                        security.restart_count,
-                        security.duration_secs
-                    );
-                    if let Some(reason) = &security.terminal_reason {
-                        println!("                 terminal_reason={reason}");
-                    }
-                }
-                if let Some(quality) = &summary.quality {
-                    let tok = quality
-                        .tokens_used
-                        .map_or_else(String::new, |n| format!(", tokens={n}"));
-                    println!(
-                        "  Quality:      {} (run_id={}, state={}, verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
-                        if quality.success { "PASS" } else { "FAIL" },
-                        quality.run_id,
-                        quality.state,
-                        quality.verdict,
-                        quality.model,
-                        quality.backend,
-                        quality.restart_count,
-                        quality.duration_secs
-                    );
-                    if let Some(reason) = &quality.terminal_reason {
-                        println!("                 terminal_reason={reason}");
-                    }
-                }
+            let mut run_ids = Vec::new();
+            if let Some(entry) = &summary.security {
+                run_ids.push(entry.run_id.clone());
             }
+            if let Some(entry) = &summary.quality {
+                run_ids.push(entry.run_id.clone());
+            }
+            if json_output {
+                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids, true);
+            }
+            let payload = serde_json::json!({
+                "schema": "apm2.fac.review.run.v1",
+                "summary": summary,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
 
             if success {
                 exit_codes::SUCCESS
@@ -2517,19 +2477,15 @@ pub fn run_review(
             }
         },
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_run_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_run_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2541,24 +2497,20 @@ pub fn run_dispatch(
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
     force: bool,
-    json_output: bool,
+    _json_output: bool,
 ) -> u8 {
     let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
         Ok(value) => value,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_dispatch_target_resolution_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_dispatch_target_resolution_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -2570,51 +2522,26 @@ pub fn run_dispatch(
         force,
     ) {
         Ok(summary) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "schema": "apm2.fac.review.dispatch.v1",
-                    "summary": summary,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Review Dispatch");
-                println!("  PR:            {}", summary.pr_url);
-                println!("  PR Number:     {}", summary.pr_number);
-                println!("  Head SHA:      {}", summary.head_sha);
-                println!("  Dispatch Epoch:{}", summary.dispatch_epoch);
-                for result in &summary.results {
-                    println!(
-                        "  - type={} mode={} state={} run_id={} seq={} terminal_reason={}",
-                        result.review_type,
-                        result.mode,
-                        result.run_state,
-                        result.run_id.as_deref().unwrap_or("-"),
-                        result
-                            .sequence_number
-                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
-                        result.terminal_reason.as_deref().unwrap_or("-"),
-                    );
-                }
-            }
+            let payload = serde_json::json!({
+                "schema": "apm2.fac.review.dispatch.v1",
+                "summary": summary,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
             exit_codes::SUCCESS
         },
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_dispatch_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_dispatch_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2634,19 +2561,15 @@ pub fn run_status(
             }
         },
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_status_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_status_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2713,7 +2636,7 @@ pub fn run_wait(
     wait_for_sha: Option<&str>,
     timeout_seconds: Option<u64>,
     poll_interval_seconds: u64,
-    json_output: bool,
+    _json_output: bool,
 ) -> u8 {
     let max_interval = poll_interval_seconds.max(1);
     let poll_interval = Duration::from_secs(max_interval);
@@ -2728,48 +2651,23 @@ pub fn run_wait(
             let elapsed_seconds = elapsed.as_secs();
             let has_failed = status.terminal_failure
                 || review_types_terminal_failed(&status, review_type_filter);
-            if json_output {
-                let payload = serde_json::json!({
-                    "schema": "apm2.fac.review.wait.v1",
-                    "status": "completed",
-                    "filter_pr": pr_number,
-                    "filter_review_type": review_type_filter,
-                    "wait_for_sha": wait_for_sha,
-                    "attempts": attempts,
-                    "elapsed_seconds": elapsed_seconds,
-                    "poll_interval_seconds": max_interval,
-                    "project": status,
-                    "fail_closed": has_failed,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                println!("FAC Review Wait");
-                println!("  Filter PR: #{pr_number}");
-                if let Some(review_type) = review_type_filter {
-                    println!("  Filter Type: {review_type}");
-                }
-                if let Some(wait_sha) = wait_for_sha {
-                    println!("  Wait SHA: {wait_sha}");
-                }
-                println!("  Poll Interval: {max_interval}s");
-                println!("  Attempts: {attempts}");
-                println!("  Elapsed: {elapsed_seconds}s");
-                println!("  Final: {}", status.line);
-                println!("  Fail Closed: {}", if has_failed { "yes" } else { "no" });
-                if !status.errors.is_empty() {
-                    println!("  Errors:");
-                    for error in &status.errors {
-                        println!(
-                            "    ts={} event={} review={} seq={} detail={}",
-                            error.ts, error.event, error.review_type, error.seq, error.detail
-                        );
-                    }
-                }
-            }
+            let payload = serde_json::json!({
+                "schema": "apm2.fac.review.wait.v1",
+                "status": "completed",
+                "filter_pr": pr_number,
+                "filter_review_type": review_type_filter,
+                "wait_for_sha": wait_for_sha,
+                "attempts": attempts,
+                "elapsed_seconds": elapsed_seconds,
+                "poll_interval_seconds": max_interval,
+                "project": status,
+                "fail_closed": has_failed,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
 
             if has_failed {
                 exit_codes::GENERIC_ERROR
@@ -2778,21 +2676,17 @@ pub fn run_wait(
             }
         },
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_wait_failed",
-                    "message": err,
-                    "filter_pr": pr_number,
-                    "filter_review_type": review_type_filter,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_wait_failed",
+                "message": err,
+                "filter_pr": pr_number,
+                "filter_review_type": review_type_filter,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2808,19 +2702,15 @@ pub fn run_findings(
     match findings::run_findings(repo, pr_number, sha, refresh, json_output) {
         Ok(code) => code,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_findings_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_findings_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2863,19 +2753,15 @@ pub fn run_finding(
     ) {
         Ok(code) => code,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_finding_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_finding_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2901,19 +2787,15 @@ pub fn run_comment_compat(
     ) {
         Ok(code) => code,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_comment_compat_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_comment_compat_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2923,19 +2805,15 @@ pub fn run_prepare(repo: &str, pr_number: Option<u32>, sha: Option<&str>, json_o
     match prepare::run_prepare(repo, pr_number, sha, json_output) {
         Ok(code) => code,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_prepare_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "fac_review_prepare_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -2983,29 +2861,17 @@ pub fn run_project(
     head_sha: Option<&str>,
     since_epoch: Option<u64>,
     after_seq: u64,
-    emit_errors: bool,
+    _emit_errors: bool,
     fail_on_terminal: bool,
-    format_json: bool,
-    json_output: bool,
+    _format_json: bool,
+    _json_output: bool,
 ) -> u8 {
     match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
         Ok(status) => {
-            if json_output || format_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("{}", status.line);
-                if emit_errors {
-                    for error in &status.errors {
-                        println!(
-                            "ERROR ts={} event={} review={} seq={} detail={}",
-                            error.ts, error.event, error.review_type, error.seq, error.detail
-                        );
-                    }
-                }
-            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".to_string())
+            );
 
             if fail_on_terminal && status.terminal_failure {
                 exit_codes::GENERIC_ERROR
@@ -3014,21 +2880,17 @@ pub fn run_project(
             }
         },
         Err(err) => {
-            if json_output || format_json {
-                let payload = serde_json::json!({
-                    "schema": "apm2.fac.review.project.v1",
-                    "status": "unavailable",
-                    "error": "fac_review_project_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("WARN: fac review project unavailable: {err}");
-            }
+            let payload = serde_json::json!({
+                "schema": "apm2.fac.review.project.v1",
+                "status": "unavailable",
+                "error": "fac_review_project_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             // Projection is a debug/observability surface; do not fail callers by default.
             exit_codes::SUCCESS
         },
@@ -3172,7 +3034,15 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
     match run_tail_inner(lines, follow) {
         Ok(()) => exit_codes::SUCCESS,
         Err(err) => {
-            eprintln!("ERROR: {err}");
+            let payload = serde_json::json!({
+                "error": "fac_review_tail_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }
@@ -3187,19 +3057,15 @@ pub fn run_terminate(
     match run_terminate_inner(repo, pr_number, review_type, json_output) {
         Ok(()) => exit_codes::SUCCESS,
         Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "terminate_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
+            let payload = serde_json::json!({
+                "error": "terminate_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }

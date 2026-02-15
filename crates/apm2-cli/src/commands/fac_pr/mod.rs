@@ -24,26 +24,16 @@ struct PrErrorResponse {
     message: String,
 }
 
-fn output_pr_error(json_output: bool, code: &str, message: &str) {
-    if json_output {
-        let resp = PrErrorResponse {
-            error: code.to_string(),
-            message: message.to_string(),
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&PrErrorResponse {
-                error: code.to_string(),
-                message: message.to_string(),
-            })
+fn output_pr_error(_json_output: bool, code: &str, message: &str) {
+    let resp = PrErrorResponse {
+        error: code.to_string(),
+        message: message.to_string(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&resp)
             .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-        );
-    }
+    );
 }
 
 // ── CLI argument types ─────────────────────────────────────────────────────
