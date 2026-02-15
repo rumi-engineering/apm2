@@ -22,7 +22,7 @@ use super::types::{
     TerminationAuthority, allocate_local_comment_id, normalize_decision_dimension, now_iso8601,
     sanitize_for_path, validate_expected_head_sha,
 };
-use super::{findings_store, github_projection, projection_store};
+use super::{fenced_yaml, findings_store, github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-verdict:v1";
@@ -61,6 +61,10 @@ struct DecisionEntry {
     set_by: String,
     #[serde(default)]
     set_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +131,10 @@ struct DimensionDecisionView {
     set_by: String,
     set_at: String,
     sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +145,10 @@ pub struct VerdictProjectionDimensionSnapshot {
     pub reason: String,
     pub reviewed_by: String,
     pub reviewed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,6 +298,8 @@ pub fn load_verdict_projection_snapshot(
                 reason: String::new(),
                 reviewed_by: String::new(),
                 reviewed_at: String::new(),
+                model_id: None,
+                backend_id: None,
             });
             continue;
         };
@@ -306,6 +320,8 @@ pub fn load_verdict_projection_snapshot(
             reason: entry.reason.clone(),
             reviewed_by: entry.set_by.clone(),
             reviewed_at: entry.set_at.clone(),
+            model_id: normalize_optional_text(entry.model_id.as_deref()),
+            backend_id: normalize_optional_text(entry.backend_id.as_deref()),
         });
     }
 
@@ -332,6 +348,7 @@ pub fn load_verdict_projection_snapshot(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn persist_verdict_projection(
     repo: &str,
     pr_number: Option<u32>,
@@ -339,6 +356,8 @@ pub fn persist_verdict_projection(
     dimension: &str,
     decision: &str,
     reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     json_output: bool,
 ) -> Result<PersistedVerdictProjection, String> {
     persist_verdict_projection_impl(
@@ -348,12 +367,15 @@ pub fn persist_verdict_projection(
         dimension,
         decision,
         reason,
+        model_id,
+        backend_id,
         ProjectionMode::Full,
         true,
         json_output,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn persist_verdict_projection_local_only(
     repo: &str,
     pr_number: Option<u32>,
@@ -361,6 +383,8 @@ pub(super) fn persist_verdict_projection_local_only(
     dimension: &str,
     decision: &str,
     reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
 ) -> Result<PersistedVerdictProjection, String> {
     persist_verdict_projection_impl(
         repo,
@@ -369,6 +393,8 @@ pub(super) fn persist_verdict_projection_local_only(
         dimension,
         decision,
         reason,
+        model_id,
+        backend_id,
         ProjectionMode::LocalOnly,
         false,
         false,
@@ -383,6 +409,8 @@ fn persist_verdict_projection_impl(
     dimension: &str,
     decision: &str,
     reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     projection_mode: ProjectionMode,
     emit_report: bool,
     json_output: bool,
@@ -459,6 +487,8 @@ fn persist_verdict_projection_impl(
             reason: reason.unwrap_or_default().trim().to_string(),
             set_by: expected_author_login.clone(),
             set_at: now_iso8601(),
+            model_id: normalize_optional_text(model_id),
+            backend_id: normalize_optional_text(backend_id),
         },
     );
 
@@ -1078,6 +1108,9 @@ fn build_show_report_from_record(
             set_by: entry.map_or_else(String::new, |value| value.set_by.clone()),
             set_at: entry.map_or_else(String::new, |value| value.set_at.clone()),
             sha: record.head_sha.clone(),
+            model_id: entry.and_then(|value| normalize_optional_text(value.model_id.as_deref())),
+            backend_id: entry
+                .and_then(|value| normalize_optional_text(value.backend_id.as_deref())),
         });
     }
 
@@ -1118,6 +1151,8 @@ fn build_unknown_dimension_views(head_sha: &str) -> Vec<DimensionDecisionView> {
             set_by: String::new(),
             set_at: String::new(),
             sha: head_sha.to_string(),
+            model_id: None,
+            backend_id: None,
         })
         .collect()
 }
@@ -1128,6 +1163,13 @@ fn normalize_decision_value(input: &str) -> Option<&'static str> {
         "deny" => Some("deny"),
         _ => None,
     }
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn aggregate_overall_decision(dimensions: &[DimensionDecisionView]) -> &'static str {
@@ -1499,42 +1541,16 @@ fn render_decision_comment_body(
         dimensions: payload.dimensions.clone(),
         findings: collect_projected_findings(findings_bundle.as_ref(), payload),
     };
-    let yaml = serde_yaml::to_string(&projection_payload)
-        .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
-    Ok(format!(
-        "<!-- {DECISION_MARKER} -->\n```yaml\n# {DECISION_MARKER}\n{yaml}```\n"
-    ))
+    fenced_yaml::render_marked_yaml_comment(DECISION_MARKER, &projection_payload)
 }
 
 fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<(), String> {
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(report)
-                .map_err(|err| format!("failed to serialize decision report: {err}"))?
-        );
-        return Ok(());
-    }
-
-    println!("FAC Review Decision");
-    println!("  PR:            #{}", report.pr_number);
-    println!("  Head SHA:      {}", report.head_sha);
-    println!("  Overall:       {}", report.overall_decision);
-    if let Some(url) = &report.source_comment_url {
-        println!("  Source:        {url}");
-    }
-    for dimension in &report.dimensions {
-        println!("  - {}: {}", dimension.dimension, dimension.decision);
-        if !dimension.reason.is_empty() {
-            println!("      reason: {}", dimension.reason);
-        }
-    }
-    if !report.errors.is_empty() {
-        println!("  Errors:");
-        for error in &report.errors {
-            println!("    - {error}");
-        }
-    }
+    let _ = json_output;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report)
+            .map_err(|err| format!("failed to serialize decision report: {err}"))?
+    );
     Ok(())
 }
 
@@ -1566,6 +1582,8 @@ pub(super) fn seed_decision_projection_for_home_for_tests(
             reason: "test decision authority".to_string(),
             set_by: reviewer_login.to_string(),
             set_at: now.clone(),
+            model_id: None,
+            backend_id: None,
         },
     );
     let payload = DecisionComment {
@@ -1639,6 +1657,8 @@ mod tests {
                 reason: String::new(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         );
 
@@ -1699,6 +1719,8 @@ mod tests {
                 reason: "all checks passed".to_string(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-14T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         );
         let payload = DecisionComment {
@@ -1735,6 +1757,8 @@ mod tests {
                 reason: String::new(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         );
         let record = DecisionProjectionRecord {
@@ -1766,6 +1790,8 @@ mod tests {
                 reason: String::new(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         );
         dimensions.insert(
@@ -1775,6 +1801,8 @@ mod tests {
                 reason: String::new(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         );
         let record = DecisionProjectionRecord {

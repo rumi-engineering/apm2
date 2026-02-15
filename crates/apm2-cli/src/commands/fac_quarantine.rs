@@ -47,6 +47,9 @@ pub struct QuarantinePruneArgs {
     /// Apply deletions.
     #[arg(long, default_value_t = false)]
     pub apply: bool,
+    /// Output machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Entry metadata for queue inspection.
@@ -60,19 +63,23 @@ struct QueueEntry {
 }
 
 /// Run `apm2 fac quarantine` commands.
-pub fn run_quarantine(args: &QuarantineArgs) -> u8 {
+pub fn run_quarantine(args: &QuarantineArgs, parent_json_output: bool) -> u8 {
     match &args.subcommand {
-        QuarantineSubcommand::List(args) => run_quarantine_list(args),
-        QuarantineSubcommand::Prune(args) => run_quarantine_prune(args),
+        QuarantineSubcommand::List(args) => {
+            run_quarantine_list(args, parent_json_output || args.json)
+        },
+        QuarantineSubcommand::Prune(args) => {
+            run_quarantine_prune(args, parent_json_output || args.json)
+        },
     }
 }
 
-fn run_quarantine_list(args: &QuarantineListArgs) -> u8 {
+fn run_quarantine_list(_args: &QuarantineListArgs, json_output: bool) -> u8 {
     let fac_root = match resolve_fac_root() {
         Ok(path) => path,
         Err(error) => {
             return output_error(
-                args.json,
+                json_output,
                 "fac_root_unavailable",
                 &error,
                 exit_codes::GENERIC_ERROR,
@@ -109,7 +116,7 @@ fn run_quarantine_list(args: &QuarantineListArgs) -> u8 {
     let total_bytes: u64 = entries.iter().map(|entry| entry.size_bytes).sum();
     let oldest_entry_age_secs = entries.first().map(|entry| entry.age_secs);
 
-    if args.json {
+    if json_output {
         let payload = serde_json::json!({
             "entries": entries,
             "summary": {
@@ -123,10 +130,12 @@ fn run_quarantine_list(args: &QuarantineListArgs) -> u8 {
                 println!("{json}");
                 exit_codes::SUCCESS
             },
-            Err(error) => {
-                eprintln!("ERROR: cannot serialize list output: {error}");
-                exit_codes::GENERIC_ERROR
-            },
+            Err(error) => output_error(
+                json_output,
+                "fac_quarantine_list_serialize_failed",
+                &format!("cannot serialize list output: {error}"),
+                exit_codes::GENERIC_ERROR,
+            ),
         };
     }
 
@@ -159,10 +168,10 @@ fn run_quarantine_list(args: &QuarantineListArgs) -> u8 {
     exit_codes::SUCCESS
 }
 
-fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
+fn run_quarantine_prune(args: &QuarantinePruneArgs, json_output: bool) -> u8 {
     if args.dry_run && args.apply {
         return output_error(
-            false,
+            json_output,
             "invalid_args",
             "--dry-run and --apply are mutually exclusive",
             exit_codes::VALIDATION_ERROR,
@@ -174,7 +183,7 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
         Ok(path) => path,
         Err(error) => {
             return output_error(
-                false,
+                json_output,
                 "fac_root_unavailable",
                 &error,
                 exit_codes::GENERIC_ERROR,
@@ -186,8 +195,12 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
     let policy = match load_or_create_policy(&fac_root) {
         Ok(policy) => policy,
         Err(error) => {
-            eprintln!("ERROR: cannot load fac policy: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_error(
+                json_output,
+                "fac_quarantine_policy_load_failed",
+                &format!("cannot load fac policy: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
@@ -200,13 +213,32 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            eprintln!("ERROR: cannot compute quarantine prune plan: {error:?}");
-            return exit_codes::GENERIC_ERROR;
+            return output_error(
+                json_output,
+                "fac_quarantine_plan_failed",
+                &format!("cannot compute quarantine prune plan: {error:?}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
     if plan.targets.is_empty() {
-        println!("No entries would be deleted.");
+        if json_output {
+            let payload = serde_json::json!({
+                "apply": apply,
+                "summary": {
+                    "total_targets": 0,
+                    "total_bytes": 0_u64,
+                },
+                "targets": [],
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+        } else {
+            println!("No entries would be deleted.");
+        }
         return exit_codes::SUCCESS;
     }
 
@@ -218,15 +250,42 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
         .sum();
 
     if !apply {
-        println!("Would delete {total_targets} entries ({total_bytes} bytes)");
-        for target in &plan.targets {
-            let target_path = target.path.display().to_string();
+        if json_output {
+            let targets = plan
+                .targets
+                .iter()
+                .map(|target| {
+                    let target_path = target.path.display().to_string();
+                    serde_json::json!({
+                        "kind": queue_prune_kind_label_for_target(target.kind, &target_path),
+                        "estimated_bytes": target.estimated_bytes,
+                        "path": sanitize_for_terminal(&target_path),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let payload = serde_json::json!({
+                "apply": false,
+                "summary": {
+                    "total_targets": total_targets,
+                    "total_bytes": total_bytes,
+                },
+                "targets": targets,
+            });
             println!(
-                "{} {} {}",
-                queue_prune_kind_label_for_target(target.kind, &target_path),
-                target.estimated_bytes,
-                sanitize_for_terminal(&target_path),
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
             );
+        } else {
+            println!("Would delete {total_targets} entries ({total_bytes} bytes)");
+            for target in &plan.targets {
+                let target_path = target.path.display().to_string();
+                println!(
+                    "{} {} {}",
+                    queue_prune_kind_label_for_target(target.kind, &target_path),
+                    target.estimated_bytes,
+                    sanitize_for_terminal(&target_path),
+                );
+            }
         }
         return exit_codes::SUCCESS;
     }
@@ -234,8 +293,12 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
     let before_free = match check_disk_space(&fac_root) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("ERROR: cannot check free space before prune: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_error(
+                json_output,
+                "fac_quarantine_before_disk_sample_failed",
+                &format!("cannot check free space before prune: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
@@ -243,8 +306,12 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
     let after_free = match check_disk_space(&fac_root) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("ERROR: cannot check free space after prune: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_error(
+                json_output,
+                "fac_quarantine_after_disk_sample_failed",
+                &format!("cannot check free space after prune: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
@@ -269,13 +336,34 @@ fn run_quarantine_prune(args: &QuarantinePruneArgs) -> u8 {
     ) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("ERROR: cannot persist quarantine prune receipt: {error}");
-            return exit_codes::GENERIC_ERROR;
+            return output_error(
+                json_output,
+                "fac_quarantine_receipt_persist_failed",
+                &format!("cannot persist quarantine prune receipt: {error}"),
+                exit_codes::GENERIC_ERROR,
+            );
         },
     };
 
-    println!("Pruned {total_targets} entries ({total_bytes} bytes)");
-    println!("receipt: {}", receipt_path.display());
+    if json_output {
+        let payload = serde_json::json!({
+            "apply": true,
+            "summary": {
+                "total_targets": total_targets,
+                "total_bytes": total_bytes,
+                "before_free_bytes": before_free,
+                "after_free_bytes": after_free,
+            },
+            "receipt": receipt_path.to_string_lossy(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("Pruned {total_targets} entries ({total_bytes} bytes)");
+        println!("receipt: {}", receipt_path.display());
+    }
     exit_codes::SUCCESS
 }
 
@@ -415,18 +503,25 @@ fn infer_queue_root(fac_root: &Path) -> PathBuf {
 fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
     if json_output {
         let payload = serde_json::json!({
-            "code": code,
+            "error": code,
             "message": message,
         });
         if let Ok(json) = serde_json::to_string_pretty(&payload) {
             println!("{json}");
         } else {
-            println!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}");
+            println!("{{\"error\":\"{code}\",\"message\":\"{message}\"}}");
         }
         return exit_code;
     }
 
-    eprintln!("[{code}] {message}");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "error": code,
+            "message": message,
+        }))
+        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+    );
     exit_code
 }
 

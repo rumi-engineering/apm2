@@ -79,6 +79,10 @@ pub(super) struct StoredFinding {
     pub location: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_id: Option<String>,
     #[serde(default)]
     pub created_at: String,
     pub evidence_digest: String,
@@ -415,6 +419,8 @@ pub(super) fn append_dimension_finding(
     impact: Option<&str>,
     location: Option<&str>,
     reviewer_id: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     evidence_pointer: Option<&str>,
     source: &str,
 ) -> Result<(FindingsBundle, StoredFinding), String> {
@@ -450,6 +456,8 @@ pub(super) fn append_dimension_finding(
         impact: normalize_optional_text(impact),
         location: normalize_optional_text(location),
         reviewer_id: normalize_optional_text(reviewer_id),
+        model_id: normalize_optional_text(model_id),
+        backend_id: normalize_optional_text(backend_id),
         created_at,
         evidence_digest: finding_digest(
             owner_repo,
@@ -463,6 +471,8 @@ pub(super) fn append_dimension_finding(
             impact,
             location,
             reviewer_id,
+            model_id,
+            backend_id,
             evidence_pointer,
         )?,
         raw_evidence_pointer: normalize_optional_text(evidence_pointer)
@@ -632,6 +642,8 @@ fn finding_digest(
     impact: Option<&str>,
     location: Option<&str>,
     reviewer_id: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     evidence_pointer: Option<&str>,
 ) -> Result<String, String> {
     let payload = serde_json::json!({
@@ -646,6 +658,8 @@ fn finding_digest(
         "impact": impact.map_or("", str::trim),
         "location": location.map_or("", str::trim),
         "reviewer_id": reviewer_id.map_or("", str::trim),
+        "model_id": model_id.map_or("", str::trim),
+        "backend_id": backend_id.map_or("", str::trim),
         "evidence_pointer": evidence_pointer.map_or("", str::trim),
     });
     let canonical = serde_jcs::to_vec(&payload)
@@ -695,6 +709,8 @@ mod tests {
             impact: None,
             location: None,
             reviewer_id: None,
+            model_id: None,
+            backend_id: None,
             created_at: "2026-02-14T00:00:00Z".to_string(),
             evidence_digest: "digest".to_string(),
             raw_evidence_pointer: "none".to_string(),

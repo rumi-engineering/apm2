@@ -61,7 +61,7 @@
 //!   cannot acquire a lane are moved back to pending.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,7 @@ use apm2_core::fac::{
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -253,6 +254,16 @@ pub fn run_fac_worker(
     print_unit: bool,
 ) -> u8 {
     let poll_interval_secs = poll_interval_secs.min(MAX_POLL_INTERVAL_SECS);
+    if json_output {
+        emit_worker_event(
+            "worker_started",
+            serde_json::json!({
+                "once": once,
+                "poll_interval_secs": poll_interval_secs,
+                "max_jobs": max_jobs,
+            }),
+        );
+    }
 
     // Resolve queue root directory
     let queue_root = match resolve_queue_root() {
@@ -506,7 +517,7 @@ pub fn run_fac_worker(
                 persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
                 let _ = save_broker_state(&broker);
                 if json_output {
-                    print_json(&summary);
+                    emit_worker_summary(&summary);
                 } else {
                     eprintln!("worker: no pending jobs found");
                 }
@@ -519,6 +530,15 @@ pub fn run_fac_worker(
         for candidate in &candidates {
             if max_jobs > 0 && total_processed >= max_jobs {
                 break;
+            }
+            if json_output {
+                emit_worker_event(
+                    "job_started",
+                    serde_json::json!({
+                        "job_id": candidate.spec.job_id,
+                        "queue_lane": candidate.spec.queue_lane,
+                    }),
+                );
             }
 
             let lane = parse_queue_lane(&candidate.spec.queue_lane);
@@ -552,24 +572,63 @@ pub fn run_fac_worker(
             match &outcome {
                 JobOutcome::Quarantined { reason } => {
                     summary.jobs_quarantined += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_failed",
+                            serde_json::json!({
+                                "job_id": candidate.spec.job_id,
+                                "outcome": "quarantined",
+                                "reason": reason,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: quarantined {}: {reason}", candidate.path.display());
                     }
                 },
                 JobOutcome::Denied { reason } => {
                     summary.jobs_denied += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_failed",
+                            serde_json::json!({
+                                "job_id": candidate.spec.job_id,
+                                "outcome": "denied",
+                                "reason": reason,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: denied {}: {reason}", candidate.spec.job_id);
                     }
                 },
                 JobOutcome::Completed { job_id } => {
                     summary.jobs_completed += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_completed",
+                            serde_json::json!({
+                                "job_id": job_id,
+                                "outcome": "completed",
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: completed {job_id}");
                     }
                 },
                 JobOutcome::Skipped { reason } => {
                     summary.jobs_skipped += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_skipped",
+                            serde_json::json!({
+                                "job_id": candidate.spec.job_id,
+                                "outcome": "skipped",
+                                "reason": reason,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: skipped: {reason}");
                     }
@@ -588,7 +647,7 @@ pub fn run_fac_worker(
                 persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
                 let _ = save_broker_state(&broker);
                 if json_output {
-                    print_json(&summary);
+                    emit_worker_summary(&summary);
                 }
                 return exit_codes::SUCCESS;
             }
@@ -609,7 +668,7 @@ pub fn run_fac_worker(
     }
 
     if json_output {
-        print_json(&summary);
+        emit_worker_summary(&summary);
     }
 
     persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
@@ -1216,6 +1275,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3214,20 +3274,61 @@ fn sleep_remaining(cycle_start: Instant, poll_interval_secs: u64) {
 /// Outputs a worker error message.
 fn output_worker_error(json_output: bool, message: &str) {
     if json_output {
-        let err = serde_json::json!({
-            "error": message,
-        });
-        eprintln!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+        emit_worker_event(
+            "worker_error",
+            serde_json::json!({
+                "error": "fac_worker_failed",
+                "message": message,
+            }),
+        );
     } else {
-        eprintln!("worker error: {message}");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error": "fac_worker_failed",
+                "message": message,
+            }))
+            .unwrap_or_default()
+        );
     }
 }
 
-/// Prints a JSON-serializable value to stdout.
-fn print_json<T: Serialize>(value: &T) {
-    if let Ok(json) = serde_json::to_string_pretty(value) {
-        println!("{json}");
+fn worker_ts_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn emit_worker_jsonl(value: &serde_json::Value) {
+    if let Ok(line) = serde_json::to_string(value) {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
     }
+}
+
+fn emit_worker_event(event: &str, extra: serde_json::Value) {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "event".to_string(),
+        serde_json::Value::String(event.to_string()),
+    );
+    map.insert("ts".to_string(), serde_json::Value::String(worker_ts_now()));
+    match extra {
+        serde_json::Value::Object(extra_map) => {
+            for (key, value) in extra_map {
+                map.insert(key, value);
+            }
+        },
+        other => {
+            map.insert("data".to_string(), other);
+        },
+    }
+    emit_worker_jsonl(&serde_json::Value::Object(map));
+}
+
+fn emit_worker_summary(summary: &WorkerSummary) {
+    let data = serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}));
+    emit_worker_event("worker_summary", data);
 }
 
 // =============================================================================
@@ -3741,6 +3842,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -3812,6 +3918,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),

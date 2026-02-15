@@ -114,6 +114,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "ctrlc",
  "directories",
  "fs2",
  "futures",

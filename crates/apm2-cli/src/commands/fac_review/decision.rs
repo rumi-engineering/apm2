@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use super::fenced_yaml;
 use super::target::resolve_pr_target;
 use super::types::{
     ReviewRunStatus, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, TerminationAuthority,
@@ -61,6 +62,10 @@ struct DecisionEntry {
     set_by: String,
     #[serde(default)]
     set_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +140,10 @@ struct DimensionDecisionView {
     set_by: String,
     set_at: String,
     sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
 }
 
 pub fn run_verdict_show(
@@ -209,6 +218,8 @@ pub fn run_verdict_set(
             reason: reason.unwrap_or_default().trim().to_string(),
             set_by: actor,
             set_at: now_iso8601(),
+            model_id: None,
+            backend_id: None,
         },
     );
 
@@ -424,7 +435,7 @@ fn parse_decision_comments_for_author(
 }
 
 fn parse_decision_comment(comment: &IssueComment) -> Result<ParsedDecisionComment, String> {
-    let yaml_block = extract_fenced_yaml(&comment.body)
+    let yaml_block = fenced_yaml::extract_fenced_yaml(&comment.body)
         .ok_or_else(|| "missing fenced yaml block in decision comment".to_string())?;
     let payload: DecisionComment = serde_yaml::from_str(yaml_block)
         .map_err(|err| format!("failed to parse decision yaml: {err}"))?;
@@ -436,14 +447,6 @@ fn parse_decision_comment(comment: &IssueComment) -> Result<ParsedDecisionCommen
         comment: comment.clone(),
         payload,
     })
-}
-
-fn extract_fenced_yaml(body: &str) -> Option<&str> {
-    let start_marker = "```yaml\n";
-    let start = body.find(start_marker)?;
-    let yaml_start = start + start_marker.len();
-    let end = body[yaml_start..].find("\n```")?;
-    Some(body[yaml_start..yaml_start + end].trim())
 }
 
 fn latest_decision_comment(entries: &[ParsedDecisionComment]) -> Option<&ParsedDecisionComment> {
@@ -585,6 +588,8 @@ fn build_report_from_payload(
                 set_by: entry.set_by.clone(),
                 set_at: entry.set_at.clone(),
                 sha: payload.sha.clone(),
+                model_id: normalize_optional_text(entry.model_id.as_deref()),
+                backend_id: normalize_optional_text(entry.backend_id.as_deref()),
             }
         } else {
             fail_closed = true;
@@ -596,6 +601,8 @@ fn build_report_from_payload(
                 set_by: String::new(),
                 set_at: String::new(),
                 sha: payload.sha.clone(),
+                model_id: None,
+                backend_id: None,
             }
         };
         dimensions.push(view);
@@ -628,8 +635,17 @@ fn build_unknown_dimension_views(head_sha: &str) -> Vec<DimensionDecisionView> {
             set_by: String::new(),
             set_at: String::new(),
             sha: head_sha.to_string(),
+            model_id: None,
+            backend_id: None,
         })
         .collect()
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn normalize_decision_value(input: &str) -> Option<&'static str> {
@@ -866,11 +882,7 @@ pub(super) fn resolve_completion_signal_from_projection_for_home(
 }
 
 fn render_decision_comment_body(payload: &DecisionComment) -> Result<String, String> {
-    let yaml = serde_yaml::to_string(payload)
-        .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
-    Ok(format!(
-        "<!-- {DECISION_MARKER} -->\n```yaml\n# {DECISION_MARKER}\n{yaml}```\n"
-    ))
+    fenced_yaml::render_marked_yaml_comment(DECISION_MARKER, payload)
 }
 
 fn create_decision_comment(
@@ -919,34 +931,12 @@ fn cache_written_decision_comment(
 }
 
 fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<(), String> {
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(report)
-                .map_err(|err| format!("failed to serialize decision report: {err}"))?
-        );
-        return Ok(());
-    }
-
-    println!("FAC Review Decision");
-    println!("  PR:            #{}", report.pr_number);
-    println!("  Head SHA:      {}", report.head_sha);
-    println!("  Overall:       {}", report.overall_decision);
-    if let Some(url) = &report.source_comment_url {
-        println!("  Source:        {url}");
-    }
-    for dimension in &report.dimensions {
-        println!("  - {}: {}", dimension.dimension, dimension.decision);
-        if !dimension.reason.is_empty() {
-            println!("      reason: {}", dimension.reason);
-        }
-    }
-    if !report.errors.is_empty() {
-        println!("  Errors:");
-        for error in &report.errors {
-            println!("    - {error}");
-        }
-    }
+    let _ = json_output;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report)
+            .map_err(|err| format!("failed to serialize decision report: {err}"))?
+    );
     Ok(())
 }
 
@@ -1240,6 +1230,8 @@ mod tests {
                 set_by: String::new(),
                 set_at: String::new(),
                 sha: "abc".to_string(),
+                model_id: None,
+                backend_id: None,
             },
             DimensionDecisionView {
                 dimension: CODE_QUALITY_DIMENSION.to_string(),
@@ -1248,6 +1240,8 @@ mod tests {
                 set_by: String::new(),
                 set_at: String::new(),
                 sha: "abc".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         ];
         assert_eq!(aggregate_overall_decision(&dimensions), "deny");
@@ -1263,6 +1257,8 @@ mod tests {
                 reason: String::new(),
                 set_by: String::new(),
                 set_at: String::new(),
+                model_id: None,
+                backend_id: None,
             },
         );
         dimensions.insert(
@@ -1272,6 +1268,8 @@ mod tests {
                 reason: String::new(),
                 set_by: String::new(),
                 set_at: String::new(),
+                model_id: None,
+                backend_id: None,
             },
         );
         let payload = DecisionComment {
@@ -1370,6 +1368,8 @@ dimensions:
                 reason: String::new(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
             },
         );
         let payload = DecisionComment {

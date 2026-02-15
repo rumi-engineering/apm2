@@ -206,9 +206,9 @@ pub fn build_bounded_test_command(
 }
 
 fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String, String)]) {
-    for (key, _value) in setenv_pairs {
+    for (key, value) in setenv_pairs {
         command.push("--setenv".to_string());
-        command.push(key.clone());
+        command.push(format!("{key}={value}"));
     }
 }
 
@@ -453,10 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn append_systemd_setenv_args_only_passes_names() {
+    fn append_systemd_setenv_args_passes_key_value_pairs() {
         let mut command = Vec::new();
         append_systemd_setenv_args(&mut command, &[("TOKEN".to_string(), "abcd".to_string())]);
-        assert_eq!(command, vec!["--setenv".to_string(), "TOKEN".to_string()]);
-        assert!(command.iter().all(|arg: &String| !arg.contains('=')));
+        assert_eq!(
+            command,
+            vec!["--setenv".to_string(), "TOKEN=abcd".to_string()]
+        );
     }
 }
