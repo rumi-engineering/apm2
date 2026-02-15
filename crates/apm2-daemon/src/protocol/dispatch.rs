@@ -7911,6 +7911,7 @@ impl PrivilegedDispatcher {
             declared_leakage_budget_bits: boundary_flow.claimed_leakage_budget_bits,
             timing_budget_policy_max_ticks: Some(boundary_flow.timing_budget_policy_max_ticks),
             declared_timing_budget_ticks: boundary_flow.claimed_timing_budget_ticks,
+            token_binding: None,
         }
     }
 

@@ -66,7 +66,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use apm2_core::channel::{
-    ChannelBoundaryDefect, decode_channel_context_token, validate_channel_boundary,
+    ChannelBoundaryDefect, ExpectedTokenBinding, decode_channel_context_token_with_binding,
+    validate_channel_boundary,
 };
 use apm2_core::crypto::Signer;
 use apm2_core::economics::admission::{
@@ -83,7 +84,7 @@ use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
-    validate_job_spec, validate_job_spec_control_lane,
+    parse_b3_256_digest, validate_job_spec, validate_job_spec_control_lane,
 };
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
@@ -949,6 +950,11 @@ fn process_job(
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -1161,12 +1167,25 @@ fn process_job(
     // Use monotonic wall-clock seconds for token temporal validation.
     let current_time_secs = current_timestamp_epoch_secs();
 
-    let boundary_check = match decode_channel_context_token(
+    // TCK-00565: Build expected token binding for fail-closed validation.
+    // Parse the canonicalizer tuple digest from the b3-256 hex string to raw bytes.
+    let ct_digest_bytes = parse_b3_256_digest(canonicalizer_tuple_digest);
+    let expected_binding = ct_digest_bytes
+        .as_ref()
+        .map(|ct_bytes| ExpectedTokenBinding {
+            fac_policy_hash: policy_digest,
+            canonicalizer_tuple_digest: ct_bytes,
+            boundary_id: DEFAULT_BOUNDARY_ID,
+            current_tick: broker.current_tick(),
+        });
+
+    let boundary_check = match decode_channel_context_token_with_binding(
         token,
         verifying_key,
         &spec.actuation.lease_id,
         current_time_secs,
         &spec.actuation.request_id,
+        expected_binding.as_ref(),
     ) {
         Ok(check) => check,
         Err(e) => {
@@ -1299,7 +1318,10 @@ fn process_job(
 
     // Validate boundary check defects.
     let defects = validate_channel_boundary(&boundary_check);
-    let boundary_trace = build_channel_boundary_trace(&defects);
+    // TCK-00565: Include decoded token binding in the boundary trace for receipt
+    // audit.
+    let boundary_trace =
+        build_channel_boundary_trace_with_binding(&defects, boundary_check.token_binding.as_ref());
     if !defects.is_empty() {
         let reason = format!(
             "channel boundary violations: {}",
@@ -2955,7 +2977,10 @@ fn compute_job_spec_digest_preview(bytes: &[u8]) -> String {
     format!("b3-256:{}", hash.to_hex())
 }
 
-fn build_channel_boundary_trace(defects: &[ChannelBoundaryDefect]) -> ChannelBoundaryTrace {
+fn build_channel_boundary_trace_with_binding(
+    defects: &[ChannelBoundaryDefect],
+    binding: Option<&apm2_core::channel::TokenBindingV1>,
+) -> ChannelBoundaryTrace {
     let mut defect_classes = Vec::new();
     for defect in defects.iter().take(MAX_BOUNDARY_DEFECT_CLASSES) {
         defect_classes.push(strip_json_string_quotes(&serialize_to_json_string(
@@ -2964,10 +2989,27 @@ fn build_channel_boundary_trace(defects: &[ChannelBoundaryDefect]) -> ChannelBou
     }
 
     let defect_count = u32::try_from(defects.len()).unwrap_or(u32::MAX);
+
+    let (policy_hash, tuple_digest, boundary_id, issued_at_tick, expiry_tick) =
+        binding.map_or((None, None, None, None, None), |b| {
+            (
+                Some(hex::encode(b.fac_policy_hash)),
+                Some(hex::encode(b.canonicalizer_tuple_digest)),
+                Some(b.boundary_id.clone()),
+                Some(b.issued_at_tick),
+                Some(b.expiry_tick),
+            )
+        });
+
     ChannelBoundaryTrace {
         passed: defects.is_empty(),
         defect_count,
         defect_classes,
+        token_fac_policy_hash: policy_hash,
+        token_canonicalizer_tuple_digest: tuple_digest,
+        token_boundary_id: boundary_id,
+        token_issued_at_tick: issued_at_tick,
+        token_expiry_tick: expiry_tick,
     }
 }
 
@@ -3358,6 +3400,11 @@ mod tests {
             passed: true,
             defect_count: 0,
             defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),

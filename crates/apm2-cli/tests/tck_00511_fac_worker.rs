@@ -155,6 +155,7 @@ fn baseline_check() -> ChannelBoundaryCheck {
         declared_leakage_budget_bits: None,
         timing_budget_policy_max_ticks: Some(10),
         declared_timing_budget_ticks: None,
+        token_binding: None,
     }
 }
 

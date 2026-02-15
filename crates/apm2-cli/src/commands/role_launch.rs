@@ -696,6 +696,7 @@ fn enforce_channel_boundary(
         declared_leakage_budget_bits: channel_context.declared_leakage_budget_bits,
         timing_budget_policy_max_ticks: channel_context.timing_budget_policy_max_ticks,
         declared_timing_budget_ticks: channel_context.declared_timing_budget_ticks,
+        token_binding: None,
     };
     let defects = validate_channel_boundary(&check);
     if defects.is_empty() {
@@ -1683,6 +1684,7 @@ mod tests {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
+            token_binding: None,
         }
     }
 
