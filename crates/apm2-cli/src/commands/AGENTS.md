@@ -143,6 +143,13 @@ pub enum EventSubcommand {
 
 Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK), and `message` (including actionable remediation). Credentials checks are WARN-only to avoid blocking local-only workflows.
 
+#### Worker Liveness Path Invariant (TCK-00607)
+
+- The daemon doctor `worker_liveness` probe must mirror daemon cache-path derivation exactly:
+  - if `ledger_db_path` is set, cache path is `ledger_db_path.with_extension("projection_cache.db")`
+  - otherwise, cache path is `{state_file_parent}/projection_cache.db`
+- When daemon is running, doctor probes runtime `--state-file` / `--ledger-db` overrides from `/proc/<pid>/cmdline` (resolved against daemon cwd) before evaluating cache presence. This prevents false negatives when runtime paths differ from static config.
+
 ### Process Management (process.rs)
 
 | Function | Description |

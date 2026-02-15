@@ -596,6 +596,8 @@ struct LegacyReviewRunStateV1 {
     backend_id: Option<String>,
     #[serde(default)]
     restart_count: u32,
+    #[serde(default)]
+    nudge_count: u32,
     sequence_number: u32,
     #[serde(default)]
     previous_run_id: Option<String>,
@@ -708,6 +710,7 @@ fn migrate_legacy_run_state_for_home(
         model_id: legacy.model_id,
         backend_id: legacy.backend_id,
         restart_count: legacy.restart_count,
+        nudge_count: legacy.nudge_count,
         sequence_number: legacy.sequence_number,
         previous_run_id: legacy.previous_run_id,
         previous_head_sha: legacy.previous_head_sha,
@@ -1709,6 +1712,7 @@ mod tests {
             model_id: Some("gpt-5.3-codex".to_string()),
             backend_id: Some("codex".to_string()),
             restart_count: 1,
+            nudge_count: 0,
             sequence_number: 3,
             previous_run_id: None,
             previous_head_sha: None,

@@ -60,6 +60,7 @@ apm2 fac review run --pr <N> --type all
   transient units before they start (TCK-00548). Stripping is enforced via both the
   setenv allowlist and `env_remove_keys` on the spawned process.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
+- **One-shot missing-verdict nudge**: On clean exit without a completion signal, orchestrator resumes the same session once (`SpawnMode::Resume`) with an explicit required `apm2 fac verdict set ...` command; crash/timeout paths still fall through to existing auto-verdict behavior.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.
 - **Per-SHA finding comments**: `apm2 fac review comment` writes one finding per comment using an `apm2-finding:v1` marker and `apm2.finding.v1` metadata block.
@@ -180,6 +181,7 @@ pub struct ReviewRunState {
     pub model_id: Option<String>,
     pub backend_id: Option<String>,
     pub restart_count: u32,
+    pub nudge_count: u32,
     pub sequence_number: u32,
     pub previous_run_id: Option<String>,
     pub previous_head_sha: Option<String>,
@@ -302,3 +304,8 @@ pub use types::ReviewRunType;
   - `fetch_pr_body_for_projection()` no longer makes a redundant GitHub API call when the first call returns empty and the local snapshot is also empty.
   - Restored `review_artifact_lint` in `post_test_script_gates` in both `run_evidence_gates()` and `run_evidence_gates_with_status()` — the gate was accidentally dropped during bounded-runner refactoring.
   - `run_doctor()` `json_output` parameter is now explicit (no underscore prefix) with documentation that doctor `--pr` intentionally always emits JSON as a machine-readable diagnostic surface.
+- TCK-00607: Doctor activity metrics + one-shot reviewer nudge + timeout consistency.
+  - `apm2 fac doctor --pr <N>` now surfaces per-agent `tool_call_count`, `log_line_count`, and `nudge_count` keyed by `run_id` when available.
+  - Event scanning for doctor is explicitly bounded (`DOCTOR_EVENT_SCAN_MAX_LINES`, `DOCTOR_EVENT_SCAN_MAX_LINE_BYTES`) and scans both current and rotated review event logs.
+  - Log counting is bounded (`DOCTOR_LOG_SCAN_MAX_BYTES`, `DOCTOR_LOG_SCAN_MAX_LINES`) to avoid unbounded memory/CPU growth on large logs.
+  - `ReviewRunState` persists `nudge_count`; orchestrator emits `nudge_resume` and allows at most one nudge per run (`MAX_MISSING_VERDICT_NUDGES = 1`), disabled via `APM2_FAC_DISABLE_NUDGE`.

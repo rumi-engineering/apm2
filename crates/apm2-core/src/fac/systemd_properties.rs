@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(properties.memory_max_bytes, 51_539_607_552);
         assert_eq!(properties.tasks_max, 1536);
         assert_eq!(properties.io_weight, 100);
-        assert_eq!(properties.timeout_start_sec, 240);
+        assert_eq!(properties.timeout_start_sec, 600);
         assert_eq!(properties.runtime_max_sec, 1800);
         assert_eq!(properties.kill_mode, "control-group");
     }
@@ -129,7 +129,7 @@ mod tests {
         let mut profile =
             LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
         profile.resource_profile.memory_max_bytes = 10_000;
-        profile.timeouts.test_timeout_seconds = 240;
+        profile.timeouts.test_timeout_seconds = 600;
 
         let constraints = JobConstraints {
             require_nextest: false,
@@ -150,7 +150,7 @@ mod tests {
             SystemdUnitProperties::from_lane_profile(&profile, Some(&loose_constraints));
 
         assert_eq!(constrained_properties.memory_max_bytes, 10_000);
-        assert_eq!(constrained_properties.timeout_start_sec, 240);
+        assert_eq!(constrained_properties.timeout_start_sec, 600);
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
             "MemoryMax=51539607552",
             "TasksMax=1536",
             "IOWeight=100",
-            "TimeoutStartSec=240",
+            "TimeoutStartSec=600",
             "RuntimeMaxSec=1800",
             "KillMode=control-group",
         ];
@@ -185,7 +185,7 @@ mod tests {
             ("MemoryMax".to_string(), "51539607552".to_string()),
             ("TasksMax".to_string(), "1536".to_string()),
             ("IOWeight".to_string(), "100".to_string()),
-            ("TimeoutStartSec".to_string(), "240".to_string()),
+            ("TimeoutStartSec".to_string(), "600".to_string()),
             ("RuntimeMaxSec".to_string(), "1800".to_string()),
             ("KillMode".to_string(), "control-group".to_string()),
         ];
