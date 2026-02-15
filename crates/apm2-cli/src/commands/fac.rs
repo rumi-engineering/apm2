@@ -253,6 +253,12 @@ pub enum FacSubcommand {
     /// same cgroup as the reference process. When sccache is enabled and
     /// containment fails, reports that sccache should be auto-disabled.
     Verify(VerifyArgs),
+    /// Evidence bundle export/import with RFC-0028/RFC-0029 validation.
+    ///
+    /// Export produces a self-describing envelope + blobs for a job.
+    /// Import validates RFC-0028 channel boundary and RFC-0029 economics
+    /// receipts, rejecting bundles that fail either check (fail-closed).
+    Bundle(BundleArgs),
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -726,6 +732,58 @@ pub struct ContainmentArgs {
     pub sccache_enabled: bool,
 
     /// Output in JSON format.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac bundle`.
+#[derive(Debug, Args)]
+pub struct BundleArgs {
+    #[command(subcommand)]
+    pub subcommand: BundleSubcommand,
+}
+
+/// Bundle subcommands.
+#[derive(Debug, Subcommand)]
+pub enum BundleSubcommand {
+    /// Export an evidence bundle for a job.
+    ///
+    /// Produces a self-describing envelope JSON + referenced blobs under
+    /// an export directory. The envelope includes RFC-0028 boundary check
+    /// data and RFC-0029 economics traces from the job receipt.
+    Export(BundleExportArgs),
+    /// Import an evidence bundle from a path.
+    ///
+    /// Validates RFC-0028 channel boundary (must pass with zero defects)
+    /// and RFC-0029 economics receipts (must be Allow verdicts). Rejects
+    /// bundles that fail either validation (fail-closed).
+    Import(BundleImportArgs),
+}
+
+/// Arguments for `apm2 fac bundle export`.
+#[derive(Debug, Args)]
+pub struct BundleExportArgs {
+    /// Job ID to export the evidence bundle for.
+    pub job_id: String,
+
+    /// Output directory for the exported bundle.
+    ///
+    /// Defaults to `$APM2_HOME/private/fac/bundles/<job_id>/`.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac bundle import`.
+#[derive(Debug, Args)]
+pub struct BundleImportArgs {
+    /// Path to the evidence bundle envelope JSON file.
+    pub path: PathBuf,
+
+    /// Emit JSON output.
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -1802,6 +1860,7 @@ pub fn run_fac(
             | FacSubcommand::Quarantine(_)
             | FacSubcommand::Job(_)
             | FacSubcommand::Verify(_)
+            | FacSubcommand::Bundle(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2264,6 +2323,14 @@ pub fn run_fac(
                 run_verify_containment(containment_args, resolve_json(containment_args.json))
             },
         },
+        FacSubcommand::Bundle(args) => match &args.subcommand {
+            BundleSubcommand::Export(export_args) => {
+                run_bundle_export(export_args, resolve_json(export_args.json))
+            },
+            BundleSubcommand::Import(import_args) => {
+                run_bundle_import(import_args, resolve_json(import_args.json))
+            },
+        },
     }
 }
 
@@ -2291,7 +2358,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Broker(_)
         | FacSubcommand::Gc(_)
         | FacSubcommand::Quarantine(_)
-        | FacSubcommand::Verify(_) => true,
+        | FacSubcommand::Verify(_)
+        | FacSubcommand::Bundle(_) => true,
     }
 }
 
@@ -4419,6 +4487,185 @@ fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
         exit_codes::SUCCESS
     } else {
         exit_codes::VALIDATION_ERROR
+    }
+}
+
+// =============================================================================
+// Bundle Export/Import (TCK-00527)
+// =============================================================================
+
+/// Maximum envelope file size for bounded reads during import (256 KiB).
+const MAX_BUNDLE_ENVELOPE_FILE_SIZE: u64 = 262_144;
+
+/// Runs `apm2 fac bundle export <job_id>`.
+fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
+    let fac_root =
+        apm2_core::github::resolve_apm2_home().map(|home| home.join("private").join("fac"));
+
+    let Some(fac_root) = fac_root else {
+        return output_error(
+            json_output,
+            "fac_home_not_resolved",
+            "cannot resolve $APM2_HOME for FAC root",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = fac_root.join("receipts");
+
+    // Look up the job receipt.
+    let Some(receipt) = apm2_core::fac::lookup_job_receipt(&receipts_dir, &args.job_id) else {
+        return output_error(
+            json_output,
+            "fac_bundle_receipt_not_found",
+            &format!("no receipt found for job_id={}", args.job_id),
+            exit_codes::NOT_FOUND,
+        );
+    };
+
+    // Build the envelope with default export config (no policy binding or
+    // advanced boundary substructures for local-only export).
+    let config = apm2_core::fac::evidence_bundle::BundleExportConfig::default();
+    let envelope = match apm2_core::fac::evidence_bundle::build_evidence_bundle_envelope(
+        &receipt,
+        &config,
+        &[], // No blobs for local-only export.
+    ) {
+        Ok(env) => env,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_export_failed",
+                &format!("failed to build evidence bundle: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Determine output directory.
+    let output_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| fac_root.join("bundles").join(&args.job_id));
+
+    // Create output directory.
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        return output_error(
+            json_output,
+            "fac_bundle_export_mkdir_failed",
+            &format!(
+                "cannot create export directory {}: {e}",
+                output_dir.display()
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Serialize and write the envelope.
+    let data = match apm2_core::fac::evidence_bundle::serialize_envelope(&envelope) {
+        Ok(d) => d,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_export_serialize_failed",
+                &format!("failed to serialize envelope: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let envelope_path = output_dir.join("envelope.json");
+    if let Err(e) = std::fs::write(&envelope_path, &data) {
+        return output_error(
+            json_output,
+            "fac_bundle_export_write_failed",
+            &format!("failed to write envelope: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let result = serde_json::json!({
+        "status": "exported",
+        "job_id": args.job_id,
+        "envelope_path": envelope_path.display().to_string(),
+        "content_hash": envelope.content_hash,
+        "blob_count": envelope.blob_refs.len(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+
+    exit_codes::SUCCESS
+}
+
+/// Runs `apm2 fac bundle import <path>`.
+fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
+    let path = &args.path;
+
+    // Bounded file read.
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot read {}: {e}", path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if metadata.len() > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+        return output_error(
+            json_output,
+            "fac_bundle_import_too_large",
+            &format!(
+                "envelope file too large: {} bytes > {} max",
+                metadata.len(),
+                MAX_BUNDLE_ENVELOPE_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot read {}: {e}", path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Fail-closed import validation.
+    match apm2_core::fac::evidence_bundle::import_evidence_bundle(&data) {
+        Ok(envelope) => {
+            let result = serde_json::json!({
+                "status": "imported",
+                "job_id": envelope.receipt.job_id,
+                "schema": envelope.schema,
+                "content_hash": envelope.content_hash,
+                "boundary_source": format!("{:?}", envelope.boundary_check.source),
+                "queue_admission_verdict": envelope.economics_trace.queue_admission.verdict,
+                "budget_admission_verdict": envelope.economics_trace.budget_admission.verdict,
+                "blob_count": envelope.blob_refs.len(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+            exit_codes::SUCCESS
+        },
+        Err(e) => output_error(
+            json_output,
+            "fac_bundle_import_validation_failed",
+            &format!("bundle import rejected (fail-closed): {e}"),
+            exit_codes::VALIDATION_ERROR,
+        ),
     }
 }
 

@@ -652,6 +652,57 @@ user-mode and system-mode execution backends.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
+## evidence_bundle Submodule (TCK-00527)
+
+The `evidence_bundle` submodule implements evidence bundle export/import commands
+exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-only).
+
+### Key Types
+
+- `EvidenceBundleEnvelopeV1`: Self-describing envelope containing a job receipt,
+  RFC-0028 boundary check reconstruction data, RFC-0029 economics traces, optional
+  policy binding, blob references, and a BLAKE3 content hash.
+- `BundleBoundaryCheckV1`: RFC-0028 boundary check reconstruction data carrying all
+  fields required by `validate_channel_boundary()`.
+- `BundleEconomicsTraceV1`: RFC-0029 economics traces (queue admission + budget
+  admission).
+- `BundleExportConfig`: Configuration for export carrying optional boundary-check
+  substructures (leakage budget, timing channel, disclosure policy, policy binding).
+
+### Core Capabilities
+
+- `build_evidence_bundle_envelope()`: Builds an envelope from a job receipt and
+  export config. Requires RFC-0028 boundary trace, RFC-0029 queue admission trace,
+  and RFC-0029 budget admission trace in the receipt (fail-closed on missing traces).
+  Computes BLAKE3 content hash with domain-separated, length-prefixed encoding.
+- `serialize_envelope()`: Serializes the envelope to JSON bytes.
+- `import_evidence_bundle()`: Imports and validates an envelope from JSON bytes.
+  Enforces: bounded read (MAX_ENVELOPE_SIZE=256 KiB), schema verification, content
+  hash integrity, RFC-0028 boundary validation (zero defects required), RFC-0029
+  economics receipt validation (Allow verdicts required), and policy binding digest
+  matching.
+
+### CLI Commands
+
+- `apm2 fac bundle export <job_id>`: Exports an evidence bundle for a job to
+  `$APM2_HOME/private/fac/bundles/<job_id>/envelope.json`.
+- `apm2 fac bundle import <path>`: Imports and validates an evidence bundle from a
+  file path. Rejects bundles that fail RFC-0028 or RFC-0029 validation (fail-closed).
+
+### Security Invariants (TCK-00527)
+
+- [INV-EB-001] Import refuses when `validate_channel_boundary()` returns any
+  defects (boundary check invalid or policy binding mismatched).
+- [INV-EB-002] Import refuses when economics receipt traces are missing,
+  unverifiable, or carry non-Allow verdicts.
+- [INV-EB-003] Envelope reads are bounded by `MAX_ENVELOPE_SIZE` (256 KiB) before
+  deserialization.
+- [INV-EB-004] Envelope content hash is verified via BLAKE3 with constant-time
+  comparison after load.
+- [INV-EB-005] All collection fields are bounded (MAX_BUNDLE_BLOB_COUNT=256).
+- [INV-EB-006] Policy binding digest matching uses constant-time comparison
+  (`subtle::ConstantTimeEq::ct_eq()`).
+
 ## Receipt Versioning (TCK-00518)
 
 The `FacJobReceiptV1` type supports two canonical byte representations:
