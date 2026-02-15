@@ -317,7 +317,14 @@ fn main() -> Result<()> {
             (default_operator_socket(), default_session_socket())
         }
     } else {
-        (default_operator_socket(), default_session_socket())
+        // TCK-00595: Environment-based auto-config when no ecosystem.toml exists.
+        // Uses XDG-standard default paths and auto-detects GitHub coordinates
+        // from git remote + GITHUB_TOKEN from env for config-less startup.
+        let env_config = apm2_core::config::EcosystemConfig::from_env();
+        (
+            env_config.daemon.operator_socket,
+            env_config.daemon.session_socket,
+        )
     };
 
     // Alias for backward compatibility

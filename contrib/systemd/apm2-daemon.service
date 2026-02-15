@@ -1,5 +1,7 @@
+# TCK-00595: System-mode service unit (multi-user.target).
+# For user-mode, see contrib/systemd/user/apm2-daemon.service.
 [Unit]
-Description=APM2 Daemon — Forge Admission Cycle broker
+Description=APM2 Daemon — Forge Admission Cycle
 Documentation=https://github.com/guardian-intelligence/apm2
 After=network-online.target
 Wants=network-online.target
@@ -7,9 +9,8 @@ Requires=apm2-daemon.socket
 
 [Service]
 Type=simple
-# Adjust this path to match your deployment layout if different.
-ExecStart=%h/.cargo/bin/apm2 daemon --no-daemon
-ExecStop=%h/.cargo/bin/apm2 kill
+ExecStart=/usr/local/bin/apm2 daemon --no-daemon
+ExecStop=/usr/local/bin/apm2 kill
 Restart=always
 RestartSec=5
 WatchdogSec=300

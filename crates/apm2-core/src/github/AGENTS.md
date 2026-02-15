@@ -319,6 +319,20 @@ lease.revoke(
 assert!(lease.is_terminal());
 ```
 
+## Remote URL Parsing (TCK-00595)
+
+The module provides utility functions for parsing GitHub remote URLs:
+
+- `parse_github_remote_url(url) -> Option<(String, String)>`: Parses SSH, HTTPS, and HTTP
+  GitHub remote URLs into `(owner, repo)` tuples. Validates segments against `[a-zA-Z0-9._-]`.
+- `detect_github_owner_repo_from_cwd() -> Option<(String, String)>`: Runs `git remote get-url origin`
+  and parses the result. **For short-lived CLI only** — the daemon must use explicit config.
+
+**Contracts:**
+- [CTR-0801] `parse_github_remote_url` rejects URLs longer than 2048 bytes (DoS bound)
+- [CTR-0802] `parse_github_remote_url` rejects owner/repo segments with non-alphanumeric/`-._` chars
+- [CTR-0803] `detect_github_owner_repo_from_cwd` returns `None` on any git command failure
+
 ## Related Modules
 
 - [`apm2_core::lease`](../lease/AGENTS.md) - Core lease infrastructure (GateLease pattern)
