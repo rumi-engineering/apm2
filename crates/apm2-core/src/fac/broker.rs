@@ -44,6 +44,9 @@ use crate::economics::queue_admission::{
     HtfEvaluationWindow, RevocationFrontierSnapshot, TimeAuthorityEnvelopeV1,
     envelope_signature_canonical_bytes,
 };
+use crate::fac::broker_rate_limits::{
+    ControlPlaneBudget, ControlPlaneBudgetError, ControlPlaneLimits,
+};
 use crate::fac::canonicalizer_tuple::CanonicalizerTupleV1;
 use crate::fac::job_spec::parse_b3_256_digest;
 use crate::schema_registry::fac_schemas::{BoundedDeserializeError, bounded_from_slice_with_limit};
@@ -203,6 +206,10 @@ pub enum BrokerError {
         "admission health gate not satisfied: broker health check required before token issuance"
     )]
     AdmissionHealthGateNotSatisfied,
+
+    /// Control-plane rate limit or quota exceeded (TCK-00568).
+    #[error("control-plane budget denied: {0}")]
+    ControlPlaneBudgetDenied(#[from] ControlPlaneBudgetError),
 
     /// Job spec digest is zero (not bound).
     #[error("job_spec_digest is zero (not bound to a job)")]
@@ -443,6 +450,12 @@ pub struct FacBroker {
     /// Synchronization: protected by the same external lock that guards
     /// `&mut self` / `&self` access. No interior mutability.
     admission_health_gate_passed: bool,
+    /// Control-plane rate limits budget (TCK-00568).
+    ///
+    /// Tracks cumulative usage for token issuance, queue enqueue, and
+    /// bundle export operations. Admission is checked BEFORE mutation
+    /// (INV-CPRL-002). Protected by the same external lock as `&mut self`.
+    control_plane_budget: ControlPlaneBudget,
 }
 
 impl Default for FacBroker {
@@ -452,22 +465,49 @@ impl Default for FacBroker {
 }
 
 impl FacBroker {
-    /// Creates a new broker with a freshly generated signing key.
+    /// Creates a new broker with a freshly generated signing key and
+    /// default control-plane rate limits.
     ///
     /// The admission health gate starts as `false` (fail-closed:
     /// INV-BRK-HEALTH-GATE-001). A successful [`Self::check_health()`] or
     /// [`Self::evaluate_admission_health_gate()`] must occur before token
     /// issuance is permitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default control-plane limits fail validation (this is a
+    /// programming error — the defaults are compile-time constants that always
+    /// pass validation).
     #[must_use]
     pub fn new() -> Self {
+        // Default limits always pass validation.
+        let control_plane_budget = ControlPlaneBudget::new(ControlPlaneLimits::default())
+            .expect("default control-plane limits must be valid");
         Self {
             signer: Signer::generate(),
             state: BrokerState::default(),
             admission_health_gate_passed: false,
+            control_plane_budget,
         }
     }
 
-    /// Creates a broker from an existing signer and state.
+    /// Creates a new broker with the specified control-plane rate limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the limits exceed hard caps.
+    pub fn with_limits(limits: ControlPlaneLimits) -> Result<Self, BrokerError> {
+        let control_plane_budget = ControlPlaneBudget::new(limits)?;
+        Ok(Self {
+            signer: Signer::generate(),
+            state: BrokerState::default(),
+            admission_health_gate_passed: false,
+            control_plane_budget,
+        })
+    }
+
+    /// Creates a broker from an existing signer and state with default
+    /// control-plane rate limits.
     ///
     /// Used when loading persisted state from disk. The admission health
     /// gate starts as `false` (fail-closed: INV-BRK-HEALTH-GATE-001).
@@ -477,10 +517,33 @@ impl FacBroker {
     /// Returns an error if the loaded state fails validation.
     pub fn from_signer_and_state(signer: Signer, state: BrokerState) -> Result<Self, BrokerError> {
         state.validate()?;
+        let control_plane_budget = ControlPlaneBudget::new(ControlPlaneLimits::default())?;
         Ok(Self {
             signer,
             state,
             admission_health_gate_passed: false,
+            control_plane_budget,
+        })
+    }
+
+    /// Creates a broker from an existing signer, state, and control-plane
+    /// rate limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if state validation or limit validation fails.
+    pub fn from_signer_state_and_limits(
+        signer: Signer,
+        state: BrokerState,
+        limits: ControlPlaneLimits,
+    ) -> Result<Self, BrokerError> {
+        state.validate()?;
+        let control_plane_budget = ControlPlaneBudget::new(limits)?;
+        Ok(Self {
+            signer,
+            state,
+            admission_health_gate_passed: false,
+            control_plane_budget,
         })
     }
 
@@ -693,7 +756,7 @@ impl FacBroker {
     /// - `boundary_id` is empty or exceeds `MAX_BOUNDARY_ID_LENGTH`
     /// - Token serialization or signing fails
     pub fn issue_channel_context_token(
-        &self,
+        &mut self,
         job_spec_digest: &Hash,
         lease_id: &str,
         request_id: &str,
@@ -708,6 +771,10 @@ impl FacBroker {
         if !self.admission_health_gate_passed {
             return Err(BrokerError::AdmissionHealthGateNotSatisfied);
         }
+
+        // TCK-00568: Enforce control-plane token issuance rate limit.
+        // INV-CPRL-002: Budget check occurs BEFORE any state mutation.
+        self.control_plane_budget.admit_token_issuance()?;
 
         // Validate inputs (fail-closed)
         if bool::from(job_spec_digest.ct_eq(&[0u8; 32])) {
@@ -810,6 +877,56 @@ impl FacBroker {
             &self.signer,
             token_binding,
         )?)
+    }
+
+    // -----------------------------------------------------------------------
+    // TCK-00568: Control-plane rate limits
+    // -----------------------------------------------------------------------
+
+    /// Checks queue enqueue admission against the control-plane budget.
+    ///
+    /// Call this before enqueuing a job. The `bytes` parameter is the size
+    /// of the enqueued payload. Both the operation count and byte total are
+    /// checked.
+    ///
+    /// INV-CPRL-002: Budget check occurs BEFORE any state mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::ControlPlaneBudgetDenied`] if the enqueue
+    /// would exceed either the operation count or byte limit.
+    pub fn admit_queue_enqueue(&mut self, bytes: u64) -> Result<(), BrokerError> {
+        self.control_plane_budget.admit_queue_enqueue(bytes)?;
+        Ok(())
+    }
+
+    /// Checks bundle export admission against the control-plane budget.
+    ///
+    /// Call this before exporting a bundle. The `bytes` parameter is the
+    /// size of the exported bundle.
+    ///
+    /// INV-CPRL-002: Budget check occurs BEFORE any state mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::ControlPlaneBudgetDenied`] if the export
+    /// would exceed the byte limit.
+    pub fn admit_bundle_export(&mut self, bytes: u64) -> Result<(), BrokerError> {
+        self.control_plane_budget.admit_bundle_export(bytes)?;
+        Ok(())
+    }
+
+    /// Resets control-plane budget counters for a new window.
+    ///
+    /// Typically called at tick advancement boundaries.
+    pub const fn reset_control_plane_budget(&mut self) {
+        self.control_plane_budget.reset();
+    }
+
+    /// Returns a reference to the control-plane budget for observability.
+    #[must_use]
+    pub const fn control_plane_budget(&self) -> &ControlPlaneBudget {
+        &self.control_plane_budget
     }
 
     // -----------------------------------------------------------------------
