@@ -53,7 +53,20 @@ const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
 /// are never forwarded. This prevents cache poisoning from sccache
 /// daemons running outside the job's cgroup (MAJOR-1, MAJOR-3 fix per
 /// TCK-00548 review findings).
-const SYSTEMD_SETENV_ALLOWLIST_PREFIXES: &[&str] = &[];
+///
+/// TCK-00526: Prefixes aligned with
+/// `FacPolicyV1::default_policy().env_allowlist_prefixes`
+/// so that policy-derived environment variables (e.g. `LC_ALL`, `TERM`,
+/// `XDG_RUNTIME_DIR`) pass the setenv allowlist validation in
+/// `build_systemd_setenv_pairs`.
+///
+/// NOTE: `RUST` and `CARGO_` are intentionally NOT included as prefixes
+/// here. Specific RUST*/CARGO_* variables are enumerated in the exact
+/// list instead, which prevents `RUSTC_WRAPPER` (sccache) from sneaking
+/// through. The prefixes below cover locale, terminal, and XDG
+/// variables that the policy allowlist inherits from the ambient
+/// environment.
+const SYSTEMD_SETENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_", "TERM", "XDG_"];
 
 /// Env var keys that are explicitly stripped from the spawned bounded
 /// test process environment to prevent inheritance from the parent.
