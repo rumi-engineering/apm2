@@ -78,6 +78,11 @@ const MAX_LOG_ENTRIES: usize = 10_000;
 /// Maximum directory recursion depth while enforcing log quota.
 const MAX_LOG_QUOTA_DIR_DEPTH: usize = 8;
 
+/// Maximum number of directory entries read per directory during log quota
+/// enforcement. Prevents directory-flood `DoS` where an attacker creates
+/// millions of subdirectories. Matches INV-RMTREE-009 from `safe_rmtree_v1`.
+const MAX_DIR_ENTRIES: usize = 10_000;
+
 /// Default lane count when not configured via environment.
 pub const DEFAULT_LANE_COUNT: usize = 3;
 
@@ -1562,12 +1567,32 @@ impl LaneManager {
             });
         }
 
+        // Bound per-directory breadth to prevent directory-flood DoS
+        // (INV-RMTREE-009). An attacker can create millions of entries in the
+        // logs directory; without this cap the worker would spin reading all of
+        // them and starve.
+        let mut dir_entry_count: usize = 0;
+
         for entry in fs::read_dir(base).map_err(|e| LaneCleanupError::LogQuotaFailed {
             step: CLEANUP_STEP_LOG_QUOTA,
             reason: format!("cannot read logs directory {}: {e}", base.display()),
             steps_completed: steps_completed.to_vec(),
             failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
         })? {
+            dir_entry_count += 1;
+            if dir_entry_count > MAX_DIR_ENTRIES {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!(
+                        "log directory {} contains more than {MAX_DIR_ENTRIES} entries \
+                         (directory-flood DoS prevention)",
+                        base.display()
+                    ),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
+
             let entry = entry.map_err(|e| LaneCleanupError::LogQuotaFailed {
                 step: CLEANUP_STEP_LOG_QUOTA,
                 reason: format!("cannot read log directory entry: {e}"),
@@ -3229,6 +3254,40 @@ mod tests {
         assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
         assert_eq!(entries.len(), MAX_LOG_ENTRIES);
         assert!(total_size > 0);
+    }
+
+    #[test]
+    fn collect_log_entries_rejects_dir_entry_flood() {
+        // Regression test for directory-flood DoS prevention
+        // (f-685-security-1771184894734689-0). The read_dir iteration must
+        // be bounded by MAX_DIR_ENTRIES, including subdirectories.
+        let logs_dir = tempfile::tempdir().expect("tempdir");
+        // Create MAX_DIR_ENTRIES + 1 subdirectories (all count toward the
+        // per-directory breadth limit).
+        for idx in 0..=MAX_DIR_ENTRIES {
+            fs::create_dir(logs_dir.path().join(format!("subdir_{idx}"))).expect("create subdir");
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size = 0;
+        let steps_completed = Vec::new();
+        let err = LaneManager::collect_log_entries(
+            logs_dir.path(),
+            &mut entries,
+            &mut total_size,
+            0,
+            &steps_completed,
+        )
+        .expect_err("directory-flood should be rejected");
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("directory-flood DoS prevention"),
+            "error reason should mention DoS prevention, got: {reason}"
+        );
     }
 
     #[test]

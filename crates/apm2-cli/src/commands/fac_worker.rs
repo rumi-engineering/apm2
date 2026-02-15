@@ -2372,12 +2372,22 @@ fn check_process_liveness(pid: u32) -> ProcessLiveness {
         return ProcessLiveness::Dead;
     }
 
-    // Safety: kill(pid, 0) with signal 0 performs an existence check
-    // without delivering any signal. This is a standard POSIX operation.
-    // The pid is validated above to be non-zero. The cast from u32 to
-    // i32 (pid_t) is safe because valid PIDs fit in i32; wrapping of
-    // very large u32 values would produce a negative pid_t which kill()
-    // would reject with ESRCH, which is safe (treated as dead).
+    // SAFETY: This block is safe because the following pre-conditions are
+    // upheld by the caller and the guard above, and result in a sound
+    // post-condition:
+    //
+    // Pre-conditions:
+    //   1. `pid` is non-zero (guarded by the `pid == 0` early return above).
+    //   2. Signal 0 is used, which performs an existence check without delivering
+    //      any signal — a standard POSIX `kill(2)` operation.
+    //   3. The cast from `u32` to `i32` (`pid_t`) is bounded: valid PIDs fit in
+    //      `i32`. Wrapping of very large `u32` values produces a negative `pid_t`,
+    //      which `kill()` rejects with `ESRCH` (treated as dead below).
+    //
+    // Post-condition: `ret` contains the kernel return value (0 = exists,
+    // -1 = error with errno set). No memory is accessed, no signal is
+    // delivered, and no UB can result from any `pid_t` value passed to
+    // `kill(2)` with signal 0.
     #[allow(clippy::cast_possible_wrap)]
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
 
