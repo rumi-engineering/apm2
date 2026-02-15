@@ -904,7 +904,7 @@ impl LaneCorruptMarkerV1 {
         }
 
         let bytes = bounded_read_file(&path, MAX_LEASE_FILE_SIZE)?;
-        let mut marker: Self = serde_json::from_slice(&bytes).map_err(|e| {
+        let marker: Self = serde_json::from_slice(&bytes).map_err(|e| {
             LaneError::Serialization(format!("failed to parse corrupt marker: {e}"))
         })?;
 
@@ -929,14 +929,7 @@ impl LaneCorruptMarkerV1 {
             });
         }
         validate_string_field("reason", &marker.reason, MAX_STRING_LENGTH)?;
-        if let Some(receipt_digest) = &marker.cleanup_receipt_digest {
-            validate_string_field("cleanup_receipt_digest", receipt_digest, MAX_STRING_LENGTH)?;
-        }
         validate_string_field("detected_at", &marker.detected_at, MAX_STRING_LENGTH)?;
-
-        if marker.cleanup_receipt_digest.is_none() {
-            marker.cleanup_receipt_digest = None;
-        }
 
         Ok(Some(marker))
     }
@@ -1572,6 +1565,7 @@ impl LaneManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_workspace_path(
         lanes_dir: &Path,
         workspace_path: &Path,
@@ -1621,13 +1615,6 @@ impl LaneManager {
             )));
         }
 
-        if !git_metadata.is_file() && !git_metadata.is_dir() {
-            return Err(invalid_workspace_path(format!(
-                "workspace path {} has invalid .git metadata",
-                workspace_path.display()
-            )));
-        }
-
         let canonical_workspace = workspace_path.canonicalize().map_err(|e| {
             invalid_workspace_path(format!(
                 "workspace path {} must canonicalize successfully: {e}",
@@ -1641,6 +1628,57 @@ impl LaneManager {
                 lanes_dir.display()
             ))
         })?;
+
+        let gitdir_indirection_error = || {
+            invalid_workspace_path(
+                "workspace .git indirection points outside lane boundary".to_string(),
+            )
+        };
+
+        let canonical_git_dir = if git_metadata.is_file() {
+            return Err(gitdir_indirection_error());
+        } else if git_metadata.is_dir() {
+            let git_dir_metadata = git_path.symlink_metadata().map_err(|e| {
+                invalid_workspace_path(format!(
+                    "workspace path {} resolved gitdir could not be statted: {e}",
+                    workspace_path.display()
+                ))
+            })?;
+
+            if git_dir_metadata.file_type().is_symlink() {
+                return Err(invalid_workspace_path(format!(
+                    "workspace path {} has a symlink gitdir entry, which is not allowed",
+                    workspace_path.display()
+                )));
+            }
+
+            if !git_dir_metadata.is_dir() {
+                return Err(invalid_workspace_path(format!(
+                    "workspace path {} resolved gitdir is not a directory",
+                    workspace_path.display()
+                )));
+            }
+
+            git_path.canonicalize().map_err(|e| {
+                invalid_workspace_path(format!(
+                    "workspace path {} resolved gitdir could not be canonicalized: {e}",
+                    workspace_path.display()
+                ))
+            })?
+        } else {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has invalid .git metadata",
+                workspace_path.display()
+            )));
+        };
+
+        if !canonical_git_dir.starts_with(&canonical_lanes_dir) {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has gitdir outside lane directory {}",
+                canonical_git_dir.display(),
+                canonical_lanes_dir.display()
+            )));
+        }
 
         if !canonical_workspace.starts_with(&canonical_lanes_dir) {
             return Err(invalid_workspace_path(format!(
@@ -3051,6 +3089,39 @@ mod tests {
         );
         let status = manager.lane_status(lane_id).expect("lane status");
         assert_eq!(status.state, LaneState::Corrupt);
+    }
+
+    #[test]
+    fn run_lane_cleanup_rejects_gitdir_indirection_outside_lane_directory() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let foreign_git_dir = root.path().join("foreign_git");
+        fs::create_dir_all(&foreign_git_dir).expect("create foreign git dir");
+        fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", foreign_git_dir.display()),
+        )
+        .expect("write gitdir file");
+
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect_err("gitdir indirection outside lane directory should be rejected");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
     }
 
     #[cfg(unix)]

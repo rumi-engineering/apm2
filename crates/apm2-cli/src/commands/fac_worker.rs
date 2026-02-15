@@ -2168,6 +2168,19 @@ fn process_job(
 }
 
 /// Try to acquire a non-corrupt worker lane lock in order.
+fn is_lane_stale_recovery_eligible(lease: &LaneLeaseV1) -> bool {
+    matches!(lease.state, LaneState::Running | LaneState::Cleanup) && !is_process_alive(lease.pid)
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn acquire_worker_lane(
     lane_mgr: &LaneManager,
     lane_ids: &[String],
@@ -2192,28 +2205,37 @@ fn acquire_worker_lane(
             Ok(None) => {
                 let lane_dir = lane_mgr.lane_dir(lane_id);
                 match LaneLeaseV1::load(&lane_dir) {
-                    Ok(Some(lease))
-                        if matches!(lease.state, LaneState::Running | LaneState::Cleanup) =>
-                    {
-                        let reason =
-                            format!("stale lease state '{}' for pid {}", lease.state, lease.pid);
-                        eprintln!(
-                            "worker: WARNING: marking stale lease lane as corrupt: {lane_id} ({reason})"
-                        );
-                        if let Err(err) = persist_corrupt_marker_with_retries(
-                            lane_mgr.fac_root(),
-                            lane_id,
-                            &reason,
-                            None,
-                        ) {
+                    Ok(Some(lease)) => match lease.state {
+                        LaneState::Corrupt => {
                             eprintln!(
-                                "worker: ERROR: failed to persist stale-lease corrupt marker for lane {lane_id}: {err} ({reason})"
+                                "worker: WARNING: skipping corrupt lease lane {lane_id}: {state}",
+                                state = lease.state
                             );
-                        }
+                        },
+                        state @ (LaneState::Running | LaneState::Cleanup)
+                            if !is_lane_stale_recovery_eligible(&lease) =>
+                        {
+                            let reason =
+                                format!("stale lease state '{}' for pid {state}", lease.pid);
+                            eprintln!(
+                                "worker: WARNING: marking stale lease lane as corrupt: {lane_id} ({reason})"
+                            );
+                            if let Err(err) = persist_corrupt_marker_with_retries(
+                                lane_mgr.fac_root(),
+                                lane_id,
+                                &reason,
+                                None,
+                            ) {
+                                eprintln!(
+                                    "worker: ERROR: failed to persist stale-lease corrupt marker for lane {lane_id}: {err} ({reason})"
+                                );
+                            }
+                        },
+                        _ => {
+                            return Some((guard, lane_id.clone()));
+                        },
                     },
-                    Ok(Some(_) | None) => {
-                        return Some((guard, lane_id.clone()));
-                    },
+                    Ok(None) => return Some((guard, lane_id.clone())),
                     Err(err) => {
                         eprintln!(
                             "worker: WARNING: skipping lane {lane_id} after lease load failed: {err}"
@@ -4413,7 +4435,7 @@ mod tests {
         let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
         lane_mgr.ensure_directories().expect("ensure lanes");
 
-        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Cleanup, u32::MAX);
+        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Cleanup, std::process::id());
 
         let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
         let (_guard, acquired_lane_id) =
@@ -4433,5 +4455,21 @@ mod tests {
             marker.reason.contains("stale lease state") && marker.reason.contains("CLEANUP"),
             "marker reason should include stale cleanup lease state"
         );
+    }
+
+    #[test]
+    fn test_acquire_worker_lane_skips_corrupt_lease_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Corrupt, u32::MAX);
+
+        let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
+        let (_guard, acquired_lane_id) =
+            acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
+        assert_eq!(acquired_lane_id, "lane-01");
     }
 }

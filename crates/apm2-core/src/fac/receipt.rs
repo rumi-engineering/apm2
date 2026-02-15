@@ -96,7 +96,7 @@ pub const MAX_LANE_CLEANUP_RECEIPT_SIZE: usize = 65_536;
 pub const FAC_LANE_CLEANUP_RECEIPT_SCHEMA: &str = LANE_CLEANUP_RECEIPT_SCHEMA;
 
 /// Maximum cleanup reason length for `LaneCleanupReceiptV1`.
-const MAX_CLEANUP_REASON_LENGTH: usize = 512;
+const MAX_CLEANUP_REASON_LENGTH: usize = MAX_STRING_LENGTH;
 
 /// Maximum number of cleanup steps retained in a lane cleanup receipt.
 const MAX_CLEANUP_STEPS: usize = 16;
