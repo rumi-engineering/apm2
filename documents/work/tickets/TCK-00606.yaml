@@ -542,6 +542,204 @@ ticket_meta:
           Affected file:
           - crates/apm2-cli/src/commands/fac.rs (FacCommand)
 
+      - id: S12_REMOVE_HUMAN_READABLE_OUTPUT
+        title: "Remove all human-readable text output paths — JSON-only invariant"
+        detail: |
+          End support for human-readable (text/table) output across all
+          FAC commands. Every FAC command must emit JSON or JSONL to
+          stdout unconditionally. There is no `--text` escape hatch.
+
+          This supersedes S11's `--text` opt-in approach. The reasoning:
+          FAC commands are consumed exclusively by agents and automation.
+          Maintaining dual output paths (text + JSON) doubles the testing
+          surface, introduces format-drift bugs where one path is updated
+          but not the other, and adds dead code that no consumer uses.
+
+          Required changes:
+          (a) Remove the `--text` flag from FacCommand (if added by S11)
+              and all per-subcommand text-mode output branches.
+          (b) Remove all `if !json_output { println!(...) }` text-mode
+              formatting paths, human tables, and human_log! invocations
+              that write to stdout.
+          (c) Diagnostic/progress messages may still go to stderr (they
+              are not parsed by consumers), but stdout is reserved
+              exclusively for JSON/JSONL.
+          (d) Short-lived commands emit a single pretty-printed JSON
+              object to stdout.
+          (e) Long-running commands emit compact JSONL to stdout (one
+              object per line, flushed after each event).
+          (f) Error responses are JSON objects on stdout with an `error`
+              field — not bare text on stderr.
+
+          Invariant: `apm2 fac <any-subcommand> | jq .` must always
+          succeed (single-object commands) or `apm2 fac <any-subcommand>
+          | while read line; do echo "$line" | jq .; done` must succeed
+          (JSONL-streaming commands).
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac.rs (remove --text, remove text branches)
+          - crates/apm2-cli/src/commands/fac_review/gates.rs (remove human table)
+          - crates/apm2-cli/src/commands/fac_review/push.rs (remove text output)
+          - crates/apm2-cli/src/commands/fac_review/restart.rs (remove text output)
+          - crates/apm2-cli/src/commands/fac_review/mod.rs (remove text branches in doctor, wait, status, etc.)
+          - All other fac_review/*.rs and fac_*.rs files with text-mode branches
+
+      - id: S13_GITHUB_COMMENT_CODE_FENCE_ESCAPE
+        title: "Fix code fence truncation in GitHub PR comment projection"
+        detail: |
+          GitHub-projected comments (verdict decisions, CI status) use
+          YAML inside a markdown fenced code block:
+
+              <!-- marker -->
+              ```yaml
+              # marker
+              {serde_yaml output}```
+
+          Two bugs cause code blocks to be truncated or sliced:
+
+          1. MISSING NEWLINE BEFORE CLOSING FENCE
+             render_decision_comment_body() in both decision.rs and
+             verdict_projection.rs, and to_comment_body() in ci_status.rs,
+             produce the closing fence as `{yaml}``` ` without a guaranteed
+             newline separator. While serde_yaml::to_string() typically
+             emits a trailing `\n`, the format string does not defensively
+             ensure one. If any edge case omits it, the closing fence is
+             not on its own line and GitHub does not close the code block.
+
+          2. YAML VALUES CONTAINING TRIPLE BACKTICKS
+             Reviewer-generated text fields (reason, finding summary,
+             finding details) may contain markdown code fences (```)
+             within their values. serde_yaml serializes these as-is in
+             block or flow scalars. When embedded inside the outer
+             ```yaml fence, GitHub's markdown parser sees the inner
+             backticks as the closing fence, truncating everything after.
+             The read-side parser extract_fenced_yaml() (decision.rs:441)
+             has the same vulnerability — it searches for "\n```" and
+             matches the first occurrence, which may be inside a YAML
+             value rather than the actual closing fence.
+
+          Required changes:
+          (a) Fix the format string in all three render functions to
+              defensively ensure a newline before the closing fence:
+              `format!("<!-- {MARKER} -->\n```yaml\n# {MARKER}\n{yaml}\n```\n")`
+              (The extra \n before ``` is harmless if yaml already ends
+              with \n, producing a blank line which is valid markdown.)
+          (b) Sanitize YAML string values before serialization: replace
+              any occurrence of ``` (triple backtick) within string
+              fields with a safe alternative (e.g., replace backticks
+              with Unicode fullwidth grave accent U+FF40, or HTML entity
+              &#96;&#96;&#96;) to prevent premature fence closure.
+              Alternatively, use a unique fence marker (e.g.,
+              `````yaml ... ````` with 5 backticks) that is statistically
+              unlikely to appear in reviewer text.
+          (c) Harden extract_fenced_yaml() to match the closing fence
+              using the same backtick count as the opening fence, and
+              require the closing fence to be on a line by itself (no
+              leading content other than optional whitespace).
+          (d) Apply the same fix to ci_status.rs::to_comment_body().
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac_review/decision.rs (render_decision_comment_body, extract_fenced_yaml)
+          - crates/apm2-cli/src/commands/fac_review/verdict_projection.rs (render_decision_comment_body)
+          - crates/apm2-cli/src/commands/fac_review/ci_status.rs (to_comment_body)
+
+      - id: S14_STRUCTURED_ERROR_OUTPUT
+        title: "All errors and warnings on stdout must be valid JSON — never break jq"
+        detail: |
+          Several FAC commands currently emit unstructured error/warning
+          text to stdout, which corrupts the JSON stream and breaks
+          `jq` parsing. This is the #1 way agents lose parseable output.
+
+          Current violation patterns:
+
+          1. UNSTRUCTURED ERROR LISTS ON STDOUT
+             decision.rs:945-947, findings.rs:438-440, and
+             verdict_projection.rs:1575-1577 print human-formatted error
+             listings to stdout via println!:
+               println!("  Errors:");
+               println!("    - {error}");
+             These lines land in the same stream as JSON output and
+             break any `| jq .` pipeline.
+
+          2. MIXED STRUCTURED/UNSTRUCTURED IN SAME COMMAND
+             Some commands emit a JSON payload via println! for the
+             success path but fall through to eprintln!/println! for
+             error paths. An agent piping stdout to jq gets either
+             valid JSON or garbage — no reliable error contract.
+
+          3. JSONL STREAM CORRUPTION
+             For JSONL-streaming commands (gates, push, worker), if an
+             error occurs mid-stream, the error must be a valid JSONL
+             line, not bare text. A bare `eprintln!("ERROR: ...")` is
+             safe (stderr, not parsed), but a `println!("ERROR: ...")`
+             mid-JSONL-stream produces an unparseable line.
+
+          Required changes:
+
+          (a) Establish the stdout-is-JSON invariant:
+              - stdout MUST contain only valid JSON (single object) or
+                valid JSONL (one JSON object per line). No exceptions.
+              - stderr is the sink for human-readable diagnostics,
+                progress messages, and warnings. These are never parsed
+                by consumers and cannot break jq.
+
+          (b) For single-object commands, errors become JSON error
+              objects on stdout:
+                {"error": "<error_code>", "message": "<detail>"}
+              This is already the pattern in gates.rs (line 106-113)
+              and lifecycle.rs (line 2907). Normalize all commands to
+              use this pattern.
+
+          (c) For JSONL-streaming commands, errors become JSONL event
+              lines on stdout:
+                {"event": "<command>_error", "error": "<detail>", "ts": "..."}
+              The stream remains parseable line-by-line. The consumer
+              detects the error via the event field discriminator.
+
+          (d) Audit and fix every println! call in fac_review/ that
+              emits non-JSON content. Specific known violations:
+              - decision.rs:945-947 (error list in text verdict show)
+              - findings.rs:431, 438-440 (error details in text findings)
+              - verdict_projection.rs:1575-1577 (error list in text show)
+              These are text-mode paths that S12 removes entirely.
+              After S12, these code paths no longer exist — but the
+              error information they carried must be preserved as
+              fields within the JSON response (e.g., an `errors: [...]`
+              array in the response struct).
+
+          (e) Provide a shared error emission helper alongside the
+              JSONL helper in jsonl.rs:
+              - `fn emit_json_error(code: &str, message: &str)` for
+                single-object error responses.
+              - `fn emit_jsonl_error(event_prefix: &str, message: &str)`
+                for error events within a JSONL stream.
+              Both write to stdout and flush.
+
+          (f) Exit codes remain meaningful:
+              - 0: command succeeded (JSON response contains result)
+              - 1: command failed (JSON response contains error)
+              The consumer reads the exit code first, then parses the
+              JSON payload. Both paths produce valid JSON.
+
+          Contract: for any FAC command invocation, the following must
+          hold:
+            `apm2 fac <cmd> [args] 2>/dev/null | jq . >/dev/null`
+          must exit 0 (valid JSON) regardless of whether the command
+          itself succeeded or failed. Failures produce JSON error
+          objects, not parse failures.
+
+          Affected files:
+          - crates/apm2-cli/src/commands/fac_review/jsonl.rs (error helpers)
+          - crates/apm2-cli/src/commands/fac_review/decision.rs (remove println! error lists)
+          - crates/apm2-cli/src/commands/fac_review/findings.rs (remove println! error lists)
+          - crates/apm2-cli/src/commands/fac_review/verdict_projection.rs (remove println! error lists)
+          - crates/apm2-cli/src/commands/fac_review/gates.rs (normalize error path)
+          - crates/apm2-cli/src/commands/fac_review/push.rs (normalize error path)
+          - crates/apm2-cli/src/commands/fac_review/restart.rs (normalize error path)
+          - crates/apm2-cli/src/commands/fac_review/mod.rs (normalize error paths)
+          - crates/apm2-cli/src/commands/fac_gc.rs (normalize error path)
+          - crates/apm2-cli/src/commands/fac_broker.rs (normalize error path)
+
     out_of_scope:
       - "Non-FAC commands (process management, creds, daemon). Those are a separate ticket."
       - "Changing the semantic content of any command's output — only the wire format changes."
@@ -549,6 +747,7 @@ ticket_meta:
       - "Changing exit codes or error semantics."
       - "Modifying the NDJSON telemetry file format under ~/.apm2/ — only stdout output changes."
       - "Pretty-printing JSONL — JSONL lines are compact (one object per line); pretty JSON is only for single-object responses."
+      - "Human-readable text output — S12 removes all text output paths; no --text flag will exist."
   plan:
     steps:
       - id: STEP_01
@@ -699,7 +898,7 @@ ticket_meta:
       - "Error events in JSONL streams are JSON objects with `event: \"..._error\"` — not bare text on stderr."
       - "subcommand_requests_machine_output() has no catch-all `false` arm — every FacSubcommand variant is explicitly handled."
       - "FacCommand.json defaults to true — agents get structured output without passing any flag."
-      - "FacCommand.text (or equivalent) allows human-readable opt-in."
+      - "No `--text` flag exists. No human-readable text output path exists. All stdout is JSON or JSONL unconditionally."
       - "`fac gates --json` streams per-gate JSONL events (gate_started, gate_completed) followed by a gates_summary line."
       - "`fac push --json` streams per-stage JSONL events (git_push, gates, pr_update, dispatch) followed by a push_summary line."
       - "`fac restart --json` outputs a single RestartResponse JSON object."
@@ -731,10 +930,21 @@ ticket_meta:
       - "`--wait-for-recommended-action` + `--fix` is rejected with an error (mutually exclusive flags)."
       - "`--wait-for-recommended-action` exit code is 0 for action resolved, timeout expired, or signal received; exit code 1 only for doctor evaluation failures or precondition violations."
       - "SIGINT and SIGTERM during `--wait-for-recommended-action` trigger a graceful exit: one final `run_doctor_inner()` call, emit the full DoctorPrSummary, exit 0. The orchestrator always gets a usable snapshot."
-      - "Text mode `--wait-for-recommended-action` prints one-line progress to stderr per tick and final DoctorPrSummary to stdout."
-      - "In text mode (--text), all existing human-readable output is preserved unchanged."
       - "All response and event structs derive Serialize (and Deserialize where appropriate)."
       - "All evidence gates and tests pass."
+      - "No FAC command emits unstructured text to stdout under any flag combination. `stdout` is exclusively JSON/JSONL."
+      - "All human-readable text output paths (tables, progress messages, human_log! to stdout) are removed."
+      - "Diagnostic/progress messages to stderr are permitted but never parsed by consumers."
+      - "GitHub-projected verdict comments use a fenced code block with a guaranteed newline before the closing fence."
+      - "YAML values embedded in GitHub comment code fences are sanitized: triple backticks within YAML string fields cannot prematurely close the markdown code fence."
+      - "extract_fenced_yaml() correctly identifies the closing fence even when YAML content contains backtick sequences."
+      - "CI status comments (ci_status.rs) apply the same code fence fix as verdict comments."
+      - "For any FAC command invocation: `apm2 fac <cmd> [args] 2>/dev/null | jq . >/dev/null` exits 0 regardless of command success or failure."
+      - "Failed commands emit a JSON error object to stdout (`{\"error\": \"<code>\", \"message\": \"<detail>\"}`) — not bare text."
+      - "Errors mid-JSONL-stream are valid JSONL event lines with an `event` field ending in `_error` — the stream remains parseable line-by-line."
+      - "No `println!` call in any FAC command emits non-JSON content to stdout."
+      - "Shared error emission helpers (`emit_json_error`, `emit_jsonl_error`) exist in the JSONL helper module for consistent error formatting."
+      - "Error information previously carried by text-mode println! paths (error lists in verdict show, findings, verdict projection) is preserved as `errors: [...]` arrays within JSON response structs."
   notes:
     context: |
       This ticket addresses a usability bug that affects every LLM agent
@@ -764,11 +974,12 @@ ticket_meta:
         intermediate events and read only the last line for the final result.
       - stderr is reserved for diagnostics that should never be parsed.
         All structured output goes to stdout.
-      - The `--text` flag is the escape hatch for human operators. It is
-        never the default.
+      - There is no --text flag. JSON is the only output format. S12
+        supersedes S11's --text opt-in approach: all consumers are agents,
+        dual output paths are dead code and a maintenance hazard.
 
       Priority: P0 (--wait-for-recommended-action), P1 (JSON parity,
-      model provenance).
+      model provenance, GitHub comment fix).
       Complexity: Medium-high — the JSON parity work is mechanical, but
       --wait-for-recommended-action requires careful poll loop design,
       JSONL heartbeat streaming, timeout handling, and exit code semantics.

@@ -1,0 +1,628 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/cac/rfc_doc_v1.schema.json",
+  "title": "CAC RFC Document V1",
+  "description": "Context-as-Code (CAC) RFC document: single JSON file, recursively structured nodes, intended for slicing, linting, and deterministic compilation into WorkObjects/work graphs. Timestamps and workflow status are intentionally omitted (git is source of truth).",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "cac.rfc_doc.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "rfc.document"
+    },
+    "meta": {
+      "$ref": "#/$defs/Meta"
+    },
+    "payload": {
+      "$ref": "#/$defs/Payload"
+    }
+  },
+  "unevaluatedProperties": false,
+  "$defs": {
+    "Relationship": {
+      "type": "object",
+      "description": "Lightweight relation edge for navigation (supersedes, informs, affects, etc).",
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Uppercase relation kind. Semantics are organization-specific.",
+          "pattern": "^[A-Z][A-Z0-9_]{1,63}$"
+        },
+        "ref": {
+          "type": "string",
+          "description": "Reference target (RFC id, dcp URI, file path, etc).",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "Link": {
+      "type": "object",
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Link kind (theory.law, theory.invariant, code.path, doc, rfc, etc). Open-ended; lowercase recommended.",
+          "pattern": "^[a-z][a-z0-9_.:-]{0,63}$"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "anchor": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "VerificationCheck": {
+      "type": "object",
+      "description": "Replayable verification check. Not an evidence-id system; checks describe how to validate work outputs.",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "run": {
+          "type": "string",
+          "description": "Command or procedure to run.",
+          "maxLength": 8192
+        },
+        "expect": {
+          "type": "string",
+          "description": "Expected result / predicate in prose.",
+          "maxLength": 8192
+        },
+        "artifacts": {
+          "type": "array",
+          "description": "Expected files/artifacts produced or inspected by this check (paths/globs).",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "maxItems": 512,
+          "default": []
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 8192
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "FileTouch": {
+      "type": "object",
+      "description": "A repo surface touched by a work item (path-level intent).",
+      "required": [
+        "path",
+        "op"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "create",
+            "modify",
+            "delete",
+            "move",
+            "rename"
+          ]
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "Meta": {
+      "type": "object",
+      "description": "Non-content metadata. No timestamps, status, classification, or roles (git is source of truth).",
+      "required": [
+        "id",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^RFC-\\d{4}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 256
+        },
+        "stable_id": {
+          "type": "string",
+          "description": "Optional stable identifier (e.g., dcp:// URI).",
+          "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "maxItems": 256,
+          "default": []
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Relationship"
+          },
+          "maxItems": 2048,
+          "default": []
+        },
+        "provenance": {
+          "type": "object",
+          "description": "Optional provenance (who/what emitted this artifact). No timestamps.",
+          "properties": {
+            "actor_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "notes": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          "unevaluatedProperties": false
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "Payload": {
+      "type": "object",
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/RfcRoot"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "NodeBase": {
+      "type": "object",
+      "required": [
+        "type",
+        "title"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Node type. Lowercase snake_case recommended. Tooling may treat some types specially.",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        "id": {
+          "type": "string",
+          "description": "Optional stable identifier for referencing nodes (REQ-0001, WO-..., etc). Uniqueness is enforced by lint, not JSON Schema.",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "body": {
+          "type": "string",
+          "description": "Human-readable content. Markdown recommended.",
+          "maxLength": 2000000
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "maxItems": 256,
+          "default": []
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Link"
+          },
+          "maxItems": 4096,
+          "default": []
+        },
+        "data": {
+          "type": "object",
+          "description": "Type-specific structured payload. For unknown/custom node types this is free-form.",
+          "maxProperties": 10000,
+          "default": {}
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Node"
+          },
+          "maxItems": 10000,
+          "default": []
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "RfcData": {
+      "type": "object",
+      "description": "Optional RFC root summary block.",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 32768
+        },
+        "target_outcomes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 4096
+          },
+          "maxItems": 512,
+          "default": []
+        },
+        "non_goals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 4096
+          },
+          "maxItems": 512,
+          "default": []
+        }
+      },
+      "unevaluatedProperties": true
+    },
+    "RequirementData": {
+      "type": "object",
+      "required": [
+        "level",
+        "statement"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "MUST",
+            "SHOULD",
+            "MAY",
+            "MUST_NOT",
+            "SHOULD_NOT"
+          ]
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 32768
+        },
+        "rationale": {
+          "type": "string",
+          "maxLength": 65536
+        },
+        "acceptance": {
+          "type": "array",
+          "description": "Acceptance criteria in prose. Prefer explicit checks and bind to validation plan nodes.",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "maxItems": 512,
+          "default": []
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "maxItems": 512,
+          "default": []
+        }
+      },
+      "unevaluatedProperties": true
+    },
+    "DecisionData": {
+      "type": "object",
+      "required": [
+        "decision"
+      ],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 32768
+        },
+        "rationale": {
+          "type": "string",
+          "maxLength": 65536
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "maxItems": 256,
+          "default": []
+        },
+        "consequences": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "maxItems": 256,
+          "default": []
+        }
+      },
+      "unevaluatedProperties": true
+    },
+    "WorkObjectData": {
+      "type": "object",
+      "required": [
+        "outcome"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "description": "Concrete end-state produced by this work item.",
+          "minLength": 3,
+          "maxLength": 32768
+        },
+        "work_kind": {
+          "type": "string",
+          "description": "Optional coarse classification. Purely informational; not an authority role system.",
+          "enum": [
+            "implement",
+            "test",
+            "doc",
+            "refactor",
+            "migration",
+            "ops",
+            "research"
+          ]
+        },
+        "depends_on": {
+          "type": "array",
+          "description": "IDs of prerequisite work items (graph edges).",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "maxItems": 512,
+          "default": []
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered, reviewable steps. Keep steps mechanically actionable.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "maxItems": 4096,
+          "default": []
+        },
+        "touches": {
+          "type": "array",
+          "description": "Repo paths or module surfaces this work item changes.",
+          "items": {
+            "$ref": "#/$defs/FileTouch"
+          },
+          "maxItems": 4096,
+          "default": []
+        },
+        "definition_of_done": {
+          "type": "array",
+          "description": "Verification checks for this work item.",
+          "items": {
+            "$ref": "#/$defs/VerificationCheck"
+          },
+          "maxItems": 2048,
+          "default": []
+        },
+        "binds": {
+          "type": "object",
+          "description": "Optional bindings to requirement IDs (no evidence IDs).",
+          "properties": {
+            "requirements": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
+              },
+              "maxItems": 4096,
+              "default": []
+            }
+          },
+          "unevaluatedProperties": false,
+          "default": {}
+        }
+      },
+      "unevaluatedProperties": true
+    },
+    "NodeTypeRules": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "rfc"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/RfcData"
+              },
+              "children": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "requirement"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/RequirementData"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "decision"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/DecisionData"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "work_object"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/WorkObjectData"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "task"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/WorkObjectData"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Node": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/NodeBase"
+        },
+        {
+          "$ref": "#/$defs/NodeTypeRules"
+        }
+      ]
+    },
+    "RfcRoot": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Node"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "rfc"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
