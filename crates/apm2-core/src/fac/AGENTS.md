@@ -667,10 +667,11 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   2. Inherit only variables matching `env_allowlist_prefixes`.
   3. Remove variables matching `env_denylist_prefixes` (denylist wins).
   4. Strip variables listed in `env_clear` (unconditional).
-  5. Hardcoded containment safety: unconditionally strip `RUSTC_WRAPPER` and
+  5. Apply `env_set` overrides (force-set key=value pairs).
+  6. Hardcoded containment safety: unconditionally strip `RUSTC_WRAPPER` and
      all `SCCACHE_*` variables regardless of policy configuration (defense-in-depth,
-     non-configurable).
-  6. Apply `env_set` overrides (force-set key=value pairs).
+     non-configurable). Runs AFTER `env_set` to ensure policy overrides cannot
+     re-introduce these variables.
   7. Enforce managed `CARGO_HOME` when `deny_ambient_cargo_home` is true.
   8. Enforce `CARGO_TARGET_DIR` from policy.
   Output is a deterministic `BTreeMap` (sorted keys).
@@ -711,18 +712,22 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
 - [INV-ENV-002] Denylist takes priority over allowlist when both match a variable.
 - [INV-ENV-003] `env_clear` unconditionally strips named variables regardless of
   allowlist/denylist.
-- [INV-ENV-004] `env_set` overrides are applied last (before CARGO_HOME/TARGET_DIR),
-  ensuring policy-defined values cannot be overridden by ambient state.
+- [INV-ENV-004] `env_set` overrides are applied before hardcoded containment
+  stripping (before CARGO_HOME/TARGET_DIR). Policy-defined values cannot
+  override hardcoded safety strips (INV-ENV-008).
 - [INV-ENV-005] When `deny_ambient_cargo_home` is true, `CARGO_HOME` is always set
   to the managed path (`$APM2_HOME/private/fac/cargo_home`), preventing reliance on
   `~/.cargo` state.
 - [INV-ENV-006] Managed `CARGO_HOME` directory is created with 0o700 permissions
-  (CTR-2611) on Unix.
+  (CTR-2611) on Unix. Existing directories are verified for correct ownership
+  (current user) and permissions (0o700, no group/other access).
 - [INV-ENV-007] Output environment is deterministic (`BTreeMap` sorted by key).
 - [INV-ENV-008] `RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped by
   `build_job_environment()` regardless of policy configuration (hardcoded
-  defense-in-depth). This prevents compiler injection even if a custom policy
-  inadvertently re-admits these variables via allowlist prefixes.
+  defense-in-depth). This step runs AFTER `env_set` overrides so that even a
+  malicious policy using `env_set` to re-introduce these variables is defeated.
+  This prevents compiler injection even if a custom policy inadvertently
+  re-admits these variables via allowlist prefixes or env_set overrides.
 - [INV-ENV-009] Default `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
   `RUSTDOCFLAGS`, `RUSTUP_`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_TEST_THREADS`)
   to prevent broad `RUST` prefix from admitting `RUSTC_WRAPPER`.

@@ -372,9 +372,11 @@ impl FacPolicyV1 {
 ///    match at least one `env_allowlist_prefixes` entry.
 /// 3. Remove any variable matching `env_denylist_prefixes` (denylist wins).
 /// 4. Remove all variables listed in `env_clear` (unconditional strip).
-/// 5. Hardcoded safety: unconditionally strip `RUSTC_WRAPPER` and `SCCACHE_*`
+/// 5. Apply `env_set` overrides (force-set specific key=value pairs).
+/// 6. Hardcoded safety: unconditionally strip `RUSTC_WRAPPER` and `SCCACHE_*`
 ///    regardless of policy configuration (containment invariant, TCK-00548).
-/// 6. Apply `env_set` overrides (force-set specific key=value pairs).
+///    This step runs AFTER `env_set` to ensure policy overrides cannot
+///    re-introduce these variables.
 /// 7. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
 ///    the ambient environment, replace it with the managed path.
 /// 8. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
@@ -421,18 +423,20 @@ pub fn build_job_environment(
         env.remove(key);
     }
 
-    // Step 5: Hardcoded containment safety — unconditionally strip
-    // RUSTC_WRAPPER and SCCACHE_* regardless of policy configuration.
-    // These variables enable wrapper-controlled compiler execution that
-    // bypasses cgroup containment (TCK-00548). This is a non-configurable
-    // safety invariant: even a misconfigured policy cannot re-admit them.
-    env.remove("RUSTC_WRAPPER");
-    env.retain(|key, _| !key.starts_with("SCCACHE_"));
-
-    // Step 6: Force-set policy overrides.
+    // Step 5: Force-set policy overrides.
     for entry in &policy.env_set {
         env.insert(entry.key.clone(), entry.value.clone());
     }
+
+    // Step 6: Hardcoded containment safety — unconditionally strip
+    // RUSTC_WRAPPER and SCCACHE_* regardless of policy configuration.
+    // These variables enable wrapper-controlled compiler execution that
+    // bypasses cgroup containment (TCK-00548). This is a non-configurable
+    // safety invariant: even a misconfigured policy cannot re-admit them
+    // via env_set overrides. This step MUST run AFTER env_set (Step 5) to
+    // ensure policy env_set cannot re-introduce these variables.
+    env.remove("RUSTC_WRAPPER");
+    env.retain(|key, _| !key.starts_with("SCCACHE_"));
 
     // Step 7: Enforce managed CARGO_HOME when ambient is denied.
     if let Some(cargo_home) = policy.resolve_cargo_home(apm2_home) {
@@ -1103,5 +1107,44 @@ mod tests {
         assert_eq!(env.get("RUST_BACKTRACE").map(String::as_str), Some("1"));
         assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
         assert_eq!(env.get("RUST_TEST_THREADS").map(String::as_str), Some("4"));
+    }
+
+    /// Regression: A malicious or misconfigured policy that uses `env_set` to
+    /// re-introduce `RUSTC_WRAPPER` or `SCCACHE_*` must still have those
+    /// variables stripped by the hardcoded safety step (INV-ENV-008).
+    #[test]
+    fn test_build_job_environment_env_set_cannot_reintroduce_rustc_wrapper() {
+        let mut policy = FacPolicyV1::default_policy();
+        // Simulate a malicious policy that attempts to re-introduce
+        // RUSTC_WRAPPER and SCCACHE_DIR via env_set overrides.
+        policy.env_set.push(EnvSetEntry {
+            key: "RUSTC_WRAPPER".to_string(),
+            value: "sccache".to_string(),
+        });
+        policy.env_set.push(EnvSetEntry {
+            key: "SCCACHE_DIR".to_string(),
+            value: "/tmp/sccache".to_string(),
+        });
+        policy.env_set.push(EnvSetEntry {
+            key: "SCCACHE_CACHE_SIZE".to_string(),
+            value: "100G".to_string(),
+        });
+
+        let apm2_home = Path::new("/tmp/test-apm2-home");
+        let ambient: Vec<(String, String)> = vec![];
+        let env = build_job_environment(&policy, &ambient, apm2_home);
+
+        assert!(
+            !env.contains_key("RUSTC_WRAPPER"),
+            "env_set must not be able to re-introduce RUSTC_WRAPPER"
+        );
+        assert!(
+            !env.contains_key("SCCACHE_DIR"),
+            "env_set must not be able to re-introduce SCCACHE_DIR"
+        );
+        assert!(
+            !env.contains_key("SCCACHE_CACHE_SIZE"),
+            "env_set must not be able to re-introduce SCCACHE_CACHE_SIZE"
+        );
     }
 }

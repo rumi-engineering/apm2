@@ -46,12 +46,17 @@ const WRAPPER_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
 const WRAPPER_STRIP_PREFIXES: &[&str] = &["SCCACHE_"];
 
 /// Compute the full set of wrapper-stripping `env_remove_keys` by combining the
-/// static `WRAPPER_STRIP_KEYS` with any ambient `SCCACHE_*` variables.
-fn compute_gate_env_remove_keys() -> Vec<String> {
+/// static `WRAPPER_STRIP_KEYS` with any variables matching
+/// `WRAPPER_STRIP_PREFIXES` discovered from both the ambient process
+/// environment AND the provided policy-filtered environment. This ensures that
+/// variables introduced by `env_set` in the policy (not present in the ambient
+/// env) are also stripped as defense-in-depth.
+fn compute_gate_env_remove_keys(policy_env: Option<&[(String, String)]>) -> Vec<String> {
     let mut keys: Vec<String> = WRAPPER_STRIP_KEYS
         .iter()
         .map(|k| (*k).to_string())
         .collect();
+    // Scan the ambient process environment.
     for (key, _) in std::env::vars() {
         if WRAPPER_STRIP_PREFIXES
             .iter()
@@ -59,6 +64,19 @@ fn compute_gate_env_remove_keys() -> Vec<String> {
             && !keys.contains(&key)
         {
             keys.push(key);
+        }
+    }
+    // Also scan the policy-filtered environment for policy-introduced variables
+    // that were not in the ambient environment.
+    if let Some(envs) = policy_env {
+        for (key, _) in envs {
+            if WRAPPER_STRIP_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+                && !keys.contains(key)
+            {
+                keys.push(key.clone());
+            }
         }
     }
     keys
@@ -1098,8 +1116,9 @@ pub fn run_evidence_gates(
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // build_job_environment already strips these at the policy level, but
     // env_remove on the spawned Command provides defense-in-depth against
-    // parent process env inheritance.
-    let gate_wrapper_strip = compute_gate_env_remove_keys();
+    // parent process env inheritance. Pass the policy-filtered environment
+    // so policy-introduced SCCACHE_* variables are also discovered.
+    let gate_wrapper_strip = compute_gate_env_remove_keys(Some(&gate_env));
     let gate_wrapper_strip_ref: Option<&[String]> = if gate_wrapper_strip.is_empty() {
         None
     } else {
@@ -1426,7 +1445,9 @@ pub fn run_evidence_gates_with_status(
     let gate_env = build_gate_policy_env()?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
-    let gate_wrapper_strip = compute_gate_env_remove_keys();
+    // Pass the policy-filtered environment so policy-introduced SCCACHE_*
+    // variables are also discovered for defense-in-depth stripping.
+    let gate_wrapper_strip = compute_gate_env_remove_keys(Some(&gate_env));
     let gate_wrapper_strip_ref: Option<&[String]> = if gate_wrapper_strip.is_empty() {
         None
     } else {
