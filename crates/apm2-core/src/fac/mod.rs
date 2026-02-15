@@ -93,6 +93,7 @@ mod artifact_manifest;
 pub mod blob_store;
 pub mod broker;
 pub mod broker_health;
+pub mod broker_health_ipc;
 pub mod broker_rate_limits;
 pub mod builtin_profiles;
 pub mod builtin_roles;

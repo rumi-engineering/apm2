@@ -1462,6 +1462,13 @@ struct ServicesStatusResponse {
     /// Worker heartbeat status (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_heartbeat: Option<apm2_core::fac::worker_heartbeat::HeartbeatStatus>,
+    /// Broker health IPC status (if available).
+    ///
+    /// TCK-00600: Exposes broker version, readiness, and health independently
+    /// of systemd unit state. This is the source of truth for whether the
+    /// daemon's internal health checks are passing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_health: Option<apm2_core::fac::broker_health_ipc::BrokerHealthIpcStatus>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1524,14 +1531,39 @@ fn run_services_status(_json_output: bool) -> u8 {
     }
 
     // TCK-00600: Read worker heartbeat for liveness assessment.
-    let worker_heartbeat = apm2_core::github::resolve_apm2_home().map(|home| {
-        let fac_root = home.join("private").join("fac");
-        apm2_core::fac::worker_heartbeat::read_heartbeat(&fac_root)
-    });
+    let fac_root =
+        apm2_core::github::resolve_apm2_home().map(|home| home.join("private").join("fac"));
+    let worker_heartbeat = fac_root
+        .as_ref()
+        .map(|root| apm2_core::fac::worker_heartbeat::read_heartbeat(root));
 
-    // If the worker service is active but heartbeat is stale, mark as degraded.
+    // TCK-00600: If the worker service is active but heartbeat is stale OR
+    // read failed, mark as degraded. This covers both staleness (found=true,
+    // fresh=false) and read failures (found=false or error=Some).
+    let worker_active = services
+        .iter()
+        .any(|s| s.unit.contains("worker") && s.active_state == "active");
     if let Some(ref hb) = worker_heartbeat {
         if hb.found && !hb.fresh {
+            // Stale heartbeat while worker claims to be active.
+            degraded = true;
+        } else if worker_active && !hb.found {
+            // Worker is active but heartbeat file missing or read error.
+            degraded = true;
+        }
+    }
+
+    // TCK-00600: Read broker health IPC for version + readiness assessment.
+    // This is the source of truth for whether the daemon's internal health
+    // checks are passing, independent of systemd unit state.
+    let broker_health = fac_root
+        .as_ref()
+        .map(|root| apm2_core::fac::broker_health_ipc::read_broker_health(root));
+
+    // TCK-00600: If broker health is available and reports unhealthy/degraded
+    // or is stale, mark overall status as degraded.
+    if let Some(ref bh) = broker_health {
+        if bh.found && (!bh.fresh || bh.health_status != "healthy") {
             degraded = true;
         }
     }
@@ -1542,6 +1574,7 @@ fn run_services_status(_json_output: bool) -> u8 {
         overall_health,
         services: services.clone(),
         worker_heartbeat,
+        broker_health,
     };
     if let Ok(json) = serde_json::to_string_pretty(&response) {
         println!("{json}");
