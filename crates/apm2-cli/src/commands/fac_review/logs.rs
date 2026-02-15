@@ -2,12 +2,16 @@
 //! selector-based zoom-in.
 
 use std::fs;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::evidence::LANE_EVIDENCE_GATES;
 use super::findings::{
     SelectorToken, parse_selector, parse_selector_type, render_tool_output_selector,
 };
@@ -174,12 +178,29 @@ fn resolve_selector_zoom(
                         tool_output.gate
                     )
                 })?;
-            let content = fs::read(&evidence_path).map_err(|err| {
-                format!(
-                    "failed to read tool output log {}: {err}",
-                    evidence_path.display()
-                )
-            })?;
+            // Open with O_NOFOLLOW to atomically reject symlinks at the
+            // kernel level, preventing symlink traversal attacks on
+            // evidence log paths.
+            let content = {
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NOFOLLOW);
+                let mut file = options.open(&evidence_path).map_err(|err| {
+                    format!(
+                        "failed to open tool output log {}: {err}",
+                        evidence_path.display()
+                    )
+                })?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).map_err(|err| {
+                    format!(
+                        "failed to read tool output log {}: {err}",
+                        evidence_path.display()
+                    )
+                })?;
+                buf
+            };
             let digest = sha256_hex(&content);
             let content_ref = evidence_path.display().to_string();
             let text = String::from_utf8_lossy(&content);
@@ -225,17 +246,6 @@ fn truncate_excerpt(text: &str, max_lines: usize, max_chars: usize) -> String {
     }
     out
 }
-
-const LANE_EVIDENCE_GATES: &[&str] = &[
-    "merge_conflict_main",
-    "rustfmt",
-    "clippy",
-    "doc",
-    "test",
-    "test_safety_guard",
-    "workspace_integrity",
-    "review_artifact_lint",
-];
 
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
     let lanes_dir = home.join("private/fac/lanes");

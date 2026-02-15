@@ -2,6 +2,8 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +67,21 @@ pub(super) struct StreamStats {
     bytes_total: u64,
     was_truncated: bool,
 }
+
+/// Canonical list of lane-scoped evidence gate names used by the FAC pipeline.
+///
+/// Shared across evidence collection, log discovery, and push projection so
+/// the gate list is defined in a single place.
+pub const LANE_EVIDENCE_GATES: &[&str] = &[
+    "merge_conflict_main",
+    "rustfmt",
+    "clippy",
+    "doc",
+    "test",
+    "test_safety_guard",
+    "workspace_integrity",
+    "review_artifact_lint",
+];
 
 const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
 const LOG_STREAM_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -688,6 +705,19 @@ fn attach_log_bundle_hash(
 /// log writer prepends outside the payload byte counter.
 const LOG_BUNDLE_PER_FILE_MAX_BYTES: u64 = LOG_STREAM_MAX_BYTES + 4096;
 
+/// Open a file for reading with `O_NOFOLLOW` to atomically reject symlinks at
+/// the kernel level. This eliminates TOCTOU races between metadata checks and
+/// file opens — the kernel refuses to follow symlinks in a single syscall.
+fn open_nofollow(path: &Path) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options
+        .open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))
+}
+
 fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
     let mut log_paths: Vec<PathBuf> = fs::read_dir(logs_dir)
         .map_err(|err| {
@@ -699,10 +729,11 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            // Use symlink_metadata to detect symlinks: is_file() on
-            // symlink_metadata returns true only for real regular files,
-            // never for symlinks (even those pointing to regular files).
-            // This rejects symlink-based DoS vectors (e.g., /dev/zero).
+            // Pre-filter using symlink_metadata as defense-in-depth to avoid
+            // attempting O_NOFOLLOW opens on entries that are obviously not
+            // regular files (directories, sockets, etc.).  The actual open
+            // below uses O_NOFOLLOW so even if the entry is swapped between
+            // this check and the open the kernel will reject the symlink.
             fs::symlink_metadata(path).is_ok_and(|meta| {
                 let ft = meta.file_type();
                 ft.is_file() && !ft.is_symlink()
@@ -723,9 +754,10 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
             .and_then(|name| name.to_str())
             .unwrap_or("");
 
-        // Bounded read: check file size before allocating, then cap with
-        // Read::take to prevent memory exhaustion from oversized files.
-        let file = fs::File::open(&path)
+        // Open with O_NOFOLLOW to atomically reject symlinks at the kernel
+        // level, eliminating the TOCTOU window between the symlink_metadata
+        // filter above and this open.
+        let file = open_nofollow(&path)
             .map_err(|err| format!("failed to open evidence log file {}: {err}", path.display()))?;
         let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         if file_size > LOG_BUNDLE_PER_FILE_MAX_BYTES {
