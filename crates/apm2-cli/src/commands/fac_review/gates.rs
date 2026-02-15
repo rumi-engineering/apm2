@@ -160,37 +160,12 @@ pub fn run_gates(
                     extra: summary_value,
                 });
             } else {
-                println!("FAC Gates");
-                println!("  SHA:     {}", summary.sha);
+                // JSON-only: emit the summary as pretty-printed JSON.
                 println!(
-                    "  Verdict: {}",
-                    if summary.passed { "PASS" } else { "FAIL" }
+                    "{}",
+                    serde_json::to_string_pretty(&summary)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
                 );
-                println!("  Bounded: {}", summary.bounded);
-                println!(
-                    "  Mode:    {}",
-                    if summary.quick { "quick" } else { "full" }
-                );
-                println!("  Timeout: {}s", summary.effective_timeout_seconds);
-                println!("  Cache:   {}", summary.cache_status);
-                println!();
-                println!("  {:<25} {:<6} {:>8}", "Gate", "Status", "Duration");
-                println!("  {}", "-".repeat(43));
-                for gate in &summary.gates {
-                    println!(
-                        "  {:<25} {:<6} {:>7}s",
-                        gate.name, gate.status, gate.duration_secs
-                    );
-                }
-                println!();
-                if summary.quick {
-                    println!("  Cache: not written in quick mode");
-                } else {
-                    println!(
-                        "  Cache: ~/.apm2/private/fac/gate_cache_v2/{}/",
-                        &summary.sha
-                    );
-                }
             }
             if summary.passed {
                 exit_codes::SUCCESS
@@ -219,7 +194,17 @@ pub fn run_gates(
                     }),
                 });
             } else {
-                eprintln!("ERROR: {err}");
+                // JSON-only: emit the error as a structured JSON object.
+                let payload = serde_json::json!({
+                    "error": "gate_error",
+                    "message": err,
+                    "passed": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
             }
             exit_codes::GENERIC_ERROR
         },
