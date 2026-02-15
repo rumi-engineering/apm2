@@ -35,7 +35,7 @@ use subtle::ConstantTimeEq;
 
 use crate::channel::{
     ChannelBoundaryCheck, ChannelContextTokenError, ChannelSource, DeclassificationIntentScope,
-    derive_channel_source_witness, issue_channel_context_token,
+    TokenBindingV1, derive_channel_source_witness, issue_channel_context_token_with_token_binding,
 };
 use crate::crypto::{Signer, VerifyingKey};
 use crate::determinism::write_atomic;
@@ -663,12 +663,14 @@ impl FacBroker {
     // RFC-0028: ChannelContextToken issuance
     // -----------------------------------------------------------------------
 
-    /// Issues an RFC-0028 `ChannelContextToken` bound to `job_spec_digest`
-    /// and `lease_id`.
+    /// Issues an RFC-0028 `ChannelContextToken` bound to `job_spec_digest`,
+    /// `lease_id`, and `boundary_id`.
     ///
     /// The token encodes a fully-populated `ChannelBoundaryCheck` with
     /// `broker_verified = true` and all verification flags set, signed by
-    /// the broker's Ed25519 key.
+    /// the broker's Ed25519 key. The token also includes a TCK-00565
+    /// `TokenBindingV1` that binds the token to the current FAC policy hash,
+    /// canonicalizer tuple digest, `boundary_id`, and tick-based expiry.
     ///
     /// # Health Gate Precondition (INV-BRK-HEALTH-GATE-001)
     ///
@@ -688,12 +690,14 @@ impl FacBroker {
     /// - `job_spec_digest` is all-zero (not bound to a job)
     /// - `lease_id` is empty
     /// - `request_id` is empty
+    /// - `boundary_id` is empty or exceeds `MAX_BOUNDARY_ID_LENGTH`
     /// - Token serialization or signing fails
     pub fn issue_channel_context_token(
         &self,
         job_spec_digest: &Hash,
         lease_id: &str,
         request_id: &str,
+        boundary_id: &str,
     ) -> Result<String, BrokerError> {
         // INV-BRK-HEALTH-GATE-001: Enforce admission health gate before
         // any token issuance. This is the mandatory pre-issuance guard
@@ -715,6 +719,7 @@ impl FacBroker {
         if request_id.is_empty() {
             return Err(BrokerError::EmptyRequestId);
         }
+        validate_boundary_id(boundary_id)?;
         let Some(policy_root_digest) = self.find_admitted_policy_digest(job_spec_digest) else {
             return Err(BrokerError::UnadmittedPolicyDigest {
                 detail: "requested job_spec_digest has not been admitted".to_string(),
@@ -781,14 +786,29 @@ impl FacBroker {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
+            token_binding: None, // Set by issue_channel_context_token_with_token_binding below.
         };
 
-        Ok(issue_channel_context_token(
+        // TCK-00565: Bind the token to policy, canonicalizer, boundary, and
+        // tick-based expiry so the worker can fail-closed on any drift.
+        let token_binding = TokenBindingV1 {
+            fac_policy_hash: policy_root_digest,
+            canonicalizer_tuple_digest,
+            boundary_id: boundary_id.to_string(),
+            issued_at_tick: self.state.current_tick,
+            expiry_tick: self
+                .state
+                .current_tick
+                .saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
+        };
+
+        Ok(issue_channel_context_token_with_token_binding(
             &check,
             lease_id,
             request_id,
             current_time_secs(),
             &self.signer,
+            token_binding,
         )?)
     }
 
@@ -1524,7 +1544,7 @@ mod tests {
             .expect("job digest should admit");
 
         let token = broker
-            .issue_channel_context_token(&job_digest, lease_id, request_id)
+            .issue_channel_context_token(&job_digest, lease_id, request_id, "test-boundary")
             .expect("token issuance should succeed");
 
         // Decode with broker's verifying key
@@ -1612,7 +1632,8 @@ mod tests {
     fn issue_channel_context_token_rejects_zero_job_digest() {
         let mut broker = FacBroker::new();
         broker.set_admission_health_gate_for_test(true);
-        let result = broker.issue_channel_context_token(&[0u8; 32], "lease-1", "REQ-1");
+        let result =
+            broker.issue_channel_context_token(&[0u8; 32], "lease-1", "REQ-1", "test-boundary");
         assert_eq!(result, Err(BrokerError::ZeroJobSpecDigest));
     }
 
@@ -1623,7 +1644,7 @@ mod tests {
         broker
             .admit_policy_digest([0x11; 32])
             .expect("job digest should admit");
-        let result = broker.issue_channel_context_token(&[0x11; 32], "", "REQ-1");
+        let result = broker.issue_channel_context_token(&[0x11; 32], "", "REQ-1", "test-boundary");
         assert_eq!(result, Err(BrokerError::EmptyLeaseId));
     }
 
@@ -1634,7 +1655,8 @@ mod tests {
         broker
             .admit_policy_digest([0x11; 32])
             .expect("job digest should admit");
-        let result = broker.issue_channel_context_token(&[0x11; 32], "lease-1", "");
+        let result =
+            broker.issue_channel_context_token(&[0x11; 32], "lease-1", "", "test-boundary");
         assert_eq!(result, Err(BrokerError::EmptyRequestId));
     }
 
@@ -1642,7 +1664,8 @@ mod tests {
     fn issue_channel_context_token_rejects_unadmitted_job_digest() {
         let mut broker = FacBroker::new();
         broker.set_admission_health_gate_for_test(true);
-        let result = broker.issue_channel_context_token(&[0x11; 32], "lease-1", "REQ-1");
+        let result =
+            broker.issue_channel_context_token(&[0x11; 32], "lease-1", "REQ-1", "test-boundary");
         assert!(matches!(
             result,
             Err(BrokerError::UnadmittedPolicyDigest { .. })
@@ -1663,7 +1686,8 @@ mod tests {
             .admit_policy_digest(job_digest)
             .expect("job digest should admit");
 
-        let result = broker.issue_channel_context_token(&job_digest, "lease-1", "REQ-1");
+        let result =
+            broker.issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary");
         assert_eq!(
             result,
             Err(BrokerError::AdmissionHealthGateNotSatisfied),
@@ -1721,7 +1745,7 @@ mod tests {
 
         // Now token issuance should succeed
         let token = broker
-            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1")
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("token issuance should succeed after healthy check");
         assert!(!token.is_empty());
     }
@@ -1762,7 +1786,8 @@ mod tests {
         );
 
         // Token issuance must now be denied
-        let result = broker.issue_channel_context_token(&job_digest, "lease-1", "REQ-1");
+        let result =
+            broker.issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary");
         assert_eq!(
             result,
             Err(BrokerError::AdmissionHealthGateNotSatisfied),
@@ -1793,7 +1818,7 @@ mod tests {
             .expect("job digest should admit on attacker broker");
 
         let forged_token = attacker
-            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1")
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("attacker token should encode");
         let decode_now = now_secs();
 
@@ -2460,7 +2485,7 @@ mod tests {
 
         // 1. Issue channel token
         let token = broker
-            .issue_channel_context_token(&job_digest, lease_id, request_id)
+            .issue_channel_context_token(&job_digest, lease_id, request_id, "test-boundary")
             .expect("token should issue");
         let decode_now = now_secs();
 

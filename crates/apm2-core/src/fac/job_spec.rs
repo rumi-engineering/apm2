@@ -915,7 +915,8 @@ pub(crate) fn format_b3_256_digest(hash: &[u8; 32]) -> String {
 /// Parses a `"b3-256:<hex>"` string into raw 32 bytes.
 ///
 /// Returns `None` if the prefix is wrong or the hex is malformed.
-pub(crate) fn parse_b3_256_digest(s: &str) -> Option<[u8; 32]> {
+#[must_use]
+pub fn parse_b3_256_digest(s: &str) -> Option<[u8; 32]> {
     let hex_str = s.strip_prefix(B3_256_PREFIX)?;
     if hex_str.len() != 64 {
         return None;

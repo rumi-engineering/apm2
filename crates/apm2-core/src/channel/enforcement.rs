@@ -273,6 +273,32 @@ pub struct ChannelBoundaryCheck {
     /// Client-claimed timing budget in ticks before policy clamping.
     #[serde(default)]
     pub declared_timing_budget_ticks: Option<u64>,
+    /// TCK-00565: Decoded token binding contract fields (if present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_binding: Option<TokenBindingV1>,
+}
+
+/// Maximum length for boundary identifiers in token bindings.
+pub const MAX_TOKEN_BOUNDARY_ID_LENGTH: usize = 256;
+
+/// Token binding contract fields for TCK-00565 (RFC-0028).
+///
+/// Binds a token to a specific (`fac_policy_hash`,
+/// `canonicalizer_tuple_digest`, `boundary_id`) tuple plus tick-based expiry.
+/// Workers deny on any mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBindingV1 {
+    /// BLAKE3 hash of the FAC policy the token was issued under.
+    pub fac_policy_hash: [u8; 32],
+    /// BLAKE3 digest of the canonicalizer tuple at issuance time.
+    pub canonicalizer_tuple_digest: [u8; 32],
+    /// Boundary identifier the token is scoped to.
+    pub boundary_id: String,
+    /// Broker tick when the token was issued.
+    pub issued_at_tick: u64,
+    /// Broker tick at which the token expires (exclusive).
+    pub expiry_tick: u64,
 }
 
 /// Serialized channel context payload signed by the daemon signer.
@@ -319,6 +345,9 @@ struct ChannelContextTokenPayloadV1 {
     timing_budget_policy_max_ticks: Option<u64>,
     #[serde(default)]
     declared_timing_budget_ticks: Option<u64>,
+    /// TCK-00565: Token binding contract fields.
+    #[serde(default)]
+    token_binding: Option<TokenBindingV1>,
 }
 
 /// Serialized signed channel context token.
@@ -410,6 +439,36 @@ pub enum ChannelContextTokenError {
         /// Decoder current time.
         current_time_secs: u64,
     },
+
+    /// Token FAC policy hash does not match the expected policy hash.
+    #[error("token binding: fac_policy_hash mismatch")]
+    FacPolicyHashMismatch,
+
+    /// Token canonicalizer tuple digest does not match the expected digest.
+    #[error("token binding: canonicalizer_tuple_digest mismatch")]
+    CanonicalizerTupleDigestMismatch,
+
+    /// Token `boundary_id` does not match the expected boundary.
+    #[error("token binding: boundary_id mismatch: expected {expected}, got {actual}")]
+    BoundaryIdMismatch {
+        /// Expected boundary identifier.
+        expected: String,
+        /// Actual boundary identifier carried in the token.
+        actual: String,
+    },
+
+    /// Token tick-based expiry has been exceeded.
+    #[error("token binding: tick expired (expiry_tick={expiry_tick}, current_tick={current_tick})")]
+    TickExpired {
+        /// Token expiry tick.
+        expiry_tick: u64,
+        /// Current broker tick.
+        current_tick: u64,
+    },
+
+    /// Token binding block is missing when expected.
+    #[error("token binding: missing token_binding block")]
+    MissingTokenBinding,
 }
 
 /// Channel boundary violation defect.
@@ -548,24 +607,51 @@ pub fn issue_channel_context_token(
     issued_at_secs: u64,
     signer: &Signer,
 ) -> Result<String, ChannelContextTokenError> {
-    issue_channel_context_token_with_freshness(
+    issue_channel_context_token_with_binding(
         check,
         lease_id,
         request_id,
         issued_at_secs,
         CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
         signer,
+        None,
+    )
+}
+
+/// Issues a base64-encoded channel context token with TCK-00565 token binding.
+///
+/// # Errors
+///
+/// Returns an error if the boundary check has no channel source witness or if
+/// serialization fails.
+pub fn issue_channel_context_token_with_token_binding(
+    check: &ChannelBoundaryCheck,
+    lease_id: &str,
+    request_id: &str,
+    issued_at_secs: u64,
+    signer: &Signer,
+    binding: TokenBindingV1,
+) -> Result<String, ChannelContextTokenError> {
+    issue_channel_context_token_with_binding(
+        check,
+        lease_id,
+        request_id,
+        issued_at_secs,
+        CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
+        signer,
+        Some(binding),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn issue_channel_context_token_with_freshness(
+fn issue_channel_context_token_with_binding(
     check: &ChannelBoundaryCheck,
     lease_id: &str,
     request_id: &str,
     issued_at_secs: u64,
     expires_after_secs: u64,
     signer: &Signer,
+    token_binding: Option<TokenBindingV1>,
 ) -> Result<String, ChannelContextTokenError> {
     let Some(channel_source_witness) = check.channel_source_witness else {
         return Err(ChannelContextTokenError::MissingWitness);
@@ -595,6 +681,7 @@ fn issue_channel_context_token_with_freshness(
         declared_leakage_budget_bits: check.declared_leakage_budget_bits,
         timing_budget_policy_max_ticks: check.timing_budget_policy_max_ticks,
         declared_timing_budget_ticks: check.declared_timing_budget_ticks,
+        token_binding,
     };
 
     let payload_json = canonical_payload(&payload)?;
@@ -611,6 +698,23 @@ fn issue_channel_context_token_with_freshness(
     Ok(base64::engine::general_purpose::STANDARD.encode(token_json))
 }
 
+/// Expected token binding values for TCK-00565 validation.
+///
+/// When provided, `decode_channel_context_token` enforces that the token's
+/// binding fields match these expected values. Missing expected bindings
+/// skip the corresponding check (backwards compatibility with pre-TCK-00565
+/// tokens).
+pub struct ExpectedTokenBinding<'a> {
+    /// Expected FAC policy hash.
+    pub fac_policy_hash: &'a [u8; 32],
+    /// Expected canonicalizer tuple digest.
+    pub canonicalizer_tuple_digest: &'a [u8; 32],
+    /// Expected boundary identifier.
+    pub boundary_id: &'a str,
+    /// Current broker tick for tick-based expiry check.
+    pub current_tick: u64,
+}
+
 /// Decodes and verifies a base64-encoded channel context token.
 ///
 /// # Errors
@@ -623,6 +727,36 @@ pub fn decode_channel_context_token(
     expected_lease_id: &str,
     current_time_secs: u64,
     expected_request_id: &str,
+) -> Result<ChannelBoundaryCheck, ChannelContextTokenError> {
+    decode_channel_context_token_with_binding(
+        token,
+        daemon_verifying_key,
+        expected_lease_id,
+        current_time_secs,
+        expected_request_id,
+        None,
+    )
+}
+
+/// Decodes and verifies a channel context token with TCK-00565 binding checks.
+///
+/// When `expected_binding` is `Some`, validates the token's binding fields
+/// (`fac_policy_hash`, `canonicalizer_tuple_digest`, `boundary_id`, tick
+/// expiry) against the expected values. A token missing the binding block when
+/// expected bindings are provided is denied (fail-closed).
+///
+/// # Errors
+///
+/// Returns an error if the token cannot be decoded, fails schema checks,
+/// has an invalid source witness, or any binding field mismatches.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn decode_channel_context_token_with_binding(
+    token: &str,
+    daemon_verifying_key: &VerifyingKey,
+    expected_lease_id: &str,
+    current_time_secs: u64,
+    expected_request_id: &str,
+    expected_binding: Option<&ExpectedTokenBinding<'_>>,
 ) -> Result<ChannelBoundaryCheck, ChannelContextTokenError> {
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LEN {
         return Err(ChannelContextTokenError::TokenTooLong {
@@ -705,6 +839,43 @@ pub fn decode_channel_context_token(
         });
     }
 
+    // TCK-00565: Validate token binding contract fields when expected.
+    if let Some(expected) = expected_binding {
+        let Some(binding) = &payload.payload.token_binding else {
+            return Err(ChannelContextTokenError::MissingTokenBinding);
+        };
+
+        // Validate fac_policy_hash (constant-time).
+        if !bool::from(binding.fac_policy_hash.ct_eq(expected.fac_policy_hash)) {
+            return Err(ChannelContextTokenError::FacPolicyHashMismatch);
+        }
+
+        // Validate canonicalizer_tuple_digest (constant-time).
+        if !bool::from(
+            binding
+                .canonicalizer_tuple_digest
+                .ct_eq(expected.canonicalizer_tuple_digest),
+        ) {
+            return Err(ChannelContextTokenError::CanonicalizerTupleDigestMismatch);
+        }
+
+        // Validate boundary_id.
+        if binding.boundary_id != expected.boundary_id {
+            return Err(ChannelContextTokenError::BoundaryIdMismatch {
+                expected: expected.boundary_id.to_string(),
+                actual: binding.boundary_id.clone(),
+            });
+        }
+
+        // Validate tick-based expiry (fail-closed on expired).
+        if expected.current_tick >= binding.expiry_tick {
+            return Err(ChannelContextTokenError::TickExpired {
+                expiry_tick: binding.expiry_tick,
+                current_tick: expected.current_tick,
+            });
+        }
+    }
+
     Ok(ChannelBoundaryCheck {
         source: payload.payload.source,
         channel_source_witness: Some(payload.payload.channel_source_witness),
@@ -725,6 +896,7 @@ pub fn decode_channel_context_token(
         declared_leakage_budget_bits: payload.payload.declared_leakage_budget_bits,
         timing_budget_policy_max_ticks: payload.payload.timing_budget_policy_max_ticks,
         declared_timing_budget_ticks: payload.payload.declared_timing_budget_ticks,
+        token_binding: payload.payload.token_binding,
     })
 }
 
@@ -1208,6 +1380,7 @@ mod tests {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
+            token_binding: None,
         }
     }
 
@@ -1709,6 +1882,7 @@ mod tests {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
+            token_binding: None,
         };
 
         let bytes1 = canonical_payload(&payload).expect("payload should serialize");
@@ -1745,6 +1919,7 @@ mod tests {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
+            token_binding: None,
         };
 
         let mut payload2 = payload1.clone();
@@ -1789,6 +1964,7 @@ mod tests {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
+            token_binding: None,
         };
         let payload_json = canonical_payload(&payload).expect("payload should serialize");
         let token_payload = ChannelContextTokenV1 {
@@ -1911,13 +2087,14 @@ mod tests {
         let check = baseline_check();
         let signer = Signer::generate();
         let issued_at_secs = now_secs();
-        let token = issue_channel_context_token_with_freshness(
+        let token = issue_channel_context_token_with_binding(
             &check,
             "lease-1",
             "REQ-1",
             issued_at_secs,
             1,
             &signer,
+            None,
         )
         .expect("token should encode");
 
@@ -2009,5 +2186,253 @@ mod tests {
         .expect("replayed token with same request must remain idempotent");
         assert_eq!(first, check);
         assert_eq!(second, check);
+    }
+
+    // -----------------------------------------------------------------------
+    // TCK-00565: Token binding contract tests
+    // -----------------------------------------------------------------------
+
+    fn make_token_with_binding(
+        signer: &Signer,
+        binding: TokenBindingV1,
+    ) -> (String, ChannelBoundaryCheck) {
+        let check = baseline_check();
+        let token = issue_channel_context_token_with_token_binding(
+            &check,
+            "lease-bind",
+            "REQ-BIND",
+            now_secs(),
+            signer,
+            binding,
+        )
+        .expect("token with binding should encode");
+        (token, check)
+    }
+
+    fn default_binding() -> TokenBindingV1 {
+        TokenBindingV1 {
+            fac_policy_hash: [0xAA; 32],
+            canonicalizer_tuple_digest: [0xBB; 32],
+            boundary_id: "local".to_string(),
+            issued_at_tick: 100,
+            expiry_tick: 200,
+        }
+    }
+
+    #[test]
+    fn tck_00565_token_binding_roundtrip() {
+        let signer = Signer::generate();
+        let binding = default_binding();
+        let (token, _check) = make_token_with_binding(&signer, binding);
+
+        let expected = ExpectedTokenBinding {
+            fac_policy_hash: &[0xAA; 32],
+            canonicalizer_tuple_digest: &[0xBB; 32],
+            boundary_id: "local",
+            current_tick: 150,
+        };
+
+        let decoded = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            Some(&expected),
+        )
+        .expect("valid binding should decode");
+
+        let tb = decoded
+            .token_binding
+            .expect("decoded check must carry token_binding");
+        assert_eq!(tb.fac_policy_hash, [0xAA; 32]);
+        assert_eq!(tb.canonicalizer_tuple_digest, [0xBB; 32]);
+        assert_eq!(tb.boundary_id, "local");
+        assert_eq!(tb.issued_at_tick, 100);
+        assert_eq!(tb.expiry_tick, 200);
+    }
+
+    #[test]
+    fn tck_00565_policy_rotation_invalidates_token() {
+        let signer = Signer::generate();
+        let binding = default_binding();
+        let (token, _check) = make_token_with_binding(&signer, binding);
+
+        // Worker expects a different policy hash (simulating policy rotation).
+        let expected = ExpectedTokenBinding {
+            fac_policy_hash: &[0xFF; 32],
+            canonicalizer_tuple_digest: &[0xBB; 32],
+            boundary_id: "local",
+            current_tick: 150,
+        };
+
+        let result = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            Some(&expected),
+        );
+        assert!(
+            matches!(result, Err(ChannelContextTokenError::FacPolicyHashMismatch)),
+            "policy rotation must invalidate token, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00565_canonicalizer_drift_invalidates_token() {
+        let signer = Signer::generate();
+        let binding = default_binding();
+        let (token, _check) = make_token_with_binding(&signer, binding);
+
+        // Worker expects a different canonicalizer tuple digest.
+        let expected = ExpectedTokenBinding {
+            fac_policy_hash: &[0xAA; 32],
+            canonicalizer_tuple_digest: &[0xCC; 32],
+            boundary_id: "local",
+            current_tick: 150,
+        };
+
+        let result = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            Some(&expected),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ChannelContextTokenError::CanonicalizerTupleDigestMismatch)
+            ),
+            "canonicalizer drift must invalidate token, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00565_tick_expiry_denies_stale_token() {
+        let signer = Signer::generate();
+        let binding = TokenBindingV1 {
+            fac_policy_hash: [0xAA; 32],
+            canonicalizer_tuple_digest: [0xBB; 32],
+            boundary_id: "local".to_string(),
+            issued_at_tick: 100,
+            expiry_tick: 200,
+        };
+        let (token, _check) = make_token_with_binding(&signer, binding);
+
+        // Worker's current tick is at or past the expiry tick.
+        let expected = ExpectedTokenBinding {
+            fac_policy_hash: &[0xAA; 32],
+            canonicalizer_tuple_digest: &[0xBB; 32],
+            boundary_id: "local",
+            current_tick: 200,
+        };
+
+        let result = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            Some(&expected),
+        );
+        assert!(
+            matches!(result, Err(ChannelContextTokenError::TickExpired { .. })),
+            "expired tick must deny token, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00565_boundary_id_mismatch_denied() {
+        let signer = Signer::generate();
+        let binding = default_binding();
+        let (token, _check) = make_token_with_binding(&signer, binding);
+
+        // Worker expects a different boundary_id.
+        let expected = ExpectedTokenBinding {
+            fac_policy_hash: &[0xAA; 32],
+            canonicalizer_tuple_digest: &[0xBB; 32],
+            boundary_id: "remote",
+            current_tick: 150,
+        };
+
+        let result = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            Some(&expected),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ChannelContextTokenError::BoundaryIdMismatch { .. })
+            ),
+            "boundary_id mismatch must deny token, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00565_missing_binding_in_token_denied_when_expected() {
+        let signer = Signer::generate();
+        let check = baseline_check();
+        // Issue a token WITHOUT binding (legacy path).
+        let token =
+            issue_channel_context_token(&check, "lease-bind", "REQ-BIND", now_secs(), &signer)
+                .expect("legacy token should encode");
+
+        // Worker expects binding — must be denied.
+        let expected = ExpectedTokenBinding {
+            fac_policy_hash: &[0xAA; 32],
+            canonicalizer_tuple_digest: &[0xBB; 32],
+            boundary_id: "local",
+            current_tick: 150,
+        };
+
+        let result = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            Some(&expected),
+        );
+        assert!(
+            matches!(result, Err(ChannelContextTokenError::MissingTokenBinding)),
+            "missing binding must be denied when expected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00565_no_expected_binding_skips_validation() {
+        let signer = Signer::generate();
+        let binding = default_binding();
+        let (token, _check) = make_token_with_binding(&signer, binding.clone());
+
+        // Decode without expected binding — validation is skipped.
+        let decoded = decode_channel_context_token_with_binding(
+            &token,
+            &signer.verifying_key(),
+            "lease-bind",
+            now_secs(),
+            "REQ-BIND",
+            None,
+        )
+        .expect("no expected binding should skip validation");
+
+        // The decoded check should have the binding populated.
+        let tb = decoded
+            .token_binding
+            .expect("decoded check must carry binding even without validation");
+        assert_eq!(tb.fac_policy_hash, binding.fac_policy_hash);
+        assert_eq!(
+            tb.canonicalizer_tuple_digest,
+            binding.canonicalizer_tuple_digest
+        );
+        assert_eq!(tb.boundary_id, binding.boundary_id);
     }
 }
