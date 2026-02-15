@@ -69,23 +69,31 @@ use apm2_core::channel::{
     ChannelBoundaryDefect, decode_channel_context_token, validate_channel_boundary,
 };
 use apm2_core::crypto::Signer;
+use apm2_core::economics::admission::{
+    BudgetAdmissionEvaluator, BudgetAdmissionTrace as EconomicsBudgetAdmissionTrace,
+    BudgetAdmissionVerdict, ObservedUsage,
+};
+use apm2_core::economics::profile::EconomicsProfile;
 use apm2_core::economics::queue_admission::{
     HtfEvaluationWindow, QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionVerdict,
     QueueLane, QueueSchedulerState, evaluate_queue_admission,
 };
+use apm2_core::evidence::MemoryCas;
 use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
-    FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
+    FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
+    validate_job_spec,
 };
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
-    BudgetAdmissionTrace, CanonicalizerTupleV1, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES,
-    DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
-    LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
-    parse_policy_hash, persist_content_addressed_receipt, persist_policy, run_preflight,
+    BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1, ChannelBoundaryTrace,
+    DEFAULT_MIN_FREE_BYTES, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1,
+    GateReceipt, GateReceiptBuilder, LaneProfileV1, MAX_POLICY_SIZE,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager, SystemdUnitProperties,
+    compute_policy_hash, deserialize_policy, parse_policy_hash, persist_content_addressed_receipt,
+    persist_policy, run_preflight,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -367,13 +375,41 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
-    let (policy_hash, policy_digest) = match load_or_create_policy(&fac_root) {
+    let (policy_hash, policy_digest, policy) = match load_or_create_policy(&fac_root) {
         Ok(policy) => policy,
         Err(e) => {
             output_worker_error(json_output, &format!("cannot load fac policy: {e}"));
             return exit_codes::GENERIC_ERROR;
         },
     };
+
+    let budget_cas = MemoryCas::new();
+    let baseline_profile = EconomicsProfile::default_baseline();
+    if let Err(e) = baseline_profile.store_in_cas(&budget_cas) {
+        output_worker_error(
+            json_output,
+            &format!("cannot seed baseline economics profile in CAS: {e}"),
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
+    // Verify that the policy's economics_profile_hash is resolvable from CAS.
+    // Currently only the baseline profile is available. If the policy references
+    // a different hash (future custom profile), we cannot resolve it — fail
+    // explicitly rather than silently denying all jobs.
+    let baseline_hash = baseline_profile.profile_hash().unwrap_or([0u8; 32]);
+    if policy.economics_profile_hash != baseline_hash && policy.economics_profile_hash != [0u8; 32]
+    {
+        output_worker_error(
+            json_output,
+            &format!(
+                "fac policy references economics profile hash {:x?} which is not loaded in CAS; \
+                 only baseline profile (hash {:x?}) is currently supported",
+                &policy.economics_profile_hash[..8],
+                &baseline_hash[..8],
+            ),
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
 
     if let Err(e) = broker.admit_policy_digest(policy_digest) {
         output_worker_error(json_output, &format!("cannot admit fac policy digest: {e}"));
@@ -479,6 +515,8 @@ pub fn run_fac_worker(
                     &signer,
                     &policy_hash,
                     &policy_digest,
+                    &policy,
+                    &budget_cas,
                     candidates.len(),
                     print_unit,
                     &current_tuple_digest,
@@ -771,6 +809,8 @@ fn process_job(
     signer: &Signer,
     policy_hash: &str,
     policy_digest: &[u8; 32],
+    policy: &FacPolicyV1,
+    budget_cas: &MemoryCas,
     _candidates_count: usize,
     print_unit: bool,
     canonicalizer_tuple_digest: &str,
@@ -790,7 +830,6 @@ fn process_job(
     // The file was already validated by `scan_pending`; this avoids duplicate I/O.
     let _ = &candidate.raw_bytes;
     let spec = &candidate.spec;
-
     // Validate structure + digest + request_id binding.
     if let Err(e) = validate_job_spec(spec) {
         let is_digest_error = matches!(
@@ -1194,6 +1233,63 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
+    let (budget_tier, budget_intent_class) = job_kind_to_budget_key(&spec.kind);
+    let budget_trace = {
+        let budget_evaluator =
+            BudgetAdmissionEvaluator::new(budget_cas, policy.economics_profile_hash);
+        // Pre-execution budget admission: observed_usage reflects declared constraints
+        // from the job spec, not runtime telemetry. Tokens and tool calls have no
+        // pre-execution estimate. Post-execution enforcement is a separate concern.
+        let observed_usage = ObservedUsage {
+            tokens_used: 0,
+            tool_calls_used: 0,
+            time_ms_used: spec
+                .constraints
+                .test_timeout_seconds
+                .map_or(0, |s| s.saturating_mul(1000)),
+            io_bytes_used: candidate.raw_bytes.len() as u64,
+        };
+        let budget_decision =
+            budget_evaluator.evaluate(budget_tier, budget_intent_class, &observed_usage);
+        let trace = fac_budget_admission_trace(&budget_decision.trace);
+        if budget_decision.verdict != BudgetAdmissionVerdict::Allow {
+            let reason = budget_decision
+                .deny_reason
+                .as_deref()
+                .unwrap_or("budget admission denied (no detail)");
+            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::BudgetAdmissionDenied),
+                reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                Some(&trace),
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
+                );
+            }
+            return JobOutcome::Denied {
+                reason: reason.to_string(),
+            };
+        }
+        Some(trace)
+    };
+
     // PCAC lifecycle: check if authority was already consumed (replay protection).
     if is_authority_consumed(queue_root, &spec.job_id) {
         let reason = format!("authority already consumed for job {}", spec.job_id);
@@ -1213,7 +1309,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
-            None,
+            budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
@@ -1264,7 +1360,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
-            None,
+            budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
@@ -1349,7 +1445,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
-            None,
+            budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
@@ -1390,7 +1486,7 @@ fn process_job(
                 &reason,
                 Some(&boundary_trace),
                 Some(&queue_trace),
-                None,
+                budget_trace.as_ref(),
                 None,
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
@@ -1457,7 +1553,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
-            None,
+            budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
@@ -1497,7 +1593,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
-            None,
+            budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
@@ -1533,7 +1629,7 @@ fn process_job(
                 reason,
                 Some(&boundary_trace),
                 Some(&queue_trace),
-                None,
+                budget_trace.as_ref(),
                 None,
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
@@ -1604,7 +1700,7 @@ fn process_job(
             &reason,
             Some(&boundary_trace),
             Some(&queue_trace),
-            None,
+            budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
@@ -1640,7 +1736,7 @@ fn process_job(
         "completed",
         Some(&boundary_trace),
         Some(&queue_trace),
-        None,
+        budget_trace.as_ref(),
         patch_digest.as_deref(),
         Some(canonicalizer_tuple_digest),
         None,
@@ -1991,7 +2087,7 @@ fn emit_scan_receipt(
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
 }
 
-fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32]), String> {
+fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32], FacPolicyV1), String> {
     let policy_dir = fac_root.join("policy");
     let policy_path = policy_dir.join("fac_policy.v1.json");
 
@@ -2010,7 +2106,7 @@ fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32]), String> 
     let policy_digest =
         parse_policy_hash(&policy_hash).ok_or_else(|| "invalid policy hash".to_string())?;
 
-    Ok((policy_hash, policy_digest))
+    Ok((policy_hash, policy_digest, policy))
 }
 
 /// Emit a unified `FacJobReceiptV1` and persist under
@@ -2024,7 +2120,7 @@ fn emit_job_receipt(
     reason: &str,
     rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
     eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
-    eio29_budget_admission: Option<&BudgetAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
     patch_digest: Option<&str>,
     canonicalizer_tuple_digest: Option<&str>,
     moved_job_path: Option<&str>,
@@ -2087,6 +2183,20 @@ fn build_channel_boundary_trace(defects: &[ChannelBoundaryDefect]) -> ChannelBou
         passed: defects.is_empty(),
         defect_count,
         defect_classes,
+    }
+}
+
+fn fac_budget_admission_trace(trace: &EconomicsBudgetAdmissionTrace) -> FacBudgetAdmissionTrace {
+    let verdict = match trace.verdict {
+        BudgetAdmissionVerdict::Allow => "allow",
+        BudgetAdmissionVerdict::Freeze => "freeze",
+        BudgetAdmissionVerdict::Escalate => "escalate",
+        _ => "deny",
+    };
+
+    FacBudgetAdmissionTrace {
+        verdict: verdict.to_string(),
+        reason: trace.deny_reason.clone(),
     }
 }
 

@@ -18,6 +18,7 @@ use thiserror::Error;
 use super::job_spec::parse_b3_256_digest;
 use super::policy_resolution::{DeterminismClass, RiskTier};
 use crate::determinism::canonicalize_json;
+use crate::economics::profile::EconomicsProfile;
 
 /// Schema identifier for `FacPolicyV1`.
 pub const POLICY_SCHEMA_ID: &str = "apm2.fac.policy.v1";
@@ -41,6 +42,15 @@ pub const MAX_STRING_LENGTH: usize = 4_096;
 pub const SUPPORTED_POLICY_VERSIONS: &[u32] = &[1];
 
 const POLICY_HASH_DOMAIN: &[u8] = b"apm2.fac.policy.v1\0";
+
+/// Returns the deterministic hash of `EconomicsProfile::default_baseline()`.
+fn default_economics_profile_hash() -> [u8; 32] {
+    // EconomicsProfile::default_baseline().profile_hash() computes the BLAKE3 hash
+    // of the canonical JSON representation. This is deterministic.
+    EconomicsProfile::default_baseline()
+        .profile_hash()
+        .unwrap_or([0u8; 32])
+}
 
 /// Errors returned by policy parsing, validation, and persistence.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -177,6 +187,12 @@ pub struct FacPolicyV1 {
 
     /// Determinism class for this policy.
     pub determinism_class: DeterminismClass,
+
+    /// BLAKE3 hash of the economics profile artifact in CAS.
+    ///
+    /// Zero hash means no profile bound (will fail-closed on budget admission).
+    #[serde(default = "default_economics_profile_hash")]
+    pub economics_profile_hash: [u8; 32],
 }
 
 impl Default for FacPolicyV1 {
@@ -189,6 +205,9 @@ impl FacPolicyV1 {
     /// Default authoritative policy for standard host class.
     #[must_use]
     pub fn default_policy() -> Self {
+        let economics_profile = EconomicsProfile::default_baseline();
+        let economics_profile_hash = economics_profile.profile_hash().unwrap_or([0u8; 32]);
+
         Self {
             schema: POLICY_SCHEMA_ID.to_string(),
             version: 1,
@@ -226,6 +245,7 @@ impl FacPolicyV1 {
             cargo_home: None,
             risk_tier: RiskTier::Tier2,
             determinism_class: DeterminismClass::SoftDeterministic,
+            economics_profile_hash,
         }
     }
 

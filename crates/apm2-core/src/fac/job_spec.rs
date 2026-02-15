@@ -10,6 +10,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::determinism::canonicalize_json;
+use crate::pcac::{BoundaryIntentClass, RiskTier};
 
 // Constants
 
@@ -59,6 +60,17 @@ const B3_256_PREFIX: &str = "b3-256:";
 
 const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control"];
 const VALID_SOURCE_KINDS: &[&str] = &["mirror_commit", "patch_injection"];
+
+/// Maps job kind to RFC-0029 budget admission keys.
+#[must_use]
+pub fn job_kind_to_budget_key(kind: &str) -> (RiskTier, BoundaryIntentClass) {
+    match kind {
+        "gates" | "warm" => (RiskTier::Tier0, BoundaryIntentClass::Actuate),
+        "bulk" => (RiskTier::Tier1, BoundaryIntentClass::Actuate),
+        "control" => (RiskTier::Tier1, BoundaryIntentClass::Govern),
+        _ => (RiskTier::Tier2Plus, BoundaryIntentClass::Actuate),
+    }
+}
 
 // Error type
 
@@ -282,7 +294,7 @@ pub struct FacJobSpecV1 {
     /// Computed with `actuation.channel_context_token = null`.
     pub job_spec_digest: String,
 
-    /// Job kind: `"gates"`, `"warm"`, `"gc"`, `"reset"`, etc.
+    /// Job kind: `"gates"`, `"warm"`, `"bulk"`, `"control"`.
     pub kind: String,
 
     /// RFC-0029 queue lane for admission/scheduling.
@@ -1146,5 +1158,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn budget_key_mapping_is_stable() {
+        let unknown = job_kind_to_budget_key("unknown-kind");
+        assert_eq!(unknown, (RiskTier::Tier2Plus, BoundaryIntentClass::Actuate));
+
+        assert_eq!(
+            job_kind_to_budget_key("gates"),
+            (RiskTier::Tier0, BoundaryIntentClass::Actuate)
+        );
+        assert_eq!(
+            job_kind_to_budget_key("warm"),
+            (RiskTier::Tier0, BoundaryIntentClass::Actuate)
+        );
+        assert_eq!(
+            job_kind_to_budget_key("control"),
+            (RiskTier::Tier1, BoundaryIntentClass::Govern)
+        );
+        assert_eq!(
+            job_kind_to_budget_key("bulk"),
+            (RiskTier::Tier1, BoundaryIntentClass::Actuate)
+        );
     }
 }

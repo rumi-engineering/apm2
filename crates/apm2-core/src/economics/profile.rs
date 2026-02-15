@@ -189,6 +189,44 @@ impl EconomicsProfile {
         Ok(profile)
     }
 
+    /// Creates a default baseline profile with permissive budget entries for
+    /// all standard risk tier and intent class combinations.
+    #[must_use]
+    pub fn default_baseline() -> Self {
+        let entry = BudgetEntry {
+            max_tokens: 1_000_000,
+            max_tool_calls: 10_000,
+            max_time_ms: 600_000,
+            max_io_bytes: 1_073_741_824,
+        };
+
+        let mut budget_matrix = BTreeMap::new();
+        for tier in [RiskTier::Tier0, RiskTier::Tier1, RiskTier::Tier2Plus] {
+            for class in [
+                BoundaryIntentClass::Observe,
+                BoundaryIntentClass::Assert,
+                BoundaryIntentClass::Delegate,
+                BoundaryIntentClass::Actuate,
+                BoundaryIntentClass::Govern,
+            ] {
+                budget_matrix.insert((tier, class), entry);
+            }
+        }
+
+        Self {
+            lifecycle_cost_vector: LifecycleCostVector {
+                c_join: 1,
+                c_revalidate: 1,
+                c_consume: 1,
+                c_effect: 1,
+                c_replay: 1,
+                c_recovery: 1,
+            },
+            input_state: EconomicsProfileInputState::Current,
+            budget_matrix,
+        }
+    }
+
     /// Returns the budget entry for a `(tier, intent_class)` key.
     #[must_use]
     pub fn budget_entry(

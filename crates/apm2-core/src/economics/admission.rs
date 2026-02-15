@@ -381,6 +381,30 @@ mod tests {
     }
 
     #[test]
+    fn default_baseline_profile_allows_zero_usage() {
+        let profile = EconomicsProfile::default_baseline();
+        let cas = MemoryCas::new();
+        let profile_hash = profile
+            .store_in_cas(&cas)
+            .expect("default baseline profile should store");
+
+        let evaluator = BudgetAdmissionEvaluator::new(&cas, profile_hash);
+        let decision = evaluator.evaluate(
+            RiskTier::Tier1,
+            BoundaryIntentClass::Actuate,
+            &ObservedUsage {
+                tokens_used: 0,
+                tool_calls_used: 0,
+                time_ms_used: 0,
+                io_bytes_used: 0,
+            },
+        );
+
+        assert_eq!(decision.verdict, BudgetAdmissionVerdict::Allow);
+        assert_eq!(decision.deny_reason, None);
+    }
+
+    #[test]
     fn missing_cas_entry_denies_fail_closed() {
         let cas = MemoryCas::new();
         let evaluator = BudgetAdmissionEvaluator::new(&cas, [0xAA; 32]);

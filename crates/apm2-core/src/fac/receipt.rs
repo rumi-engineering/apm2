@@ -235,6 +235,8 @@ pub enum DenialReasonCode {
     AdmissionHealthGateFailed,
     /// RFC-0029 queue admission denied.
     QueueAdmissionDenied,
+    /// RFC-0029 budget admission denied.
+    BudgetAdmissionDenied,
     /// PCAC authority already consumed.
     AuthorityAlreadyConsumed,
     /// PCAC consume operation failed.
@@ -2294,6 +2296,10 @@ pub mod tests {
             (
                 DenialReasonCode::QueueAdmissionDenied,
                 "\"queue_admission_denied\"",
+            ),
+            (
+                DenialReasonCode::BudgetAdmissionDenied,
+                "\"budget_admission_denied\"",
             ),
             (
                 DenialReasonCode::AuthorityAlreadyConsumed,
