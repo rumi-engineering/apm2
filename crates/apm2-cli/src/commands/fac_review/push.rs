@@ -466,6 +466,12 @@ fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> 
     {
         expected.insert("test_safety_guard".to_string());
     }
+    if workspace_root
+        .join("scripts/ci/review_artifact_lint.sh")
+        .exists()
+    {
+        expected.insert("review_artifact_lint".to_string());
+    }
     expected
 }
 
