@@ -255,6 +255,72 @@ health gate to refuse job admission when broker health is degraded.
   active on ALL production admission/token issuance paths through the
   `FacBroker` API.
 
+## broker_rate_limits Submodule (TCK-00568)
+
+The `broker_rate_limits` submodule implements RFC-0029 control-plane budget
+admission for the FAC Broker. It bounds token issuance, queue enqueue operations,
+queue byte throughput, and bundle export byte throughput using configurable limits
+with hard caps.
+
+### Key Types
+
+- `ControlPlaneLimits`: Configuration struct with per-dimension limits and hard
+  cap validation. Validated via `validate()` before use. Defaults: 10K tokens,
+  100K enqueue ops, 10 GiB queue bytes, 10 GiB bundle export bytes.
+- `ControlPlaneBudget`: Cumulative counter tracker. Enforces admission-before-mutation
+  ordering (INV-CPRL-002). Provides `admit_token_issuance()`,
+  `admit_queue_enqueue(ops, bytes)`, and `admit_bundle_export(bytes)` methods.
+- `ControlPlaneDenialReceipt`: Structured denial evidence carrying dimension,
+  current usage, limit, and requested increment.
+- `ControlPlaneDimension`: Enum identifying the budget dimension that was exceeded
+  (`TokenIssuance`, `QueueEnqueueOps`, `QueueEnqueueBytes`, `BundleExportBytes`).
+- `ControlPlaneBudgetError`: Error taxonomy with `InvalidLimits` and
+  `BudgetExceeded` variants. `BudgetExceeded` carries a human-readable reason
+  string and a `ControlPlaneDenialReceipt`.
+
+### Hard Caps
+
+- `MAX_TOKEN_ISSUANCE_LIMIT`: 1,000,000
+- `MAX_QUEUE_ENQUEUE_LIMIT`: 1,000,000
+- `MAX_QUEUE_BYTES_LIMIT`: 64 GiB
+- `MAX_BUNDLE_EXPORT_BYTES_LIMIT`: 64 GiB
+
+### Core Capabilities
+
+- Budget admission with `checked_add` arithmetic to prevent counter overflow
+  (INV-CPRL-004).
+- Fail-closed semantics: zero limits deny all operations immediately
+  (INV-CPRL-003).
+- Admission-before-mutation ordering: counters only advance on successful
+  admission (INV-CPRL-002).
+- Hard cap validation prevents misconfiguration above system safety bounds
+  (INV-CPRL-001).
+- `reset()` clears all counters for window advancement boundaries.
+- Serialization round-trip via `serde` for persistence and observability.
+
+### Broker Integration
+
+- `FacBroker` holds a `ControlPlaneBudget` field initialized from default or
+  custom limits.
+- `issue_channel_context_token()` calls `admit_token_issuance()` before input
+  validation (fail-closed gate).
+- `admit_queue_enqueue(bytes)` and `admit_bundle_export(bytes)` are public
+  methods on `FacBroker` for callers to gate queue and export operations.
+- `reset_control_plane_budget()` resets counters at tick advancement boundaries.
+- `BrokerError::ControlPlaneBudgetDenied` variant propagates budget errors.
+- `DenialReasonCode::ControlPlaneBudgetDenied` variant for receipt integration.
+
+### Security Invariants (TCK-00568)
+
+- [INV-CPRL-001] Limits exceeding hard caps are rejected at construction time.
+- [INV-CPRL-002] Counters advance only after successful admission check
+  (admission-before-mutation).
+- [INV-CPRL-003] Zero limits deny all operations immediately (fail-closed).
+- [INV-CPRL-004] All counter arithmetic uses `checked_add`; overflow produces a
+  denial receipt, never wrapping.
+- [INV-CPRL-005] Budget denial always produces a structured
+  `ControlPlaneDenialReceipt` with machine-readable evidence.
+
 ## projection_compromise Submodule
 
 The `projection_compromise` submodule implements compromise handling for public
