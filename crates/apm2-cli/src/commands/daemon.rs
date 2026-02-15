@@ -222,6 +222,18 @@ pub fn install(enable_linger: bool) -> Result<()> {
                 unit_path.display()
             )
         })?;
+        // Restrict unit file permissions to owner-read/write + group/other-read (0644).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| {
+                    format!(
+                        "failed to set permissions on unit file {}",
+                        unit_path.display()
+                    )
+                })?;
+        }
     }
 
     run_user_systemctl(&["daemon-reload"])?;
