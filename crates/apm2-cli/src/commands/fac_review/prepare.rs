@@ -25,6 +25,8 @@ struct PrepareSummary {
     base_ref: String,
     diff_path: String,
     commit_history_path: String,
+    diff_content: String,
+    commit_history_content: String,
     temp_dir: String,
 }
 
@@ -90,6 +92,8 @@ pub fn run_prepare(
         base_ref,
         diff_path: diff_path.display().to_string(),
         commit_history_path: history_path.display().to_string(),
+        diff_content: diff,
+        commit_history_content: commit_history,
         temp_dir: prepared_dir.display().to_string(),
     };
 

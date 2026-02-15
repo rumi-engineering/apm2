@@ -97,7 +97,7 @@
             {
               "action": "parse_json",
               "from": "prepare_json",
-              "extract": ["pr_number", "diff_path", "commit_history_path"]
+              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content"]
             },
             {
               "action": "on_failure",
@@ -115,8 +115,8 @@
               "action": "read_all_references",
               "rule": "Read every file listed in the references[] section IN FULL. Do not summarize, skip, or skim — details matter. Each reference contains invariants, contracts, checklists, and anti-patterns that are load-bearing for review accuracy. Incomplete internalization produces false negatives."
             },
-            {"action": "read_file", "path": "$diff_path"},
-            {"action": "read_file", "path": "$commit_history_path"},
+            {"action": "use_captured", "from": "diff_content", "purpose": "Full PR diff from prepare output"},
+            {"action": "use_captured", "from": "commit_history_content", "purpose": "Commit history from prepare output"},
             {
               "action": "read_module_agents",
               "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] that the diff must preserve."
