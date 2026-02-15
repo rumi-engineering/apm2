@@ -73,6 +73,10 @@ struct FindingSummary {
     location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviewer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
     created_at: String,
     evidence_selector: String,
     evidence_digest: String,
@@ -119,6 +123,8 @@ fn run_finding_inner(
     impact: Option<&str>,
     location: Option<&str>,
     reviewer_id: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     evidence_pointer: Option<&str>,
     source: &str,
     json_output: bool,
@@ -143,6 +149,8 @@ fn run_finding_inner(
         impact,
         location,
         reviewer_id,
+        model_id,
+        backend_id,
         evidence_pointer,
         source,
     )?;
@@ -169,6 +177,8 @@ fn run_finding_inner(
         impact: normalize_optional(finding.impact.as_deref()),
         location: normalize_optional(finding.location.as_deref()),
         reviewer_id: normalize_optional(finding.reviewer_id.as_deref()),
+        model_id: normalize_optional(finding.model_id.as_deref()),
+        backend_id: normalize_optional(finding.backend_id.as_deref()),
         created_at: finding.created_at.clone(),
         evidence_selector: selector,
         evidence_digest: finding.evidence_digest.clone(),
@@ -177,35 +187,11 @@ fn run_finding_inner(
 
     let _ =
         projection_store::save_identity_with_context(&owner_repo, resolved_pr, &head_sha, source);
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("FAC Review Finding");
-        println!("  Repo:          {}", summary.repo);
-        println!("  PR Number:     {}", summary.pr_number);
-        println!("  PR URL:        {}", summary.pr_url);
-        println!("  Head SHA:      {}", summary.head_sha);
-        println!("  Review Type:   {}", summary.review_type);
-        println!("  Severity:      {}", summary.severity);
-        println!("  Finding ID:    {}", summary.finding_id);
-        println!("  Summary:       {}", summary.summary);
-        if let Some(details) = summary.details.as_deref() {
-            println!("  Details:       {details}");
-        }
-        if let Some(risk) = summary.risk.as_deref() {
-            println!("  Risk:          {risk}");
-        }
-        if let Some(impact) = summary.impact.as_deref() {
-            println!("  Impact:        {impact}");
-        }
-        if let Some(location) = summary.location.as_deref() {
-            println!("  Location:      {location}");
-        }
-        println!("  Selector:      {}", summary.evidence_selector);
-    }
+    let _ = json_output;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+    );
     Ok(exit_codes::SUCCESS)
 }
 
@@ -222,6 +208,8 @@ pub fn run_finding(
     impact: Option<&str>,
     location: Option<&str>,
     reviewer_id: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
     evidence_pointer: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
@@ -237,6 +225,8 @@ pub fn run_finding(
         impact,
         location,
         reviewer_id,
+        model_id,
+        backend_id,
         evidence_pointer,
         FINDING_SOURCE,
         json_output,
@@ -291,6 +281,8 @@ pub fn run_comment_compat(
         severity,
         &summary,
         Some(&summary),
+        None,
+        None,
         None,
         None,
         None,

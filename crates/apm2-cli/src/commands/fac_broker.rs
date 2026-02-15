@@ -68,33 +68,38 @@ pub fn run_broker(args: &BrokerArgs, json_output: bool) -> u8 {
 }
 
 fn run_status(status_args: &BrokerStatusArgs, parent_json_output: bool) -> u8 {
-    let use_json = parent_json_output || status_args.json;
+    let _ = parent_json_output || status_args.json;
     match build_status() {
         Ok(response) => {
-            if use_json {
-                match serde_json::to_string_pretty(&response) {
-                    Ok(payload) => {
-                        println!("{payload}");
-                    },
-                    Err(error) => {
-                        eprintln!("ERROR: failed to serialize broker status response: {error}");
-                        return exit_codes::GENERIC_ERROR;
-                    },
-                }
-            } else {
-                println!("Schema version: {}", response.schema_version);
-                println!("Admitted digest count: {}", response.admitted_digest_count);
-                println!("Tick: {}", response.tick);
-                println!(
-                    "Verifying key fingerprint: {}",
-                    response.verifying_key_fingerprint
-                );
-                println!("Health status: {}", response.health_status);
+            match serde_json::to_string_pretty(&response) {
+                Ok(payload) => {
+                    println!("{payload}");
+                },
+                Err(error) => {
+                    let err_payload = serde_json::json!({
+                        "error": "broker_status_serialization_failed",
+                        "message": format!("failed to serialize broker status response: {error}"),
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&err_payload)
+                            .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                    );
+                    return exit_codes::GENERIC_ERROR;
+                },
             }
             exit_codes::SUCCESS
         },
         Err(error) => {
-            eprintln!("Error: {error}");
+            let err_payload = serde_json::json!({
+                "error": "broker_status_failed",
+                "message": format!("{error}"),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&err_payload)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+            );
             exit_codes::GENERIC_ERROR
         },
     }

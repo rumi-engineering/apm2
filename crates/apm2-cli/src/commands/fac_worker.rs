@@ -61,7 +61,7 @@
 //!   cannot acquire a lane are moved back to pending.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,7 @@ use apm2_core::fac::{
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -253,6 +254,16 @@ pub fn run_fac_worker(
     print_unit: bool,
 ) -> u8 {
     let poll_interval_secs = poll_interval_secs.min(MAX_POLL_INTERVAL_SECS);
+    if json_output {
+        emit_worker_event(
+            "worker_started",
+            serde_json::json!({
+                "once": once,
+                "poll_interval_secs": poll_interval_secs,
+                "max_jobs": max_jobs,
+            }),
+        );
+    }
 
     // Resolve queue root directory
     let queue_root = match resolve_queue_root() {
@@ -337,10 +348,21 @@ pub fn run_fac_worker(
                 reason: "scheduler state missing, reconstructing conservatively".to_string(),
                 timestamp_secs: current_timestamp_epoch_secs(),
             };
-            eprintln!(
-                "INFO: scheduler state reconstructed: {} ({}, {})",
-                recovery.schema, recovery.reason, recovery.timestamp_secs
-            );
+            if json_output {
+                emit_worker_event(
+                    "scheduler_recovery",
+                    serde_json::json!({
+                        "schema": recovery.schema,
+                        "reason": recovery.reason,
+                        "timestamp_secs": recovery.timestamp_secs,
+                    }),
+                );
+            } else {
+                eprintln!(
+                    "INFO: scheduler state reconstructed: {} ({}, {})",
+                    recovery.schema, recovery.reason, recovery.timestamp_secs
+                );
+            }
             QueueSchedulerState::new()
         },
         Err(e) => {
@@ -350,11 +372,23 @@ pub fn run_fac_worker(
                     .to_string(),
                 timestamp_secs: current_timestamp_epoch_secs(),
             };
-            eprintln!("WARNING: failed to load scheduler state: {e}, starting fresh");
-            eprintln!(
-                "INFO: scheduler state reconstructed: {} ({}, {})",
-                recovery.schema, recovery.reason, recovery.timestamp_secs
-            );
+            if json_output {
+                emit_worker_event(
+                    "scheduler_recovery",
+                    serde_json::json!({
+                        "schema": recovery.schema,
+                        "reason": recovery.reason,
+                        "timestamp_secs": recovery.timestamp_secs,
+                        "load_error": e,
+                    }),
+                );
+            } else {
+                eprintln!("WARNING: failed to load scheduler state: {e}, starting fresh");
+                eprintln!(
+                    "INFO: scheduler state reconstructed: {} ({}, {})",
+                    recovery.schema, recovery.reason, recovery.timestamp_secs
+                );
+            }
             QueueSchedulerState::new()
         },
     };
@@ -444,22 +478,23 @@ pub fn run_fac_worker(
     match check_or_admit_canonicalizer_tuple(&fac_root) {
         Ok(CanonicalizerTupleCheck::Matched) => {},
         Ok(CanonicalizerTupleCheck::Missing) => {
-            eprintln!(
-                "FATAL: no admitted canonicalizer tuple found. Run 'apm2 fac canonicalizer admit' to bootstrap."
+            output_worker_error(
+                json_output,
+                "no admitted canonicalizer tuple found. run `apm2 fac canonicalizer admit` to bootstrap",
             );
             return exit_codes::GENERIC_ERROR;
         },
         Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple)) => {
-            eprintln!("FATAL: canonicalizer tuple mismatch");
-            eprintln!(
-                "  current: {}/{}",
-                current_tuple.canonicalizer_id, current_tuple.canonicalizer_version
+            output_worker_error(
+                json_output,
+                &format!(
+                    "canonicalizer tuple mismatch (current={}/{}, admitted={}/{}). remedy: re-run broker admission or update binary",
+                    current_tuple.canonicalizer_id,
+                    current_tuple.canonicalizer_version,
+                    admitted_tuple.canonicalizer_id,
+                    admitted_tuple.canonicalizer_version
+                ),
             );
-            eprintln!(
-                "  admitted: {}/{}",
-                admitted_tuple.canonicalizer_id, admitted_tuple.canonicalizer_version
-            );
-            eprintln!("  remedy: re-run broker admission or update binary");
             return exit_codes::GENERIC_ERROR;
         },
         Err(e) => {
@@ -491,7 +526,13 @@ pub fn run_fac_worker(
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
                 if once {
-                    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
+                    if let Err(persist_err) = persist_queue_scheduler_state(
+                        &fac_root,
+                        &queue_state,
+                        broker.current_tick(),
+                    ) {
+                        output_worker_error(json_output, &persist_err);
+                    }
                     return exit_codes::GENERIC_ERROR;
                 }
                 sleep_remaining(cycle_start, poll_interval_secs);
@@ -503,10 +544,17 @@ pub fn run_fac_worker(
 
         if candidates.is_empty() {
             if once {
-                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+                if let Err(persist_err) = persist_queue_scheduler_state(
+                    &fac_root,
+                    &cycle_scheduler,
+                    broker.current_tick(),
+                ) {
+                    output_worker_error(json_output, &persist_err);
+                    return exit_codes::GENERIC_ERROR;
+                }
                 let _ = save_broker_state(&broker);
                 if json_output {
-                    print_json(&summary);
+                    emit_worker_summary(&summary);
                 } else {
                     eprintln!("worker: no pending jobs found");
                 }
@@ -520,7 +568,17 @@ pub fn run_fac_worker(
             if max_jobs > 0 && total_processed >= max_jobs {
                 break;
             }
+            if json_output {
+                emit_worker_event(
+                    "job_started",
+                    serde_json::json!({
+                        "job_id": candidate.spec.job_id,
+                        "queue_lane": candidate.spec.queue_lane,
+                    }),
+                );
+            }
 
+            let job_started = Instant::now();
             let lane = parse_queue_lane(&candidate.spec.queue_lane);
             let outcome = if let Err(e) = cycle_scheduler.record_admission(lane) {
                 JobOutcome::Denied {
@@ -548,28 +606,76 @@ pub fn run_fac_worker(
                 cycle_scheduler.record_completion(lane);
                 outcome
             };
+            let duration_secs = job_started.elapsed().as_secs();
 
             match &outcome {
                 JobOutcome::Quarantined { reason } => {
                     summary.jobs_quarantined += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_failed",
+                            serde_json::json!({
+                                "job_id": candidate.spec.job_id,
+                                "outcome": "quarantined",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
+                                "reason": reason,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: quarantined {}: {reason}", candidate.path.display());
                     }
                 },
                 JobOutcome::Denied { reason } => {
                     summary.jobs_denied += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_failed",
+                            serde_json::json!({
+                                "job_id": candidate.spec.job_id,
+                                "outcome": "denied",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
+                                "reason": reason,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: denied {}: {reason}", candidate.spec.job_id);
                     }
                 },
                 JobOutcome::Completed { job_id } => {
                     summary.jobs_completed += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_completed",
+                            serde_json::json!({
+                                "job_id": job_id,
+                                "outcome": "completed",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: completed {job_id}");
                     }
                 },
                 JobOutcome::Skipped { reason } => {
                     summary.jobs_skipped += 1;
+                    if json_output {
+                        emit_worker_event(
+                            "job_skipped",
+                            serde_json::json!({
+                                "job_id": candidate.spec.job_id,
+                                "outcome": "skipped",
+                                "queue_lane": candidate.spec.queue_lane,
+                                "duration_secs": duration_secs,
+                                "reason": reason,
+                            }),
+                        );
+                    }
                     if !json_output {
                         eprintln!("worker: skipped: {reason}");
                     }
@@ -585,16 +691,28 @@ pub fn run_fac_worker(
             }
 
             if once {
-                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+                if let Err(persist_err) = persist_queue_scheduler_state(
+                    &fac_root,
+                    &cycle_scheduler,
+                    broker.current_tick(),
+                ) {
+                    output_worker_error(json_output, &persist_err);
+                    return exit_codes::GENERIC_ERROR;
+                }
                 let _ = save_broker_state(&broker);
                 if json_output {
-                    print_json(&summary);
+                    emit_worker_summary(&summary);
                 }
                 return exit_codes::SUCCESS;
             }
         }
 
-        persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+        if let Err(persist_err) =
+            persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick())
+        {
+            output_worker_error(json_output, &persist_err);
+            return exit_codes::GENERIC_ERROR;
+        }
         queue_state = cycle_scheduler;
 
         if max_jobs > 0 && total_processed >= max_jobs {
@@ -609,10 +727,15 @@ pub fn run_fac_worker(
     }
 
     if json_output {
-        print_json(&summary);
+        emit_worker_summary(&summary);
     }
 
-    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
+    if let Err(persist_err) =
+        persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick())
+    {
+        output_worker_error(json_output, &persist_err);
+        return exit_codes::GENERIC_ERROR;
+    }
     let _ = save_broker_state(&broker);
     exit_codes::SUCCESS
 }
@@ -621,12 +744,12 @@ fn persist_queue_scheduler_state(
     fac_root: &Path,
     queue_state: &QueueSchedulerState,
     current_tick: u64,
-) {
+) -> Result<(), String> {
     let mut state = queue_state.to_scheduler_state_v1(current_tick);
     state.persisted_at_secs = current_timestamp_epoch_secs();
-    if let Err(e) = persist_scheduler_state(fac_root, &state) {
-        eprintln!("WARNING: failed to persist scheduler state: {e}");
-    }
+    persist_scheduler_state(fac_root, &state)
+        .map(|_| ())
+        .map_err(|e| format!("failed to persist scheduler state: {e}"))
 }
 
 fn check_or_admit_canonicalizer_tuple(fac_root: &Path) -> Result<CanonicalizerTupleCheck, String> {
@@ -3215,20 +3338,54 @@ fn sleep_remaining(cycle_start: Instant, poll_interval_secs: u64) {
 /// Outputs a worker error message.
 fn output_worker_error(json_output: bool, message: &str) {
     if json_output {
-        let err = serde_json::json!({
-            "error": message,
-        });
-        eprintln!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+        emit_worker_event(
+            "worker_error",
+            serde_json::json!({
+                "error": "fac_worker_failed",
+                "message": message,
+            }),
+        );
     } else {
         eprintln!("worker error: {message}");
     }
 }
 
-/// Prints a JSON-serializable value to stdout.
-fn print_json<T: Serialize>(value: &T) {
-    if let Ok(json) = serde_json::to_string_pretty(value) {
-        println!("{json}");
+fn worker_ts_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn emit_worker_jsonl(value: &serde_json::Value) {
+    if let Ok(line) = serde_json::to_string(value) {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
     }
+}
+
+fn emit_worker_event(event: &str, extra: serde_json::Value) {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "event".to_string(),
+        serde_json::Value::String(event.to_string()),
+    );
+    map.insert("ts".to_string(), serde_json::Value::String(worker_ts_now()));
+    match extra {
+        serde_json::Value::Object(extra_map) => {
+            for (key, value) in extra_map {
+                map.insert(key, value);
+            }
+        },
+        other => {
+            map.insert("data".to_string(), other);
+        },
+    }
+    emit_worker_jsonl(&serde_json::Value::Object(map));
+}
+
+fn emit_worker_summary(summary: &WorkerSummary) {
+    let data = serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}));
+    emit_worker_event("worker_summary", data);
 }
 
 // =============================================================================
