@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local CI orchestrator: executes the full CI check surface in a single run.
-# Intended to be wrapped once by run_bounded_tests.sh for outer cgroup limits.
+# Bounded runtime control is handled by Rust FAC code paths.
 
 set -euo pipefail
 

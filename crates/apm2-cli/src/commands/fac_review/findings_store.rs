@@ -296,6 +296,32 @@ fn bind_findings_bundle_integrity(bundle: &mut FindingsBundle) -> Result<(), Str
     Ok(())
 }
 
+fn verify_findings_bundle_integrity_without_rotation(
+    bundle: &FindingsBundle,
+) -> Result<(), String> {
+    let Some(stored) = bundle.integrity_hmac.as_deref() else {
+        return Err(format!(
+            "missing findings bundle integrity_hmac for {} PR #{} sha {}",
+            bundle.owner_repo, bundle.pr_number, bundle.head_sha
+        ));
+    };
+    let secret =
+        read_secret_hex_bytes(&findings_secret_path(&bundle.owner_repo, bundle.pr_number)?)?
+            .ok_or_else(|| {
+                format!(
+                    "missing findings integrity secret for {} PR #{}",
+                    bundle.owner_repo, bundle.pr_number
+                )
+            })?;
+    let payload = findings_bundle_binding_payload(bundle)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    let matches = verify_hmac(stored, &computed)?;
+    if !matches {
+        return Err("findings bundle integrity check failed".to_string());
+    }
+    Ok(())
+}
+
 fn findings_lock_path(owner_repo: &str, pr_number: u32, head_sha: &str) -> Result<PathBuf, String> {
     let bundle_path = findings_bundle_path(owner_repo, pr_number, head_sha)?;
     let parent = bundle_path.parent().ok_or_else(|| {
@@ -349,10 +375,10 @@ pub(super) fn load_findings_bundle(
         },
     };
 
-    let mut bundle = serde_json::from_slice::<FindingsBundle>(&bytes)
+    let bundle = serde_json::from_slice::<FindingsBundle>(&bytes)
         .map_err(|err| format!("failed to parse findings bundle {}: {err}", path.display()))?;
     validate_loaded_bundle_identity(&bundle, owner_repo, pr_number, head_sha)?;
-    bind_findings_bundle_integrity(&mut bundle)?;
+    verify_findings_bundle_integrity_without_rotation(&bundle)?;
     Ok(Some(bundle))
 }
 

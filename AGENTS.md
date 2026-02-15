@@ -22,11 +22,11 @@
   "payload": {
     "purpose": "Intent-based context router for agents entering the APM2 repository. Select the route matching your task, read priority_reads in order, and stop when you have sufficient context to begin work.",
     "execution_notes": [
-      "python3 is installed on this repository environment; do not assume a `python` symlink exists."
+      "python3 is installed on this repository environment; do not assume a `python` symlink exists.",
+      "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do not add deprecated shims, re-exports, renamed aliases, or any other backwards-compat scaffolding by default. The system is capable of instant rollback and upgrading from breaking changes."
     ],
     "parallel_collaboration_policy": {
-      "instruction": "Concurrent multi-agent edits are expected in this repository. If you observe local modifications you did not author, assume they were made by another agent working in parallel and continue your assigned task.",
-      "exception": "Escalate only if there is a direct merge conflict, destructive overwrite risk, or ambiguity about ownership of the exact lines you must change."
+      "instruction": "Concurrent multi-agent edits are expected in this repository. If you observe local modifications you did not author, assume they were made by another agent working in parallel and continue your assigned task."
     },
     "usage": {
       "step_1": "Identify your intent from the routing_table below.",
@@ -134,39 +134,6 @@
           "Stop-conditions (goal reached, budget exhausted, blocked, escalated, error) are verifiable facts, not heuristics"
         ],
         "reference_rfc": "RFC-0011"
-      },
-      "holonic_hierarchy": {
-        "summary": "Recursion that scales from one box to 100B agent holarchies.",
-        "definition": "Holons are simultaneously wholes (autonomous agents) and parts (components in larger systems). This recursive composition means the same semantics—budgets, capabilities, boundaries, receipts—apply at every scale. A holon has internal structure (sub-holons), a boundary (typed channels), and invariants that compose through recursion depths.",
-        "key_principles": [
-          "One invariant architecture from single-agent to federated meshes",
-          "Boundaries are sealed: Markov blanket prevents data-plane leakage",
-          "Communication is typed and canonicalized before hashing/signing",
-          "Each recursion level has its own episode, lease, and budget"
-        ],
-        "reference_rfc": "RFC-0003"
-      },
-      "ledger_as_truth": {
-        "summary": "Truth is append-only; mutable state is derived.",
-        "definition": "The Ledger is the Topology of Truth: hash-chained, append-only, monotone. All authoritative facts (work decisions, policy, capability grants, evidence receipts) live in the ledger. Projections (views into the ledger) are disposable caches. Event-sourcing via deterministic reducers derives any mutable workspace state from ledger facts. Scale invariant: one box and global federation both use the same ledger append + reducer pipeline.",
-        "key_principles": [
-          "No retraction, no hidden state mutation—only appends",
-          "Projections are content-addressed and traceable to ledger facts",
-          "Reducers are deterministic; same events + reducer = same output",
-          "Consensus for control-plane (shared authority facts), convergence for data-plane (CRDTs)"
-        ],
-        "reference_rfcs": ["RFC-0014", "RFC-0016"]
-      },
-      "proof_admitted_gates": {
-        "summary": "Authority gated by machine-verifiable evidence receipts.",
-        "definition": "Every high-impact transition requires a receipt bundle signed by a gate. Gates are policy-indexed closures over evidence facts. Gates enforce the constraint hierarchy: Containment > Correctness > Liveness (S0 > S1 > S2). A fail at higher tiers is monotone—once failed, re-evaluation with more evidence cannot override the failure.",
-        "key_principles": [
-          "No transition without a gate receipt bound to evidence",
-          "Fail dominates verdict aggregation; missing evidence = fail or pending, never pass",
-          "High-risk gates (T2/T3) require uncertainty qualification and reverification paths",
-          "Tiered policy defines different gates for different risk levels and transition types"
-        ],
-        "reference_rfcs": ["RFC-0015", "RFC-0019"]
       }
     },
     "major_rfc_context": {

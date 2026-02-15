@@ -43,6 +43,7 @@ pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED: &str = "verdict_finalized_ag
 pub const TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED_LEGACY: &str =
     "manual_termination_after_decision";
 pub const TERMINAL_MANUAL_TERMINATION_DECISION_BOUND: &str = "manual_termination_decision_bound";
+pub const TERMINAL_REPAIR_STATE_REBUILT: &str = "repair_state_rebuilt";
 
 pub fn is_verdict_finalized_agent_stop_reason(reason: &str) -> bool {
     reason.eq_ignore_ascii_case(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED)
@@ -349,6 +350,8 @@ pub struct ReviewStateFile {
 #[serde(deny_unknown_fields)]
 pub struct PulseFile {
     pub head_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub written_at: DateTime<Utc>,
 }
 

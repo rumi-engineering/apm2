@@ -1513,15 +1513,25 @@ pub fn get_process_start_time(pid: u32) -> Option<u64> {
 
 // ── Pulse files ─────────────────────────────────────────────────────────────
 
-pub fn write_pulse_file(pr_number: u32, review_type: &str, head_sha: &str) -> Result<(), String> {
+pub fn write_pulse_file(
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+    run_id: Option<&str>,
+) -> Result<(), String> {
     let path = pulse_file_path(pr_number, review_type)?;
-    write_pulse_file_to_path(&path, head_sha)
+    write_pulse_file_to_path(&path, head_sha, run_id)
 }
 
-pub fn write_pulse_file_to_path(path: &Path, head_sha: &str) -> Result<(), String> {
+pub fn write_pulse_file_to_path(
+    path: &Path,
+    head_sha: &str,
+    run_id: Option<&str>,
+) -> Result<(), String> {
     ensure_parent_dir(path)?;
     let pulse = PulseFile {
         head_sha: head_sha.to_string(),
+        run_id: run_id.map(ToString::to_string),
         written_at: Utc::now(),
     };
     let content = serde_json::to_vec_pretty(&pulse)

@@ -67,16 +67,10 @@ decision_tree:
           action: "References do not interpolate variables. Replace placeholders like <TICKET_ID>, <PR_NUMBER>, and <WORKTREE_PATH> before running commands."
         - id: DISCOVER_RELEVANT_FAC_HELP
           action: |
-            Discover what the apm2 CLI can do for you. Run these commands checklist:
-            (1) `apm2 fac --help`
+            Discover the 3 CLI commands you will use. Run these help commands:
+            (1) `apm2 fac review findings --help`
             (2) `apm2 fac gates --help`
-            (3) `apm2 fac logs --help`
-            (4) `apm2 fac push --help`
-            (5) `apm2 fac review --help`
-            (6) `apm2 fac review status --help`
-            (7) `apm2 fac review verdict --help`
-            (8) `apm2 fac review verdict set --help`
-            (9) `apm2 fac restart --help`
+            (3) `apm2 fac push --help`
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
@@ -85,6 +79,13 @@ decision_tree:
             Before proceeding, confirm: (1) ticket.status is OPEN, (2) all entries in dependencies.tickets are completed — read the reason field to understand each blocking relationship, (3) note custody.responsibility_domains — DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed review patterns.
 
             Orient on the ticket structure: binds links your work to requirements and evidence artifacts via file paths; scope.in_scope is your delivery contract and scope.out_of_scope is a hard boundary; definition_of_done.criteria plus linked requirement acceptance_criteria form your completion checklist.
+        - id: FETCH_REVIEW_FINDINGS
+          action: |
+            If a PR already exists for this branch, fetch current review findings:
+            `apm2 fac review findings --pr <PR_NUMBER> --json`
+            This shows all BLOCKER, MAJOR, MINOR, and NIT findings from prior review rounds.
+            Use these findings as your fix list — each one is a concrete issue to address.
+            If no PR exists yet (fresh implementation), skip this step.
         - id: LOAD_REQUIRED_READING
           action: "Read SKILL references marked REQUIRED READING and any orchestrator-provided warm handoff files before edits."
         - id: LOAD_REQUIREMENT_BINDINGS
@@ -316,9 +317,12 @@ decision_tree:
         - id: DONE
           action: "output DONE and nothing else, your task is complete."
 
-invariants[15]:
+invariants[16]:
   # Clean Tree Invariant (HIGHEST PRIORITY — agents repeatedly violate this)
   - "NEVER run `apm2 fac gates` (full) or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL. `--quick` mode is the ONLY exception."
+
+  # No Backwards Compatibility by Default
+  - "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do not add deprecated shims, re-exports, renamed aliases, or any other backwards-compat scaffolding by default. Breaking changes are the norm; migration paths are only required when a ticket or RFC explicitly mandates them."
 
   - "Do not ship fail-open defaults for missing, stale, unknown, or unverifiable authority/security state."
   - "Do not rely on shape-only validation for trust decisions; validate authenticity and binding claims."

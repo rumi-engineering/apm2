@@ -56,12 +56,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    CanonicalizerTupleV1, FacBroker, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
-    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
-    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
+    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
+    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    safe_rmtree_v1,
 };
-use apm2_core::github::resolve_apm2_home;
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
 use clap::{Args, Subcommand};
@@ -179,11 +178,6 @@ pub enum FacSubcommand {
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
 
-    /// Generic info view.
-    ///
-    /// Use `--canonicalizer` to show the current canonicalizer tuple.
-    Info(InfoArgs),
-
     /// Manage FAC execution lanes.
     ///
     /// Shows lane states derived from lock state, lease records, and PID
@@ -206,6 +200,7 @@ pub enum FacSubcommand {
     ///
     /// Reaps stale agent registry entries and can refresh local PR identity
     /// from authoritative remote state.
+    #[command(hide = true)]
     Recover(RecoverArgs),
 
     /// Show local pipeline, evidence, and review log paths.
@@ -231,12 +226,6 @@ pub enum FacSubcommand {
     /// RFC-0028 channel context tokens and RFC-0029 admission, then
     /// atomically claims and executes valid jobs.
     Worker(WorkerArgs),
-
-    /// Interact with the current canonicalizer tuple.
-    ///
-    /// Use `info` to display tuple metadata and `admit` to explicitly admit
-    /// the current tuple.
-    Canonicalizer(CanonicalizerArgs),
 
     /// GitHub App credential management and PR operations.
     ///
@@ -265,18 +254,9 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub quick: bool,
 
-    /// Run gates locally without broker/worker (unsafe: bypasses admission
-    /// control).
-    #[arg(long)]
-    pub direct: bool,
-
     /// Wall timeout for bounded test execution (seconds).
-    #[arg(long, default_value_t = 240)]
+    #[arg(long, default_value_t = 600)]
     pub timeout_seconds: u64,
-
-    /// Maximum seconds to wait for worker completion in default mode.
-    #[arg(long, default_value = "300")]
-    pub wait_timeout: u64,
 
     /// Memory ceiling for bounded test execution.
     #[arg(long, default_value = "24G")]
@@ -289,46 +269,6 @@ pub struct GatesArgs {
     /// CPU quota for bounded test execution.
     #[arg(long, default_value = "200%")]
     pub cpu_quota: String,
-}
-
-/// Arguments for `apm2 fac canonicalizer`.
-#[derive(Debug, Args)]
-pub struct CanonicalizerArgs {
-    #[command(subcommand)]
-    pub subcommand: CanonicalizerSubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum CanonicalizerSubcommand {
-    /// Show current canonicalizer tuple metadata.
-    Info(CanonicalizerInfoArgs),
-    /// Explicitly admit the current binary's canonicalizer tuple.
-    ///
-    /// Required for first-run bootstrap; worker and daemon will refuse
-    /// to start without an admitted tuple.
-    Admit(CanonicalizerAdmitArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct CanonicalizerInfoArgs {
-    /// Emit canonicalizer tuple metadata as JSON.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct CanonicalizerAdmitArgs {
-    /// Emit canonicalizer admit result as JSON.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac info`.
-#[derive(Debug, Args)]
-pub struct InfoArgs {
-    /// Show canonicalizer tuple metadata.
-    #[arg(long, default_value_t = false)]
-    pub canonicalizer: bool,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -344,6 +284,10 @@ pub struct DoctorArgs {
     /// Target pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
+
+    /// Execute doctor-prescribed recovery actions for the PR.
+    #[arg(long, default_value_t = false)]
+    pub fix: bool,
 
     /// Output in JSON format.
     #[arg(long, default_value_t = false)]
@@ -581,10 +525,16 @@ pub struct RestartArgs {
     /// Restart everything regardless of current CI state.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Refresh local projection identity from authoritative PR head before
+    /// restart strategy resolution.
+    #[arg(long, default_value_t = false)]
+    pub refresh_identity: bool,
 }
 
 /// Arguments for `apm2 fac recover`.
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RecoverArgs {
     /// Pull request number (auto-detected from local branch if omitted).
     #[arg(long)]
@@ -597,6 +547,18 @@ pub struct RecoverArgs {
     /// Refresh local projection identity from current authoritative PR head.
     #[arg(long, default_value_t = false)]
     pub refresh_identity: bool,
+
+    /// Reap stale/dead agent entries for the target PR.
+    #[arg(long, default_value_t = false)]
+    pub reap_stale_agents: bool,
+
+    /// Reset local lifecycle state for the target PR.
+    #[arg(long, default_value_t = false)]
+    pub reset_lifecycle: bool,
+
+    /// Run all recovery operations for the target PR.
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
 
     /// Emit JSON output.
     #[arg(long, default_value_t = false)]
@@ -1513,8 +1475,6 @@ pub fn run_fac(
             | FacSubcommand::Lane(_)
             | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
-            | FacSubcommand::Canonicalizer(_)
-            | FacSubcommand::Info(_)
             | FacSubcommand::Broker(_)
             | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
@@ -1536,8 +1496,6 @@ pub fn run_fac(
             args.pids_max,
             &args.cpu_quota,
             json_output,
-            args.direct,
-            args.wait_timeout,
         ),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
@@ -1548,20 +1506,98 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Doctor(args) => {
+            if args.fix && args.pr.is_none() {
+                return output_error(
+                    json_output || args.json,
+                    "fac_doctor_fix_requires_pr",
+                    "`apm2 fac doctor --fix` requires `--pr <N>`",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
             if let Some(pr) = args.pr {
                 let repo = match derive_fac_repo_or_exit(json_output || args.json) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
-                fac_review::run_doctor(&repo, pr, json_output || args.json)
+                fac_review::run_doctor(&repo, pr, args.fix, json_output || args.json)
             } else {
-                match crate::commands::daemon::doctor(
-                    operator_socket,
-                    config_path,
-                    json_output || args.json,
-                ) {
-                    Ok(()) => exit_codes::SUCCESS,
-                    Err(_) => exit_codes::GENERIC_ERROR,
+                let output_json = json_output || args.json;
+                let (mut checks, has_critical_error) =
+                    match crate::commands::daemon::collect_doctor_checks(
+                        operator_socket,
+                        config_path,
+                    ) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return output_error(
+                                output_json,
+                                "fac_doctor_failed",
+                                &err.to_string(),
+                                exit_codes::GENERIC_ERROR,
+                            );
+                        },
+                    };
+                let repo_hint = fac_review::derive_repo().ok();
+                let mut tracked_pr_warning = None;
+                let tracked_prs =
+                    match fac_review::collect_tracked_pr_summaries(repo_hint.as_deref()) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let message =
+                                format!("failed to build tracked PR doctor summary: {err}");
+                            checks.push(crate::commands::daemon::DaemonDoctorCheck {
+                                name: "tracked_pr_summary".to_string(),
+                                status: "WARN",
+                                message: message.clone(),
+                            });
+                            tracked_pr_warning = Some(message);
+                            Vec::new()
+                        },
+                    };
+                if !output_json && let Some(message) = tracked_pr_warning.as_deref() {
+                    eprintln!("WARNING: {message}");
+                }
+
+                if output_json {
+                    let payload = serde_json::json!({
+                        "schema": "apm2.fac.doctor.system.v1",
+                        "checks": checks,
+                        "tracked_prs": tracked_prs,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("{:<28} {:<6} Message", "Check", "Status");
+                    println!("{}", "-".repeat(78));
+                    for check in &checks {
+                        println!("{:<28} {:<6} {}", check.name, check.status, check.message);
+                    }
+                    println!();
+                    println!("Tracked PRs");
+                    if tracked_prs.is_empty() {
+                        println!("  none");
+                    } else {
+                        for pr in &tracked_prs {
+                            println!(
+                                "  #{} {} state={} action={} active_agents={} last_activity_seconds_ago={}",
+                                pr.pr_number,
+                                pr.owner_repo,
+                                pr.lifecycle_state,
+                                pr.recommended_action.action,
+                                pr.active_agents,
+                                pr.last_activity_seconds_ago
+                                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                            );
+                        }
+                    }
+                }
+
+                if has_critical_error {
+                    exit_codes::GENERIC_ERROR
+                } else {
+                    exit_codes::SUCCESS
                 }
             }
         },
@@ -1615,7 +1651,7 @@ pub fn run_fac(
             LaneSubcommand::Reset(reset_args) => run_lane_reset(reset_args, json_output),
         },
         FacSubcommand::Push(args) => {
-            let repo = match derive_fac_repo_or_exit(json_output) {
+            let repo = match derive_fac_repo_or_exit(machine_output) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
@@ -1624,17 +1660,27 @@ pub fn run_fac(
                 &args.remote,
                 args.branch.as_deref(),
                 args.ticket.as_deref(),
+                json_output,
             )
         },
         FacSubcommand::Restart(args) => {
-            let repo = match derive_fac_repo_or_exit(json_output) {
+            let repo = match derive_fac_repo_or_exit(machine_output) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            fac_review::run_restart(&repo, args.pr, args.force, json_output)
+            fac_review::run_restart(
+                &repo,
+                args.pr,
+                args.force,
+                args.refresh_identity,
+                json_output,
+            )
         },
         FacSubcommand::Recover(args) => {
             let output_json = json_output || args.json;
+            if !output_json {
+                eprintln!("DEPRECATED: use `apm2 fac doctor --pr <N> --fix` instead.");
+            }
             let repo = match derive_fac_repo_or_exit(output_json) {
                 Ok(value) => value,
                 Err(code) => return code,
@@ -1644,6 +1690,9 @@ pub fn run_fac(
                 args.pr,
                 args.force,
                 args.refresh_identity,
+                args.reap_stale_agents,
+                args.reset_lifecycle,
+                args.all,
                 output_json,
             )
         },
@@ -1669,7 +1718,7 @@ pub fn run_fac(
         },
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output) {
+                let repo = match derive_fac_repo_or_exit(machine_output) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -1691,7 +1740,7 @@ pub fn run_fac(
                 matches!(wait_args.format, ReviewFormatArg::Json),
             ),
             ReviewSubcommand::Dispatch(dispatch_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output) {
+                let repo = match derive_fac_repo_or_exit(machine_output) {
                     Ok(value) => value,
                     Err(code) => return code,
                 };
@@ -1704,11 +1753,19 @@ pub fn run_fac(
                     json_output,
                 )
             },
-            ReviewSubcommand::Status(status_args) => fac_review::run_status(
-                status_args.pr,
-                status_args.review_type.map(ReviewStatusTypeArg::as_str),
-                json_output || status_args.json,
-            ),
+            ReviewSubcommand::Status(status_args) => {
+                let output_json = json_output || status_args.json;
+                if !output_json {
+                    eprintln!(
+                        "DEPRECATED: use `apm2 fac doctor --pr <N> --json` instead. This command will be removed in a future release."
+                    );
+                }
+                fac_review::run_status(
+                    status_args.pr,
+                    status_args.review_type.map(ReviewStatusTypeArg::as_str),
+                    output_json,
+                )
+            },
             ReviewSubcommand::Prepare(prepare_args) => {
                 let repo = match derive_fac_repo_or_exit(json_output || prepare_args.json) {
                     Ok(value) => value,
@@ -1833,121 +1890,10 @@ pub fn run_fac(
             json_output,
             args.print_unit,
         ),
-        FacSubcommand::Canonicalizer(args) => match &args.subcommand {
-            CanonicalizerSubcommand::Info(info_args) => {
-                run_canonicalizer_info(info_args.json || json_output)
-            },
-            CanonicalizerSubcommand::Admit(admit_args) => {
-                run_canonicalizer_admit(admit_args.json || json_output)
-            },
-        },
-        FacSubcommand::Info(args) => {
-            if args.canonicalizer {
-                run_canonicalizer_info(json_output)
-            } else {
-                output_error(
-                    json_output,
-                    "unsupported_info_option",
-                    "use --canonicalizer with fac info",
-                    exit_codes::VALIDATION_ERROR,
-                )
-            }
-        },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
         FacSubcommand::Gc(args) => fac_gc::run_gc(args),
     }
-}
-
-fn run_canonicalizer_info(json_output: bool) -> u8 {
-    let fac_root = match resolve_fac_root() {
-        Ok(path) => path,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "fac_root_unavailable",
-                &e,
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    let current_tuple = CanonicalizerTupleV1::from_current();
-    let tuple = match FacBroker::load_admitted_tuple(&fac_root) {
-        Ok(tuple) => tuple,
-        Err(error) => {
-            eprintln!("WARNING: using current canonicalizer tuple: {error}");
-            current_tuple
-        },
-    };
-
-    let digest = tuple.compute_digest();
-
-    if json_output {
-        let payload = serde_json::json!({
-            "tuple": tuple,
-            "digest": digest,
-        });
-        let output = serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| "{\"error\":\"cannot serialize canonicalizer tuple\"}".to_string());
-        println!("{output}");
-        return exit_codes::SUCCESS;
-    }
-
-    println!("Canonicalizer Tuple:");
-    println!("  ID:      {}", tuple.canonicalizer_id);
-    println!("  Version: {}", tuple.canonicalizer_version);
-    println!(
-        "  Hash:    {} ({})",
-        tuple.hash_algorithm, tuple.digest_format
-    );
-    println!("  Depth:   {}", tuple.max_depth);
-    println!("  Digest:  {digest}");
-    exit_codes::SUCCESS
-}
-
-fn run_canonicalizer_admit(json_output: bool) -> u8 {
-    let fac_root = match resolve_fac_root() {
-        Ok(path) => path,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "fac_root_unavailable",
-                &e,
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    let mut broker = FacBroker::new();
-    let digest = match broker.admit_canonicalizer_tuple(&fac_root) {
-        Ok(digest) => digest,
-        Err(error) => {
-            return output_error(
-                json_output,
-                "canonicalizer_tuple_admit_failed",
-                &format!("failed to admit canonicalizer tuple: {error}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    if json_output {
-        let payload = serde_json::json!({
-            "status": "admitted",
-            "tuple": CanonicalizerTupleV1::from_current(),
-            "digest": digest,
-        });
-        let output = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-            "{\"error\":\"cannot serialize tuple admission result\"}".to_string()
-        });
-        println!("{output}");
-    } else {
-        println!("Canonicalizer tuple admitted successfully.");
-        println!("Digest: {digest}");
-    }
-
-    exit_codes::SUCCESS
 }
 
 const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool {
@@ -1974,16 +1920,11 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
             | ReviewSubcommand::Dispatch(_)
             | ReviewSubcommand::Tail(_) => false,
         },
-        FacSubcommand::Canonicalizer(args) => match &args.subcommand {
-            CanonicalizerSubcommand::Info(info_args) => info_args.json,
-            CanonicalizerSubcommand::Admit(admit_args) => admit_args.json,
-        },
         FacSubcommand::Broker(args) => match &args.subcommand {
             BrokerSubcommand::Status(status_args) => status_args.json,
         },
         FacSubcommand::Gates(_)
         | FacSubcommand::Work(_)
-        | FacSubcommand::Info(_)
         | FacSubcommand::Services(_)
         | FacSubcommand::Gc(_)
         | FacSubcommand::RoleLaunch(_)
@@ -2015,13 +1956,6 @@ fn resolve_ledger_path(explicit: Option<&Path>) -> PathBuf {
         || PathBuf::from("/var/lib/apm2").join(DEFAULT_LEDGER_FILENAME),
         |dirs| dirs.data_dir().join(DEFAULT_LEDGER_FILENAME),
     )
-}
-
-/// Resolves FAC root directory (`$APM2_HOME/private/fac`).
-fn resolve_fac_root() -> Result<PathBuf, String> {
-    resolve_apm2_home()
-        .map(|home| home.join("private").join("fac"))
-        .ok_or_else(|| "could not resolve APM2 home".to_string())
 }
 
 /// Resolves the CAS path from explicit path, env var, or default.
@@ -4299,6 +4233,18 @@ mod tests {
     }
 
     #[test]
+    fn test_gates_timeout_default_is_600_seconds() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "gates"])
+            .expect("gates parser should apply defaults");
+        match parsed.subcommand {
+            FacSubcommand::Gates(args) => {
+                assert_eq!(args.timeout_seconds, 600);
+            },
+            other => panic!("expected gates subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_subcommand_machine_output_detection_for_nested_json() {
         let review_status = FacSubcommand::Review(ReviewArgs {
             subcommand: ReviewSubcommand::Status(ReviewStatusArgs {
@@ -4313,6 +4259,9 @@ mod tests {
             pr: Some(615),
             force: false,
             refresh_identity: false,
+            reap_stale_agents: false,
+            reset_lifecycle: false,
+            all: false,
             json: true,
         });
         assert!(subcommand_requests_machine_output(&recover));
@@ -4320,6 +4269,7 @@ mod tests {
         let restart = FacSubcommand::Restart(RestartArgs {
             pr: Some(615),
             force: false,
+            refresh_identity: false,
         });
         assert!(!subcommand_requests_machine_output(&restart));
 
@@ -4330,6 +4280,19 @@ mod tests {
             print_unit: false,
         });
         assert!(!subcommand_requests_machine_output(&worker));
+    }
+
+    #[test]
+    fn test_doctor_fix_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--pr", "615", "--fix"])
+            .expect("doctor --fix should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(args.fix);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4398,68 +4361,6 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalizer_subcommand_parses() {
-        assert_fac_command_parses(&["fac", "canonicalizer", "info"]);
-        assert_fac_command_parses(&["fac", "canonicalizer", "info", "--json"]);
-        assert_fac_command_parses(&["fac", "canonicalizer", "admit"]);
-        assert_fac_command_parses(&["fac", "canonicalizer", "admit", "--json"]);
-    }
-
-    #[test]
-    fn test_canonicalizer_subcommand_global_json_flag_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "canonicalizer", "info"])
-            .expect("canonicalizer should accept global json flag");
-        assert!(parsed.json);
-        match parsed.subcommand {
-            FacSubcommand::Canonicalizer(args) => match args.subcommand {
-                CanonicalizerSubcommand::Info(_) => {},
-                CanonicalizerSubcommand::Admit(_) => {
-                    panic!("expected canonicalizer info subcommand, got {args:?}")
-                },
-            },
-            other => panic!("expected canonicalizer subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_broker_status_subcommand_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "broker", "status"])
-            .expect("broker status should parse");
-        match parsed.subcommand {
-            FacSubcommand::Broker(args) => match args.subcommand {
-                BrokerSubcommand::Status(status_args) => {
-                    assert!(!status_args.json);
-                },
-            },
-            other => panic!("expected broker subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_broker_status_global_json_flag_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "broker", "status"])
-            .expect("global json flag should be accepted for broker status");
-
-        assert!(parsed.json);
-        match parsed.subcommand {
-            FacSubcommand::Broker(args) => match args.subcommand {
-                BrokerSubcommand::Status(_) => {},
-            },
-            other => panic!("expected broker subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_info_subcommand_with_canonicalizer_flag_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "info", "--canonicalizer"])
-            .expect("info --canonicalizer should parse");
-        match parsed.subcommand {
-            FacSubcommand::Info(info_args) => assert!(info_args.canonicalizer),
-            other => panic!("expected info subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_lane_reset_and_worker_commands_parse() {
         assert_fac_command_parses(&["fac", "lane", "reset", "lane-00"]);
         assert_fac_command_parses(&["fac", "lane", "reset", "lane-07", "--force"]);
@@ -4502,26 +4403,6 @@ mod tests {
                 },
             },
             other => panic!("expected services subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_gates_direct_and_wait_timeout_parse() {
-        let parsed = FacLogsCliHarness::try_parse_from([
-            "fac",
-            "gates",
-            "--direct",
-            "--wait-timeout",
-            "120",
-        ])
-        .expect("gates direct mode should parse");
-
-        match parsed.subcommand {
-            FacSubcommand::Gates(args) => {
-                assert!(args.direct);
-                assert_eq!(args.wait_timeout, 120);
-            },
-            other => panic!("expected gates subcommand, got {other:?}"),
         }
     }
 }

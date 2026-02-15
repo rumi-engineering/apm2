@@ -347,19 +347,22 @@ pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Resu
 /// When projection is enabled in config, the check verifies that the
 /// projection cache database exists (created by the projection worker on
 /// startup), which serves as evidence the worker is active.
-pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<()> {
-    #[derive(serde::Serialize)]
-    struct DoctorCheck {
-        name: String,
-        status: &'static str,
-        message: String,
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DaemonDoctorCheck {
+    pub name: String,
+    pub status: &'static str,
+    pub message: String,
+}
 
+pub fn collect_doctor_checks(
+    operator_socket: &Path,
+    config_path: &Path,
+) -> Result<(Vec<DaemonDoctorCheck>, bool)> {
     let mut checks = Vec::new();
     let mut has_error = false;
 
     let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(value) if !value.is_empty());
-    checks.push(DoctorCheck {
+    checks.push(DaemonDoctorCheck {
         name: "GITHUB_TOKEN".to_string(),
         status: if github_token_set { "OK" } else { "ERROR" },
         message: if github_token_set {
@@ -383,7 +386,7 @@ pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<
         Err(msg) => (false, msg),
     };
     let daemon_running_ok = daemon_running;
-    checks.push(DoctorCheck {
+    checks.push(DaemonDoctorCheck {
         name: "daemon_running".to_string(),
         status: if daemon_running_ok { "OK" } else { "ERROR" },
         message: if daemon_probe_message.is_empty() {
@@ -400,7 +403,7 @@ pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<
     match available_space_bytes(&data_dir) {
         Ok(free_bytes) => {
             let has_space = free_bytes >= 1_073_741_824;
-            checks.push(DoctorCheck {
+            checks.push(DaemonDoctorCheck {
                 name: "disk_space".to_string(),
                 status: if has_space { "OK" } else { "ERROR" },
                 message: if has_space {
@@ -419,7 +422,7 @@ pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<
         },
         Err(error) => {
             has_error = true;
-            checks.push(DoctorCheck {
+            checks.push(DaemonDoctorCheck {
                 name: "disk_space".to_string(),
                 status: "ERROR",
                 message: format!(
@@ -432,7 +435,7 @@ pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<
 
     match socket_permission_check(operator_socket) {
         Ok(permission_ok) => {
-            checks.push(DoctorCheck {
+            checks.push(DaemonDoctorCheck {
                 name: "socket_permissions".to_string(),
                 status: if permission_ok { "OK" } else { "ERROR" },
                 message: if permission_ok {
@@ -447,7 +450,7 @@ pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<
         },
         Err(error) => {
             has_error = true;
-            checks.push(DoctorCheck {
+            checks.push(DaemonDoctorCheck {
                 name: "socket_permissions".to_string(),
                 status: "ERROR",
                 message: format!(
@@ -464,17 +467,21 @@ pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<
     // has started by checking for its cache database file. The projection
     // worker creates this file on startup, so its absence indicates the
     // worker is not active.
-    {
-        let projection_check = check_projection_worker_health(config_path, daemon_running_ok);
-        if projection_check.is_error {
-            has_error = true;
-        }
-        checks.push(DoctorCheck {
-            name: "projection_worker".to_string(),
-            status: projection_check.status,
-            message: projection_check.message,
-        });
+    let projection_check = check_projection_worker_health(config_path, daemon_running_ok);
+    if projection_check.is_error {
+        has_error = true;
     }
+    checks.push(DaemonDoctorCheck {
+        name: "projection_worker".to_string(),
+        status: projection_check.status,
+        message: projection_check.message,
+    });
+
+    Ok((checks, has_error))
+}
+
+pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<()> {
+    let (checks, has_error) = collect_doctor_checks(operator_socket, config_path)?;
 
     if json {
         println!(

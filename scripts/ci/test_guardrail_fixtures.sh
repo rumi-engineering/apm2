@@ -4,7 +4,6 @@
 # Validates:
 # - test_safety_guard.sh blocks dangerous signatures and honors allowlist
 # - workspace_integrity_guard.sh detects tracked-content mutation
-# - run_bounded_tests.sh terminates hung commands via timeout watchdog
 # - fac_preflight_authorization.sh enforces trusted FAC workflow policy
 # - credential_hardening.sh enforces PAT-free, argv-safe credential posture
 
@@ -154,31 +153,6 @@ else
     log_fail "tracked file mutation was not detected"
 fi
 rm -rf "${workspace_repo}"
-echo
-
-# ---------------------------------------------------------------------------
-# Test 3: run_bounded_tests timeout watchdog behavior
-# ---------------------------------------------------------------------------
-echo "Test 3: run_bounded_tests.sh"
-if expect_fail env APM2_CI_ALLOW_TIMEOUT_FALLBACK=1 \
-    "${REPO_ROOT}/scripts/ci/run_bounded_tests.sh" \
-    --timeout-seconds 1 \
-    --kill-after-seconds 1 \
-    -- bash -lc "sleep 3"; then
-    log_pass "hung command terminated by watchdog timeout"
-else
-    log_fail "hung command was not terminated by watchdog timeout"
-fi
-
-if env APM2_CI_ALLOW_TIMEOUT_FALLBACK=1 \
-    "${REPO_ROOT}/scripts/ci/run_bounded_tests.sh" \
-    --timeout-seconds 5 \
-    --kill-after-seconds 1 \
-    -- bash -lc "echo ok" >/dev/null 2>&1; then
-    log_pass "bounded runner allows command completion within limits"
-else
-    log_fail "bounded runner failed a command that should pass"
-fi
 echo
 
 # ---------------------------------------------------------------------------

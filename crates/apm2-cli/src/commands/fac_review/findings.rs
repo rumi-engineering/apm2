@@ -192,8 +192,7 @@ struct FindingsReport {
 struct DimensionFindings {
     dimension: String,
     status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verdict: Option<String>,
+    verdict: String,
     findings: Vec<FindingRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -318,7 +317,7 @@ fn build_dimension_findings(
             return DimensionFindings {
                 dimension: dimension.to_string(),
                 status: "ERROR".to_string(),
-                verdict: None,
+                verdict: "pending".to_string(),
                 findings: Vec::new(),
                 error: Some(format!("failed to resolve verdict: {err}")),
             };
@@ -331,7 +330,7 @@ fn build_dimension_findings(
             return DimensionFindings {
                 dimension: dimension.to_string(),
                 status: "ERROR".to_string(),
-                verdict: None,
+                verdict: "pending".to_string(),
                 findings: Vec::new(),
                 error: Some(format!(
                     "unsupported findings bundle schema `{}`",
@@ -348,12 +347,15 @@ fn build_dimension_findings(
         }
     }
 
+    let (status, verdict) = resolved_verdict.as_deref().map_or_else(
+        || ("PENDING".to_string(), "pending".to_string()),
+        |value| (value.to_string(), value.to_string()),
+    );
+
     DimensionFindings {
         dimension: dimension.to_string(),
-        status: resolved_verdict
-            .as_deref()
-            .map_or_else(|| "PENDING".to_string(), ToString::to_string),
-        verdict: resolved_verdict,
+        status,
+        verdict,
         findings,
         error: None,
     }
@@ -555,6 +557,8 @@ mod tests {
         assert_eq!(report.dimensions.len(), 2);
         assert_eq!(report.dimensions[0].status, "PENDING");
         assert_eq!(report.dimensions[1].status, "PENDING");
+        assert_eq!(report.dimensions[0].verdict, "pending");
+        assert_eq!(report.dimensions[1].verdict, "pending");
         assert_eq!(report.dimensions[0].findings.len(), 1);
         assert_eq!(report.dimensions[0].findings[0].finding_id, "sec-000001");
     }
