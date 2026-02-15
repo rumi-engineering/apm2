@@ -15,7 +15,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::dispatch::dispatch_single_review;
-use super::evidence::{EvidenceGateResult, run_evidence_gates, run_evidence_gates_with_status};
+use super::evidence::{
+    EvidenceGateResult, LANE_EVIDENCE_GATES, run_evidence_gates, run_evidence_gates_with_status,
+};
 use super::gate_cache::GateCache;
 use super::projection::{GateResult, sync_gate_status_to_pr};
 use super::types::{
@@ -26,16 +28,6 @@ use super::{github_projection, lifecycle, projection_store, state};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
-const LANE_EVIDENCE_GATES: &[&str] = &[
-    "merge_conflict_main",
-    "rustfmt",
-    "clippy",
-    "doc",
-    "test",
-    "test_safety_guard",
-    "workspace_integrity",
-    "review_artifact_lint",
-];
 #[cfg(not(test))]
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
 #[cfg(test)]
