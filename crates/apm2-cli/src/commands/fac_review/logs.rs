@@ -179,19 +179,25 @@ fn resolve_selector_zoom(
                         tool_output.sha
                     )
                 })?;
-            let _cached_result = gate_cache.get(&tool_output.gate).ok_or_else(|| {
+            let cached_result = gate_cache.get(&tool_output.gate).ok_or_else(|| {
                 format!(
                     "gate `{}` not found in cache for SHA {} — cannot validate tool output selector",
                     tool_output.gate, tool_output.sha
                 )
             })?;
 
-            // Now proceed with existing log discovery (SHA-validated via cache proof).
-            let evidence_path = find_latest_evidence_gate_log(&apm2_home_dir()?, &tool_output.gate)
+            // Resolve log path from the SHA-bound gate cache entry rather than
+            // searching by mtime, which could return a log from a different SHA.
+            let evidence_path = cached_result
+                .log_path
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
                 .ok_or_else(|| {
                     format!(
-                        "no evidence logs found for lane-scoped gate `{}`",
-                        tool_output.gate
+                        "no SHA-bound evidence log path found for gate `{}` at SHA {} — \
+                         cached log_path is missing or the file no longer exists",
+                        tool_output.gate, tool_output.sha
                     )
                 })?;
             // Open with O_NOFOLLOW to atomically reject symlinks at the
@@ -322,6 +328,7 @@ fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
     logs
 }
 
+#[allow(dead_code)] // Retained for future log discovery / fallback use cases.
 fn find_latest_evidence_gate_log(home: &Path, gate: &str) -> Option<PathBuf> {
     let expected_name = format!("{gate}.log");
     let mut latest: Option<(PathBuf, SystemTime)> = None;

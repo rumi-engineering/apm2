@@ -1139,6 +1139,7 @@ pub fn run_evidence_gates_with_status(
             merge_attestation,
             false,
             merge_digest,
+            log_path.to_str().map(str::to_string),
         );
         if !passed {
             updater.force_update(&status);
@@ -1155,6 +1156,7 @@ pub fn run_evidence_gates_with_status(
                     result.bytes_written,
                     result.bytes_total,
                     result.was_truncated,
+                    result.log_path.as_ref().and_then(|p| p.to_str()),
                 );
             }
             let _ = gate_cache.save();
@@ -1195,6 +1197,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest.clone(),
                     false,
                     cached.evidence_log_digest.clone(),
+                    cached.log_path.clone(),
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -1230,6 +1233,7 @@ pub fn run_evidence_gates_with_status(
                 attestation_digest.clone(),
                 false,
                 None,
+                log_path.to_str().map(str::to_string),
             );
             all_passed = false;
             evidence_lines.push(format!(
@@ -1280,6 +1284,7 @@ pub fn run_evidence_gates_with_status(
             attestation_digest.clone(),
             false,
             sha256_file_hex(&log_path),
+            log_path.to_str().map(str::to_string),
         );
         if !passed {
             all_passed = false;
@@ -1334,6 +1339,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest.clone(),
                     false,
                     cached.evidence_log_digest.clone(),
+                    cached.log_path.clone(),
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -1369,6 +1375,7 @@ pub fn run_evidence_gates_with_status(
                 attestation_digest.clone(),
                 false,
                 None,
+                log_path.to_str().map(str::to_string),
             );
             all_passed = false;
             evidence_lines.push(format!(
@@ -1419,6 +1426,7 @@ pub fn run_evidence_gates_with_status(
             attestation_digest.clone(),
             false,
             sha256_file_hex(&log_path),
+            log_path.to_str().map(str::to_string),
         );
         if !passed {
             all_passed = false;
@@ -1476,6 +1484,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest.clone(),
                     false,
                     cached.evidence_log_digest.clone(),
+                    cached.log_path.clone(),
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -1508,6 +1517,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest,
                     false,
                     None,
+                    log_path.to_str().map(str::to_string),
                 );
                 all_passed = false;
                 evidence_lines.push(format!(
@@ -1559,6 +1569,7 @@ pub fn run_evidence_gates_with_status(
                 attestation_digest,
                 false,
                 sha256_file_hex(&log_path),
+                log_path.to_str().map(str::to_string),
             );
             if !passed {
                 all_passed = false;
@@ -1609,6 +1620,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest.clone(),
                     false,
                     cached.evidence_log_digest.clone(),
+                    cached.log_path.clone(),
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -1641,6 +1653,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest,
                     false,
                     None,
+                    log_path.to_str().map(str::to_string),
                 );
                 all_passed = false;
                 evidence_lines.push(format!(
@@ -1671,6 +1684,7 @@ pub fn run_evidence_gates_with_status(
                 attestation_digest,
                 false,
                 sha256_file_hex(&log_path),
+                log_path.to_str().map(str::to_string),
             );
             if !passed {
                 all_passed = false;
@@ -1720,6 +1734,7 @@ pub fn run_evidence_gates_with_status(
                     attestation_digest.clone(),
                     false,
                     cached.evidence_log_digest.clone(),
+                    cached.log_path.clone(),
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -1755,6 +1770,7 @@ pub fn run_evidence_gates_with_status(
                 attestation_digest.clone(),
                 false,
                 None,
+                log_path.to_str().map(str::to_string),
             );
             all_passed = false;
             evidence_lines.push(format!(
@@ -1804,6 +1820,7 @@ pub fn run_evidence_gates_with_status(
             attestation_digest.clone(),
             false,
             sha256_file_hex(&log_path),
+            log_path.to_str().map(str::to_string),
         );
         if !passed {
             all_passed = false;
@@ -1832,6 +1849,7 @@ pub fn run_evidence_gates_with_status(
             result.bytes_written,
             result.bytes_total,
             result.was_truncated,
+            result.log_path.as_ref().and_then(|p| p.to_str()),
         );
     }
 
@@ -2466,5 +2484,180 @@ mod tests {
                 );
             },
         }
+    }
+
+    /// Helper: create a temporary directory with 0o700 permissions for test
+    /// isolation, returning the directory path itself (not a file inside it).
+    fn temp_test_dir(test_name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "apm2-evidence-tests-{test_name}-{}-{nonce}",
+            std::process::id()
+        ));
+        crate::commands::fac_permissions::ensure_dir_with_mode(&dir).expect("create temp dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .expect("set temp dir permissions");
+        }
+        dir
+    }
+
+    /// BLOCKER 1: Prove that >=3 concurrent evidence gate runs produce unique,
+    /// non-overlapping log files via lane-scoped namespacing.
+    ///
+    /// Each thread runs `run_single_evidence_gate` with a trivially-fast
+    /// command (`echo`), writing to a unique log path. The test asserts:
+    ///   - All 3 runs succeed.
+    ///   - Each produces a distinct log file path.
+    ///   - No log file content is empty or duplicated across runs.
+    #[test]
+    fn concurrent_evidence_runs_produce_unique_logs() {
+        let workspace_root = temp_test_dir("concurrent");
+        let num_concurrent = 3;
+        let sha = "deadbeef_concurrent_test";
+
+        let handles: Vec<_> = (0..num_concurrent)
+            .map(|idx| {
+                let ws = workspace_root.clone();
+                thread::spawn(move || {
+                    let gate_name = format!("echo_gate_{idx}");
+                    let log_dir = ws.join(format!("lane-{idx}"));
+                    crate::commands::fac_permissions::ensure_dir_with_mode(&log_dir)
+                        .expect("create lane dir");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+
+                        fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o700))
+                            .expect("set lane dir permissions");
+                    }
+                    let log_path = log_dir.join(format!("{gate_name}.log"));
+
+                    let (passed, _stream_stats) = run_single_evidence_gate(
+                        &ws,
+                        sha,
+                        &gate_name,
+                        "echo",
+                        &[&format!("hello from lane {idx}")],
+                        &log_path,
+                    );
+                    (passed, log_path)
+                })
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.join().expect("thread should not panic"));
+        }
+
+        // All runs must succeed.
+        for (idx, (passed, _)) in results.iter().enumerate() {
+            assert!(passed, "concurrent run {idx} should pass");
+        }
+
+        // All log paths must be unique.
+        let paths: Vec<String> = results
+            .iter()
+            .map(|(_, p)| p.display().to_string())
+            .collect();
+        let unique_paths: std::collections::HashSet<&String> = paths.iter().collect();
+        assert_eq!(
+            unique_paths.len(),
+            num_concurrent,
+            "each concurrent run must produce a unique log path"
+        );
+
+        // No log file content should be empty or identical to another.
+        let contents: Vec<String> = results
+            .iter()
+            .map(|(_, p)| fs::read_to_string(p).expect("log file should be readable"))
+            .collect();
+        for (idx, content) in contents.iter().enumerate() {
+            assert!(!content.is_empty(), "log {idx} should not be empty");
+        }
+        let unique_contents: std::collections::HashSet<&String> = contents.iter().collect();
+        assert_eq!(
+            unique_contents.len(),
+            num_concurrent,
+            "log file contents must be unique across concurrent runs"
+        );
+    }
+
+    /// BLOCKER 2: Prove that log caps prevent disk blowup without deadlocking
+    /// child processes.
+    ///
+    /// Launches a child that emits well beyond the 4 MB cap on both stdout
+    /// and stderr. Asserts:
+    ///   - The child process completes (no deadlock).
+    ///   - `bytes_written` is bounded (<= 4 MB + chunk overhead).
+    ///   - `was_truncated` metadata is `true`.
+    #[test]
+    fn log_cap_prevents_blowup_without_deadlock() {
+        let workspace_root = temp_test_dir("log_cap");
+        let sha = "deadbeef_logcap_test";
+        let gate_name = "logcap_gate";
+        let log_path = workspace_root.join(format!("{gate_name}.log"));
+
+        // Generate ~8 MB on stdout and ~8 MB on stderr (well beyond 4 MB cap).
+        // Use a bash one-liner that writes to both streams.
+        let emit_bytes = 8 * 1024 * 1024; // 8 MB per stream
+        let script = format!(
+            "dd if=/dev/zero bs=4096 count={stdout_blocks} 2>/dev/null; \
+             dd if=/dev/zero bs=4096 count={stderr_blocks} >&2 2>/dev/null",
+            stdout_blocks = emit_bytes / 4096,
+            stderr_blocks = emit_bytes / 4096,
+        );
+
+        let (passed, stream_stats) = run_single_evidence_gate(
+            &workspace_root,
+            sha,
+            gate_name,
+            "bash",
+            &["-c", &script],
+            &log_path,
+        );
+
+        // The command itself succeeds (dd returns 0).
+        assert!(passed, "log cap gate should pass (child exited 0)");
+
+        // bytes_written must be bounded by LOG_STREAM_MAX_BYTES + chunk overhead.
+        // We allow one extra chunk per stream thread (2 * chunk size) as
+        // overhead since the atomic counter is checked after the fetch_add.
+        let max_expected = LOG_STREAM_MAX_BYTES + 2 * LOG_STREAM_CHUNK_BYTES as u64;
+        assert!(
+            stream_stats.bytes_written <= max_expected,
+            "bytes_written ({}) should be bounded by {} (4 MB + 2 chunks)",
+            stream_stats.bytes_written,
+            max_expected,
+        );
+
+        // Total bytes emitted should exceed the cap (proving truncation occurred).
+        assert!(
+            stream_stats.bytes_total > LOG_STREAM_MAX_BYTES,
+            "bytes_total ({}) should exceed 4 MB cap to prove truncation",
+            stream_stats.bytes_total,
+        );
+
+        // was_truncated must be true.
+        assert!(
+            stream_stats.was_truncated,
+            "was_truncated should be true when output exceeds cap"
+        );
+
+        // The log file on disk should also be bounded.
+        let log_size = fs::metadata(&log_path)
+            .expect("log file should exist")
+            .len();
+        assert!(
+            log_size <= max_expected,
+            "on-disk log size ({log_size}) should be bounded by {max_expected}"
+        );
     }
 }

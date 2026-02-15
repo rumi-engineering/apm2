@@ -266,6 +266,11 @@ fn run_gates_inner(
                 attestation_digest,
                 quick,
                 evidence_log_digest,
+                result
+                    .log_path
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .map(str::to_string),
             );
         }
         for result in &gate_results {
@@ -275,6 +280,7 @@ fn run_gates_inner(
                 result.bytes_written,
                 result.bytes_total,
                 result.was_truncated,
+                result.log_path.as_ref().and_then(|p| p.to_str()),
             );
         }
         cache.save()?;
