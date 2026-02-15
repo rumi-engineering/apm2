@@ -507,11 +507,20 @@ pub fn run_doctor(repo: &str, pr_number: u32, fix: bool, json_output: bool) -> u
     }
 }
 
+/// Maximum number of tracked PRs to include in doctor summaries.
+/// Prevents unbounded memory consumption on long-lived instances.
+const MAX_TRACKED_PR_SUMMARIES: usize = 100;
+
 pub fn collect_tracked_pr_summaries(
     fallback_owner_repo: Option<&str>,
 ) -> Result<Vec<DoctorTrackedPrSummary>, String> {
-    let mut summaries = Vec::new();
-    for pr_number in list_review_pr_numbers()? {
+    let mut pr_numbers = list_review_pr_numbers()?;
+    // Sort descending so we keep the most recent PRs when truncating.
+    pr_numbers.sort_unstable_by(|a, b| b.cmp(a));
+    pr_numbers.truncate(MAX_TRACKED_PR_SUMMARIES);
+
+    let mut summaries = Vec::with_capacity(pr_numbers.len());
+    for pr_number in pr_numbers {
         let Some(owner_repo) = resolve_owner_repo_for_pr(pr_number, fallback_owner_repo) else {
             continue;
         };

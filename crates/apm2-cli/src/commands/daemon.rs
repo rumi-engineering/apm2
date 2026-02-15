@@ -358,13 +358,14 @@ pub struct DaemonDoctorCheck {
     pub message: String,
 }
 
-/// Maximum number of doctor checks we will collect. Prevents unbounded
-/// growth if future checks are added without updating this constant.
+/// Initial capacity for doctor checks vector. This is an optimization hint;
+/// the vector can grow beyond this if more checks are added.
 const MAX_DOCTOR_CHECKS: usize = 64;
 
 pub fn collect_doctor_checks(
     operator_socket: &Path,
     config_path: &Path,
+    full: bool,
 ) -> Result<(Vec<DaemonDoctorCheck>, bool)> {
     let mut checks: Vec<DaemonDoctorCheck> = Vec::with_capacity(MAX_DOCTOR_CHECKS);
     let mut has_error = false;
@@ -635,47 +636,71 @@ pub fn collect_doctor_checks(
     }
     checks.push(lane_check);
 
-    // ── Credentials Posture (WARN-only by default) ──────────────────────
-    // TCK-00547: Credentials are WARN, not ERROR, because they are only
-    // needed for GitHub-facing commands, not local gates.
+    // ── Credentials Posture ────────────────────────────────────────────
+    // TCK-00547: Credentials are WARN by default, but upgraded to ERROR
+    // when --full is set (for GitHub-facing workflows like push/review).
+    let cred_fail_status: &str = if full { "ERROR" } else { "WARN" };
 
     // GITHUB_TOKEN / GH_TOKEN env var
     let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(ref v) if !v.is_empty());
     let gh_token_set = matches!(std::env::var("GH_TOKEN"), Ok(ref v) if !v.is_empty());
     let any_token = github_token_set || gh_token_set;
+    let creds_token_status = if any_token { "OK" } else { cred_fail_status };
     checks.push(DaemonDoctorCheck {
         name: "creds_github_token".to_string(),
-        status: if any_token { "OK" } else { "WARN" },
+        status: creds_token_status,
         message: if any_token {
             "GitHub token environment variable is set (GITHUB_TOKEN or GH_TOKEN)".to_string()
         } else {
             "neither GITHUB_TOKEN nor GH_TOKEN is set; GitHub-facing commands will fail. \
-             Remediation: export GITHUB_TOKEN=<token> or configure GitHub App credentials"
+             Remediation: export GITHUB_TOKEN=<token>, or configure GitHub App credentials \
+             as an alternative (see `apm2 fac pr auth-setup`)"
                 .to_string()
         },
     });
+    if creds_token_status == "ERROR" {
+        has_error = true;
+    }
 
     // GitHub App config (github_app.toml)
     let app_config = apm2_core::github::load_github_app_config();
     let app_configured = app_config.is_some();
+    // If a token is available, App config is optional — only fail if neither is
+    // present
+    let app_status = if app_configured || any_token {
+        "OK"
+    } else {
+        cred_fail_status
+    };
     checks.push(DaemonDoctorCheck {
         name: "creds_github_app".to_string(),
-        status: if app_configured { "OK" } else { "WARN" },
+        status: app_status,
         message: if app_configured {
             "GitHub App configuration found (github_app.toml)".to_string()
+        } else if any_token {
+            "GitHub App not configured, but token auth is available (OK as alternative)".to_string()
         } else {
             "GitHub App not configured (no github_app.toml found). \
-             Remediation: run `apm2 fac pr auth-setup` to configure GitHub App credentials"
+             Remediation: run `apm2 fac pr auth-setup` to configure GitHub App credentials, \
+             or export GITHUB_TOKEN as an alternative"
                 .to_string()
         },
     });
+    if app_status == "ERROR" {
+        has_error = true;
+    }
 
     // Systemd credential file for GH token
     let cred_file_exists =
         resolve_apm2_home().is_some_and(|home| home.join("private/creds/gh-token").exists());
+    let cred_file_status = if cred_file_exists {
+        "OK"
+    } else {
+        cred_fail_status
+    };
     checks.push(DaemonDoctorCheck {
         name: "creds_systemd_gh_token".to_string(),
-        status: if cred_file_exists { "OK" } else { "WARN" },
+        status: cred_file_status,
         message: if cred_file_exists {
             "systemd credential file for gh-token exists".to_string()
         } else {
@@ -685,12 +710,15 @@ pub fn collect_doctor_checks(
                 .to_string()
         },
     });
+    if cred_file_status == "ERROR" {
+        has_error = true;
+    }
 
     Ok((checks, has_error))
 }
 
 pub fn doctor(operator_socket: &Path, config_path: &Path, json: bool) -> Result<()> {
-    let (checks, has_error) = collect_doctor_checks(operator_socket, config_path)?;
+    let (checks, has_error) = collect_doctor_checks(operator_socket, config_path, false)?;
 
     if json {
         println!(
@@ -810,15 +838,16 @@ fn check_projection_worker_health(
 
 /// Check whether a binary is available by running it with the given args.
 ///
-/// Returns `true` if the process starts successfully (regardless of exit
-/// code — we only care that the binary exists on PATH).
+/// Returns `true` if the process spawns AND exits with a successful status.
+/// This prevents false positives where a parent binary exists (e.g. `cargo`)
+/// but a required subcommand (e.g. `cargo nextest`) is not installed.
 fn check_binary_available(binary: &str, args: &[&str]) -> bool {
     Command::new(binary)
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .is_ok_and(|status| status.success())
 }
 
 /// Maximum number of lane directories to scan for symlink safety.
@@ -867,12 +896,87 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
         },
     };
 
+    // Verify lanes_dir itself is not a symlink (MAJOR: symlink follow on root)
+    match std::fs::symlink_metadata(lanes_dir) {
+        Ok(root_meta) => {
+            if root_meta.file_type().is_symlink() {
+                return DaemonDoctorCheck {
+                    name: "lane_safety".to_string(),
+                    status: "ERROR",
+                    message: format!(
+                        "lane directory {} is a symlink (potential path traversal). \
+                         Remediation: remove the symlink and recreate as a real directory",
+                        lanes_dir.display()
+                    ),
+                };
+            }
+            if !root_meta.is_dir() {
+                return DaemonDoctorCheck {
+                    name: "lane_safety".to_string(),
+                    status: "ERROR",
+                    message: format!(
+                        "lane path {} exists but is not a directory",
+                        lanes_dir.display()
+                    ),
+                };
+            }
+
+            // Ownership and permission checks on the lane root
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let current_uid = nix::unistd::getuid().as_raw();
+                if root_meta.uid() != current_uid {
+                    return DaemonDoctorCheck {
+                        name: "lane_safety".to_string(),
+                        status: "ERROR",
+                        message: format!(
+                            "lane directory {} is owned by uid {} but current user is uid {}. \
+                             Remediation: chown {} {}",
+                            lanes_dir.display(),
+                            root_meta.uid(),
+                            current_uid,
+                            current_uid,
+                            lanes_dir.display()
+                        ),
+                    };
+                }
+                let mode = root_meta.mode() & 0o777;
+                if mode & 0o002 != 0 {
+                    return DaemonDoctorCheck {
+                        name: "lane_safety".to_string(),
+                        status: "ERROR",
+                        message: format!(
+                            "lane directory {} is world-writable (mode {:04o}). \
+                             Remediation: chmod o-w {}",
+                            lanes_dir.display(),
+                            mode,
+                            lanes_dir.display()
+                        ),
+                    };
+                }
+            }
+        },
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "lane_safety".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "failed to stat lane directory {}: {err}",
+                    lanes_dir.display()
+                ),
+            };
+        },
+    }
+
     let mut scanned = 0_usize;
     let mut symlink_found = false;
     let mut symlink_path = String::new();
+    let mut scan_incomplete = false;
 
     for entry in entries {
         if scanned >= MAX_LANE_SCAN {
+            scan_incomplete = true;
             break;
         }
         scanned = scanned.saturating_add(1);
@@ -888,6 +992,44 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
             symlink_path = entry.path().display().to_string();
             break;
         }
+
+        // Per-entry ownership and permission checks
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current_uid = nix::unistd::getuid().as_raw();
+            if metadata.uid() != current_uid {
+                return DaemonDoctorCheck {
+                    name: "lane_safety".to_string(),
+                    status: "ERROR",
+                    message: format!(
+                        "lane entry {} is owned by uid {} but current user is uid {}. \
+                         Remediation: chown -R {} {}",
+                        entry.path().display(),
+                        metadata.uid(),
+                        current_uid,
+                        current_uid,
+                        lanes_dir.display()
+                    ),
+                };
+            }
+            if metadata.is_dir() {
+                let mode = metadata.mode() & 0o777;
+                if mode & 0o002 != 0 {
+                    return DaemonDoctorCheck {
+                        name: "lane_safety".to_string(),
+                        status: "ERROR",
+                        message: format!(
+                            "lane entry {} is world-writable (mode {:04o}). \
+                             Remediation: chmod o-w {}",
+                            entry.path().display(),
+                            mode,
+                            entry.path().display()
+                        ),
+                    };
+                }
+            }
+        }
     }
 
     if symlink_found {
@@ -899,11 +1041,22 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
                  Remediation: remove the symlink and recreate as a real directory"
             ),
         }
+    } else if scan_incomplete {
+        DaemonDoctorCheck {
+            name: "lane_safety".to_string(),
+            status: "WARN",
+            message: format!(
+                "lane directory scan incomplete: scanned {scanned} entries but more remain \
+                 (limit: {MAX_LANE_SCAN}). Not all entries were verified for symlinks or permissions"
+            ),
+        }
     } else {
         DaemonDoctorCheck {
             name: "lane_safety".to_string(),
             status: "OK",
-            message: format!("lane directory safe ({scanned} entries scanned, no symlinks)"),
+            message: format!(
+                "lane directory safe ({scanned} entries scanned, no symlinks, ownership and permissions OK)"
+            ),
         }
     }
 }
@@ -1176,6 +1329,15 @@ mod tests {
         ));
     }
 
+    /// TCK-00547 MAJOR-3: `check_binary_available` returns false when the
+    /// binary spawns but exits with a non-zero status (e.g. missing
+    /// subcommand).
+    #[test]
+    fn check_binary_available_false_for_failing_exit_status() {
+        // `false` binary always exits with code 1
+        assert!(!check_binary_available("false", &[]));
+    }
+
     /// TCK-00547: lane safety check returns OK when lane dir does not exist.
     #[test]
     fn lane_safety_ok_when_no_lane_dir() {
@@ -1219,5 +1381,58 @@ mod tests {
         let result = check_lane_directory_safety_at(&lanes_dir);
         assert_eq!(result.status, "OK");
         assert!(result.message.contains("no symlinks"));
+    }
+
+    /// TCK-00547 MAJOR-2: lane safety detects `lanes_dir` itself being a
+    /// symlink.
+    #[cfg(unix)]
+    #[test]
+    fn lane_safety_detects_root_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let real_dir = temp.path().join("real_lanes");
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let symlink_lanes = temp.path().join("lanes_symlink");
+        std::os::unix::fs::symlink(&real_dir, &symlink_lanes).unwrap();
+
+        let result = check_lane_directory_safety_at(&symlink_lanes);
+        assert_eq!(result.status, "ERROR");
+        assert!(result.message.contains("is a symlink"));
+    }
+
+    /// TCK-00547 MAJOR-4: lane safety detects world-writable lane directories.
+    #[cfg(unix)]
+    #[test]
+    fn lane_safety_detects_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let lanes_dir = temp.path().join("lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+
+        // Make lanes_dir world-writable
+        std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let result = check_lane_directory_safety_at(&lanes_dir);
+        assert_eq!(result.status, "ERROR");
+        assert!(result.message.contains("world-writable"));
+    }
+
+    /// TCK-00547 MAJOR-1: lane safety returns WARN when scan limit is reached.
+    #[cfg(unix)]
+    #[test]
+    fn lane_safety_warns_on_incomplete_scan() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lanes_dir = temp.path().join("lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+
+        // Create MAX_LANE_SCAN + 1 entries to trigger incomplete scan
+        for i in 0..=MAX_LANE_SCAN {
+            std::fs::create_dir(lanes_dir.join(format!("lane-{i:04}"))).unwrap();
+        }
+
+        let result = check_lane_directory_safety_at(&lanes_dir);
+        assert_eq!(result.status, "WARN");
+        assert!(result.message.contains("incomplete"));
     }
 }
