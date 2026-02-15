@@ -526,7 +526,13 @@ pub fn run_fac_worker(
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
                 if once {
-                    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
+                    if let Err(persist_err) = persist_queue_scheduler_state(
+                        &fac_root,
+                        &queue_state,
+                        broker.current_tick(),
+                    ) {
+                        output_worker_error(json_output, &persist_err);
+                    }
                     return exit_codes::GENERIC_ERROR;
                 }
                 sleep_remaining(cycle_start, poll_interval_secs);
@@ -538,7 +544,14 @@ pub fn run_fac_worker(
 
         if candidates.is_empty() {
             if once {
-                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+                if let Err(persist_err) = persist_queue_scheduler_state(
+                    &fac_root,
+                    &cycle_scheduler,
+                    broker.current_tick(),
+                ) {
+                    output_worker_error(json_output, &persist_err);
+                    return exit_codes::GENERIC_ERROR;
+                }
                 let _ = save_broker_state(&broker);
                 if json_output {
                     emit_worker_summary(&summary);
@@ -678,7 +691,14 @@ pub fn run_fac_worker(
             }
 
             if once {
-                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+                if let Err(persist_err) = persist_queue_scheduler_state(
+                    &fac_root,
+                    &cycle_scheduler,
+                    broker.current_tick(),
+                ) {
+                    output_worker_error(json_output, &persist_err);
+                    return exit_codes::GENERIC_ERROR;
+                }
                 let _ = save_broker_state(&broker);
                 if json_output {
                     emit_worker_summary(&summary);
@@ -687,7 +707,12 @@ pub fn run_fac_worker(
             }
         }
 
-        persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+        if let Err(persist_err) =
+            persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick())
+        {
+            output_worker_error(json_output, &persist_err);
+            return exit_codes::GENERIC_ERROR;
+        }
         queue_state = cycle_scheduler;
 
         if max_jobs > 0 && total_processed >= max_jobs {
@@ -705,7 +730,12 @@ pub fn run_fac_worker(
         emit_worker_summary(&summary);
     }
 
-    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
+    if let Err(persist_err) =
+        persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick())
+    {
+        output_worker_error(json_output, &persist_err);
+        return exit_codes::GENERIC_ERROR;
+    }
     let _ = save_broker_state(&broker);
     exit_codes::SUCCESS
 }
@@ -714,12 +744,12 @@ fn persist_queue_scheduler_state(
     fac_root: &Path,
     queue_state: &QueueSchedulerState,
     current_tick: u64,
-) {
+) -> Result<(), String> {
     let mut state = queue_state.to_scheduler_state_v1(current_tick);
     state.persisted_at_secs = current_timestamp_epoch_secs();
-    if let Err(e) = persist_scheduler_state(fac_root, &state) {
-        eprintln!("WARNING: failed to persist scheduler state: {e}");
-    }
+    persist_scheduler_state(fac_root, &state)
+        .map(|_| ())
+        .map_err(|e| format!("failed to persist scheduler state: {e}"))
 }
 
 fn check_or_admit_canonicalizer_tuple(fac_root: &Path) -> Result<CanonicalizerTupleCheck, String> {

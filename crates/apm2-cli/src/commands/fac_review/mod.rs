@@ -522,7 +522,17 @@ pub fn run_doctor(
         },
     };
 
-    let interrupted = doctor_interrupt_flag();
+    let interrupted = match doctor_interrupt_flag() {
+        Ok(flag) => flag,
+        Err(err) => {
+            return emit_doctor_wait_error(
+                json_output,
+                "fac_doctor_signal_handler_failed",
+                &err,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
     interrupted.store(false, Ordering::SeqCst);
 
     let poll_interval = Duration::from_secs(poll_interval_seconds.max(1));
@@ -658,21 +668,25 @@ fn emit_doctor_wait_error(json_output: bool, error: &str, message: &str, exit_co
     exit_code
 }
 
-fn doctor_interrupt_flag() -> Arc<AtomicBool> {
-    static INTERRUPTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    Arc::clone(INTERRUPTED.get_or_init(|| {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let handler_flag = Arc::clone(&interrupted);
-        if ctrlc::set_handler(move || {
-            handler_flag.store(true, Ordering::SeqCst);
+/// Returns the global interrupt flag used by the doctor wait loop.
+///
+/// Registers a `ctrlc` signal handler (SIGINT + SIGTERM via the `termination`
+/// feature) on first call. If the handler cannot be registered, returns `Err`
+/// so the caller can refuse to start wait mode rather than running without
+/// graceful shutdown semantics (fail-closed).
+fn doctor_interrupt_flag() -> Result<Arc<AtomicBool>, String> {
+    static INTERRUPTED: OnceLock<Result<Arc<AtomicBool>, String>> = OnceLock::new();
+    INTERRUPTED
+        .get_or_init(|| {
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let handler_flag = Arc::clone(&interrupted);
+            ctrlc::set_handler(move || {
+                handler_flag.store(true, Ordering::SeqCst);
+            })
+            .map_err(|e| format!("failed to register Ctrl-C/SIGTERM handler: {e}"))?;
+            Ok(interrupted)
         })
-        .is_err()
-        {
-            // Another subsystem may have already installed a process-global
-            // Ctrl-C handler. Keep doctor functional and fall back to timeout.
-        }
-        interrupted
-    }))
+        .clone()
 }
 
 /// Maximum number of tracked PRs to include in doctor summaries.
@@ -5569,8 +5583,10 @@ mod tests {
     /// us).
     #[test]
     fn doctor_interrupt_flag_is_singleton_and_default_false() {
-        let flag_a = super::doctor_interrupt_flag();
-        let flag_b = super::doctor_interrupt_flag();
+        let flag_a = super::doctor_interrupt_flag()
+            .expect("handler should register or already be registered");
+        let flag_b = super::doctor_interrupt_flag()
+            .expect("handler should register or already be registered");
 
         // Both calls return Arc clones of the same global flag.
         assert!(std::sync::Arc::ptr_eq(&flag_a, &flag_b));
@@ -5599,8 +5615,9 @@ mod tests {
     /// a new handler. This proves the handler is installed for SIGTERM too.
     #[test]
     fn ctrlc_termination_feature_handles_sigterm() {
-        // Ensure the global handler is installed.
-        let _ = super::doctor_interrupt_flag();
+        // Ensure the global handler is installed (must succeed for this
+        // test's assertion to be meaningful).
+        super::doctor_interrupt_flag().expect("handler should register or already be registered");
 
         // Attempting to install a second handler should fail because the
         // global handler is already installed (ctrlc only allows one handler).
