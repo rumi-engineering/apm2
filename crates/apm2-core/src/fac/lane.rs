@@ -959,6 +959,11 @@ impl LaneCorruptMarkerV1 {
 impl fmt::Display for LaneStatusV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:<12} {:<10}", self.lane_id, self.state)?;
+        if self.state == LaneState::Corrupt {
+            if let Some(reason) = &self.corrupt_reason {
+                write!(f, " corrupt_reason={reason}")?;
+            }
+        }
         if let Some(ref job_id) = self.job_id {
             // Truncate job_id for display using Unicode-safe boundaries.
             let display_id = job_id.chars().take(30).collect::<String>();

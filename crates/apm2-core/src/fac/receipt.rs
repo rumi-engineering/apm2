@@ -64,7 +64,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -405,13 +404,14 @@ impl LaneCleanupReceiptV1 {
     ///
     /// Returns `LaneCleanupReceiptError::Serialization`, `InvalidData`, or
     /// `Io` depending on failure mode.
-    pub fn persist(&self, fac_receipts_dir: &Path) -> Result<PathBuf, LaneCleanupReceiptError> {
+    pub fn persist(
+        &self,
+        fac_receipts_dir: &Path,
+        timestamp_secs: u64,
+    ) -> Result<PathBuf, LaneCleanupReceiptError> {
         let mut copy = self.clone();
         copy.schema = LANE_CLEANUP_RECEIPT_SCHEMA.to_string();
-        if copy.timestamp_secs == 0 {
-            copy.timestamp_secs = current_wall_clock_secs();
-        }
-
+        copy.timestamp_secs = timestamp_secs;
         copy.content_hash = copy.compute_content_hash();
         copy.validate()?;
 
@@ -1534,14 +1534,6 @@ pub fn compute_job_receipt_content_hash_v2(receipt: &FacJobReceiptV1) -> String 
     hasher.update(b"apm2.fac.job_receipt.content_hash.v2\0");
     hasher.update(&canonical);
     format!("b3-256:{}", hasher.finalize().to_hex())
-}
-
-#[allow(clippy::disallowed_methods)]
-fn current_wall_clock_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn is_valid_b3_256_digest(value: &str) -> bool {
