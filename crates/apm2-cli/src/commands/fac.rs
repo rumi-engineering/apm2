@@ -160,12 +160,12 @@ pub enum FacSubcommand {
     /// Allows inspecting tool log index entries without raw log parsing.
     Episode(EpisodeArgs),
 
-    /// Show receipt from CAS.
+    /// Job receipt operations: show, list, status lookup, and reindex.
     ///
-    /// Retrieves and displays a receipt artifact from content-addressed storage
-    /// by its hash. Supports gate receipts, review receipts, and summary
-    /// receipts.
-    Receipt(ReceiptArgs),
+    /// Provides index-accelerated receipt lookups. The receipt index is a
+    /// non-authoritative cache — corrupt or missing index triggers automatic
+    /// rebuild from the receipt store.
+    Receipts(ReceiptArgs),
 
     /// Rebuild role-scoped context deterministically.
     ///
@@ -373,7 +373,7 @@ pub struct EpisodeInspectArgs {
     pub limit: u64,
 }
 
-/// Arguments for `apm2 fac receipt`.
+/// Arguments for `apm2 fac receipts`.
 #[derive(Debug, Args)]
 pub struct ReceiptArgs {
     #[command(subcommand)]
@@ -383,15 +383,48 @@ pub struct ReceiptArgs {
 /// Receipt subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ReceiptSubcommand {
-    /// Show receipt from CAS.
+    /// Show receipt from CAS by content hash.
     Show(ReceiptShowArgs),
+    /// List receipt headers from the index (no directory scan).
+    ///
+    /// Displays receipt headers sorted by timestamp (most recent first).
+    /// Uses the receipt index for O(1) access. If the index is missing
+    /// or corrupt, it is rebuilt automatically.
+    List(ReceiptListArgs),
+    /// Look up the latest receipt for a job ID.
+    ///
+    /// Consults the receipt index first for O(1) lookup, falling back
+    /// to bounded directory scan only if the index does not contain the
+    /// job. This avoids full receipt directory scans for common operations.
+    Status(ReceiptStatusArgs),
+    /// Rebuild the receipt index from the receipt store.
+    ///
+    /// Forces a full scan of all receipt files and rebuilds the
+    /// non-authoritative index used for fast job/receipt lookup.
+    /// The index is a cache — this command is safe to run at any time.
+    Reindex,
 }
 
-/// Arguments for `apm2 fac receipt show`.
+/// Arguments for `apm2 fac receipts show`.
 #[derive(Debug, Args)]
 pub struct ReceiptShowArgs {
     /// Receipt hash (hex-encoded BLAKE3).
     pub receipt_hash: String,
+}
+
+/// Arguments for `apm2 fac receipts list`.
+#[derive(Debug, Args)]
+pub struct ReceiptListArgs {
+    /// Maximum number of entries to display.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+}
+
+/// Arguments for `apm2 fac receipts status`.
+#[derive(Debug, Args)]
+pub struct ReceiptStatusArgs {
+    /// Job ID to look up.
+    pub job_id: String,
 }
 
 /// Arguments for `apm2 fac context`.
@@ -1639,10 +1672,13 @@ pub fn run_fac(
                 run_episode_inspect(inspect_args, &ledger_path, &cas_path, json_output)
             },
         },
-        FacSubcommand::Receipt(args) => match &args.subcommand {
+        FacSubcommand::Receipts(args) => match &args.subcommand {
             ReceiptSubcommand::Show(show_args) => {
                 run_receipt_show(show_args, &cas_path, json_output)
             },
+            ReceiptSubcommand::List(list_args) => run_receipt_list(list_args, json_output),
+            ReceiptSubcommand::Status(status_args) => run_receipt_status(status_args, json_output),
+            ReceiptSubcommand::Reindex => run_receipt_reindex(json_output),
         },
         FacSubcommand::Context(args) => match &args.subcommand {
             ContextSubcommand::Rebuild(rebuild_args) => {
@@ -1938,7 +1974,7 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Gc(_)
         | FacSubcommand::RoleLaunch(_)
         | FacSubcommand::Episode(_)
-        | FacSubcommand::Receipt(_)
+        | FacSubcommand::Receipts(_)
         | FacSubcommand::Context(_)
         | FacSubcommand::Resume(_)
         | FacSubcommand::Lane(_)
@@ -2690,6 +2726,249 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
     }
 
     "unknown".to_string()
+}
+
+// =============================================================================
+// Receipt List Command (TCK-00560)
+// =============================================================================
+
+/// List receipt headers from the index.
+///
+/// Uses the receipt index for O(1) access instead of scanning the receipt
+/// directory. Common operations no longer require full directory scans.
+fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+    let headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let display_count = headers.len().min(args.limit);
+    let display_headers = &headers[..display_count];
+
+    if json_output {
+        let result = serde_json::json!({
+            "status": "ok",
+            "total_indexed": headers.len(),
+            "displayed": display_count,
+            "receipts": display_headers.iter().map(|h| {
+                serde_json::json!({
+                    "content_hash": h.content_hash,
+                    "job_id": h.job_id,
+                    "outcome": h.outcome,
+                    "timestamp_secs": h.timestamp_secs,
+                    "queue_lane": h.queue_lane,
+                    "unsafe_direct": h.unsafe_direct,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "Receipt Index ({} total, showing {})",
+            headers.len(),
+            display_count
+        );
+        println!();
+        if display_headers.is_empty() {
+            println!("  (no receipts indexed)");
+        } else {
+            println!(
+                "  {:<12} {:<44} {:<12} Timestamp",
+                "Job ID", "Content Hash", "Outcome"
+            );
+            println!("  {}", "-".repeat(80));
+            for h in display_headers {
+                println!(
+                    "  {:<12} {:<44} {:<12} {}",
+                    truncate_str(&h.job_id, 12),
+                    truncate_str(&h.content_hash, 44),
+                    format!("{:?}", h.outcome),
+                    h.timestamp_secs,
+                );
+            }
+        }
+    }
+    exit_codes::SUCCESS
+}
+
+/// Truncate a string to at most `max_len` characters, appending ".." if
+/// truncated. Uses char-aware truncation to avoid panicking on multi-byte
+/// UTF-8 boundaries.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else if max_len > 2 {
+        let truncated: String = s.chars().take(max_len - 2).collect();
+        format!("{truncated}..")
+    } else {
+        s.chars().take(max_len).collect()
+    }
+}
+
+// =============================================================================
+// Receipt Status Command (TCK-00560)
+// =============================================================================
+
+/// Look up the latest receipt for a job ID using the index.
+///
+/// Consults the receipt index first (O(1)), falls back to bounded directory
+/// scan only if the index miss. This satisfies the ticket requirement:
+/// "Common operations do not require full receipt directory scans."
+fn run_receipt_status(args: &ReceiptStatusArgs, json_output: bool) -> u8 {
+    if args.job_id.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_job_id",
+            "Job ID cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    if let Some(receipt) = apm2_core::fac::lookup_job_receipt(&receipts_dir, &args.job_id) {
+        if json_output {
+            let result = serde_json::json!({
+                "status": "found",
+                "job_id": receipt.job_id,
+                "content_hash": receipt.content_hash,
+                "outcome": receipt.outcome,
+                "timestamp_secs": receipt.timestamp_secs,
+                "reason": receipt.reason,
+                "unsafe_direct": receipt.unsafe_direct,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+        } else {
+            println!("Receipt for job {}", args.job_id);
+            println!("  Content Hash:   {}", receipt.content_hash);
+            println!("  Outcome:        {:?}", receipt.outcome);
+            println!("  Timestamp:      {}", receipt.timestamp_secs);
+            println!("  Reason:         {}", receipt.reason);
+            println!("  Unsafe Direct:  {}", receipt.unsafe_direct);
+        }
+        exit_codes::SUCCESS
+    } else {
+        if json_output {
+            let result = serde_json::json!({
+                "status": "not_found",
+                "job_id": args.job_id,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+        } else {
+            println!("No receipt found for job {}", args.job_id);
+        }
+        exit_codes::NOT_FOUND
+    }
+}
+
+// =============================================================================
+// Receipt Reindex Command (TCK-00560)
+// =============================================================================
+
+/// Execute the receipt reindex command.
+///
+/// Rebuilds the non-authoritative receipt index by scanning all receipt files
+/// in the receipt store. The index is a cache for fast job/receipt lookup.
+fn run_receipt_reindex(json_output: bool) -> u8 {
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    if !receipts_dir.is_dir() {
+        if json_output {
+            let result = serde_json::json!({
+                "status": "ok",
+                "message": "no receipt directory found, nothing to index",
+                "entries": 0,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "no receipt directory found at {}, nothing to index",
+                receipts_dir.display()
+            );
+        }
+        return exit_codes::SUCCESS;
+    }
+
+    let start = std::time::Instant::now();
+    match apm2_core::fac::ReceiptIndexV1::rebuild_from_store(&receipts_dir) {
+        Ok(index) => {
+            let count = index.len();
+            match index.persist(&receipts_dir) {
+                Ok(index_path) => {
+                    let elapsed = start.elapsed();
+                    if json_output {
+                        let result = serde_json::json!({
+                            "status": "ok",
+                            "entries": count,
+                            "index_path": index_path.display().to_string(),
+                            "rebuild_epoch": index.rebuild_epoch,
+                            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&result).unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "receipt index rebuilt: {} entries in {:.2}s → {}",
+                            count,
+                            elapsed.as_secs_f64(),
+                            index_path.display()
+                        );
+                    }
+                    exit_codes::SUCCESS
+                },
+                Err(err) => output_error(
+                    json_output,
+                    "index_persist_failed",
+                    &format!("failed to persist receipt index: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                ),
+            }
+        },
+        Err(err) => output_error(
+            json_output,
+            "index_rebuild_failed",
+            &format!("failed to rebuild receipt index: {err}"),
+            exit_codes::GENERIC_ERROR,
+        ),
+    }
 }
 
 fn default_context_rebuild_output_dir(episode_id: &str) -> PathBuf {
@@ -4413,5 +4692,43 @@ mod tests {
             },
             other => panic!("expected services subcommand, got {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // truncate_str UTF-8 safety tests (MINOR finding fix)
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_str_ascii_no_truncation() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_ascii_truncated() {
+        assert_eq!(truncate_str("hello world", 7), "hello..");
+    }
+
+    #[test]
+    fn test_truncate_str_multibyte_no_panic() {
+        // Multi-byte UTF-8 characters should not cause panic.
+        let s = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}"; // 4 emoji characters
+        let result = truncate_str(s, 3);
+        assert_eq!(result.chars().count(), 3); // 1 char + ".."
+        assert!(result.ends_with(".."));
+    }
+
+    #[test]
+    fn test_truncate_str_exact_length() {
+        assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn test_truncate_str_max_len_two() {
+        assert_eq!(truncate_str("abcdef", 2), "ab");
+    }
+
+    #[test]
+    fn test_truncate_str_max_len_zero() {
+        assert_eq!(truncate_str("abc", 0), "");
     }
 }
