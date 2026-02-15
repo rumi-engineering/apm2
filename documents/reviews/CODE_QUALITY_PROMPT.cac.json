@@ -24,14 +24,15 @@
     "inputs": ["OPTIONAL_CONTEXT"],
     "outputs": ["FindingsProjection", "DecisionProjection"],
     "commands": {
-      "description": "The reviewer uses exactly 3 CLI commands. No others are needed.",
-      "prepare": "apm2 fac review prepare --json",
-      "finding": "apm2 fac review finding --type code-quality --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\" --json",
-      "verdict": "apm2 fac review verdict set --dimension code-quality --verdict <approve|deny> --reason \"...\" --json"
+      "description": "The reviewer uses exactly 3 CLI commands via `cargo run -p apm2-cli --`. This ensures the workspace-built binary is used, not a stale global install. No other commands are needed.",
+      "binary_prefix": "cargo run -p apm2-cli --",
+      "prepare": "cargo run -p apm2-cli -- fac review prepare --json",
+      "finding": "cargo run -p apm2-cli -- fac review finding --type code-quality --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\" --json",
+      "verdict": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict <approve|deny> --reason \"...\" --json"
     },
     "constraints": {
       "forbidden_operations": [
-        "You may ONLY run the 3 commands listed in the commands section: `apm2 fac review prepare`, `apm2 fac review finding`, and `apm2 fac review verdict set`. NEVER run any other command — including but not limited to git, gh, rg, cat, apm2 fac doctor, apm2 fac gates, apm2 fac logs, apm2 fac restart, or any shell command. If you need information not provided by the 3 allowed commands, state the gap in a finding — do not attempt to discover it yourself.",
+        "NEVER use bare `apm2` — always use `cargo run -p apm2-cli --` so the workspace-built binary is used.",
         "NEVER pass --sha to any command. The CLI auto-derives the SHA from the PR identity.",
         "All interactions with the repository MUST be read-only. Do not modify any files.",
         "NEVER paste raw command output into finding fields (summary, risk, impact, body). Finding fields must contain your original analysis text only."
@@ -39,6 +40,7 @@
       "invariants": [
         "Every execution path MUST terminate with exactly one verdict set call.",
         "SHA is managed by the CLI — the reviewer never tracks, stores, or references it.",
+        "ALWAYS use `cargo run -p apm2-cli --` instead of bare `apm2`. The workspace binary contains the code under review; a globally installed binary may be stale and missing fields or fixes from the current PR.",
         "Deployment invariant: this CLI serves Anveio on the current VPS only; do NOT file compatibility findings that require broad enterprise/custom-remote support or GitHub-as-authority fallback.",
         "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them."
       ]
@@ -87,12 +89,12 @@
           "id": "STEP_1_PREPARE",
           "purpose": "Discover the CLI surface and materialize local review inputs.",
           "steps": [
-            {"action": "command", "run": "apm2 fac review prepare --help"},
-            {"action": "command", "run": "apm2 fac review finding --help"},
-            {"action": "command", "run": "apm2 fac review verdict set --help"},
+            {"action": "command", "run": "cargo run -p apm2-cli -- fac review prepare --help"},
+            {"action": "command", "run": "cargo run -p apm2-cli -- fac review finding --help"},
+            {"action": "command", "run": "cargo run -p apm2-cli -- fac review verdict set --help"},
             {
               "action": "command",
-              "run": "apm2 fac review prepare --json",
+              "run": "cargo run -p apm2-cli -- fac review prepare --json",
               "capture_as": "prepare_json"
             },
             {
@@ -155,7 +157,7 @@
           },
           "emit_rule": {
             "action": "For each finding, classify severity (BLOCKER, MAJOR, MINOR, NIT) and call:",
-            "command": "apm2 fac review finding --type code-quality --severity <severity> --summary \"<one-line>\" --risk \"<why this matters>\" --impact \"<consequences if unaddressed>\" --location \"<file:line or module>\" --body \"<detailed description and required action>\" --json",
+            "command": "cargo run -p apm2-cli -- fac review finding --type code-quality --severity <severity> --summary \"<one-line>\" --risk \"<why this matters>\" --impact \"<consequences if unaddressed>\" --location \"<file:line or module>\" --body \"<detailed description and required action>\" --json",
             "quality_rules": [
               "Each finding MUST include: summary, risk, impact, location, and body (required action).",
               "REQUIREMENTS COVERAGE: Check the diff against every in_scope item and definition_of_done criterion from the ticket. If a scope item is not addressed by the diff, or a DoD criterion has no supporting evidence in the change, emit a BLOCKER finding with summary 'Missing requirement: <item>' and body describing what is missing and what the ticket requires.",
@@ -174,14 +176,14 @@
               "if": "blocker_count == 0 AND major_count == 0",
               "then": {
                 "action": "command",
-                "run": "apm2 fac review verdict set --dimension code-quality --verdict approve --reason \"PASS: no blocker or major findings\" --json"
+                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict approve --reason \"PASS: no blocker or major findings\" --json"
               }
             },
             {
               "if": "blocker_count > 0 OR major_count > 0",
               "then": {
                 "action": "command",
-                "run": "apm2 fac review verdict set --dimension code-quality --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\" --json"
+                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\" --json"
               }
             }
           ],
