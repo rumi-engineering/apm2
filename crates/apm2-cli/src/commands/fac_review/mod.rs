@@ -1470,17 +1470,58 @@ fn scan_event_signals_for_pr(
         return DoctorEventSignals::default();
     }
 
+    scan_event_signals_from_sources_with_budget(
+        &[path, rotated_path],
+        pr_number,
+        run_ids,
+        DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE,
+    )
+}
+
+fn read_event_source_tail(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    if max_bytes == 0 {
+        return Some(Vec::new());
+    }
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len == 0 {
+        return Some(Vec::new());
+    }
+
+    let bytes_to_read = file_len.min(max_bytes);
+    let start_offset = file_len.saturating_sub(bytes_to_read);
+    file.seek(SeekFrom::Start(start_offset)).ok()?;
+
+    let mut tail = Vec::new();
+    file.take(bytes_to_read).read_to_end(&mut tail).ok()?;
+
+    if start_offset > 0 {
+        if let Some(newline_idx) = tail.iter().position(|byte| *byte == b'\n') {
+            tail = tail.split_off(newline_idx.saturating_add(1));
+        } else {
+            tail.clear();
+        }
+    }
+    Some(tail)
+}
+
+fn scan_event_signals_from_sources_with_budget(
+    sources: &[PathBuf],
+    pr_number: u32,
+    run_ids: &std::collections::BTreeSet<String>,
+    max_bytes_per_source: u64,
+) -> DoctorEventSignals {
     let mut signals = DoctorEventSignals::default();
     let mut remaining_lines = DOCTOR_EVENT_SCAN_MAX_LINES;
-    for source in [path, rotated_path] {
+    for source in sources {
         if remaining_lines == 0 {
             break;
         }
-        let Ok(file) = File::open(&source) else {
+        let Some(tail_bytes) = read_event_source_tail(source, max_bytes_per_source) else {
             continue;
         };
-        let reader = BufReader::new(file);
-        let mut remaining_bytes = DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE;
+        let reader = std::io::Cursor::new(tail_bytes);
+        let mut remaining_bytes = max_bytes_per_source;
         scan_event_signals_from_reader_with_budget(
             reader,
             pr_number,
@@ -6034,6 +6075,63 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(models, vec!["model-safe".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_event_signals_from_sources_with_budget_prefers_tail_segment() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("review_events.ndjson");
+        let mut lines = String::new();
+        for index in 0..400 {
+            lines.push_str(
+                &serde_json::json!({
+                    "pr_number": 42,
+                    "review_type": "security",
+                    "run_id": format!("old-{index}"),
+                    "event": "run_start",
+                    "model": "model-old",
+                    "ts": "2026-02-15T00:00:00Z"
+                })
+                .to_string(),
+            );
+            lines.push('\n');
+        }
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "run_start",
+                "model": "model-tail",
+                "ts": "2026-02-15T00:01:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "tool_call",
+                "tool": "read_file",
+                "ts": "2026-02-15T00:01:05Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        std::fs::write(&path, lines).expect("write events");
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_sources_with_budget(&[path], 42, &run_ids, 1024);
+        let models = signals
+            .model_attempts
+            .get("security")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(models, vec!["model-tail".to_string()]);
+        assert_eq!(signals.tool_call_counts.get("keep").copied(), Some(1));
     }
 
     #[test]
