@@ -98,6 +98,9 @@ pub const FAC_LANE_CLEANUP_RECEIPT_SCHEMA: &str = LANE_CLEANUP_RECEIPT_SCHEMA;
 /// Maximum cleanup reason length for `LaneCleanupReceiptV1`.
 const MAX_CLEANUP_REASON_LENGTH: usize = 512;
 
+/// Maximum number of cleanup steps retained in a lane cleanup receipt.
+const MAX_CLEANUP_STEPS: usize = 16;
+
 /// Maximum RFC-0028 boundary defect classes included in a receipt trace.
 const MAX_FAC_JOB_BOUNDARY_DEFECT_CLASSES: usize = 32;
 
@@ -358,6 +361,14 @@ impl LaneCleanupReceiptV1 {
             }
         } else if matches!(self.outcome, super::lane::LaneCleanupOutcome::Failed) {
             return Err(LaneCleanupReceiptError::MissingField("failure_reason"));
+        }
+
+        if self.steps_completed.len() > MAX_CLEANUP_STEPS {
+            return Err(LaneCleanupReceiptError::StringTooLong {
+                field: "steps_completed",
+                actual: self.steps_completed.len(),
+                max: MAX_CLEANUP_STEPS,
+            });
         }
 
         for step in &self.steps_completed {
@@ -2462,6 +2473,22 @@ pub mod tests {
         let first = sample_cleanup_receipt(LaneCleanupOutcome::Success);
         let second = sample_cleanup_receipt(LaneCleanupOutcome::Success);
         assert_eq!(first.canonical_bytes(), second.canonical_bytes());
+    }
+
+    #[test]
+    fn test_cleanup_receipt_validate_rejects_too_many_steps() {
+        let mut receipt = sample_cleanup_receipt(LaneCleanupOutcome::Success);
+        receipt.steps_completed = (0..=MAX_CLEANUP_STEPS)
+            .map(|idx| format!("step-{idx}"))
+            .collect();
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(LaneCleanupReceiptError::StringTooLong {
+                field: "steps_completed",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -67,9 +67,13 @@ const CLEANUP_STEP_GIT_RESET: &str = "git_reset";
 const CLEANUP_STEP_GIT_CLEAN: &str = "git_clean";
 const CLEANUP_STEP_TEMP_PRUNE: &str = "temp_prune";
 const CLEANUP_STEP_LOG_QUOTA: &str = "log_quota";
+const CLEANUP_STEP_WORKSPACE_VALIDATION: &str = "workspace_path_validation";
 
 /// Maximum log directory size in bytes (100 MB).
 const MAX_LOG_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of collected log entries during quota enforcement.
+const MAX_LOG_ENTRIES: usize = 10_000;
 
 /// Maximum directory recursion depth while enforcing log quota.
 const MAX_LOG_QUOTA_DIR_DEPTH: usize = 8;
@@ -1205,6 +1209,8 @@ impl LaneManager {
     /// # Stale Lease Detection Rules (RFC-0019 §4.4)
     ///
     /// - Lock held + corrupt marker → CORRUPT
+    /// - Lock free + corrupt marker (even with no lease) → CORRUPT until marker
+    ///   is cleared explicitly via `LaneCorruptMarkerV1::remove()`
     /// - Lock held + lease missing/invalid → LEASED
     /// - Lock free + lease missing/invalid → IDLE
     /// - Lock free + lease RUNNING + PID alive → CORRUPT (INV-LANE-004)
@@ -1258,6 +1264,20 @@ impl LaneManager {
             pid_alive,
             corrupt_reason,
         })
+    }
+
+    /// Clear a corrupt marker for a lane.
+    ///
+    /// This is used by operator recovery workflows when a marker is known to
+    /// have been resolved externally.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::InvalidLaneId` for malformed lane IDs, or
+    /// `LaneError::Io` for filesystem errors.
+    pub fn clear_corrupt_marker(&self, lane_id: &str) -> Result<(), LaneError> {
+        validate_lane_id(lane_id)?;
+        LaneCorruptMarkerV1::remove(&self.fac_root, lane_id)
     }
 
     /// Get the status of all lanes.
@@ -1323,10 +1343,23 @@ impl LaneManager {
 
         persist_lease_state(&mut lease, LaneState::Cleanup)?;
 
+        let workspace_path = match Self::validate_workspace_path(
+            &lanes_dir,
+            workspace_path,
+            &steps_completed,
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(err);
+            },
+        };
+
         // Step 1: git reset (restore workspace to HEAD).
         let reset_output = Command::new("git")
             .args(["reset", "--hard", "HEAD"])
-            .current_dir(workspace_path)
+            .current_dir(&workspace_path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .output();
         let reset_output = match reset_output {
@@ -1358,7 +1391,7 @@ impl LaneManager {
         // Step 2: git clean -ffdxq (remove untracked files).
         let clean_output = Command::new("git")
             .args(["clean", "-ffdxq"])
-            .current_dir(workspace_path)
+            .current_dir(&workspace_path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .output();
         let clean_output = match clean_output {
@@ -1521,6 +1554,15 @@ impl LaneManager {
                 });
             }
 
+            if entries.len() + 1 > MAX_LOG_ENTRIES {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("log directory contains more than {MAX_LOG_ENTRIES} entries"),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
+
             let size = metadata.len();
             let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             entries.push((path, size, mtime));
@@ -1528,6 +1570,87 @@ impl LaneManager {
         }
 
         Ok(())
+    }
+
+    fn validate_workspace_path(
+        lanes_dir: &Path,
+        workspace_path: &Path,
+        steps_completed: &[String],
+        step: &'static str,
+    ) -> Result<PathBuf, LaneCleanupError> {
+        let invalid_workspace_path = |reason: String| LaneCleanupError::GitCommandFailed {
+            step,
+            reason,
+            steps_completed: steps_completed.to_vec(),
+            failure_step: Some(step.to_string()),
+        };
+
+        let metadata = workspace_path.symlink_metadata().map_err(|e| {
+            invalid_workspace_path(format!(
+                "cannot stat workspace path {}: {e}",
+                workspace_path.display()
+            ))
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} is a symlink, which is not allowed",
+                workspace_path.display()
+            )));
+        }
+
+        if !metadata.is_dir() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} is not a directory",
+                workspace_path.display()
+            )));
+        }
+
+        let git_path = workspace_path.join(".git");
+        let git_metadata = git_path.symlink_metadata().map_err(|e| {
+            invalid_workspace_path(format!(
+                "workspace path {} must contain .git metadata: {e}",
+                workspace_path.display()
+            ))
+        })?;
+
+        if git_metadata.file_type().is_symlink() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has a symlink .git entry, which is not allowed",
+                workspace_path.display()
+            )));
+        }
+
+        if !git_metadata.is_file() && !git_metadata.is_dir() {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} has invalid .git metadata",
+                workspace_path.display()
+            )));
+        }
+
+        let canonical_workspace = workspace_path.canonicalize().map_err(|e| {
+            invalid_workspace_path(format!(
+                "workspace path {} must canonicalize successfully: {e}",
+                workspace_path.display()
+            ))
+        })?;
+
+        let canonical_lanes_dir = lanes_dir.canonicalize().map_err(|e| {
+            invalid_workspace_path(format!(
+                "lane directory {} must canonicalize successfully: {e}",
+                lanes_dir.display()
+            ))
+        })?;
+
+        if !canonical_workspace.starts_with(&canonical_lanes_dir) {
+            return Err(invalid_workspace_path(format!(
+                "workspace path {} is outside lane directory {}",
+                canonical_workspace.display(),
+                lanes_dir.display()
+            )));
+        }
+
+        Ok(canonical_workspace)
     }
 }
 
@@ -1540,6 +1663,8 @@ impl LaneManager {
 ///
 /// Stale lease detection rules (RFC-0019 §4.4, fail-closed):
 /// - Lock free + lease RUNNING + PID alive → CORRUPT
+/// - Lock free + corrupt marker (including missing lease) → CORRUPT until
+///   marker is cleared explicitly via `LaneCorruptMarkerV1::remove()`
 /// - Lock free + lease RUNNING + PID dead → IDLE (stale lease)
 /// - Lock held + lease RUNNING → RUNNING
 /// - Lock held + lease state other → use lease state
@@ -2599,6 +2724,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lane_manager_clear_corrupt_marker() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let lane_id = "lane-00";
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "test recovery".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        marker.persist(manager.fac_root()).expect("persist marker");
+
+        manager.clear_corrupt_marker(lane_id).expect("clear marker");
+
+        assert!(
+            LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
+                .expect("load marker")
+                .is_none()
+        );
+    }
+
     // ── Lane State Derivation ──────────────────────────────────────────
 
     fn make_lease(state: LaneState) -> LaneLeaseV1 {
@@ -2709,6 +2860,11 @@ mod tests {
             derive_lane_state(true, Some(&lease), false, true),
             LaneState::Corrupt
         );
+        assert_eq!(
+            derive_lane_state(false, None, false, true),
+            LaneState::Corrupt,
+            "corrupt marker remains authoritative when lease is absent"
+        );
     }
 
     #[test]
@@ -2776,6 +2932,7 @@ mod tests {
 
         let lane_id = "lane-00";
         let workspace = manager.lane_dir(lane_id).join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
         let guard = manager
             .try_lock(lane_id)
             .expect("try_lock")
@@ -2789,7 +2946,7 @@ mod tests {
         assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
         assert_eq!(
             err.failure_step().expect("failure step"),
-            CLEANUP_STEP_GIT_RESET,
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
         );
 
         let status_during = manager.lane_status(lane_id).expect("status during failure");
@@ -2869,6 +3026,84 @@ mod tests {
             .as_slice()
         );
         assert_eq!(err.failure_step(), Some(CLEANUP_STEP_LOG_QUOTA));
+    }
+
+    #[test]
+    fn run_lane_cleanup_rejects_workspace_outside_lane_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let foreign_workspace = root.path().join("foreign_workspace");
+        init_git_workspace(&foreign_workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &foreign_workspace)
+            .expect_err("workspace outside lane directory should be rejected");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Corrupt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lane_cleanup_rejects_workspace_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        let workspace_link = lane_dir.join("workspace_link");
+        symlink(&workspace, &workspace_link).expect("create workspace symlink");
+
+        persist_running_lease(&manager, lane_id);
+
+        let err = manager
+            .run_lane_cleanup(lane_id, &workspace_link)
+            .expect_err("symlink workspace path should be rejected");
+        assert!(matches!(err, LaneCleanupError::GitCommandFailed { .. }));
+        assert_eq!(
+            err.failure_step().expect("failure step"),
+            CLEANUP_STEP_WORKSPACE_VALIDATION,
+        );
+    }
+
+    #[test]
+    fn collect_log_entries_rejects_too_many_entries() {
+        let logs_dir = tempfile::tempdir().expect("tempdir");
+        for idx in 0..=MAX_LOG_ENTRIES {
+            fs::write(logs_dir.path().join(format!("log_{idx}")), b"entry").expect("write log");
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size = 0;
+        let steps_completed = Vec::new();
+        let err = LaneManager::collect_log_entries(
+            logs_dir.path(),
+            &mut entries,
+            &mut total_size,
+            0,
+            &steps_completed,
+        )
+        .expect_err("collecting too many log entries should fail");
+        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
+        assert_eq!(entries.len(), MAX_LOG_ENTRIES);
+        assert!(total_size > 0);
     }
 
     #[test]
