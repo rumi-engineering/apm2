@@ -116,11 +116,9 @@ fn bounded_unit_properties(limits: BoundedTestLimits<'_>) -> Vec<String> {
 }
 
 fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String, String)]) {
-    // NOTE: Current systemd implementation requires passing values in argv.
-    // This is a known limitation for sensitive values; see ticket TCK-00602.
-    for (key, value) in setenv_pairs {
+    for (key, _value) in setenv_pairs {
         command.push("--setenv".to_string());
-        command.push(format!("{key}={value}"));
+        command.push(key.clone());
     }
 }
 
@@ -350,13 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn append_systemd_setenv_args_passes_name_value_pairs() {
+    fn append_systemd_setenv_args_only_passes_names() {
         let mut command = Vec::new();
         append_systemd_setenv_args(&mut command, &[("TOKEN".to_string(), "abcd".to_string())]);
-        assert_eq!(
-            command,
-            vec!["--setenv".to_string(), "TOKEN=abcd".to_string()]
-        );
-        assert!(command.iter().any(|arg: &String| arg.contains('=')));
+        assert_eq!(command, vec!["--setenv".to_string(), "TOKEN".to_string()]);
+        assert!(command.iter().all(|arg: &String| !arg.contains('=')));
     }
 }
