@@ -1,11 +1,16 @@
 //! Rust-native bounded test runner command construction.
 //!
 //! Replaces shell-wrapper command assembly with deterministic Rust logic.
+//! Supports both user-mode (`systemd-run --user`) and system-mode
+//! (`systemd-run --system`) execution backends. Backend selection is
+//! controlled by `APM2_FAC_EXECUTION_BACKEND` (see
+//! `apm2_core::fac::execution_backend` for details).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use apm2_core::fac::execution_backend::{ExecutionBackend, SystemModeConfig, select_backend};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
@@ -33,6 +38,8 @@ pub struct BoundedTestCommandSpec {
     pub command: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub setenv_pairs: Vec<(String, String)>,
+    /// The execution backend used for this command.
+    pub backend: ExecutionBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,41 +67,98 @@ pub fn build_bounded_test_command(
         return Err("systemd-run not found on PATH".to_string());
     }
 
-    let environment = normalized_runtime_environment();
-    let user_bus_path = resolve_user_bus_socket_path(&environment)
-        .ok_or_else(|| "failed to derive D-Bus socket path for bounded runner".to_string())?;
-    if !Path::new(&user_bus_path).exists() {
-        return Err(format!(
-            "user D-Bus socket not found at {user_bus_path}; bounded runner unavailable"
-        ));
+    // Select execution backend: user-mode (requires D-Bus session) or
+    // system-mode (headless VPS). Controlled by APM2_FAC_EXECUTION_BACKEND.
+    let backend =
+        select_backend().map_err(|e| format!("execution backend selection failed: {e}"))?;
+
+    match backend {
+        ExecutionBackend::UserMode => {
+            // User-mode: verify the user bus is available.
+            let environment = normalized_runtime_environment();
+            let user_bus_path = resolve_user_bus_socket_path(&environment).ok_or_else(|| {
+                "failed to derive D-Bus socket path for bounded runner. \
+                     Set APM2_FAC_EXECUTION_BACKEND=system for headless environments"
+                    .to_string()
+            })?;
+            if !Path::new(&user_bus_path).exists() {
+                return Err(format!(
+                    "user D-Bus socket not found at {user_bus_path}; \
+                     set APM2_FAC_EXECUTION_BACKEND=system for headless environments"
+                ));
+            }
+
+            let mut command = vec![
+                "systemd-run".to_string(),
+                "--user".to_string(),
+                "--pipe".to_string(),
+                "--quiet".to_string(),
+                "--wait".to_string(),
+                "--working-directory".to_string(),
+                workspace_root.display().to_string(),
+            ];
+
+            let setenv_pairs =
+                build_systemd_setenv_pairs(collect_inherited_setenv_pairs(), extra_setenv)?;
+            append_systemd_setenv_args(&mut command, &setenv_pairs);
+
+            for property in bounded_unit_properties(limits) {
+                command.push("--property".to_string());
+                command.push(property);
+            }
+
+            command.push("--".to_string());
+            command.extend(nextest_command.iter().cloned());
+
+            Ok(BoundedTestCommandSpec {
+                command,
+                environment,
+                setenv_pairs,
+                backend: ExecutionBackend::UserMode,
+            })
+        },
+        ExecutionBackend::SystemMode => {
+            // System-mode: no user bus needed. Runs as a dedicated
+            // service user via `systemd-run --system --property=User=...`.
+            let system_config = SystemModeConfig::from_env()
+                .map_err(|e| format!("system-mode config error: {e}"))?;
+
+            let mut command = vec![
+                "systemd-run".to_string(),
+                "--system".to_string(),
+                "--pipe".to_string(),
+                "--quiet".to_string(),
+                "--wait".to_string(),
+                "--working-directory".to_string(),
+                workspace_root.display().to_string(),
+            ];
+
+            let setenv_pairs =
+                build_systemd_setenv_pairs(collect_inherited_setenv_pairs(), extra_setenv)?;
+            append_systemd_setenv_args(&mut command, &setenv_pairs);
+
+            let mut properties = bounded_unit_properties(limits);
+            // System-mode: set the service user for job isolation
+            properties.push(format!("User={}", system_config.service_user));
+
+            for property in properties {
+                command.push("--property".to_string());
+                command.push(property);
+            }
+
+            command.push("--".to_string());
+            command.extend(nextest_command.iter().cloned());
+
+            // System-mode does not require a user D-Bus environment, so
+            // the environment vec is empty.
+            Ok(BoundedTestCommandSpec {
+                command,
+                environment: Vec::new(),
+                setenv_pairs,
+                backend: ExecutionBackend::SystemMode,
+            })
+        },
     }
-
-    let mut command = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--pipe".to_string(),
-        "--quiet".to_string(),
-        "--wait".to_string(),
-        "--working-directory".to_string(),
-        workspace_root.display().to_string(),
-    ];
-
-    let setenv_pairs = build_systemd_setenv_pairs(collect_inherited_setenv_pairs(), extra_setenv)?;
-    append_systemd_setenv_args(&mut command, &setenv_pairs);
-
-    for property in bounded_unit_properties(limits) {
-        command.push("--property".to_string());
-        command.push(property);
-    }
-
-    command.push("--".to_string());
-    command.extend(nextest_command.iter().cloned());
-
-    Ok(BoundedTestCommandSpec {
-        command,
-        environment,
-        setenv_pairs,
-    })
 }
 
 fn bounded_unit_properties(limits: BoundedTestLimits<'_>) -> Vec<String> {
