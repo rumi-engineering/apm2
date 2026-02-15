@@ -6,7 +6,8 @@ Wants=apm2-daemon.service
 Requires=apm2-daemon.service
 
 [Service]
-Type=simple
+# TCK-00600: Type=notify — worker sends READY=1 after broker connection.
+Type=notify
 ExecStart=/usr/local/bin/apm2 fac worker --poll-interval-secs 10
 Restart=always
 RestartSec=5
