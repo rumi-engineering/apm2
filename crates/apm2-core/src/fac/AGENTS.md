@@ -482,6 +482,10 @@ by another worker).
   from any persistent corrupt marker.
 - [INV-LANE-CLEANUP-004] Lane log retention is enforced by oldest-first file
   pruning to `MAX_LOG_QUOTA_BYTES`.
+- [INV-LANE-CLEANUP-004a] `collect_log_entries` bounds per-directory breadth
+  by `MAX_DIR_ENTRIES` (10,000, matching INV-RMTREE-009). Exceeding the limit
+  returns `Err` with a DoS-prevention reason, preventing directory-flood
+  resource exhaustion.
 - [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
   job execution and removed on every terminal path.
 - [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)
