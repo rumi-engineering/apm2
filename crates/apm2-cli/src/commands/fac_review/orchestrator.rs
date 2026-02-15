@@ -75,9 +75,9 @@ const fn verdict_dimension_for_kind(review_kind: ReviewKind) -> &'static str {
     }
 }
 
-fn required_verdict_command(pr_number: u32, head_sha: &str, review_kind: ReviewKind) -> String {
+fn required_verdict_command(review_kind: ReviewKind) -> String {
     format!(
-        "apm2 fac verdict set --pr {pr_number} --sha {head_sha} --dimension {} --verdict <approve|deny> --reason '<your synthesized reasoning>'",
+        "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\" --json",
         verdict_dimension_for_kind(review_kind)
     )
 }
@@ -113,12 +113,10 @@ fn read_prompt_excerpt_for_nudge(prompt_path: &std::path::Path) -> String {
 }
 
 fn build_missing_verdict_nudge_message(
-    pr_number: u32,
-    head_sha: &str,
     review_kind: ReviewKind,
     prompt_path: &std::path::Path,
 ) -> String {
-    let command = required_verdict_command(pr_number, head_sha, review_kind);
+    let command = required_verdict_command(review_kind);
     let prompt_excerpt = read_prompt_excerpt_for_nudge(prompt_path);
     format!(
         "RESUME TASK - REQUIRED TERMINAL COMMAND NOT EXECUTED.\n\
@@ -1272,14 +1270,9 @@ fn run_single_review(
                         && restart_count < MAX_RESTART_ATTEMPTS
                         && !missing_verdict_nudge_disabled()
                     {
-                        let nudge_message = build_missing_verdict_nudge_message(
-                            pr_number,
-                            &current_head_sha,
-                            review_kind,
-                            &prompt_path,
-                        );
-                        let required_command =
-                            required_verdict_command(pr_number, &current_head_sha, review_kind);
+                        let nudge_message =
+                            build_missing_verdict_nudge_message(review_kind, &prompt_path);
+                        let required_command = required_verdict_command(review_kind);
                         run_state.nudge_count = run_state.nudge_count.saturating_add(1);
                         emit_run_event(
                             "nudge_resume",
@@ -1711,12 +1704,10 @@ mod tests {
 
     #[test]
     fn required_verdict_command_uses_code_quality_dimension_for_quality_reviews() {
-        let command = required_verdict_command(
-            42,
-            "0123456789abcdef0123456789abcdef01234567",
-            ReviewKind::Quality,
-        );
+        let command = required_verdict_command(ReviewKind::Quality);
+        assert!(command.starts_with("cargo run -p apm2-cli -- fac review verdict set"));
         assert!(command.contains("--dimension code-quality"));
+        assert!(!command.contains("--sha"));
     }
 
     #[test]
@@ -1726,15 +1717,10 @@ mod tests {
         let oversized_prompt = "x".repeat(MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS + 128);
         std::fs::write(&prompt_path, oversized_prompt).expect("write prompt");
 
-        let message = build_missing_verdict_nudge_message(
-            42,
-            "0123456789abcdef0123456789abcdef01234567",
-            ReviewKind::Security,
-            &prompt_path,
-        );
+        let message = build_missing_verdict_nudge_message(ReviewKind::Security, &prompt_path);
 
         assert!(message.contains("RESUME TASK"));
-        assert!(message.contains("apm2 fac verdict set --pr 42"));
+        assert!(message.contains("cargo run -p apm2-cli -- fac review verdict set"));
         assert!(message.contains("--dimension security"));
         assert!(message.contains("...[truncated]"));
     }
