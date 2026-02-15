@@ -51,6 +51,8 @@ pub struct DaemonConfig {
     pub log_dir: PathBuf,           // Default: $APM2_DATA_DIR/logs (or ~/.local/share/apm2/logs)
     #[serde(default = "default_state_file")]
     pub state_file: PathBuf,        // Default: $APM2_DATA_DIR/state.json (or ~/.local/share/apm2/state.json)
+    #[serde(default = "default_ledger_db")]
+    pub ledger_db: Option<PathBuf>, // Default: Some($APM2_DATA_DIR/ledger.db) (or ~/.local/share/apm2/ledger.db)
     #[serde(default)]
     pub audit: AuditConfig,         // Audit event retention policy
     #[serde(default)]
@@ -74,6 +76,10 @@ The `APM2_DATA_DIR` override is useful for development and CI environments.
 **CAS Configuration (TCK-00383):**
 - `cas_path`: Optional path to the durable content-addressed storage (CAS) directory. When provided, the daemon wires `ToolBroker`, `DurableCas`, ledger event emitter, and holonic clock via `with_persistence_and_cas()`. Without this, session-scoped operations (tool execution, event emission, evidence publishing) fail closed.
 - **Security constraints**: The path must be absolute, must not contain symbolic link components, and the directory is created with mode 0700 (owner-only access). Existing directories are verified to be owned by the daemon UID with no group/other permissions. Violations cause fail-closed initialization failure.
+
+**Ledger Database Configuration (TCK-00608):**
+- `ledger_db`: Optional path to the daemon ledger SQLite database. Serde default resolves to `Some($APM2_DATA_DIR/ledger.db)` using the same XDG/data-dir fallback chain as other daemon paths.
+- Runtime precedence is expected to be: CLI `--ledger-db` override > `daemon.ledger_db` in ecosystem config > default XDG ledger path.
 
 **Dual-Socket Architecture (TCK-00249, TCK-00280):**
 - `operator_socket`: Used for privileged operations (process control, credential management). Mode 0600 restricts to owner.
