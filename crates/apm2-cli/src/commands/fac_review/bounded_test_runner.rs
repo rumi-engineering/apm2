@@ -274,6 +274,52 @@ fn command_available(command: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Checks whether sccache is enabled in the current environment and
+/// verifies containment. If sccache is enabled but containment
+/// verification fails (child processes escaped the cgroup), returns
+/// a reason string indicating sccache should be disabled.
+///
+/// Returns `Ok(None)` if sccache is safe to use or not enabled.
+/// Returns `Ok(Some(reason))` if sccache should be disabled.
+///
+/// This is a best-effort check: if `/proc` is unreadable (e.g.,
+/// non-Linux), returns `Ok(None)` and does not block the build.
+#[must_use]
+pub fn check_sccache_containment_for_build() -> Option<String> {
+    // Check if RUSTC_WRAPPER is set to sccache
+    let sccache_enabled = std::env::var("RUSTC_WRAPPER")
+        .ok()
+        .is_some_and(|v| v.contains("sccache"));
+
+    if !sccache_enabled {
+        return None;
+    }
+
+    let pid = std::process::id();
+    apm2_core::fac::check_sccache_containment(pid, true).unwrap_or_else(|_| {
+        // Fail-closed: if we can't check containment, assume unsafe
+        // and recommend disabling sccache.
+        Some(format!(
+            "containment check for PID {pid} failed; \
+             sccache auto-disabled as a precaution"
+        ))
+    })
+}
+
+/// Removes sccache-related environment variables from a setenv pairs
+/// list. Returns the filtered list and the number of removed entries.
+pub fn strip_sccache_from_setenv(
+    setenv_pairs: Vec<(String, String)>,
+) -> (Vec<(String, String)>, usize) {
+    let original_len = setenv_pairs.len();
+    let filtered: Vec<(String, String)> = setenv_pairs
+        .into_iter()
+        .filter(|(key, _)| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"))
+        .collect();
+    let removed = original_len.saturating_sub(filtered.len());
+    (filtered, removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

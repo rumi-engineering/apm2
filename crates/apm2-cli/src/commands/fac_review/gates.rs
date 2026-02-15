@@ -218,7 +218,21 @@ fn run_gates_inner(
         .map_err(|err| format!("bounded test runner unavailable for FAC gates: {err}"))?;
         bounded = true;
         test_command_environment.extend(spec.environment);
-        test_command_environment.extend(spec.setenv_pairs);
+
+        // TCK-00548: Check sccache containment before forwarding
+        // sccache env vars. If containment fails, strip sccache
+        // vars to prevent cache poisoning.
+        let mut setenv_pairs = spec.setenv_pairs;
+        if let Some(reason) = super::bounded_test_runner::check_sccache_containment_for_build() {
+            eprintln!("WARNING: sccache auto-disabled for bounded test: {reason}");
+            let (filtered, removed) =
+                super::bounded_test_runner::strip_sccache_from_setenv(setenv_pairs);
+            setenv_pairs = filtered;
+            if removed > 0 {
+                eprintln!("  removed {removed} sccache-related env var(s) from test environment");
+            }
+        }
+        test_command_environment.extend(setenv_pairs);
         Some(spec.command)
     };
 

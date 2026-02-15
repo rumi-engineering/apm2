@@ -347,6 +347,13 @@ pub struct FacJobReceiptV1 {
     /// It is intentionally optional and currently not populated by the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    /// Containment verification trace (TCK-00548).
+    ///
+    /// Records whether child processes (rustc, nextest, etc.) were verified
+    /// to share the same cgroup as the job unit, and whether sccache was
+    /// auto-disabled due to containment failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment: Option<super::containment::ContainmentTrace>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -592,6 +599,20 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(path.as_bytes());
         }
 
+        // TCK-00548: Containment trace. Appended at end for backward
+        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(trace) = &self.containment {
+            bytes.push(1u8);
+            bytes.push(u8::from(trace.verified));
+            bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace.cgroup_path.as_bytes());
+            bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
+            bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
+            bytes.push(u8::from(trace.sccache_auto_disabled));
+        }
+
         bytes
     }
 
@@ -807,6 +828,7 @@ pub struct FacJobReceiptV1Builder {
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    containment: Option<super::containment::ContainmentTrace>,
     timestamp_secs: Option<u64>,
 }
 
@@ -900,6 +922,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn eio29_budget_admission(mut self, trace: BudgetAdmissionTrace) -> Self {
         self.eio29_budget_admission = Some(trace);
+        self
+    }
+
+    /// Sets the containment verification trace (TCK-00548).
+    #[must_use]
+    pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
+        self.containment = Some(trace);
         self
     }
 
@@ -1108,6 +1137,7 @@ impl FacJobReceiptV1Builder {
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
+            containment: self.containment,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),

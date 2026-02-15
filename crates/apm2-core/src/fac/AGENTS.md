@@ -609,3 +609,45 @@ still enforced; only the token requirement is waived.
   except the token requirement.
 - All deny paths in the control-lane flow emit explicit refusal receipts before
   moving jobs to `denied/`.
+
+## containment Submodule (TCK-00548)
+
+The `containment` submodule implements cgroup membership verification for
+child processes during FAC job execution. It verifies that child processes
+(rustc, nextest, cc, ld, sccache) share the same cgroup hierarchy as the
+job unit, preventing cache poisoning via escaped sccache daemons.
+
+### Key Types
+
+- `ContainmentVerdict`: Full verdict with `contained` flag, reference cgroup,
+  mismatch list, sccache detection, and auto-disable status.
+- `ContainmentMismatch`: Single escaped process with PID, name, expected and
+  actual cgroup paths.
+- `ContainmentTrace`: Lightweight trace for inclusion in `FacJobReceiptV1`.
+- `ContainmentError`: Fail-closed error taxonomy for proc read failures,
+  parse failures, and resource bounds.
+
+### Core Capabilities
+
+- `read_cgroup_path(pid)`: Reads the cgroup v2 path from `/proc/<pid>/cgroup`.
+- `discover_children(parent_pid)`: BFS discovery of all descendant processes
+  via `/proc/*/status` PPid scanning, bounded by `MAX_CHILD_PROCESSES` (2048).
+- `verify_containment(reference_pid, sccache_enabled)`: Full containment
+  check with sccache auto-disable logic.
+- `check_sccache_containment(reference_pid, sccache_enabled)`: Convenience
+  function returning `Option<String>` reason if sccache should be disabled.
+- `is_cgroup_contained(child_path, reference_path)`: Exact or subtree
+  prefix matching with slash separator enforcement.
+
+### Security Invariants (TCK-00548)
+
+- [INV-CONTAIN-001] Fail-closed: unreadable `/proc` entries result in
+  mismatch verdict. Default `ContainmentVerdict::default()` has
+  `contained: false`.
+- [INV-CONTAIN-002] All `/proc` reads bounded by `MAX_PROC_READ_SIZE` (4 KiB).
+- [INV-CONTAIN-003] Process discovery bounded by `MAX_CHILD_PROCESSES` (2048)
+  and `MAX_PROC_SCAN_ENTRIES` (65536). Overflow returns `Err`.
+- [INV-CONTAIN-004] Cgroup path comparison uses exact prefix matching with
+  slash separator to prevent `/foo` matching `/foobar`.
+- [INV-CONTAIN-005] Process comm names bounded by `MAX_COMM_LENGTH` (64).
+- [INV-CONTAIN-006] PID validation rejects 0 and values > `MAX_PID_VALUE`.

@@ -1,0 +1,1158 @@
+//! Containment verification for FAC job execution.
+//!
+//! This module implements cgroup membership checks to verify that child
+//! processes (rustc, nextest, cc, ld, etc.) share the same cgroup hierarchy
+//! as the job unit. When sccache is enabled and containment fails, sccache
+//! is auto-disabled with a receipt recording the downgrade.
+//!
+//! # Architecture
+//!
+//! On cgroups v2 (unified hierarchy), each process has a single cgroup
+//! path visible in `/proc/<pid>/cgroup` as `0::<path>`. A transient
+//! systemd unit confines all child processes under the same cgroup
+//! subtree. If a process (e.g., sccache daemon) escapes the cgroup,
+//! containment is broken and build cache poisoning becomes possible.
+//!
+//! # Fail-Closed Semantics
+//!
+//! - If `/proc/<pid>/cgroup` cannot be read, the process is treated as escaped
+//!   (fail-closed per INV-CORE-003).
+//! - If the cgroup hierarchy cannot be determined, containment is assumed to
+//!   have failed.
+//! - When sccache is enabled and containment fails, sccache is auto-disabled
+//!   rather than allowing an unsafe build.
+//!
+//! # Security Invariants
+//!
+//! - [INV-CONTAIN-001] Containment check is fail-closed: unreadable `/proc`
+//!   entries result in mismatch verdict.
+//! - [INV-CONTAIN-002] All `/proc` reads are bounded by `MAX_PROC_READ_SIZE`.
+//! - [INV-CONTAIN-003] Process discovery bounds: at most `MAX_CHILD_PROCESSES`
+//!   children are checked.
+//! - [INV-CONTAIN-004] Cgroup path comparison uses exact prefix matching to
+//!   prevent subtree escapes.
+//! - [INV-CONTAIN-005] Process names discovered from `/proc/<pid>/comm` are
+//!   bounded by `MAX_COMM_LENGTH`.
+//! - [INV-CONTAIN-006] PID parsing rejects negative values and values exceeding
+//!   `MAX_PID_VALUE`.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum size for `/proc` file reads (4 KiB).
+///
+/// `/proc/<pid>/cgroup` and `/proc/<pid>/comm` are typically under 1 KiB.
+/// This cap prevents denial-of-service via crafted procfs entries (RSK-1601).
+pub const MAX_PROC_READ_SIZE: u64 = 4096;
+
+/// Maximum number of child processes to check for containment.
+///
+/// Prevents unbounded iteration over process trees. A typical build
+/// job has at most a few hundred concurrent processes.
+pub const MAX_CHILD_PROCESSES: usize = 2048;
+
+/// Maximum length for process comm name from `/proc/<pid>/comm`.
+///
+/// Linux kernel truncates comm to 15 bytes + newline (`TASK_COMM_LEN=16`).
+pub const MAX_COMM_LENGTH: usize = 64;
+
+/// Maximum PID value (Linux default max PID is 4194304 with
+/// `/proc/sys/kernel/pid_max`).
+pub const MAX_PID_VALUE: u32 = 4_194_304;
+
+/// Maximum number of directory entries scanned in `/proc` during
+/// process discovery.
+pub const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
+
+/// Maximum number of containment mismatches recorded in a verdict.
+pub const MAX_CONTAINMENT_MISMATCHES: usize = 256;
+
+/// Maximum cgroup path length.
+pub const MAX_CGROUP_PATH_LENGTH: usize = 4096;
+
+/// Maximum length for mismatch detail strings in serialized output.
+const MAX_MISMATCH_DETAIL_LENGTH: usize = 512;
+
+/// Process names of interest for containment verification.
+/// These are the processes whose cgroup membership is most critical
+/// for build integrity.
+const CONTAINMENT_CRITICAL_PROCESSES: &[&str] = &[
+    "rustc",
+    "cargo",
+    "nextest",
+    "cargo-nextest",
+    "cc",
+    "cc1",
+    "ld",
+    "ar",
+    "as",
+    "sccache",
+    "sccache-dist",
+];
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+/// Errors during containment verification.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContainmentError {
+    /// Failed to read procfs entry.
+    #[error("failed to read /proc/{pid}/{file}: {reason}")]
+    ProcReadFailed {
+        /// The PID that could not be read.
+        pid: u32,
+        /// The procfs file that failed.
+        file: String,
+        /// Reason for failure.
+        reason: String,
+    },
+
+    /// Cgroup path could not be parsed.
+    #[error("failed to parse cgroup path for PID {pid}: {reason}")]
+    CgroupParseFailed {
+        /// PID with invalid cgroup data.
+        pid: u32,
+        /// Parse failure reason.
+        reason: String,
+    },
+
+    /// Too many child processes to check.
+    #[error("child process count {count} exceeds limit {max}")]
+    TooManyChildren {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Invalid PID value.
+    #[error("invalid PID value: {reason}")]
+    InvalidPid {
+        /// Reason for rejection.
+        reason: String,
+    },
+
+    /// Too many mismatches to record.
+    #[error("containment mismatch count {count} exceeds limit {max}")]
+    TooManyMismatches {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Cgroup path exceeds length limit.
+    #[error("cgroup path length {length} exceeds limit {max}")]
+    CgroupPathTooLong {
+        /// Actual length.
+        length: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+}
+
+// =============================================================================
+// Core Types
+// =============================================================================
+
+/// A single containment mismatch: a process found outside the expected cgroup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainmentMismatch {
+    /// PID of the mismatched process.
+    pub pid: u32,
+    /// Process name (from `/proc/<pid>/comm`).
+    pub process_name: String,
+    /// Expected cgroup path (the job unit's cgroup).
+    pub expected_cgroup: String,
+    /// Actual cgroup path found for this process.
+    pub actual_cgroup: String,
+}
+
+/// Verdict of a containment verification check.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainmentVerdict {
+    /// Whether containment is verified (all children in same cgroup).
+    pub contained: bool,
+    /// The reference cgroup path (the job unit's cgroup).
+    pub reference_cgroup: String,
+    /// Total number of child processes checked.
+    pub processes_checked: u32,
+    /// Number of critical processes (rustc, nextest, etc.) found.
+    pub critical_processes_found: u32,
+    /// Processes that escaped the expected cgroup.
+    pub mismatches: Vec<ContainmentMismatch>,
+    /// Whether sccache was detected as active.
+    pub sccache_detected: bool,
+    /// If sccache was auto-disabled due to containment failure.
+    pub sccache_auto_disabled: bool,
+    /// Human-readable reason if sccache was disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sccache_disabled_reason: Option<String>,
+}
+
+/// Trace for containment checks included in job receipts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainmentTrace {
+    /// Whether containment was verified.
+    pub verified: bool,
+    /// The reference cgroup path.
+    pub cgroup_path: String,
+    /// Number of processes checked.
+    pub processes_checked: u32,
+    /// Number of mismatches found.
+    pub mismatch_count: u32,
+    /// Whether sccache was auto-disabled.
+    pub sccache_auto_disabled: bool,
+}
+
+impl ContainmentTrace {
+    /// Creates a trace from a verdict.
+    #[must_use]
+    pub fn from_verdict(verdict: &ContainmentVerdict) -> Self {
+        Self {
+            verified: verdict.contained,
+            cgroup_path: verdict.reference_cgroup.clone(),
+            processes_checked: verdict.processes_checked,
+            #[allow(clippy::cast_possible_truncation)]
+            mismatch_count: verdict.mismatches.len() as u32,
+            sccache_auto_disabled: verdict.sccache_auto_disabled,
+        }
+    }
+}
+
+// =============================================================================
+// Cgroup Path Parsing
+// =============================================================================
+
+/// Reads the cgroup v2 path for a process from `/proc/<pid>/cgroup`.
+///
+/// On cgroups v2 (unified hierarchy), the file contains a single line:
+/// `0::<path>`. Returns the `<path>` portion.
+///
+/// # Errors
+///
+/// Returns [`ContainmentError::ProcReadFailed`] if the file cannot be read.
+/// Returns [`ContainmentError::CgroupParseFailed`] if no v2 entry is found.
+/// Returns [`ContainmentError::InvalidPid`] if the PID is invalid.
+/// Fail-closed: any read or parse failure is an error (INV-CONTAIN-001).
+pub fn read_cgroup_path(pid: u32) -> Result<String, ContainmentError> {
+    read_cgroup_path_from_proc(pid, Path::new("/proc"))
+}
+
+/// Reads the cgroup path with a configurable procfs root (for testing).
+///
+/// # Errors
+///
+/// Returns [`ContainmentError::InvalidPid`] if the PID is invalid.
+/// Returns [`ContainmentError::ProcReadFailed`] if the cgroup file cannot be
+/// read. Returns [`ContainmentError::CgroupParseFailed`] if no v2 entry is
+/// found.
+pub fn read_cgroup_path_from_proc(pid: u32, proc_root: &Path) -> Result<String, ContainmentError> {
+    validate_pid(pid)?;
+
+    let cgroup_file = proc_root.join(pid.to_string()).join("cgroup");
+    let content = read_proc_file_bounded(&cgroup_file, pid, "cgroup")?;
+
+    parse_cgroup_v2_path(&content, pid)
+}
+
+/// Parses a cgroup v2 path from `/proc/<pid>/cgroup` content.
+///
+/// Expected format: `0::<path>\n`
+/// The `0::` prefix indicates cgroups v2 unified hierarchy.
+fn parse_cgroup_v2_path(content: &str, pid: u32) -> Result<String, ContainmentError> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // cgroups v2 unified hierarchy: line starts with "0::"
+        if let Some(path) = trimmed.strip_prefix("0::") {
+            if path.len() > MAX_CGROUP_PATH_LENGTH {
+                return Err(ContainmentError::CgroupPathTooLong {
+                    length: path.len(),
+                    max: MAX_CGROUP_PATH_LENGTH,
+                });
+            }
+            return Ok(path.to_string());
+        }
+    }
+
+    Err(ContainmentError::CgroupParseFailed {
+        pid,
+        reason: "no cgroups v2 entry (0::) found".to_string(),
+    })
+}
+
+// =============================================================================
+// Process Discovery
+// =============================================================================
+
+/// Discovered process information.
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    /// Process ID.
+    pub pid: u32,
+    /// Process name from `/proc/<pid>/comm`.
+    pub comm: String,
+    /// Cgroup path from `/proc/<pid>/cgroup`.
+    pub cgroup_path: String,
+}
+
+/// Discovers child processes of a given PID by scanning `/proc`.
+///
+/// Scans `/proc/*/status` for `PPid` matching the parent PID, then
+/// recursively discovers children of children up to `MAX_CHILD_PROCESSES`.
+///
+/// # Arguments
+///
+/// * `parent_pid` - PID of the parent process (job unit main process)
+///
+/// # Returns
+///
+/// A list of discovered child `ProcessInfo` entries.
+///
+/// # Errors
+///
+/// Returns error if more than `MAX_CHILD_PROCESSES` are found.
+pub fn discover_children(parent_pid: u32) -> Result<Vec<ProcessInfo>, ContainmentError> {
+    discover_children_from_proc(parent_pid, Path::new("/proc"))
+}
+
+/// Discovers children with a configurable procfs root (for testing).
+///
+/// # Errors
+///
+/// Returns [`ContainmentError::InvalidPid`] if the parent PID is invalid.
+/// Returns [`ContainmentError::ProcReadFailed`] if the proc directory cannot be
+/// read. Returns [`ContainmentError::TooManyChildren`] if the child count
+/// exceeds `MAX_CHILD_PROCESSES`.
+pub fn discover_children_from_proc(
+    parent_pid: u32,
+    proc_root: &Path,
+) -> Result<Vec<ProcessInfo>, ContainmentError> {
+    validate_pid(parent_pid)?;
+
+    // Build parent->children mapping from /proc/*/status
+    let mut parent_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut proc_entries_scanned: usize = 0;
+
+    let proc_dir = match std::fs::read_dir(proc_root) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(ContainmentError::ProcReadFailed {
+                pid: parent_pid,
+                file: "proc_dir".to_string(),
+                reason: format!("cannot read {}: {e}", proc_root.display()),
+            });
+        },
+    };
+
+    for entry in proc_dir {
+        proc_entries_scanned = proc_entries_scanned.saturating_add(1);
+        if proc_entries_scanned > MAX_PROC_SCAN_ENTRIES {
+            break;
+        }
+
+        let Ok(entry) = entry else { continue };
+
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only look at numeric directories (PID directories)
+        let child_pid: u32 = match name_str.parse() {
+            Ok(p) if p > 0 && p <= MAX_PID_VALUE => p,
+            _ => continue,
+        };
+
+        // Read PPid from /proc/<pid>/status
+        let status_path = proc_root.join(&name).join("status");
+        if let Ok(ppid) = read_ppid_from_status(&status_path, child_pid) {
+            parent_map.entry(ppid).or_default().push(child_pid);
+        }
+    }
+
+    // BFS from parent_pid to collect all descendants
+    let mut descendants = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(parent_pid);
+
+    while let Some(current) = queue.pop_front() {
+        if let Some(children) = parent_map.get(&current) {
+            for &child_pid in children {
+                if descendants.len() >= MAX_CHILD_PROCESSES {
+                    return Err(ContainmentError::TooManyChildren {
+                        count: descendants.len().saturating_add(1),
+                        max: MAX_CHILD_PROCESSES,
+                    });
+                }
+
+                // Read comm and cgroup for this child
+                let comm =
+                    read_comm(child_pid, proc_root).unwrap_or_else(|_| "<unknown>".to_string());
+                let cgroup_path = read_cgroup_path_from_proc(child_pid, proc_root)
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+
+                descendants.push(ProcessInfo {
+                    pid: child_pid,
+                    comm,
+                    cgroup_path,
+                });
+                queue.push_back(child_pid);
+            }
+        }
+    }
+
+    Ok(descendants)
+}
+
+/// Reads the comm (process name) from `/proc/<pid>/comm`.
+fn read_comm(pid: u32, proc_root: &Path) -> Result<String, ContainmentError> {
+    let comm_path = proc_root.join(pid.to_string()).join("comm");
+    let content = read_proc_file_bounded(&comm_path, pid, "comm")?;
+    let trimmed = content.trim();
+    if trimmed.len() > MAX_COMM_LENGTH {
+        Ok(trimmed[..MAX_COMM_LENGTH].to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// Reads `PPid` from `/proc/<pid>/status`.
+fn read_ppid_from_status(status_path: &Path, pid: u32) -> Result<u32, ContainmentError> {
+    let content = read_proc_file_bounded(status_path, pid, "status")?;
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            let trimmed = rest.trim();
+            return trimmed
+                .parse::<u32>()
+                .map_err(|_| ContainmentError::ProcReadFailed {
+                    pid,
+                    file: "status".to_string(),
+                    reason: format!("invalid PPid value: '{trimmed}'"),
+                });
+        }
+    }
+
+    Err(ContainmentError::ProcReadFailed {
+        pid,
+        file: "status".to_string(),
+        reason: "PPid field not found".to_string(),
+    })
+}
+
+// =============================================================================
+// Containment Verification
+// =============================================================================
+
+/// Verifies containment of child processes within the expected cgroup.
+///
+/// Reads the cgroup path of the reference PID (job unit main process),
+/// then discovers all child processes and verifies they share the same
+/// cgroup subtree.
+///
+/// # Arguments
+///
+/// * `reference_pid` - PID of the job's main process (reference cgroup)
+/// * `sccache_enabled` - Whether sccache is currently enabled
+///
+/// # Returns
+///
+/// A `ContainmentVerdict` with the check results.
+///
+/// # Errors
+///
+/// Returns error only for hard failures (too many children, etc.).
+/// Individual process read failures produce mismatches, not errors
+/// (fail-closed: unreadable process = assumed escaped).
+pub fn verify_containment(
+    reference_pid: u32,
+    sccache_enabled: bool,
+) -> Result<ContainmentVerdict, ContainmentError> {
+    verify_containment_with_proc(reference_pid, sccache_enabled, Path::new("/proc"))
+}
+
+/// Verifies containment with a configurable procfs root (for testing).
+///
+/// # Errors
+///
+/// Returns [`ContainmentError::InvalidPid`] if the reference PID is invalid.
+/// Returns [`ContainmentError::ProcReadFailed`] if the reference cgroup cannot
+/// be read. Returns [`ContainmentError::TooManyChildren`] if the child count
+/// exceeds limits. Returns [`ContainmentError::TooManyMismatches`] if mismatch
+/// count exceeds limits.
+pub fn verify_containment_with_proc(
+    reference_pid: u32,
+    sccache_enabled: bool,
+    proc_root: &Path,
+) -> Result<ContainmentVerdict, ContainmentError> {
+    // Read the reference cgroup path (fail-closed: error if unreadable)
+    let reference_cgroup = read_cgroup_path_from_proc(reference_pid, proc_root)?;
+
+    // Discover children
+    let children = discover_children_from_proc(reference_pid, proc_root)?;
+
+    let mut mismatches = Vec::new();
+    let mut critical_count: u32 = 0;
+    let mut sccache_detected = false;
+
+    for child in &children {
+        // Check if this is a critical process
+        let is_critical = CONTAINMENT_CRITICAL_PROCESSES
+            .iter()
+            .any(|&name| child.comm.contains(name));
+
+        if is_critical {
+            critical_count = critical_count.saturating_add(1);
+        }
+
+        // Check if sccache is running
+        if child.comm.contains("sccache") {
+            sccache_detected = true;
+        }
+
+        // Verify cgroup containment: the child's cgroup must be equal to
+        // or a subtree of the reference cgroup.
+        let contained = is_cgroup_contained(&child.cgroup_path, &reference_cgroup);
+
+        if !contained {
+            if mismatches.len() >= MAX_CONTAINMENT_MISMATCHES {
+                return Err(ContainmentError::TooManyMismatches {
+                    count: mismatches.len().saturating_add(1),
+                    max: MAX_CONTAINMENT_MISMATCHES,
+                });
+            }
+
+            mismatches.push(ContainmentMismatch {
+                pid: child.pid,
+                process_name: truncate_string(&child.comm, MAX_MISMATCH_DETAIL_LENGTH),
+                expected_cgroup: truncate_string(&reference_cgroup, MAX_MISMATCH_DETAIL_LENGTH),
+                actual_cgroup: truncate_string(&child.cgroup_path, MAX_MISMATCH_DETAIL_LENGTH),
+            });
+        }
+    }
+
+    let all_contained = mismatches.is_empty();
+
+    // Sccache gating: if sccache is enabled and containment failed,
+    // auto-disable sccache.
+    let sccache_auto_disabled = sccache_enabled && !all_contained;
+    let sccache_disabled_reason = if sccache_auto_disabled {
+        Some(format!(
+            "containment verification failed: {} process(es) escaped cgroup '{}'; \
+             sccache auto-disabled to prevent cache poisoning",
+            mismatches.len(),
+            truncate_string(&reference_cgroup, 128),
+        ))
+    } else {
+        None
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(ContainmentVerdict {
+        contained: all_contained,
+        reference_cgroup,
+        processes_checked: children.len() as u32,
+        critical_processes_found: critical_count,
+        mismatches,
+        sccache_detected,
+        sccache_auto_disabled,
+        sccache_disabled_reason,
+    })
+}
+
+/// Checks whether a child cgroup path is contained within a reference
+/// cgroup path.
+///
+/// Containment means the child's cgroup path is either:
+/// 1. Exactly equal to the reference path, OR
+/// 2. A subtree of the reference path (starts with `reference/`)
+///
+/// This uses exact prefix matching with a trailing `/` separator to
+/// prevent `/sys/fs/cgroup/foo` from matching `/sys/fs/cgroup/foobar`.
+#[must_use]
+pub fn is_cgroup_contained(child_path: &str, reference_path: &str) -> bool {
+    if child_path == "<unreadable>" {
+        // Fail-closed: unreadable cgroup means not contained
+        // (INV-CONTAIN-001).
+        return false;
+    }
+
+    if child_path == reference_path {
+        return true;
+    }
+
+    // Check if child is in a subtree of the reference.
+    // Must use slash-separated prefix to prevent partial name matches.
+    let prefix_with_slash = if reference_path.ends_with('/') {
+        reference_path.to_string()
+    } else {
+        format!("{reference_path}/")
+    };
+
+    child_path.starts_with(&prefix_with_slash)
+}
+
+/// Determines whether sccache should be disabled based on containment.
+///
+/// Returns `Some(reason)` if sccache should be disabled, `None` if safe.
+///
+/// # Arguments
+///
+/// * `reference_pid` - PID of the job's main process
+/// * `sccache_enabled` - Whether sccache is currently configured
+///
+/// # Returns
+///
+/// - `Ok(None)` if sccache is safe to use (containment passed or sccache not
+///   enabled)
+/// - `Ok(Some(reason))` if sccache should be disabled
+///
+/// # Errors
+///
+/// Returns a [`ContainmentError`] if the containment check itself fails
+/// (treat as unsafe, fail-closed).
+pub fn check_sccache_containment(
+    reference_pid: u32,
+    sccache_enabled: bool,
+) -> Result<Option<String>, ContainmentError> {
+    check_sccache_containment_with_proc(reference_pid, sccache_enabled, Path::new("/proc"))
+}
+
+/// Checks sccache containment with configurable procfs root.
+///
+/// # Errors
+///
+/// Returns a [`ContainmentError`] if the containment check itself fails
+/// (treat as unsafe, fail-closed).
+pub fn check_sccache_containment_with_proc(
+    reference_pid: u32,
+    sccache_enabled: bool,
+    proc_root: &Path,
+) -> Result<Option<String>, ContainmentError> {
+    if !sccache_enabled {
+        return Ok(None);
+    }
+
+    let verdict = verify_containment_with_proc(reference_pid, sccache_enabled, proc_root)?;
+
+    if verdict.sccache_auto_disabled {
+        Ok(verdict.sccache_disabled_reason)
+    } else {
+        Ok(None)
+    }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/// Validates a PID value.
+fn validate_pid(pid: u32) -> Result<(), ContainmentError> {
+    if pid == 0 {
+        return Err(ContainmentError::InvalidPid {
+            reason: "PID 0 is not a valid process".to_string(),
+        });
+    }
+    if pid > MAX_PID_VALUE {
+        return Err(ContainmentError::InvalidPid {
+            reason: format!("PID {pid} exceeds maximum {MAX_PID_VALUE}"),
+        });
+    }
+    Ok(())
+}
+
+/// Reads a procfs file with bounded size (INV-CONTAIN-002).
+fn read_proc_file_bounded(
+    path: &Path,
+    pid: u32,
+    file_name: &str,
+) -> Result<String, ContainmentError> {
+    let file = File::open(path).map_err(|e| ContainmentError::ProcReadFailed {
+        pid,
+        file: file_name.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let mut reader = BufReader::new(file).take(MAX_PROC_READ_SIZE);
+    let mut content = String::with_capacity(256);
+
+    reader
+        .read_to_string(&mut content)
+        .map_err(|e| ContainmentError::ProcReadFailed {
+            pid,
+            file: file_name.to_string(),
+            reason: e.to_string(),
+        })?;
+
+    Ok(content)
+}
+
+/// Truncates a string to a maximum length, appending "..." if truncated.
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let truncated = &s[..max_len.saturating_sub(3)];
+        format!("{truncated}...")
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    // ========================================================================
+    // Cgroup path parsing tests
+    // ========================================================================
+
+    #[test]
+    fn parse_cgroup_v2_path_valid() {
+        let content = "0::/system.slice/apm2-job.service\n";
+        let path = parse_cgroup_v2_path(content, 1234).unwrap();
+        assert_eq!(path, "/system.slice/apm2-job.service");
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_with_user_slice() {
+        let content =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/apm2-job.service\n";
+        let path = parse_cgroup_v2_path(content, 1234).unwrap();
+        assert_eq!(
+            path,
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/apm2-job.service"
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_root() {
+        let content = "0::/\n";
+        let path = parse_cgroup_v2_path(content, 1).unwrap();
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_no_v2_entry() {
+        let content = "1:name=systemd:/init.scope\n";
+        let result = parse_cgroup_v2_path(content, 1);
+        assert!(matches!(
+            result,
+            Err(ContainmentError::CgroupParseFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_empty() {
+        let content = "";
+        let result = parse_cgroup_v2_path(content, 1);
+        assert!(matches!(
+            result,
+            Err(ContainmentError::CgroupParseFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_too_long() {
+        let long_path = "/".to_string() + &"a".repeat(MAX_CGROUP_PATH_LENGTH + 1);
+        let content = format!("0::{long_path}\n");
+        let result = parse_cgroup_v2_path(&content, 1);
+        assert!(matches!(
+            result,
+            Err(ContainmentError::CgroupPathTooLong { .. })
+        ));
+    }
+
+    // ========================================================================
+    // Cgroup containment check tests
+    // ========================================================================
+
+    #[test]
+    fn cgroup_contained_exact_match() {
+        assert!(is_cgroup_contained(
+            "/system.slice/apm2-job.service",
+            "/system.slice/apm2-job.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_contained_subtree() {
+        assert!(is_cgroup_contained(
+            "/system.slice/apm2-job.service/child-scope",
+            "/system.slice/apm2-job.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_not_contained_different_path() {
+        assert!(!is_cgroup_contained(
+            "/system.slice/other.service",
+            "/system.slice/apm2-job.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_not_contained_partial_name_match() {
+        // Ensure "/foo" does not match "/foobar"
+        assert!(!is_cgroup_contained(
+            "/system.slice/apm2-job.service-extra",
+            "/system.slice/apm2-job.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_not_contained_unreadable() {
+        // Fail-closed: unreadable means not contained
+        assert!(!is_cgroup_contained(
+            "<unreadable>",
+            "/system.slice/apm2-job.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_contained_reference_trailing_slash() {
+        assert!(is_cgroup_contained(
+            "/system.slice/apm2-job.service/child",
+            "/system.slice/apm2-job.service/"
+        ));
+    }
+
+    // ========================================================================
+    // PID validation tests
+    // ========================================================================
+
+    #[test]
+    fn validate_pid_zero_rejected() {
+        assert!(matches!(
+            validate_pid(0),
+            Err(ContainmentError::InvalidPid { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_pid_exceeds_max() {
+        assert!(matches!(
+            validate_pid(MAX_PID_VALUE + 1),
+            Err(ContainmentError::InvalidPid { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_pid_valid() {
+        assert!(validate_pid(1).is_ok());
+        assert!(validate_pid(MAX_PID_VALUE).is_ok());
+    }
+
+    // ========================================================================
+    // Mock procfs tests
+    // ========================================================================
+
+    #[test]
+    fn read_cgroup_from_mock_proc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_dir = tmp.path().join("1234");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(
+            pid_dir.join("cgroup"),
+            "0::/system.slice/apm2-fac-job-lane00.service\n",
+        )
+        .unwrap();
+
+        let path = read_cgroup_path_from_proc(1234, tmp.path()).unwrap();
+        assert_eq!(path, "/system.slice/apm2-fac-job-lane00.service");
+    }
+
+    #[test]
+    fn read_cgroup_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_dir = tmp.path().join("1234");
+        fs::create_dir_all(&pid_dir).unwrap();
+        // No cgroup file
+
+        let result = read_cgroup_path_from_proc(1234, tmp.path());
+        assert!(matches!(
+            result,
+            Err(ContainmentError::ProcReadFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn discover_children_mock_proc() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Parent PID 100
+        let parent_dir = tmp.path().join("100");
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::write(
+            parent_dir.join("status"),
+            "Name:\tinit\nPPid:\t0\nPid:\t100\n",
+        )
+        .unwrap();
+        fs::write(parent_dir.join("cgroup"), "0::/system.slice/apm2.service\n").unwrap();
+        fs::write(parent_dir.join("comm"), "cargo\n").unwrap();
+
+        // Child PID 101 (child of 100)
+        let child_dir = tmp.path().join("101");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("status"),
+            "Name:\trustc\nPPid:\t100\nPid:\t101\n",
+        )
+        .unwrap();
+        fs::write(child_dir.join("cgroup"), "0::/system.slice/apm2.service\n").unwrap();
+        fs::write(child_dir.join("comm"), "rustc\n").unwrap();
+
+        // Grandchild PID 102 (child of 101)
+        let grandchild_dir = tmp.path().join("102");
+        fs::create_dir_all(&grandchild_dir).unwrap();
+        fs::write(
+            grandchild_dir.join("status"),
+            "Name:\tcc1\nPPid:\t101\nPid:\t102\n",
+        )
+        .unwrap();
+        fs::write(
+            grandchild_dir.join("cgroup"),
+            "0::/system.slice/apm2.service\n",
+        )
+        .unwrap();
+        fs::write(grandchild_dir.join("comm"), "cc1\n").unwrap();
+
+        let children = discover_children_from_proc(100, tmp.path()).unwrap();
+        assert_eq!(children.len(), 2);
+
+        let pids: Vec<u32> = children.iter().map(|c| c.pid).collect();
+        assert!(pids.contains(&101));
+        assert!(pids.contains(&102));
+    }
+
+    #[test]
+    fn verify_containment_all_contained() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Reference process
+        let ref_dir = tmp.path().join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // Child in same cgroup
+        let child_dir = tmp.path().join("101");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(child_dir.join("status"), "Name:\trustc\nPPid:\t100\n").unwrap();
+        fs::write(
+            child_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(child_dir.join("comm"), "rustc\n").unwrap();
+
+        let verdict = verify_containment_with_proc(100, false, tmp.path()).unwrap();
+        assert!(verdict.contained);
+        assert_eq!(verdict.processes_checked, 1);
+        assert_eq!(verdict.mismatches.len(), 0);
+    }
+
+    #[test]
+    fn verify_containment_escaped_process() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Reference process
+        let ref_dir = tmp.path().join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // Child in DIFFERENT cgroup (escaped!)
+        let child_dir = tmp.path().join("101");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(child_dir.join("status"), "Name:\tsccache\nPPid:\t100\n").unwrap();
+        fs::write(child_dir.join("cgroup"), "0::/user.slice/sccache.service\n").unwrap();
+        fs::write(child_dir.join("comm"), "sccache\n").unwrap();
+
+        let verdict = verify_containment_with_proc(100, true, tmp.path()).unwrap();
+        assert!(!verdict.contained);
+        assert_eq!(verdict.mismatches.len(), 1);
+        assert_eq!(verdict.mismatches[0].pid, 101);
+        assert!(verdict.sccache_detected);
+        assert!(verdict.sccache_auto_disabled);
+        assert!(verdict.sccache_disabled_reason.is_some());
+    }
+
+    #[test]
+    fn verify_containment_sccache_not_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Reference process
+        let ref_dir = tmp.path().join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // Child escaped but sccache not enabled
+        let child_dir = tmp.path().join("101");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(child_dir.join("status"), "Name:\tsccache\nPPid:\t100\n").unwrap();
+        fs::write(child_dir.join("cgroup"), "0::/user.slice/sccache.service\n").unwrap();
+        fs::write(child_dir.join("comm"), "sccache\n").unwrap();
+
+        let verdict = verify_containment_with_proc(100, false, tmp.path()).unwrap();
+        assert!(!verdict.contained);
+        assert!(!verdict.sccache_auto_disabled);
+    }
+
+    #[test]
+    fn check_sccache_containment_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ref_dir = tmp.path().join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        let result = check_sccache_containment_with_proc(100, true, tmp.path()).unwrap();
+        assert!(result.is_none(), "no children means all contained");
+    }
+
+    #[test]
+    fn check_sccache_containment_disabled() {
+        let result =
+            check_sccache_containment_with_proc(100, false, Path::new("/nonexistent")).unwrap();
+        assert!(result.is_none(), "sccache not enabled => None");
+    }
+
+    #[test]
+    fn containment_trace_from_verdict() {
+        let verdict = ContainmentVerdict {
+            contained: true,
+            reference_cgroup: "/system.slice/test.service".to_string(),
+            processes_checked: 5,
+            critical_processes_found: 2,
+            mismatches: vec![],
+            sccache_detected: false,
+            sccache_auto_disabled: false,
+            sccache_disabled_reason: None,
+        };
+
+        let trace = ContainmentTrace::from_verdict(&verdict);
+        assert!(trace.verified);
+        assert_eq!(trace.cgroup_path, "/system.slice/test.service");
+        assert_eq!(trace.processes_checked, 5);
+        assert_eq!(trace.mismatch_count, 0);
+        assert!(!trace.sccache_auto_disabled);
+    }
+
+    #[test]
+    fn truncate_string_within_limit() {
+        assert_eq!(truncate_string("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_string_exceeds_limit() {
+        let result = truncate_string("hello world", 8);
+        assert_eq!(result, "hello...");
+    }
+
+    #[test]
+    fn default_verdict_is_fail_closed() {
+        let v = ContainmentVerdict::default();
+        assert!(!v.contained, "default verdict must be fail-closed");
+    }
+
+    #[test]
+    fn containment_error_display() {
+        let err = ContainmentError::ProcReadFailed {
+            pid: 123,
+            file: "cgroup".to_string(),
+            reason: "permission denied".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("123"));
+        assert!(msg.contains("cgroup"));
+        assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn containment_mismatch_serde_roundtrip() {
+        let m = ContainmentMismatch {
+            pid: 42,
+            process_name: "rustc".to_string(),
+            expected_cgroup: "/a".to_string(),
+            actual_cgroup: "/b".to_string(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let m2: ContainmentMismatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn containment_verdict_serde_roundtrip() {
+        let v = ContainmentVerdict {
+            contained: true,
+            reference_cgroup: "/test".to_string(),
+            processes_checked: 1,
+            critical_processes_found: 1,
+            mismatches: vec![],
+            sccache_detected: false,
+            sccache_auto_disabled: false,
+            sccache_disabled_reason: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let v2: ContainmentVerdict = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn containment_trace_serde_roundtrip() {
+        let t = ContainmentTrace {
+            verified: true,
+            cgroup_path: "/test".to_string(),
+            processes_checked: 3,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let t2: ContainmentTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, t2);
+    }
+}
