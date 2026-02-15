@@ -129,6 +129,19 @@ pub enum EventSubcommand {
 |----------|-------------|
 | `run(config, no_daemon)` | Start daemon (spawns `apm2-daemon` binary) |
 | `kill(socket_path)` | Send shutdown via `OperatorClient` |
+| `collect_doctor_checks(operator_socket, config_path)` | Collect all doctor health checks (TCK-00547) |
+
+#### Doctor Check Categories (TCK-00547)
+
+`collect_doctor_checks` runs checks in these categories:
+
+1. **Host Capability**: cgroup v2 availability, systemd execution backend selection
+2. **Control-Plane Readiness**: broker socket reachability, worker liveness (projection probe)
+3. **Toolchain**: cargo, cargo-nextest, systemd-run availability
+4. **Security Posture**: FAC root permissions (0700/ownership), socket permissions (0600), lane symlink detection
+5. **Credentials Posture** (WARN-only): GITHUB_TOKEN/GH_TOKEN, GitHub App config, systemd credential file
+
+Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK), and `message` (including actionable remediation). Credentials checks are WARN-only to avoid blocking local-only workflows.
 
 ### Process Management (process.rs)
 

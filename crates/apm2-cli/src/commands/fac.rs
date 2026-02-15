@@ -295,6 +295,14 @@ pub struct DoctorArgs {
     /// Output in JSON format.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+
+    /// Upgrade credential checks from WARN to ERROR.
+    ///
+    /// Use this when running GitHub-facing workflows (push, review dispatch)
+    /// that require valid credentials. Without this flag, missing credentials
+    /// produce WARN; with it, they produce ERROR and cause a non-zero exit.
+    #[arg(long, default_value_t = false)]
+    pub full: bool,
 }
 
 /// Arguments for `apm2 fac services`.
@@ -1563,6 +1571,7 @@ pub fn run_fac(
                     match crate::commands::daemon::collect_doctor_checks(
                         operator_socket,
                         config_path,
+                        args.full,
                     ) {
                         Ok(value) => value,
                         Err(err) => {
@@ -4578,6 +4587,20 @@ mod tests {
             FacSubcommand::Doctor(args) => {
                 assert_eq!(args.pr, Some(615));
                 assert!(args.fix);
+                assert!(!args.full);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_full_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--full"])
+            .expect("doctor --full should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert!(args.full);
+                assert!(args.pr.is_none());
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
