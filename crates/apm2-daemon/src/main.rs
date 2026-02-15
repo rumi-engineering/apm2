@@ -69,7 +69,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use secrecy::ExposeSecret;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -1066,6 +1066,12 @@ async fn async_main(args: Args) -> Result<()> {
         daemon_config.session_socket_path
     );
 
+    // TCK-00600: Notify systemd that the daemon is ready.
+    // This must happen after socket bind so that clients can connect
+    // immediately after systemd considers the service started.
+    let _ = apm2_core::fac::sd_notify::notify_ready();
+    let _ = apm2_core::fac::sd_notify::notify_status("daemon ready, accepting connections");
+
     {
         let inner = state.read().await;
         info!("Managing {} processes", inner.supervisor.process_count());
@@ -1222,11 +1228,21 @@ async fn async_main(args: Args) -> Result<()> {
         .expect("default BrokerState is always valid");
         let mut health_checker = apm2_core::fac::BrokerHealthChecker::new();
         let boundary_id = boundary_id.clone();
+        // TCK-00600: Clone fac_root into the poller task so we can write
+        // broker_health.json after each health evaluation.
+        let fac_root_for_poller = fac_root.clone();
+        let daemon_start = std::time::Instant::now();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
+            // TCK-00600: Watchdog ticker sends WATCHDOG=1 to systemd at half
+            // the WatchdogSec interval. Runs in the same poller task because
+            // it already ticks every 10 seconds.
+            let mut watchdog = apm2_core::fac::sd_notify::WatchdogTicker::new();
             loop {
                 interval.tick().await;
+                // TCK-00600: Ping systemd watchdog if due.
+                watchdog.ping_if_due();
                 let events = orch.poll_timeouts().await;
                 if !events.is_empty() {
                     info!(
@@ -1372,6 +1388,61 @@ async fn async_main(args: Args) -> Result<()> {
                         "Admission health gate CLOSED by poller \
                          (INV-BRK-HEALTH-GATE-001)"
                     );
+                }
+
+                // TCK-00600: Write broker health IPC file after each health
+                // evaluation. This file is read by `apm2 fac services status`
+                // to report broker readiness and version independently of
+                // systemd unit state. Fail-open: a write failure is logged but
+                // does not affect the admission gate (INV-BHI-004).
+                let health_status_str = if gate_healthy { "healthy" } else { "unhealthy" };
+                let uptime_secs = daemon_start.elapsed().as_secs();
+                if let Err(e) = apm2_core::fac::broker_health_ipc::write_broker_health(
+                    &fac_root_for_poller,
+                    env!("CARGO_PKG_VERSION"),
+                    gate_healthy,
+                    uptime_secs,
+                    health_status_str,
+                    if gate_healthy {
+                        None
+                    } else {
+                        Some("admission health gate closed")
+                    },
+                ) {
+                    warn!(
+                        error = %e,
+                        "Failed to write broker health IPC file (non-fatal)"
+                    );
+                }
+
+                // TCK-00600: Read worker heartbeat and incorporate its
+                // staleness state into daemon health reporting. The worker
+                // writes `worker_heartbeat.json` after each poll cycle;
+                // the daemon reads it here to surface worker health
+                // alongside broker health. This is observability only —
+                // a stale or missing heartbeat does not affect the broker
+                // admission gate (INV-WHB-005).
+                let worker_hb =
+                    apm2_core::fac::worker_heartbeat::read_heartbeat(&fac_root_for_poller);
+                if worker_hb.found {
+                    if worker_hb.fresh {
+                        trace!(
+                            worker_pid = worker_hb.pid,
+                            worker_cycle_count = worker_hb.cycle_count,
+                            worker_age_secs = worker_hb.age_secs,
+                            worker_health = %worker_hb.health_status,
+                            "Worker heartbeat fresh"
+                        );
+                    } else {
+                        warn!(
+                            worker_pid = worker_hb.pid,
+                            worker_age_secs = worker_hb.age_secs,
+                            "Worker heartbeat stale (age > {}s)",
+                            apm2_core::fac::worker_heartbeat::MAX_HEARTBEAT_AGE_SECS
+                        );
+                    }
+                } else {
+                    debug!("Worker heartbeat file not found (worker may not be running)");
                 }
             }
         });
@@ -2187,6 +2258,9 @@ async fn async_main(args: Args) -> Result<()> {
     // remain in daemon state AND a pre-recorded PID set to guarantee
     // containment even for processes whose runner was dropped mid-stop.
     info!("Shutting down daemon...");
+
+    // TCK-00600: Notify systemd that the daemon is stopping.
+    let _ = apm2_core::fac::sd_notify::notify_stopping();
 
     // Record all tracked PIDs BEFORE the graceful phase so we can always
     // find orphans in the force-kill phase.

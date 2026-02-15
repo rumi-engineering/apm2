@@ -2,6 +2,8 @@
 # Install via: apm2 daemon install --enable-linger
 # The install command dynamically resolves ExecStart from the current binary.
 # This reference file uses %h/.cargo/bin/apm2 as the default cargo install path.
+# TCK-00600: Type=notify — daemon sends READY=1 after socket bind, WATCHDOG=1
+# periodically. systemd restarts if watchdog is not pinged within WatchdogSec.
 [Unit]
 Description=APM2 Daemon — Forge Admission Cycle
 After=network-online.target
@@ -9,7 +11,7 @@ Wants=network-online.target
 Requires=apm2-daemon.socket
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=%h/.cargo/bin/apm2 daemon --no-daemon
 ExecStop=%h/.cargo/bin/apm2 kill
 Restart=always

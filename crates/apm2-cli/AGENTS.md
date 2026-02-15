@@ -137,7 +137,19 @@ Credential management subcommands.
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
 | `apm2 fac lane reset <lane_id>` | Reset lane: delete workspace/target/logs, remove lease |
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
-| `apm2 fac services status` | Check daemon/worker service status |
+| `apm2 fac services status` | Check daemon/worker service status with health verdicts |
+
+**Services Status Enhancements (TCK-00600):**
+- Per-service `health` field: `healthy` / `degraded` / `unhealthy` (deterministic).
+- Per-service `watchdog_sec` field: configured WatchdogSec in seconds.
+- Overall `overall_health` field: worst-case across all services.
+- `worker_heartbeat` field: heartbeat file freshness, age, PID from worker.
+- Worker heartbeat read via `apm2_core::fac::worker_heartbeat::read_heartbeat`.
+
+**Worker Watchdog Integration (TCK-00600):**
+- Worker sends `READY=1` after broker connection via `sd_notify::notify_ready()`.
+- Worker sends periodic `WATCHDOG=1` via `WatchdogTicker::ping_if_due()`.
+- Worker writes heartbeat file each poll cycle via `write_heartbeat()`.
 
 **Invariants:**
 - [INV-LANE-001] At most one job executes in a lane at a time (enforced via `flock(LOCK_EX)`).
