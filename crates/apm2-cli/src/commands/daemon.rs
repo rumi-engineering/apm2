@@ -953,7 +953,7 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let current_uid = nix::unistd::getuid().as_raw();
+        let current_uid = nix::unistd::geteuid().as_raw();
         if root_meta.uid() != current_uid {
             return DaemonDoctorCheck {
                 name: "lane_safety".to_string(),
@@ -970,13 +970,13 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
             };
         }
         let mode = root_meta.mode() & 0o777;
-        if mode & 0o002 != 0 {
+        if mode & 0o077 != 0 {
             return DaemonDoctorCheck {
                 name: "lane_safety".to_string(),
                 status: "ERROR",
                 message: format!(
-                    "lane directory {} is world-writable (mode {:04o}). \
-                     Remediation: chmod o-w {}",
+                    "lane directory {} has unsafe permissions (mode {:04o}). \
+                     Remediation: chmod 0700 {}",
                     lanes_dir.display(),
                     mode,
                     lanes_dir.display()
@@ -999,22 +999,43 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
         },
     };
 
-    // MAJOR FIX: Sort directory entries by name before scanning to ensure
-    // deterministic classification under the MAX_LANE_SCAN cap. Without
-    // sorting, filesystem iteration order is non-deterministic, meaning
-    // whether a malicious symlink is detected depends on arbitrary ordering.
-    let mut sorted_entries: Vec<_> = entries.filter_map(std::result::Result::ok).collect();
+    // MAJOR FIX: Use a bounded vector collection to prevent memory DoS.
+    // If the number of entries exceeds MAX_LANE_SCAN, fail closed (ERROR)
+    // instead of truncating and warning. This prevents hiding malicious
+    // symlinks in a large directory.
+    let mut sorted_entries = Vec::with_capacity(MAX_LANE_SCAN);
+    for entry in entries {
+        match entry {
+            Ok(e) => {
+                sorted_entries.push(e);
+                if sorted_entries.len() > MAX_LANE_SCAN {
+                    return DaemonDoctorCheck {
+                        name: "lane_safety".to_string(),
+                        status: "ERROR",
+                        message: format!(
+                            "lane directory contains too many entries (> {MAX_LANE_SCAN}). \
+                             Security checks cannot run safely. Remediation: clean up old lanes"
+                        ),
+                    };
+                }
+            },
+            Err(e) => {
+                return DaemonDoctorCheck {
+                    name: "lane_safety".to_string(),
+                    status: "ERROR",
+                    message: format!("failed to read lane entry: {e}"),
+                };
+            },
+        }
+    }
+
+    // Sort for deterministic reporting
     sorted_entries.sort_by_key(std::fs::DirEntry::file_name);
 
-    let total_entries = sorted_entries.len();
-    let scan_incomplete = total_entries > MAX_LANE_SCAN;
-    let mut scanned = 0_usize;
     let mut symlink_found = false;
     let mut symlink_path = String::new();
 
-    for entry in sorted_entries.iter().take(MAX_LANE_SCAN) {
-        scanned = scanned.saturating_add(1);
-
+    for entry in sorted_entries {
         // Check if the entry is a symlink (TOCTOU defense)
         let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
             continue;
@@ -1029,7 +1050,7 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let current_uid = nix::unistd::getuid().as_raw();
+            let current_uid = nix::unistd::geteuid().as_raw();
             if metadata.uid() != current_uid {
                 return DaemonDoctorCheck {
                     name: "lane_safety".to_string(),
@@ -1047,13 +1068,13 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
             }
             if metadata.is_dir() {
                 let mode = metadata.mode() & 0o777;
-                if mode & 0o002 != 0 {
+                if mode & 0o077 != 0 {
                     return DaemonDoctorCheck {
                         name: "lane_safety".to_string(),
                         status: "ERROR",
                         message: format!(
-                            "lane entry {} is world-writable (mode {:04o}). \
-                             Remediation: chmod o-w {}",
+                            "lane entry {} has unsafe permissions (mode {:04o}). \
+                             Remediation: chmod 0700 {}",
                             entry.path().display(),
                             mode,
                             entry.path().display()
@@ -1073,22 +1094,11 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
                  Remediation: remove the symlink and recreate as a real directory"
             ),
         }
-    } else if scan_incomplete {
-        DaemonDoctorCheck {
-            name: "lane_safety".to_string(),
-            status: "WARN",
-            message: format!(
-                "lane directory scan incomplete: scanned {scanned} entries but more remain \
-                 (limit: {MAX_LANE_SCAN}). Not all entries were verified for symlinks or permissions"
-            ),
-        }
     } else {
         DaemonDoctorCheck {
             name: "lane_safety".to_string(),
             status: "OK",
-            message: format!(
-                "lane directory safe ({scanned} entries scanned, no symlinks, ownership and permissions OK)"
-            ),
+            message: "lane directory safe (no symlinks, ownership and permissions OK)".to_string(),
         }
     }
 }
@@ -1384,9 +1394,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lane_safety_detects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         let lanes_dir = temp.path().join("lanes");
         std::fs::create_dir_all(&lanes_dir).unwrap();
+        std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // Create a symlink inside the lanes directory
         let real_dir = temp.path().join("real_target");
@@ -1403,12 +1415,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lane_safety_ok_when_clean() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         let lanes_dir = temp.path().join("lanes");
         std::fs::create_dir_all(&lanes_dir).unwrap();
+        std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // Create a normal directory (not a symlink)
-        std::fs::create_dir(lanes_dir.join("lane-0")).unwrap();
+        let lane_path = lanes_dir.join("lane-0");
+        std::fs::create_dir(&lane_path).unwrap();
+        std::fs::set_permissions(&lane_path, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let result = check_lane_directory_safety_at(&lanes_dir);
         assert_eq!(result.status, "OK");
@@ -1432,10 +1448,11 @@ mod tests {
         assert!(result.message.contains("is a symlink"));
     }
 
-    /// TCK-00547 MAJOR-4: lane safety detects world-writable lane directories.
+    /// TCK-00547 MAJOR-4: lane safety detects unsafe permissions (group/world
+    /// writable).
     #[cfg(unix)]
     #[test]
-    fn lane_safety_detects_world_writable() {
+    fn lane_safety_detects_unsafe_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::TempDir::new().unwrap();
@@ -1447,25 +1464,30 @@ mod tests {
 
         let result = check_lane_directory_safety_at(&lanes_dir);
         assert_eq!(result.status, "ERROR");
-        assert!(result.message.contains("world-writable"));
+        assert!(result.message.contains("unsafe permissions"));
     }
 
-    /// TCK-00547 MAJOR-1: lane safety returns WARN when scan limit is reached.
+    /// TCK-00547 MAJOR-1: lane safety returns ERROR when scan limit is reached
+    /// (fail-closed).
     #[cfg(unix)]
     #[test]
-    fn lane_safety_warns_on_incomplete_scan() {
+    fn lane_safety_errors_on_too_many_entries() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         let lanes_dir = temp.path().join("lanes");
         std::fs::create_dir_all(&lanes_dir).unwrap();
+        std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        // Create MAX_LANE_SCAN + 1 entries to trigger incomplete scan
+        // Create MAX_LANE_SCAN + 1 entries to trigger overflow
         for i in 0..=MAX_LANE_SCAN {
-            std::fs::create_dir(lanes_dir.join(format!("lane-{i:04}"))).unwrap();
+            let path = lanes_dir.join(format!("lane-{i:04}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         let result = check_lane_directory_safety_at(&lanes_dir);
-        assert_eq!(result.status, "WARN");
-        assert!(result.message.contains("incomplete"));
+        assert_eq!(result.status, "ERROR");
+        assert!(result.message.contains("too many entries"));
     }
 
     /// TCK-00547 R2 MINOR (security): dangling symlink on lanes root is
@@ -1491,13 +1513,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lane_safety_deterministic_scan_order() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         let lanes_dir = temp.path().join("lanes");
         std::fs::create_dir_all(&lanes_dir).unwrap();
+        std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // Create entries that would come after the symlink in sorted order
         for i in 0..10 {
-            std::fs::create_dir(lanes_dir.join(format!("lane-{i:04}"))).unwrap();
+            let path = lanes_dir.join(format!("lane-{i:04}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         // Place a symlink with a name that sorts first (aaa-evil)
