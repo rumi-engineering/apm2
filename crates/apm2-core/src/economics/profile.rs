@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::determinism::canonicalize_json;
 use crate::events::Canonicalize;
 use crate::evidence::{CasError, ContentAddressedStore};
+use crate::fac::broker_rate_limits::ControlPlaneLimits;
 use crate::pcac::{BoundaryIntentClass, RiskTier};
 
 const PROFILE_SCHEMA: &str = "apm2.economics_constraint_profile.v1";
@@ -78,6 +79,12 @@ pub struct EconomicsProfile {
     pub input_state: EconomicsProfileInputState,
     /// Budget matrix keyed by `(RiskTier, BoundaryIntentClass)`.
     pub budget_matrix: BTreeMap<(RiskTier, BoundaryIntentClass), BudgetEntry>,
+    /// Control-plane rate limits (TCK-00568).
+    ///
+    /// CAS-addressed alongside other economics data so that distributed
+    /// quota configuration is hash-bound to the profile. When `None`,
+    /// the broker falls back to [`ControlPlaneLimits::default()`].
+    pub control_plane_limits: Option<ControlPlaneLimits>,
 }
 
 impl Canonicalize for EconomicsProfile {
@@ -149,6 +156,16 @@ pub enum EconomicsProfileError {
         /// Actual hash (hex-encoded).
         actual: String,
     },
+
+    /// Control-plane limits are invalid (TCK-00568).
+    ///
+    /// The `control_plane_limits` field contains values that exceed hard caps
+    /// or are otherwise invalid per `ControlPlaneLimits::validate()`.
+    #[error("invalid control-plane limits in economics profile: {detail}")]
+    InvalidControlPlaneLimits {
+        /// Detail about the validation failure.
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +176,10 @@ struct EconomicsProfileWire {
     lifecycle_cost_vector: LifecycleCostVector,
     input_state: EconomicsProfileInputState,
     budget_entries: Vec<BudgetCell>,
+    /// Control-plane rate limits (TCK-00568). Optional for backwards
+    /// compatibility with profiles serialized before TCK-00568.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_plane_limits: Option<ControlPlaneLimits>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +205,28 @@ impl EconomicsProfile {
             lifecycle_cost_vector,
             input_state,
             budget_matrix,
+            control_plane_limits: None,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Creates a validated economics profile with control-plane limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if profile validation fails.
+    pub fn with_control_plane_limits(
+        lifecycle_cost_vector: LifecycleCostVector,
+        input_state: EconomicsProfileInputState,
+        budget_matrix: BTreeMap<(RiskTier, BoundaryIntentClass), BudgetEntry>,
+        control_plane_limits: ControlPlaneLimits,
+    ) -> Result<Self, EconomicsProfileError> {
+        let profile = Self {
+            lifecycle_cost_vector,
+            input_state,
+            budget_matrix,
+            control_plane_limits: Some(control_plane_limits),
         };
         profile.validate()?;
         Ok(profile)
@@ -224,6 +267,7 @@ impl EconomicsProfile {
             },
             input_state: EconomicsProfileInputState::Current,
             budget_matrix,
+            control_plane_limits: Some(ControlPlaneLimits::default()),
         }
     }
 
@@ -378,6 +422,7 @@ impl EconomicsProfile {
             lifecycle_cost_vector: self.lifecycle_cost_vector,
             input_state: self.input_state,
             budget_entries,
+            control_plane_limits: self.control_plane_limits,
         }
     }
 
@@ -406,6 +451,7 @@ impl EconomicsProfile {
             lifecycle_cost_vector: wire.lifecycle_cost_vector,
             input_state: wire.input_state,
             budget_matrix,
+            control_plane_limits: wire.control_plane_limits,
         })
     }
 }
@@ -423,6 +469,16 @@ impl EconomicsProfileWire {
                 expected: PROFILE_SCHEMA_VERSION.to_string(),
                 actual: self.schema_version.clone(),
             });
+        }
+        // TCK-00568: Validate control-plane limits if present.
+        // Prevents CAS-addressed profiles from carrying over-cap values
+        // that would be silently rejected at runtime.
+        if let Some(ref limits) = self.control_plane_limits {
+            limits
+                .validate()
+                .map_err(|e| EconomicsProfileError::InvalidControlPlaneLimits {
+                    detail: e.to_string(),
+                })?;
         }
         Ok(())
     }
@@ -557,6 +613,7 @@ mod tests {
                 };
                 MAX_BUDGET_ENTRIES + 1
             ],
+            control_plane_limits: None,
         };
         let payload = serde_json::to_vec(&wire).expect("wire should serialize");
         let mut framed = Vec::from(ECONOMICS_PROFILE_HASH_DOMAIN);
@@ -569,5 +626,116 @@ mod tests {
             EconomicsProfileError::BudgetEntriesTooLarge { count, max }
                 if count == MAX_BUDGET_ENTRIES + 1 && max == MAX_BUDGET_ENTRIES
         ));
+    }
+
+    // TCK-00568: EconomicsProfile validation rejects invalid control-plane limits.
+    #[test]
+    fn with_control_plane_limits_rejects_over_cap_token_issuance() {
+        use crate::fac::broker_rate_limits::{ControlPlaneLimits, MAX_TOKEN_ISSUANCE_LIMIT};
+
+        let over_cap_limits = ControlPlaneLimits {
+            max_token_issuance: MAX_TOKEN_ISSUANCE_LIMIT + 1,
+            ..ControlPlaneLimits::default()
+        };
+        let matrix = BTreeMap::new();
+        let result = EconomicsProfile::with_control_plane_limits(
+            lifecycle_costs(),
+            EconomicsProfileInputState::Current,
+            matrix,
+            over_cap_limits,
+        );
+        let err = result.expect_err("over-cap token issuance should be rejected");
+        assert!(
+            matches!(err, EconomicsProfileError::InvalidControlPlaneLimits { .. }),
+            "expected InvalidControlPlaneLimits, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn with_control_plane_limits_rejects_over_cap_queue_bytes() {
+        use crate::fac::broker_rate_limits::{ControlPlaneLimits, MAX_QUEUE_BYTES_LIMIT};
+
+        let over_cap_limits = ControlPlaneLimits {
+            max_queue_bytes: MAX_QUEUE_BYTES_LIMIT + 1,
+            ..ControlPlaneLimits::default()
+        };
+        let matrix = BTreeMap::new();
+        let result = EconomicsProfile::with_control_plane_limits(
+            lifecycle_costs(),
+            EconomicsProfileInputState::Current,
+            matrix,
+            over_cap_limits,
+        );
+        let err = result.expect_err("over-cap queue bytes should be rejected");
+        assert!(
+            matches!(err, EconomicsProfileError::InvalidControlPlaneLimits { .. }),
+            "expected InvalidControlPlaneLimits, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn with_control_plane_limits_rejects_over_cap_bundle_export() {
+        use crate::fac::broker_rate_limits::{ControlPlaneLimits, MAX_BUNDLE_EXPORT_BYTES_LIMIT};
+
+        let over_cap_limits = ControlPlaneLimits {
+            max_bundle_export_bytes: MAX_BUNDLE_EXPORT_BYTES_LIMIT + 1,
+            ..ControlPlaneLimits::default()
+        };
+        let matrix = BTreeMap::new();
+        let result = EconomicsProfile::with_control_plane_limits(
+            lifecycle_costs(),
+            EconomicsProfileInputState::Current,
+            matrix,
+            over_cap_limits,
+        );
+        let err = result.expect_err("over-cap bundle export should be rejected");
+        assert!(
+            matches!(err, EconomicsProfileError::InvalidControlPlaneLimits { .. }),
+            "expected InvalidControlPlaneLimits, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_framed_bytes_rejects_over_cap_control_plane_limits() {
+        use crate::fac::broker_rate_limits::{ControlPlaneLimits, MAX_TOKEN_ISSUANCE_LIMIT};
+
+        let wire = EconomicsProfileWire {
+            schema: PROFILE_SCHEMA.to_string(),
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            lifecycle_cost_vector: lifecycle_costs(),
+            input_state: EconomicsProfileInputState::Current,
+            budget_entries: vec![],
+            control_plane_limits: Some(ControlPlaneLimits {
+                max_token_issuance: MAX_TOKEN_ISSUANCE_LIMIT + 1,
+                ..ControlPlaneLimits::default()
+            }),
+        };
+        let payload = serde_json::to_vec(&wire).expect("wire should serialize");
+        let mut framed = Vec::from(ECONOMICS_PROFILE_HASH_DOMAIN);
+        framed.extend_from_slice(&payload);
+
+        let err = EconomicsProfile::from_framed_bytes(&framed)
+            .expect_err("over-cap limits in wire should be rejected at decode");
+        assert!(
+            matches!(err, EconomicsProfileError::InvalidControlPlaneLimits { .. }),
+            "expected InvalidControlPlaneLimits, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn valid_control_plane_limits_accepted_in_profile() {
+        use crate::fac::broker_rate_limits::ControlPlaneLimits;
+
+        let matrix = BTreeMap::new();
+        let result = EconomicsProfile::with_control_plane_limits(
+            lifecycle_costs(),
+            EconomicsProfileInputState::Current,
+            matrix,
+            ControlPlaneLimits::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "default control-plane limits should be valid"
+        );
     }
 }

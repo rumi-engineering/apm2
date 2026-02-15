@@ -93,6 +93,7 @@ mod artifact_manifest;
 pub mod blob_store;
 pub mod broker;
 pub mod broker_health;
+pub mod broker_rate_limits;
 pub mod builtin_profiles;
 pub mod builtin_roles;
 mod canonicalizer_tuple;
@@ -206,6 +207,14 @@ pub use broker_health::{
     MAX_HEALTH_FINDINGS, MAX_HEALTH_HISTORY, MAX_HEALTH_REQUIRED_AUTHORITY_SETS,
     WorkerHealthGateError, WorkerHealthPolicy, compute_eval_window_hash,
     evaluate_worker_health_gate,
+};
+// Re-export broker rate limits types (TCK-00568)
+pub use broker_rate_limits::{
+    ControlPlaneBudget, ControlPlaneBudgetError, ControlPlaneDenialReceipt, ControlPlaneDimension,
+    ControlPlaneLimits, DENY_REASON_BUNDLE_EXPORT_BYTES_EXCEEDED, DENY_REASON_COUNTER_OVERFLOW,
+    DENY_REASON_QUEUE_BYTES_EXCEEDED, DENY_REASON_QUEUE_ENQUEUE_RATE_EXCEEDED,
+    DENY_REASON_TOKEN_ISSUANCE_EXCEEDED, MAX_BUNDLE_EXPORT_BYTES_LIMIT, MAX_QUEUE_BYTES_LIMIT,
+    MAX_QUEUE_ENQUEUE_LIMIT, MAX_TOKEN_ISSUANCE_LIMIT,
 };
 // Re-export builtin profile types (TCK-00329)
 pub use builtin_profiles::{
