@@ -1274,6 +1274,57 @@ pre-populating build caches in the lane target namespace.
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
 
+## reconcile Submodule (TCK-00534)
+
+The `reconcile` submodule implements crash recovery reconciliation for FAC queue
+and lane state. After an unclean shutdown (crash, SIGKILL, OOM-kill), the queue
+and lane state can become inconsistent. This module detects and repairs
+inconsistencies deterministically on worker startup.
+
+### Key Types
+
+- `ReconcileError`: Error taxonomy covering lane errors, I/O failures, bounded
+  collection overflow, and serialization errors.
+- `OrphanedJobPolicy`: Policy enum for handling claimed jobs without a running
+  lane (`Requeue` or `MarkFailed`). Default is `Requeue`.
+- `LaneRecoveryAction`: Per-lane action taken during reconciliation
+  (`StaleLeaseCleared`, `AlreadyConsistent`, `MarkedCorrupt`).
+- `QueueRecoveryAction`: Per-job action taken during queue reconciliation
+  (`Requeued`, `MarkedFailed`, `StillActive`).
+- `ReconcileReceiptV1`: Structured receipt emitted after each reconciliation
+  pass, persisted to `$APM2_HOME/private/fac/receipts/reconcile/` for
+  auditability.
+
+### Core Capabilities
+
+- `reconcile_on_startup(fac_root, queue_root, orphan_policy, dry_run)`: Main
+  entry point. Runs two-phase recovery:
+  1. **Lane reconciliation** (`reconcile_lanes`): Scans all lanes for stale
+     leases (PID dead + lock not held). Stale leases are removed to return lanes
+     to IDLE. Ambiguous PID state (EPERM) triggers CORRUPT marking (fail-closed).
+  2. **Queue reconciliation** (`reconcile_queue`): Scans `queue/claimed/` for
+     orphaned jobs not backed by any active lane. Applies configured policy
+     (requeue to `pending/` or mark failed to `denied/`).
+- Dry-run mode: report what would be done without mutating state.
+- Idempotent: running reconciliation multiple times produces correct results.
+- Called automatically on worker startup with `OrphanedJobPolicy::Requeue`.
+- CLI: `apm2 fac reconcile --dry-run|--apply [--orphan-policy requeue|mark-failed]`.
+
+### Security Invariants (TCK-00534)
+
+- [INV-RECON-001] No job is silently dropped; all outcomes recorded as receipts.
+- [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
+  (EPERM) marks lane CORRUPT (not recovered).
+- [INV-RECON-003] All in-memory collections are bounded by hard `MAX_*`
+  constants (`MAX_LANE_RECOVERY_ACTIONS=64`,
+  `MAX_QUEUE_RECOVERY_ACTIONS=4096`).
+- [INV-RECON-004] Reconciliation is idempotent and safe to call on every
+  startup.
+- [INV-RECON-005] Queue reads are bounded (`MAX_CLAIMED_SCAN_ENTRIES=4096`).
+- CTR-2501 deviation: `current_timestamp_rfc3339()` and `wall_clock_nanos()`
+  use wall-clock time for receipt timestamps and file deduplication suffixes.
+  Documented inline with security justification.
+
 ## Control-Lane Exception (TCK-00533)
 
 `stop_revoke` jobs bypass the standard RFC-0028 channel context token and

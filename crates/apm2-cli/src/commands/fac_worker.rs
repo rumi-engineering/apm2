@@ -518,6 +518,62 @@ pub fn run_fac_worker(
 
     let verifying_key = broker.verifying_key();
 
+    // TCK-00534: Crash recovery — reconcile queue/claimed and lane leases on
+    // worker startup. Detects stale leases (PID dead, lock released) and
+    // orphaned claimed jobs, then recovers them deterministically with receipts.
+    {
+        let _ = apm2_core::fac::sd_notify::notify_status("reconciling queue and lane state");
+        match apm2_core::fac::reconcile_on_startup(
+            &fac_root,
+            &queue_root,
+            apm2_core::fac::OrphanedJobPolicy::Requeue,
+            false, // apply mutations
+        ) {
+            Ok(receipt) => {
+                let recovered = receipt.stale_leases_recovered
+                    + receipt.orphaned_jobs_requeued
+                    + receipt.orphaned_jobs_failed;
+                if json_output {
+                    emit_worker_event(
+                        "reconcile_complete",
+                        serde_json::json!({
+                            "schema": receipt.schema,
+                            "lanes_inspected": receipt.lanes_inspected,
+                            "stale_leases_recovered": receipt.stale_leases_recovered,
+                            "orphaned_jobs_requeued": receipt.orphaned_jobs_requeued,
+                            "orphaned_jobs_failed": receipt.orphaned_jobs_failed,
+                            "lanes_marked_corrupt": receipt.lanes_marked_corrupt,
+                            "claimed_files_inspected": receipt.claimed_files_inspected,
+                        }),
+                    );
+                } else if recovered > 0 {
+                    eprintln!(
+                        "INFO: reconciliation recovered {} items \
+                         (stale_leases={}, requeued={}, failed={}, corrupt={})",
+                        recovered,
+                        receipt.stale_leases_recovered,
+                        receipt.orphaned_jobs_requeued,
+                        receipt.orphaned_jobs_failed,
+                        receipt.lanes_marked_corrupt,
+                    );
+                }
+            },
+            Err(e) => {
+                // Reconciliation errors are non-fatal — the worker can still
+                // process new jobs even if recovery fails. Log the error but
+                // continue startup.
+                if json_output {
+                    emit_worker_event(
+                        "reconcile_error",
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                } else {
+                    eprintln!("WARNING: reconciliation failed: {e}");
+                }
+            },
+        }
+    }
+
     let mut total_processed: u64 = 0;
     let mut cycle_count: u64 = 0;
     let mut summary = WorkerSummary {

@@ -273,6 +273,11 @@ pub enum FacSubcommand {
     /// Import validates RFC-0028 channel boundary and RFC-0029 economics
     /// receipts, rejecting bundles that fail either check (fail-closed).
     Bundle(BundleArgs),
+    /// Reconcile queue and lane state after crash or unclean shutdown.
+    ///
+    /// Detects stale lane leases (PID dead, lock released), orphaned claimed
+    /// jobs, and recovers them deterministically. All actions emit receipts.
+    Reconcile(ReconcileArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -718,6 +723,26 @@ pub struct LaneResetArgs {
     /// Force reset even if lane is RUNNING. Kills the lane's process first.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac reconcile`.
+#[derive(Debug, Args)]
+pub struct ReconcileArgs {
+    /// Report what would be done without mutating state.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Apply all recovery mutations.
+    #[arg(long, default_value_t = false)]
+    pub apply: bool,
+
+    /// Policy for orphaned claimed jobs: "requeue" (default) or "mark-failed".
+    #[arg(long, default_value = "requeue")]
+    pub orphan_policy: String,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -1955,6 +1980,7 @@ pub fn run_fac(
             | FacSubcommand::Warm(_)
             | FacSubcommand::Bench(_)
             | FacSubcommand::Bundle(_)
+            | FacSubcommand::Reconcile(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2441,6 +2467,98 @@ pub fn run_fac(
                 run_bundle_import(import_args, resolve_json(import_args.json))
             },
         },
+        FacSubcommand::Reconcile(args) => run_reconcile(args, resolve_json(args.json)),
+    }
+}
+
+/// Execute `apm2 fac reconcile`.
+fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
+    use apm2_core::fac::{OrphanedJobPolicy, reconcile_on_startup};
+    use apm2_core::github::resolve_apm2_home;
+
+    let Some(home) = resolve_apm2_home() else {
+        if json_output {
+            println!("{{\"error\": \"cannot resolve APM2 home\"}}");
+        } else {
+            eprintln!("ERROR: cannot resolve APM2 home directory");
+        }
+        return crate::exit_codes::codes::GENERIC_ERROR;
+    };
+    let fac_root = home.join("private").join("fac");
+    let queue_root = home.join("queue");
+
+    // Parse orphan policy.
+    let orphan_policy = match args.orphan_policy.as_str() {
+        "requeue" => OrphanedJobPolicy::Requeue,
+        "mark-failed" => OrphanedJobPolicy::MarkFailed,
+        other => {
+            if json_output {
+                println!(
+                    "{{\"error\": \"invalid orphan-policy: {other}, expected requeue or mark-failed\"}}"
+                );
+            } else {
+                eprintln!(
+                    "ERROR: invalid --orphan-policy '{other}', expected 'requeue' or 'mark-failed'"
+                );
+            }
+            return crate::exit_codes::codes::GENERIC_ERROR;
+        },
+    };
+
+    // Determine mode: --dry-run takes priority; without flags, default to dry-run.
+    let dry_run = !args.apply;
+
+    if !dry_run && args.dry_run {
+        // Contradiction: both --dry-run and --apply specified.
+        if json_output {
+            println!("{{\"error\": \"cannot specify both --dry-run and --apply\"}}");
+        } else {
+            eprintln!("ERROR: cannot specify both --dry-run and --apply");
+        }
+        return crate::exit_codes::codes::GENERIC_ERROR;
+    }
+
+    match reconcile_on_startup(&fac_root, &queue_root, orphan_policy, dry_run) {
+        Ok(receipt) => {
+            if json_output {
+                if let Ok(json) = serde_json::to_string_pretty(&receipt) {
+                    println!("{json}");
+                }
+            } else {
+                let mode = if dry_run { "DRY RUN" } else { "APPLIED" };
+                println!("Reconciliation complete ({mode}):");
+                println!("  Lanes inspected:          {}", receipt.lanes_inspected);
+                println!(
+                    "  Stale leases recovered:   {}",
+                    receipt.stale_leases_recovered
+                );
+                println!(
+                    "  Claimed files inspected:  {}",
+                    receipt.claimed_files_inspected
+                );
+                println!(
+                    "  Orphaned jobs requeued:    {}",
+                    receipt.orphaned_jobs_requeued
+                );
+                println!(
+                    "  Orphaned jobs failed:      {}",
+                    receipt.orphaned_jobs_failed
+                );
+                println!(
+                    "  Lanes marked corrupt:      {}",
+                    receipt.lanes_marked_corrupt
+                );
+            }
+            0
+        },
+        Err(e) => {
+            if json_output {
+                println!("{{\"error\": \"{e}\"}}");
+            } else {
+                eprintln!("ERROR: reconciliation failed: {e}");
+            }
+            crate::exit_codes::codes::GENERIC_ERROR
+        },
     }
 }
 
@@ -2471,7 +2589,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Verify(_)
         | FacSubcommand::Warm(_)
         | FacSubcommand::Bench(_)
-        | FacSubcommand::Bundle(_) => true,
+        | FacSubcommand::Bundle(_)
+        | FacSubcommand::Reconcile(_) => true,
     }
 }
 
