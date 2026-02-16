@@ -3446,6 +3446,18 @@ fn execute_warm_job(
     if let Err(e) = std::fs::create_dir_all(&cargo_home) {
         let reason = format!("cannot create lane CARGO_HOME: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
+        let moved_path = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
         let _ = emit_job_receipt(
             fac_root,
             spec,
@@ -3457,7 +3469,7 @@ fn execute_warm_job(
             budget_trace,
             patch_digest,
             Some(canonicalizer_tuple_digest),
-            None,
+            moved_path.as_deref(),
             policy_hash,
             containment_trace,
         );
@@ -3466,6 +3478,18 @@ fn execute_warm_job(
     if let Err(e) = std::fs::create_dir_all(&cargo_target_dir) {
         let reason = format!("cannot create lane CARGO_TARGET_DIR: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
+        let moved_path = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
         let _ = emit_job_receipt(
             fac_root,
             spec,
@@ -3477,7 +3501,7 @@ fn execute_warm_job(
             budget_trace,
             patch_digest,
             Some(canonicalizer_tuple_digest),
-            None,
+            moved_path.as_deref(),
             policy_hash,
             containment_trace,
         );

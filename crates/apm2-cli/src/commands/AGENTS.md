@@ -228,3 +228,19 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 - **Process liveness** (`fac_worker.rs`): Stale lease detection uses `libc::kill(pid, 0)` with
   errno discrimination (ESRCH vs EPERM) instead of shell `kill -0` with `status.success()`.
   EPERM means the process exists but is unpermissioned; the lane is marked corrupt, not idle.
+
+## Warm Command Invariants (Updated for TCK-00525)
+
+- **Lane encoding** (`fac_warm.rs`): The `--lane` flag value is validated using the same
+  character set the worker enforces (`[A-Za-z0-9_-]`), length-checked against
+  `MAX_QUEUE_LANE_LENGTH`, and encoded in the job spec's `queue_lane` field. Defaults to
+  `"bulk"` when omitted. The worker uses `queue_lane` for lane scheduling admission.
+- **Deterministic denial queue move** (`fac_worker.rs`): All warm job denial paths in
+  `execute_warm_job` (CARGO_HOME/CARGO_TARGET_DIR creation failure, phase validation failure,
+  and warm execution failure) move the claimed file to `denied/` via `move_to_dir_safe`
+  and report `moved_job_path` in the denial receipt. No denial returns without a terminal
+  queue state transition.
+- **Timeout-derived poll cap** (`fac_warm.rs`): The poll iteration cap in `wait_for_receipt`
+  is derived from the effective timeout (`timeout / poll_interval + headroom`), not a fixed
+  constant. Callers passing `--wait-timeout-secs` above the default (1200s) are no longer
+  cut short by the iteration cap.
