@@ -817,7 +817,19 @@ struct PipelineTestCommand {
     env_remove_keys: Vec<String>,
 }
 
-fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestCommand, String> {
+/// Build the pipeline test command with policy-filtered environment.
+///
+/// # Arguments
+///
+/// * `workspace_root` - The workspace root directory.
+/// * `lane_dir` - The lane directory from the actually-locked lane (returned by
+///   `allocate_lane_job_logs_dir`). This MUST correspond to the lane protected
+///   by the caller's `LaneLockGuard` to maintain lock/env coupling and prevent
+///   concurrent access races.
+fn build_pipeline_test_command(
+    workspace_root: &Path,
+    lane_dir: &Path,
+) -> Result<PipelineTestCommand, String> {
     let memory_max_bytes = parse_memory_limit(DEFAULT_TEST_MEMORY_MAX)?;
     if memory_max_bytes > max_memory_bytes() {
         return Err(format!(
@@ -839,9 +851,21 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
         ensure_pipeline_managed_cargo_home(&cargo_home)?;
     }
 
+    // Derive the lane_id from the lane_dir for the lane profile. The
+    // lane_id is the final path component (e.g., "lane-00", "lane-01").
+    let lane_id = lane_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "cannot extract lane_id from lane_dir: {}",
+                lane_dir.display()
+            )
+        })?;
+
     let timeout_decision =
         resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
-    let profile = LaneProfileV1::new("lane-00", "b3-256:fac-review", "boundary-00")
+    let profile = LaneProfileV1::new(lane_id, "b3-256:fac-review", "boundary-00")
         .map_err(|err| format!("failed to construct FAC pipeline lane profile: {err}"))?;
     let lane_env = compute_test_env(&profile);
 
@@ -850,11 +874,11 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
     // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
-    // XDG_CONFIG_HOME). For pipeline/evidence path, use the synthetic lane-00
-    // directory under $APM2_HOME/private/fac/lanes/lane-00.
-    let lane_dir = fac_root.join("lanes/lane-00");
-    ensure_lane_env_dirs(&lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, &lane_dir);
+    // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
+    // to maintain lock/env coupling (round 2 fix: was previously hardcoded
+    // to lane-00).
+    ensure_lane_env_dirs(lane_dir)?;
+    apply_lane_env_overrides(&mut policy_env, lane_dir);
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
@@ -916,7 +940,14 @@ fn resolve_evidence_env_remove_keys(opts: Option<&EvidenceGateOptions>) -> Optio
 /// `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`) so every FAC gate phase runs with
 /// deterministic lane-local values, preventing writes to ambient user
 /// locations.
-fn build_gate_policy_env() -> Result<Vec<(String, String)>, String> {
+///
+/// # Arguments
+///
+/// * `lane_dir` - The lane directory from the actually-locked lane (returned by
+///   `allocate_lane_job_logs_dir`). This MUST correspond to the lane protected
+///   by the caller's `LaneLockGuard` to maintain lock/env coupling and prevent
+///   concurrent access races (e.g., with `apm2 fac lane reset`).
+fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, String> {
     let apm2_home = apm2_core::github::resolve_apm2_home()
         .ok_or_else(|| "cannot resolve APM2_HOME for gate env policy enforcement".to_string())?;
     let fac_root = apm2_home.join("private/fac");
@@ -930,11 +961,10 @@ fn build_gate_policy_env() -> Result<Vec<(String, String)>, String> {
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
     // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
-    // Uses the synthetic lane-00 directory under
-    // $APM2_HOME/private/fac/lanes/lane-00.
-    let lane_dir = fac_root.join("lanes/lane-00");
-    ensure_lane_env_dirs(&lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, &lane_dir);
+    // Uses the lane directory from the actually-locked lane to maintain
+    // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
+    ensure_lane_env_dirs(lane_dir)?;
+    apply_lane_env_overrides(&mut policy_env, lane_dir);
 
     Ok(policy_env.into_iter().collect())
 }
@@ -951,7 +981,28 @@ fn ensure_pipeline_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
 
-fn allocate_lane_job_logs_dir() -> Result<(PathBuf, LaneLockGuard), String> {
+/// Result of lane allocation: logs directory, the lane's root directory,
+/// and the lock guard that must be held for the lifetime of the job.
+struct AllocatedLane {
+    /// Path to the job-specific logs directory within the lane.
+    logs_dir: PathBuf,
+    /// Path to the lane's root directory
+    /// (`$APM2_HOME/private/fac/lanes/<lane_id>`). Used to derive per-lane
+    /// env isolation directories (`HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
+    /// `XDG_CONFIG_HOME`) via `ensure_lane_env_dirs` +
+    /// `apply_lane_env_overrides`.
+    ///
+    /// SAFETY: This `lane_dir` corresponds to the lane protected by
+    /// `_lane_guard`. Callers MUST use this `lane_dir` (not a hardcoded
+    /// `lane-00`) for env overrides to maintain lock/env coupling.
+    lane_dir: PathBuf,
+    /// Exclusive lock guard for the allocated lane. Must be held for the
+    /// entire duration of lane usage to prevent concurrent access (e.g.,
+    /// `apm2 fac lane reset` racing with env dir creation).
+    _lane_guard: LaneLockGuard,
+}
+
+fn allocate_lane_job_logs_dir() -> Result<AllocatedLane, String> {
     let lane_manager = LaneManager::from_default_home()
         .map_err(|err| format!("failed to resolve lane manager: {err}"))?;
     lane_manager
@@ -963,11 +1014,16 @@ fn allocate_lane_job_logs_dir() -> Result<(PathBuf, LaneLockGuard), String> {
     for lane_id in LaneManager::default_lane_ids() {
         match lane_manager.try_lock(&lane_id) {
             Ok(Some(guard)) => {
-                let logs_dir = lane_manager.lane_dir(&lane_id).join("logs").join(&job_id);
+                let lane_dir = lane_manager.lane_dir(&lane_id);
+                let logs_dir = lane_dir.join("logs").join(&job_id);
                 crate::commands::fac_permissions::ensure_dir_with_mode(&logs_dir).map_err(
                     |err| format!("failed to create job log dir {}: {err}", logs_dir.display()),
                 )?;
-                return Ok((logs_dir, guard));
+                return Ok(AllocatedLane {
+                    logs_dir,
+                    lane_dir,
+                    _lane_guard: guard,
+                });
             },
             Ok(None) => {},
             Err(err) => {
@@ -1128,12 +1184,15 @@ pub fn run_evidence_gates(
     opts: Option<&EvidenceGateOptions>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let emit_human_logs = opts.is_none_or(|o| o.emit_human_logs);
-    let (logs_dir, _lane_guard) = allocate_lane_job_logs_dir()?;
+    let allocated = allocate_lane_job_logs_dir()?;
+    let logs_dir = allocated.logs_dir;
 
     // TCK-00526: Build policy-filtered environment for ALL gates (not just
     // the test gate). This enforces default-deny on fmt, clippy, doc, and
     // script gates, preventing ambient secret leakage.
-    let gate_env = build_gate_policy_env()?;
+    // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
+    // (not hardcoded lane-00) to maintain lock/env coupling.
+    let gate_env = build_gate_policy_env(&allocated.lane_dir)?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // build_job_environment already strips these at the policy level, but
@@ -1461,10 +1520,13 @@ pub fn run_evidence_gates_with_status(
     emit_human_logs: bool,
     on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
-    let (logs_dir, _lane_guard) = allocate_lane_job_logs_dir()?;
+    let allocated = allocate_lane_job_logs_dir()?;
+    let logs_dir = allocated.logs_dir;
 
     // TCK-00526: Build policy-filtered environment for ALL gates.
-    let gate_env = build_gate_policy_env()?;
+    // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
+    // (not hardcoded lane-00) to maintain lock/env coupling.
+    let gate_env = build_gate_policy_env(&allocated.lane_dir)?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // Pass the policy-filtered environment so policy-introduced SCCACHE_*
@@ -1482,7 +1544,7 @@ pub fn run_evidence_gates_with_status(
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
-    let pipeline_test_command = build_pipeline_test_command(workspace_root)?;
+    let pipeline_test_command = build_pipeline_test_command(workspace_root, &allocated.lane_dir)?;
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,
@@ -2951,7 +3013,9 @@ mod tests {
     #[test]
     fn pipeline_test_command_uses_rust_bounded_runner_or_surfaces_preflight_error() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        match build_pipeline_test_command(temp_dir.path()) {
+        let lane_dir = temp_dir.path().join("lane-test");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+        match build_pipeline_test_command(temp_dir.path(), &lane_dir) {
             Ok(command) => {
                 let joined = command.command.join(" ");
                 assert!(joined.contains("systemd-run"));
@@ -2976,7 +3040,9 @@ mod tests {
         // env_remove_keys from bounded_spec so the pipeline/restart path
         // strips sccache env vars.
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        if let Ok(command) = build_pipeline_test_command(temp_dir.path()) {
+        let lane_dir = temp_dir.path().join("lane-test");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+        if let Ok(command) = build_pipeline_test_command(temp_dir.path(), &lane_dir) {
             // The bounded test runner always strips at least RUSTC_WRAPPER.
             assert!(
                 command

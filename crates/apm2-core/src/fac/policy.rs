@@ -586,16 +586,30 @@ pub fn ensure_lane_env_dirs(lane_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify that an existing lane environment directory has restrictive
-/// permissions (0o700), is owned by the current user (CTR-2611), and is
-/// not a symlink (INV-LANE-ENV-001).
+/// Verify that a directory has restrictive permissions (0o700), is owned
+/// by the current user (CTR-2611), and is not a symlink
+/// (INV-LANE-ENV-001).
 ///
 /// Uses `symlink_metadata` instead of `metadata` to avoid following
 /// symlinks. An attacker could plant a symlink (e.g., `home` -> `~/.ssh`)
-/// in the lane directory; `metadata` would follow it and report the
-/// target's attributes, bypassing isolation.
+/// to escape isolation; `metadata` would follow it and report the
+/// target's attributes, bypassing the check.
+///
+/// `context` is a human-readable label for error messages (e.g.,
+/// "lane env dir", "managed `CARGO_HOME`") to identify the purpose of the
+/// directory being verified.
+///
+/// This is the shared implementation backing both
+/// `verify_lane_env_dir_permissions` and `verify_cargo_home_permissions`
+/// (TCK-00575 round 2 NIT: deduplicated permission verification).
+///
+/// # Errors
+///
+/// Returns a human-readable error when the path is a symlink, is not a
+/// directory, is owned by a different user, or has group/other-accessible
+/// permissions (mode bits beyond 0o700).
 #[cfg(unix)]
-fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
+pub fn verify_dir_permissions(dir_path: &Path, context: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     use subtle::ConstantTimeEq;
@@ -603,13 +617,13 @@ fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
     // SAFETY: symlink_metadata does NOT follow symlinks, so we detect
     // symlinks at the path itself rather than their targets.
     let metadata = std::fs::symlink_metadata(dir_path)
-        .map_err(|e| format!("cannot stat lane env dir at {}: {e}", dir_path.display()))?;
+        .map_err(|e| format!("cannot stat {context} at {}: {e}", dir_path.display()))?;
 
     // Reject symlinks explicitly — an attacker could create a symlink
     // pointing to a sensitive directory (e.g., ~/.ssh) to escape isolation.
     if metadata.file_type().is_symlink() {
         return Err(format!(
-            "lane env path at {} is a symlink; refusing to follow — \
+            "{context} at {} is a symlink; refusing to follow — \
              this may indicate an isolation escape attempt",
             dir_path.display()
         ));
@@ -617,7 +631,7 @@ fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
 
     if !metadata.is_dir() {
         return Err(format!(
-            "lane env path at {} is not a directory",
+            "{context} at {} is not a directory",
             dir_path.display()
         ));
     }
@@ -631,7 +645,7 @@ fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
         .into();
     if !uid_matches {
         return Err(format!(
-            "lane env dir at {} is owned by uid {} but current user is uid {}; \
+            "{context} at {} is owned by uid {} but current user is uid {}; \
              refusing to use a directory owned by another user",
             dir_path.display(),
             metadata.uid(),
@@ -642,7 +656,7 @@ fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
     let mode = metadata.mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(format!(
-            "lane env dir at {} has too-permissive mode {:#05o} \
+            "{context} at {} has too-permissive mode {:#05o} \
              (group/other access detected); expected 0o700. \
              Fix with: chmod 700 {}",
             dir_path.display(),
@@ -652,6 +666,17 @@ fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Verify that an existing lane environment directory has restrictive
+/// permissions (0o700), is owned by the current user (CTR-2611), and is
+/// not a symlink (INV-LANE-ENV-001).
+///
+/// Delegates to [`verify_dir_permissions`] with a "lane env dir" context
+/// label.
+#[cfg(unix)]
+fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
+    verify_dir_permissions(dir_path, "lane env dir")
 }
 
 /// Computes the deterministic policy hash using domain-separated BLAKE3.

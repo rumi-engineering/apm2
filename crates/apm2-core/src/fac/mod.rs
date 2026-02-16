@@ -318,6 +318,8 @@ pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
 };
+#[cfg(unix)]
+pub use policy::verify_dir_permissions;
 pub use policy::{
     EnvSetEntry, FacPolicyError, FacPolicyV1, LANE_ENV_DIR_HOME, LANE_ENV_DIR_TMP,
     LANE_ENV_DIR_XDG_CACHE, LANE_ENV_DIR_XDG_CONFIG, LANE_ENV_DIRS, POLICY_SCHEMA_ID,
