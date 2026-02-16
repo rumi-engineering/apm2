@@ -324,7 +324,14 @@ pub struct SystemdUnitProperties {
 }
 
 impl SystemdUnitProperties {
-    /// Build properties from lane profile and job constraints.
+    /// Build properties from lane profile, job constraints, and an explicit
+    /// sandbox hardening profile (from policy).
+    ///
+    /// This is the ONLY public constructor for `SystemdUnitProperties`.
+    /// Production code MUST supply the policy-driven hardening profile
+    /// (INV-SBX-001). Using `SandboxHardeningProfile::default()` directly
+    /// is prohibited in production paths — the profile must come from
+    /// `FacPolicyV1.sandbox_hardening`.
     ///
     /// Job constraints override lane defaults using MIN semantics:
     /// - `memory_max_bytes` = min(`profile.memory_max_bytes`,
@@ -332,9 +339,10 @@ impl SystemdUnitProperties {
     /// - `timeout_start_sec` = min(`profile.test_timeout_seconds`,
     ///   `constraints.test_timeout_seconds`)
     #[must_use]
-    pub fn from_lane_profile(
+    pub fn from_lane_profile_with_hardening(
         profile: &LaneProfileV1,
         job_constraints: Option<&JobConstraints>,
+        hardening: SandboxHardeningProfile,
     ) -> Self {
         let resource_profile = &profile.resource_profile;
         let timeouts = &profile.timeouts;
@@ -359,21 +367,8 @@ impl SystemdUnitProperties {
             timeout_start_sec,
             runtime_max_sec: timeouts.job_runtime_max_seconds,
             kill_mode: "control-group".to_string(),
-            sandbox_hardening: SandboxHardeningProfile::default(),
+            sandbox_hardening: hardening,
         }
-    }
-
-    /// Build properties from lane profile, job constraints, and an explicit
-    /// sandbox hardening profile (from policy).
-    #[must_use]
-    pub fn from_lane_profile_with_hardening(
-        profile: &LaneProfileV1,
-        job_constraints: Option<&JobConstraints>,
-        hardening: SandboxHardeningProfile,
-    ) -> Self {
-        let mut props = Self::from_lane_profile(profile, job_constraints);
-        props.sandbox_hardening = hardening;
-        props
     }
 
     /// Render properties as `[Service]` directives.
@@ -429,10 +424,14 @@ mod tests {
     use crate::fac::lane::{LanePolicy, LaneTimeouts, ResourceProfile};
 
     #[test]
-    fn from_lane_profile_uses_lane_defaults_without_overrides() {
+    fn from_lane_profile_with_hardening_uses_lane_defaults_without_overrides() {
         let profile =
             LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
-        let properties = SystemdUnitProperties::from_lane_profile(&profile, None);
+        let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+        );
 
         assert_eq!(properties.cpu_quota_percent, 200);
         assert_eq!(properties.memory_max_bytes, 51_539_607_552);
@@ -441,7 +440,7 @@ mod tests {
         assert_eq!(properties.timeout_start_sec, 600);
         assert_eq!(properties.runtime_max_sec, 1800);
         assert_eq!(properties.kill_mode, "control-group");
-        // Default hardening profile is applied.
+        // Hardening profile is applied from explicit parameter (INV-SBX-001).
         assert_eq!(
             properties.sandbox_hardening,
             SandboxHardeningProfile::default()
@@ -460,7 +459,11 @@ mod tests {
             memory_max_bytes: Some(1_000),
             test_timeout_seconds: Some(120),
         };
-        let properties = SystemdUnitProperties::from_lane_profile(&profile, Some(&constraints));
+        let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            Some(&constraints),
+            SandboxHardeningProfile::default(),
+        );
 
         assert_eq!(properties.memory_max_bytes, 1_000);
         assert_eq!(properties.timeout_start_sec, 120);
@@ -470,8 +473,11 @@ mod tests {
             memory_max_bytes: Some(20_000),
             test_timeout_seconds: Some(600),
         };
-        let constrained_properties =
-            SystemdUnitProperties::from_lane_profile(&profile, Some(&loose_constraints));
+        let constrained_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            Some(&loose_constraints),
+            SandboxHardeningProfile::default(),
+        );
 
         assert_eq!(constrained_properties.memory_max_bytes, 10_000);
         assert_eq!(constrained_properties.timeout_start_sec, 600);
@@ -481,7 +487,11 @@ mod tests {
     fn to_unit_directives_includes_hardening() {
         let profile =
             LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
-        let properties = SystemdUnitProperties::from_lane_profile(&profile, None);
+        let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+        );
 
         let directives = properties.to_unit_directives();
         // Resource directives.
@@ -506,7 +516,11 @@ mod tests {
     fn to_dbus_properties_includes_hardening() {
         let profile =
             LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
-        let properties = SystemdUnitProperties::from_lane_profile(&profile, None);
+        let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+        );
 
         let dbus_props = properties.to_dbus_properties();
         // Core resource properties.
@@ -551,13 +565,14 @@ mod tests {
             policy: LanePolicy::default(),
         };
 
-        let zero_properties = SystemdUnitProperties::from_lane_profile(
+        let zero_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
             &zero_profile,
             Some(&JobConstraints {
                 require_nextest: false,
                 test_timeout_seconds: Some(0),
                 memory_max_bytes: Some(0),
             }),
+            SandboxHardeningProfile::default(),
         );
 
         assert_eq!(zero_properties.cpu_quota_percent, 0);
@@ -585,13 +600,14 @@ mod tests {
             policy: LanePolicy::default(),
         };
 
-        let max_properties = SystemdUnitProperties::from_lane_profile(
+        let max_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
             &max_profile,
             Some(&JobConstraints {
                 require_nextest: false,
                 test_timeout_seconds: Some(u64::MAX),
                 memory_max_bytes: Some(u64::MAX),
             }),
+            SandboxHardeningProfile::default(),
         );
 
         assert_eq!(max_properties.cpu_quota_percent, u32::MAX);

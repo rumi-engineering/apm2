@@ -842,6 +842,16 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
+        // TCK-00573: Sandbox hardening hash. Appended at end for backward
+        // compatibility with pre-TCK-00573 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
         bytes
     }
 
@@ -3621,6 +3631,126 @@ pub mod tests {
         assert_ne!(
             hash_none, hash_some,
             "v2 canonical_bytes must change when containment trace is set"
+        );
+    }
+
+    // ── Sandbox hardening hash receipt binding (TCK-00573) ──
+
+    #[test]
+    fn test_sandbox_hardening_hash_included_in_persisted_receipt() {
+        let hardening = crate::fac::SandboxHardeningProfile::default();
+        let hash = hardening.content_hash_hex();
+        let receipt = FacJobReceiptV1Builder::new(
+            "receipt-sbx-001",
+            "job-sbx-001",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("sandbox hardening test")
+        .timestamp_secs(1_700_000_099)
+        .policy_hash("b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .sandbox_hardening_hash(&hash)
+        .try_build()
+        .expect("receipt with sandbox_hardening_hash");
+
+        // Hash is present in the receipt.
+        assert_eq!(
+            receipt.sandbox_hardening_hash.as_deref(),
+            Some(hash.as_str()),
+            "sandbox_hardening_hash must be set in receipt"
+        );
+        // Hash format is b3-256:<64hex>.
+        assert!(hash.starts_with("b3-256:"), "hash must have b3-256: prefix");
+        assert_eq!(hash.len(), 71, "b3-256:<64hex> must be exactly 71 chars");
+
+        // Canonical bytes include the hash.
+        let bytes = receipt.canonical_bytes();
+        assert!(
+            bytes
+                .windows(hash.len())
+                .any(|window| window == hash.as_bytes()),
+            "sandbox_hardening_hash must be encoded in canonical bytes"
+        );
+
+        // Serialized JSON includes the field.
+        let json = serde_json::to_string(&receipt).expect("serialize receipt");
+        assert!(
+            json.contains("sandbox_hardening_hash"),
+            "serialized JSON must include sandbox_hardening_hash field"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+        assert_eq!(
+            parsed
+                .get("sandbox_hardening_hash")
+                .and_then(|v| v.as_str()),
+            Some(hash.as_str()),
+            "sandbox_hardening_hash must match in serialized JSON"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_hardening_hash_changes_canonical_bytes() {
+        let mut receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample receipt");
+        let bytes_without = receipt.canonical_bytes();
+
+        receipt.sandbox_hardening_hash =
+            Some(crate::fac::SandboxHardeningProfile::default().content_hash_hex());
+        let bytes_with = receipt.canonical_bytes();
+
+        assert_ne!(
+            bytes_without, bytes_with,
+            "canonical_bytes must differ when sandbox_hardening_hash is present vs absent"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_hardening_hash_rejects_malformed() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-sbx-bad",
+            "job-sbx-bad",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("bad hash test")
+        .timestamp_secs(1_700_000_100)
+        .policy_hash("b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .sandbox_hardening_hash("not-a-valid-hash")
+        .try_build();
+
+        assert!(
+            result.is_err(),
+            "malformed sandbox_hardening_hash must be rejected"
         );
     }
 }

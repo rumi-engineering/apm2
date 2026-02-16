@@ -637,8 +637,7 @@ user-mode and system-mode execution backends.
   - `kill_mode` → `KillMode` (default `control-group`)
   - `sandbox_hardening` → `SandboxHardeningProfile` (TCK-00573)
 - Input binding:
-  - `from_lane_profile(&LaneProfileV1, Option<&JobConstraints>)` — uses default hardening
-  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — uses policy-driven hardening
+  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — the ONLY public constructor; requires explicit policy-driven hardening profile (INV-SBX-001)
 - Override semantics:
   - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
   - `sandbox_hardening` is policy-driven via `FacPolicyV1.sandbox_hardening` (TCK-00573).
