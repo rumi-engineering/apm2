@@ -2398,6 +2398,20 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
                 max: MAX_STRING_LENGTH,
             });
         }
+        if let Some(hash) = proto.sandbox_hardening_hash.as_ref() {
+            if hash.len() > MAX_STRING_LENGTH {
+                return Err(ReceiptError::StringTooLong {
+                    field: "sandbox_hardening_hash",
+                    actual: hash.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !is_strict_b3_256_digest(hash) {
+                return Err(ReceiptError::InvalidData(
+                    "sandbox_hardening_hash must be b3-256:<64 hex chars>".to_string(),
+                ));
+            }
+        }
 
         let changeset_digest: [u8; 32] = proto.changeset_digest.try_into().map_err(|_| {
             ReceiptError::InvalidData("changeset_digest must be 32 bytes".to_string())
@@ -2413,6 +2427,8 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
                 ReceiptError::InvalidData("evidence_bundle_hash must be 32 bytes".to_string())
             })?;
         let job_spec_digest = proto.job_spec_digest;
+
+        let sandbox_hardening_hash = proto.sandbox_hardening_hash;
 
         let receipt_signature: [u8; 64] = proto.receipt_signature.try_into().map_err(|_| {
             ReceiptError::InvalidData("receipt_signature must be 64 bytes".to_string())
@@ -2431,9 +2447,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             evidence_bundle_hash,
             job_spec_digest,
             passed: proto.passed,
-            // Proto wire format does not yet carry sandbox_hardening_hash;
-            // default to None for proto-sourced receipts.
-            sandbox_hardening_hash: None,
+            sandbox_hardening_hash,
             receipt_signature,
         })
     }
@@ -2453,6 +2467,7 @@ impl From<GateReceipt> for GateReceiptProto {
             payload_hash: receipt.payload_hash.to_vec(),
             evidence_bundle_hash: receipt.evidence_bundle_hash.to_vec(),
             job_spec_digest: receipt.job_spec_digest,
+            sandbox_hardening_hash: receipt.sandbox_hardening_hash,
             receipt_signature: receipt.receipt_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
@@ -3489,6 +3504,9 @@ pub mod tests {
             .job_spec_digest(
                 "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
+            .sandbox_hardening_hash(
+                "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
             .passed(true)
             .build_and_sign(&signer);
 
@@ -3498,6 +3516,10 @@ pub mod tests {
         let recovered = GateReceipt::try_from(decoded_proto).unwrap();
 
         assert_eq!(original.job_spec_digest, recovered.job_spec_digest);
+        assert_eq!(
+            original.sandbox_hardening_hash,
+            recovered.sandbox_hardening_hash
+        );
         assert!(
             recovered
                 .validate_signature(&signer.verifying_key())
@@ -3519,6 +3541,7 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
+            sandbox_hardening_hash: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3543,6 +3566,7 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
+            sandbox_hardening_hash: None,
             receipt_signature: vec![0u8; 32], // Wrong length - should be 64
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3593,6 +3617,7 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
+            sandbox_hardening_hash: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
