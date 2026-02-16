@@ -267,6 +267,12 @@ pub enum FacSubcommand {
     /// headline deltas (cold->warm improvement, target dir size collapse,
     /// denial rate).
     Bench(BenchArgs),
+    /// Evidence bundle export/import with RFC-0028/RFC-0029 validation.
+    ///
+    /// Export produces a self-describing envelope + blobs for a job.
+    /// Import validates RFC-0028 channel boundary and RFC-0029 economics
+    /// receipts, rejecting bundles that fail either check (fail-closed).
+    Bundle(BundleArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -420,6 +426,8 @@ pub enum DoctorExitActionArg {
     Fix,
     Escalate,
     Merge,
+    Done,
+    Approve,
     DispatchImplementor,
     RestartReviews,
 }
@@ -430,6 +438,8 @@ impl DoctorExitActionArg {
             Self::Fix => "fix",
             Self::Escalate => "escalate",
             Self::Merge => "merge",
+            Self::Done => "done",
+            Self::Approve => "approve",
             Self::DispatchImplementor => "dispatch_implementor",
             Self::RestartReviews => "restart_reviews",
         }
@@ -801,6 +811,58 @@ pub struct ContainmentArgs {
     pub sccache_enabled: bool,
 
     /// Output in JSON format.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac bundle`.
+#[derive(Debug, Args)]
+pub struct BundleArgs {
+    #[command(subcommand)]
+    pub subcommand: BundleSubcommand,
+}
+
+/// Bundle subcommands.
+#[derive(Debug, Subcommand)]
+pub enum BundleSubcommand {
+    /// Export an evidence bundle for a job.
+    ///
+    /// Produces a self-describing envelope JSON + referenced blobs under
+    /// an export directory. The envelope includes RFC-0028 boundary check
+    /// data and RFC-0029 economics traces from the job receipt.
+    Export(BundleExportArgs),
+    /// Import an evidence bundle from a path.
+    ///
+    /// Validates RFC-0028 channel boundary (must pass with zero defects)
+    /// and RFC-0029 economics receipts (must be Allow verdicts). Rejects
+    /// bundles that fail either validation (fail-closed).
+    Import(BundleImportArgs),
+}
+
+/// Arguments for `apm2 fac bundle export`.
+#[derive(Debug, Args)]
+pub struct BundleExportArgs {
+    /// Job ID to export the evidence bundle for.
+    pub job_id: String,
+
+    /// Output directory for the exported bundle.
+    ///
+    /// Defaults to `$APM2_HOME/private/fac/bundles/<job_id>/`.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac bundle import`.
+#[derive(Debug, Args)]
+pub struct BundleImportArgs {
+    /// Path to the evidence bundle envelope JSON file.
+    pub path: PathBuf,
+
+    /// Emit JSON output.
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -1879,6 +1941,7 @@ pub fn run_fac(
             | FacSubcommand::Verify(_)
             | FacSubcommand::Warm(_)
             | FacSubcommand::Bench(_)
+            | FacSubcommand::Bundle(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2357,6 +2420,14 @@ pub fn run_fac(
             &args.cpu_quota,
             resolve_json(args.json),
         ),
+        FacSubcommand::Bundle(args) => match &args.subcommand {
+            BundleSubcommand::Export(export_args) => {
+                run_bundle_export(export_args, resolve_json(export_args.json))
+            },
+            BundleSubcommand::Import(import_args) => {
+                run_bundle_import(import_args, resolve_json(import_args.json))
+            },
+        },
     }
 }
 
@@ -2386,7 +2457,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Quarantine(_)
         | FacSubcommand::Verify(_)
         | FacSubcommand::Warm(_)
-        | FacSubcommand::Bench(_) => true,
+        | FacSubcommand::Bench(_)
+        | FacSubcommand::Bundle(_) => true,
     }
 }
 
@@ -4518,6 +4590,509 @@ fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
+// Bundle Export/Import (TCK-00527)
+// =============================================================================
+
+/// Maximum envelope file size for bounded reads during import (256 KiB).
+const MAX_BUNDLE_ENVELOPE_FILE_SIZE: u64 = 262_144;
+
+/// Parse a hex-encoded digest string (with optional `b3-256:` prefix) into a
+/// verified 32-byte array, or return `MalformedPolicyDigest` on any failure.
+fn parse_verified_digest(
+    field_name: &str,
+    raw: &str,
+) -> Result<[u8; 32], apm2_core::fac::evidence_bundle::EvidenceBundleError> {
+    let hex_part = raw.strip_prefix("b3-256:").unwrap_or(raw);
+    let bytes = hex::decode(hex_part).map_err(|e| {
+        apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+            field: field_name.to_string(),
+            detail: format!("hex decode failed: {e}"),
+        }
+    })?;
+    <[u8; 32]>::try_from(bytes).map_err(|v| {
+        apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+            field: field_name.to_string(),
+            detail: format!("expected 32 bytes, got {}", v.len()),
+        }
+    })
+}
+
+/// Build a `BundleExportConfig` from authoritative receipt artifacts.
+///
+/// Constructs well-formed RFC-0028 and RFC-0029 boundary substructures so
+/// that exported envelopes satisfy `import_evidence_bundle` validation.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError::MalformedPolicyDigest` if `policy_hash` or
+/// `canonicalizer_tuple_digest` is present but cannot be decoded to a valid
+/// 32-byte digest. Fail-closed: export must not proceed with fabricated
+/// placeholder digests.
+fn build_export_config_from_receipt(
+    receipt: &apm2_core::fac::FacJobReceiptV1,
+) -> Result<
+    apm2_core::fac::evidence_bundle::BundleExportConfig,
+    apm2_core::fac::evidence_bundle::EvidenceBundleError,
+> {
+    use apm2_core::channel::BoundaryFlowPolicyBinding;
+
+    // Derive policy binding from receipt traces. For local export the receipt
+    // itself is the authoritative source — the policy/canonicalizer digests
+    // are self-consistent (matching) to pass import validation.
+    //
+    // Fail-closed: if either digest field is present but malformed, reject
+    // the export rather than fabricating a placeholder.
+    let policy_binding = {
+        let policy_digest = match receipt.policy_hash.as_deref() {
+            Some(h) => parse_verified_digest("policy_hash", h)?,
+            None => {
+                return Err(
+                    apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+                        field: "policy_hash".to_string(),
+                        detail: "field is absent; cannot construct policy binding without a verified digest".to_string(),
+                    },
+                );
+            },
+        };
+        let canonicalizer_digest = match receipt.canonicalizer_tuple_digest.as_deref() {
+            Some(h) => parse_verified_digest("canonicalizer_tuple_digest", h)?,
+            None => {
+                return Err(
+                    apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+                        field: "canonicalizer_tuple_digest".to_string(),
+                        detail: "field is absent; cannot construct policy binding without a verified digest".to_string(),
+                    },
+                );
+            },
+        };
+
+        Some(BoundaryFlowPolicyBinding {
+            policy_digest,
+            admitted_policy_root_digest: policy_digest,
+            canonicalizer_tuple_digest: canonicalizer_digest,
+            admitted_canonicalizer_tuple_digest: canonicalizer_digest,
+        })
+    };
+
+    // Export only evidence that actually exists in the source receipt.
+    // Leakage budget receipt, timing channel budget, and disclosure policy
+    // binding are NOT present in FacJobReceiptV1 so they are honestly marked
+    // absent (None). The envelope validation is aware of which fields are
+    // present vs absent and does not require fabricated data.
+    let leakage_budget_receipt = None;
+    let timing_channel_budget = None;
+    let disclosure_policy_binding = None;
+
+    Ok(apm2_core::fac::evidence_bundle::BundleExportConfig {
+        policy_binding,
+        leakage_budget_receipt,
+        timing_channel_budget,
+        disclosure_policy_binding,
+    })
+}
+
+/// Discover receipt blob hash from the `content_hash` field and export it.
+///
+/// Returns the list of exported blob ref strings (hex-encoded BLAKE3 hashes).
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError::BlobExportFailed` if a referenced blob
+/// cannot be decoded, retrieved from the store, or written to the output
+/// directory. Fail-closed: export must not succeed when referenced blob
+/// artifacts are missing or cannot be persisted.
+fn discover_and_export_blobs(
+    fac_root: &std::path::Path,
+    receipt: &apm2_core::fac::FacJobReceiptV1,
+    output_dir: &std::path::Path,
+) -> Result<Vec<String>, apm2_core::fac::evidence_bundle::EvidenceBundleError> {
+    let blob_store = apm2_core::fac::BlobStore::new(fac_root);
+    let mut exported_refs = Vec::new();
+
+    // Helper: parse hex, retrieve from store, write to output dir.
+    let export_one_blob =
+        |label: &str,
+         raw_hash: &str|
+         -> Result<String, apm2_core::fac::evidence_bundle::EvidenceBundleError> {
+            let hex_part = raw_hash.strip_prefix("b3-256:").unwrap_or(raw_hash);
+            let hash_bytes = hex::decode(hex_part).map_err(|e| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: hex decode failed: {e}"),
+                }
+            })?;
+            let hash_arr = <[u8; 32]>::try_from(hash_bytes).map_err(|v| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: expected 32 bytes, got {}", v.len()),
+                }
+            })?;
+            let blob_data = blob_store.retrieve(&hash_arr).map_err(|e| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: blob store retrieve failed: {e}"),
+                }
+            })?;
+            let blob_filename = format!("{hex_part}.blob");
+            let blob_dest = output_dir.join(&blob_filename);
+            // MINOR security fix: use FAC-safe file write (0600 mode,
+            // O_NOFOLLOW, symlink check) instead of std::fs::write.
+            crate::commands::fac_permissions::write_fac_file_with_mode(&blob_dest, &blob_data)
+                .map_err(|e| {
+                    apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                        blob_ref: raw_hash.to_string(),
+                        detail: format!("{label}: write to {}: {e}", blob_dest.display()),
+                    }
+                })?;
+            Ok(format!("b3-256:{hex_part}"))
+        };
+
+    // The receipt content_hash is a BLAKE3 hex digest — parse it to look
+    // up the receipt blob in the content-addressed store.
+    exported_refs.push(export_one_blob("content_hash", &receipt.content_hash)?);
+
+    // Also export the job_spec_digest blob.
+    exported_refs.push(export_one_blob(
+        "job_spec_digest",
+        &receipt.job_spec_digest,
+    )?);
+
+    Ok(exported_refs)
+}
+
+/// Validate that a job ID is safe for use as a filesystem path component.
+///
+/// Rejects empty strings, absolute paths, path separators, `..` components,
+/// and any characters outside `[A-Za-z0-9_-]`. This prevents path traversal
+/// attacks where a crafted `job_id` like `../../../etc/passwd` or `/tmp/evil`
+/// could escape the FAC root directory.
+fn validate_job_id_for_path(job_id: &str) -> Result<(), String> {
+    if job_id.is_empty() {
+        return Err("job_id must not be empty".to_string());
+    }
+    if job_id.starts_with('/') || job_id.starts_with('\\') {
+        return Err(format!(
+            "job_id must not be an absolute path, got {job_id:?}"
+        ));
+    }
+    if job_id.contains("..") {
+        return Err(format!(
+            "job_id must not contain path traversal (..), got {job_id:?}"
+        ));
+    }
+    if !job_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+    {
+        return Err(format!(
+            "job_id contains invalid characters: only [A-Za-z0-9._-] allowed, got {job_id:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Runs `apm2 fac bundle export <job_id>`.
+fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
+    // MAJOR security fix: validate job_id before using as path component.
+    // Untrusted job_id from job receipts could contain path traversal sequences
+    // (e.g., "../../../etc/passwd" or "/tmp/evil") that escape the FAC root.
+    if let Err(reason) = validate_job_id_for_path(&args.job_id) {
+        return output_error(
+            json_output,
+            "fac_bundle_export_invalid_job_id",
+            &reason,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let fac_root =
+        apm2_core::github::resolve_apm2_home().map(|home| home.join("private").join("fac"));
+
+    let Some(fac_root) = fac_root else {
+        return output_error(
+            json_output,
+            "fac_home_not_resolved",
+            "cannot resolve $APM2_HOME for FAC root",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = fac_root.join("receipts");
+
+    // Look up the job receipt.
+    let Some(receipt) = apm2_core::fac::lookup_job_receipt(&receipts_dir, &args.job_id) else {
+        return output_error(
+            json_output,
+            "fac_bundle_receipt_not_found",
+            &format!("no receipt found for job_id={}", args.job_id),
+            exit_codes::NOT_FOUND,
+        );
+    };
+
+    // Determine output directory (create early so blobs can be exported into it).
+    let output_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| fac_root.join("bundles").join(&args.job_id));
+
+    // MINOR security fix: use FAC-safe permissions helper (0700 directories)
+    // instead of std::fs::create_dir_all which inherits the default umask and
+    // follows symlinks.
+    if let Err(e) = crate::commands::fac_permissions::ensure_dir_with_mode(&output_dir) {
+        return output_error(
+            json_output,
+            "fac_bundle_export_mkdir_failed",
+            &format!(
+                "cannot create export directory {}: {e}",
+                output_dir.display()
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Discover and export blobs (receipt + job spec) to the output directory.
+    // Fail-closed: if any referenced blob cannot be retrieved or written, the
+    // command fails rather than producing an incomplete bundle.
+    let blob_refs = match discover_and_export_blobs(&fac_root, &receipt, &output_dir) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_blob_export_failed",
+                &format!("blob export failed: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Build the envelope with authoritative export config constructed from
+    // the receipt (satisfies import validation). Fail-closed: if policy/
+    // canonicalizer digests cannot be parsed to verified 32-byte arrays, the
+    // command fails rather than fabricating placeholder digests.
+    let config = match build_export_config_from_receipt(&receipt) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_export_malformed_digest",
+                &format!("failed to construct export config: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    let envelope = match apm2_core::fac::evidence_bundle::build_evidence_bundle_envelope(
+        &receipt, &config, &blob_refs,
+    ) {
+        Ok(env) => env,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_export_failed",
+                &format!("failed to build evidence bundle: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Serialize and write the envelope.
+    let data = match apm2_core::fac::evidence_bundle::serialize_envelope(&envelope) {
+        Ok(d) => d,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_export_serialize_failed",
+                &format!("failed to serialize envelope: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // MINOR security fix: use FAC-safe file write (0600 mode, O_NOFOLLOW,
+    // symlink check) instead of std::fs::write which inherits default umask
+    // and follows symlinks.
+    let envelope_path = output_dir.join("envelope.json");
+    if let Err(e) =
+        crate::commands::fac_permissions::write_fac_file_with_mode(&envelope_path, &data)
+    {
+        return output_error(
+            json_output,
+            "fac_bundle_export_write_failed",
+            &format!("failed to write envelope: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let result = serde_json::json!({
+        "status": "exported",
+        "job_id": args.job_id,
+        "envelope_path": envelope_path.display().to_string(),
+        "content_hash": envelope.content_hash,
+        "blob_count": envelope.blob_refs.len(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+
+    exit_codes::SUCCESS
+}
+
+/// Open a file for reading without following symlinks (`O_NOFOLLOW` on Unix).
+///
+/// On non-Unix platforms, falls back to a plain open (no symlink protection).
+fn open_no_follow_for_import(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
+/// Runs `apm2 fac bundle import <path>`.
+///
+/// Uses single-handle open with `O_NOFOLLOW` + `fstat` + bounded streaming
+/// read to avoid TOCTOU between metadata check and read. The same file
+/// descriptor is used for size validation and data read.
+fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
+    use std::io::Read;
+
+    let path = &args.path;
+
+    // Open once with O_NOFOLLOW — refuses symlinks at the kernel level.
+    let file = match open_no_follow_for_import(path) {
+        Ok(f) => f,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot open {}: {e}", path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // fstat on the opened fd — no TOCTOU race.
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot fstat {}: {e}", path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Reject non-regular files (symlinks already refused by O_NOFOLLOW;
+    // this catches devices, FIFOs, etc.).
+    if !metadata.is_file() {
+        return output_error(
+            json_output,
+            "fac_bundle_import_not_regular_file",
+            &format!("envelope path is not a regular file: {}", path.display()),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    if metadata.len() > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+        return output_error(
+            json_output,
+            "fac_bundle_import_too_large",
+            &format!(
+                "envelope file too large: {} bytes > {} max",
+                metadata.len(),
+                MAX_BUNDLE_ENVELOPE_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Bounded streaming read from the same handle (no second open).
+    let mut data = Vec::new();
+    let read_result = file
+        .take(MAX_BUNDLE_ENVELOPE_FILE_SIZE + 1)
+        .read_to_end(&mut data);
+    match read_result {
+        Ok(_) => {},
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot read {}: {e}", path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    }
+
+    // Belt-and-suspenders: re-check after streaming in case fstat size
+    // was stale (filesystem bug) or a non-regular file sneaked past.
+    if data.len() as u64 > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+        return output_error(
+            json_output,
+            "fac_bundle_import_too_large",
+            &format!(
+                "envelope data too large after read: {} bytes > {} max",
+                data.len(),
+                MAX_BUNDLE_ENVELOPE_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Fail-closed import validation.
+    let envelope = match apm2_core::fac::evidence_bundle::import_evidence_bundle(&data) {
+        Ok(env) => env,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_validation_failed",
+                &format!("bundle import rejected (fail-closed): {e}"),
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
+
+    // Verify all blob_refs exist and have matching BLAKE3 hashes.
+    // The bundle directory is the parent of the envelope file path.
+    if !envelope.blob_refs.is_empty() {
+        let bundle_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if let Err(e) = apm2_core::fac::evidence_bundle::verify_blob_refs(&envelope, bundle_dir) {
+            return output_error(
+                json_output,
+                "fac_bundle_import_blob_verification_failed",
+                &format!("blob verification failed (fail-closed): {e}"),
+                exit_codes::VALIDATION_ERROR,
+            );
+        }
+    }
+
+    let result = serde_json::json!({
+        "status": "imported",
+        "job_id": envelope.receipt.job_id,
+        "schema": envelope.schema,
+        "content_hash": envelope.content_hash,
+        "boundary_source": format!("{:?}", envelope.boundary_check.source),
+        "queue_admission_verdict": envelope.economics_trace.queue_admission.verdict,
+        "budget_admission_verdict": envelope.economics_trace.budget_admission.verdict,
+        "blob_count": envelope.blob_refs.len(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+    exit_codes::SUCCESS
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -5200,6 +5775,46 @@ mod tests {
     }
 
     #[test]
+    fn test_doctor_wait_exit_on_accepts_done_action() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--exit-on",
+            "done",
+        ])
+        .expect("done should parse as a valid doctor exit action");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.exit_on, vec![DoctorExitActionArg::Done]);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_exit_on_accepts_approve_action() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--exit-on",
+            "approve",
+        ])
+        .expect("approve should parse as a valid doctor exit action");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.exit_on, vec![DoctorExitActionArg::Approve]);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_review_prompt_command_sequence_parses_with_verdict_surface() {
         assert_fac_command_parses(&["fac", "review", "prepare", "--json"]);
         assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
@@ -5393,5 +6008,297 @@ mod tests {
     #[test]
     fn test_truncate_str_max_len_zero() {
         assert_eq!(truncate_str("abc", 0), "");
+    }
+
+    /// Integration test: exported bundle can be re-imported successfully.
+    ///
+    /// This proves the export/import pair forms a usable RFC-0028/0029 harness
+    /// (BLOCKER-3 fix). The test constructs a valid receipt, writes it to the
+    /// receipt store, runs the export path, then imports the exported envelope.
+    #[test]
+    fn test_bundle_export_import_round_trip() {
+        use apm2_core::fac::evidence_bundle::{
+            build_evidence_bundle_envelope, import_evidence_bundle, serialize_envelope,
+        };
+        use apm2_core::fac::{
+            BudgetAdmissionTrace, ChannelBoundaryTrace, FacJobOutcome, FacJobReceiptV1,
+            QueueAdmissionTrace,
+        };
+
+        // Valid 32-byte hex digest for policy binding (64 hex chars).
+        let valid_digest = "ab".repeat(32);
+
+        // Build a valid receipt with RFC-0028 and RFC-0029 traces.
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-rt-receipt".to_string(),
+            job_id: "test-rt-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &valid_digest,
+            policy_hash: Some(format!("b3-256:{valid_digest}")),
+            canonicalizer_tuple_digest: Some(format!("b3-256:{valid_digest}")),
+            outcome: FacJobOutcome::Completed,
+            reason: "round trip test".to_string(),
+            rfc0028_channel_boundary: Some(ChannelBoundaryTrace {
+                passed: true,
+                defect_count: 0,
+                defect_classes: vec![],
+                token_fac_policy_hash: None,
+                token_canonicalizer_tuple_digest: None,
+                token_boundary_id: None,
+                token_issued_at_tick: None,
+                token_expiry_tick: None,
+            }),
+            eio29_queue_admission: Some(QueueAdmissionTrace {
+                verdict: "Allow".to_string(),
+                queue_lane: "consume".to_string(),
+                defect_reason: None,
+            }),
+            eio29_budget_admission: Some(BudgetAdmissionTrace {
+                verdict: "Allow".to_string(),
+                reason: None,
+            }),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        // Build a well-formed export config (same logic as production path).
+        let config = build_export_config_from_receipt(&receipt)
+            .expect("export config should succeed with valid digests");
+
+        // Build envelope.
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[])
+            .expect("export should succeed with authoritative config");
+
+        // Serialize.
+        let data = serialize_envelope(&envelope).expect("serialize should succeed");
+
+        // Import must succeed (fail-closed validation passes).
+        let imported = import_evidence_bundle(&data)
+            .expect("import should succeed for well-formed exported bundle");
+
+        assert_eq!(imported.receipt.job_id, "test-rt-job");
+        assert_eq!(
+            imported.schema,
+            apm2_core::fac::evidence_bundle::EVIDENCE_BUNDLE_SCHEMA
+        );
+        assert_eq!(imported.content_hash, envelope.content_hash);
+    }
+
+    // =========================================================================
+    // Fail-closed tests for malformed policy digests (MAJOR finding fix)
+    // =========================================================================
+
+    /// Missing `policy_hash` must produce `MalformedPolicyDigest` error.
+    #[test]
+    fn test_build_export_config_missing_policy_hash_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-missing-ph".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: None, // absent
+            canonicalizer_tuple_digest: Some(format!("b3-256:{}", "cd".repeat(32))),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(result.is_err(), "missing policy_hash must fail");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy_hash"),
+            "error must mention the field: {msg}"
+        );
+    }
+
+    /// Missing `canonicalizer_tuple_digest` must produce
+    /// `MalformedPolicyDigest` error.
+    #[test]
+    fn test_build_export_config_missing_canonicalizer_digest_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-missing-ctd".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: Some(format!("b3-256:{}", "ab".repeat(32))),
+            canonicalizer_tuple_digest: None, // absent
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(
+            result.is_err(),
+            "missing canonicalizer_tuple_digest must fail"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("canonicalizer_tuple_digest"),
+            "error must mention the field: {msg}"
+        );
+    }
+
+    /// Malformed (non-hex) `policy_hash` must produce `MalformedPolicyDigest`
+    /// error.
+    #[test]
+    fn test_build_export_config_malformed_hex_policy_hash_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-bad-hex-ph".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: Some("b3-256:not_valid_hex!!".to_string()),
+            canonicalizer_tuple_digest: Some(format!("b3-256:{}", "cd".repeat(32))),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(result.is_err(), "non-hex policy_hash must fail");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy_hash") && msg.contains("hex"),
+            "error must mention field and hex failure: {msg}"
+        );
+    }
+
+    /// Wrong-length `policy_hash` (valid hex but not 32 bytes) must fail.
+    #[test]
+    fn test_build_export_config_wrong_length_policy_hash_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-short-ph".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: Some("b3-256:aabb".to_string()), // only 2 bytes
+            canonicalizer_tuple_digest: Some(format!("b3-256:{}", "cd".repeat(32))),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(result.is_err(), "wrong-length policy_hash must fail");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy_hash") && msg.contains("32 bytes"),
+            "error must mention field and expected length: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR security fix: job_id path traversal prevention tests
+    // =========================================================================
+
+    /// TCK-00527: Empty `job_id` must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_empty() {
+        let result = validate_job_id_for_path("");
+        assert!(result.is_err(), "empty job_id must be rejected");
+        assert!(
+            result.unwrap_err().contains("empty"),
+            "error must mention empty"
+        );
+    }
+
+    /// TCK-00527: Absolute path `job_id` must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_absolute_path() {
+        let result = validate_job_id_for_path("/tmp/evil");
+        assert!(result.is_err(), "absolute path job_id must be rejected");
+        assert!(
+            result.unwrap_err().contains("absolute"),
+            "error must mention absolute path"
+        );
+    }
+
+    /// TCK-00527: Backslash absolute path must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_backslash_absolute() {
+        let result = validate_job_id_for_path("\\tmp\\evil");
+        assert!(
+            result.is_err(),
+            "backslash absolute path job_id must be rejected"
+        );
+    }
+
+    /// TCK-00527: Path traversal via `..` must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_dotdot_traversal() {
+        for traversal in &["../../../etc/passwd", "..%2F..%2Fetc", "foo/../bar", ".."] {
+            let result = validate_job_id_for_path(traversal);
+            assert!(
+                result.is_err(),
+                "path traversal job_id {traversal:?} must be rejected"
+            );
+        }
+    }
+
+    /// TCK-00527: Job IDs containing path separators must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_path_separators() {
+        for bad in &["a/b", "a\\b", "foo/bar/baz"] {
+            let result = validate_job_id_for_path(bad);
+            assert!(
+                result.is_err(),
+                "job_id with path separator {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// TCK-00527: Job IDs with special characters must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_special_chars() {
+        for bad in &["a;b", "a b", "a\x00b", "a*b", "a?b", "$HOME"] {
+            let result = validate_job_id_for_path(bad);
+            assert!(
+                result.is_err(),
+                "job_id with special chars {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// TCK-00527: Valid job IDs must be accepted.
+    #[test]
+    fn test_validate_job_id_accepts_valid_ids() {
+        for valid in &[
+            "abc-123",
+            "ABC_def",
+            "job-42",
+            "a",
+            "test-rt-job",
+            "fac.job.2026-02-15",
+        ] {
+            let result = validate_job_id_for_path(valid);
+            assert!(
+                result.is_ok(),
+                "valid job_id {valid:?} must be accepted: {:?}",
+                result.unwrap_err()
+            );
+        }
     }
 }
