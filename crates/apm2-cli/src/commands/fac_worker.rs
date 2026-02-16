@@ -183,11 +183,7 @@ enum JobOutcome {
     /// Job was denied due to token or admission failure.
     Denied { reason: String },
     /// Job was successfully claimed and executed.
-    Completed {
-        job_id: String,
-        /// Observed runtime cost metrics for post-run cost model calibration.
-        observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
-    },
+    Completed { job_id: String },
     /// Job was aborted due to unrecoverable internal error.
     /// NOTE: currently unused because cleanup failures no longer change
     /// job outcome (BLOCKER fix for f-685-code_quality-0). Retained for
@@ -355,14 +351,8 @@ pub fn run_fac_worker(
         },
     );
 
-    let (mut queue_state, mut cost_model) = match load_scheduler_state(&fac_root) {
-        Ok(Some(saved)) => {
-            let cm = saved
-                .cost_model
-                .clone()
-                .unwrap_or_else(apm2_core::economics::CostModelV1::with_defaults);
-            (QueueSchedulerState::from_persisted(&saved), cm)
-        },
+    let mut queue_state = match load_scheduler_state(&fac_root) {
+        Ok(Some(saved)) => QueueSchedulerState::from_persisted(&saved),
         Ok(None) => {
             let recovery = SchedulerRecoveryReceipt {
                 schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
@@ -384,10 +374,7 @@ pub fn run_fac_worker(
                     recovery.schema, recovery.reason, recovery.timestamp_secs
                 );
             }
-            (
-                QueueSchedulerState::new(),
-                apm2_core::economics::CostModelV1::with_defaults(),
-            )
+            QueueSchedulerState::new()
         },
         Err(e) => {
             let recovery = SchedulerRecoveryReceipt {
@@ -413,10 +400,7 @@ pub fn run_fac_worker(
                     recovery.schema, recovery.reason, recovery.timestamp_secs
                 );
             }
-            (
-                QueueSchedulerState::new(),
-                apm2_core::economics::CostModelV1::with_defaults(),
-            )
+            QueueSchedulerState::new()
         },
     };
 
@@ -673,7 +657,6 @@ pub fn run_fac_worker(
                         &fac_root,
                         &queue_state,
                         broker.current_tick(),
-                        Some(&cost_model),
                     ) {
                         output_worker_error(json_output, &persist_err);
                     }
@@ -692,7 +675,6 @@ pub fn run_fac_worker(
                     &fac_root,
                     &cycle_scheduler,
                     broker.current_tick(),
-                    Some(&cost_model),
                 ) {
                     output_worker_error(json_output, &persist_err);
                     return exit_codes::GENERIC_ERROR;
@@ -751,7 +733,6 @@ pub fn run_fac_worker(
                     summary.jobs_completed as u64,
                     summary.jobs_denied as u64,
                     summary.jobs_quarantined as u64,
-                    &cost_model,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -801,27 +782,8 @@ pub fn run_fac_worker(
                         eprintln!("worker: denied {}: {reason}", candidate.spec.job_id);
                     }
                 },
-                JobOutcome::Completed {
-                    job_id,
-                    observed_cost,
-                } => {
+                JobOutcome::Completed { job_id } => {
                     summary.jobs_completed += 1;
-
-                    // TCK-00532: Post-run cost model calibration from receipt.
-                    // Feed observed runtime cost into the EWMA cost model so
-                    // future admission estimates converge toward reality.
-                    if let Some(cost) = observed_cost {
-                        let job_kind = &candidate.spec.kind;
-                        if let Err(cal_err) = cost_model.calibrate(job_kind, cost) {
-                            if !json_output {
-                                eprintln!(
-                                    "worker: cost model calibration warning for kind \
-                                     '{job_kind}': {cal_err}"
-                                );
-                            }
-                        }
-                    }
-
                     if json_output {
                         emit_worker_event(
                             "job_completed",
@@ -875,7 +837,6 @@ pub fn run_fac_worker(
                     &fac_root,
                     &cycle_scheduler,
                     broker.current_tick(),
-                    Some(&cost_model),
                 ) {
                     output_worker_error(json_output, &persist_err);
                     return exit_codes::GENERIC_ERROR;
@@ -888,12 +849,9 @@ pub fn run_fac_worker(
             }
         }
 
-        if let Err(persist_err) = persist_queue_scheduler_state(
-            &fac_root,
-            &cycle_scheduler,
-            broker.current_tick(),
-            Some(&cost_model),
-        ) {
+        if let Err(persist_err) =
+            persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick())
+        {
             output_worker_error(json_output, &persist_err);
             return exit_codes::GENERIC_ERROR;
         }
@@ -917,12 +875,9 @@ pub fn run_fac_worker(
         emit_worker_summary(&summary);
     }
 
-    if let Err(persist_err) = persist_queue_scheduler_state(
-        &fac_root,
-        &queue_state,
-        broker.current_tick(),
-        Some(&cost_model),
-    ) {
+    if let Err(persist_err) =
+        persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick())
+    {
         output_worker_error(json_output, &persist_err);
         return exit_codes::GENERIC_ERROR;
     }
@@ -934,11 +889,9 @@ fn persist_queue_scheduler_state(
     fac_root: &Path,
     queue_state: &QueueSchedulerState,
     current_tick: u64,
-    cost_model: Option<&apm2_core::economics::CostModelV1>,
 ) -> Result<(), String> {
     let mut state = queue_state.to_scheduler_state_v1(current_tick);
     state.persisted_at_secs = current_timestamp_epoch_secs();
-    state.cost_model = cost_model.cloned();
     persist_scheduler_state(fac_root, &state)
         .map(|_| ())
         .map_err(|e| format!("failed to persist scheduler state: {e}"))
@@ -1158,11 +1111,7 @@ fn process_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
-    cost_model: &apm2_core::economics::CostModelV1,
 ) -> JobOutcome {
-    // TCK-00532: Capture wall-clock start for observed cost measurement.
-    let job_wall_start = Instant::now();
-
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
@@ -1306,7 +1255,6 @@ fn process_job(
             verdict: "allow".to_string(),
             queue_lane: "control".to_string(),
             defect_reason: None,
-            cost_estimate_ticks: None,
         };
         let budget_trace: Option<FacBudgetAdmissionTrace> = None;
 
@@ -1773,7 +1721,6 @@ fn process_job(
             verdict: "deny".to_string(),
             queue_lane: spec.queue_lane.clone(),
             defect_reason: Some("admission health gate not passed".to_string()),
-            cost_estimate_ticks: None,
         };
         let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
             .map(|p| {
@@ -1848,8 +1795,7 @@ fn process_job(
         convergence_horizon: convergence,
         convergence_receipts,
         required_authority_sets: Vec::new(),
-        // TCK-00532: Use cost model estimate instead of hardcoded 1.
-        cost: cost_model.queue_cost(&spec.kind),
+        cost: 1,
         current_tick,
     };
 
@@ -2635,7 +2581,6 @@ fn process_job(
             heartbeat_jobs_completed,
             heartbeat_jobs_denied,
             heartbeat_jobs_quarantined,
-            job_wall_start,
         );
     }
 
@@ -2661,10 +2606,6 @@ fn process_job(
             .sandbox_hardening_hash(&sbx_hash)
             .passed(false)
             .build_and_sign(signer);
-
-    // TCK-00532: Capture observed cost BEFORE emitting the receipt so the
-    // receipt carries the actual runtime measurement.
-    let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
 
     if let Err(receipt_err) = emit_job_receipt(
         fac_root,
@@ -2733,7 +2674,6 @@ fn process_job(
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
-        observed_cost: Some(observed_cost),
     }
 }
 
@@ -3249,7 +3189,6 @@ fn handle_stop_revoke(
                 "worker: stop_revoke: target {target_job_id} already in {terminal_state}/, treating as success"
             );
             // Emit completion receipt for the stop_revoke job itself.
-            let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
             let _ = emit_job_receipt(
                 fac_root,
                 spec,
@@ -3271,11 +3210,8 @@ fn handle_stop_revoke(
                 &queue_root.join(COMPLETED_DIR),
                 claimed_file_name,
             );
-            // Reuse the same `observed` snapshot for the outcome to keep
-            // emitted receipt and calibration data aligned (NIT fix).
             return JobOutcome::Completed {
                 job_id: spec.job_id.clone(),
-                observed_cost: Some(observed),
             };
         }
 
@@ -3505,7 +3441,6 @@ fn handle_stop_revoke(
 
     // Step 4a: Emit completion receipt for the stop_revoke job itself
     // BEFORE moving it to completed/.
-    let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
     if let Err(receipt_err) = emit_job_receipt(
         fac_root,
         spec,
@@ -3551,11 +3486,8 @@ fn handle_stop_revoke(
         };
     }
 
-    // Reuse the same `observed` snapshot for the outcome to keep
-    // emitted receipt and calibration data aligned (NIT fix).
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
-        observed_cost: Some(observed),
     }
 }
 
@@ -3598,7 +3530,6 @@ fn execute_warm_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
-    job_wall_start: Instant,
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
@@ -4052,9 +3983,6 @@ fn execute_warm_job(
             .passed(persist_ok)
             .build_and_sign(signer);
 
-    // TCK-00532: Capture observed cost BEFORE emitting receipt.
-    let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
-
     if let Err(receipt_err) = emit_job_receipt(
         fac_root,
         spec,
@@ -4111,7 +4039,6 @@ fn execute_warm_job(
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
-        observed_cost: Some(observed_cost),
     }
 }
 
@@ -4678,21 +4605,6 @@ fn emit_job_receipt(
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
 }
 
-/// Compute observed job cost from wall-clock elapsed time.
-///
-/// CPU time and I/O bytes are reported as 0 (best-effort: these metrics
-/// require cgroup accounting which is not yet wired into the worker).
-fn observed_cost_from_elapsed(
-    elapsed: std::time::Duration,
-) -> apm2_core::economics::cost_model::ObservedJobCost {
-    apm2_core::economics::cost_model::ObservedJobCost {
-        duration_ms: u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX)))
-            .unwrap_or(u64::MAX),
-        cpu_time_ms: 0,   // best-effort: cgroup CPU accounting not yet wired
-        bytes_written: 0, // best-effort: cgroup I/O accounting not yet wired
-    }
-}
-
 fn compute_job_spec_digest_preview(bytes: &[u8]) -> String {
     let hash = blake3::hash(bytes);
     format!("b3-256:{}", hash.to_hex())
@@ -4758,7 +4670,6 @@ fn build_queue_admission_trace(decision: &QueueAdmissionDecision) -> JobQueueAdm
         verdict: strip_json_string_quotes(&serialize_to_json_string(&decision.trace.verdict)),
         queue_lane: lane,
         defect_reason: decision.trace.defect.as_ref().map(|d| d.reason.clone()),
-        cost_estimate_ticks: decision.trace.cost_estimate_ticks,
     }
 }
 
@@ -5169,7 +5080,6 @@ mod tests {
             verdict: "allow".to_string(),
             queue_lane: "control".to_string(),
             defect_reason: None,
-            cost_estimate_ticks: None,
         };
 
         let receipt_path = emit_job_receipt(
@@ -5401,7 +5311,6 @@ mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
-            cost_estimate_ticks: None,
         };
         let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
         let containment_trace = apm2_core::fac::containment::ContainmentTrace {
@@ -5479,7 +5388,6 @@ mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
-            cost_estimate_ticks: None,
         };
         let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
 

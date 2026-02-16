@@ -25,7 +25,6 @@
 //!   TP-EIO29-001 and TP-EIO29-004 enforcement
 
 pub mod admission;
-pub mod cost_model;
 pub mod optimization_gate;
 pub mod profile;
 pub mod projection_continuity;
@@ -36,10 +35,6 @@ pub mod replay_recovery;
 pub use admission::{
     BudgetAdmissionDecision, BudgetAdmissionEvaluator, BudgetAdmissionTrace,
     BudgetAdmissionVerdict, ObservedUsage,
-};
-pub use cost_model::{
-    COST_MODEL_SCHEMA, CalibrationState, CostModelError, CostModelV1, JobCostEstimate,
-    MAX_CALIBRATION_SAMPLES, MAX_JOB_KIND_LENGTH, MAX_JOB_KINDS, ObservedJobCost,
 };
 pub use optimization_gate::{
     AuthoritySurfaceDiff, AuthoritySurfaceEvidence, AuthoritySurfaceEvidenceState,
