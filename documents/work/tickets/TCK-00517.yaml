@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00517"
     title: "Repo substrate: bare mirror + lane checkouts + patch injection provenance (eliminate pipeline SHA drift)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

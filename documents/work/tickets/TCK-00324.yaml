@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00324
     title: xtask cutover stage 1
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

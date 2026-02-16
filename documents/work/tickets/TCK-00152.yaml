@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00152
     title: Implement stop conditions and circuit breaker logic
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0012
     requirements:

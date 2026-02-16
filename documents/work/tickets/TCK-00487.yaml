@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00487"
     title: "Ledger hash-chain signature verification and incremental startup validation"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

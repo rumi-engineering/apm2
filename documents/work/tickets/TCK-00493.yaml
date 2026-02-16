@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00493"
     title: "Admission evidence closure: seal AdmissionBundleV1 (CAS) before receipt/event emission; bind all authoritative outcomes to bundle digest (no digest cycles)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"

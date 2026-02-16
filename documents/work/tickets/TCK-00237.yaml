@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00237
     title: 'HTF: Add CAC schemas for ClockProfileV1 and TimeEnvelopeV1'
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0016
     requirements:

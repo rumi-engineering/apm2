@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00557"
     title: "flake.nix + packaging: ensure devShell invariants and (optional) package broker/worker binaries"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

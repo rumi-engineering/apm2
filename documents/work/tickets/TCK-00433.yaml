@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00433"
     title: "[Umbrella] FAC projection cutover over split runtime/workflow/security slices"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

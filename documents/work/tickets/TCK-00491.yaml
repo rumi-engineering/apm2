@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00491"
     title: "Admission Spine v1.1: codify PCAC-boundary + ledger trust-stack composition contract (RFC addendum + requirement scaffolding + digest-cycle + witness-seed fixes + anti-rollback anchoring)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"

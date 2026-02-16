@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00439"
     title: "RFC-0019 ch17 CAC snapshot contract registry hardening"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

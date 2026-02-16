@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00379
     title: Attestation floor tightening by risk tier
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

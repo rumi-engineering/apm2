@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00291"
     title: "Tool handlers: replace Read/Write/Execute stubs with real implementations"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

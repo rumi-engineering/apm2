@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00120
     title: Implement end-to-end compile command
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

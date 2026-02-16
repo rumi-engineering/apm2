@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00174
     title: Implement apm2 episode CLI commands
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
 dependencies:

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00250
     title: Add per-connection session token issuance
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

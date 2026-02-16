@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00521"
     title: "FacPolicyV1: implement authoritative policy object + hashing + policy binding for RFC-0028"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

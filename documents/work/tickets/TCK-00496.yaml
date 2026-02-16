@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00496"
     title: "Quarantine lifecycle hardening: priority-aware eviction, saturation-safe insertion (deny), per-session quota isolation, and restart-safe persistence for fail-closed tiers"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

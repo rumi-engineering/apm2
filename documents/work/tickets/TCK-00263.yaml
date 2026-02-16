@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00263
     title: Implement credential broker for SSH operations
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

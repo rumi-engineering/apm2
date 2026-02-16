@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00269
     title: Add latency benchmarks for spawn and mediation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

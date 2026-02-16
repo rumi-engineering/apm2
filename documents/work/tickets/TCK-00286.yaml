@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00286"
     title: "Fix context firewall security findings from PR #335"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

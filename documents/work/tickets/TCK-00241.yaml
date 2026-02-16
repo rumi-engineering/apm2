@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00241
     title: 'HTF: Convert leases to tick-based expiry and ignore wall timestamps'
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0016
     requirements:

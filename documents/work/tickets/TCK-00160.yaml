@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00160
     title: Implement EpisodeRuntime with state machine
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

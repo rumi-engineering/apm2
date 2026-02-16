@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00142"
     title: "Implement export conformance tests"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

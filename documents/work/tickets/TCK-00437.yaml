@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00437"
     title: "[Umbrella] FAC RoleSpec vNext rollout for WorkObject execution"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

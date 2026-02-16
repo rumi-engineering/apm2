@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00310"
     title: "FAC v0 NEW WORK REQUIRED: ChangeSetBundleV1 + ChangeSetPublished event"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

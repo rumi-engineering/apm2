@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00116
     title: Implement ticket emitter
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

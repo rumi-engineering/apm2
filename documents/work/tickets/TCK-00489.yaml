@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00489"
     title: "Priority-aware quarantine lifecycle with saturation-safe insertion"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

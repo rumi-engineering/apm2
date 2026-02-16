@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00236
     title: 'HTF: Introduce core time types (LedgerTime, HtfTick, TimeEnvelopeRef)'
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0016
     requirements:

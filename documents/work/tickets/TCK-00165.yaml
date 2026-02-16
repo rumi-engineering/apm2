@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00165
     title: Implement tool execution and budget charging
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

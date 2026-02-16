@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00511"
     title: "FAC Worker: queue consumer with RFC-0028 authorization + RFC-0029 admission gating (default-mode executor)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

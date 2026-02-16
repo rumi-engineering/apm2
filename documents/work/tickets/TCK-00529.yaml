@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00529"
     title: "System-mode execution path: run jobs without user-bus dependency (broker-managed transient units)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

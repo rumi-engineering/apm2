@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00257
     title: Add GateLeaseIssued validation for GATE_EXECUTOR spawn
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

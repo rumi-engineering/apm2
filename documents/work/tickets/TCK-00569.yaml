@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00569"
     title: "Lane cleanup state machine: post-job cleanup, failure handling, CORRUPT transitions, and cleanup receipts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

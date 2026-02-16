@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00199
     title: Capability Proof Model and Event Definitions
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

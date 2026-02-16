@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00381
     title: Pull-only anti-entropy with Byzantine relay resistance
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

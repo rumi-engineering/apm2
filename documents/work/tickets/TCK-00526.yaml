@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00526"
     title: "FAC-managed CARGO_HOME + env clearing policy (eliminate ambient user state)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

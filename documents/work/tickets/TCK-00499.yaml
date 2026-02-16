@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00499"
     title: "Spine conformance suite: no-bypass, replay across restart, tamper detection, fail-closed prerequisites, anti-rollback anchoring, downgrade resistance, and bounded-work regressions"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"

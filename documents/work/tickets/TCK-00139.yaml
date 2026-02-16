@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00139"
     title: "Add CLI command: apm2 pack compile"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00349
     title: Session-typed state machine and fail-closed decoding hardening
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

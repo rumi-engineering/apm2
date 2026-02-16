@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00391"
     title: "Autonomous FAC end-to-end integration test: full lifecycle without xtask"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

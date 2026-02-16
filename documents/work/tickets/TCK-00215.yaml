@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00215"
     title: "FAC: CI attestation types (L0/L1 levels)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

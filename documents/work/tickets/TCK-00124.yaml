@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00124"
     title: "Implement agent-friendly UX verification for AAT"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0003"
     rfc_id: "RFC-0004"

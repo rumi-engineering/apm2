@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00218"
     title: "FAC: AatGateReceipt typed payload schema"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

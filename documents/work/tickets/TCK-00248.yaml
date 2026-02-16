@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00248
     title: Add SO_PEERCRED authentication to ProtocolServer
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00370
     title: FactRootV1 composition with RFC-0014 quorum checkpoints
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

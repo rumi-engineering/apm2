@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00336
     title: 'Refactor: remove unsafe-by-default protocol/bypass paths (exclude xtask)'
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

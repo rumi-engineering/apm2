@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00332
     title: Orchestrator revision loop (1..100 cycles) with deterministic stop conditions
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

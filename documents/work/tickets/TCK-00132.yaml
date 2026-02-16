@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00132"
     title: "Implement admission pipeline and receipts"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

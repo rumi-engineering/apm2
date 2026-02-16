@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00147"
     title: "Add CLI commands: apm2 capabilities, apm2 selftest"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

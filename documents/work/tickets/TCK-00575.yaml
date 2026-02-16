@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00575"
     title: "Env & path hygiene completion: set HOME/TMPDIR/XDG dirs per lane; prevent writes to ambient user locations"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00510"
     title: "FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

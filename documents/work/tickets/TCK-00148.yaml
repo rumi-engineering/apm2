@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00148
     title: Implement CoordinationState and event type definitions
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0012
     requirements:

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00295"
     title: "xtask Stage X1: optional internal receipts/events (still non-authoritative)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

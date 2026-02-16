@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00527"
     title: "Evidence bundle export/import commands exercising RFC-0028 boundary validation + RFC-0029 receipt validation (local-only)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

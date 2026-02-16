@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00545"
     title: "Patch bytes backend: implement `fac_blobs_v1` store under `$APM2_HOME/private/fac/blobs` + GC policy"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

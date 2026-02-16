@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00399"
     title: "Wire AdapterRegistry into SpawnEpisode to spawn agent CLI processes"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

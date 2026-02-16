@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00556"
     title: "Node identity primitives: node_fingerprint derivation + boundary_id configuration + stable emission into LaneProfileV1"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

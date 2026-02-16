@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00505"
     title: "Wire economics admission gate into projection worker pre-projection path"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

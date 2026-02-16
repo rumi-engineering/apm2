@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00512"
     title: "Job spec hardening: add `job_spec_digest` + `actuation` block (RFC-0028 binding) to FacJobSpecV1"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

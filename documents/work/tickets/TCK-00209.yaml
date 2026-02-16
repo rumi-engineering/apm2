@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00209"
     title: "FAC: ContextPackManifest types and allowlist matching"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

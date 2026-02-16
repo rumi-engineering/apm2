@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00486"
     title: "Ledger namespace isolation for authoritative policy-root derivation"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

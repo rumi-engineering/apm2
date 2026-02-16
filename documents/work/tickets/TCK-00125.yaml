@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00125"
     title: "Implement determinism checks and environment pinning for AAT"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0003"
     rfc_id: "RFC-0004"

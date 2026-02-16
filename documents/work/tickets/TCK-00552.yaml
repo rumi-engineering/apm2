@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00552"
     title: "Benchmark harness: measure cold/warm gate times, disk footprint collapse, and concurrency stability (prove 10x claim)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

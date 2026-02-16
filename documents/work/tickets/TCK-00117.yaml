@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00117
     title: Add lint rules for clutter prevention
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

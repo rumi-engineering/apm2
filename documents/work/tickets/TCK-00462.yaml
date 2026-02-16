@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00462"
     title: "RFC-0028 REQ-0001 lifecycle intent typing and acceptance-fact separation"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

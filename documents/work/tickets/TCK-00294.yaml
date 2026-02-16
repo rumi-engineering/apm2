@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00294"
     title: "xtask Stage X0: explicit NON-AUTHORITATIVE banner (keep usable)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

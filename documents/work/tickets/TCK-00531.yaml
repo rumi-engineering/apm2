@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00531"
     title: "RFC-0029 scheduler state persistence: stable state file + restart safety + anti-starvation continuity"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

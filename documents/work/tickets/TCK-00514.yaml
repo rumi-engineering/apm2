@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00514"
     title: "Queue hygiene: add denied/quarantine dirs + denial/quarantine receipts + retention policy"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

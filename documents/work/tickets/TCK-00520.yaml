@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00520"
     title: "Logs v1: per-(lane,job,gate) log namespaces + streaming/caps + log bundle hashing"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

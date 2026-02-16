@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00200
     title: Cross-Node Capability Verification Integration
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

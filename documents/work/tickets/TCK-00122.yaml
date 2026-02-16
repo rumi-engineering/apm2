@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00122
     title: Implement Refactor Radar stage
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

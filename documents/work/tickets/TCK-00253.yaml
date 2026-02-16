@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00253
     title: Implement ClaimWork handler with policy resolution
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

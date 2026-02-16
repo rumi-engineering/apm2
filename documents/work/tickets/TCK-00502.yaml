@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00502"
     title: "Anti-rollback anchoring: implement external anchor provider(s) and enforce fail-closed tier gating when missing/mismatched"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"

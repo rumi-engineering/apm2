@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00326
     title: ContextPack sealing + broker firewall initialization (end-to-end)
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

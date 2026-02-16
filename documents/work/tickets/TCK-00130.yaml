@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00130"
     title: "Implement canonicalization test vectors"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

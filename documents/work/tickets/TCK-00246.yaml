@@ -5,7 +5,7 @@ ticket_meta:
     id: TCK-00246
     title: 'HTF: Code-lint enforcement denying wall clock authority in privileged
       paths'
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0016
     requirements:

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00507"
     title: "Continuity profile and sink snapshot resolution for economics gate input assembly"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

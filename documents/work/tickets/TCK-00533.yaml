@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00533"
     title: "Cancellation semantics: stop_revoke lane + kill running unit + receipts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

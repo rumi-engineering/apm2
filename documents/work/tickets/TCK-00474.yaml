@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00474"
     title: "RFC-0029 REQ-0005 replay-recovery bounds and idempotency closure"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

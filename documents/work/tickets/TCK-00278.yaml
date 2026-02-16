@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00278
     title: Enhanced xtask tooling and ticket skill for agent onboarding
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
 acceptance_criteria:

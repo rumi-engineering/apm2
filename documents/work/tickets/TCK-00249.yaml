@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00249
     title: Implement dual-socket topology for privilege separation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

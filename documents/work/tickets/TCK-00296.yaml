@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00296"
     title: "xtask Stage X2: gate GitHub status writes behind explicit dev flag"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

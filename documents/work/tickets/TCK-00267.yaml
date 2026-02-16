@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00267
     title: Implement LEASE_REVOKED signal and crash recovery
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

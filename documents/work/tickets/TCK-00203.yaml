@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00203"
     title: "FAC: GateLease proto message and Rust types"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

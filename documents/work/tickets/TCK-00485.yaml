@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00485"
     title: "PCAC-gated declassification receipts with durable single-use and request-scoped binding"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0027"

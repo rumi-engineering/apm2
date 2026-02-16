@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00118
     title: Implement model router with routing profiles
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

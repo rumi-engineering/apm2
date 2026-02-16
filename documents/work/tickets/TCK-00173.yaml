@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00173
     title: Implement Claude Code harness adapter
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

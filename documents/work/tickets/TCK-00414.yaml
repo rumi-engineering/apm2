@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00414"
     title: "Re-architect identity abstraction with spec-driven wire/tag/derivation/resolution contracts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0020"

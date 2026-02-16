@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00114
     title: Implement Impact Map generation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00133"
     title: "Add CLI command: apm2 cac apply-patch"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

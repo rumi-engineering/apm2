@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00430"
     title: "Objective and gate evidence exporters for RFC-0027"
-    status: "DRAFT"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0027"

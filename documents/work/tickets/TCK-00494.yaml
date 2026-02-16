@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00494"
     title: "RequestTool cutover: handler becomes thin wrapper over AdmissionKernel plan/execute (no direct broker/effect calls)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"
