@@ -809,6 +809,11 @@ pub struct QueueAdmissionTrace {
     pub tp003_passed: bool,
     /// Current tick at evaluation time.
     pub evaluated_at_tick: u64,
+    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// Present when the cost model provided the estimate; absent for legacy
+    /// admission traces created before cost model integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_ticks: Option<u64>,
 }
 
 impl QueueAdmissionTrace {
@@ -997,6 +1002,7 @@ impl QueueSchedulerState {
             lane_snapshots,
             last_evaluation_tick: current_tick,
             persisted_at_secs: 0,
+            cost_model: None,
             content_hash: String::new(),
         }
     }
@@ -1423,6 +1429,7 @@ pub fn evaluate_queue_admission(
         tp001_passed,
         tp002_passed,
         tp003_passed,
+        Some(request.cost),
     ) {
         return decision;
     }
@@ -1436,6 +1443,7 @@ pub fn evaluate_queue_admission(
         tp002_passed,
         tp003_passed,
         evaluated_at_tick: current_tick,
+        cost_estimate_ticks: Some(request.cost),
     };
 
     QueueAdmissionDecision {
@@ -1465,6 +1473,8 @@ fn evaluate_temporal_predicates(
     // envelope fails (fail-open to authority reduction only).
     let tp001_stop_revoke_emergency = !tp001_passed && lane == QueueLane::StopRevoke;
 
+    let cost_estimate = Some(request.cost);
+
     if !tp001_passed && !tp001_stop_revoke_emergency {
         let reason = tp001_result.unwrap_err();
         return Err(deny_queue(&DenyContext {
@@ -1477,6 +1487,7 @@ fn evaluate_temporal_predicates(
             tp001_passed,
             tp002_passed: false,
             tp003_passed: false,
+            cost_estimate_ticks: cost_estimate,
         }));
     }
 
@@ -1499,6 +1510,7 @@ fn evaluate_temporal_predicates(
             tp001_passed,
             tp002_passed,
             tp003_passed: false,
+            cost_estimate_ticks: cost_estimate,
         }));
     }
 
@@ -1521,6 +1533,7 @@ fn evaluate_temporal_predicates(
             tp001_passed,
             tp002_passed,
             tp003_passed,
+            cost_estimate_ticks: cost_estimate,
         }));
     }
 
@@ -1542,6 +1555,7 @@ fn check_structural_constraints(
     tp001_passed: bool,
     tp002_passed: bool,
     tp003_passed: bool,
+    cost_estimate_ticks: Option<u64>,
 ) -> Result<(), QueueAdmissionDecision> {
     let mk_ctx = |reason: &'static str| DenyContext {
         lane: Some(lane),
@@ -1553,6 +1567,7 @@ fn check_structural_constraints(
         tp001_passed,
         tp002_passed,
         tp003_passed,
+        cost_estimate_ticks,
     };
 
     // Tick-floor invariants for guaranteed lanes
@@ -1607,6 +1622,7 @@ pub fn evaluate_anti_entropy_admission(
         .map_or(ZERO_HASH, |e| e.content_hash);
     let boundary_id = &request.eval_window.boundary_id;
 
+    let cost_estimate = Some(request.cost);
     let mk_deny = |reason: &str, pred: Option<TemporalPredicateId>, tp001: bool, tp003: bool| {
         deny_queue(&DenyContext {
             lane: None,
@@ -1618,6 +1634,7 @@ pub fn evaluate_anti_entropy_admission(
             tp001_passed: tp001,
             tp002_passed: false,
             tp003_passed: tp003,
+            cost_estimate_ticks: cost_estimate,
         })
     };
 
@@ -1676,6 +1693,7 @@ pub fn evaluate_anti_entropy_admission(
         tp002_passed: false, // TP-002 not evaluated for anti-entropy
         tp003_passed,
         evaluated_at_tick: current_tick,
+        cost_estimate_ticks: Some(request.cost),
     };
 
     QueueAdmissionDecision {
@@ -1700,6 +1718,8 @@ struct DenyContext<'a> {
     tp001_passed: bool,
     tp002_passed: bool,
     tp003_passed: bool,
+    /// Cost estimate (in ticks) from the admission request for audit trail.
+    cost_estimate_ticks: Option<u64>,
 }
 
 fn deny_queue(ctx: &DenyContext<'_>) -> QueueAdmissionDecision {
@@ -1720,6 +1740,7 @@ fn deny_queue(ctx: &DenyContext<'_>) -> QueueAdmissionDecision {
         tp002_passed: ctx.tp002_passed,
         tp003_passed: ctx.tp003_passed,
         evaluated_at_tick: ctx.current_tick,
+        cost_estimate_ticks: ctx.cost_estimate_ticks,
     };
 
     QueueAdmissionDecision {
