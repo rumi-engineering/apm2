@@ -9,7 +9,7 @@ use crate::fac::GcReceiptV1;
 use crate::fac::blob_store::{BLOB_DIR, BlobStore};
 use crate::fac::flock_util::try_acquire_exclusive_nonblocking;
 use crate::fac::job_spec::parse_b3_256_digest;
-use crate::fac::lane::{LaneManager, LaneState};
+use crate::fac::lane::{LaneManager, LaneState, LaneStatusV1};
 use crate::fac::safe_rmtree::{
     MAX_DIR_ENTRIES, SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1,
 };
@@ -66,10 +66,29 @@ pub enum GcPlanError {
 /// # Errors
 ///
 /// Returns `GcPlanError::Io` when workspace inspection fails.
-#[allow(clippy::too_many_lines)]
 pub fn plan_gc(
     fac_root: &Path,
     lane_manager: &LaneManager,
+    quarantine_ttl_secs: u64,
+    denied_ttl_secs: u64,
+) -> Result<GcPlan, GcPlanError> {
+    let statuses = lane_manager
+        .all_lane_statuses()
+        .map_err(|error| GcPlanError::Io(error.to_string()))?;
+    plan_gc_with_statuses(
+        fac_root,
+        lane_manager,
+        statuses,
+        quarantine_ttl_secs,
+        denied_ttl_secs,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn plan_gc_with_statuses(
+    fac_root: &Path,
+    lane_manager: &LaneManager,
+    statuses: Vec<LaneStatusV1>,
     quarantine_ttl_secs: u64,
     denied_ttl_secs: u64,
 ) -> Result<GcPlan, GcPlanError> {
@@ -78,10 +97,6 @@ pub fn plan_gc(
         effective_retention_seconds(quarantine_ttl_secs, QUARANTINE_RETENTION_SECS);
     let effective_denied_ttl = effective_retention_seconds(denied_ttl_secs, DENIED_RETENTION_SECS);
     let now_secs = current_wall_clock_secs();
-
-    let statuses = lane_manager
-        .all_lane_statuses()
-        .map_err(|error| GcPlanError::Io(error.to_string()))?;
 
     for status in statuses {
         if status.state != LaneState::Idle {
@@ -903,7 +918,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::fac::lane::{LaneLeaseV1, LaneManager, LaneState};
+    use crate::fac::lane::{LaneManager, LaneState, LaneStatusV1};
 
     fn write_file(path: &Path, size: u64) {
         let file = std::fs::File::create(path).expect("create file");
@@ -934,25 +949,30 @@ mod tests {
 
         let lane_id = "lane-00";
         let lane_dir = lane_manager.lane_dir(lane_id);
-        let _lane_lock = lane_manager
-            .try_lock(lane_id)
-            .expect("lock")
-            .expect("acquired");
-        let lease = LaneLeaseV1::new(
-            lane_id,
-            "job-001",
-            1234,
-            LaneState::Running,
-            "2026-01-01T00:00:00Z",
-            "fp-lane",
-            "fp-toolchain",
-        )
-        .expect("lease");
-        lease.persist(&lane_dir).expect("persist lease");
+        let target_dir = lane_dir.join("target");
+        let log_dir = lane_dir.join("logs");
+        std::fs::create_dir_all(&target_dir).expect("target dir");
+        std::fs::create_dir_all(&log_dir).expect("log dir");
+        write_file(&target_dir.join("artifact.bin"), 128);
+        write_file(&log_dir.join("lane.log"), 32);
 
-        let plan = plan_gc(
+        let statuses = vec![LaneStatusV1 {
+            lane_id: lane_id.to_string(),
+            state: LaneState::Running,
+            job_id: Some("job-001".to_string()),
+            pid: Some(1234),
+            started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            toolchain_fingerprint: Some("fp-toolchain".to_string()),
+            lane_profile_hash: Some("fp-lane".to_string()),
+            corrupt_reason: None,
+            lock_held: true,
+            pid_alive: Some(true),
+        }];
+
+        let plan = plan_gc_with_statuses(
             &fac_root,
             &lane_manager,
+            statuses,
             QUARANTINE_RETENTION_SECS,
             DENIED_RETENTION_SECS,
         )
@@ -961,7 +981,7 @@ mod tests {
             !plan
                 .targets
                 .iter()
-                .any(|target| target.path.to_string_lossy().contains(lane_id)),
+                .any(|target| target.path == target_dir || target.path == log_dir),
             "running lanes must be skipped"
         );
     }
