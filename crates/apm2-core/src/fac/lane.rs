@@ -23,7 +23,8 @@
 //! - Lock acquisition is atomic and exclusive via `flock(LOCK_EX | LOCK_NB)`.
 //! - Lease records are persisted via atomic write (temp → rename).
 //! - Stale lease detection uses PID liveness checks (fail-closed).
-//! - Directories are created with mode 0o700 (CTR-2611).
+//! - Directories are created with mode 0o700 in operator mode and 0o770 in
+//!   system-mode (CTR-2611).
 //!
 //! # Invariants
 //!
@@ -48,6 +49,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::execution_backend::{ExecutionBackend, select_backend};
 use super::safe_rmtree::safe_rmtree_v1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1153,7 +1155,8 @@ impl LaneManager {
     }
 
     /// Ensure all lane directories and lock parent directories exist with
-    /// mode 0o700 (CTR-2611).
+    /// restrictive permissions (0o700 in operator mode, 0o770 in system-mode)
+    /// (CTR-2611).
     ///
     /// # Errors
     ///
@@ -1972,6 +1975,7 @@ fn apm2_home_dir() -> Result<PathBuf, String> {
 }
 
 /// Create a directory with restricted permissions (0o700) per CTR-2611.
+/// In system-mode, shared-group execution contexts require 0o770.
 ///
 /// Uses `DirBuilder` with mode set at create-time to avoid TOCTOU window.
 fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
@@ -1995,7 +1999,13 @@ fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(
+                if matches!(select_backend(), Ok(ExecutionBackend::SystemMode)) {
+                    0o770
+                } else {
+                    0o700
+                },
+            )
             .create(path)
             .map_err(|e| LaneError::io(format!("creating directory {}", path.display()), e))
     }
