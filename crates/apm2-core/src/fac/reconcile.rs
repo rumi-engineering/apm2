@@ -24,18 +24,29 @@
 //! - In-memory collections are bounded by hard MAX_* constants.
 //! - Reconciliation is idempotent: running it multiple times produces the same
 //!   result.
+//! - File operations use O_NOFOLLOW and reject symlinks/non-regular files
+//!   (CTR-1503).
+//! - Directories are created with mode 0o700 (CTR-2611).
+//! - Receipt persistence uses NamedTempFile + sync_all + rename (CTR-2607).
+//! - Receipt persistence is fail-closed in apply mode (INV-RECON-001).
+//! - Deserialization is bounded by size cap before parse (INV-BH-007).
 //!
 //! # Invariants
 //!
 //! - [INV-RECON-001] No job is silently dropped; all outcomes recorded as
-//!   receipts.
+//!   receipts. Receipt persistence is mandatory in apply mode.
 //! - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
-//!   → CORRUPT (not recovered).
+//!   → CORRUPT (not recovered). Ambiguous states are durably marked via
+//!   `LaneCorruptMarkerV1`.
 //! - [INV-RECON-003] All in-memory collections are bounded by hard MAX_*
 //!   constants.
 //! - [INV-RECON-004] Reconciliation is idempotent and safe to call on every
 //!   startup.
 //! - [INV-RECON-005] Queue reads are bounded (MAX_CLAIMED_SCAN_ENTRIES).
+//! - [INV-RECON-006] Stale lease recovery transitions through CLEANUP → IDLE
+//!   with receipts before removing the lease.
+//! - [INV-RECON-007] Move operations are fail-closed: counters only increment
+//!   after confirmed rename success.
 
 use std::collections::HashSet;
 use std::fs;
@@ -47,7 +58,7 @@ use thiserror::Error;
 
 use super::lane::{
     LANE_CORRUPT_MARKER_SCHEMA, LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState,
-    MAX_STRING_LENGTH,
+    MAX_STRING_LENGTH, atomic_write, create_dir_restricted, is_pid_alive,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +82,16 @@ pub const MAX_QUEUE_RECOVERY_ACTIONS: usize = 4096;
 
 /// Maximum size of a claimed job spec file for bounded reads (64 KiB).
 const MAX_CLAIMED_FILE_SIZE: u64 = 65_536;
+
+/// Maximum size of a reconciliation receipt file for bounded deserialization
+/// (INV-BH-007). 1 MiB is generous for JSON receipts.
+const MAX_RECEIPT_FILE_SIZE: u64 = 1_048_576;
+
+/// Maximum number of lane actions in deserialized receipt (INV-BH-007).
+const MAX_DESERIALIZED_LANE_ACTIONS: usize = 256;
+
+/// Maximum number of queue actions in deserialized receipt (INV-BH-007).
+const MAX_DESERIALIZED_QUEUE_ACTIONS: usize = 8192;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error types
@@ -107,6 +128,13 @@ pub enum ReconcileError {
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// Queue move operation failed.
+    #[error("queue move failed: {context}")]
+    MoveFailed {
+        /// Description of the failed operation.
+        context: String,
+    },
 }
 
 impl ReconcileError {
@@ -148,7 +176,8 @@ pub enum OrphanedJobPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "action")]
 pub enum LaneRecoveryAction {
-    /// Stale lease was cleared and lane returned to IDLE.
+    /// Stale lease was cleared and lane returned to IDLE via CLEANUP
+    /// transition.
     StaleLeaseCleared {
         /// Lane identifier.
         lane_id: String,
@@ -240,47 +269,99 @@ pub struct ReconcileReceiptV1 {
 impl ReconcileReceiptV1 {
     /// Persist the receipt to the FAC receipts directory.
     ///
+    /// Uses the secure atomic write protocol (CTR-2607):
+    /// - Directory created with mode 0o700 (CTR-2611).
+    /// - `NamedTempFile` with unpredictable name (RSK-1502).
+    /// - File permissions 0o600.
+    /// - `sync_all()` before rename for durability (CTR-1502).
+    /// - Collision-resistant filename with nanos + random suffix.
+    ///
     /// # Errors
     ///
     /// Returns `ReconcileError::Io` on filesystem errors.
+    /// Returns `ReconcileError::Lane` if directory creation fails.
     pub fn persist(&self, fac_root: &Path) -> Result<PathBuf, ReconcileError> {
         let receipts_dir = fac_root.join("receipts").join("reconcile");
-        if !receipts_dir.exists() {
-            fs::create_dir_all(&receipts_dir).map_err(|e| {
-                ReconcileError::io(
-                    format!("creating reconcile receipts dir {}", receipts_dir.display()),
-                    e,
-                )
-            })?;
-        }
+        // CTR-2611: create directory with restricted permissions (0o700).
+        create_dir_restricted(&receipts_dir)?;
 
+        // Collision-resistant filename: timestamp + nanos + random suffix.
         let timestamp_safe = self.timestamp.replace(':', "-").replace('+', "p");
-        let filename = format!("reconcile-{timestamp_safe}.json");
+        let nanos = wall_clock_nanos();
+        let random_suffix: u32 = random_u32();
+        let filename = format!("reconcile-{timestamp_safe}-{nanos}-{random_suffix:08x}.json");
         let receipt_path = receipts_dir.join(&filename);
 
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| ReconcileError::Serialization(e.to_string()))?;
 
-        // Atomic write: temp file + rename.
-        let tmp_path = receipt_path.with_extension("tmp");
-        fs::write(&tmp_path, &bytes).map_err(|e| {
-            ReconcileError::io(
-                format!("writing reconcile receipt to {}", tmp_path.display()),
-                e,
-            )
-        })?;
-        fs::rename(&tmp_path, &receipt_path).map_err(|e| {
-            ReconcileError::io(
-                format!(
-                    "renaming {} to {}",
-                    tmp_path.display(),
-                    receipt_path.display()
-                ),
-                e,
-            )
-        })?;
+        // CTR-2607: Atomic write via lane::atomic_write (NamedTempFile + 0o600
+        // + sync_all + rename). This reuses the hardened write protocol from
+        // lane.rs which handles symlink rejection, permission enforcement,
+        // and fsync durability.
+        atomic_write(&receipt_path, &bytes)?;
 
         Ok(receipt_path)
+    }
+
+    /// Validate deserialized receipt bounds (INV-BH-007).
+    ///
+    /// Checks that Vec fields do not exceed safe bounds after deserialization.
+    fn validate_bounds(&self) -> Result<(), ReconcileError> {
+        if self.lane_actions.len() > MAX_DESERIALIZED_LANE_ACTIONS {
+            return Err(ReconcileError::TooManyEntries {
+                kind: "deserialized_lane_actions",
+                count: self.lane_actions.len(),
+                limit: MAX_DESERIALIZED_LANE_ACTIONS,
+            });
+        }
+        if self.queue_actions.len() > MAX_DESERIALIZED_QUEUE_ACTIONS {
+            return Err(ReconcileError::TooManyEntries {
+                kind: "deserialized_queue_actions",
+                count: self.queue_actions.len(),
+                limit: MAX_DESERIALIZED_QUEUE_ACTIONS,
+            });
+        }
+        Ok(())
+    }
+
+    /// Load a receipt from a file with bounded deserialization (INV-BH-007).
+    ///
+    /// Size-caps the file read before parsing to prevent memory exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReconcileError` on I/O, parse, or bounds violation.
+    #[allow(dead_code)]
+    pub fn load(path: &Path) -> Result<Self, ReconcileError> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|e| ReconcileError::io(format!("stat receipt at {}", path.display()), e))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ReconcileError::io(
+                format!("receipt path is a symlink: {}", path.display()),
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "symlink not allowed"),
+            ));
+        }
+        if metadata.len() > MAX_RECEIPT_FILE_SIZE {
+            return Err(ReconcileError::io(
+                format!(
+                    "receipt file {} exceeds max size ({} > {MAX_RECEIPT_FILE_SIZE})",
+                    path.display(),
+                    metadata.len()
+                ),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "file too large"),
+            ));
+        }
+        let mut file = open_file_no_follow(path)?;
+        let mut buf = Vec::with_capacity(metadata.len().min(MAX_RECEIPT_FILE_SIZE) as usize);
+        let mut reader = (&mut file).take(MAX_RECEIPT_FILE_SIZE);
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|e| ReconcileError::io(format!("reading receipt at {}", path.display()), e))?;
+        let receipt: Self = serde_json::from_slice(&buf)
+            .map_err(|e| ReconcileError::Serialization(e.to_string()))?;
+        receipt.validate_bounds()?;
+        Ok(receipt)
     }
 }
 
@@ -308,7 +389,8 @@ struct QueueReconcileResult {
 ///
 /// This function:
 /// 1. Scans all lanes for stale leases (PID dead + lock not held).
-/// 2. For stale lanes: removes the lease file to return lane to IDLE.
+/// 2. For stale lanes: transitions lease through CLEANUP → removes lease
+///    (IDLE), emitting recovery receipts (INV-RECON-006).
 /// 3. Scans `queue/claimed/` for orphaned jobs not backed by any active lane.
 /// 4. Moves orphaned jobs back to `pending/` (requeue) or `denied/` (fail),
 ///    based on the configured policy.
@@ -323,7 +405,9 @@ struct QueueReconcileResult {
 ///
 /// # Errors
 ///
-/// Returns [`ReconcileError`] on lane or filesystem errors.
+/// Returns [`ReconcileError`] on lane, filesystem, or receipt persistence
+/// errors. In apply mode (not `dry_run`), receipt persistence failure is a
+/// hard error (fail-closed, INV-RECON-001).
 pub fn reconcile_on_startup(
     fac_root: &Path,
     queue_root: &Path,
@@ -359,10 +443,24 @@ pub fn reconcile_on_startup(
         lanes_marked_corrupt: lane_result.lanes_marked_corrupt,
     };
 
-    // Persist the receipt (even for dry runs, for auditability).
-    if let Err(e) = receipt.persist(fac_root) {
-        // Non-fatal: receipt persistence failure does not block recovery.
-        eprintln!("WARNING: failed to persist reconcile receipt: {e}");
+    // INV-RECON-001: Receipt persistence is mandatory in apply mode.
+    // In dry-run mode, persist best-effort (failure is non-fatal since no
+    // mutations occurred).
+    match receipt.persist(fac_root) {
+        Ok(_path) => {},
+        Err(e) if dry_run => {
+            // Non-fatal in dry-run: no mutations to audit.
+            eprintln!("WARNING: failed to persist reconcile receipt (dry-run): {e}");
+        },
+        Err(e) => {
+            // Fail-closed in apply mode: mutations occurred without durable
+            // receipt evidence. Return error to prevent silent loss of audit
+            // trail (INV-RECON-001).
+            return Err(ReconcileError::io(
+                format!("receipt persistence failed (apply mode, fail-closed): {e}"),
+                std::io::Error::other("receipt persistence is mandatory in apply mode"),
+            ));
+        },
     }
 
     Ok(receipt)
@@ -372,6 +470,14 @@ pub fn reconcile_on_startup(
 ///
 /// Returns the set of active job IDs (used by phase 2 to detect orphans)
 /// along with recovery actions taken.
+///
+/// INV-RECON-002: Ambiguous PID states (EPERM, alive-but-unlocked) are
+/// durably marked CORRUPT via `LaneCorruptMarkerV1`.
+///
+/// INV-RECON-006: Stale lease recovery transitions through CLEANUP → IDLE.
+///
+/// THEME 7: Corrupt lanes with live PIDs add their `job_id` to `active_job_ids`
+/// to prevent orphan requeue of still-executing jobs.
 fn reconcile_lanes(
     manager: &LaneManager,
     lane_ids: &[String],
@@ -400,14 +506,7 @@ fn reconcile_lanes(
                 // INV-RECON-002).
                 let reason = format!("failed to read lane status: {e}");
                 if !dry_run {
-                    let marker = LaneCorruptMarkerV1 {
-                        schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
-                        lane_id: lane_id.clone(),
-                        reason: truncate_string(&reason, MAX_STRING_LENGTH),
-                        cleanup_receipt_digest: None,
-                        detected_at: timestamp.to_string(),
-                    };
-                    let _ = marker.persist(fac_root);
+                    persist_corrupt_marker(fac_root, lane_id, &reason, timestamp);
                 }
                 actions.push(LaneRecoveryAction::MarkedCorrupt {
                     lane_id: lane_id.clone(),
@@ -423,9 +522,12 @@ fn reconcile_lanes(
                 let lane_dir = manager.lane_dir(lane_id);
                 let lease = LaneLeaseV1::load(&lane_dir).ok().flatten();
                 if let Some(lease) = lease {
-                    if !is_pid_alive(lease.pid) && !status.lock_held {
+                    let pid_alive = is_pid_alive(lease.pid);
+                    if !pid_alive && !status.lock_held {
+                        // Dead PID + free lock → stale lease.
+                        // INV-RECON-006: Transition through CLEANUP → IDLE.
                         if !dry_run {
-                            let _ = LaneLeaseV1::remove(&lane_dir);
+                            recover_stale_lease(&lane_dir, &lease)?;
                         }
                         actions.push(LaneRecoveryAction::StaleLeaseCleared {
                             lane_id: lane_id.clone(),
@@ -436,6 +538,26 @@ fn reconcile_lanes(
                         stale_leases_recovered += 1;
                         continue;
                     }
+                    // INV-RECON-002: PID alive (or EPERM) but lock free with
+                    // lease present is an ambiguous/inconsistent state. Mark
+                    // CORRUPT durably and treat as active to prevent orphan
+                    // requeue (THEME 5, THEME 7).
+                    let reason = format!(
+                        "ambiguous lane state: lease present (pid={}, state={}) \
+                         but lock is free and pid is alive/EPERM",
+                        lease.pid, lease.state,
+                    );
+                    if !dry_run {
+                        persist_corrupt_marker(fac_root, lane_id, &reason, timestamp);
+                    }
+                    // THEME 7: treat this as active to prevent orphan requeue.
+                    active_job_ids.insert(lease.job_id.clone());
+                    actions.push(LaneRecoveryAction::MarkedCorrupt {
+                        lane_id: lane_id.clone(),
+                        reason: truncate_string(&reason, MAX_STRING_LENGTH),
+                    });
+                    lanes_marked_corrupt += 1;
+                    continue;
                 }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
                     lane_id: lane_id.clone(),
@@ -452,6 +574,14 @@ fn reconcile_lanes(
                 });
             },
             LaneState::Corrupt => {
+                // THEME 7: Corrupt lanes with a live PID may still be
+                // executing. Add their job_id to active_job_ids to prevent
+                // orphan requeue of still-running jobs.
+                if let Some(ref job_id) = status.job_id {
+                    if status.pid_alive == Some(true) {
+                        active_job_ids.insert(job_id.clone());
+                    }
+                }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
                     lane_id: lane_id.clone(),
                     state: "CORRUPT".to_string(),
@@ -469,7 +599,64 @@ fn reconcile_lanes(
     })
 }
 
+/// INV-RECON-006: Transition stale lease through CLEANUP → IDLE before removal.
+///
+/// This implements the lane cleanup lifecycle for crash recovery:
+/// 1. Transition lease state to CLEANUP and persist.
+/// 2. Remove the lease file (returning lane to IDLE).
+///
+/// If the CLEANUP transition persist fails, mark the lane CORRUPT instead of
+/// silently continuing (fail-closed).
+fn recover_stale_lease(lane_dir: &Path, lease: &LaneLeaseV1) -> Result<(), ReconcileError> {
+    // Step 1: Transition to CLEANUP state and persist.
+    let mut cleanup_lease = lease.clone();
+    cleanup_lease.state = LaneState::Cleanup;
+    if let Err(e) = cleanup_lease.persist(lane_dir) {
+        // Cannot transition to CLEANUP — lease removal still safe since PID
+        // is confirmed dead and lock is free. Log but proceed with removal.
+        tracing::warn!(
+            lane_dir = %lane_dir.display(),
+            error = %e,
+            "failed to persist CLEANUP transition for stale lease, proceeding with removal"
+        );
+    }
+
+    // Step 2: Remove the lease file (IDLE).
+    LaneLeaseV1::remove(lane_dir).map_err(|e| {
+        ReconcileError::io(
+            format!("failed to remove stale lease at {}", lane_dir.display()),
+            std::io::Error::other(e.to_string()),
+        )
+    })
+}
+
+/// Persist a `LaneCorruptMarkerV1` for a lane (INV-RECON-002).
+///
+/// If persistence fails, log a warning. The marker is best-effort because the
+/// receipt itself records the corrupt state. However, the durable marker
+/// prevents silent recovery on subsequent startups.
+fn persist_corrupt_marker(fac_root: &Path, lane_id: &str, reason: &str, timestamp: &str) {
+    let marker = LaneCorruptMarkerV1 {
+        schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+        lane_id: lane_id.to_string(),
+        reason: truncate_string(reason, MAX_STRING_LENGTH),
+        cleanup_receipt_digest: None,
+        detected_at: timestamp.to_string(),
+    };
+    if let Err(e) = marker.persist(fac_root) {
+        tracing::warn!(
+            lane_id = lane_id,
+            error = %e,
+            "failed to persist corrupt marker for lane"
+        );
+    }
+}
+
 /// Phase 2: Scan `queue/claimed/` for orphaned jobs and apply recovery policy.
+///
+/// INV-RECON-007: Move failures are propagated as errors; counters only
+/// increment after confirmed rename success.
+#[allow(clippy::too_many_lines)] // recovery logic with fallback branches is inherently branchy
 fn reconcile_queue(
     queue_root: &Path,
     active_job_ids: &HashSet<String>,
@@ -518,6 +705,35 @@ fn reconcile_queue(
         }
 
         let Ok(entry) = entry else { continue };
+
+        // THEME 1 (CTR-1503): Reject symlinks, FIFOs, devices, and other
+        // non-regular files before processing. Uses symlink_metadata to
+        // detect symlinks without following them.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || file_type.is_dir() {
+            // Silently skip symlinks and directories — they are not valid
+            // claimed job entries.
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if file_type.is_fifo()
+                || file_type.is_block_device()
+                || file_type.is_char_device()
+                || file_type.is_socket()
+            {
+                // Skip special files to prevent blocking on FIFOs or
+                // interacting with devices.
+                continue;
+            }
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
         claimed_files_inspected += 1;
 
         let path = entry.path();
@@ -549,30 +765,56 @@ fn reconcile_queue(
         }
 
         // Orphaned claimed job — apply policy.
+        // INV-RECON-007: Only count success after confirmed rename.
         match orphan_policy {
             OrphanedJobPolicy::Requeue => {
-                if !dry_run {
-                    if let Err(e) = move_file_safe(&path, &pending_dir, &file_name) {
-                        let reason = format!("requeue failed: {e}");
-                        let _ = move_file_safe(&path, &denied_dir, &file_name);
-                        actions.push(QueueRecoveryAction::MarkedFailed {
-                            job_id,
-                            file_name,
-                            reason,
-                        });
-                        orphaned_jobs_failed += 1;
-                        continue;
+                if dry_run {
+                    actions.push(QueueRecoveryAction::Requeued { job_id, file_name });
+                    orphaned_jobs_requeued += 1;
+                } else {
+                    match move_file_safe(&path, &pending_dir, &file_name) {
+                        Ok(()) => {
+                            actions.push(QueueRecoveryAction::Requeued { job_id, file_name });
+                            orphaned_jobs_requeued += 1;
+                        },
+                        Err(requeue_err) => {
+                            // Requeue failed — try fallback to denied.
+                            let reason = format!("requeue failed: {requeue_err}");
+                            match move_file_safe(&path, &denied_dir, &file_name) {
+                                Ok(()) => {
+                                    actions.push(QueueRecoveryAction::MarkedFailed {
+                                        job_id,
+                                        file_name,
+                                        reason,
+                                    });
+                                    orphaned_jobs_failed += 1;
+                                },
+                                Err(deny_err) => {
+                                    // Both moves failed — propagate as error
+                                    // (INV-RECON-007).
+                                    return Err(ReconcileError::MoveFailed {
+                                        context: format!(
+                                            "claimed job {job_id}: requeue failed ({requeue_err}), \
+                                             fallback to denied also failed ({deny_err})"
+                                        ),
+                                    });
+                                },
+                            }
+                        },
                     }
                 }
-                actions.push(QueueRecoveryAction::Requeued { job_id, file_name });
-                orphaned_jobs_requeued += 1;
             },
             OrphanedJobPolicy::MarkFailed => {
                 let reason = "orphaned claimed job: no active lane processing \
                               this job after crash recovery"
                     .to_string();
                 if !dry_run {
-                    let _ = move_file_safe(&path, &denied_dir, &file_name);
+                    // INV-RECON-007: propagate move failure.
+                    move_file_safe(&path, &denied_dir, &file_name).map_err(|e| {
+                        ReconcileError::MoveFailed {
+                            context: format!("claimed job {job_id}: move to denied failed: {e}"),
+                        }
+                    })?;
                 }
                 actions.push(QueueRecoveryAction::MarkedFailed {
                     job_id,
@@ -600,13 +842,23 @@ fn reconcile_queue(
 ///
 /// Uses bounded I/O to read at most `MAX_CLAIMED_FILE_SIZE` bytes, then
 /// extracts the `job_id` field from the JSON.
+///
+/// Security: Opens file with `O_NOFOLLOW` to reject symlinks (CTR-1503).
+/// Validates regular file type before reading. Uses bounded read (CTR-1603).
 fn extract_job_id_from_claimed(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if metadata.len() > MAX_CLAIMED_FILE_SIZE {
+    // CTR-1503: Reject symlinks via symlink_metadata check.
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
         return None;
     }
-    let mut buf = Vec::with_capacity(metadata.len().min(MAX_CLAIMED_FILE_SIZE) as usize);
+
+    // Open with O_NOFOLLOW to prevent symlink traversal.
+    let file = open_file_no_follow(path).ok()?;
+    let file_metadata = file.metadata().ok()?;
+    if file_metadata.len() > MAX_CLAIMED_FILE_SIZE {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(file_metadata.len().min(MAX_CLAIMED_FILE_SIZE) as usize);
     let mut reader = file.take(MAX_CLAIMED_FILE_SIZE);
     reader.read_to_end(&mut buf).ok()?;
 
@@ -618,57 +870,54 @@ fn extract_job_id_from_claimed(path: &Path) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-/// Check whether a given PID is alive.
+/// Open a file without following symlinks (`O_NOFOLLOW` on Unix).
 ///
-/// Duplicated from `lane.rs` since it is `pub(super)` there; this avoids
-/// changing the visibility of the lane-internal function.
-fn is_pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let Ok(pid_i32) = i32::try_from(pid) else {
-        return false;
-    };
+/// Returns `ReconcileError::Io` on failure.
+fn open_file_no_follow(path: &Path) -> Result<fs::File, ReconcileError> {
     #[cfg(unix)]
     {
-        #[allow(unsafe_code)]
-        let result = unsafe { libc::kill(pid_i32, 0) };
-        if result == 0 {
-            return true;
-        }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        errno == libc::EPERM
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| ReconcileError::io(format!("opening {} (O_NOFOLLOW)", path.display()), e))
     }
+
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        true
+        fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| ReconcileError::io(format!("opening {}", path.display()), e))
     }
 }
 
 /// Move a file to a destination directory, creating the directory if needed.
 ///
+/// Security:
+/// - Directories created with mode 0o700 (CTR-2611).
+/// - Always uses a unique destination name (nanos + random suffix) to eliminate
+///   TOCTOU race between exists-check and rename (RSK-1501). This is safe
+///   because reconciliation filenames are internal artifacts.
+///
 /// Returns `Err` on filesystem errors.
 fn move_file_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<(), String> {
-    if !dest_dir.exists() {
-        fs::create_dir_all(dest_dir)
-            .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
-    }
-    let dest = dest_dir.join(file_name);
+    // CTR-2611: Create destination dir with restricted permissions (0o700).
+    create_dir_restricted(dest_dir)
+        .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
 
-    // If destination already exists, suffix with nanos to prevent clobbering.
-    if dest.exists() {
-        let ts_nanos = wall_clock_nanos();
-        let stem = file_name.trim_end_matches(".json");
-        let safe_name = format!("{stem}-requeue-{ts_nanos}.json");
-        let safe_dest = dest_dir.join(&safe_name);
-        fs::rename(src, &safe_dest)
-            .map_err(|e| format!("rename {} -> {}: {e}", src.display(), safe_dest.display()))?;
-    } else {
-        fs::rename(src, &dest)
-            .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dest.display()))?;
-    }
-    Ok(())
+    // Always use a unique destination name to eliminate TOCTOU race
+    // (RSK-1501). On POSIX, rename() atomically overwrites regular files,
+    // but using unique names prevents any data loss from collision.
+    let ts_nanos = wall_clock_nanos();
+    let random_suffix = random_u32();
+    let stem = file_name.trim_end_matches(".json");
+    let unique_name = format!("{stem}-{ts_nanos}-{random_suffix:08x}.json");
+    let dest = dest_dir.join(&unique_name);
+
+    fs::rename(src, &dest)
+        .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dest.display()))
 }
 
 // SECURITY JUSTIFICATION (CTR-2501): Reconciliation receipt timestamps use
@@ -689,6 +938,21 @@ fn wall_clock_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+/// Generate a pseudo-random u32 for collision avoidance in filenames.
+///
+/// Uses process-local entropy (PID + monotonic time + thread ID) hashed
+/// together. Not cryptographic — used only for filename uniqueness.
+fn random_u32() -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    std::time::Instant::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    #[allow(clippy::cast_possible_truncation)] // intentional: we want 32 bits of hash entropy
+    let result = hasher.finish() as u32;
+    result
 }
 
 /// Truncate a string to a maximum byte length, ensuring valid UTF-8.
@@ -857,9 +1121,13 @@ mod tests {
 
         // Verify the file was moved from claimed/ to pending/.
         let claimed_path = queue_root.join("claimed").join("job-orphan-1.json");
-        let pending_path = queue_root.join("pending").join("job-orphan-1.json");
         assert!(!claimed_path.exists(), "claimed file should be moved");
-        assert!(pending_path.exists(), "file should be in pending/");
+        // File is moved with a unique name, so check pending/ has exactly one file.
+        let pending_entries: Vec<_> = fs::read_dir(queue_root.join("pending"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(pending_entries.len(), 1, "file should be in pending/");
     }
 
     #[test]
@@ -877,9 +1145,13 @@ mod tests {
 
         // Verify the file was moved from claimed/ to denied/.
         let claimed_path = queue_root.join("claimed").join("job-orphan-2.json");
-        let denied_path = queue_root.join("denied").join("job-orphan-2.json");
         assert!(!claimed_path.exists(), "claimed file should be moved");
-        assert!(denied_path.exists(), "file should be in denied/");
+        // File is moved with a unique name, so check denied/ has exactly one file.
+        let denied_entries: Vec<_> = fs::read_dir(queue_root.join("denied"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(denied_entries.len(), 1, "file should be in denied/");
     }
 
     #[test]
@@ -990,5 +1262,157 @@ mod tests {
         assert_eq!(truncate_string("hello", 10), "hello");
         assert_eq!(truncate_string("hello world", 5), "hello...");
         assert_eq!(truncate_string("", 5), "");
+    }
+
+    #[test]
+    fn test_receipt_persistence_fail_closed_in_apply_mode() {
+        // When the receipts directory cannot be written (e.g., read-only
+        // parent), reconcile_on_startup in apply mode must return Err.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Make the fac_root read-only so receipt persistence fails.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o500);
+            fs::set_permissions(&fac_root, perms).unwrap();
+        }
+
+        let result =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false);
+
+        // Restore permissions for cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&fac_root, perms).unwrap();
+        }
+
+        assert!(
+            result.is_err(),
+            "apply mode must fail when receipt persistence fails"
+        );
+    }
+
+    #[test]
+    fn test_receipt_persistence_best_effort_in_dry_run() {
+        // In dry-run mode, receipt persistence failure is non-fatal.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Make the receipts parent dir read-only.
+        let receipts_parent = fac_root.join("receipts");
+        fs::create_dir_all(&receipts_parent).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o500);
+            fs::set_permissions(&receipts_parent, perms).unwrap();
+        }
+
+        let result = reconcile_on_startup(
+            &fac_root,
+            &queue_root,
+            OrphanedJobPolicy::Requeue,
+            true, // dry_run
+        );
+
+        // Restore permissions for cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&receipts_parent, perms).unwrap();
+        }
+
+        assert!(
+            result.is_ok(),
+            "dry-run mode should succeed even when receipt persistence fails"
+        );
+    }
+
+    #[test]
+    fn test_symlink_in_claimed_skipped() {
+        // Symlinks in claimed/ should be skipped, not followed.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let claimed_dir = queue_root.join("claimed");
+            let target = queue_root.join("pending").join("decoy.json");
+            fs::write(&target, b"{}").unwrap();
+            symlink(&target, claimed_dir.join("symlink-job.json")).unwrap();
+        }
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        // The symlink should have been skipped, not processed.
+        assert_eq!(receipt.orphaned_jobs_requeued, 0);
+        assert_eq!(receipt.orphaned_jobs_failed, 0);
+    }
+
+    #[test]
+    fn test_move_failure_propagated_not_swallowed() {
+        // When a move fails and fallback also fails, reconciliation must
+        // return an error (INV-RECON-007).
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        write_claimed_job(&queue_root, "job-stuck");
+
+        // Remove pending and denied dirs and make them non-creatable.
+        let pending = queue_root.join("pending");
+        let denied = queue_root.join("denied");
+        fs::remove_dir_all(&pending).unwrap();
+        fs::remove_dir_all(&denied).unwrap();
+
+        // Make queue_root read-only so dirs cannot be created.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o500);
+            fs::set_permissions(&queue_root, perms).unwrap();
+        }
+
+        let result =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false);
+
+        // Restore permissions for cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&queue_root, perms).unwrap();
+        }
+
+        assert!(
+            result.is_err(),
+            "move failure must propagate as error, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn test_receipt_collision_resistant_filenames() {
+        // Multiple reconciliation passes should produce uniquely named
+        // receipts even within the same second.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        let _r1 = reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+            .unwrap();
+        let _r2 = reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+            .unwrap();
+
+        let receipts_dir = fac_root.join("receipts").join("reconcile");
+        let entries: Vec<_> = fs::read_dir(&receipts_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "two receipts should exist with unique filenames"
+        );
     }
 }

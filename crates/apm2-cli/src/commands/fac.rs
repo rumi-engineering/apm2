@@ -2478,7 +2478,8 @@ fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
 
     let Some(home) = resolve_apm2_home() else {
         if json_output {
-            println!("{{\"error\": \"cannot resolve APM2 home\"}}");
+            let err_json = serde_json::json!({"error": "cannot resolve APM2 home"});
+            println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
         } else {
             eprintln!("ERROR: cannot resolve APM2 home directory");
         }
@@ -2493,9 +2494,10 @@ fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
         "mark-failed" => OrphanedJobPolicy::MarkFailed,
         other => {
             if json_output {
-                println!(
-                    "{{\"error\": \"invalid orphan-policy: {other}, expected requeue or mark-failed\"}}"
-                );
+                let err_json = serde_json::json!({
+                    "error": format!("invalid orphan-policy: {other}, expected requeue or mark-failed")
+                });
+                println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
             } else {
                 eprintln!(
                     "ERROR: invalid --orphan-policy '{other}', expected 'requeue' or 'mark-failed'"
@@ -2511,7 +2513,9 @@ fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
     if !dry_run && args.dry_run {
         // Contradiction: both --dry-run and --apply specified.
         if json_output {
-            println!("{{\"error\": \"cannot specify both --dry-run and --apply\"}}");
+            let err_json =
+                serde_json::json!({"error": "cannot specify both --dry-run and --apply"});
+            println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
         } else {
             eprintln!("ERROR: cannot specify both --dry-run and --apply");
         }
@@ -2553,7 +2557,8 @@ fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
         },
         Err(e) => {
             if json_output {
-                println!("{{\"error\": \"{e}\"}}");
+                let err_json = serde_json::json!({"error": e.to_string()});
+                println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
             } else {
                 eprintln!("ERROR: reconciliation failed: {e}");
             }

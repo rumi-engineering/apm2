@@ -1893,7 +1893,7 @@ fn derive_lane_state(
 ///
 /// Uses `kill(pid, 0)` which checks for process existence without sending a
 /// signal.
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -1980,7 +1980,7 @@ fn apm2_home_dir() -> Result<PathBuf, String> {
 /// In system-mode, shared-group execution contexts require 0o770.
 ///
 /// Uses `DirBuilder` with mode set at create-time to avoid TOCTOU window.
-fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
+pub(crate) fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
     ensure_safe_path(path, "create_dir_restricted")?;
 
     if let Ok(metadata) = fs::symlink_metadata(path) {
@@ -2027,7 +2027,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), LaneError> {
 }
 
 /// Atomic write: write to temp file then rename (CTR-2607).
-fn atomic_write(target: &Path, data: &[u8]) -> Result<(), LaneError> {
+pub(crate) fn atomic_write(target: &Path, data: &[u8]) -> Result<(), LaneError> {
     ensure_safe_path(target, "atomic_write")?;
     ensure_parent_dir(target)?;
     if let Ok(metadata) = fs::symlink_metadata(target) {
@@ -2077,7 +2077,7 @@ fn atomic_write(target: &Path, data: &[u8]) -> Result<(), LaneError> {
 ///
 /// Streams into a bounded buffer to prevent memory exhaustion from crafted
 /// files.
-fn bounded_read_file(path: &Path, max_size: u64) -> Result<Vec<u8>, LaneError> {
+pub(crate) fn bounded_read_file(path: &Path, max_size: u64) -> Result<Vec<u8>, LaneError> {
     ensure_safe_path(path, "bounded_read_file")?;
     let mut file = open_file_no_follow(path)?;
     let mut buf = Vec::new();

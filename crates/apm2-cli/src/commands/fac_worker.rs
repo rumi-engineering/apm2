@@ -559,17 +559,19 @@ pub fn run_fac_worker(
                 }
             },
             Err(e) => {
-                // Reconciliation errors are non-fatal — the worker can still
-                // process new jobs even if recovery fails. Log the error but
-                // continue startup.
+                // Reconciliation failure is fatal: the worker must not process
+                // new jobs while queue/lane state may be inconsistent from a
+                // prior crash. Fail-closed to prevent duplicate execution or
+                // stale state interference (INV-RECON-001, INV-RECON-002).
                 if json_output {
                     emit_worker_event(
                         "reconcile_error",
                         serde_json::json!({ "error": e.to_string() }),
                     );
                 } else {
-                    eprintln!("WARNING: reconciliation failed: {e}");
+                    eprintln!("ERROR: reconciliation failed, cannot start worker: {e}");
                 }
+                return exit_codes::GENERIC_ERROR;
             },
         }
     }

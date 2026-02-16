@@ -1284,7 +1284,7 @@ inconsistencies deterministically on worker startup.
 ### Key Types
 
 - `ReconcileError`: Error taxonomy covering lane errors, I/O failures, bounded
-  collection overflow, and serialization errors.
+  collection overflow, serialization errors, and move failures (`MoveFailed`).
 - `OrphanedJobPolicy`: Policy enum for handling claimed jobs without a running
   lane (`Requeue` or `MarkFailed`). Default is `Requeue`.
 - `LaneRecoveryAction`: Per-lane action taken during reconciliation
@@ -1300,27 +1300,66 @@ inconsistencies deterministically on worker startup.
 - `reconcile_on_startup(fac_root, queue_root, orphan_policy, dry_run)`: Main
   entry point. Runs two-phase recovery:
   1. **Lane reconciliation** (`reconcile_lanes`): Scans all lanes for stale
-     leases (PID dead + lock not held). Stale leases are removed to return lanes
-     to IDLE. Ambiguous PID state (EPERM) triggers CORRUPT marking (fail-closed).
+     leases (PID dead + lock not held). Stale leases are recovered through
+     the CLEANUP state transition (`recover_stale_lease`) to reach IDLE.
+     Ambiguous PID state (EPERM) triggers durable CORRUPT marking
+     (fail-closed) with `LaneCorruptMarkerV1` persistence.
   2. **Queue reconciliation** (`reconcile_queue`): Scans `queue/claimed/` for
-     orphaned jobs not backed by any active lane. Applies configured policy
-     (requeue to `pending/` or mark failed to `denied/`).
-- Dry-run mode: report what would be done without mutating state.
+     orphaned jobs not backed by any active lane. Rejects symlinks and
+     non-regular file types. Applies configured policy (requeue to `pending/`
+     or mark failed to `denied/`). Move failures are propagated, not swallowed.
+- `ReconcileReceiptV1::load()`: Bounded receipt deserialization with size cap
+  and post-parse bounds validation.
+- Dry-run mode: report what would be done without mutating state (receipt
+  persistence is best-effort).
+- Apply mode: receipt persistence is mandatory (fail-closed).
 - Idempotent: running reconciliation multiple times produces correct results.
 - Called automatically on worker startup with `OrphanedJobPolicy::Requeue`.
+  Worker startup aborts if reconciliation fails.
 - CLI: `apm2 fac reconcile --dry-run|--apply [--orphan-policy requeue|mark-failed]`.
 
 ### Security Invariants (TCK-00534)
 
 - [INV-RECON-001] No job is silently dropped; all outcomes recorded as receipts.
+  Receipt persistence is mandatory in apply mode (fail-closed); dry-run mode
+  uses best-effort persistence. Worker startup aborts on reconciliation failure
+  to prevent processing jobs with inconsistent queue/lane state.
 - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
-  (EPERM) marks lane CORRUPT (not recovered).
+  (EPERM) marks lane CORRUPT (not recovered). Corrupt lanes with alive PIDs
+  contribute their job_id to the active_job_ids set, preventing queue
+  reconciliation from treating those jobs as orphans.
 - [INV-RECON-003] All in-memory collections are bounded by hard `MAX_*`
   constants (`MAX_LANE_RECOVERY_ACTIONS=64`,
-  `MAX_QUEUE_RECOVERY_ACTIONS=4096`).
+  `MAX_QUEUE_RECOVERY_ACTIONS=4096`). Receipt deserialization enforces
+  `MAX_RECEIPT_FILE_SIZE` (1 MiB) via `bounded_read_file` before parsing,
+  plus `MAX_DESERIALIZED_LANE_ACTIONS` and `MAX_DESERIALIZED_QUEUE_ACTIONS`
+  bounds after parsing.
 - [INV-RECON-004] Reconciliation is idempotent and safe to call on every
   startup.
 - [INV-RECON-005] Queue reads are bounded (`MAX_CLAIMED_SCAN_ENTRIES=4096`).
+- [INV-RECON-006] Stale lease recovery routes through the CLEANUP state
+  transition (`recover_stale_lease`): the lease is persisted as CLEANUP state,
+  then removed to reach IDLE. This mirrors the normal lane lifecycle and
+  prevents bypassing cleanup invariants.
+- [INV-RECON-007] Move operations are fail-closed: `move_file_safe` propagates
+  rename failures as `ReconcileError::MoveFailed`. Queue reconciliation counters
+  only increment after confirmed rename success. Requeue failures attempt
+  fallback to denied before returning an error.
+- [INV-RECON-008] Queue scanning rejects non-regular files (symlinks, FIFOs,
+  block/char devices, sockets) via `entry.file_type()` check.
+  `extract_job_id_from_claimed` validates with `symlink_metadata` and reads
+  via `open_file_no_follow` (O_NOFOLLOW) to prevent symlink traversal.
+- [INV-RECON-009] All filesystem writes use hardened I/O from `lane.rs`:
+  directories via `create_dir_restricted` (0o700), files via `atomic_write`
+  (NamedTempFile + 0o600 permissions + `sync_all` + atomic rename). Receipt
+  filenames include nanosecond timestamp + random suffix for collision
+  resistance.
+- [INV-RECON-010] `move_file_safe` destination names are always unique
+  (nanos + random_u32 suffix), eliminating TOCTOU races from
+  exists-then-rename patterns.
+- [INV-RECON-011] CLI JSON error output uses `serde_json::json!()` +
+  `serde_json::to_string()` instead of raw string interpolation, preventing
+  malformed JSON from unsanitized error messages.
 - CTR-2501 deviation: `current_timestamp_rfc3339()` and `wall_clock_nanos()`
   use wall-clock time for receipt timestamps and file deduplication suffixes.
   Documented inline with security justification.
