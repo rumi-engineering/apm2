@@ -652,22 +652,34 @@ user-mode and system-mode execution backends.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
-## evidence_bundle Submodule (TCK-00527)
+## evidence_bundle Submodule (TCK-00527, TCK-00542)
 
 The `evidence_bundle` submodule implements evidence bundle export/import commands
 exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-only).
+It also provides a manifest+envelope schema pair for bundle discovery, indexing,
+and content-addressed integrity verification (TCK-00542).
 
 ### Key Types
 
 - `EvidenceBundleEnvelopeV1`: Self-describing envelope containing a job receipt,
   RFC-0028 boundary check reconstruction data, RFC-0029 economics traces, optional
-  policy binding, blob references, and a BLAKE3 content hash.
+  policy binding, blob references, and a BLAKE3 content hash. Accepts both legacy
+  schema `apm2.fac.evidence_bundle.v1` and canonical schema
+  `apm2.fac.evidence_bundle_envelope.v1` on import (backwards compatible).
 - `BundleBoundaryCheckV1`: RFC-0028 boundary check reconstruction data carrying all
   fields required by `validate_channel_boundary()`.
 - `BundleEconomicsTraceV1`: RFC-0029 economics traces (queue admission + budget
   admission).
 - `BundleExportConfig`: Configuration for export carrying optional boundary-check
   substructures (leakage budget, timing channel, disclosure policy, policy binding).
+- `EvidenceBundleManifestV1` (TCK-00542): Lightweight outer manifest document for
+  bundle discovery and indexing. References the envelope by its content hash, carries
+  summary metadata (job_id, outcome, timestamp), a `channel_boundary_checked` flag,
+  and a bounded list of manifest entries. Uses `#[serde(deny_unknown_fields)]` for
+  strict parsing at the import boundary.
+- `EvidenceBundleManifestEntryV1` (TCK-00542): Single entry in a manifest describing
+  an evidence artifact by its role, content hash reference, and description. Uses
+  `#[serde(deny_unknown_fields)]` for strict parsing.
 
 ### Core Capabilities
 
@@ -690,6 +702,19 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
 - `verify_blob_refs()`: Verifies all blob_refs in an imported envelope exist in the
   bundle directory and their BLAKE3 hashes match declared values. Bounded reads,
   path traversal prevention, constant-time hash comparison.
+- `build_evidence_bundle_manifest()` (TCK-00542): Builds a manifest from an envelope
+  and optional additional entries. Enforces channel boundary check requirement
+  (fail-closed on Unknown source with broker_verified=false). Constructs default
+  entries for the envelope and each blob reference. Enforces `MAX_MANIFEST_ENTRIES`
+  bound. Computes BLAKE3 content hash with domain-separated, length-prefixed encoding
+  over all manifest fields.
+- `serialize_manifest()` (TCK-00542): Serializes a manifest to JSON bytes.
+- `import_evidence_bundle_manifest()` (TCK-00542): Imports and validates a manifest
+  from JSON bytes. Enforces: bounded read (MAX_MANIFEST_SIZE=64 KiB), schema
+  verification, entry count bound, per-field length bounds (MAX_JOB_ID_LENGTH,
+  MAX_OUTCOME_REASON_LENGTH, MAX_ENVELOPE_HASH_REF_LENGTH, MAX_ENTRY_DESCRIPTION_LENGTH),
+  content hash integrity (constant-time comparison), and channel_boundary_checked=true
+  requirement.
 
 ### CLI Commands
 
@@ -758,6 +783,31 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
   receipt. Leakage budget receipt, timing channel budget, and disclosure policy
   binding are marked absent (None) when not present in `FacJobReceiptV1`, rather
   than fabricating placeholder data.
+- [INV-MF-001] (TCK-00542) Manifest import refuses manifests larger than
+  `MAX_MANIFEST_SIZE` (64 KiB) before deserialization.
+- [INV-MF-002] (TCK-00542) Manifest import refuses when schema does not match
+  `EVIDENCE_BUNDLE_MANIFEST_SCHEMA` (`apm2.fac.evidence_bundle_manifest.v1`).
+- [INV-MF-003] (TCK-00542) Manifest content hash uses domain-separated BLAKE3
+  hashing (`MANIFEST_HASH_DOMAIN`) with length-prefixed encoding for all
+  variable-length fields. Verified via constant-time comparison.
+- [INV-MF-004] (TCK-00542) Manifest import refuses when `entries.len()` exceeds
+  `MAX_MANIFEST_ENTRIES` (256).
+- [INV-MF-005] (TCK-00542) All manifest string fields are bounded during import:
+  `job_id` (MAX_JOB_ID_LENGTH=256), `outcome_reason` (MAX_OUTCOME_REASON_LENGTH=1024),
+  `envelope_content_hash` (MAX_ENVELOPE_HASH_REF_LENGTH=256), entry descriptions
+  (MAX_ENTRY_DESCRIPTION_LENGTH=512), entry content_hash_refs
+  (MAX_ENVELOPE_HASH_REF_LENGTH=256).
+- [INV-MF-006] (TCK-00542) Channel boundary check presence is required for both
+  manifest construction and import. Construction fails with
+  `ChannelBoundaryCheckRequired` when the envelope boundary check indicates an
+  unchecked state. Import fails when `channel_boundary_checked` is false.
+- [INV-MF-007] (TCK-00542) Both `EvidenceBundleManifestV1` and
+  `EvidenceBundleManifestEntryV1` use `#[serde(deny_unknown_fields)]` to reject
+  any fields not defined in the struct during deserialization (fail-closed on
+  unknown/malformed input).
+- [INV-EB-014] (TCK-00542) Envelope import accepts both the legacy schema
+  (`apm2.fac.evidence_bundle.v1`) and the canonical schema
+  (`apm2.fac.evidence_bundle_envelope.v1`) for backwards compatibility.
 
 ## Policy Environment Enforcement (TCK-00526)
 
