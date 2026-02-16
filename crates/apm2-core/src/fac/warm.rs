@@ -721,9 +721,19 @@ fn format_epoch_secs(secs: u64) -> String {
 /// from a malicious or verbose tool wrapper producing unbounded stdout
 /// (finding #7: bounded I/O on untrusted process output).
 ///
-/// Uses `MAX_VERSION_TIMEOUT_SECS` with `Child::try_wait` polling to prevent
-/// indefinite blocking when a tool command hangs, matching the same timeout
-/// pattern used for warm phase execution.
+/// The stdout read runs inside a helper thread while the child handle is
+/// shared via `Arc<Mutex<Child>>`. If the helper thread does not finish
+/// within `MAX_VERSION_TIMEOUT_SECS`, the calling thread acquires the
+/// mutex and kills the child, which closes the pipe and unblocks the
+/// helper's `read_to_end`. This prevents a hung or malicious tool binary
+/// from blocking warm receipt generation indefinitely.
+///
+/// Synchronization protocol: `child_arc` (`Arc<Mutex<Child>>`) protects
+/// the `Child` handle. The helper thread holds the lock only for
+/// `.wait()` (after stdout read completes). The calling thread acquires
+/// the lock only on timeout to call `.kill()` + `.wait()`. These are
+/// mutually exclusive phases: the helper is blocked on the pipe read
+/// (not holding the lock) when the timeout fires, so no deadlock occurs.
 fn version_output(program: &str, args: &[&str]) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
@@ -732,44 +742,69 @@ fn version_output(program: &str, args: &[&str]) -> Option<String> {
         .spawn()
         .ok()?;
 
+    // Take stdout before wrapping child — ChildStdout is independent of
+    // the Child handle and can be moved into the helper thread separately.
     let stdout = child.stdout.take()?;
-    let mut bounded = stdout.take(MAX_VERSION_OUTPUT_BYTES);
-    let mut buf = Vec::with_capacity(256);
-    if bounded.read_to_end(&mut buf).is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    }
 
-    // Wait for exit with bounded timeout to prevent indefinite blocking
-    // when a tool command hangs.
-    let start = Instant::now();
-    let timeout = Duration::from_secs(MAX_VERSION_TIMEOUT_SECS);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            },
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            },
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            },
+    // Share child via Arc<Mutex> so the calling thread can kill it on
+    // timeout while the helper thread can wait on it after reading stdout.
+    let child_arc = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let child_clone = std::sync::Arc::clone(&child_arc);
+
+    // Helper thread performs the blocking stdout read and process wait.
+    // The calling thread joins with a bounded timeout so that a hung
+    // child cannot block indefinitely.
+    let handle = std::thread::spawn(move || -> Option<String> {
+        let mut bounded = stdout.take(MAX_VERSION_OUTPUT_BYTES);
+        let mut buf = Vec::with_capacity(256);
+        if bounded.read_to_end(&mut buf).is_err() {
+            // Read failed (pipe error or child killed by timeout).
+            // Acquire lock and clean up.
+            if let Ok(mut c) = child_clone.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return None;
         }
-    }
 
-    String::from_utf8(buf).ok().map(|s| s.trim().to_string())
+        // Reap the child — if the process already exited during read,
+        // this returns immediately.
+        if let Ok(mut c) = child_clone.lock() {
+            match c.wait() {
+                Ok(status) if status.success() => {},
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+
+        String::from_utf8(buf).ok().map(|s| s.trim().to_string())
+    });
+
+    // Join the helper thread with a bounded deadline. Poll `is_finished`
+    // with short sleeps to avoid busy-waiting while still respecting the
+    // timeout. This is the std-only equivalent of a timed join.
+    let timeout = Duration::from_secs(MAX_VERSION_TIMEOUT_SECS);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.is_finished() {
+            return handle.join().ok().flatten();
+        }
+        if Instant::now() >= deadline {
+            // Helper thread is still blocked — likely on `read_to_end`.
+            // Kill the child to close the pipe and unblock the read.
+            if let Ok(mut c) = child_arc.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            // Join the helper thread — the killed child closes the
+            // pipe, unblocking `read_to_end`. The thread returns
+            // promptly.
+            let _ = handle.join();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
