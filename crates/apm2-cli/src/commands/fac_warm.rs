@@ -474,7 +474,8 @@ fn load_or_init_policy(fac_root: &Path) -> Result<(String, [u8; 32], FacPolicyV1
         deserialize_policy(&bytes).map_err(|e| format!("cannot load fac policy: {e}"))?
     } else {
         let default_policy = FacPolicyV1::default();
-        let _ = persist_policy(fac_root, &default_policy);
+        persist_policy(fac_root, &default_policy)
+            .map_err(|e| format!("cannot persist default policy: {e}"))?;
         default_policy
     };
 

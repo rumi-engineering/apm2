@@ -88,6 +88,10 @@ pub const MAX_PHASE_TIMEOUT_SECS: u64 = 1800;
 /// Maximum bytes to read from tool version stdout (finding #7: bounded reads).
 const MAX_VERSION_OUTPUT_BYTES: u64 = 8192;
 
+/// Maximum wall-clock time for a version probe command (seconds).
+/// Version commands should complete near-instantly; 30s is generous.
+const MAX_VERSION_TIMEOUT_SECS: u64 = 30;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase Enum
 // ─────────────────────────────────────────────────────────────────────────────
@@ -710,11 +714,16 @@ fn format_epoch_secs(secs: u64) -> String {
     format!("{secs}.000000000")
 }
 
-/// Collect version output from a tool command with bounded stdout reads.
+/// Collect version output from a tool command with bounded stdout reads and
+/// bounded execution time.
 ///
 /// [INV-WARM-008] Uses `Read::take(MAX_VERSION_OUTPUT_BYTES)` to prevent OOM
 /// from a malicious or verbose tool wrapper producing unbounded stdout
 /// (finding #7: bounded I/O on untrusted process output).
+///
+/// Uses `MAX_VERSION_TIMEOUT_SECS` with `Child::try_wait` polling to prevent
+/// indefinite blocking when a tool command hangs, matching the same timeout
+/// pattern used for warm phase execution.
 fn version_output(program: &str, args: &[&str]) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
@@ -732,9 +741,32 @@ fn version_output(program: &str, args: &[&str]) -> Option<String> {
         return None;
     }
 
-    let status = child.wait().ok()?;
-    if !status.success() {
-        return None;
+    // Wait for exit with bounded timeout to prevent indefinite blocking
+    // when a tool command hangs.
+    let start = Instant::now();
+    let timeout = Duration::from_secs(MAX_VERSION_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            },
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            },
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            },
+        }
     }
 
     String::from_utf8(buf).ok().map(|s| s.trim().to_string())
