@@ -83,6 +83,12 @@ pub const MAX_OUTCOME_REASON_LENGTH: usize = 1024;
 /// Maximum envelope hash reference length in the manifest.
 pub const MAX_ENVELOPE_HASH_REF_LENGTH: usize = 256;
 
+/// Maximum outcome string length in the manifest.
+pub const MAX_OUTCOME_LEN: usize = 64;
+
+/// Maximum manifest entry role string length.
+pub const MAX_ROLE_LEN: usize = 64;
+
 /// Maximum manifest entry count.
 pub const MAX_MANIFEST_ENTRIES: usize = 256;
 
@@ -462,7 +468,7 @@ pub fn build_evidence_bundle_envelope(
 
     // Build envelope without content hash first.
     let mut envelope = EvidenceBundleEnvelopeV1 {
-        schema: EVIDENCE_BUNDLE_SCHEMA.to_string(),
+        schema: EVIDENCE_BUNDLE_ENVELOPE_SCHEMA.to_string(),
         receipt: receipt.clone(),
         boundary_check,
         economics_trace,
@@ -1226,6 +1232,40 @@ pub fn build_evidence_bundle_manifest(
         });
     }
 
+    let outcome = format!("{:?}", envelope.receipt.outcome);
+    if outcome.len() > MAX_OUTCOME_LEN {
+        return Err(EvidenceBundleError::FieldTooLong {
+            field: "manifest.outcome".to_string(),
+            actual: outcome.len(),
+            max: MAX_OUTCOME_LEN,
+        });
+    }
+
+    // Validate caller-supplied entry fields before constructing the manifest.
+    for (i, entry) in additional_entries.iter().enumerate() {
+        if entry.role.len() > MAX_ROLE_LEN {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("additional_entries[{i}].role"),
+                actual: entry.role.len(),
+                max: MAX_ROLE_LEN,
+            });
+        }
+        if entry.description.len() > MAX_ENTRY_DESCRIPTION_LENGTH {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("additional_entries[{i}].description"),
+                actual: entry.description.len(),
+                max: MAX_ENTRY_DESCRIPTION_LENGTH,
+            });
+        }
+        if entry.content_hash_ref.len() > MAX_ENVELOPE_HASH_REF_LENGTH {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("additional_entries[{i}].content_hash_ref"),
+                actual: entry.content_hash_ref.len(),
+                max: MAX_ENVELOPE_HASH_REF_LENGTH,
+            });
+        }
+    }
+
     // Build the default entries: envelope + blobs.
     let mut entries = Vec::with_capacity(1 + envelope.blob_refs.len() + additional_entries.len());
 
@@ -1260,7 +1300,7 @@ pub fn build_evidence_bundle_manifest(
     let mut manifest = EvidenceBundleManifestV1 {
         schema: EVIDENCE_BUNDLE_MANIFEST_SCHEMA.to_string(),
         job_id: envelope.receipt.job_id.clone(),
-        outcome: format!("{:?}", envelope.receipt.outcome),
+        outcome,
         outcome_reason: envelope.receipt.reason.clone(),
         timestamp_secs: envelope.receipt.timestamp_secs,
         envelope_content_hash: envelope.content_hash.clone(),
@@ -1340,12 +1380,27 @@ pub fn import_evidence_bundle_manifest(
         });
     }
 
+    // INV-MF-007: Blob-count bound.
+    if manifest.blob_count > MAX_BUNDLE_BLOB_COUNT {
+        return Err(EvidenceBundleError::TooManyBlobs {
+            count: manifest.blob_count,
+            max: MAX_BUNDLE_BLOB_COUNT,
+        });
+    }
+
     // INV-MF-005: Per-field length bounds.
     if manifest.job_id.len() > MAX_JOB_ID_LENGTH {
         return Err(EvidenceBundleError::FieldTooLong {
             field: "manifest.job_id".to_string(),
             actual: manifest.job_id.len(),
             max: MAX_JOB_ID_LENGTH,
+        });
+    }
+    if manifest.outcome.len() > MAX_OUTCOME_LEN {
+        return Err(EvidenceBundleError::FieldTooLong {
+            field: "manifest.outcome".to_string(),
+            actual: manifest.outcome.len(),
+            max: MAX_OUTCOME_LEN,
         });
     }
     if manifest.outcome_reason.len() > MAX_OUTCOME_REASON_LENGTH {
@@ -1363,6 +1418,13 @@ pub fn import_evidence_bundle_manifest(
         });
     }
     for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.role.len() > MAX_ROLE_LEN {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("manifest.entries[{i}].role"),
+                actual: entry.role.len(),
+                max: MAX_ROLE_LEN,
+            });
+        }
         if entry.description.len() > MAX_ENTRY_DESCRIPTION_LENGTH {
             return Err(EvidenceBundleError::FieldTooLong {
                 field: format!("manifest.entries[{i}].description"),
@@ -1503,7 +1565,7 @@ pub mod tests {
         let data = serialize_envelope(&envelope).expect("serialize should succeed");
         let imported = import_evidence_bundle(&data).expect("import should succeed");
 
-        assert_eq!(imported.schema, EVIDENCE_BUNDLE_SCHEMA);
+        assert_eq!(imported.schema, EVIDENCE_BUNDLE_ENVELOPE_SCHEMA);
         assert_eq!(imported.receipt.job_id, "test-job-001");
     }
 
@@ -2711,6 +2773,82 @@ pub mod tests {
         );
     }
 
+    #[test]
+    fn manifest_build_refuses_overlong_additional_entry_role() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let entries = vec![EvidenceBundleManifestEntryV1 {
+            role: "r".repeat(MAX_ROLE_LEN + 1),
+            content_hash_ref: "b3-256:".to_string() + &"ab".repeat(32),
+            description: "valid description".to_string(),
+        }];
+
+        let result = build_evidence_bundle_manifest(&envelope, &entries);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong additional entry role, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_outcome() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.outcome = "o".repeat(MAX_OUTCOME_LEN + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong outcome, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_entry_role() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.entries[0].role = "r".repeat(MAX_ROLE_LEN + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong entry role, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_too_many_blobs() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.blob_count = MAX_BUNDLE_BLOB_COUNT + 1;
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::TooManyBlobs { .. })),
+            "should reject too many blob_refs in manifest, got: {result:?}"
+        );
+    }
+
     // =========================================================================
     // TCK-00542: Channel boundary check requirement
     // =========================================================================
@@ -2845,10 +2983,12 @@ pub mod tests {
     fn envelope_import_accepts_legacy_schema() {
         let receipt = make_valid_receipt();
         let config = make_valid_export_config();
-        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
 
-        // The default schema from build is EVIDENCE_BUNDLE_SCHEMA (legacy).
-        assert_eq!(envelope.schema, EVIDENCE_BUNDLE_SCHEMA);
+        // Mutate to legacy schema explicitly; this should still import.
+        envelope.schema = EVIDENCE_BUNDLE_SCHEMA.to_string();
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
 
         let data = serialize_envelope(&envelope).expect("serialize");
         let result = import_evidence_bundle(&data);
