@@ -9,8 +9,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use apm2_core::fac::{
-    FacPolicyV1, LaneProfileV1, apply_lane_env_overrides, build_job_environment, compute_test_env,
-    ensure_lane_env_dirs,
+    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, LaneState, apply_lane_env_overrides,
+    build_job_environment, compute_test_env, ensure_lane_env_dirs,
 };
 use sha2::{Digest, Sha256};
 
@@ -282,6 +282,21 @@ fn run_gates_inner(
     if let Some(cargo_home) = policy.resolve_cargo_home(&apm2_home) {
         ensure_managed_cargo_home(&cargo_home)?;
     }
+
+    // TCK-00575: Acquire exclusive lane lock on lane-00 before any lane
+    // operations. This prevents concurrent `apm2 fac gates` invocations
+    // from colliding on the shared synthetic lane directory.
+    let lane_manager = LaneManager::from_default_home()
+        .map_err(|e| format!("failed to initialize lane manager: {e}"))?;
+    lane_manager
+        .ensure_directories()
+        .map_err(|e| format!("failed to ensure lane directories: {e}"))?;
+    let _lane_guard = acquire_gates_lane_lock(&lane_manager)?;
+
+    // TCK-00575: Check for CORRUPT state before executing gates.
+    // If lane-00 is corrupt (from a previous failed run), refuse to
+    // run gates in a dirty environment. The user must reset first.
+    check_lane_not_corrupt(&lane_manager)?;
 
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
@@ -688,6 +703,40 @@ fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
 
+/// Acquire an exclusive lock on `lane-00` for gate execution.
+///
+/// `apm2 fac gates` uses a shared synthetic lane directory `lane-00`.
+/// Without an exclusive lock, concurrent gate invocations would collide
+/// on the lane's env dirs, workspace, and target directories.
+fn acquire_gates_lane_lock(lane_manager: &LaneManager) -> Result<LaneLockGuard, String> {
+    lane_manager.acquire_lock("lane-00").map_err(|e| {
+        format!(
+            "cannot acquire exclusive lock on lane-00 for gate execution — \
+             another `apm2 fac gates` process may be running: {e}"
+        )
+    })
+}
+
+/// Check that `lane-00` is not in a CORRUPT state.
+///
+/// If a previous gate run (or worker) marked the lane as corrupt, running
+/// gates in that environment risks non-deterministic results. The user must
+/// run `apm2 fac lane reset lane-00` to clear the corrupt marker first.
+fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
+    let status = lane_manager
+        .lane_status("lane-00")
+        .map_err(|e| format!("cannot check lane-00 status: {e}"))?;
+    if status.state == LaneState::Corrupt {
+        let reason = status.corrupt_reason.as_deref().unwrap_or("unknown");
+        return Err(format!(
+            "lane-00 is in CORRUPT state (reason: {reason}). \
+             Cannot run gates in a dirty environment. \
+             Run `apm2 fac lane reset lane-00` to clear the corrupt marker first."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -859,6 +908,68 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0], "started:test_gate");
         assert_eq!(recorded[1], "completed:test_gate:passed=true");
+    }
+
+    /// Regression (MAJOR 2): `check_lane_not_corrupt` must refuse to run
+    /// gates when `lane-00` has a corrupt marker, preventing execution in
+    /// a known-bad environment.
+    #[test]
+    fn check_lane_not_corrupt_rejects_corrupt_lane() {
+        use apm2_core::fac::{LANE_CORRUPT_MARKER_SCHEMA, LaneCorruptMarkerV1};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        // Plant a corrupt marker on lane-00.
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: "lane-00".to_string(),
+            reason: "test corruption".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        marker.persist(&fac_root).expect("persist marker");
+
+        let err = check_lane_not_corrupt(&manager).expect_err("should reject corrupt lane");
+        assert!(
+            err.contains("CORRUPT"),
+            "error should mention CORRUPT, got: {err}"
+        );
+        assert!(
+            err.contains("test corruption"),
+            "error should include corrupt reason, got: {err}"
+        );
+    }
+
+    /// Positive case: `check_lane_not_corrupt` should succeed when
+    /// `lane-00` has no corrupt marker.
+    #[test]
+    fn check_lane_not_corrupt_accepts_clean_lane() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        check_lane_not_corrupt(&manager).expect("clean lane should pass");
+    }
+
+    /// Regression (MAJOR 1): `acquire_gates_lane_lock` must acquire an
+    /// exclusive lock preventing concurrent gate invocations from colliding.
+    #[test]
+    fn acquire_gates_lane_lock_succeeds_on_free_lane() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let guard = acquire_gates_lane_lock(&manager).expect("should acquire lock");
+        // Lock is held while guard is alive.
+        drop(guard);
     }
 
     fn run_git(repo: &Path, args: &[&str]) {

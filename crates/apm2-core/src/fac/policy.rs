@@ -528,52 +528,92 @@ pub fn apply_lane_env_overrides(env: &mut BTreeMap<String, String>, lane_dir: &P
 /// permissions (0o700 on Unix, CTR-2611).
 ///
 /// Creates `home/`, `tmp/`, `xdg_cache/`, and `xdg_config/` under
-/// `lane_dir`. If the directories already exist, verifies that they are
-/// owned by the current user and have mode 0o700 on Unix.
+/// `lane_dir`. Uses atomic creation (mkdir, handle `AlreadyExists`) to
+/// eliminate the TOCTOU window between existence checks and creation.
+/// Rejects symlinks via `symlink_metadata` to prevent isolation escape
+/// (INV-LANE-ENV-001).
 ///
 /// # Errors
 ///
-/// Returns a human-readable error when directory creation fails, or
-/// when an existing directory has incorrect ownership or permissions.
+/// Returns a human-readable error when directory creation fails, when
+/// a symlink is detected, or when an existing directory has incorrect
+/// ownership or permissions.
 pub fn ensure_lane_env_dirs(lane_dir: &Path) -> Result<(), String> {
     for subdir in LANE_ENV_DIRS {
         let dir_path = lane_dir.join(subdir);
-        if dir_path.exists() {
-            #[cfg(unix)]
-            {
-                verify_lane_env_dir_permissions(&dir_path)?;
-            }
-            continue;
-        }
+        // Atomic creation: attempt mkdir first, handle AlreadyExists.
+        // This eliminates the TOCTOU window between exists() and create().
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
+            match std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(&dir_path)
-                .map_err(|e| {
-                    format!("cannot create lane env dir at {}: {e}", dir_path.display())
-                })?;
+            {
+                Ok(()) => {
+                    // Directory created successfully — verify it (paranoid
+                    // check against race where attacker replaces with symlink
+                    // between create and verify).
+                    verify_lane_env_dir_permissions(&dir_path)?;
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Already exists — verify permissions and reject symlinks.
+                    verify_lane_env_dir_permissions(&dir_path)?;
+                },
+                Err(e) => {
+                    return Err(format!(
+                        "cannot create lane env dir at {}: {e}",
+                        dir_path.display()
+                    ));
+                },
+            }
         }
         #[cfg(not(unix))]
         {
-            std::fs::create_dir_all(&dir_path).map_err(|e| {
-                format!("cannot create lane env dir at {}: {e}", dir_path.display())
-            })?;
+            match std::fs::create_dir_all(&dir_path) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(e) => {
+                    return Err(format!(
+                        "cannot create lane env dir at {}: {e}",
+                        dir_path.display()
+                    ));
+                },
+            }
         }
     }
     Ok(())
 }
 
 /// Verify that an existing lane environment directory has restrictive
-/// permissions (0o700) and is owned by the current user (CTR-2611).
+/// permissions (0o700), is owned by the current user (CTR-2611), and is
+/// not a symlink (INV-LANE-ENV-001).
+///
+/// Uses `symlink_metadata` instead of `metadata` to avoid following
+/// symlinks. An attacker could plant a symlink (e.g., `home` -> `~/.ssh`)
+/// in the lane directory; `metadata` would follow it and report the
+/// target's attributes, bypassing isolation.
 #[cfg(unix)]
 fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(dir_path)
+    use subtle::ConstantTimeEq;
+
+    // SAFETY: symlink_metadata does NOT follow symlinks, so we detect
+    // symlinks at the path itself rather than their targets.
+    let metadata = std::fs::symlink_metadata(dir_path)
         .map_err(|e| format!("cannot stat lane env dir at {}: {e}", dir_path.display()))?;
+
+    // Reject symlinks explicitly — an attacker could create a symlink
+    // pointing to a sensitive directory (e.g., ~/.ssh) to escape isolation.
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "lane env path at {} is a symlink; refusing to follow — \
+             this may indicate an isolation escape attempt",
+            dir_path.display()
+        ));
+    }
 
     if !metadata.is_dir() {
         return Err(format!(
@@ -582,8 +622,14 @@ fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
         ));
     }
 
+    // Constant-time UID comparison to prevent timing side-channels
+    // consistent with project style (INV-PC-001).
     let current_uid = nix::unistd::geteuid().as_raw();
-    if metadata.uid() != current_uid {
+    let uid_matches: bool = current_uid
+        .to_le_bytes()
+        .ct_eq(&metadata.uid().to_le_bytes())
+        .into();
+    if !uid_matches {
         return Err(format!(
             "lane env dir at {} is owned by uid {} but current user is uid {}; \
              refusing to use a directory owned by another user",
@@ -1504,5 +1550,113 @@ mod tests {
         assert!(LANE_ENV_DIRS.contains(&"tmp"));
         assert!(LANE_ENV_DIRS.contains(&"xdg_cache"));
         assert!(LANE_ENV_DIRS.contains(&"xdg_config"));
+    }
+
+    /// Regression (BLOCKER 3): verify that `ensure_lane_env_dirs` +
+    /// `apply_lane_env_overrides` together produce a deterministic,
+    /// lane-local environment — proving the integration pattern used
+    /// in both `build_gate_policy_env` and `build_pipeline_test_command`
+    /// in evidence.rs.
+    #[test]
+    fn test_ensure_and_apply_lane_env_overrides_integration() {
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-00");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        // Step 1: ensure dirs — creates home/, tmp/, xdg_cache/, xdg_config/
+        ensure_lane_env_dirs(&lane_dir).expect("ensure_lane_env_dirs");
+
+        // Step 2: build a policy env simulating ambient inherit
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = tmp.path();
+        let ambient = vec![
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("TMPDIR".to_string(), "/tmp".to_string()),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                "/home/user/.cache".to_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                "/home/user/.config".to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        let mut env = build_job_environment(&policy, &ambient, apm2_home);
+
+        // Step 3: apply lane overrides (pattern used by evidence.rs)
+        apply_lane_env_overrides(&mut env, &lane_dir);
+
+        // All 4 env vars must point to lane-local dirs, not ambient ones.
+        let lane_str = lane_dir.to_str().expect("lane_dir to str");
+        for var in &["HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"] {
+            let val = env.get(*var).unwrap_or_else(|| {
+                panic!("{var} must be present in env after apply_lane_env_overrides")
+            });
+            assert!(
+                val.starts_with(lane_str),
+                "{var}={val} should start with lane dir {lane_str}"
+            );
+        }
+
+        // All 4 lane subdirectories must actually exist on disk.
+        for subdir in LANE_ENV_DIRS {
+            assert!(
+                lane_dir.join(subdir).is_dir(),
+                "{subdir} must be a directory"
+            );
+        }
+
+        // PATH should be unaffected by lane overrides.
+        assert!(env.contains_key("PATH"), "PATH should remain in env");
+    }
+
+    /// Regression: a symlink planted in the lane directory (e.g., `home` ->
+    /// `~/.ssh`) must be rejected by `ensure_lane_env_dirs` to prevent
+    /// isolation escape. `verify_lane_env_dir_permissions` uses
+    /// `symlink_metadata` (not `metadata`) so it detects the symlink
+    /// itself rather than following it to the target.
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_lane_env_dirs_rejects_symlink() {
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-sym");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        // Plant a symlink at `home` -> some other directory (simulating
+        // an attacker pointing `home` to `~/.ssh` or similar).
+        let target = tmp.path().join("attacker_target");
+        std::fs::create_dir_all(&target).expect("create target dir");
+        std::os::unix::fs::symlink(&target, lane_dir.join("home")).expect("create symlink");
+
+        let err = ensure_lane_env_dirs(&lane_dir).expect_err("should reject symlink");
+        assert!(
+            err.contains("symlink"),
+            "error should mention symlink, got: {err}"
+        );
+    }
+
+    /// Regression: `verify_lane_env_dir_permissions` must reject a
+    /// symlink even if the symlink target is a valid directory with
+    /// correct permissions.
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_lane_env_dir_permissions_rejects_symlink_to_valid_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let target = tmp.path().join("valid_target");
+        std::fs::create_dir_all(&target).expect("create target dir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("set target permissions");
+
+        let symlink_path = tmp.path().join("link_to_valid");
+        std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
+
+        let err = verify_lane_env_dir_permissions(&symlink_path).expect_err("should reject");
+        assert!(
+            err.contains("symlink"),
+            "should report symlink rejection, got: {err}"
+        );
     }
 }

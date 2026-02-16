@@ -81,56 +81,89 @@ pub fn load_or_create_fac_policy(fac_root: &Path) -> Result<FacPolicyV1, String>
 /// permissions (0o700 on Unix, CTR-2611). This is a one-time setup for
 /// FAC-managed cargo home isolation (TCK-00526).
 ///
+/// Uses atomic creation (mkdir, handle `AlreadyExists`) to eliminate the
+/// TOCTOU window between existence checks and creation. Rejects symlinks
+/// via `symlink_metadata` to prevent isolation escape (INV-LANE-ENV-001).
+///
 /// If the directory already exists, verifies that it is owned by the current
 /// user and has mode 0o700 on Unix. Returns an error if permissions are too
-/// permissive, preventing cross-user state leakage or cargo home poisoning.
+/// permissive or the path is a symlink, preventing cross-user state leakage
+/// or cargo home poisoning.
 pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
-    if cargo_home.exists() {
-        #[cfg(unix)]
-        {
-            verify_cargo_home_permissions(cargo_home)?;
-        }
-        return Ok(());
-    }
+    // Atomic creation: attempt mkdir first, handle AlreadyExists.
+    // This eliminates the TOCTOU window between exists() and create().
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
+        match std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(cargo_home)
-            .map_err(|e| {
-                format!(
+        {
+            Ok(()) => {
+                // Created successfully — verify permissions (paranoid check
+                // against race where attacker replaces with symlink).
+                verify_cargo_home_permissions(cargo_home)?;
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Already exists — verify permissions and reject symlinks.
+                verify_cargo_home_permissions(cargo_home)?;
+            },
+            Err(e) => {
+                return Err(format!(
                     "cannot create managed CARGO_HOME at {}: {e}",
                     cargo_home.display()
-                )
-            })?;
+                ));
+            },
+        }
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(cargo_home).map_err(|e| {
-            format!(
-                "cannot create managed CARGO_HOME at {}: {e}",
-                cargo_home.display()
-            )
-        })?;
+        match std::fs::create_dir_all(cargo_home) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => {
+                return Err(format!(
+                    "cannot create managed CARGO_HOME at {}: {e}",
+                    cargo_home.display()
+                ));
+            },
+        }
     }
     Ok(())
 }
 
 /// Verify that an existing managed `CARGO_HOME` directory has restrictive
-/// permissions (0o700) and is owned by the current user. Returns an error
-/// if the directory is too permissive (CTR-2611).
+/// permissions (0o700), is owned by the current user (CTR-2611), and is
+/// not a symlink (INV-LANE-ENV-001).
+///
+/// Uses `symlink_metadata` instead of `metadata` to avoid following
+/// symlinks. An attacker could plant a symlink to redirect cargo home
+/// to a malicious location, bypassing isolation.
 #[cfg(unix)]
 fn verify_cargo_home_permissions(cargo_home: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(cargo_home).map_err(|e| {
+    use subtle::ConstantTimeEq;
+
+    // SAFETY: symlink_metadata does NOT follow symlinks, detecting the
+    // symlink itself rather than its target.
+    let metadata = std::fs::symlink_metadata(cargo_home).map_err(|e| {
         format!(
             "cannot stat managed CARGO_HOME at {}: {e}",
             cargo_home.display()
         )
     })?;
+
+    // Reject symlinks explicitly — an attacker could create a symlink
+    // pointing cargo home to a poisoned directory.
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "managed CARGO_HOME at {} is a symlink; refusing to follow — \
+             this may indicate a cargo home poisoning attempt",
+            cargo_home.display()
+        ));
+    }
 
     if !metadata.is_dir() {
         return Err(format!(
@@ -139,8 +172,14 @@ fn verify_cargo_home_permissions(cargo_home: &Path) -> Result<(), String> {
         ));
     }
 
+    // Constant-time UID comparison to prevent timing side-channels
+    // consistent with project style (INV-PC-001).
     let current_uid = nix::unistd::geteuid().as_raw();
-    if metadata.uid() != current_uid {
+    let uid_matches: bool = current_uid
+        .to_le_bytes()
+        .ct_eq(&metadata.uid().to_le_bytes())
+        .into();
+    if !uid_matches {
         return Err(format!(
             "managed CARGO_HOME at {} is owned by uid {} but current user is uid {}; \
              refusing to use a directory owned by another user",
@@ -263,5 +302,41 @@ mod tests {
         fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700))
             .expect("set permissions");
         ensure_managed_cargo_home(&cargo_home).expect("should accept 0o700");
+    }
+
+    /// Regression: a symlink at the managed `CARGO_HOME` path must be
+    /// rejected to prevent cargo home poisoning via isolation escape.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_cargo_home_rejects_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("symlink_target");
+        fs::create_dir_all(&target).expect("create target");
+        let cargo_home = dir.path().join("cargo_symlink");
+        std::os::unix::fs::symlink(&target, &cargo_home).expect("create symlink");
+        let err = ensure_managed_cargo_home(&cargo_home).expect_err("should reject symlink");
+        assert!(
+            err.contains("symlink"),
+            "error should mention symlink, got: {err}"
+        );
+    }
+
+    /// Regression: `verify_cargo_home_permissions` must reject a symlink
+    /// even when the target directory has correct permissions and ownership.
+    #[cfg(unix)]
+    #[test]
+    fn verify_cargo_home_permissions_rejects_symlink_to_valid_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("valid_target");
+        fs::create_dir_all(&target).expect("create target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("set permissions");
+        let symlink_path = dir.path().join("link_to_valid");
+        std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
+        let err = verify_cargo_home_permissions(&symlink_path).expect_err("should reject");
+        assert!(
+            err.contains("symlink"),
+            "should report symlink rejection, got: {err}"
+        );
     }
 }
