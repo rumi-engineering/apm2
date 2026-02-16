@@ -38,6 +38,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::determinism::canonicalize_json;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -324,17 +326,28 @@ impl CostModelV1 {
         Ok(())
     }
 
-    /// Returns deterministic canonical JSON bytes for hashing.
+    /// Returns deterministic CAC-JSON canonical bytes for hashing.
+    ///
+    /// Uses the project-standard `canonicalize_json()` helper (SP-INV-004)
+    /// instead of raw `serde_json::to_vec` to ensure JCS-compliant key
+    /// ordering and deterministic formatting across platforms.
     ///
     /// # Errors
     ///
-    /// Returns `CostModelError::Serialization` if serialization fails.
+    /// Returns `CostModelError::Serialization` if serialization or
+    /// canonicalization fails.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CostModelError> {
         let mut normalized = self.clone();
         normalized.content_hash = String::new();
-        serde_json::to_vec(&normalized).map_err(|e| CostModelError::Serialization {
-            detail: e.to_string(),
-        })
+        let json_str =
+            serde_json::to_string(&normalized).map_err(|e| CostModelError::Serialization {
+                detail: e.to_string(),
+            })?;
+        let canonical =
+            canonicalize_json(&json_str).map_err(|e| CostModelError::Serialization {
+                detail: format!("canonicalization failed: {e}"),
+            })?;
+        Ok(canonical.into_bytes())
     }
 
     /// Computes the content hash for integrity verification.
@@ -376,11 +389,28 @@ impl CostModelV1 {
                 max: MAX_JOB_KIND_LENGTH,
             });
         }
-        if self.calibration.len() >= MAX_JOB_KINDS && !self.calibration.contains_key(kind) {
-            return Err(CostModelError::TooManyKinds {
-                count: self.calibration.len().saturating_add(1),
-                max: MAX_JOB_KINDS,
-            });
+
+        // Check that adding this kind would not exceed MAX_JOB_KINDS for the
+        // TOTAL set of unique keys across both estimates and calibration maps.
+        // This prevents the persistent-DoS scenario where calibrate() pushes
+        // the combined key count past the validate() limit, making the model
+        // invalid on disk (INV-CM04).
+        let is_new_kind =
+            !self.estimates.contains_key(kind) && !self.calibration.contains_key(kind);
+        if is_new_kind {
+            let mut total_kinds = self.estimates.len();
+            for key in self.calibration.keys() {
+                if !self.estimates.contains_key(key.as_str()) {
+                    total_kinds = total_kinds.saturating_add(1);
+                }
+            }
+            // +1 for the new kind about to be inserted
+            if total_kinds.saturating_add(1) > MAX_JOB_KINDS {
+                return Err(CostModelError::TooManyKinds {
+                    count: total_kinds.saturating_add(1),
+                    max: MAX_JOB_KINDS,
+                });
+            }
         }
 
         // Pre-compute the current estimate before mutable borrow of calibration map.
