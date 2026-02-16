@@ -521,16 +521,13 @@ fn run_gates_inner(
         bounded = true;
         test_command_environment.extend(spec.environment);
 
-        // TCK-00548: sccache env vars (RUSTC_WRAPPER, SCCACHE_*) are
-        // unconditionally stripped from bounded test commands. We cannot
-        // verify cgroup containment for the systemd transient unit
-        // before it starts (the unit PID does not exist yet), so
-        // sccache is never forwarded in bounded test mode. The
-        // stripping happens in two places:
-        //   1. The allowlist in bounded_test_runner excludes RUSTC_WRAPPER and
-        //      SCCACHE_* so they are not included in --setenv args.
-        //   2. env_remove_keys strips them from the spawned process environment to
-        //      prevent inheritance from the parent.
+        // TCK-00549: The policy-computed environment from
+        // compute_nextest_test_environment() is passed directly to
+        // build_bounded_test_command(). The bounded executor uses
+        // FacPolicyV1-driven env filtering (no ad-hoc allowlists).
+        // Defense-in-depth: RUSTC_WRAPPER and SCCACHE_* are stripped
+        // both inside build_policy_setenv_pairs() and via env_remove_keys
+        // on the spawned process (TCK-00548, INV-ENV-008).
         test_command_environment.extend(spec.setenv_pairs);
 
         // Log if sccache env vars were found and stripped.
