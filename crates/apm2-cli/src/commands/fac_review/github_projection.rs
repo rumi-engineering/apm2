@@ -1,10 +1,12 @@
 //! Dedicated GitHub projection layer for FAC review CLI commands.
 //!
 //! This module is the write boundary for GitHub projection operations.
+//! All `gh` CLI calls use [`apm2_core::fac::gh_command`] for non-interactive,
+//! lane-scoped auth (TCK-00597).
 
 use std::io::Write;
-use std::process::Command;
 
+use apm2_core::fac::gh_command;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,7 +33,7 @@ pub(super) fn create_issue_comment(
         .map_err(|err| format!("failed to flush issue comment payload: {err}"))?;
 
     let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "api",
             &endpoint,
@@ -71,7 +73,7 @@ pub(super) fn update_issue_comment(
         .map_err(|err| format!("failed to flush issue comment patch payload: {err}"))?;
 
     let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "api",
             &endpoint,
@@ -103,7 +105,7 @@ pub(super) fn patch_issue_comment_body(
 
 #[allow(dead_code)]
 pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .arg("pr")
         .arg("view")
         .arg(pr_number.to_string())
@@ -120,7 +122,7 @@ pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, 
 }
 
 pub(super) fn edit_pr_body(owner_repo: &str, pr_number: u32, body: &str) -> Result<(), String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .arg("pr")
         .arg("edit")
         .arg(pr_number.to_string())
@@ -137,7 +139,7 @@ pub(super) fn edit_pr_body(owner_repo: &str, pr_number: u32, body: &str) -> Resu
 }
 
 pub(super) fn find_pr_for_branch(repo: &str, branch: &str) -> Result<Option<u32>, String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "pr",
             "list",
@@ -169,7 +171,7 @@ pub(super) fn find_pr_for_branch(repo: &str, branch: &str) -> Result<Option<u32>
 }
 
 pub(super) fn create_pr(repo: &str, title: &str, body: &str) -> Result<u32, String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "pr", "create", "--repo", repo, "--title", title, "--body", body, "--base", "main",
         ])
@@ -192,7 +194,7 @@ pub(super) fn create_pr(repo: &str, title: &str, body: &str) -> Result<u32, Stri
 
 pub(super) fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), String> {
     let pr_ref = pr_number.to_string();
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "pr", "edit", &pr_ref, "--repo", repo, "--title", title, "--body", body,
         ])
@@ -214,7 +216,7 @@ fn run_enable_auto_merge_with_strategy(
     pr_ref: &str,
     strategy_flag: &str,
 ) -> Result<(), String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "pr",
             "merge",

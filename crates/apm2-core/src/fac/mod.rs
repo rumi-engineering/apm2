@@ -123,6 +123,8 @@ pub mod gc;
 /// Garbage-collection receipt schema and persistence helpers.
 #[allow(missing_docs)]
 pub mod gc_receipt;
+/// Non-interactive, lane-scoped GitHub CLI command builder (TCK-00597).
+pub mod gh_cli;
 pub mod harness_sandbox;
 pub mod job_spec;
 mod key_policy;
@@ -305,6 +307,8 @@ pub use gc_receipt::{
     DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
     MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,
 };
+// Re-export gh_cli (TCK-00597)
+pub use gh_cli::{GhCommand, gh_command};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,

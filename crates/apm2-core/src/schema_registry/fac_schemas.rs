@@ -348,7 +348,7 @@ mod tests {
         // ALL_FAC_SCHEMA_IDS, acting as a change-detection gate.
         assert_eq!(
             ALL_FAC_SCHEMA_IDS.len(),
-            13,
+            14,
             "ALL_FAC_SCHEMA_IDS count changed — update this test after adding new schemas"
         );
     }
