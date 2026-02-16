@@ -983,7 +983,7 @@ fn ensure_pipeline_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
 
 /// Result of lane allocation: logs directory, the lane's root directory,
 /// and the lock guard that must be held for the lifetime of the job.
-struct AllocatedLane {
+pub(super) struct EvidenceLaneContext {
     /// Path to the job-specific logs directory within the lane.
     logs_dir: PathBuf,
     /// Path to the lane's root directory
@@ -1002,28 +1002,33 @@ struct AllocatedLane {
     _lane_guard: LaneLockGuard,
 }
 
-fn allocate_lane_job_logs_dir() -> Result<AllocatedLane, String> {
+pub(super) fn allocate_evidence_lane_context(
+    lane_manager: &LaneManager,
+    lane_id: &str,
+    lane_lock: LaneLockGuard,
+) -> Result<EvidenceLaneContext, String> {
+    let lane_dir = lane_manager.lane_dir(lane_id);
+    let logs_dir = lane_dir.join("logs").join(Uuid::new_v4().to_string());
+    crate::commands::fac_permissions::ensure_dir_with_mode(&logs_dir)
+        .map_err(|err| format!("failed to create job log dir {}: {err}", logs_dir.display()))?;
+    Ok(EvidenceLaneContext {
+        logs_dir,
+        lane_dir,
+        _lane_guard: lane_lock,
+    })
+}
+
+fn allocate_lane_job_logs_dir() -> Result<EvidenceLaneContext, String> {
     let lane_manager = LaneManager::from_default_home()
         .map_err(|err| format!("failed to resolve lane manager: {err}"))?;
     lane_manager
         .ensure_directories()
         .map_err(|err| format!("failed to ensure FAC lane directories: {err}"))?;
 
-    let job_id = Uuid::new_v4().to_string();
-
     for lane_id in LaneManager::default_lane_ids() {
         match lane_manager.try_lock(&lane_id) {
             Ok(Some(guard)) => {
-                let lane_dir = lane_manager.lane_dir(&lane_id);
-                let logs_dir = lane_dir.join("logs").join(&job_id);
-                crate::commands::fac_permissions::ensure_dir_with_mode(&logs_dir).map_err(
-                    |err| format!("failed to create job log dir {}: {err}", logs_dir.display()),
-                )?;
-                return Ok(AllocatedLane {
-                    logs_dir,
-                    lane_dir,
-                    _lane_guard: guard,
-                });
+                return allocate_evidence_lane_context(&lane_manager, &lane_id, guard);
             },
             Ok(None) => {},
             Err(err) => {
@@ -1183,16 +1188,26 @@ pub fn run_evidence_gates(
     projection_log: Option<&mut File>,
     opts: Option<&EvidenceGateOptions>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
+    let lane_context = allocate_lane_job_logs_dir()?;
+    run_evidence_gates_with_lane_context(workspace_root, sha, projection_log, opts, lane_context)
+}
+
+pub(super) fn run_evidence_gates_with_lane_context(
+    workspace_root: &Path,
+    sha: &str,
+    projection_log: Option<&mut File>,
+    opts: Option<&EvidenceGateOptions>,
+    lane_context: EvidenceLaneContext,
+) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let emit_human_logs = opts.is_none_or(|o| o.emit_human_logs);
-    let allocated = allocate_lane_job_logs_dir()?;
-    let logs_dir = allocated.logs_dir;
+    let logs_dir = lane_context.logs_dir;
 
     // TCK-00526: Build policy-filtered environment for ALL gates (not just
     // the test gate). This enforces default-deny on fmt, clippy, doc, and
     // script gates, preventing ambient secret leakage.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
-    let gate_env = build_gate_policy_env(&allocated.lane_dir)?;
+    let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // build_job_environment already strips these at the policy level, but
@@ -1520,13 +1535,36 @@ pub fn run_evidence_gates_with_status(
     emit_human_logs: bool,
     on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
-    let allocated = allocate_lane_job_logs_dir()?;
-    let logs_dir = allocated.logs_dir;
+    let lane_context = allocate_lane_job_logs_dir()?;
+    run_evidence_gates_with_status_with_lane_context(
+        workspace_root,
+        sha,
+        owner_repo,
+        pr_number,
+        projection_log,
+        emit_human_logs,
+        on_gate_progress,
+        lane_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_evidence_gates_with_status_with_lane_context(
+    workspace_root: &Path,
+    sha: &str,
+    owner_repo: &str,
+    pr_number: u32,
+    projection_log: Option<&mut File>,
+    emit_human_logs: bool,
+    on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
+    lane_context: EvidenceLaneContext,
+) -> Result<(bool, Vec<EvidenceGateResult>), String> {
+    let logs_dir = lane_context.logs_dir;
 
     // TCK-00526: Build policy-filtered environment for ALL gates.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
-    let gate_env = build_gate_policy_env(&allocated.lane_dir)?;
+    let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // Pass the policy-filtered environment so policy-introduced SCCACHE_*
@@ -1544,7 +1582,8 @@ pub fn run_evidence_gates_with_status(
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
-    let pipeline_test_command = build_pipeline_test_command(workspace_root, &allocated.lane_dir)?;
+    let pipeline_test_command =
+        build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,
