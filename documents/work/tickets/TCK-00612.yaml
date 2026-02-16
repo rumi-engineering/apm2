@@ -1,0 +1,68 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00612"
+    title: "Investigate and fix test gate performance regression (120s → 10+ minutes)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+  root_cause_analysis:
+    summary: |
+      Test gates that previously completed in ~120s are now taking over
+      10 minutes, blocking all work from getting through the pipeline.
+
+      INVESTIGATION REQUIRED: Identify multiple theories and performance-
+      profile tests that may be consuming untoward resources, or any
+      recent changes to the bounded test running logic that could have
+      caused this regression.
+
+      Theories to investigate:
+        1. Recent changes to bounded test runner logic (gate execution,
+           timeout handling, parallelism limits)
+        2. Test compilation time regression (incremental build cache
+           invalidation, new heavy dependencies)
+        3. Resource contention (lock contention, file I/O bottleneck,
+           lane/worktree locking changes)
+        4. Gate orchestration overhead (poll loop inefficiency, redundant
+           gate re-execution, state machine thrashing)
+        5. New test additions or test scope expansion inflating total
+           execution time
+        6. Crash recovery reconciliation (TCK-00534) introducing
+           overhead on every gate cycle
+
+scope:
+  in_scope: []
+  out_of_scope: []
+
+plan:
+  steps: []
+
+definition_of_done:
+  evidence_ids: []
+  criteria: []
+
+notes:
+  context: |
+    Reported by operator: test gates that used to complete in ~120s are
+    now taking over 10 minutes, with no work getting through the
+    pipeline. This is a critical throughput regression affecting all
+    PR processing.
+
+    Investigation request (verbatim):
+    "There's something deeply wrong with our test gates -- it used to
+    take just ~120s to execute gates but now gates are taking over 10
+    minutes and no work is getting through. Please investigate and
+    identify what could be causing this. Since this is a tricky issue,
+    identify multiple theories and performance profile tests that may
+    be consuming untoward resources or any recent changes to the bounded
+    test running logic that could have caused this."
+  security: "default-deny, least privilege, fail-closed"
