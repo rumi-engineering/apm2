@@ -247,6 +247,23 @@ impl SandboxHardeningProfile {
         format!("b3-256:{}", hex::encode(hash))
     }
 
+    /// Render only the user-mode-safe subset of hardening directives.
+    ///
+    /// User-mode systemd cannot apply directives that require mount namespaces
+    /// (PrivateTmp, ProtectControlGroups, ProtectKernelTunables,
+    /// ProtectKernelLogs) or capability manipulation (RestrictSUIDSGID,
+    /// LockPersonality, RestrictRealtime, RestrictAddressFamilies,
+    /// SystemCallArchitectures). Only `NoNewPrivileges` is safe in user mode
+    /// because it uses `prctl(PR_SET_NO_NEW_PRIVS)` which is unprivileged.
+    #[must_use]
+    pub fn to_user_mode_property_strings(&self) -> Vec<String> {
+        let mut props = Vec::with_capacity(1);
+        if self.no_new_privileges {
+            props.push("NoNewPrivileges=yes".to_string());
+        }
+        props
+    }
+
     /// Returns the number of enabled directives (for audit logging).
     #[must_use]
     pub fn enabled_directive_count(&self) -> usize {
@@ -739,6 +756,23 @@ mod tests {
             profile.restrict_address_families,
             vec!["AF_UNIX", "AF_INET", "AF_INET6"]
         );
+    }
+
+    #[test]
+    fn hardening_profile_user_mode_only_emits_no_new_privileges() {
+        let profile = SandboxHardeningProfile::default();
+        let props = profile.to_user_mode_property_strings();
+        assert_eq!(props, vec!["NoNewPrivileges=yes"]);
+    }
+
+    #[test]
+    fn hardening_profile_user_mode_empty_when_nnp_disabled() {
+        let profile = SandboxHardeningProfile {
+            no_new_privileges: false,
+            ..Default::default()
+        };
+        let props = profile.to_user_mode_property_strings();
+        assert!(props.is_empty());
     }
 
     #[test]

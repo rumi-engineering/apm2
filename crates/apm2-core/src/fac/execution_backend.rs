@@ -412,8 +412,9 @@ pub fn build_systemd_run_command(
         args.push(name.to_string());
     }
 
-    // Build properties list
-    let mut property_list = build_property_list(properties);
+    // Build properties list (backend-aware: user-mode skips directives
+    // that require mount namespaces / root capabilities).
+    let mut property_list = build_property_list(properties, backend);
 
     // System-mode: add User= property and additional hardening
     let service_user = if backend == ExecutionBackend::SystemMode {
@@ -517,7 +518,7 @@ fn parse_dbus_unix_path(address: &str) -> Option<&str> {
 ///
 /// Includes sandbox hardening directives from `SandboxHardeningProfile`
 /// (TCK-00573) after the resource and kill-signal properties.
-fn build_property_list(props: &SystemdUnitProperties) -> Vec<String> {
+fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend) -> Vec<String> {
     let mut list = vec![
         "MemoryAccounting=yes".to_string(),
         "CPUAccounting=yes".to_string(),
@@ -538,7 +539,20 @@ fn build_property_list(props: &SystemdUnitProperties) -> Vec<String> {
     ];
 
     // Sandbox hardening directives (TCK-00573).
-    list.extend(props.sandbox_hardening.to_property_strings());
+    // User-mode systemd cannot apply mount-namespace directives (PrivateTmp,
+    // ProtectControlGroups, ProtectKernelTunables, ProtectKernelLogs) or
+    // capability-manipulation directives (RestrictSUIDSGID, LockPersonality,
+    // RestrictAddressFamilies, SystemCallArchitectures, RestrictRealtime) —
+    // these require root/CAP_SYS_ADMIN.  Only NoNewPrivileges (prctl-based)
+    // is safe in user mode.  System-mode applies the full profile.
+    match backend {
+        ExecutionBackend::SystemMode => {
+            list.extend(props.sandbox_hardening.to_property_strings());
+        },
+        ExecutionBackend::UserMode => {
+            list.extend(props.sandbox_hardening.to_user_mode_property_strings());
+        },
+    }
 
     list
 }
@@ -958,15 +972,15 @@ mod tests {
     #[test]
     fn property_list_is_deterministic() {
         let props = test_properties();
-        let list1 = build_property_list(&props);
-        let list2 = build_property_list(&props);
+        let list1 = build_property_list(&props, ExecutionBackend::SystemMode);
+        let list2 = build_property_list(&props, ExecutionBackend::SystemMode);
         assert_eq!(list1, list2, "property list must be deterministic");
     }
 
     #[test]
     fn property_list_includes_accounting_and_kill_directives() {
         let props = test_properties();
-        let list = build_property_list(&props);
+        let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
         assert!(list.contains(&"MemoryAccounting=yes".to_string()));
         assert!(list.contains(&"CPUAccounting=yes".to_string()));
@@ -980,7 +994,7 @@ mod tests {
     #[test]
     fn property_list_includes_sandbox_hardening_directives() {
         let props = test_properties();
-        let list = build_property_list(&props);
+        let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
         // All default sandbox hardening directives must be present (TCK-00573).
         assert!(
@@ -1037,7 +1051,7 @@ mod tests {
         };
         let props =
             SystemdUnitProperties::from_lane_profile_with_hardening(&profile, None, hardening);
-        let list = build_property_list(&props);
+        let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
         // Disabled directives must NOT be in the property list.
         assert!(
@@ -1053,6 +1067,58 @@ mod tests {
             list.contains(&"ProtectControlGroups=yes".to_string()),
             "ProtectControlGroups should still be present"
         );
+    }
+
+    #[test]
+    fn property_list_user_mode_only_includes_no_new_privileges() {
+        let props = test_properties();
+        let list = build_property_list(&props, ExecutionBackend::UserMode);
+
+        // NoNewPrivileges is safe in user-mode (prctl-based).
+        assert!(
+            list.contains(&"NoNewPrivileges=yes".to_string()),
+            "NoNewPrivileges should be present in user-mode"
+        );
+        // Mount-namespace and capability directives must NOT be present.
+        assert!(
+            !list.iter().any(|p| p.starts_with("PrivateTmp")),
+            "PrivateTmp requires root, should not be in user-mode"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("ProtectControlGroups")),
+            "ProtectControlGroups requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("ProtectKernelTunables")),
+            "ProtectKernelTunables requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("ProtectKernelLogs")),
+            "ProtectKernelLogs requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("RestrictSUIDSGID")),
+            "RestrictSUIDSGID requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("LockPersonality")),
+            "LockPersonality requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("RestrictRealtime")),
+            "RestrictRealtime requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("RestrictAddressFamilies")),
+            "RestrictAddressFamilies requires root"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("SystemCallArchitectures")),
+            "SystemCallArchitectures requires root"
+        );
+        // Resource accounting/limits must still be present.
+        assert!(list.contains(&"MemoryAccounting=yes".to_string()));
+        assert!(list.contains(&"KillSignal=SIGKILL".to_string()));
     }
 
     // ── D-Bus path parsing ──────────────────────────────────────────────
