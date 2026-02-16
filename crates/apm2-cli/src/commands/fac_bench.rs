@@ -22,15 +22,17 @@
 //!   CTR-2607).
 //! - \[INV-BENCH-005\] All collections are bounded by hard `MAX_*` constants.
 
+use std::env;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::commands::fac_warm::run_fac_warm;
 use crate::exit_codes::codes as exit_codes;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,12 @@ const MAX_GATE_PHASES: usize = 32;
 
 /// Maximum number of runs in a single bench report.
 const MAX_BENCH_RUNS: usize = 16;
+
+/// Maximum bytes to retain from child process output.
+const MAX_CHILD_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Maximum directory candidates when inferring many-worktree baselines.
+const MAX_MANY_WORKTREE_ENTRIES: usize = 512;
 
 /// Schema identifier for bench report.
 const BENCH_REPORT_SCHEMA: &str = "apm2.fac.bench_report.v1";
@@ -105,8 +113,14 @@ pub struct HeadlineDeltas {
     pub warm_total_ms: u64,
     /// Speedup factor (cold / warm). E.g., 10.0 means 10x faster.
     pub speedup_factor: f64,
+    /// Aggregate size of target directories across sibling worktrees.
+    pub many_worktrees_target_baseline_bytes: u64,
     /// Target directory size after warm (bytes).
     pub warm_target_size_bytes: u64,
+    /// Reduction factor for many-worktree baseline vs warm target.
+    pub target_collapse_factor: f64,
+    /// Reduction percentage for many-worktree baseline vs warm target.
+    pub target_collapse_percent: f64,
     /// Number of concurrent runs that passed.
     pub concurrent_passed: u32,
     /// Number of concurrent runs total.
@@ -158,15 +172,17 @@ pub fn run_fac_bench(
     let overall_start = Instant::now();
 
     // Validate concurrency bound (INV-BENCH-003).
-    let effective_concurrency = concurrency.min(MAX_CONCURRENCY);
-    if concurrency > MAX_CONCURRENCY {
+    let effective_concurrency = concurrency.max(1).min(MAX_CONCURRENCY);
+    if concurrency != effective_concurrency {
         emit_warn(
             json_output,
             &format!(
-                "concurrency clamped from {concurrency} to {MAX_CONCURRENCY} (MAX_CONCURRENCY)"
+                "concurrency clamped from {concurrency} to {effective_concurrency} (MAX_CONCURRENCY)"
             ),
         );
     }
+
+    let many_worktrees_target_baseline_bytes = measure_many_worktrees_target_baseline();
 
     // Resolve HEAD SHA.
     let head_sha = match resolve_head_sha() {
@@ -235,7 +251,7 @@ pub fn run_fac_bench(
             &serde_json::json!({"phase": "warm"}),
         );
         let warm_start = Instant::now();
-        let warm_ok = run_warm_phase(json_output);
+        let warm_ok = run_warm_phase(timeout_seconds, json_output);
         let warm_dur = millis_from_elapsed(&warm_start);
         emit_event(
             json_output,
@@ -247,9 +263,11 @@ pub fn run_fac_bench(
             }),
         );
         if !warm_ok {
-            emit_warn(
+            return output_error(
                 json_output,
-                "warm phase failed; warm gate times may reflect cold performance",
+                "warm_phase_failed",
+                "warm phase failed; refusing to proceed without FAC containment",
+                exit_codes::GENERIC_ERROR,
             );
         }
     }
@@ -387,11 +405,19 @@ pub fn run_fac_bench(
         .find(|d| d.path.contains("target"))
         .map_or(0, |d| d.size_bytes);
 
+    let (target_collapse_factor, target_collapse_percent) = compute_target_collapse_metrics(
+        many_worktrees_target_baseline_bytes,
+        warm_target_size_bytes,
+    );
+
     let deltas = HeadlineDeltas {
         cold_total_ms: cold_ms,
         warm_total_ms: warm_ms,
         speedup_factor,
+        many_worktrees_target_baseline_bytes,
         warm_target_size_bytes,
+        target_collapse_factor,
+        target_collapse_percent,
         concurrent_passed,
         concurrent_total,
         denial_rate,
@@ -475,9 +501,26 @@ fn run_gate_measurement(
 ) -> GateRunMeasurement {
     let overall = Instant::now();
 
-    // Run gates via the CLI binary to get an isolated measurement.
+    // Resolve the active CLI binary path to avoid PATH-based resolution.
+    let exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            return GateRunMeasurement {
+                label: label.to_string(),
+                total_duration_ms: millis_from_elapsed(&overall),
+                all_passed: false,
+                phases: vec![GatePhaseTiming {
+                    name: "exe_resolve_error".to_string(),
+                    duration_ms: 0,
+                    passed: false,
+                }],
+            };
+        },
+    };
+
+    // Run gates via the active CLI binary to get an isolated measurement.
     // We parse the JSON output to extract per-phase timings.
-    let mut cmd = Command::new("apm2");
+    let mut cmd = Command::new(exe);
     cmd.args([
         "fac",
         "gates",
@@ -492,31 +535,27 @@ fn run_gate_measurement(
         cpu_quota,
     ]);
 
-    let output = cmd.output();
     let total_duration_ms = millis_from_elapsed(&overall);
+    let output_result = run_command_with_bounded_output(cmd, MAX_CHILD_OUTPUT_BYTES, Stdio::null());
 
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let all_passed = out.status.success();
-            let phases = parse_gate_phases(&stdout);
-
-            if !all_passed && json_output {
-                // Emit stderr hints on failure.
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if !stderr.is_empty() {
-                    let truncated_stderr: String = stderr.chars().take(2048).collect();
-                    emit_event(
-                        json_output,
-                        "gate_stderr",
-                        &serde_json::json!({
-                            "label": label,
-                            "stderr": truncated_stderr,
-                        }),
-                    );
-                }
+    match output_result {
+        Ok((status, output, output_truncated)) => {
+            if output_truncated && json_output {
+                emit_event(
+                    json_output,
+                    "command_output_truncated",
+                    &serde_json::json!({
+                        "command": "fac gates",
+                        "label": label,
+                        "stdout": true,
+                        "truncated": output_truncated,
+                    }),
+                );
             }
 
+            let stdout = String::from_utf8_lossy(&output);
+            let all_passed = status.success();
+            let phases = parse_gate_phases(&stdout);
             GateRunMeasurement {
                 label: label.to_string(),
                 total_duration_ms,
@@ -646,33 +685,162 @@ fn parse_gate_phases(stdout: &str) -> Vec<GatePhaseTiming> {
 // Warm phase
 // ---------------------------------------------------------------------------
 
+/// Read from a stream with a strict upper bound.
+///
+/// Returns collected bytes (capped), and whether truncation occurred.
+fn read_stream_with_cap(mut reader: impl Read, max_bytes: usize) -> Result<(Vec<u8>, bool), String> {
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("read stream failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+
+        if !truncated {
+            let remaining = max_bytes.saturating_sub(output.len());
+            if n <= remaining {
+                output.extend_from_slice(&chunk[..n]);
+            } else {
+                output.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+            }
+        }
+
+        if output.len() >= max_bytes {
+            truncated = true;
+            output.truncate(max_bytes);
+        }
+    }
+
+    Ok((output, truncated))
+}
+
+/// Run a command and read bounded output with bounded buffering.
+///
+/// Redirects stderr to the supplied target and caps stdout bytes.
+fn run_command_with_bounded_output(
+    mut cmd: Command,
+    max_stdout_bytes: usize,
+    stderr: Stdio,
+) -> Result<(std::process::ExitStatus, Vec<u8>, bool), String> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "missing stdout pipe".to_string())?;
+
+    let (stdout, truncated) = read_stream_with_cap(&mut stdout, max_stdout_bytes)?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("wait failed: {e}"))?;
+
+    Ok((status, stdout, truncated))
+}
+
+/// Compute target collapse metrics from many-worktree baseline and warm target.
+fn compute_target_collapse_metrics(baseline_bytes: u64, warm_bytes: u64) -> (f64, f64) {
+    if baseline_bytes == 0 || warm_bytes == 0 {
+        return (0.0, 0.0);
+    }
+
+    let factor = baseline_bytes as f64 / warm_bytes as f64;
+    let percent =
+        ((baseline_bytes as f64 - warm_bytes as f64) / baseline_bytes as f64) * 100.0;
+
+    (factor, percent)
+}
+
+/// Sum target directory sizes for sibling worktrees.
+///
+/// This approximates the "many worktree" baseline by scanning the repo
+/// parent directory for sibling trees and summing any immediate `target`
+/// directories that look like git worktree roots.
+fn measure_many_worktrees_target_baseline() -> u64 {
+    let Some(repo_root) = find_repo_root_from_cwd() else {
+        return 0;
+    };
+
+    let Some(parent) = repo_root.parent() else {
+        return 0;
+    };
+
+    let Ok(entries) = fs::read_dir(parent) else {
+        return 0;
+    };
+
+    let mut total = 0u64;
+    let mut entries_scanned = 0usize;
+    for entry in entries.flatten() {
+        if entries_scanned >= MAX_MANY_WORKTREE_ENTRIES {
+            break;
+        }
+        entries_scanned = entries_scanned.saturating_add(1);
+
+        let Ok(meta) = entry.symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let candidate = entry.path();
+        if !is_worktree_root(&candidate) {
+            continue;
+        }
+
+        let target = candidate.join("target");
+        let Ok(target_meta) = target.symlink_metadata() else {
+            continue;
+        };
+        if !target_meta.is_dir() || target_meta.file_type().is_symlink() {
+            continue;
+        }
+        total = total.saturating_add(measure_directory(&target).size_bytes);
+    }
+
+    total
+}
+
+fn is_worktree_root(path: &Path) -> bool {
+    let git_path = path.join(".git");
+    git_path
+        .symlink_metadata()
+        .map(|m| {
+            let ty = m.file_type();
+            !ty.is_symlink() && (ty.is_file() || ty.is_dir())
+        })
+        .unwrap_or(false)
+}
+
+fn find_repo_root_from_cwd() -> Option<PathBuf> {
+    let mut current = env::current_dir().ok()?;
+    loop {
+        let git_path = current.join(".git");
+        if git_path.symlink_metadata().is_ok() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 /// Run the warm phase to pre-populate build caches.
 ///
 /// Returns `true` if warm succeeded.
-fn run_warm_phase(json_output: bool) -> bool {
-    // We run `cargo build --workspace` directly as a quick warm-up.
-    // This populates compiled dependencies without the full broker/queue flow.
-    let output = Command::new("cargo")
-        .args(["build", "--workspace"])
-        .output();
-
-    match output {
-        Ok(out) => {
-            if !out.status.success() && json_output {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let truncated: String = stderr.chars().take(2048).collect();
-                emit_event(
-                    json_output,
-                    "warm_stderr",
-                    &serde_json::json!({
-                        "stderr": truncated,
-                    }),
-                );
-            }
-            out.status.success()
-        },
-        Err(_) => false,
-    }
+fn run_warm_phase(timeout_seconds: u64, json_output: bool) -> bool {
+    let status = run_fac_warm(&None, &None, true, timeout_seconds, json_output);
+    status == exit_codes::SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -790,9 +958,14 @@ fn measure_directory(root: &Path) -> DiskFootprint {
                 continue;
             };
 
-            let Ok(meta) = entry.metadata() else {
+            let Ok(meta) = entry.symlink_metadata() else {
                 continue;
             };
+
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
 
             if meta.is_dir() {
                 dir_count = dir_count.saturating_add(1);
@@ -915,7 +1088,10 @@ fn compute_report_content_hash(report: &BenchReportV1) -> String {
     hasher.update(report.deltas.cold_total_ms.to_le_bytes());
     hasher.update(report.deltas.warm_total_ms.to_le_bytes());
     hasher.update(report.deltas.speedup_factor.to_le_bytes());
+    hasher.update(report.deltas.many_worktrees_target_baseline_bytes.to_le_bytes());
     hasher.update(report.deltas.warm_target_size_bytes.to_le_bytes());
+    hasher.update(report.deltas.target_collapse_factor.to_le_bytes());
+    hasher.update(report.deltas.target_collapse_percent.to_le_bytes());
     hasher.update(report.deltas.concurrent_passed.to_le_bytes());
     hasher.update(report.deltas.concurrent_total.to_le_bytes());
     hasher.update(report.deltas.denial_rate.to_le_bytes());
@@ -1053,6 +1229,9 @@ mod tests {
                 cold_total_ms: 3000,
                 warm_total_ms: 300,
                 speedup_factor: 10.0,
+                many_worktrees_target_baseline_bytes: 1024,
+                target_collapse_factor: 2.0,
+                target_collapse_percent: 50.0,
                 warm_target_size_bytes: 1024,
                 concurrent_passed: 2,
                 concurrent_total: 2,
@@ -1082,6 +1261,9 @@ mod tests {
                 cold_total_ms: 3000,
                 warm_total_ms: 300,
                 speedup_factor: 10.0,
+                many_worktrees_target_baseline_bytes: 0,
+                target_collapse_factor: 0.0,
+                target_collapse_percent: 0.0,
                 warm_target_size_bytes: 0,
                 concurrent_passed: 0,
                 concurrent_total: 0,
@@ -1174,8 +1356,33 @@ mod tests {
     #[test]
     fn test_max_concurrency_clamp() {
         let requested: u8 = 20;
-        let effective = requested.min(MAX_CONCURRENCY);
+        let effective = requested.max(1).min(MAX_CONCURRENCY);
         assert_eq!(effective, MAX_CONCURRENCY);
+
+        let zero_requested: u8 = 0;
+        let zero_effective = zero_requested.max(1).min(MAX_CONCURRENCY);
+        assert_eq!(zero_effective, 1);
+    }
+
+    #[test]
+    fn test_target_collapse_metrics() {
+        let (factor, percent) = compute_target_collapse_metrics(1_000, 250);
+        assert!((factor - 4.0).abs() < f64::EPSILON);
+        assert!((percent - 75.0).abs() < f64::EPSILON);
+
+        let (factor_zero, percent_zero) = compute_target_collapse_metrics(0, 100);
+        assert_eq!(factor_zero, 0.0);
+        assert_eq!(percent_zero, 0.0);
+    }
+
+    #[test]
+    fn test_find_repo_root_from_cwd_none_if_missing() {
+        // If no .git is reachable in ancestors, baseline inference should be None.
+        let original = env::current_dir().expect("capture cwd");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        assert!(env::set_current_dir(tmp.path()).is_ok());
+        assert!(find_repo_root_from_cwd().is_none());
+        assert!(env::set_current_dir(original).is_ok());
     }
 
     #[test]
@@ -1192,6 +1399,9 @@ mod tests {
                 cold_total_ms: 3000,
                 warm_total_ms: 300,
                 speedup_factor: 10.0,
+                many_worktrees_target_baseline_bytes: 0,
+                target_collapse_factor: 0.0,
+                target_collapse_percent: 0.0,
                 warm_target_size_bytes: 0,
                 concurrent_passed: 0,
                 concurrent_total: 0,
