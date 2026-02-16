@@ -1957,6 +1957,7 @@ fn process_job(
                 .to_string()
         })
         .ok();
+        let sbx_hash = policy.sandbox_hardening.content_hash_hex();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1971,7 +1972,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
-            None,
+            Some(&sbx_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2038,6 +2039,7 @@ fn process_job(
             eprintln!("worker: WARNING: failed to move job to denied");
         }
         let reason = format!("preflight failed: {error:?}");
+        let sbx_hash = policy.sandbox_hardening.content_hash_hex();
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -2052,7 +2054,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
-            None,
+            Some(&sbx_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2081,6 +2083,7 @@ fn process_job(
                     .to_string()
             })
             .ok();
+            let sbx_hash = policy.sandbox_hardening.content_hash_hex();
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -2095,7 +2098,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
-                None,
+                Some(&sbx_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
