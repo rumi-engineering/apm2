@@ -443,6 +443,244 @@ scope:
           - The file ends cleanly after the "warm and GC interfaces /
             compute lease concept / Nix reproduction" outline.
 
+    - id: S8_HARDEN_STUCK_STALE_AGENT_DETECTION
+      title: "Harden detection of stuck/stale agents so orchestrators don't have to"
+      detail: |
+        The agent registry (lifecycle.rs) tracks `TrackedAgent` entries with
+        state transitions: Dispatched → Running → Completed/Crashed/Reaped.
+        The reaper (`reap_registry_stale_entries()` at lifecycle.rs:1680-1762)
+        auto-reaps agents with dead PIDs or no PID after 240s. But
+        `build_recommended_action()` has no awareness of agent staleness —
+        it only checks `active_agents == 0` for the restart_reviews branch.
+
+        Three gaps force orchestrators to manually detect and recover stuck
+        agents:
+
+        GAP 1: IDLE RUNNING AGENTS NOT DETECTED
+
+        Doctor already collects `last_activity_seconds_ago` (age of most
+        recent event from review events log) and `elapsed_seconds` (time
+        since agent started) in DoctorAgentSnapshot, but
+        build_recommended_action() never consults these. An agent in Running
+        state with a live PID but zero activity for 30+ minutes will produce
+        action="wait" indefinitely.
+
+        Fix: Before the terminal "wait" fallback, check active agents for
+        staleness. If ALL active agents have `last_activity_seconds_ago >
+        AGENT_IDLE_TIMEOUT` (e.g., 300 seconds), emit action="restart_reviews"
+        with reason "all active reviewer agents are idle (no activity for
+        {N}s); recommend restart" and command pointing to
+        `apm2 fac restart --pr <N> --force --refresh-identity`.
+
+        This requires adding agent snapshot data to DoctorActionInputs.
+        Currently DoctorActionInputs carries `active_agents: usize` (a
+        count). Extend it to carry a lightweight activity summary:
+
+            pub struct DoctorAgentActivitySummary {
+                pub active_agents: usize,
+                pub all_active_idle: bool,       // all active agents idle > threshold
+                pub max_idle_seconds: Option<u64>, // worst-case idle time
+            }
+
+        GAP 2: DISPATCHED-NEVER-RUNNING NOT SURFACED
+
+        The reaper handles Dispatched-without-PID after 240s TTL, but doctor
+        recommends "wait" during that entire window. The orchestrator sees
+        "wait" and has no way to know a dispatch may have failed.
+
+        Fix: If any agent is in Dispatched state with elapsed > 120s (the
+        base DISPATCH_PENDING_TTL), include a warning in the recommended
+        action reason: "reviewer dispatch pending for {N}s (may be stuck)".
+        This doesn't change the action — the reaper will handle cleanup —
+        but gives the orchestrator visibility.
+
+        GAP 3: DOCTOR --FIX SHOULD AUTO-REAP AND RESTART
+
+        Currently `derive_doctor_repair_plan()` (mod.rs:1365-1404) sets
+        `reap_stale_agents = true` when it detects dead-PID agents or
+        capacity overflow. But it does NOT trigger a restart after reaping.
+        The orchestrator must poll again, see restart_reviews, and execute
+        it — an extra round-trip.
+
+        Fix: In `run_repair_plan()`, after reaping stale agents, if verdicts
+        are still pending and active_agents drops to zero, also execute a
+        restart (equivalent to `apm2 fac restart --pr <N>`). Log the
+        compound repair: "reaped stale agents and restarted reviews."
+
+        Acceptance:
+          - Running agent with no activity for >300s triggers
+            action="restart_reviews" (not "wait").
+          - Dispatched agent pending for >120s includes warning text in
+            recommended_action.reason.
+          - `apm2 fac doctor --pr <N> --fix` reaps stale agents AND
+            restarts reviews in a single invocation when applicable.
+          - Orchestrator control loop no longer needs IDLE_AGENT_RECOVERY
+            step (180s timeout) — doctor handles it.
+
+    - id: S9_UPDATE_ORCHESTRATOR_MONITOR_SKILL
+      title: "Update orchestrator-monitor SKILL.md for new action vocabulary"
+      detail: |
+        `documents/skills/orchestrator-monitor/SKILL.md` must be updated to
+        reflect the changes in S1-S8. The orchestrator's control loop
+        simplifies dramatically when every action has a command.
+
+        CHANGES REQUIRED:
+
+        1. SIMPLIFY HEARTBEAT_LOOP CLASSIFY step (line 88-91):
+
+           The 8-state classification (MERGED, READY_TO_MERGE, PR_CONFLICTING,
+           CI_FAILED, REVIEW_FAILED, REVIEW_MISSING, WAITING_CI,
+           BLOCKED_UNKNOWN) is now largely redundant — doctor's action
+           vocabulary covers these states directly:
+             - MERGED            → doctor action "done"
+             - READY_TO_MERGE    → doctor action "approve" or "merge"
+             - PR_CONFLICTING    → doctor action "escalate" (conflicts)
+             - REVIEW_FAILED     → doctor action "dispatch_implementor"
+             - REVIEW_MISSING    → doctor action "restart_reviews"
+             - WAITING_CI        → doctor action "wait"
+             - BLOCKED_UNKNOWN   → doctor action "escalate" (budget)
+             - CI_FAILED         → doctor action "fix"
+
+           Update CLASSIFY to: "Read recommended_action from doctor output.
+           The action field is the authoritative classification." Keep the
+           state names as documentation labels but stop requiring the
+           orchestrator to derive them from raw JSON fields.
+
+        2. SIMPLIFY EXECUTE_ACTIONS node (lines 102-121):
+
+           Currently 5 sub-steps with manual logic per state. Replace with
+           a command-driven dispatch pattern:
+
+             - If action has command: execute the command.
+             - If action is terminal (done, merge): record completion, move on.
+             - If action is "dispatch_implementor": execute command to get
+               findings, then dispatch implementor with handoff payload.
+
+           The READY_TO_MERGE_ACTION ("check main branch... check again
+           shortly until merged") is replaced by polling with
+           `--exit-on done` — auto-merge handles the actual merge.
+
+        3. SIMPLIFY FIX_AGENT_PROMPT_CONTRACT node (lines 165-195):
+
+           The 8-step prompt construction is now partially addressed by
+           dispatch_implementor having a command and enriched reason with
+           per-dimension verdicts. The node should focus on what the
+           orchestrator ADDS beyond what doctor provides:
+             - Ticket ID (from orchestrator context, not doctor)
+             - Worktree path (from orchestrator state)
+             - implementor skill invocation syntax
+
+           The node no longer needs to: derive findings from raw
+           findings_summary JSON, compute HEAD SHA, or determine which
+           dimensions failed — this is all in the enriched reason.
+
+        4. UPDATE operational_playbook scenarios (lines 214-263):
+
+           Add new scenarios:
+             - trigger: "Doctor reports action=done"
+               action: "PR is complete. Remove from active monitoring set."
+             - trigger: "Doctor reports action=approve"
+               action: "All reviews approve. Poll with --exit-on done to
+               await auto-merge completion."
+             - trigger: "Doctor reports stuck/idle agents"
+               action: "Follow recommended_action.command (restart with
+               --force). Do not manually inspect agent logs."
+
+           Update existing scenarios to reference command field:
+             - "dispatch_implementor" scenario: "Execute
+               recommended_action.command to retrieve findings, then
+               construct implementor handoff."
+             - "wait" scenario: "Execute recommended_action.command (polls
+               with --wait-for-recommended-action)."
+
+        5. REMOVE IDLE_AGENT_RECOVERY from STALL_AND_BACKPRESSURE (line 133):
+
+           The 180s idle agent timeout is now handled by doctor (S8). Remove
+           the orchestrator-side idle detection. Keep ENFORCE_BACKPRESSURE
+           but simplify: doctor's action already accounts for capacity.
+
+        6. UPDATE invariants (lines 265-275):
+
+           Add: "When doctor provides recommended_action.command, execute it
+           verbatim. Do not re-derive commands from raw JSON fields."
+           Add: "Use --exit-on done to detect PR completion instead of
+           parsing lifecycle.state from doctor JSON."
+
+        7. ADD simplified control loop pattern to notes (lines 24-29):
+
+           The ideal orchestrator loop is now:
+               for pr in scope:
+                 loop:
+                   result = apm2 fac doctor --pr {pr} --json \
+                       --wait-for-recommended-action \
+                       --exit-on done
+                   match result.action:
+                     "done" → break
+                     "dispatch_implementor" → dispatch_with_handoff(result)
+                     _ → execute(result.command)
+
+           Document this pattern in notes as the canonical control loop.
+
+        Acceptance:
+          - SKILL.md references "done" and "approve" as valid doctor actions.
+          - FIX_AGENT_PROMPT_CONTRACT simplified to focus on orchestrator-
+            added context (ticket ID, worktree, skill invocation), not
+            re-deriving findings from raw JSON.
+          - IDLE_AGENT_RECOVERY removed or replaced with "doctor handles
+            stuck agent detection."
+          - Operational playbook has scenarios for done, approve, and
+            stuck-agent recovery.
+          - The simplified control loop pattern is documented.
+
+    - id: S10_UPDATE_IMPLEMENTOR_DEFAULT_SKILL
+      title: "Update implementor-default SKILL.md for doctor integration awareness"
+      detail: |
+        `documents/skills/implementor-default/SKILL.md` needs targeted
+        updates to align with the new doctor action vocabulary. The
+        implementor workflow itself doesn't change — implementors still
+        write code, run gates, and push. But the context they receive from
+        orchestrator handoffs changes because the orchestrator now gets
+        richer information from doctor.
+
+        CHANGES REQUIRED:
+
+        1. UPDATE FETCH_REVIEW_FINDINGS step (START node, line 82-88):
+
+           Currently says:
+               `apm2 fac review findings --pr <PR_NUMBER> --json`
+
+           This is correct and unchanged. But add a note that orchestrator
+           handoffs now include per-dimension verdict summaries from
+           doctor's enriched dispatch_implementor reason (e.g.,
+           "security=deny(2B/1M) code-quality=approve"). The implementor
+           should still fetch full findings via the command, but can use
+           the summary for triage priority.
+
+        2. ADD awareness of doctor action gating in orientation/notes:
+
+           The implementor should know that it is only dispatched AFTER all
+           review dimensions have completed (S1 gating). This means:
+             - The findings set is COMPLETE — no more reviews are pending.
+             - The implementor should address ALL findings across ALL
+               dimensions in a single pass, not just the dimension that
+               triggered dispatch.
+             - There will be no surprise "second dispatch" for a later
+               dimension completing.
+
+        3. UPDATE references section (lines 20-57):
+
+           Verify the RFC-0019 amendment reference at line 26 still points
+           to a valid file (it does — we cleaned up the amendment in S7
+           but didn't remove valid content). No change needed unless the
+           file path changed.
+
+        Acceptance:
+          - SKILL.md notes that dispatch occurs only after all verdicts
+            are resolved.
+          - FETCH_REVIEW_FINDINGS step mentions orchestrator handoff
+            includes per-dimension summary.
+          - No broken references after S7 amendment cleanup.
+
   out_of_scope:
     - "Adding a full `apm2 fac dispatch-implementor --pr <N>` CLI verb that autonomously launches an implementor agent. This would be the ideal long-term fix for S2, but is a large change requiring agent lifecycle management in the CLI. The pragmatic S2 fix (command + enriched reason) is sufficient to close the orchestrator improvisation gap."
     - "Adding `apm2 fac merge --pr <N>` CLI verb. Auto-merge via maybe_auto_merge_if_ready() handles the merge path; the new 'done' and 'approve' actions make the merged/approved state observable to orchestrators."
@@ -450,7 +688,6 @@ scope:
     - "Adding --repo filter or --exclude-examples to global doctor mode (useful but separate concern from the action cascade)."
     - "Adding --active-only or --current-sha-only agent filtering (useful but orthogonal to the action command gap)."
     - "Adding worktree_status.behind_main_by field (useful but orthogonal)."
-    - "Self-healing auto-reap for dispatched-no-PID agents (separate ticket — addresses a stuck-state recovery gap, not the action vocabulary gap)."
 
 plan:
   steps:
@@ -550,15 +787,61 @@ plan:
         exit-on variants (2).
 
     - id: STEP_09
-      title: "Verify full cascade"
+      title: "Add agent activity summary to DoctorActionInputs"
+      detail: |
+        1. Define DoctorAgentActivitySummary struct with:
+           active_agents, all_active_idle, max_idle_seconds.
+        2. Populate from DoctorAgentSnapshot data already collected in
+           run_doctor_inner().
+        3. Replace active_agents: usize in DoctorActionInputs with the
+           new summary struct.
+        4. Update build_recommended_action() to use summary fields.
+
+    - id: STEP_10
+      title: "Add stuck/idle agent detection to build_recommended_action()"
+      detail: |
+        Before the terminal "wait" fallback:
+        1. If all_active_idle (all active agents idle > threshold),
+           return restart_reviews with --force --refresh-identity command.
+        2. If any Dispatched agent > 120s, append warning to wait reason.
+
+        In run_repair_plan():
+        3. After reaping stale agents, if active_agents drops to zero and
+           verdicts pending, auto-restart reviews.
+
+    - id: STEP_11
+      title: "Update orchestrator-monitor SKILL.md"
+      detail: |
+        Apply all changes described in S9:
+        1. Simplify CLASSIFY to reference doctor action vocabulary.
+        2. Simplify EXECUTE_ACTIONS to command-driven dispatch.
+        3. Simplify FIX_AGENT_PROMPT_CONTRACT.
+        4. Update operational_playbook with done/approve/stuck scenarios.
+        5. Remove IDLE_AGENT_RECOVERY.
+        6. Update invariants.
+        7. Add simplified control loop pattern to notes.
+
+    - id: STEP_12
+      title: "Update implementor-default SKILL.md"
+      detail: |
+        Apply changes described in S10:
+        1. Add note about per-dimension summary in orchestrator handoffs.
+        2. Add awareness that dispatch is gated on all verdicts resolved.
+        3. Verify references still valid after S7 amendment cleanup.
+
+    - id: STEP_13
+      title: "Verify full cascade and all changes"
       detail: |
         1. cargo test -p apm2-cli — all tests pass.
         2. Verify every action in build_recommended_action() has either
            command: Some(...) or is a terminal action (done, merge).
         3. Verify the action cascade order is:
            fix → done → merge → approve → escalate(conflicts) →
-           dispatch_implementor → restart_reviews → escalate(budget) → wait
+           dispatch_implementor → restart_reviews(idle) →
+           restart_reviews(no agents) → escalate(budget) → wait
         4. Grep-verify no remaining command: None for non-terminal actions.
+        5. Verify SKILL.md files are consistent with new action vocabulary.
+        6. Verify no broken references in implementor-default SKILL.md.
 
 definition_of_done:
   evidence_ids: []
@@ -575,6 +858,11 @@ definition_of_done:
     - "wait action command contains `--wait-for-recommended-action` so orchestrators have an actionable polling next step."
     - "Existing dispatch_implementor tests updated to include both dimensions and continue to pass."
     - "12 new tests cover verdict gating, done/approve actions, command fields, and exit-on parsing."
+    - "Running agent idle >300s with live PID triggers action=restart_reviews (not wait)."
+    - "`apm2 fac doctor --pr <N> --fix` reaps stale agents AND restarts reviews in one invocation when verdicts are pending."
+    - "orchestrator-monitor SKILL.md references done, approve, and stuck-agent actions; FIX_AGENT_PROMPT_CONTRACT simplified; IDLE_AGENT_RECOVERY removed."
+    - "orchestrator-monitor SKILL.md documents the simplified control loop pattern (poll → match action → execute command)."
+    - "implementor-default SKILL.md notes dispatch is gated on all verdicts resolved and handoffs include per-dimension summaries."
     - "`cargo test -p apm2-cli` passes."
 
 notes:
