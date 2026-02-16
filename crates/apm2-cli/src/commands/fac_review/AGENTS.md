@@ -35,7 +35,7 @@ apm2 fac review run --pr <N> --type all
        +-- gate_attestation.rs (gate attestation recording)
        +-- gate_cache.rs     (gate result caching)
        +-- logs.rs           (review log retrieval by PR/selector)
-       +-- pipeline.rs       (end-to-end pipeline: dispatch + project)
+       +-- pipeline.rs       (end-to-end pipeline: mirror checkout + gates + dispatch)
        +-- prepare.rs        (review input preparation)
        +-- projection.rs     (projection snapshot for GitHub surfaces + PR body gate-status sync)
        +-- projection_store.rs (local canonical projection cache under ~/.apm2/fac_projection)
@@ -63,7 +63,7 @@ apm2 fac review run --pr <N> --type all
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **One-shot missing-verdict nudge**: On clean exit without a completion signal, orchestrator resumes the same session once (`SpawnMode::Resume`) with an explicit required `apm2 fac verdict set ...` command; crash/timeout paths still fall through to existing auto-verdict behavior.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
-- **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.
+- **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA (used by restart and dispatch paths; the pipeline path uses mirror-based lane checkout instead, see TCK-00544).
 - **Per-SHA finding comments**: `apm2 fac review comment` writes one finding per comment using an `apm2-finding:v1` marker and `apm2.finding.v1` metadata block.
 - **PR body gate status sync**: `apm2 fac push` writes a marker-bounded gate-status section in the PR body with expanded latest SHA and collapsed previous SHA snapshots.
 
@@ -315,6 +315,8 @@ pub use types::ReviewRunType;
   - `evidence.rs`: `build_pipeline_test_command()` and `build_gate_policy_env()` accept a `lane_dir` parameter from the actually-locked lane (returned by `allocate_lane_job_logs_dir` / `allocate_evidence_lane_context`) and call `ensure_lane_env_dirs()` + `apply_lane_env_overrides()` using that lane directory, maintaining lock/env coupling. `EvidenceLaneContext` contains `logs_dir`, `lane_dir`, and `_lane_guard` so callers use the correct lane for env overrides. Every FAC gate phase (fmt, clippy, doc, test, script) runs with deterministic lane-local `HOME`/`TMPDIR`/`XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` values scoped to the locked lane.
   - `policy.rs`: `ensure_lane_env_dirs()` uses atomic creation (mkdir + handle `AlreadyExists`) instead of `exists()` check, eliminating TOCTOU. `verify_dir_permissions()` is the shared public helper for directory permission verification (symlink rejection, ownership check, mode 0o700 in operator mode/0o770 in system-mode), used by both `verify_lane_env_dir_permissions()` and `verify_cargo_home_permissions()`. UID comparison uses `subtle::ConstantTimeEq`.
   - `policy_loader.rs`: `ensure_managed_cargo_home()` uses atomic creation (mkdir + handle `AlreadyExists`) instead of `exists()` check. `verify_cargo_home_permissions()` delegates to the shared `verify_dir_permissions()` helper in `apm2-core`.
+- TCK-00544: Pipeline evidence execution via mirror-based lane checkout (eliminate SHA drift + dirty-attests-clean hazard).
+  - `pipeline.rs`: `run_pipeline_inner()` no longer calls `resolve_worktree_for_sha()` to find a caller worktree. Instead, it calls `setup_mirror_lane_workspace()` which: (1) ensures a bare mirror via `RepoMirrorManager::ensure_mirror()` using the GitHub URL derived from the `owner/name` repo slug, (2) acquires an exclusive lane lock via `LaneManager`, (3) checks out the exact target SHA from the mirror to a lane workspace via `RepoMirrorManager::checkout_to_lane()`. The lane workspace is clean by construction (freshly cloned from mirror at exact SHA), eliminating both SHA drift (HEAD cannot move) and dirty-attests-clean (no caller workspace content leaks into the lane). Evidence gates run inside the lane workspace using `run_evidence_gates_with_status_with_lane_context()` instead of `run_evidence_gates_with_status()`, accepting a pre-allocated `EvidenceLaneContext`. JSONL telemetry events added for mirror/checkout lifecycle stages (`mirror_ensure_started`, `mirror_ensure_completed`, `mirror_checkout_started`, `mirror_checkout_completed`).
 - TCK-00607: Doctor activity metrics + one-shot reviewer nudge + timeout consistency.
   - `apm2 fac doctor --pr <N>` now surfaces per-agent `tool_call_count`, `log_line_count`, and `nudge_count` keyed by `run_id` when available.
   - Event scanning for doctor is explicitly bounded (`DOCTOR_EVENT_SCAN_MAX_LINES`, `DOCTOR_EVENT_SCAN_MAX_LINE_BYTES`) and scans both current and rotated review event logs.
