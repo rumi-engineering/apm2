@@ -813,10 +813,12 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   units.
 - **Warm phases** (`fac/warm.rs`, `fac_worker.rs`): `execute_warm_job()` builds
   a hardened environment via `build_job_environment()` before calling
-  `execute_warm()`. All warm subprocesses (phase commands and version probes)
-  execute with `env_clear()` + hardened env (INV-WARM-012). FAC-private state,
-  secrets, and worker authority context are unreachable from untrusted `build.rs`
-  and proc-macro code.
+  `execute_warm()`. In the containment path (systemd-run), the hardened env is
+  forwarded via `--setenv` arguments; the systemd-run process itself inherits
+  the parent environment (needs D-Bus connectivity). In the direct spawn
+  fallback path, `env_clear()` + hardened env is used (INV-WARM-012).
+  FAC-private state, secrets, and worker authority context are unreachable
+  from untrusted `build.rs` and proc-macro code.
 
 ### Security Invariants (TCK-00526)
 
@@ -1117,12 +1119,18 @@ pre-populating build caches in the lane target namespace.
   contained. Uses `build_systemd_run_command()` from `execution_backend` for
   consistent command construction. When `systemd-run` is unavailable, falls
   back to direct `Command::spawn` with a logged warning (no silent
-  degradation). Environment is forwarded via `--setenv` arguments.
+  degradation). Environment is forwarded via `--setenv` arguments. The
+  systemd-run process itself inherits the parent environment (no
+  `env_clear()`) because it needs `DBUS_SESSION_BUS_ADDRESS` and
+  `XDG_RUNTIME_DIR` for user-mode D-Bus connectivity; the contained child
+  process receives its environment exclusively via `--setenv`.
 - [INV-WARM-015] Heartbeat refresh is integrated into the warm phase `try_wait`
   polling loop via an optional callback. Invoked every 5 seconds
   (`HEARTBEAT_REFRESH_INTERVAL`) to prevent the worker heartbeat file from
   going stale during long-running warm phases (which can take hours for large
-  projects). The heartbeat callback is passed from the worker into
+  projects). The heartbeat callback captures the last known cycle count and
+  job counters from the worker's main loop so that observers see accurate
+  state during warm phases. The callback is passed from the worker into
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
 

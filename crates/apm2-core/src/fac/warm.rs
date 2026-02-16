@@ -567,11 +567,22 @@ fn phase_cargo_args(phase: WarmPhase) -> (Vec<String>, String) {
 /// Build the `Command` for a warm phase, optionally wrapped in a `systemd-run`
 /// transient unit for cgroup containment.
 ///
-/// [INV-WARM-009] The ambient process environment is cleared via
-/// `env_clear()`, then only the policy-filtered `hardened_env` is applied.
-/// `CARGO_HOME` and `CARGO_TARGET_DIR` are overridden to lane-managed
-/// paths. `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are set to
-/// `/dev/null` to prevent ambient git config interference.
+/// [INV-WARM-009] Environment hardening differs by execution path:
+///
+/// - **Containment path** (`systemd-run`): The hardened environment is
+///   forwarded into the transient unit via `--setenv` arguments. The contained
+///   child process does NOT inherit the parent's environment; systemd manages
+///   its environment exclusively via `--setenv`. The systemd-run process itself
+///   inherits the parent environment because it needs
+///   `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` for user-mode D-Bus
+///   connectivity.
+///
+/// - **Direct spawn path** (fallback): `env_clear()` is called on the
+///   `Command`, then only the policy-filtered `hardened_env` is applied.
+///
+/// In both cases, `CARGO_HOME` and `CARGO_TARGET_DIR` are overridden to
+/// lane-managed paths, and `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are
+/// set to `/dev/null` to prevent ambient git config interference.
 ///
 /// [INV-WARM-014] When `containment` is `Some`, the cargo command is wrapped
 /// via `build_systemd_run_command()` with lane-profile resource limits. The
@@ -641,13 +652,20 @@ fn build_phase_command(
         full_args.extend(systemd_cmd.args[property_start..].iter().cloned());
 
         // Build Command from the assembled args.
+        //
+        // NOTE: We do NOT call cmd.env_clear() here. The systemd-run
+        // process itself needs DBUS_SESSION_BUS_ADDRESS and
+        // XDG_RUNTIME_DIR to connect to the user session bus (for
+        // --user mode). Clearing the environment breaks D-Bus
+        // connectivity and causes systemd-run to fail in user-mode.
+        //
+        // Environment isolation for the *contained child process* is
+        // handled by systemd: the transient unit receives its
+        // environment exclusively via --setenv arguments above, not
+        // by inheriting the parent's environment. This matches the
+        // bounded test runner pattern in bounded_test_runner.rs.
         let mut cmd = Command::new(&full_args[0]);
         cmd.args(&full_args[1..]);
-
-        // [INV-WARM-009] Clear inherited environment (default-deny).
-        // The transient unit receives its environment exclusively via
-        // --setenv arguments above; the parent process env is not leaked.
-        cmd.env_clear();
 
         let display_str = format!("systemd-run [contained] {cmd_str}");
         Ok((cmd, display_str))

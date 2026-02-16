@@ -96,8 +96,7 @@ use apm2_core::fac::{
     LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
     RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, build_job_environment,
     compute_policy_hash, deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, probe_user_bus, run_preflight,
-    select_backend,
+    persist_content_addressed_receipt, persist_policy, run_preflight, select_and_validate_backend,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -671,6 +670,10 @@ pub fn run_fac_worker(
                     print_unit,
                     &current_tuple_digest,
                     &boundary_id,
+                    cycle_count,
+                    summary.jobs_completed as u64,
+                    summary.jobs_denied as u64,
+                    summary.jobs_quarantined as u64,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -1045,6 +1048,10 @@ fn process_job(
     print_unit: bool,
     canonicalizer_tuple_digest: &str,
     boundary_id: &str,
+    heartbeat_cycle_count: u64,
+    heartbeat_jobs_completed: u64,
+    heartbeat_jobs_denied: u64,
+    heartbeat_jobs_quarantined: u64,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -2458,6 +2465,10 @@ fn process_job(
             &candidate.raw_bytes,
             policy,
             &lane_systemd_properties,
+            heartbeat_cycle_count,
+            heartbeat_jobs_completed,
+            heartbeat_jobs_denied,
+            heartbeat_jobs_quarantined,
         );
     }
 
@@ -3391,6 +3402,10 @@ fn execute_warm_job(
     _raw_bytes: &[u8],
     policy: &FacPolicyV1,
     lane_systemd_properties: &SystemdUnitProperties,
+    heartbeat_cycle_count: u64,
+    heartbeat_jobs_completed: u64,
+    heartbeat_jobs_denied: u64,
+    heartbeat_jobs_quarantined: u64,
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
@@ -3540,10 +3555,14 @@ fn execute_warm_job(
     // MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec from the lane profile,
     // matching the containment model used by standard bounded test execution.
     //
+    // Uses select_and_validate_backend() for consistency with other components
+    // (bounded test runner, gate execution). This validates prerequisites
+    // (user bus for user-mode, systemd-run for system-mode) in one call.
+    //
     // When systemd-run is unavailable (e.g., container environments), fall
     // back to direct Command::spawn with a logged warning. No silent
     // degradation — the operator is informed of reduced containment.
-    let warm_containment = match select_backend() {
+    let warm_containment = match select_and_validate_backend() {
         Ok(backend) => {
             let system_config = if backend == ExecutionBackend::SystemMode {
                 match SystemModeConfig::from_env() {
@@ -3559,14 +3578,7 @@ fn execute_warm_job(
             } else {
                 None
             };
-            // Verify user bus for user-mode (same check as bounded test runner).
-            if backend == ExecutionBackend::UserMode && !probe_user_bus() {
-                eprintln!(
-                    "worker: WARNING: user D-Bus session bus not found for warm containment, \
-                     falling back to uncontained execution"
-                );
-                None
-            } else if backend == ExecutionBackend::SystemMode && system_config.is_none() {
+            if backend == ExecutionBackend::SystemMode && system_config.is_none() {
                 None
             } else {
                 Some(WarmContainment {
@@ -3578,8 +3590,8 @@ fn execute_warm_job(
         },
         Err(e) => {
             eprintln!(
-                "worker: WARNING: execution backend selection failed for warm containment, \
-                 falling back to uncontained execution: {e}"
+                "worker: WARNING: execution backend selection/validation failed for warm \
+                 containment, falling back to uncontained execution: {e}"
             );
             None
         },
@@ -3599,18 +3611,23 @@ fn execute_warm_job(
     // projects). The heartbeat is refreshed every HEARTBEAT_REFRESH_INTERVAL
     // (5s) inside the try_wait loop.
     //
+    // The closure captures the last known cycle_count and job counters from
+    // the worker's main loop so that observers see accurate state during
+    // long warm phases, rather than misleading zeroed counters.
+    //
     // Synchronization: heartbeat_fn captures fac_root by value (Path clone)
-    // and is invoked synchronously from the same thread that calls
-    // execute_warm_phase. No cross-thread sharing or interior mutability.
+    // and counter values by copy. Invoked synchronously from the same
+    // thread that calls execute_warm_phase. No cross-thread sharing or
+    // interior mutability.
     let heartbeat_fac_root = fac_root.to_path_buf();
     let heartbeat_job_id = spec.job_id.clone();
     let heartbeat_fn = move || {
         if let Err(e) = apm2_core::fac::worker_heartbeat::write_heartbeat(
             &heartbeat_fac_root,
-            0, // cycle_count not meaningful during warm phase execution
-            0,
-            0,
-            0,
+            heartbeat_cycle_count,
+            heartbeat_jobs_completed,
+            heartbeat_jobs_denied,
+            heartbeat_jobs_quarantined,
             "warm-executing",
         ) {
             // Non-fatal: heartbeat is observability, not correctness.
