@@ -327,3 +327,6 @@ pub use types::ReviewRunType;
   - Event scanning for doctor is explicitly bounded (`DOCTOR_EVENT_SCAN_MAX_LINES`, `DOCTOR_EVENT_SCAN_MAX_LINE_BYTES`) and scans both current and rotated review event logs.
   - Log counting is bounded (`DOCTOR_LOG_SCAN_MAX_BYTES`, `DOCTOR_LOG_SCAN_MAX_LINES`) to avoid unbounded memory/CPU growth on large logs.
   - `ReviewRunState` persists `nudge_count`; orchestrator emits `nudge_resume` and allows at most one nudge per run (`MAX_MISSING_VERDICT_NUDGES = 1`), disabled via `APM2_FAC_DISABLE_NUDGE`.
+- TCK-00573: Sandbox hardening in gate attestation + GateReceipt.
+  - `gate_attestation.rs`: `GateResourcePolicy` gains `sandbox_hardening: Option<String>` field, included in attestation digest computation. `from_cli()` accepts `sandbox_hardening: Option<&str>` parameter.
+  - `gates.rs` and `evidence.rs`: Updated `GateResourcePolicy::from_cli()` call sites to pass `Some(&sandbox_hardening_hash)` computed from `SandboxHardeningProfile::default().content_hash_hex()`.

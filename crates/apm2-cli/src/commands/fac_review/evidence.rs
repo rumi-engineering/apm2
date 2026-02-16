@@ -1655,6 +1655,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut gate_cache = GateCache::new(sha);
     let pipeline_test_command =
         build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
+    // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation
+    // to prevent stale gate results from insecure environments being reused.
+    let sandbox_hardening_hash =
+        apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,
@@ -1664,6 +1668,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         pipeline_test_command.bounded_runner,
         Some(pipeline_test_command.gate_profile.as_str()),
         Some(pipeline_test_command.effective_test_parallelism),
+        Some(&sandbox_hardening_hash),
     );
     if emit_human_logs {
         eprintln!(

@@ -573,6 +573,9 @@ fn run_gates_inner(
 
     // 6. Write attested results to gate cache for full runs only.
     if !quick {
+        // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation.
+        let sandbox_hardening_hash =
+            apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
         let policy = GateResourcePolicy::from_cli(
             quick,
             timeout_decision.effective_seconds,
@@ -582,6 +585,7 @@ fn run_gates_inner(
             bounded,
             Some(gate_profile.as_str()),
             Some(test_parallelism),
+            Some(&sandbox_hardening_hash),
         );
         let mut cache = GateCache::new(&sha);
         for result in &gate_results {

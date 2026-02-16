@@ -828,12 +828,11 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. Appended at end for backward
-        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00548: Containment trace. Uses type-specific marker `2u8`
+        // to ensure injective encoding: different trailing optional field
+        // combinations always produce distinct byte streams (MAJOR-1 fix).
         if let Some(trace) = &self.containment {
-            bytes.push(1u8);
+            bytes.push(2u8);
             bytes.push(u8::from(trace.verified));
             bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(trace.cgroup_path.as_bytes());
@@ -842,12 +841,12 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00573: Sandbox hardening hash. Appended at end for backward
-        // compatibility with pre-TCK-00573 receipts. No `0u8` presence
-        // marker when absent, matching the trailing-optional pattern used
-        // by moved_job_path and containment above.
+        // TCK-00573: Sandbox hardening hash. Uses type-specific marker
+        // `3u8` to ensure injective encoding: different trailing optional
+        // field combinations always produce distinct byte streams
+        // (MAJOR-1 fix).
         if let Some(hash) = &self.sandbox_hardening_hash {
-            bytes.push(1u8);
+            bytes.push(3u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
         }
@@ -977,12 +976,10 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. Appended at end for backward
-        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00548: Containment trace. Uses type-specific marker `2u8`
+        // to ensure injective encoding (MAJOR-1 fix).
         if let Some(trace) = &self.containment {
-            bytes.push(1u8);
+            bytes.push(2u8);
             bytes.push(u8::from(trace.verified));
             bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(trace.cgroup_path.as_bytes());
@@ -991,12 +988,10 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00573: Sandbox hardening hash. Appended at end for backward
-        // compatibility with pre-TCK-00573 receipts. No `0u8` presence
-        // marker when absent, matching the trailing-optional pattern used
-        // by moved_job_path and containment above.
+        // TCK-00573: Sandbox hardening hash. Uses type-specific marker
+        // `3u8` to ensure injective encoding (MAJOR-1 fix).
         if let Some(hash) = &self.sandbox_hardening_hash {
-            bytes.push(1u8);
+            bytes.push(3u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
         }
@@ -1832,6 +1827,14 @@ pub struct GateReceipt {
     /// boundary (TCK-00388 Quality BLOCKER 2).
     pub passed: bool,
 
+    /// Sandbox hardening hash for audit (TCK-00573, MAJOR-2).
+    ///
+    /// BLAKE3 hash of the `SandboxHardeningProfile` used for the gate
+    /// execution environment, formatted as `b3-256:<64hex>`. Enables audit
+    /// verification that the expected hardening profile was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_hardening_hash: Option<String>,
+
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
     pub receipt_signature: [u8; 64],
@@ -1914,6 +1917,15 @@ impl GateReceipt {
 
         // 12. passed (1 byte: 0 = false, 1 = true)
         bytes.push(u8::from(self.passed));
+
+        // 13. sandbox_hardening_hash (optional, TCK-00573 MAJOR-2)
+        // Uses type-specific marker `4u8` to ensure injective encoding
+        // across all optional trailing fields in GateReceipt.
+        if let Some(hash) = self.sandbox_hardening_hash.as_ref() {
+            bytes.push(4u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
 
         bytes
     }
@@ -2055,6 +2067,7 @@ pub struct GateReceiptBuilder {
     evidence_bundle_hash: Option<[u8; 32]>,
     job_spec_digest: Option<String>,
     passed: Option<bool>,
+    sandbox_hardening_hash: Option<String>,
 }
 
 impl GateReceiptBuilder {
@@ -2137,6 +2150,13 @@ impl GateReceiptBuilder {
     #[must_use]
     pub const fn passed(mut self, passed: bool) -> Self {
         self.passed = Some(passed);
+        self
+    }
+
+    /// Sets the sandbox hardening hash for audit (TCK-00573 MAJOR-2).
+    #[must_use]
+    pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
+        self.sandbox_hardening_hash = Some(hash.into());
         self
     }
 
@@ -2233,6 +2253,16 @@ impl GateReceiptBuilder {
             });
         }
 
+        // TCK-00573 MAJOR-2: Validate sandbox_hardening_hash format if set.
+        if let Some(ref hash) = self.sandbox_hardening_hash {
+            if !hash.starts_with("b3-256:") || hash.len() != 71 {
+                return Err(ReceiptError::InvalidData(format!(
+                    "sandbox_hardening_hash must be 'b3-256:<64 hex chars>', got length {}",
+                    hash.len()
+                )));
+            }
+        }
+
         // Create receipt with placeholder signature
         let mut receipt = GateReceipt {
             receipt_id: self.receipt_id,
@@ -2247,6 +2277,7 @@ impl GateReceiptBuilder {
             evidence_bundle_hash,
             job_spec_digest,
             passed,
+            sandbox_hardening_hash: self.sandbox_hardening_hash,
             receipt_signature: [0u8; 64],
         };
 
@@ -2336,6 +2367,9 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             evidence_bundle_hash,
             job_spec_digest,
             passed: proto.passed,
+            // Proto wire format does not yet carry sandbox_hardening_hash;
+            // default to None for proto-sourced receipts.
+            sandbox_hardening_hash: None,
             receipt_signature,
         })
     }
@@ -3751,6 +3785,148 @@ pub mod tests {
         assert!(
             result.is_err(),
             "malformed sandbox_hardening_hash must be rejected"
+        );
+    }
+
+    // ── MAJOR-1: Injective encoding tests ──
+
+    #[test]
+    fn canonical_bytes_injective_moved_job_path_vs_containment() {
+        // Two receipts where one has moved_job_path=Some and the other has
+        // containment=Some must produce distinct canonical bytes, even
+        // though both are trailing optional fields.
+        let base = || {
+            FacJobReceiptV1Builder::new(
+                "r-001",
+                "j-001",
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::ValidationFailed)
+            .reason("test reason")
+            .timestamp_secs(1_700_000_000)
+        };
+
+        let with_moved = base().moved_job_path("some/path.json").try_build().unwrap();
+        let with_containment = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: true,
+                cgroup_path: "some/path.json".to_string(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+            })
+            .try_build()
+            .unwrap();
+
+        assert_ne!(
+            with_moved.canonical_bytes(),
+            with_containment.canonical_bytes(),
+            "moved_job_path and containment must produce distinct canonical bytes"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_injective_containment_vs_sandbox_hash() {
+        // A receipt with containment but no sandbox hash must differ from
+        // one with sandbox hash but no containment.
+        let base = || {
+            FacJobReceiptV1Builder::new(
+                "r-002",
+                "j-002",
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::ValidationFailed)
+            .reason("test reason")
+            .timestamp_secs(1_700_000_000)
+        };
+
+        let with_containment = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: false,
+                cgroup_path: String::new(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+            })
+            .try_build()
+            .unwrap();
+        let with_sandbox = base()
+            .sandbox_hardening_hash(
+                "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .try_build()
+            .unwrap();
+
+        assert_ne!(
+            with_containment.canonical_bytes(),
+            with_sandbox.canonical_bytes(),
+            "containment and sandbox_hardening_hash must produce distinct canonical bytes"
+        );
+    }
+
+    // ── MAJOR-2: GateReceipt sandbox_hardening_hash tests ──
+
+    #[test]
+    fn gate_receipt_includes_sandbox_hardening_hash_in_canonical_bytes() {
+        let signer = Signer::generate();
+        let receipt_without = GateReceiptBuilder::new("r-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
+            .build_and_sign(&signer);
+
+        let receipt_with = GateReceiptBuilder::new("r-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
+            .sandbox_hardening_hash(
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .build_and_sign(&signer);
+
+        assert_ne!(
+            receipt_without.canonical_bytes(),
+            receipt_with.canonical_bytes(),
+            "sandbox_hardening_hash must change GateReceipt canonical bytes"
+        );
+        // Verify signature of receipt with hash is valid.
+        assert!(
+            receipt_with
+                .validate_signature(&signer.verifying_key())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gate_receipt_builder_rejects_malformed_sandbox_hash() {
+        let signer = Signer::generate();
+        let result = GateReceiptBuilder::new("r-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
+            .sandbox_hardening_hash("not-a-valid-hash")
+            .try_build_and_sign(&signer);
+
+        assert!(
+            result.is_err(),
+            "malformed sandbox_hardening_hash must be rejected by GateReceiptBuilder"
         );
     }
 }
