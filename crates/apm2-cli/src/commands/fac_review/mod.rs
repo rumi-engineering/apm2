@@ -91,6 +91,8 @@ const DOCTOR_LOG_SCAN_MAX_LINES: u64 = 200_000;
 const DOCTOR_LOG_SCAN_CHUNK_BYTES: usize = 8 * 1024;
 const DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS: i64 = 300;
 const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
+const DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS: u64 = 1200;
+const DOCTOR_WAIT_TIMEOUT_EXIT_CODE: u8 = 2;
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -610,20 +612,21 @@ pub fn run_doctor(
     let mut summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
 
     loop {
+        let elapsed_seconds = started.elapsed().as_secs().min(wait_timeout_seconds);
         if exit_actions.contains(summary.recommended_action.action.as_str()) {
-            emit_doctor_wait_result(&summary, json_output, tick);
+            emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
             return exit_codes::SUCCESS;
         }
 
         if interrupted.load(Ordering::SeqCst) {
             summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
-            emit_doctor_wait_result(&summary, json_output, tick);
+            emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
             return exit_codes::SUCCESS;
         }
 
         if started.elapsed() >= wait_timeout {
-            emit_doctor_wait_result(&summary, json_output, tick);
-            return exit_codes::SUCCESS;
+            emit_doctor_wait_result(&summary, json_output, tick, true, elapsed_seconds);
+            return DOCTOR_WAIT_TIMEOUT_EXIT_CODE;
         }
 
         if json_output {
@@ -684,7 +687,13 @@ fn normalize_doctor_exit_actions(
     Ok(set)
 }
 
-fn emit_doctor_wait_result(summary: &DoctorPrSummary, json_output: bool, tick: u64) {
+fn emit_doctor_wait_result(
+    summary: &DoctorPrSummary,
+    json_output: bool,
+    tick: u64,
+    timed_out: bool,
+    elapsed_seconds: u64,
+) {
     if json_output {
         let summary_value = match serde_json::to_value(summary) {
             Ok(value) => value,
@@ -699,6 +708,8 @@ fn emit_doctor_wait_result(summary: &DoctorPrSummary, json_output: bool, tick: u
             event: "doctor_result",
             tick,
             action: summary.recommended_action.action.clone(),
+            timed_out,
+            elapsed_seconds,
             ts: jsonl::ts_now(),
             summary: summary_value,
         }) {
@@ -1341,6 +1352,9 @@ fn run_doctor_inner(
         build_doctor_findings_summary(owner_repo, pr_number, local_sha.as_deref(), &reviews);
     let (worktree_status, merge_conflict_status) =
         build_doctor_worktree_status(&mut health, local_sha.as_deref(), worktree.as_deref());
+    if !lightweight {
+        add_doctor_local_main_sync_health(&mut health, worktree.as_deref());
+    }
     let merge_readiness = build_doctor_merge_readiness(
         &reviews,
         &gates,
@@ -2328,6 +2342,89 @@ fn git_worktree_clean(worktree: &Path) -> Result<bool, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
+fn git_ref_exists(worktree: &Path, reference: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(worktree)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to resolve `{reference}` in {}: {err}",
+                worktree.display()
+            )
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(_) | None => Err(format!(
+            "failed to resolve `{reference}` in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+fn main_sync_lag(worktree: &Path) -> Result<Option<(u64, u64)>, String> {
+    if !git_ref_exists(worktree, "refs/heads/main^{commit}")?
+        || !git_ref_exists(worktree, "refs/remotes/origin/main^{commit}")?
+    {
+        return Ok(None);
+    }
+
+    let output = Command::new("git")
+        .args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            "refs/heads/main...refs/remotes/origin/main",
+        ])
+        .current_dir(worktree)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to compare main refs in {}: {err}",
+                worktree.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to compare main refs in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let counts = String::from_utf8_lossy(&output.stdout);
+    let mut parts = counts.split_whitespace();
+    let ahead = parts
+        .next()
+        .ok_or_else(|| "missing local-main ahead count".to_string())?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid local-main ahead count: {err}"))?;
+    let behind = parts
+        .next()
+        .ok_or_else(|| "missing local-main behind count".to_string())?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid local-main behind count: {err}"))?;
+    Ok(Some((ahead, behind)))
+}
+
+fn add_doctor_local_main_sync_health(health: &mut Vec<DoctorHealthItem>, worktree: Option<&str>) {
+    let repo_dir = worktree
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let Ok(Some((_ahead, behind))) = main_sync_lag(&repo_dir) else {
+        return;
+    };
+    if behind > 0 {
+        health.push(DoctorHealthItem {
+            severity: "medium",
+            message: format!("local main is {behind} commits behind origin/main"),
+            remediation: "run `git fetch origin main:main`".to_string(),
+        });
+    }
+}
+
 fn build_doctor_merge_readiness(
     reviews: &[DoctorReviewSnapshot],
     gates: &[DoctorGateSnapshot],
@@ -2477,8 +2574,8 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         .and_then(format_push_attempt_failure_hint);
     let escalate_command = format!("apm2 fac doctor --pr {} --json", input.pr_number);
     let wait_command = format!(
-        "apm2 fac doctor --pr {} --json --wait-for-recommended-action",
-        input.pr_number
+        "apm2 fac doctor --pr {} --json --wait-for-recommended-action --wait-timeout-seconds {}",
+        input.pr_number, DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS
     );
     let has_run_state_repairable = input
         .run_state_diagnostics
@@ -2524,7 +2621,39 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         };
     }
 
-    if input.merge_readiness.all_verdicts_approve {
+    if input.merge_readiness.sha_freshness_source == DoctorShaFreshnessSource::Stale {
+        return DoctorRecommendedAction {
+            action: "restart_reviews".to_string(),
+            reason: "local verdict/findings snapshot is stale relative to remote PR head"
+                .to_string(),
+            priority: "high".to_string(),
+            command: Some(format!(
+                "apm2 fac restart --pr {} --force --refresh-identity",
+                input.pr_number
+            )),
+        };
+    }
+
+    let has_actionable_findings = input
+        .findings_summary
+        .iter()
+        .any(|entry| entry.counts.blocker > 0 || entry.counts.major > 0);
+    let all_verdicts_resolved = !input
+        .findings_summary
+        .iter()
+        .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
+    let requires_implementor_remediation = input.findings_summary.iter().any(|entry| {
+        entry.formal_verdict.eq_ignore_ascii_case("deny")
+            || entry.counts.blocker > 0
+            || entry.counts.major > 0
+    });
+    let active_agents = input.agent_activity.active_agents;
+
+    if input.merge_readiness.all_verdicts_approve
+        && !has_actionable_findings
+        && active_agents == 0
+        && input.merge_readiness.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
+    {
         return DoctorRecommendedAction {
             action: "approve".to_string(),
             reason: "all review dimensions approve; awaiting auto-merge".to_string(),
@@ -2542,15 +2671,6 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         };
     }
 
-    let all_verdicts_resolved = !input
-        .findings_summary
-        .iter()
-        .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
-    let requires_implementor_remediation = input.findings_summary.iter().any(|entry| {
-        entry.formal_verdict.eq_ignore_ascii_case("deny")
-            || entry.counts.blocker > 0
-            || entry.counts.major > 0
-    });
     if requires_implementor_remediation && all_verdicts_resolved {
         let push_hint = push_failure_hint
             .unwrap_or_else(|| "review findings require implementor remediation".to_string());
@@ -2593,7 +2713,6 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         };
     }
 
-    let active_agents = input.agent_activity.active_agents;
     if active_agents == 0 && has_pending_verdict {
         let force_restart =
             has_forced_restart_terminal_reason(input.reviews, input.review_terminal_reasons);
@@ -3999,8 +4118,10 @@ fn run_dispatch_inner(
         ReviewRunType::Security => vec![ReviewKind::Security],
         ReviewRunType::Quality => vec![ReviewKind::Quality],
     };
+    let clear_projection_verdicts = true;
 
     let mut results = Vec::with_capacity(kinds.len());
+    let mut reviews_dispatched_emitted = false;
     for kind in kinds {
         lifecycle::enforce_pr_capacity(owner_repo, pr_number)?;
         let result = dispatch_single_review_with_force(
@@ -4024,6 +4145,7 @@ fn run_dispatch_inner(
                         result.mode
                     )
                 })?;
+            let emit_reviews_dispatched = !reviews_dispatched_emitted;
             let token = lifecycle::register_reviewer_dispatch(
                 owner_repo,
                 pr_number,
@@ -4032,12 +4154,17 @@ fn run_dispatch_inner(
                 Some(run_id),
                 result.pid,
                 result.pid.and_then(state::get_process_start_time),
+                emit_reviews_dispatched,
+                clear_projection_verdicts,
             )?;
             if token.is_none() {
                 return Err(format!(
                     "lifecycle registration failed for {} review: register_reviewer_dispatch returned none",
                     kind.as_str()
                 ));
+            }
+            if emit_reviews_dispatched {
+                reviews_dispatched_emitted = true;
             }
         }
         results.push(result);
@@ -6087,6 +6214,7 @@ mod tests {
         assert_eq!(action.action, "wait");
         let command = action.command.expect("wait command");
         assert!(command.contains("--wait-for-recommended-action"));
+        assert!(command.contains("--wait-timeout-seconds 1200"));
     }
 
     #[test]
@@ -6190,6 +6318,130 @@ mod tests {
         assert_eq!(action.action, "approve");
         let command = action.command.expect("approve command");
         assert!(command.contains("--wait-for-recommended-action"));
+        assert!(command.contains("--wait-timeout-seconds 1200"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_does_not_approve_without_remote_sha_match() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::LocalAuthoritative,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action =
+            build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
+        assert_eq!(action.action, "wait");
+    }
+
+    #[test]
+    fn test_build_recommended_action_blocks_approve_when_actionable_findings_exist() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 2, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action =
+            build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
+        assert_eq!(action.action, "dispatch_implementor");
+    }
+
+    #[test]
+    fn test_build_recommended_action_stale_sha_overrides_dispatch_implementor() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 0, 2, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: false,
+            gates_pass: true,
+            sha_fresh: false,
+            sha_freshness_source: super::DoctorShaFreshnessSource::Stale,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action =
+            build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
+        assert_eq!(action.action, "restart_reviews");
+        let command = action.command.expect("restart command");
+        assert!(command.contains("--force"));
+        assert!(command.contains("--refresh-identity"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_stale_sha_overrides_approve() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: false,
+            sha_freshness_source: super::DoctorShaFreshnessSource::Stale,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action =
+            build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
+        assert_eq!(action.action, "restart_reviews");
+        let command = action.command.expect("restart command");
+        assert!(command.contains("--force"));
+        assert!(command.contains("--refresh-identity"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_blocks_approve_while_reviewers_active() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("running", Some(20), Some(5))],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            Some(&agents),
+            &reviews,
+            &findings,
+            &readiness,
+        );
+        assert_eq!(action.action, "wait");
     }
 
     #[test]
@@ -6234,6 +6486,7 @@ mod tests {
         assert_eq!(action.action, "wait");
         let command = action.command.expect("wait command");
         assert!(command.contains("--wait-for-recommended-action"));
+        assert!(command.contains("--wait-timeout-seconds 1200"));
     }
 
     #[test]

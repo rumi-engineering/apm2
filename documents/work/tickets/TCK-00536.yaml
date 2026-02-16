@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00536"
     title: "Permissions hardening: enforce 0700 roots, safe ownership checks, and refuse unsafe `$APM2_HOME/private/fac` perms"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

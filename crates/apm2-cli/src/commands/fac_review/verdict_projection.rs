@@ -348,6 +348,104 @@ pub fn load_verdict_projection_snapshot(
     }))
 }
 
+#[allow(dead_code)]
+pub fn clear_dimension_verdicts_for_sha(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<(), String> {
+    let _ = clear_dimension_verdicts_for_sha_with_backup(owner_repo, pr_number, head_sha)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ClearedVerdictDimensionsBackup {
+    owner_repo: String,
+    pr_number: u32,
+    head_sha: String,
+    dimensions: BTreeMap<String, DecisionEntry>,
+}
+
+pub(super) fn clear_dimension_verdicts_for_sha_with_backup(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<Option<ClearedVerdictDimensionsBackup>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let home = super::types::apm2_home_dir()?;
+    clear_dimension_verdicts_for_home(&home, owner_repo, pr_number, head_sha)
+}
+
+pub(super) fn restore_dimension_verdicts_for_sha(
+    backup: ClearedVerdictDimensionsBackup,
+) -> Result<(), String> {
+    let home = super::types::apm2_home_dir()?;
+    restore_dimension_verdicts_for_home(&home, backup)
+}
+
+fn restore_dimension_verdicts_for_home(
+    home: &Path,
+    backup: ClearedVerdictDimensionsBackup,
+) -> Result<(), String> {
+    validate_expected_head_sha(&backup.head_sha)?;
+    let _projection_lock =
+        acquire_projection_lock_for_home(home, &backup.owner_repo, backup.pr_number)?;
+    let Some(mut record) = load_decision_projection_for_home(
+        home,
+        &backup.owner_repo,
+        backup.pr_number,
+        &backup.head_sha,
+    )?
+    else {
+        return Err(format!(
+            "cannot restore verdict projection for PR #{} sha {}: projection record missing",
+            backup.pr_number, backup.head_sha
+        ));
+    };
+    if !record.dimensions.is_empty() {
+        return Err(format!(
+            "cannot restore verdict projection for PR #{} sha {}: projection already contains active dimensions",
+            backup.pr_number, backup.head_sha
+        ));
+    }
+    record.updated_at = now_iso8601();
+    record.dimensions = backup.dimensions;
+    let payload = projection_record_to_payload(&record);
+    record.decision_signature = signature_for_payload(&payload)?;
+    save_decision_projection_for_home(home, &record)
+}
+
+fn clear_dimension_verdicts_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<Option<ClearedVerdictDimensionsBackup>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let _projection_lock = acquire_projection_lock_for_home(home, owner_repo, pr_number)?;
+    let Some(mut record) =
+        load_decision_projection_for_home(home, owner_repo, pr_number, head_sha)?
+    else {
+        return Ok(None);
+    };
+    if record.dimensions.is_empty() {
+        return Ok(None);
+    }
+
+    let backup = ClearedVerdictDimensionsBackup {
+        owner_repo: owner_repo.to_ascii_lowercase(),
+        pr_number,
+        head_sha: head_sha.to_ascii_lowercase(),
+        dimensions: record.dimensions.clone(),
+    };
+    record.updated_at = now_iso8601();
+    record.dimensions.clear();
+    let payload = projection_record_to_payload(&record);
+    record.decision_signature = signature_for_payload(&payload)?;
+    save_decision_projection_for_home(home, &record)?;
+    Ok(Some(backup))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn persist_verdict_projection(
     repo: &str,
@@ -1839,5 +1937,151 @@ mod tests {
         );
         assert_eq!(login, "fac-local-auto-verdict");
         assert!(!persist_identity);
+    }
+
+    #[test]
+    fn clear_dimension_verdicts_for_home_clears_all_dimensions_for_sha() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let owner_repo = "example/repo";
+        let pr_number = 551;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-16T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        dimensions.insert(
+            "code-quality".to_string(),
+            DecisionEntry {
+                decision: "deny".to_string(),
+                reason: "major findings".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-16T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-16T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: "apm2.fac.projection.verdict.v1".to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-02-16T00:00:00Z".to_string(),
+            decision_comment_id: 99,
+            decision_comment_url: "local://fac_projection/example/repo/pr-551/issue_comments#99"
+                .to_string(),
+            decision_signature: super::signature_for_payload(&payload)
+                .expect("serialize decision payload"),
+            dimensions,
+            integrity_hmac: None,
+        };
+        super::save_decision_projection_for_home(home, &record).expect("seed projection");
+
+        let backup =
+            super::clear_dimension_verdicts_for_home(home, owner_repo, pr_number, head_sha)
+                .expect("clear dimensions");
+        assert!(backup.is_some());
+
+        let loaded =
+            super::load_decision_projection_for_home(home, owner_repo, pr_number, head_sha)
+                .expect("load projection")
+                .expect("projection present");
+        assert!(loaded.dimensions.is_empty());
+    }
+
+    #[test]
+    fn clear_dimension_verdicts_for_home_is_noop_when_projection_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backup = super::clear_dimension_verdicts_for_home(
+            temp.path(),
+            "example/repo",
+            552,
+            "89abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("missing projection should be treated as already clear");
+        assert!(backup.is_none());
+    }
+
+    #[test]
+    fn restore_dimension_verdicts_for_sha_restores_cleared_dimensions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let owner_repo = "example/repo";
+        let pr_number = 553;
+        let head_sha = "1234567890abcdef1234567890abcdef12345678";
+
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "deny".to_string(),
+                reason: "major".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-16T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-16T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: "apm2.fac.projection.verdict.v1".to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-02-16T00:00:00Z".to_string(),
+            decision_comment_id: 100,
+            decision_comment_url: "local://fac_projection/example/repo/pr-553/issue_comments#100"
+                .to_string(),
+            decision_signature: super::signature_for_payload(&payload)
+                .expect("serialize decision payload"),
+            dimensions,
+            integrity_hmac: None,
+        };
+        super::save_decision_projection_for_home(home, &record).expect("seed projection");
+
+        let backup =
+            super::clear_dimension_verdicts_for_home(home, owner_repo, pr_number, head_sha)
+                .expect("clear dimensions")
+                .expect("backup");
+        assert!(
+            super::load_decision_projection_for_home(home, owner_repo, pr_number, head_sha)
+                .expect("load")
+                .expect("projection")
+                .dimensions
+                .is_empty()
+        );
+
+        super::restore_dimension_verdicts_for_home(home, backup).expect("restore dimensions");
+
+        let restored =
+            super::load_decision_projection_for_home(home, owner_repo, pr_number, head_sha)
+                .expect("load restored projection")
+                .expect("projection present");
+        assert_eq!(restored.dimensions.len(), 1);
+        assert!(restored.dimensions.contains_key("security"));
     }
 }

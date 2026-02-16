@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00410"
     title: "FAC-local gate execution (self-hosted OVH runner) + fail-closed test safety guardrails"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

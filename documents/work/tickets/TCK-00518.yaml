@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00518"
     title: "Default-mode gates: enqueue+wait (bounded) + `--direct` unsafe; integrate with worker + broker"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

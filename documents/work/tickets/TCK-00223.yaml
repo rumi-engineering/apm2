@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00223"
     title: "FAC: AAT selection policy engine"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

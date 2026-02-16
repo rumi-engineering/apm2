@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00201
     title: Clarify CI vs Internal Gate Architecture in Security Documentation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: null
     requirements:

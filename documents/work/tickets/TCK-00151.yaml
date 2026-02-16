@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00151
     title: Implement coordination budget enforcement and tracking
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0012
     requirements:

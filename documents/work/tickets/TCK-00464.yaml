@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00464"
     title: "RFC-0028 REQ-0003 deterministic delegation meet and no-bypass actuation closure"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

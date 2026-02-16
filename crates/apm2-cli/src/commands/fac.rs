@@ -413,7 +413,7 @@ pub struct DoctorArgs {
     pub poll_interval_seconds: u64,
 
     /// Maximum wait time while waiting for recommended action.
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(5..=180))]
+    #[arg(long, default_value_t = 1200, value_parser = parse_wait_timeout)]
     pub wait_timeout_seconds: u64,
 
     /// Exit only when doctor returns one of these actions (comma-separated).
@@ -444,6 +444,19 @@ impl DoctorExitActionArg {
             Self::RestartReviews => "restart_reviews",
         }
     }
+}
+
+fn parse_wait_timeout(raw: &str) -> Result<u64, String> {
+    let value = raw
+        .parse::<u64>()
+        .map_err(|err| format!("invalid timeout value `{raw}`: {err}"))?;
+    if !(5..=1200).contains(&value) {
+        return Err(
+            "wait timeout must be between 5 and 1200 seconds (20 minutes max). If nothing has happened for 20 minutes, the orchestrator should diagnose the problem rather than wait longer."
+                .to_string(),
+        );
+    }
+    Ok(value)
 }
 
 /// Arguments for `apm2 fac services`.
@@ -5961,6 +5974,61 @@ mod tests {
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_doctor_wait_timeout_defaults_to_1200_seconds() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+        ])
+        .expect("doctor wait default timeout should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.wait_timeout_seconds, 1200);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_timeout_accepts_maximum_1200_seconds() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--wait-timeout-seconds",
+            "1200",
+        ])
+        .expect("1200s timeout should be accepted");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.wait_timeout_seconds, 1200);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_timeout_rejects_values_over_1200_seconds() {
+        let err = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--wait-timeout-seconds",
+            "1201",
+        ])
+        .expect_err("timeout above cap should fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("between 5 and 1200 seconds"));
+        assert!(rendered.contains("diagnose the problem"));
     }
 
     #[test]

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00359
     title: Verifier cache contract and invalidation correctness
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00325
     title: ViewCommitment capture + embedding in review artifacts
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

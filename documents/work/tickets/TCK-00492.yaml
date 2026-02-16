@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00492"
     title: "AdmissionKernel: implement plan/execute API with capability-gated effect surfaces + join-input assembly (witness seeds + ledger/policy prerequisites + safe plan semantics)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"

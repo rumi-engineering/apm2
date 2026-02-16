@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00524"
     title: "Disk preflight + enforced GC: implement `apm2 fac gc` + auto-GC escalation + GC receipts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

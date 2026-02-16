@@ -1800,8 +1800,14 @@ pub fn run_push(
         .iter()
         .map(|result| GateResult {
             name: result.gate_name.clone(),
-            passed: result.passed,
-            duration_secs: result.duration_secs,
+            status: if result.passed {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            },
+            duration_secs: Some(result.duration_secs),
+            tokens_used: None,
+            model: None,
         })
         .collect::<Vec<_>>();
     if let Err(err) = sync_gate_status_to_pr(repo, pr_number, gate_status_rows, &sha) {
@@ -1824,12 +1830,30 @@ pub fn run_push(
     // by restart/recover lifecycle surfaces.
     let dispatch_started = Instant::now();
     emit_stage("dispatch_started", serde_json::json!({}));
+    let mut emitted_reviews_dispatched = false;
     let dispatch_warning = if let Err(e) = dispatch_reviews_with(
         repo,
         pr_number,
         &sha,
         dispatch_single_review,
-        lifecycle::register_reviewer_dispatch,
+        |owner_repo, pr_number, sha, review_type, run_id, pid, proc_start_time| {
+            let emit_reviews_dispatched = !emitted_reviews_dispatched;
+            let result = lifecycle::register_reviewer_dispatch(
+                owner_repo,
+                pr_number,
+                sha,
+                review_type,
+                run_id,
+                pid,
+                proc_start_time,
+                emit_reviews_dispatched,
+                true,
+            );
+            if emit_reviews_dispatched && result.is_ok() {
+                emitted_reviews_dispatched = true;
+            }
+            result
+        },
         !json_output,
     ) {
         attempt.set_stage_fail(

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00344"
     title: "CLI episode session-status and work status: add protocol support"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

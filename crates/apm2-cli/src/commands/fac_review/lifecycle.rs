@@ -1482,6 +1482,9 @@ fn apply_event_to_record(
             let dec = normalize_verdict_decision(decision)?;
             record.verdicts.insert(dim.to_string(), dec.to_string());
         },
+        LifecycleEventKind::ReviewsDispatched => {
+            record.verdicts.clear();
+        },
         LifecycleEventKind::ShaDriftDetected => {
             record.current_sha.clone_from(&sha);
         },
@@ -1866,10 +1869,108 @@ fn git_stdout_checked(current_dir: &Path, args: &[&str]) -> Result<String, Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn resolve_main_worktree(reference_dir: &Path) -> Result<PathBuf, String> {
+fn git_commit_sha_if_exists(current_dir: &Path, reference: &str) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(current_dir)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to resolve `{reference}` in {}: {err}",
+                current_dir.display()
+            )
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        Some(_) | None => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(format!(
+                "failed to resolve `{reference}` in {}: {}",
+                current_dir.display(),
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    &stderr
+                }
+            ))
+        },
+    }
+}
+
+fn git_update_ref_if_missing(
+    current_dir: &Path,
+    reference: &str,
+    new_sha: &str,
+) -> Result<bool, String> {
+    validate_expected_head_sha(new_sha)?;
+    let output = Command::new("git")
+        .args([
+            "update-ref",
+            reference,
+            new_sha,
+            "0000000000000000000000000000000000000000",
+        ])
+        .current_dir(current_dir)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to create `{reference}` in {}: {err}",
+                current_dir.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let verify_ref = format!("{reference}^{{commit}}");
+    if git_commit_sha_if_exists(current_dir, &verify_ref)?.is_some() {
+        return Ok(false);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!(
+        "failed to create `{reference}` in {}: {}",
+        current_dir.display(),
+        if stderr.is_empty() {
+            "unknown error"
+        } else {
+            &stderr
+        }
+    ))
+}
+
+fn git_worktree_has_tracked_changes(current_dir: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(current_dir)
+        .output()
+        .map_err(|err| format!("failed to inspect git worktree cleanliness: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "failed to inspect git worktree cleanliness: {}",
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
+        ));
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn find_main_worktree(reference_dir: &Path) -> Result<Option<PathBuf>, String> {
     let listing = git_stdout_checked(reference_dir, &["worktree", "list", "--porcelain"])?;
     if listing.trim().is_empty() {
-        return Ok(reference_dir.to_path_buf());
+        let active_branch =
+            git_stdout_checked(reference_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if active_branch == "main" {
+            return Ok(Some(reference_dir.to_path_buf()));
+        }
+        return Ok(None);
     }
 
     let mut current_path: Option<PathBuf> = None;
@@ -1895,14 +1996,139 @@ fn resolve_main_worktree(reference_dir: &Path) -> Result<PathBuf, String> {
         main_candidate = Some(path);
     }
     if let Some(path) = main_candidate {
-        return Ok(path);
+        return Ok(Some(path));
     }
 
     let active_branch = git_stdout_checked(reference_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if active_branch == "main" {
-        return Ok(reference_dir.to_path_buf());
+        return Ok(Some(reference_dir.to_path_buf()));
     }
-    Err("could not locate a main worktree for auto-merge".to_string())
+    Ok(None)
+}
+
+fn git_merge_base_is_ancestor(
+    current_dir: &Path,
+    ancestor_ref: &str,
+    descendant_ref: &str,
+) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor_ref, descendant_ref])
+        .current_dir(current_dir)
+        .output()
+        .map_err(|err| format!("failed to execute git merge-base: {err}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(_) | None => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(format!(
+                "failed to validate ancestor relation {} -> {}: {}",
+                ancestor_ref,
+                descendant_ref,
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    &stderr
+                }
+            ))
+        },
+    }
+}
+
+fn sync_main_worktree_if_present(reference_dir: &Path) {
+    let Ok(Some(main_worktree)) = find_main_worktree(reference_dir) else {
+        return;
+    };
+    match git_worktree_has_tracked_changes(&main_worktree) {
+        Ok(true) => {
+            eprintln!(
+                "WARNING: skipped syncing main worktree {} because it has local tracked changes",
+                main_worktree.display()
+            );
+            return;
+        },
+        Ok(false) => {},
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to inspect main worktree cleanliness at {}: {err}",
+                main_worktree.display()
+            );
+            return;
+        },
+    }
+    if let Err(err) = git_run_checked(&main_worktree, &["reset", "--hard", "HEAD"]) {
+        eprintln!(
+            "WARNING: failed to sync main worktree {} after ref update: {err}",
+            main_worktree.display()
+        );
+    }
+}
+
+fn sync_local_main_with_origin(current_dir: &Path) -> Result<(), String> {
+    git_run_checked(
+        current_dir,
+        &[
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    )?;
+    let remote_main = git_commit_sha_if_exists(current_dir, "refs/remotes/origin/main^{commit}")?
+        .ok_or_else(|| "origin/main not found after fetch".to_string())?;
+    validate_expected_head_sha(&remote_main)?;
+    let mut local_main = git_commit_sha_if_exists(current_dir, "refs/heads/main^{commit}")?;
+
+    if local_main.is_none() {
+        if git_update_ref_if_missing(current_dir, "refs/heads/main", &remote_main)? {
+            sync_main_worktree_if_present(current_dir);
+            return Ok(());
+        }
+        local_main = git_commit_sha_if_exists(current_dir, "refs/heads/main^{commit}")?;
+    }
+
+    let Some(local_main) = local_main else {
+        return Err("refs/heads/main is missing after attempted sync from origin/main".to_string());
+    };
+    validate_expected_head_sha(&local_main)?;
+
+    if local_main.eq_ignore_ascii_case(&remote_main) {
+        return Ok(());
+    }
+
+    if git_merge_base_is_ancestor(current_dir, "refs/heads/main", "refs/remotes/origin/main")? {
+        git_run_checked(
+            current_dir,
+            &["update-ref", "refs/heads/main", &remote_main, &local_main],
+        )?;
+        sync_main_worktree_if_present(current_dir);
+        return Ok(());
+    }
+
+    if git_merge_base_is_ancestor(current_dir, "refs/remotes/origin/main", "refs/heads/main")? {
+        return Ok(());
+    }
+
+    Err("local main diverged from origin/main; manual rebase/repair required".to_string())
+}
+
+fn push_local_main_to_origin(current_dir: &Path, expected_main_sha: &str) -> Result<(), String> {
+    validate_expected_head_sha(expected_main_sha)?;
+    let local_main = git_stdout_checked(
+        current_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/main^{commit}",
+        ],
+    )?;
+    if !local_main.eq_ignore_ascii_case(expected_main_sha) {
+        return Err(format!(
+            "auto-merge push aborted: local main {local_main} no longer matches expected merged SHA {expected_main_sha}"
+        ));
+    }
+    let push_refspec = format!("{expected_main_sha}:refs/heads/main");
+    git_run_checked(current_dir, &["push", "origin", &push_refspec])
 }
 
 fn try_fast_forward_main(
@@ -1910,19 +2136,10 @@ fn try_fast_forward_main(
     branch: &str,
     expected_sha: &str,
 ) -> Result<(), String> {
-    let main_worktree = resolve_main_worktree(current_dir)?;
-    let active_branch = git_stdout_checked(&main_worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if active_branch != "main" {
-        return Err(format!(
-            "auto-merge requires a main worktree, found active branch `{active_branch}` at {}",
-            main_worktree.display()
-        ));
-    }
-
     let main_ref = "refs/heads/main";
     let branch_ref = format!("refs/heads/{branch}");
-    git_run_checked(
-        &main_worktree,
+    let main_head = git_stdout_checked(
+        current_dir,
         &[
             "rev-parse",
             "--verify",
@@ -1932,7 +2149,7 @@ fn try_fast_forward_main(
     )?;
     let branch_verify = format!("{branch_ref}^{{commit}}");
     let branch_head = git_stdout_checked(
-        &main_worktree,
+        current_dir,
         &["rev-parse", "--verify", "--quiet", &branch_verify],
     )?;
     validate_expected_head_sha(&branch_head)?;
@@ -1942,31 +2159,17 @@ fn try_fast_forward_main(
         ));
     }
 
-    let merge_base = Command::new("git")
-        .args(["merge-base", "--is-ancestor", main_ref, &branch_ref])
-        .current_dir(&main_worktree)
-        .output()
-        .map_err(|err| format!("failed to execute git merge-base: {err}"))?;
-    if !merge_base.status.success() {
-        if merge_base.status.code() == Some(1) {
-            return Err(format!(
-                "non-fast-forward merge required: main is not ancestor of `{branch}`"
-            ));
-        }
-        let stderr = String::from_utf8_lossy(&merge_base.stderr)
-            .trim()
-            .to_string();
+    if !git_merge_base_is_ancestor(current_dir, main_ref, &branch_ref)? {
         return Err(format!(
-            "failed to validate fast-forward merge precondition: {}",
-            if stderr.is_empty() {
-                "unknown error"
-            } else {
-                &stderr
-            }
+            "non-fast-forward merge required: main is not ancestor of `{branch}`"
         ));
     }
 
-    git_run_checked(&main_worktree, &["merge", "--ff-only", &branch_ref])?;
+    git_run_checked(
+        current_dir,
+        &["update-ref", "refs/heads/main", &branch_head, &main_head],
+    )?;
+    sync_main_worktree_if_present(current_dir);
     Ok(())
 }
 
@@ -2060,7 +2263,9 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
         .filter(|path| path.exists())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let merge_result = try_fast_forward_main(&merge_dir, branch, &record.current_sha);
+    let merge_result = sync_local_main_with_origin(&merge_dir)
+        .and_then(|()| try_fast_forward_main(&merge_dir, branch, &record.current_sha))
+        .and_then(|()| push_local_main_to_origin(&merge_dir, &record.current_sha));
     match merge_result {
         Ok(()) => {
             if let Err(err) = apply_event(
@@ -2780,6 +2985,7 @@ fn rollback_registered_reviewer_dispatch(
     mark_registered_agent_reaped(owner_repo, pr_number, run_id, agent_type, reason)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn register_reviewer_dispatch(
     owner_repo: &str,
     pr_number: u32,
@@ -2788,6 +2994,8 @@ pub fn register_reviewer_dispatch(
     run_id: Option<&str>,
     pid: Option<u32>,
     proc_start_time: Option<u64>,
+    emit_reviews_dispatched: bool,
+    clear_projection_verdicts: bool,
 ) -> Result<Option<String>, String> {
     let agent_type = match review_type {
         "security" => AgentType::ReviewerSecurity,
@@ -2820,27 +3028,74 @@ pub fn register_reviewer_dispatch(
             return Err(err);
         },
     };
-    if let Err(err) = apply_event(
-        owner_repo,
-        pr_number,
-        sha,
-        &LifecycleEventKind::ReviewsDispatched,
-    ) {
-        let rollback_reason = "rollback:lifecycle_reviews_dispatched_failed";
-        match rollback_registered_reviewer_dispatch(
+    let mut cleared_projection_backup = None;
+    if emit_reviews_dispatched {
+        if clear_projection_verdicts {
+            match verdict_projection::clear_dimension_verdicts_for_sha_with_backup(
+                owner_repo, pr_number, sha,
+            ) {
+                Ok(backup) => {
+                    cleared_projection_backup = backup;
+                },
+                Err(err) => {
+                    let rollback_reason = "rollback:clear_projection_verdicts_failed";
+                    match rollback_registered_reviewer_dispatch(
+                        owner_repo,
+                        pr_number,
+                        run_id,
+                        agent_type,
+                        pid,
+                        rollback_reason,
+                    ) {
+                        Ok(()) => return Err(err),
+                        Err(rollback_err) => {
+                            return Err(format!(
+                                "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}"
+                            ));
+                        },
+                    }
+                },
+            }
+        }
+
+        if let Err(err) = apply_event(
             owner_repo,
             pr_number,
-            run_id,
-            agent_type,
-            pid,
-            rollback_reason,
+            sha,
+            &LifecycleEventKind::ReviewsDispatched,
         ) {
-            Ok(()) => return Err(err),
-            Err(rollback_err) => {
-                return Err(format!(
-                    "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}"
-                ));
-            },
+            let rollback_reason = "rollback:lifecycle_reviews_dispatched_failed";
+            let rollback_result = rollback_registered_reviewer_dispatch(
+                owner_repo,
+                pr_number,
+                run_id,
+                agent_type,
+                pid,
+                rollback_reason,
+            );
+            let restore_result = cleared_projection_backup
+                .take()
+                .map(verdict_projection::restore_dimension_verdicts_for_sha)
+                .transpose()
+                .map(|_| ());
+            match (rollback_result, restore_result) {
+                (Ok(()), Ok(())) => return Err(err),
+                (Ok(()), Err(restore_err)) => {
+                    return Err(format!(
+                        "{err}; additionally failed to restore cleared verdict projection: {restore_err}"
+                    ));
+                },
+                (Err(rollback_err), Ok(())) => {
+                    return Err(format!(
+                        "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}"
+                    ));
+                },
+                (Err(rollback_err), Err(restore_err)) => {
+                    return Err(format!(
+                        "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}; additionally failed to restore cleared verdict projection: {restore_err}"
+                    ));
+                },
+            }
         }
     }
     if let Err(err) = apply_event(
@@ -2852,18 +3107,34 @@ pub fn register_reviewer_dispatch(
         },
     ) {
         let rollback_reason = "rollback:lifecycle_reviewer_spawned_failed";
-        match rollback_registered_reviewer_dispatch(
+        let rollback_result = rollback_registered_reviewer_dispatch(
             owner_repo,
             pr_number,
             run_id,
             agent_type,
             pid,
             rollback_reason,
-        ) {
-            Ok(()) => return Err(err),
-            Err(rollback_err) => {
+        );
+        let restore_result = cleared_projection_backup
+            .take()
+            .map(verdict_projection::restore_dimension_verdicts_for_sha)
+            .transpose()
+            .map(|_| ());
+        match (rollback_result, restore_result) {
+            (Ok(()), Ok(())) => return Err(err),
+            (Ok(()), Err(restore_err)) => {
+                return Err(format!(
+                    "{err}; additionally failed to restore cleared verdict projection: {restore_err}"
+                ));
+            },
+            (Err(rollback_err), Ok(())) => {
                 return Err(format!(
                     "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}"
+                ));
+            },
+            (Err(rollback_err), Err(restore_err)) => {
+                return Err(format!(
+                    "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}; additionally failed to restore cleared verdict projection: {restore_err}"
                 ));
             },
         }
@@ -3055,6 +3326,7 @@ pub fn run_verdict_show(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::process::Command;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3064,7 +3336,8 @@ mod tests {
         PrLifecycleState, TrackedAgentState, acquire_registry_lock, active_agents_for_pr,
         apply_event, bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
         enforce_pr_capacity, finalize_auto_verdict_candidate, load_registry, register_agent_spawn,
-        register_reviewer_dispatch, save_registry, token_hash,
+        register_reviewer_dispatch, save_registry, sync_local_main_with_origin, token_hash,
+        try_fast_forward_main,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
     use crate::commands::fac_review::state::{
@@ -3091,6 +3364,48 @@ mod tests {
 
     fn next_repo(tag: &str, pr: u32) -> String {
         format!("example/{tag}-{pr}")
+    }
+
+    fn git_checked(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_git_repo_for_merge_tests() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        git_checked(dir, &["init"]);
+        git_checked(dir, &["config", "user.email", "test@example.com"]);
+        git_checked(dir, &["config", "user.name", "apm2-test"]);
+        fs::write(dir.join("README.md"), "base\n").expect("write base file");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "base"]);
+        git_checked(dir, &["branch", "-M", "main"]);
+        temp
     }
 
     #[test]
@@ -3125,6 +3440,70 @@ mod tests {
         )
         .expect("quality approve");
         assert_eq!(state.pr_state, PrLifecycleState::MergeReady);
+    }
+
+    #[test]
+    fn reviews_dispatched_clears_lifecycle_verdicts() {
+        let pr = next_pr();
+        let repo = next_repo("reviews-dispatched-clear", pr);
+        let sha = "11223344556677889900aabbccddeeff00112233";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("dispatch");
+        let approved = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("security approve");
+        assert!(approved.verdicts.contains_key("security"));
+
+        let reset =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("restart");
+        assert!(reset.verdicts.is_empty());
+    }
+
+    #[test]
+    fn reducer_does_not_reenter_merge_ready_with_single_verdict_after_restart() {
+        let pr = next_pr();
+        let repo = next_repo("restart-single-verdict", pr);
+        let sha = "44556677889900aabbccddeeff00112233445566";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("dispatch");
+        let _ = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("security approve");
+        let restarted =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("restart");
+        assert!(restarted.verdicts.is_empty());
+
+        let post_restart = apply_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "code-quality".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("quality approve after restart");
+        assert_eq!(post_restart.pr_state, PrLifecycleState::VerdictPending);
     }
 
     #[test]
@@ -3231,6 +3610,122 @@ mod tests {
         )
         .expect("merge_failed");
         assert_eq!(stuck.pr_state, PrLifecycleState::Stuck);
+    }
+
+    #[test]
+    fn try_fast_forward_main_succeeds_without_main_worktree_checked_out() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+
+        git_checked(dir, &["checkout", "-b", "ticket"]);
+        fs::write(dir.join("README.md"), "feature\n").expect("write feature change");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "feature"]);
+        let ticket_sha = git_stdout(dir, &["rev-parse", "HEAD"]);
+
+        try_fast_forward_main(dir, "ticket", &ticket_sha).expect("fast-forward main");
+        let main_sha = git_stdout(dir, &["rev-parse", "refs/heads/main"]);
+        assert_eq!(main_sha, ticket_sha.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn try_fast_forward_main_rejects_non_fast_forward_merge() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+
+        git_checked(dir, &["checkout", "-b", "ticket"]);
+        fs::write(dir.join("README.md"), "ticket\n").expect("write ticket change");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "ticket"]);
+        let ticket_sha = git_stdout(dir, &["rev-parse", "HEAD"]);
+
+        git_checked(dir, &["checkout", "main"]);
+        fs::write(dir.join("README.md"), "main\n").expect("write main change");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "main"]);
+
+        let err = try_fast_forward_main(dir, "ticket", &ticket_sha)
+            .expect_err("non-fast-forward merge should be rejected");
+        assert!(err.contains("non-fast-forward merge required"));
+    }
+
+    #[test]
+    fn try_fast_forward_main_rejects_expected_sha_mismatch() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+
+        git_checked(dir, &["checkout", "-b", "ticket"]);
+        fs::write(dir.join("README.md"), "feature\n").expect("write feature change");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "feature"]);
+
+        let err = try_fast_forward_main(dir, "ticket", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect_err("sha mismatch should be rejected");
+        assert!(err.contains("does not match lifecycle SHA"));
+    }
+
+    #[test]
+    fn try_fast_forward_main_does_not_reset_dirty_main_worktree() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let main_worktree = temp.path().join("main-worktree");
+        let main_worktree_str = main_worktree.to_string_lossy().to_string();
+
+        git_checked(dir, &["checkout", "-b", "ticket"]);
+        git_checked(dir, &["worktree", "add", &main_worktree_str, "main"]);
+
+        fs::write(main_worktree.join("README.md"), "dirty-main\n")
+            .expect("write dirty main worktree change");
+        fs::write(dir.join("README.md"), "feature\n").expect("write ticket change");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "feature"]);
+        let ticket_sha = git_stdout(dir, &["rev-parse", "HEAD"]);
+
+        try_fast_forward_main(dir, "ticket", &ticket_sha).expect("fast-forward main");
+        let main_sha = git_stdout(dir, &["rev-parse", "refs/heads/main"]);
+        assert_eq!(main_sha, ticket_sha.to_ascii_lowercase());
+
+        let dirty_contents =
+            fs::read_to_string(main_worktree.join("README.md")).expect("read dirty main file");
+        assert_eq!(dirty_contents, "dirty-main\n");
+    }
+
+    #[test]
+    fn sync_local_main_with_origin_recreates_missing_local_main_ref() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let origin_path = dir.join("origin.git");
+        let origin_str = origin_path.to_string_lossy().to_string();
+
+        git_checked(dir, &["clone", "--bare", ".", &origin_str]);
+        git_checked(dir, &["remote", "add", "origin", &origin_str]);
+        git_checked(
+            dir,
+            &[
+                "fetch",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+        git_checked(dir, &["checkout", "-b", "ticket"]);
+        git_checked(dir, &["branch", "-D", "main"]);
+
+        let missing_main = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/main^{commit}",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("verify local main is missing");
+        assert_eq!(missing_main.status.code(), Some(1));
+
+        sync_local_main_with_origin(dir).expect("sync should recreate local main");
+        let recreated_main = git_stdout(dir, &["rev-parse", "refs/heads/main"]);
+        let remote_main = git_stdout(dir, &["rev-parse", "refs/remotes/origin/main"]);
+        assert_eq!(recreated_main, remote_main);
     }
 
     #[test]
@@ -3692,10 +4187,18 @@ mod tests {
         let sha = "dddddddddddddddddddddddddddddddddddddddd";
         let run_id = format!("pr{pr}-security-s1-dddddddd");
 
-        let err = register_reviewer_dispatch(&repo, pr, sha, "security", Some(&run_id), None, None)
-            .expect_err(
-                "register should fail because lifecycle transition is illegal from untracked",
-            );
+        let err = register_reviewer_dispatch(
+            &repo,
+            pr,
+            sha,
+            "security",
+            Some(&run_id),
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect_err("register should fail because lifecycle transition is illegal from untracked");
         assert!(err.contains("illegal transition"));
 
         let registry = load_registry().expect("registry");
@@ -3712,6 +4215,65 @@ mod tests {
                 Some("rollback:lifecycle_reviews_dispatched_failed")
             );
         }
+    }
+
+    #[test]
+    fn register_reviewer_dispatch_restores_projection_when_reviews_dispatched_fails() {
+        let pr = next_pr();
+        let repo = next_repo("dispatch-restore-projection", pr);
+        let sha = "9999999999999999999999999999999999999999";
+        let run_id = format!("pr{pr}-security-s1-99999999");
+
+        super::verdict_projection::persist_verdict_projection_local_only(
+            &repo,
+            Some(pr),
+            Some(sha),
+            "security",
+            "approve",
+            Some("seed"),
+            None,
+            None,
+        )
+        .expect("seed security projection");
+        super::verdict_projection::persist_verdict_projection_local_only(
+            &repo,
+            Some(pr),
+            Some(sha),
+            "code-quality",
+            "approve",
+            Some("seed"),
+            None,
+            None,
+        )
+        .expect("seed quality projection");
+        assert_eq!(
+            resolve_verdict_for_dimension(&repo, pr, sha, "security").expect("load security"),
+            Some("PASS".to_string())
+        );
+
+        let err = register_reviewer_dispatch(
+            &repo,
+            pr,
+            sha,
+            "security",
+            Some(&run_id),
+            None,
+            None,
+            true,
+            true,
+        )
+        .expect_err("register should fail because lifecycle transition is illegal from untracked");
+        assert!(err.contains("illegal transition"));
+
+        assert_eq!(
+            resolve_verdict_for_dimension(&repo, pr, sha, "security").expect("load security"),
+            Some("PASS".to_string())
+        );
+        assert_eq!(
+            resolve_verdict_for_dimension(&repo, pr, sha, "code-quality")
+                .expect("load code-quality"),
+            Some("PASS".to_string())
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00179
     title: Migrate from pre-commit to cargo-husky for automated git hook management
-    status: COMPLETED
+    status: "CLOSED"
   binds:
     rfc_id: MAINTENANCE
 acceptance_criteria:

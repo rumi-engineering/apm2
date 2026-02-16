@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00466"
     title: "RFC-0028 REQ-0005 portable acceptance evidence and deterministic reverification"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

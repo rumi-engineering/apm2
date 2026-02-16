@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00288"
     title: "CLI dual-socket + protocol client alignment (no JSON IPC)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

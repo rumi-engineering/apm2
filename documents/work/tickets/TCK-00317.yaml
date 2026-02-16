@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00317
     title: Reviewer capability manifest (real allowlist)
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

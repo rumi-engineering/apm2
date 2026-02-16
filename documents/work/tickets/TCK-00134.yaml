@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00134"
     title: "Implement DCP stable-ID index"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

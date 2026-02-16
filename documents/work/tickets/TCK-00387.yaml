@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00387"
     title: "Daemon crash recovery: wire persistent session state to lease revocation and work cleanup"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00261
     title: Implement context firewall with deny + terminate semantics
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

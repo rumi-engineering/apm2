@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00434"
     title: "Remove non-FAC GitHub CI workflows and CI-adjacent config"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

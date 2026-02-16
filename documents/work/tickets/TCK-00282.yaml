@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00282
     title: CI guardrails against legacy IPC
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

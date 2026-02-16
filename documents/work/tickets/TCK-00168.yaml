@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00168
     title: Implement cgroups v2 reader for resource metrics
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

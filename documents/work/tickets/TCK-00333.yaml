@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00333
     title: FAC productivity CLI/scripts (ledger/CAS oriented debug UX)
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

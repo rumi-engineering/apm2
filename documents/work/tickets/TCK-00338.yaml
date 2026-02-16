@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00338
     title: 'Security hardening: broker sandboxing (allowlists, canonical paths, env scrub, timeouts)'
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

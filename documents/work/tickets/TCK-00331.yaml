@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00331
     title: RoleSpecV1 + tool-call matrix + instruction conformance harness
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

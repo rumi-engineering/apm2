@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00243
     title: 'HTF: Convert quarantine TTLs and AAT determinism windows to ticks'
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0016
     requirements:

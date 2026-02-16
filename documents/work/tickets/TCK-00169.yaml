@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00169
     title: Implement TelemetryCollector and frame streaming
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

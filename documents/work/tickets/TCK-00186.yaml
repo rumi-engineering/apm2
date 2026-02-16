@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00186
     title: BFT Library Evaluation Spike
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00405"
     title: "Harden PR merge gates against stale SHA and conflicting AI verdicts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

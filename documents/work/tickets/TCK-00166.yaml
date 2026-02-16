@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00166
     title: Implement tool receipt generation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

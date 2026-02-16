@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00194
     title: Integrate Schema Validation into Append Path
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

@@ -145,6 +145,8 @@ pub struct DoctorResultEvent {
     pub event: &'static str,
     pub tick: u64,
     pub action: String,
+    pub timed_out: bool,
+    pub elapsed_seconds: u64,
     pub ts: String,
     pub summary: Value,
 }
@@ -186,5 +188,27 @@ mod tests {
 
         let _ = fs::remove_file(&log_path);
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn doctor_result_event_serialization_includes_timeout_fields() {
+        let payload = serde_json::to_value(DoctorResultEvent {
+            event: "doctor_result",
+            tick: 3,
+            action: "wait".to_string(),
+            timed_out: true,
+            elapsed_seconds: 1200,
+            ts: "2026-02-16T00:00:00.000Z".to_string(),
+            summary: serde_json::json!({"recommended_action":{"action":"wait"}}),
+        })
+        .expect("serialize doctor result event");
+        assert_eq!(
+            payload.get("timed_out").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload.get("elapsed_seconds").and_then(Value::as_u64),
+            Some(1200)
+        );
     }
 }

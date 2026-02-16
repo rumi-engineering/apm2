@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00476"
     title: "RFC-0029 REQ-0007 disclosure-control interlock non-regression for optimization paths"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

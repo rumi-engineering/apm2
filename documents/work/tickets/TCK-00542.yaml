@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00542"
     title: "Evidence bundle schemas in code: manifest+envelope + hashing + bounded parsing + export/import integration"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00537"
     title: "Safe atomic file I/O primitives: atomic JSON write + O_NOFOLLOW open + bounded read helper (queue/leases/receipts)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00361
     title: Session-open identity proof and freshness enforcement
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

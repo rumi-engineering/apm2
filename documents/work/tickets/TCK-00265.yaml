@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00265
     title: Implement signature verification on ledger ingestion
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

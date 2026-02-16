@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00181
     title: Define SchemaRegistry Trait and InMemory Implementation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

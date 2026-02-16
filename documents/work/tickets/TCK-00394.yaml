@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00394"
     title: "ChangeSet publishing IPC endpoint for daemon-anchored changeset submission"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

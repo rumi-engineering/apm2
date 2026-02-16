@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00475"
     title: "RFC-0029 REQ-0006 security-interlocked optimization gates and quantitative evidence quality enforcement"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

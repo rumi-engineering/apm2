@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00221"
     title: "FAC: Artifact manifest and evidence binding"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

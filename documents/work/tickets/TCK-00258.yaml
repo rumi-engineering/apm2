@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00258
     title: Implement SoD custody domain validation at spawn
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

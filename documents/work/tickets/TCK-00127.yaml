@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00127"
     title: "Implement CAC-JSON canonicalizer"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

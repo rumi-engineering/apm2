@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00304"
     title: "HEF: Outbox + pulse publisher (post-commit)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

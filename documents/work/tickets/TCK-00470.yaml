@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00470"
     title: "RFC-0029 REQ-0001 canonical economics profile and deterministic budget admission"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

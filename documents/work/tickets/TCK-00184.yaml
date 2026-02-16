@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00184
     title: Relay Holon and Reverse-TLS Tunneling
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

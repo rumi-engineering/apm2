@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00163
     title: Implement capability manifest and validation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

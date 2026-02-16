@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00530"
     title: "LaneProfile→systemd unit properties: single authoritative builder for CPU/mem/PIDs/IO/timeouts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

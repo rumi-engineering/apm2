@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00358
     title: IdentityProofProfileV1 and profile-hash enforcement
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

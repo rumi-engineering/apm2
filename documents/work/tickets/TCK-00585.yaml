@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00585"
     title: "Horizon/authority health monitoring: broker validates TP001/TP002/TP003 invariants and emits health receipts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

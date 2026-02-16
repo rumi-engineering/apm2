@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00356
     title: Directory head and identity proof artifact family
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

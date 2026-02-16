@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00155
     title: Implement coordination end-to-end integration tests
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0012
 acceptance_criteria:

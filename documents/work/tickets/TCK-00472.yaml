@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00472"
     title: "RFC-0029 REQ-0003 verification amortization and proof-cache discipline"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0029"

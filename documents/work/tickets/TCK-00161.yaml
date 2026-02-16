@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00161
     title: Implement PTY spawning and output capture
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

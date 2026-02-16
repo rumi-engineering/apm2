@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00513"
     title: "Receipt hardening: require RFC-0028 boundary + RFC-0029 queue/budget decisions in FacJobReceiptV1"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

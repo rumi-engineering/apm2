@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00129"
     title: "Embed bootstrap schema bundle in binary"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00424"
     title: "Privileged lifecycle integration for sublease and review handlers"
-    status: "DRAFT"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0027"

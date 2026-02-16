@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00565"
     title: "RFC-0028 token binding contract: bind tokens to (job_spec_digest, FacPolicyHash, canonicalizer tuple, boundary_id) + expiry"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

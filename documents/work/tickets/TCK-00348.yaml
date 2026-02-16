@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00348
     title: Handshake contract-hash binding and tiered mismatch gates
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0020

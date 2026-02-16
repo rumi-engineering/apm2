@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00192
     title: HSM Integration for T1 Validator Keys
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 dependencies:

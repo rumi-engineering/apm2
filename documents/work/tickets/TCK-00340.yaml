@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00340
     title: 'Security hardening: multi-holon policy inheritance enforcement + attestation tightening'
+    status: "CLOSED"
   binds:
     prd_id: PRD-0010
     rfc_id: RFC-0019

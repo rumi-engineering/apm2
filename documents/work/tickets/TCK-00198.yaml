@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00198
     title: StrictlyOrderedEvidence and Gate Predicates
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 acceptance_criteria:

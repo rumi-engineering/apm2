@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00283
     title: ADV-012 legacy IPC bypass test
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

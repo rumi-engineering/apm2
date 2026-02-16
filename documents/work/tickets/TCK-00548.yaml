@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00548"
     title: "Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00501"
     title: "Crash-safe effect execution: effect journal + RequestId idempotency key propagation + fail-closed in-doubt handling"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00244
     title: 'HTF: Metrics indexing by ledger windows and tick deltas'
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0016
     requirements:

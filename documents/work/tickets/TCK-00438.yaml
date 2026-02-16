@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00438"
     title: "[Umbrella] FAC CLI RoleSpec launch over subagents with auditable liveness"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0020"

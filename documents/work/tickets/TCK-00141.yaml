@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00141"
     title: "Implement deterministic export pipeline"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0007"
     rfc_id: "RFC-0011"

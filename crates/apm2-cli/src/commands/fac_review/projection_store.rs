@@ -3,12 +3,11 @@
 //! This module provides a local-first state surface under
 //! `~/.apm2/fac_projection`.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +18,6 @@ use super::types::{
 const PROJECTION_ROOT_DIR: &str = "fac_projection";
 const IDENTITY_SCHEMA: &str = "apm2.fac.projection.identity.v1";
 const BRANCH_HINT_SCHEMA: &str = "apm2.fac.projection.branch_hint.v1";
-const ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
 const REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 const PR_BODY_SCHEMA: &str = "apm2.fac.projection.pr_body.v1";
 
@@ -132,10 +130,6 @@ fn identity_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
 
 fn issue_comments_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(pr_dir(owner_repo, pr_number)?.join("issue_comments.json"))
-}
-
-fn issue_comments_lock_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
-    Ok(pr_dir(owner_repo, pr_number)?.join("issue_comments.lock"))
 }
 
 fn reviewer_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
@@ -264,26 +258,6 @@ pub(super) fn load_branch_identity(
     load_pr_identity(&hint.owner_repo, hint.pr_number)
 }
 
-pub(super) fn save_issue_comments_cache<T: Serialize>(
-    owner_repo: &str,
-    pr_number: u32,
-    comments: &[T],
-) -> Result<(), String> {
-    let payload = comments
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("failed to serialize issue comment cache payload: {err}"))?;
-    let cache = IssueCommentsCache {
-        schema: ISSUE_COMMENTS_SCHEMA.to_string(),
-        owner_repo: owner_repo.to_string(),
-        pr_number,
-        updated_at: now_iso8601(),
-        comments: payload,
-    };
-    write_json_atomic(&issue_comments_path(owner_repo, pr_number)?, &cache)
-}
-
 pub(super) fn load_issue_comments_cache<T: DeserializeOwned>(
     owner_repo: &str,
     pr_number: u32,
@@ -301,59 +275,6 @@ pub(super) fn load_issue_comments_cache<T: DeserializeOwned>(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("failed to decode cached issue comments: {err}"))?;
     Ok(Some(parsed))
-}
-
-pub(super) fn upsert_issue_comment_cache_entry(
-    owner_repo: &str,
-    pr_number: u32,
-    comment_id: u64,
-    html_url: &str,
-    body: &str,
-    reviewer_login: &str,
-) -> Result<(), String> {
-    let lock_path = issue_comments_lock_path(owner_repo, pr_number)?;
-    ensure_parent_dir(&lock_path)?;
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|err| {
-            format!(
-                "failed to open issue comment cache lock {}: {err}",
-                lock_path.display()
-            )
-        })?;
-    lock_file.lock_exclusive().map_err(|err| {
-        format!(
-            "failed to acquire issue comment cache lock {}: {err}",
-            lock_path.display()
-        )
-    })?;
-
-    let mut comments =
-        load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)?.unwrap_or_default();
-    let entry = serde_json::json!({
-        "id": comment_id,
-        "body": body,
-        "html_url": html_url,
-        "created_at": now_iso8601(),
-        "user": { "login": reviewer_login },
-    });
-
-    if let Some(existing) = comments
-        .iter_mut()
-        .find(|value| value.get("id").and_then(serde_json::Value::as_u64) == Some(comment_id))
-    {
-        *existing = entry;
-    } else {
-        comments.push(entry);
-    }
-
-    let write_result = save_issue_comments_cache(owner_repo, pr_number, &comments);
-    drop(lock_file);
-    write_result
 }
 
 pub(super) fn save_trusted_reviewer_id(

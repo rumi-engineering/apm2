@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00427"
     title: "Tier2+ sovereignty composition checks in revalidate and consume"
-    status: "DRAFT"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0027"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00119
     title: Implement run manifest with signing
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0010
     requirements:

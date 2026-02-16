@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00193
     title: Operational Monitoring and Alerting
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0014
 dependencies:

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00440"
     title: "RFC-0019 ch18 CAC traceability overlay and Tier2+ fail-closed matrix"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

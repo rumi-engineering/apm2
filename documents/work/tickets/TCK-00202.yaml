@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00202"
     title: "FAC: Domain separator module and sign_with_domain helper"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

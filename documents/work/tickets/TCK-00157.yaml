@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00157
     title: Implement UDS protocol server with length-prefixed framing
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

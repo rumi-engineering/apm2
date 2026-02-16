@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00156
     title: Scaffold apm2-daemon module structure
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0013
     requirements:

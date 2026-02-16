@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00384"
     title: "Session telemetry tracking: wire tool_calls, events_emitted, and started_at counters"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

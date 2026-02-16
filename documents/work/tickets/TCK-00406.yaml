@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00406"
     title: "Close model-only security changes by enforcing authoritative runtime wiring"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0020"

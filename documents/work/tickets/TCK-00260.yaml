@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00260
     title: Implement tool broker with capability manifest validation
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0017
     requirements:

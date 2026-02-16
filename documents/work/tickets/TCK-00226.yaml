@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00226"
     title: "FAC: Determinism envelope schema (Phase 1 - schema only)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0015"

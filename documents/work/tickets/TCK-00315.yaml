@@ -4,6 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00315"
     title: "FAC v0 NEW WORK REQUIRED: Reviewer navigation tool surface (ListFiles/Search)"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

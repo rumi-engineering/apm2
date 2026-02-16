@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00490"
     title: "PCAC/AJC integration guide for implementor and security reviewer agents"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0027"

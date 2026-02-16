@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00154
     title: Implement CoordinationReceipt and CAS storage
-    status: READY
+    status: "CLOSED"
   binds:
     rfc_id: RFC-0012
     requirements:
