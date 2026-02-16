@@ -564,6 +564,10 @@ fn phase_cargo_args(phase: WarmPhase) -> (Vec<String>, String) {
     }
 }
 
+fn is_sensitive_setenv_key(key: &str) -> bool {
+    matches!(key, "GITHUB_TOKEN" | "GH_TOKEN")
+}
+
 /// Build the `Command` for a warm phase, optionally wrapped in a `systemd-run`
 /// transient unit for cgroup containment.
 ///
@@ -656,10 +660,19 @@ fn build_phase_command(
             .unwrap_or(systemd_cmd.args.len());
 
         let mut full_args = Vec::with_capacity(systemd_cmd.args.len() + env_map.len() * 2);
+        let mut sensitive_setenv_pairs: Vec<(String, String)> = Vec::new();
         full_args.extend(systemd_cmd.args[..property_start].iter().cloned());
         for (key, value) in &env_map {
             full_args.push("--setenv".to_string());
-            full_args.push(format!("{key}={value}"));
+            if is_sensitive_setenv_key(key) {
+                // Use key-only forwarding for sensitive vars so secret values do
+                // not appear on argv. systemd-run reads the value from its own
+                // process environment, which we set explicitly on `cmd` below.
+                full_args.push(key.clone());
+                sensitive_setenv_pairs.push((key.clone(), value.clone()));
+            } else {
+                full_args.push(format!("{key}={value}"));
+            }
         }
         full_args.extend(systemd_cmd.args[property_start..].iter().cloned());
 
@@ -678,6 +691,9 @@ fn build_phase_command(
         // bounded test runner pattern in bounded_test_runner.rs.
         let mut cmd = Command::new(&full_args[0]);
         cmd.args(&full_args[1..]);
+        for (key, value) in sensitive_setenv_pairs {
+            cmd.env(key, value);
+        }
 
         let display_str = format!("systemd-run [contained] {cmd_str}");
         Ok((cmd, display_str))
@@ -1806,6 +1822,62 @@ mod tests {
             "cmd_str should contain original command: {cmd_str}"
         );
         drop(cmd);
+    }
+
+    #[test]
+    fn test_build_phase_command_masks_sensitive_setenv_values() {
+        let mut env = test_hardened_env();
+        env.insert("GITHUB_TOKEN".to_string(), "ghp_secret_value".to_string());
+        let containment = WarmContainment {
+            backend: ExecutionBackend::UserMode,
+            properties: SystemdUnitProperties {
+                cpu_quota_percent: 200,
+                memory_max_bytes: 8_000_000_000,
+                tasks_max: 512,
+                io_weight: 100,
+                timeout_start_sec: 600,
+                runtime_max_sec: 1800,
+                kill_mode: "control-group".to_string(),
+            },
+            system_config: None,
+        };
+
+        let (cmd, _cmd_str) = build_phase_command(
+            WarmPhase::Build,
+            Path::new("/tmp/workspace"),
+            Path::new("/tmp/cargo_home"),
+            Path::new("/tmp/target"),
+            &env,
+            Some(&containment),
+            "lane-0",
+            "abcd1234-5678-90ab-cdef-1234567890ab",
+        )
+        .expect("containment command construction should succeed");
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--setenv" && window[1] == "GITHUB_TOKEN"),
+            "expected key-only --setenv forwarding for GITHUB_TOKEN, got args: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("GITHUB_TOKEN=ghp_secret_value")),
+            "secret value must not appear in systemd-run argv: {args:?}"
+        );
+
+        let has_secret_env = cmd.get_envs().any(|(key, value)| {
+            key.to_string_lossy() == "GITHUB_TOKEN"
+                && value.is_some_and(|v| v.to_string_lossy() == "ghp_secret_value")
+        });
+        assert!(
+            has_secret_env,
+            "systemd-run process env must carry GITHUB_TOKEN for key-only forwarding"
+        );
     }
 
     #[test]

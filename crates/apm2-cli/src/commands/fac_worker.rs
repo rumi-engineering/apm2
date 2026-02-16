@@ -94,9 +94,10 @@ use apm2_core::fac::{
     FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
     LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
     LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, build_job_environment,
-    compute_policy_hash, deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, run_preflight, select_and_validate_backend,
+    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
+    build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
+    load_or_default_boundary_id, parse_policy_hash, persist_content_addressed_receipt,
+    persist_policy, run_preflight, select_and_validate_backend,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -3548,7 +3549,50 @@ fn execute_warm_job(
             .to_path_buf()
     });
     let ambient_env: Vec<(String, String)> = std::env::vars().collect();
-    let hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
+    let mut hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
+
+    // TCK-00596: Plumb credential mount metadata into execution environment.
+    // This selectively re-introduces credential env vars (for example
+    // GITHUB_TOKEN) after policy default-deny filtering when a validated
+    // credential mount is available. Secret values are resolved at runtime and
+    // are never serialized into receipts/job specs.
+    if let Some(credential_mount) = build_github_credential_mount() {
+        if let Err(error) =
+            apply_credential_mount_to_env(&credential_mount, &mut hardened_env, &ambient_env)
+        {
+            let reason = format!("credential mount injection failed: {error}");
+            eprintln!("worker: warm job {}: {reason}", spec.job_id);
+            let _ = LaneLeaseV1::remove(lane_dir);
+            let moved_path = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(DENIED_DIR),
+                claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            let _ = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                patch_digest,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                containment_trace,
+            );
+            return JobOutcome::Denied { reason };
+        }
+    }
 
     // [INV-WARM-014] Construct systemd-run containment for warm phase
     // subprocesses. This wraps each cargo command in a transient unit with

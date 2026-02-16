@@ -102,6 +102,9 @@ pub const REVIEW_BLOCKED_SCHEMA_ID: &str = "apm2.review_blocked.v1";
 /// Schema ID for efficiency primitives v1.
 pub const EFFICIENCY_PRIMITIVES_SCHEMA_ID: &str = "apm2.efficiency_primitives.v1";
 
+/// Schema ID for credential mount descriptor v1.
+pub const CREDENTIAL_MOUNT_SCHEMA_ID: &str = "apm2.fac.credential_mount.v1";
+
 // ---------------------------------------------------------------------------
 // Central registry list
 // ---------------------------------------------------------------------------
@@ -129,6 +132,7 @@ pub const ALL_FAC_SCHEMA_IDS: &[&str] = &[
     VIEW_COMMITMENT_V1_SCHEMA_ID,
     REVIEW_BLOCKED_SCHEMA_ID,
     EFFICIENCY_PRIMITIVES_SCHEMA_ID,
+    CREDENTIAL_MOUNT_SCHEMA_ID,
 ];
 
 // ---------------------------------------------------------------------------

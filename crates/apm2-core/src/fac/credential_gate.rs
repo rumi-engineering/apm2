@@ -26,15 +26,21 @@
 //!   It reports the *source* of resolution, not the secret value itself.
 //! - [INV-CREDGATE-002] `require_github_credentials()` returns `Err` with an
 //!   actionable remediation message when no credential source is available.
-//! - [INV-CREDGATE-003] `CredentialMountV1` uses `SecretString` for any value
-//!   that carries secret material. `Debug` and `Display` impls redact secrets.
+//! - [INV-CREDGATE-003] `CredentialMountV1` carries metadata only (env var
+//!   names and file paths). Secret values are resolved and injected at
+//!   execution time, never serialized into receipts/logs.
 //! - [INV-CREDGATE-004] Missing credentials block only GitHub-facing workflows;
 //!   the gate is never called on the `apm2 fac gates` path.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+
+/// Schema identifier for `CredentialMountV1`.
+pub const CREDENTIAL_MOUNT_SCHEMA_ID: &str = "apm2.fac.credential_mount.v1";
 
 /// Maximum number of environment variable mounts in a single credential mount.
 pub const MAX_ENV_MOUNTS: usize = 16;
@@ -122,6 +128,7 @@ pub struct CredentialPosture {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialMountV1 {
     /// Schema identifier for forward-compatible parsing.
+    /// Must equal [`CREDENTIAL_MOUNT_SCHEMA_ID`].
     pub schema: String,
 
     /// Environment variable names that will carry secrets at runtime.
@@ -176,6 +183,15 @@ pub enum CredentialGateError {
     )]
     GitHubCredentialsMissing,
 
+    /// Credential mount schema is not recognized.
+    #[error("credential mount schema mismatch: expected {expected}, got {actual}")]
+    InvalidCredentialMountSchema {
+        /// Expected schema identifier.
+        expected: &'static str,
+        /// Actual schema identifier.
+        actual: String,
+    },
+
     /// Too many environment mounts in the credential mount.
     #[error("too many env mounts: {count} > {}", MAX_ENV_MOUNTS)]
     TooManyEnvMounts {
@@ -214,6 +230,13 @@ pub enum CredentialGateError {
         field: &'static str,
         /// The field length.
         length: usize,
+    },
+
+    /// A credential mount resolved to no usable credential payload.
+    #[error("credential payload unavailable for source {credential_source}")]
+    CredentialPayloadUnavailable {
+        /// Source identifier associated with the failed payload resolution.
+        credential_source: String,
     },
 }
 
@@ -329,6 +352,7 @@ pub fn build_github_credential_mount() -> Option<CredentialMountV1> {
             env_name: var_name.clone(),
             source: source.clone(),
         }],
+        CredentialSource::GitHubApp => Vec::new(),
         // For non-env sources, the credential is typically injected as
         // GITHUB_TOKEN at runtime by the execution backend.
         _ => vec![EnvMount {
@@ -360,10 +384,91 @@ pub fn build_github_credential_mount() -> Option<CredentialMountV1> {
     };
 
     Some(CredentialMountV1 {
-        schema: "apm2.fac.credential_mount.v1".to_string(),
+        schema: CREDENTIAL_MOUNT_SCHEMA_ID.to_string(),
         env_mounts,
         file_mounts,
     })
+}
+
+/// Apply a validated credential mount to a hardened job environment map.
+///
+/// This injects runtime credential values into `env` using mount metadata
+/// (`env_mounts`) without serializing secret material into receipts.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The mount fails bounds validation.
+/// - `env_mounts` requires a credential payload that cannot be resolved.
+pub fn apply_credential_mount_to_env(
+    mount: &CredentialMountV1,
+    env: &mut BTreeMap<String, String>,
+    ambient_env: &[(String, String)],
+) -> Result<(), CredentialGateError> {
+    validate_credential_mount(mount)?;
+
+    if mount.env_mounts.is_empty() {
+        return Ok(());
+    }
+
+    let primary_source = mount_primary_source(mount).ok_or_else(|| {
+        CredentialGateError::CredentialPayloadUnavailable {
+            credential_source: "unknown".to_string(),
+        }
+    })?;
+    let token = resolve_mount_token(primary_source, ambient_env).ok_or_else(|| {
+        CredentialGateError::CredentialPayloadUnavailable {
+            credential_source: primary_source.to_string(),
+        }
+    })?;
+
+    for env_mount in &mount.env_mounts {
+        env.insert(env_mount.env_name.clone(), token.clone());
+    }
+
+    // Ensure GITHUB_TOKEN is present as a compatibility alias when mounts
+    // provide only GH_TOKEN.
+    let has_github_token_mount = mount
+        .env_mounts
+        .iter()
+        .any(|entry| entry.env_name == "GITHUB_TOKEN");
+    if !has_github_token_mount {
+        env.insert("GITHUB_TOKEN".to_string(), token);
+    }
+
+    Ok(())
+}
+
+fn mount_primary_source(mount: &CredentialMountV1) -> Option<&CredentialSource> {
+    mount
+        .env_mounts
+        .first()
+        .map(|entry| &entry.source)
+        .or_else(|| mount.file_mounts.first().map(|entry| &entry.source))
+}
+
+fn resolve_mount_token(
+    source: &CredentialSource,
+    ambient_env: &[(String, String)],
+) -> Option<String> {
+    match source {
+        CredentialSource::EnvVar { var_name } => resolve_ambient_env(ambient_env, var_name),
+        CredentialSource::SystemdCredential { .. }
+        | CredentialSource::Apm2CredentialFile { .. } => {
+            crate::config::resolve_github_token("GITHUB_TOKEN")
+                .or_else(|| crate::config::resolve_github_token("GH_TOKEN"))
+                .map(|secret| secret.expose_secret().to_string())
+        },
+        CredentialSource::GitHubApp => None,
+    }
+}
+
+fn resolve_ambient_env(ambient_env: &[(String, String)], var_name: &str) -> Option<String> {
+    ambient_env
+        .iter()
+        .rev()
+        .find(|(key, value)| key == var_name && !value.is_empty())
+        .map(|(_, value)| value.clone())
 }
 
 /// Validate a [`CredentialMountV1`] for bounded collection sizes.
@@ -372,6 +477,12 @@ pub fn build_github_credential_mount() -> Option<CredentialMountV1> {
 ///
 /// Returns an error if any bounds are exceeded.
 pub fn validate_credential_mount(mount: &CredentialMountV1) -> Result<(), CredentialGateError> {
+    if mount.schema != CREDENTIAL_MOUNT_SCHEMA_ID {
+        return Err(CredentialGateError::InvalidCredentialMountSchema {
+            expected: CREDENTIAL_MOUNT_SCHEMA_ID,
+            actual: mount.schema.clone(),
+        });
+    }
     if mount.env_mounts.len() > MAX_ENV_MOUNTS {
         return Err(CredentialGateError::TooManyEnvMounts {
             count: mount.env_mounts.len(),
@@ -546,7 +657,7 @@ mod tests {
     #[test]
     fn validate_credential_mount_rejects_long_env_name() {
         let mount = CredentialMountV1 {
-            schema: "apm2.fac.credential_mount.v1".to_string(),
+            schema: CREDENTIAL_MOUNT_SCHEMA_ID.to_string(),
             env_mounts: vec![EnvMount {
                 env_name: "X".repeat(MAX_ENV_NAME_LENGTH + 1),
                 source: CredentialSource::EnvVar {
@@ -558,6 +669,19 @@ mod tests {
         assert!(matches!(
             validate_credential_mount(&mount),
             Err(CredentialGateError::EnvNameTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_credential_mount_rejects_schema_mismatch() {
+        let mount = CredentialMountV1 {
+            schema: "apm2.fac.credential_mount.v2".to_string(),
+            env_mounts: vec![],
+            file_mounts: vec![],
+        };
+        assert!(matches!(
+            validate_credential_mount(&mount),
+            Err(CredentialGateError::InvalidCredentialMountSchema { .. })
         ));
     }
 
@@ -603,7 +727,7 @@ mod tests {
     #[test]
     fn validate_credential_mount_rejects_long_source_field() {
         let mount = CredentialMountV1 {
-            schema: "apm2.fac.credential_mount.v1".to_string(),
+            schema: CREDENTIAL_MOUNT_SCHEMA_ID.to_string(),
             env_mounts: vec![EnvMount {
                 env_name: "GITHUB_TOKEN".to_string(),
                 source: CredentialSource::EnvVar {
@@ -618,6 +742,48 @@ mod tests {
                 field: "var_name",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn apply_credential_mount_to_env_injects_alias_for_github_token() {
+        let mount = CredentialMountV1 {
+            schema: CREDENTIAL_MOUNT_SCHEMA_ID.to_string(),
+            env_mounts: vec![EnvMount {
+                env_name: "GH_TOKEN".to_string(),
+                source: CredentialSource::EnvVar {
+                    var_name: "GH_TOKEN".to_string(),
+                },
+            }],
+            file_mounts: vec![],
+        };
+        let ambient_env = vec![("GH_TOKEN".to_string(), "ghp_example".to_string())];
+        let mut env = BTreeMap::new();
+
+        apply_credential_mount_to_env(&mount, &mut env, &ambient_env).expect("mount applied");
+
+        assert_eq!(env.get("GH_TOKEN"), Some(&"ghp_example".to_string()));
+        assert_eq!(env.get("GITHUB_TOKEN"), Some(&"ghp_example".to_string()));
+    }
+
+    #[test]
+    fn apply_credential_mount_to_env_rejects_missing_payload() {
+        let mount = CredentialMountV1 {
+            schema: CREDENTIAL_MOUNT_SCHEMA_ID.to_string(),
+            env_mounts: vec![EnvMount {
+                env_name: "GITHUB_TOKEN".to_string(),
+                source: CredentialSource::EnvVar {
+                    var_name: "GITHUB_TOKEN".to_string(),
+                },
+            }],
+            file_mounts: vec![],
+        };
+        let mut env = BTreeMap::new();
+        let ambient_env = Vec::new();
+
+        assert!(matches!(
+            apply_credential_mount_to_env(&mount, &mut env, &ambient_env),
+            Err(CredentialGateError::CredentialPayloadUnavailable { .. })
         ));
     }
 
