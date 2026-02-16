@@ -343,11 +343,15 @@ impl ReconcileReceiptV1 {
     /// Load a receipt from a file with bounded deserialization (INV-BH-007).
     ///
     /// Size-caps the file read before parsing to prevent memory exhaustion.
+    /// Validates the `schema` field matches `RECONCILE_RECEIPT_SCHEMA` after
+    /// deserialization, consistent with the validation pattern used by other
+    /// FAC record types (`LaneProfile`, `LaneLease`, `LaneCorruptMarker`).
     ///
     /// # Errors
     ///
-    /// Returns `ReconcileError` on I/O, parse, or bounds violation.
-    #[allow(dead_code)]
+    /// Returns `ReconcileError` on I/O, parse, schema mismatch, or bounds
+    /// violation.
+    #[allow(dead_code)] // Used in tests for receipt verification; may be wired to production later.
     pub fn load(path: &Path) -> Result<Self, ReconcileError> {
         let metadata = fs::symlink_metadata(path)
             .map_err(|e| ReconcileError::io(format!("stat receipt at {}", path.display()), e))?;
@@ -375,6 +379,18 @@ impl ReconcileReceiptV1 {
             .map_err(|e| ReconcileError::io(format!("reading receipt at {}", path.display()), e))?;
         let receipt: Self = serde_json::from_slice(&buf)
             .map_err(|e| ReconcileError::Serialization(e.to_string()))?;
+
+        // Schema validation: verify the schema field matches the expected
+        // value. This is consistent with the pattern used by LaneCorruptMarkerV1,
+        // LaneLeaseV1, and LaneProfileV1 which all validate the schema field
+        // on load to prevent loading mismatched/malformed records.
+        if receipt.schema != RECONCILE_RECEIPT_SCHEMA {
+            return Err(ReconcileError::Serialization(format!(
+                "schema mismatch: expected '{}', got '{}'",
+                RECONCILE_RECEIPT_SCHEMA, receipt.schema
+            )));
+        }
+
         receipt.validate_bounds()?;
         Ok(receipt)
     }
@@ -626,7 +642,7 @@ fn reconcile_lanes(
                         // Dead PID + free lock → stale lease.
                         // INV-RECON-006: Transition through CLEANUP → IDLE.
                         if !dry_run {
-                            recover_stale_lease(&lane_dir, &lease)?;
+                            recover_stale_lease(&lane_dir, &lease, fac_root)?;
                         }
                         actions.push(LaneRecoveryAction::StaleLeaseCleared {
                             lane_id: lane_id.clone(),
@@ -723,12 +739,40 @@ fn reconcile_lanes(
 ///
 /// This implements the lane cleanup lifecycle for crash recovery:
 /// 1. Transition lease state to CLEANUP and persist durably.
-/// 2. Remove the lease file (returning lane to IDLE).
+/// 2. Best-effort filesystem cleanup: prune `tmp/` and per-lane env dirs
+///    (`home/`, `xdg_cache/`, `xdg_config/`, etc.) via `safe_rmtree_v1`.
+/// 3. Remove the lease file (returning lane to IDLE).
 ///
 /// Fail-closed: If the CLEANUP transition persist fails, return an error
 /// instead of proceeding with lease removal. The caller must not remove the
 /// lease without durable CLEANUP evidence.
-fn recover_stale_lease(lane_dir: &Path, lease: &LaneLeaseV1) -> Result<(), ReconcileError> {
+///
+/// # Scope Limitations (MAJOR 2 remediation)
+///
+/// The reconciler runs at startup with limited access to `LaneManager`
+/// internals. Full `LaneManager::run_lane_cleanup` requires a RUNNING lease
+/// and a known workspace path (which may not be derivable from a stale
+/// lease after a crash). Therefore, this function performs a **best-effort
+/// subset** of the full cleanup:
+///
+/// - **Included**: `tmp/` pruning and per-lane env dir pruning via
+///   `safe_rmtree_v1`. These are the most likely sources of cross-job
+///   contamination (stale temp files, cached credentials in `home/`, etc.).
+/// - **Excluded**: `git reset --hard` and `git clean -ffdxq` (the workspace
+///   path is derived from the lane profile and mirror checkout, not stored in
+///   the lease record; additionally, git state after a crash may be arbitrary
+///   and unsafe to reset without validation). Also excluded: log quota
+///   enforcement (non-critical for contamination prevention).
+///
+/// If any cleanup step fails, the lane is marked CORRUPT via
+/// `LaneCorruptMarkerV1` rather than silently continuing. This ensures the
+/// lane will not accept new jobs until explicitly reset via
+/// `apm2 fac lane reset`.
+fn recover_stale_lease(
+    lane_dir: &Path,
+    lease: &LaneLeaseV1,
+    fac_root: &Path,
+) -> Result<(), ReconcileError> {
     // Step 1: Transition to CLEANUP state and persist durably.
     // Fail-closed: if this write fails, we must NOT remove the lease.
     let mut cleanup_lease = lease.clone();
@@ -744,13 +788,104 @@ fn recover_stale_lease(lane_dir: &Path, lease: &LaneLeaseV1) -> Result<(), Recon
         )
     })?;
 
-    // Step 2: Remove the lease file (IDLE). Safe because CLEANUP is now durable.
+    // Step 2: Best-effort filesystem cleanup — prune tmp/ and per-lane env
+    // dirs to prevent cross-job contamination from stale files left by the
+    // crashed job.
+    //
+    // NOTE: Git reset/clean is intentionally excluded because (a) the
+    // workspace path is not stored in the lease record, and (b) git state
+    // after a crash may be arbitrary. The workspace will be re-checked-out
+    // from the bare mirror on the next job assignment, which implicitly
+    // replaces any stale git state.
+    let cleanup_failed = best_effort_lane_cleanup(lane_dir);
+
+    if let Some(cleanup_reason) = cleanup_failed {
+        // Cleanup failed — mark lane CORRUPT (fail-closed). The lane must
+        // not accept new jobs until explicitly reset via `apm2 fac lane reset`.
+        let lane_id = lane_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let reason = format!(
+            "stale lease recovery cleanup failed for lane {lane_id}: {cleanup_reason}; \
+             lane marked corrupt (fail-closed, requires `apm2 fac lane reset`)"
+        );
+        let timestamp = current_timestamp_rfc3339();
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: truncate_string(&reason, MAX_STRING_LENGTH),
+            cleanup_receipt_digest: None,
+            detected_at: timestamp,
+        };
+        marker.persist(fac_root).map_err(|e| {
+            ReconcileError::io(
+                format!(
+                    "failed to persist corrupt marker after cleanup failure for lane {lane_id} \
+                     (original cleanup error: {cleanup_reason})"
+                ),
+                std::io::Error::other(e.to_string()),
+            )
+        })?;
+        // Do NOT remove the lease — lane is corrupt and needs manual reset.
+        return Err(ReconcileError::io(
+            format!(
+                "lane cleanup failed during stale lease recovery at {}: {cleanup_reason}; \
+                 lane marked CORRUPT",
+                lane_dir.display()
+            ),
+            std::io::Error::other("cleanup verification failed — lane marked corrupt"),
+        ));
+    }
+
+    // Step 3: Remove the lease file (IDLE). Safe because CLEANUP is now durable
+    // and filesystem cleanup succeeded.
     LaneLeaseV1::remove(lane_dir).map_err(|e| {
         ReconcileError::io(
             format!("failed to remove stale lease at {}", lane_dir.display()),
             std::io::Error::other(e.to_string()),
         )
     })
+}
+
+/// Best-effort filesystem cleanup for a lane during stale lease recovery.
+///
+/// Prunes `tmp/` and per-lane env directories (`home/`, `xdg_cache/`,
+/// `xdg_config/`, `xdg_data/`, `xdg_state/`, `xdg_runtime/`) via
+/// `safe_rmtree_v1`. Returns `None` on success, or `Some(reason)` describing
+/// the first failure encountered.
+///
+/// This is a subset of the full `LaneManager::run_lane_cleanup` that can run
+/// without knowledge of the workspace path or git state.
+fn best_effort_lane_cleanup(lane_dir: &Path) -> Option<String> {
+    use super::safe_rmtree::safe_rmtree_v1;
+
+    // Prune tmp/ directory.
+    let tmp_dir = lane_dir.join("tmp");
+    if tmp_dir.exists() {
+        if let Err(e) = safe_rmtree_v1(&tmp_dir, lane_dir) {
+            return Some(format!("tmp prune failed: {e}"));
+        }
+    }
+
+    // Prune per-lane env directories (home/, xdg_cache/, xdg_config/, etc.).
+    // Skip tmp/ since it was already handled above.
+    for &env_subdir in super::policy::LANE_ENV_DIRS {
+        if env_subdir == super::policy::LANE_ENV_DIR_TMP {
+            continue;
+        }
+        let env_dir = lane_dir.join(env_subdir);
+        if env_dir.exists() {
+            if let Err(e) = safe_rmtree_v1(&env_dir, lane_dir) {
+                return Some(format!(
+                    "env dir prune failed for {}: {e}",
+                    env_dir.display()
+                ));
+            }
+        }
+    }
+
+    None
 }
 
 /// Persist a `LaneCorruptMarkerV1` for a lane (INV-RECON-002).
@@ -1141,17 +1276,32 @@ fn random_u32() -> u32 {
 }
 
 /// Truncate a string to a maximum byte length, ensuring valid UTF-8.
+///
+/// When truncation is needed and `max_len >= 3`, the output includes a `"..."`
+/// suffix and the total output length is guaranteed to be `<= max_len`. This
+/// ensures truncated strings pass `validate_string_field(_, _, max_len)` checks
+/// downstream (e.g., `LaneCorruptMarkerV1::load` enforces `MAX_STRING_LENGTH`
+/// on the `reason` field).
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        // Find the last valid UTF-8 boundary at or before max_len.
+        return s.to_string();
+    }
+    // When max_len < 3, we cannot fit any prefix + "...", so just truncate
+    // to max_len bytes at a valid UTF-8 boundary without an ellipsis.
+    if max_len < 3 {
         let mut end = max_len;
         while end > 0 && !s.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}...", &s[..end])
+        return s[..end].to_string();
     }
+    // Reserve 3 bytes for "..." so the total output is <= max_len.
+    let truncated_len = max_len - 3;
+    let mut end = truncated_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1444,9 +1594,38 @@ mod tests {
 
     #[test]
     fn test_truncate_string() {
+        // No truncation needed — string fits within max_len.
         assert_eq!(truncate_string("hello", 10), "hello");
-        assert_eq!(truncate_string("hello world", 5), "hello...");
         assert_eq!(truncate_string("", 5), "");
+
+        // Truncation with ellipsis — total output must be <= max_len.
+        assert_eq!(truncate_string("hello world", 8), "hello...");
+        assert_eq!(truncate_string("hello world", 8).len(), 8);
+
+        // Edge case: max_len == 3 → empty prefix + "...".
+        assert_eq!(truncate_string("hello world", 3), "...");
+        assert_eq!(truncate_string("hello world", 3).len(), 3);
+
+        // Edge case: max_len < 3 → no ellipsis, just truncated.
+        assert_eq!(truncate_string("hello", 2), "he");
+        assert_eq!(truncate_string("hello", 0), "");
+
+        // Verify truncated strings pass MAX_STRING_LENGTH validation.
+        // This is the critical property: truncate_string(s, MAX_STRING_LENGTH)
+        // must produce a string whose len() <= MAX_STRING_LENGTH, so that
+        // LaneCorruptMarkerV1::load can validate the reason field.
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 100);
+        let truncated = truncate_string(&long_string, MAX_STRING_LENGTH);
+        assert!(
+            truncated.len() <= MAX_STRING_LENGTH,
+            "truncated string length {} exceeds MAX_STRING_LENGTH {}",
+            truncated.len(),
+            MAX_STRING_LENGTH,
+        );
+        assert!(
+            truncated.ends_with("..."),
+            "truncated string should end with '...'"
+        );
     }
 
     #[test]
@@ -1946,6 +2125,163 @@ mod tests {
         assert!(
             marker_after.is_some(),
             "durable corrupt marker must be persisted for derived corrupt state"
+        );
+    }
+
+    #[test]
+    fn test_receipt_load_rejects_wrong_schema() {
+        // ReconcileReceiptV1::load must reject receipts with a non-matching
+        // schema field, consistent with other FAC record types.
+        let tmp = TempDir::new().unwrap();
+        let receipt_path = tmp.path().join("bad-schema.json");
+
+        let bad_receipt = serde_json::json!({
+            "schema": "apm2.fac.WRONG_SCHEMA.v1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "dry_run": false,
+            "lane_actions": [],
+            "queue_actions": [],
+            "lanes_inspected": 0,
+            "claimed_files_inspected": 0,
+            "stale_leases_recovered": 0,
+            "orphaned_jobs_requeued": 0,
+            "orphaned_jobs_failed": 0,
+            "lanes_marked_corrupt": 0
+        });
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&bad_receipt).unwrap(),
+        )
+        .unwrap();
+
+        let result = ReconcileReceiptV1::load(&receipt_path);
+        assert!(result.is_err(), "load must reject wrong schema");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("schema mismatch"),
+            "error should mention schema mismatch: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_receipt_load_accepts_correct_schema() {
+        // ReconcileReceiptV1::load must accept receipts with the correct schema.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Run a reconciliation to produce a receipt with the correct schema.
+        let _receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        let receipts_dir = fac_root.join("receipts").join("reconcile");
+        let entries: Vec<_> = fs::read_dir(&receipts_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1);
+
+        let loaded = ReconcileReceiptV1::load(&entries[0].path()).unwrap();
+        assert_eq!(loaded.schema, RECONCILE_RECEIPT_SCHEMA);
+    }
+
+    #[test]
+    fn test_stale_lease_recovery_prunes_tmp_and_env_dirs() {
+        // MAJOR 2 fix: recover_stale_lease must prune tmp/ and per-lane env
+        // dirs (home/, xdg_cache/, xdg_config/, etc.) during cleanup to
+        // prevent cross-job contamination.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // safe_rmtree_v1 requires the allowed_parent (lane_dir) to have mode
+        // 0o700 (INV-RMTREE-006). Set this before creating child dirs.
+        let lane_dir = fac_root.join("lanes").join("lane-00");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lane_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        // Plant stale files in lane-00's tmp/ and env dirs.
+        let tmp_dir = lane_dir.join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join("stale-build-artifact.o"), b"stale").unwrap();
+
+        let home_dir = lane_dir.join("home");
+        fs::create_dir_all(&home_dir).unwrap();
+        fs::write(home_dir.join(".bash_history"), b"secret commands").unwrap();
+
+        let xdg_cache_dir = lane_dir.join("xdg_cache");
+        fs::create_dir_all(&xdg_cache_dir).unwrap();
+        fs::write(xdg_cache_dir.join("cached-crate.tar"), b"cached data").unwrap();
+
+        // Plant a stale lease with dead PID.
+        write_lease(
+            &fac_root,
+            "lane-00",
+            "job-dirty-workspace",
+            999_999_999,
+            LaneState::Running,
+        );
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        assert_eq!(receipt.stale_leases_recovered, 1);
+
+        // Verify stale files were cleaned up.
+        assert!(
+            !tmp_dir.exists(),
+            "tmp/ directory should be removed during stale lease recovery"
+        );
+        assert!(
+            !home_dir.exists(),
+            "home/ directory should be removed during stale lease recovery"
+        );
+        assert!(
+            !xdg_cache_dir.exists(),
+            "xdg_cache/ directory should be removed during stale lease recovery"
+        );
+
+        // Verify the lease file was also removed (lane is IDLE).
+        let lease_path = lane_dir.join("lease.v1.json");
+        assert!(
+            !lease_path.exists(),
+            "stale lease file should be removed after successful cleanup"
+        );
+    }
+
+    #[test]
+    fn test_truncated_corrupt_reason_passes_marker_load_validation() {
+        // MAJOR 1 regression test: Verify that a corrupt marker persisted
+        // with a truncated reason can be loaded back successfully. Previously,
+        // truncate_string(s, MAX_STRING_LENGTH) could produce strings of length
+        // MAX_STRING_LENGTH + 3 (due to appending "..."), which would fail the
+        // LaneCorruptMarkerV1::load validation.
+        let (_tmp, fac_root, _queue_root) = setup_fac_and_queue(3);
+
+        // Create a reason string that exceeds MAX_STRING_LENGTH to trigger truncation.
+        let long_reason = "x".repeat(MAX_STRING_LENGTH + 100);
+        let timestamp = "2026-01-01T00:00:00Z";
+
+        // persist_corrupt_marker internally calls truncate_string.
+        persist_corrupt_marker(&fac_root, "lane-00", &long_reason, timestamp).unwrap();
+
+        // Load must succeed — the truncated reason must fit within MAX_STRING_LENGTH.
+        let loaded = LaneCorruptMarkerV1::load(&fac_root, "lane-00").unwrap();
+        assert!(
+            loaded.is_some(),
+            "corrupt marker with truncated reason must load successfully"
+        );
+        let marker = loaded.unwrap();
+        assert!(
+            marker.reason.len() <= MAX_STRING_LENGTH,
+            "loaded reason length {} exceeds MAX_STRING_LENGTH {}",
+            marker.reason.len(),
+            MAX_STRING_LENGTH,
+        );
+        assert!(
+            marker.reason.ends_with("..."),
+            "truncated reason should end with '...'"
         );
     }
 

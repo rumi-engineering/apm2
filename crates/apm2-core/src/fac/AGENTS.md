@@ -1308,8 +1308,9 @@ inconsistencies deterministically on worker startup.
      orphaned jobs not backed by any active lane. Rejects symlinks and
      non-regular file types. Applies configured policy (requeue to `pending/`
      or mark failed to `denied/`). Move failures are propagated, not swallowed.
-- `ReconcileReceiptV1::load()`: Bounded receipt deserialization with size cap
-  and post-parse bounds validation.
+- `ReconcileReceiptV1::load()`: Bounded receipt deserialization with size cap,
+  schema validation (rejects non-matching `schema` field), and post-parse
+  bounds validation.
 - Dry-run mode: report what would be done without mutating state (receipt
   persistence is best-effort).
 - Apply mode: receipt persistence is mandatory (fail-closed).
@@ -1351,9 +1352,15 @@ inconsistencies deterministically on worker startup.
   adversarial flooding of non-regular entries to bypass the scan budget.
 - [INV-RECON-006] Stale lease recovery routes through the CLEANUP state
   transition (`recover_stale_lease`): the lease is persisted as CLEANUP state,
-  then removed to reach IDLE. This mirrors the normal lane lifecycle and
-  prevents bypassing cleanup invariants. CLEANUP persist failure is a hard
-  error — lease removal is blocked without durable CLEANUP evidence to
+  best-effort filesystem cleanup runs (tmp/ and per-lane env dir pruning via
+  `safe_rmtree_v1`), then the lease is removed to reach IDLE. This mirrors
+  the normal lane cleanup lifecycle and prevents cross-job contamination from
+  stale files. Git reset/clean is excluded because the workspace path is not
+  stored in the lease record and git state after a crash may be arbitrary
+  (the workspace will be re-checked-out on next job assignment). If any
+  cleanup step fails, the lane is marked CORRUPT via `LaneCorruptMarkerV1`
+  rather than silently continuing (fail-closed). CLEANUP persist failure is a
+  hard error — lease removal is blocked without durable CLEANUP evidence to
   prevent silent lifecycle bypass.
 - [INV-RECON-007] Move operations are fail-closed: `move_file_safe` propagates
   rename failures as `ReconcileError::MoveFailed`. Queue reconciliation counters
@@ -1394,6 +1401,11 @@ inconsistencies deterministically on worker startup.
   (e.g., lock free but PID alive) are durably marked so subsequent restarts
   see the lane as corrupt even if the runtime conditions that triggered the
   derivation have changed.
+- [INV-RECON-015] `truncate_string(s, max_len)` guarantees the output length
+  is `<= max_len`, including the `"..."` ellipsis suffix when truncation is
+  needed. This ensures truncated strings pass downstream `MAX_STRING_LENGTH`
+  validation (e.g., `LaneCorruptMarkerV1::load` enforces a strict length
+  check on the `reason` field).
 - CTR-2501 deviation: `current_timestamp_rfc3339()` and `wall_clock_nanos()`
   use wall-clock time for receipt timestamps and file deduplication suffixes.
   Documented inline with security justification.
