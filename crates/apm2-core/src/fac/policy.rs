@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use super::job_spec::parse_b3_256_digest;
 use super::policy_resolution::{DeterminismClass, RiskTier};
+use super::systemd_properties::SandboxHardeningProfile;
 use crate::determinism::canonicalize_json;
 use crate::economics::profile::EconomicsProfile;
 #[cfg(unix)]
@@ -220,6 +221,14 @@ pub struct FacPolicyV1 {
     /// Zero hash means no profile bound (will fail-closed on budget admission).
     #[serde(default = "default_economics_profile_hash")]
     pub economics_profile_hash: [u8; 32],
+
+    /// Sandbox hardening profile for systemd transient units (TCK-00573).
+    ///
+    /// Defines which systemd security directives are applied to FAC job units.
+    /// The default profile enables all hardening directives with safe defaults
+    /// that preserve build execution.
+    #[serde(default)]
+    pub sandbox_hardening: SandboxHardeningProfile,
 }
 
 impl Default for FacPolicyV1 {
@@ -292,6 +301,7 @@ impl FacPolicyV1 {
             risk_tier: RiskTier::Tier2,
             determinism_class: DeterminismClass::SoftDeterministic,
             economics_profile_hash,
+            sandbox_hardening: SandboxHardeningProfile::default(),
         }
     }
 
@@ -342,6 +352,14 @@ impl FacPolicyV1 {
             validate_string_field_len("env_set.key", entry.key.len(), MAX_ENV_KEY_LENGTH)?;
             validate_string_field_len("env_set.value", entry.value.len(), MAX_ENV_VALUE_LENGTH)?;
         }
+
+        // Validate sandbox hardening profile (TCK-00573).
+        self.sandbox_hardening
+            .validate()
+            .map_err(|e| FacPolicyError::InvalidFieldValue {
+                field: "sandbox_hardening",
+                value: e,
+            })?;
 
         Ok(())
     }
@@ -1008,6 +1026,62 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ── Sandbox hardening policy tests (TCK-00573) ──
+
+    #[test]
+    fn test_default_policy_includes_sandbox_hardening() {
+        let policy = FacPolicyV1::default_policy();
+        assert_eq!(policy.sandbox_hardening, SandboxHardeningProfile::default());
+        assert!(policy.sandbox_hardening.no_new_privileges);
+        assert!(policy.sandbox_hardening.private_tmp);
+    }
+
+    #[test]
+    fn test_policy_validate_rejects_invalid_sandbox_hardening() {
+        let mut policy = FacPolicyV1::default_policy();
+        // Push too many address families (exceeds MAX_ADDRESS_FAMILIES=16).
+        policy.sandbox_hardening.restrict_address_families =
+            (0..17).map(|i| format!("AF_TEST{i}")).collect();
+        let err = policy.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FacPolicyError::InvalidFieldValue {
+                    field: "sandbox_hardening",
+                    ..
+                }
+            ),
+            "expected InvalidFieldValue for sandbox_hardening, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_policy_hash_changes_on_sandbox_hardening_mutation() {
+        let mut policy1 = FacPolicyV1::default_policy();
+        let policy2 = FacPolicyV1::default_policy();
+        let hash1 = compute_policy_hash(&policy1).expect("hash1");
+        let hash2 = compute_policy_hash(&policy2).expect("hash2");
+        assert_eq!(hash1, hash2);
+
+        policy1.sandbox_hardening.no_new_privileges = false;
+        let hash3 = compute_policy_hash(&policy1).expect("hash3");
+        assert_ne!(
+            hash1, hash3,
+            "sandbox_hardening mutation must change policy hash"
+        );
+    }
+
+    #[test]
+    fn test_policy_roundtrip_json_with_sandbox_hardening() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.sandbox_hardening.private_tmp = false;
+        policy.sandbox_hardening.restrict_address_families =
+            vec!["AF_UNIX".to_string(), "AF_INET".to_string()];
+        let bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let restored = deserialize_policy(&bytes).expect("deserialize");
+        assert_eq!(restored.sandbox_hardening, policy.sandbox_hardening);
     }
 
     #[test]
