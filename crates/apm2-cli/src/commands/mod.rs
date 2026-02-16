@@ -66,3 +66,11 @@ pub mod process;
 pub mod role_launch;
 pub mod tool;
 pub mod work;
+
+#[cfg(test)]
+pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}

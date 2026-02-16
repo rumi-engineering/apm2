@@ -5511,6 +5511,7 @@ mod tests {
     // restores the previous value on Drop, limiting the blast radius.
     struct Apm2HomeGuard {
         previous: Option<std::ffi::OsString>,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
@@ -5539,9 +5540,15 @@ mod tests {
 
     impl Apm2HomeGuard {
         fn new(home: &std::path::Path) -> Self {
+            let env_lock = crate::commands::env_var_test_lock()
+                .lock()
+                .expect("serialize env-mutating test");
             let previous = std::env::var_os("APM2_HOME");
             set_apm2_home(home);
-            Self { previous }
+            Self {
+                previous,
+                _env_lock: env_lock,
+            }
         }
     }
 

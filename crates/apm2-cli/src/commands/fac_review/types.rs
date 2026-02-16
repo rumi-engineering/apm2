@@ -666,16 +666,44 @@ pub fn sanitize_for_path(input: &str) -> String {
     }
 }
 
+#[cfg_attr(test, allow(clippy::unnecessary_wraps))]
 pub fn apm2_home_dir() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        Ok(default_test_apm2_home_dir())
+    }
+    #[cfg(not(test))]
     if let Some(override_dir) = std::env::var_os("APM2_HOME") {
         let path = PathBuf::from(override_dir);
         if !path.as_os_str().is_empty() {
             return Ok(path);
         }
     }
+    #[cfg(not(test))]
     let base_dirs = directories::BaseDirs::new()
         .ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(base_dirs.home_dir().join(".apm2"))
+    #[cfg(not(test))]
+    {
+        Ok(base_dirs.home_dir().join(".apm2"))
+    }
+}
+
+#[cfg(test)]
+fn default_test_apm2_home_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+    TEST_HOME
+        .get_or_init(|| {
+            let now_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let pid = std::process::id();
+            std::env::temp_dir().join(format!("apm2-cli-test-home-{pid}-{now_nanos}"))
+        })
+        .clone()
 }
 
 fn is_fac_sensitive_dir(path: &Path) -> bool {
