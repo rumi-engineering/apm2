@@ -123,6 +123,8 @@ pub mod gc;
 /// Garbage-collection receipt schema and persistence helpers.
 #[allow(missing_docs)]
 pub mod gc_receipt;
+/// Non-interactive, lane-scoped GitHub CLI command builder (TCK-00597).
+pub mod gh_cli;
 pub mod harness_sandbox;
 pub mod job_spec;
 mod key_policy;
@@ -305,6 +307,8 @@ pub use gc_receipt::{
     DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
     MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,
 };
+// Re-export gh_cli (TCK-00597)
+pub use gh_cli::{GhCommand, gh_command};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
@@ -639,7 +643,7 @@ pub use lane::{
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
     MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE,
     MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, MAX_TEST_TIMEOUT_SECONDS, ResourceProfile,
-    compute_test_env,
+    compute_test_env_for_parallelism, resolve_host_test_parallelism,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{

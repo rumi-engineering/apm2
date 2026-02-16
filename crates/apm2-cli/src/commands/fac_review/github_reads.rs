@@ -1,9 +1,9 @@
 //! GitHub read-only API helpers for FAC projection flows.
 
-use std::process::Command;
+use apm2_core::fac::gh_command;
 
 pub(super) fn fetch_default_branch(repo: &str) -> Result<String, String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .args(["api", &format!("/repos/{repo}")])
         .output()
         .map_err(|err| format!("failed to execute gh api for default branch: {err}"))?;
@@ -23,7 +23,7 @@ pub(super) fn fetch_default_branch(repo: &str) -> Result<String, String> {
 }
 
 pub(super) fn fetch_pr_data(repo: &str, pr_number: u32) -> Result<serde_json::Value, String> {
-    let output = Command::new("gh")
+    let output = gh_command()
         .args(["api", &format!("/repos/{repo}/pulls/{pr_number}")])
         .output()
         .map_err(|err| format!("failed to execute gh api for PR metadata: {err}"))?;
@@ -41,7 +41,7 @@ pub(super) fn resolve_actor_permission(repo: &str, actor: &str) -> Result<String
     if actor.is_empty() || actor == "unknown" {
         return Ok("none".to_string());
     }
-    let output = Command::new("gh")
+    let output = gh_command()
         .args([
             "api",
             &format!("/repos/{repo}/collaborators/{actor}/permission"),
@@ -62,7 +62,7 @@ pub(super) fn resolve_actor_permission(repo: &str, actor: &str) -> Result<String
 
 pub(super) fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, String> {
     let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
-    let output = Command::new("gh")
+    let output = gh_command()
         .args(["api", &endpoint, "--jq", ".head.sha"])
         .output()
         .map_err(|err| format!("failed to execute gh api for PR head SHA: {err}"))?;
