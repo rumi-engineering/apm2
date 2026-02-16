@@ -1552,3 +1552,37 @@ require credentials.
   the gate is never called on the `apm2 fac gates` path.
 - Bounded collections: `env_mounts` capped at `MAX_ENV_MOUNTS` (16),
   env var names capped at `MAX_ENV_NAME_LENGTH` (256).
+
+## gh_cli Submodule (TCK-00597)
+
+The `gh_cli` submodule provides a centralized `gh_command()` constructor that
+returns a `std::process::Command` pre-configured for non-interactive,
+token-based authentication and lane-scoped config directory isolation. All
+`gh` CLI invocations across the codebase use this function instead of raw
+`Command::new("gh")`.
+
+### Core Capabilities
+
+- `gh_command()`: Builds a `Command::new("gh")` with:
+  - `GH_TOKEN` injected from the credential resolution chain (env var ->
+    systemd credential -> APM2 credential file) when available.
+  - `GH_CONFIG_DIR` set to `$XDG_CONFIG_HOME/gh` when `XDG_CONFIG_HOME` is
+    available (lane-scoped via TCK-00575), preventing writes to `~/.config/gh`.
+  - `GH_NO_UPDATE_NOTIFIER=1` to suppress interactive update checks.
+  - `NO_COLOR=1` to suppress ANSI color codes for deterministic parsing.
+  - `GH_PROMPT_DISABLED=1` to prevent interactive prompts.
+
+### Fail-Open Note
+
+If no token is available, the command is still returned without `GH_TOKEN`.
+This allows `gh` to fall back to ambient auth state. Callers that require
+auth should gate on `require_github_credentials()` before invoking `gh`.
+
+### Security Invariants (TCK-00597)
+
+- [INV-GHCLI-001] `GH_TOKEN` is injected only when resolved; no synthetic
+  placeholder is ever emitted.
+- [INV-GHCLI-002] `GH_CONFIG_DIR` is always set to a lane-scoped path when
+  `XDG_CONFIG_HOME` is available, preventing user-global `~/.config/gh` writes.
+- [INV-GHCLI-003] `GH_NO_UPDATE_NOTIFIER` is set to `1` to suppress
+  interactive update prompts.

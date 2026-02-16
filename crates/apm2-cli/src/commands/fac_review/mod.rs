@@ -2500,7 +2500,7 @@ fn build_doctor_github_projection_status(
 
 fn fetch_issue_comment_updated_at(owner_repo: &str, comment_id: u64) -> Option<String> {
     let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
-    let output = Command::new("gh")
+    let output = apm2_core::fac::gh_command()
         .args(["api", &endpoint, "--jq", ".updated_at"])
         .output()
         .ok()?;
