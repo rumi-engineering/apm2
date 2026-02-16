@@ -637,7 +637,8 @@ user-mode and system-mode execution backends.
   - `kill_mode` → `KillMode` (default `control-group`)
   - `sandbox_hardening` → `SandboxHardeningProfile` (TCK-00573)
 - Input binding:
-  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — the ONLY public constructor; requires explicit policy-driven hardening profile (INV-SBX-001)
+  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — primary constructor for lane-driven paths; requires explicit policy-driven hardening profile (INV-SBX-001)
+  - `from_cli_limits_with_hardening(cpu_quota_percent, memory_max_bytes, tasks_max, timeout_seconds, SandboxHardeningProfile)` — CLI-driven constructor for bounded test runner where no `LaneProfileV1` is available; uses centralized `DEFAULT_IO_WEIGHT` and `DEFAULT_KILL_MODE` constants shared with the lane constructor (INV-SBX-001)
 - Override semantics:
   - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
   - `sandbox_hardening` is policy-driven via `FacPolicyV1.sandbox_hardening` (TCK-00573).
@@ -652,7 +653,8 @@ Systemd security directives for transient units. Policy-driven via
   `LockPersonality`, `RestrictRealtime`, `RestrictAddressFamilies`,
   `SystemCallArchitectures=native`.
 - `content_hash()` / `content_hash_hex()`: Deterministic BLAKE3 hash for
-  receipt audit binding. Included in `FacJobReceiptV1.sandbox_hardening_hash`.
+  receipt audit binding. Address families are sorted before hashing for
+  canonical ordering. Included in `FacJobReceiptV1.sandbox_hardening_hash`.
 - `to_property_strings()`: Full hardening for system-mode.
 - `to_user_mode_property_strings()`: Only `NoNewPrivileges` for user-mode.
 - `validate()`: Bounds check on address families count and format.
@@ -661,7 +663,10 @@ Systemd security directives for transient units. Policy-driven via
 
 - [INV-SBX-001] All `SystemdUnitProperties` construction sites in production
   paths (worker, bounded test runner, pipeline) use `from_lane_profile_with_hardening`
-  with `FacPolicyV1.sandbox_hardening`. Hard-coded defaults are prohibited.
+  or `from_cli_limits_with_hardening` with `FacPolicyV1.sandbox_hardening`.
+  Hard-coded defaults for `io_weight` and `kill_mode` are prohibited at
+  caller sites; both constructors use shared `DEFAULT_IO_WEIGHT` and
+  `DEFAULT_KILL_MODE` constants.
 - [INV-SBX-002] `FacJobReceiptV1.sandbox_hardening_hash` is populated from
   `SandboxHardeningProfile.content_hash_hex()` in all `emit_job_receipt` paths
   that have access to the effective hardening profile.
@@ -1115,7 +1120,8 @@ All receipt-touching hot paths consult the index first:
   `O_NOFOLLOW` + bounded streaming reads (no stat-then-read TOCTOU).
 - [INV-IDX-008] `lookup_job_receipt` verifies content-addressed integrity by
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
-  index key. Hash mismatch triggers fallback to directory scan (fail-closed).
+  index key using constant-time comparison (`subtle::ConstantTimeEq`, INV-PC-001).
+  Hash mismatch triggers fallback to directory scan (fail-closed).
 
 ## sd_notify Submodule (TCK-00600)
 

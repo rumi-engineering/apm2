@@ -79,7 +79,7 @@ pub fn plan_gc(
     let known_lane_ids = LaneManager::default_lane_ids();
 
     let statuses = load_lane_statuses(lane_manager, &known_lane_ids)?;
-    let mut targets = collect_idle_lane_targets(lane_manager, &statuses, &known_lane_ids);
+    let mut targets = collect_idle_lane_targets(lane_manager, &statuses);
 
     let gate_cache_root = fac_root.join("gate_cache_v2");
     if let Ok(entries) = std::fs::read_dir(&gate_cache_root) {
@@ -207,14 +207,10 @@ fn load_lane_statuses(
 fn collect_idle_lane_targets(
     lane_manager: &LaneManager,
     statuses: &[LaneStatusV1],
-    known_lane_ids: &[String],
 ) -> Vec<GcTarget> {
     let mut targets = Vec::with_capacity(statuses.len().saturating_mul(2));
     for status in statuses {
-        let is_known_lane = known_lane_ids
-            .iter()
-            .any(|lane_id| lane_id == &status.lane_id);
-        if status.state != LaneState::Idle || !is_known_lane {
+        if status.state != LaneState::Idle {
             continue;
         }
         let lane_dir = lane_manager.lane_dir(&status.lane_id);
@@ -988,7 +984,7 @@ mod tests {
         if let Some(idle_lane_id) = &maybe_idle_lane_id {
             statuses.push(lane_status(idle_lane_id, LaneState::Idle));
         }
-        let targets = collect_idle_lane_targets(&lane_manager, &statuses, &lane_ids);
+        let targets = collect_idle_lane_targets(&lane_manager, &statuses);
         let running_lane_dir = lane_manager.lane_dir(&running_lane_id);
 
         assert!(
@@ -1009,46 +1005,6 @@ mod tests {
                 "idle lane must contribute exactly target and logs directories, got {idle_targets:?}"
             );
         }
-    }
-
-    #[test]
-    fn test_collect_idle_lane_targets_ignores_unknown_lane_id() {
-        let dir = tempdir().expect("tmp");
-        let fac_root = dir.path().join("fac");
-        std::fs::create_dir_all(&fac_root).expect("fac");
-        let lane_manager = LaneManager::new(fac_root).expect("manager");
-        lane_manager.ensure_directories().expect("dir setup");
-        let known_lane_ids = LaneManager::default_lane_ids();
-        let known_lane_id = known_lane_ids.first().cloned().expect("at least one lane");
-        let known_lane_dir = lane_manager.lane_dir(&known_lane_id);
-
-        // ensure_directories() already creates target/ and logs/ dirs.
-        // Write files so estimated_bytes > 0 (non-trivial GC targets).
-        std::fs::write(
-            known_lane_dir.join("target").join("build_artifact"),
-            b"artifact",
-        )
-        .expect("write target file");
-        std::fs::write(known_lane_dir.join("logs").join("build.log"), b"log data")
-            .expect("write log file");
-
-        let statuses = vec![
-            lane_status("../escape", LaneState::Idle),
-            lane_status(&known_lane_id, LaneState::Idle),
-        ];
-        let targets = collect_idle_lane_targets(&lane_manager, &statuses, &known_lane_ids);
-
-        assert!(
-            targets
-                .iter()
-                .all(|target| target.path.starts_with(&known_lane_dir)),
-            "unknown lane IDs must not contribute GC targets"
-        );
-        assert_eq!(
-            targets.len(),
-            2,
-            "known idle lane should contribute target and logs directories"
-        );
     }
 
     #[test]

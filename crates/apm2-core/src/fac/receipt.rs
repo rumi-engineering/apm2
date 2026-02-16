@@ -842,17 +842,14 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00573: Sandbox hardening hash. This is a new field introduced
-        // by TCK-00573 so no backward-compat concern exists — we use a full
-        // two-state presence marker (0u8/1u8) to maintain injective encoding
-        // and avoid canonicalization collisions with preceding trailing
-        // optional fields.
+        // TCK-00573: Sandbox hardening hash. Appended at end for backward
+        // compatibility with pre-TCK-00573 receipts. No `0u8` presence
+        // marker when absent, matching the trailing-optional pattern used
+        // by moved_job_path and containment above.
         if let Some(hash) = &self.sandbox_hardening_hash {
             bytes.push(1u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
-        } else {
-            bytes.push(0u8);
         }
 
         bytes
@@ -994,14 +991,14 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00573: Sandbox hardening hash. New field — use full two-state
-        // presence marker (0u8/1u8) for injective encoding.
+        // TCK-00573: Sandbox hardening hash. Appended at end for backward
+        // compatibility with pre-TCK-00573 receipts. No `0u8` presence
+        // marker when absent, matching the trailing-optional pattern used
+        // by moved_job_path and containment above.
         if let Some(hash) = &self.sandbox_hardening_hash {
             bytes.push(1u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
-        } else {
-            bytes.push(0u8);
         }
 
         bytes
