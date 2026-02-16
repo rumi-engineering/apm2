@@ -1,12 +1,26 @@
-//! Rust-native bounded test runner command construction.
+// AGENT-AUTHORED (TCK-00549)
+//! Rust-native bounded test executor with policy-driven environment.
 //!
 //! Replaces shell-wrapper command assembly with deterministic Rust logic.
 //! Supports both user-mode (`systemd-run --user`) and system-mode
 //! (`systemd-run --system`) execution backends. Backend selection and
 //! command construction are delegated to the core
-//! [`apm2_core::fac::execution_backend`] module; this module handles
-//! CLI-specific concerns (setenv allowlisting, memory/cpu string
-//! parsing, environment normalization).
+//! [`apm2_core::fac::execution_backend`] module.
+//!
+//! # Environment Policy (TCK-00549)
+//!
+//! Environment variables passed to the transient systemd unit are derived
+//! entirely from `FacPolicyV1` via `build_job_environment()`. No ad-hoc
+//! allowlists are used. The caller supplies a pre-computed policy
+//! environment map; this module forwards it as `--setenv` arguments to
+//! `systemd-run`. The hardcoded `RUSTC_WRAPPER`/`SCCACHE_*` strip is
+//! retained as defense-in-depth (INV-ENV-008) on top of the policy filter.
+//!
+//! # Resource Caps
+//!
+//! Timeouts, memory, PIDs, and CPU caps are enforced by systemd unit
+//! properties (`RuntimeMaxSec`, `MemoryMax`, `TasksMax`, `CPUQuota`),
+//! not by shell timers or process-level limits.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,58 +34,15 @@ use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 use super::timeout_policy::parse_memory_limit;
 
-const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
-    "GITHUB_RUN_ID",
-    "GITHUB_RUN_ATTEMPT",
-    "APM2_CI_DRY_RUN",
-    "APM2_CI_TARGET_DIR",
-    "CARGO_TERM_COLOR",
-    "CARGO_INCREMENTAL",
-    "RUSTFLAGS",
-    "RUST_BACKTRACE",
-    "CARGO_TARGET_DIR",
-    "CARGO_BUILD_JOBS",
-    "NEXTEST_TEST_THREADS",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "RUSTUP_TOOLCHAIN",
-    "RUSTDOCFLAGS",
-    // TCK-00526/TCK-00575: PATH, HOME, TMPDIR, USER, and LANG are
-    // required for correct toolchain and lane-isolated workspace
-    // resolution inside the bounded test unit. These are
-    // included in the FAC policy's default env_allowlist_prefixes and
-    // must be forwarded through systemd --setenv to maintain execution
-    // correctness.
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "USER",
-    "LANG",
-];
+/// Maximum number of `--setenv` pairs forwarded to the transient unit.
+/// Prevents unbounded command-line growth from a misconfigured policy.
+const MAX_SETENV_PAIRS: usize = 256;
 
-/// `RUSTC_WRAPPER` and `SCCACHE_*` are intentionally EXCLUDED from the
-/// allowlist. In bounded test mode we cannot verify cgroup containment
-/// for the systemd transient unit before it starts, so sccache env vars
-/// are never forwarded. This prevents cache poisoning from sccache
-/// daemons running outside the job's cgroup (MAJOR-1, MAJOR-3 fix per
-/// TCK-00548 review findings).
-///
-/// TCK-00526: Prefixes aligned with
-/// `FacPolicyV1::default_policy().env_allowlist_prefixes`
-/// so that policy-derived environment variables (e.g. `LC_ALL`, `TERM`,
-/// `XDG_RUNTIME_DIR`) pass the setenv allowlist validation in
-/// `build_systemd_setenv_pairs`.
-///
-/// NOTE: `RUST` and `CARGO_` are intentionally NOT included as prefixes
-/// here. Specific RUST*/CARGO_* variables are enumerated in the exact
-/// list instead, which prevents `RUSTC_WRAPPER` (sccache) from sneaking
-/// through. The prefixes below cover locale, terminal, and XDG
-/// variables that the policy allowlist inherits from the ambient
-/// environment.
-const SYSTEMD_SETENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_", "TERM", "XDG_"];
-
-/// Env var keys that are explicitly stripped from the spawned bounded
-/// test process environment to prevent inheritance from the parent.
+/// Env var keys that are unconditionally stripped from the spawned bounded
+/// test process environment, regardless of policy configuration. This is
+/// a defense-in-depth measure (INV-ENV-008, TCK-00548) that ensures
+/// sccache cannot bypass cgroup containment even if the policy is
+/// misconfigured.
 const SCCACHE_ENV_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,11 +98,31 @@ fn limits_to_properties(limits: BoundedTestLimits<'_>) -> Result<SystemdUnitProp
     })
 }
 
+/// Build a bounded test command using policy-driven environment.
+///
+/// # Arguments
+///
+/// * `workspace_root` - Working directory for the transient unit.
+/// * `limits` - Resource caps enforced by systemd unit properties.
+/// * `nextest_command` - The test command to execute inside the unit.
+/// * `policy_env` - Pre-computed environment from `FacPolicyV1` via
+///   `build_job_environment()`. This is the *sole* source of environment
+///   variables forwarded to the transient unit via `--setenv`. No ad-hoc
+///   allowlists are applied on top.
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - `nextest_command` is empty
+/// - cgroup v2 controllers are unavailable
+/// - `systemd-run` is not on PATH
+/// - Backend selection or command construction fails
+/// - The policy environment exceeds `MAX_SETENV_PAIRS`
 pub fn build_bounded_test_command(
     workspace_root: &Path,
     limits: BoundedTestLimits<'_>,
     nextest_command: &[String],
-    extra_setenv: &[(String, String)],
+    policy_env: &[(String, String)],
 ) -> Result<BoundedTestCommandSpec, String> {
     if nextest_command.is_empty() {
         return Err("nextest command cannot be empty".to_string());
@@ -152,8 +143,11 @@ pub fn build_bounded_test_command(
     let backend =
         select_backend().map_err(|e| format!("execution backend selection failed: {e}"))?;
 
-    // Build setenv pairs (common to both backends).
-    let setenv_pairs = build_systemd_setenv_pairs(collect_inherited_setenv_pairs(), extra_setenv)?;
+    // Build setenv pairs from the policy-computed environment.
+    // TCK-00549: The environment is now entirely derived from FacPolicyV1
+    // via build_job_environment(). No ad-hoc allowlists are applied here.
+    // Defense-in-depth: strip RUSTC_WRAPPER and SCCACHE_* (INV-ENV-008).
+    let setenv_pairs = build_policy_setenv_pairs(policy_env)?;
 
     // Build the user-mode D-Bus environment for process spawning.
     let environment = match backend {
@@ -237,60 +231,41 @@ fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String
     }
 }
 
-fn build_systemd_setenv_pairs(
-    inherited_setenv: Vec<(String, String)>,
-    extra_setenv: &[(String, String)],
+/// Build `--setenv` pairs from a policy-computed environment.
+///
+/// TCK-00549: This replaces the previous ad-hoc allowlist approach. The
+/// caller provides a pre-computed environment from `FacPolicyV1` (via
+/// `build_job_environment`), and this function forwards all entries as
+/// `--setenv` arguments after applying defense-in-depth stripping of
+/// `RUSTC_WRAPPER` and `SCCACHE_*` (INV-ENV-008).
+///
+/// The entries are sorted by key for deterministic command construction
+/// (INV-EXEC-005).
+fn build_policy_setenv_pairs(
+    policy_env: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
-    let mut setenv = BTreeMap::new();
-    for (key, value) in inherited_setenv {
-        setenv.insert(key, value);
+    if policy_env.len() > MAX_SETENV_PAIRS {
+        return Err(format!(
+            "policy environment exceeds bounded setenv limit: {} > {MAX_SETENV_PAIRS}",
+            policy_env.len()
+        ));
     }
 
-    // Forward caller-supplied env vars (e.g. lane profile NEXTEST_TEST_THREADS,
-    // CARGO_BUILD_JOBS) that aren't in the process environment at build time.
-    // Extra values override inherited ones for the same key.
-    for (key, value) in extra_setenv {
-        if !is_allowlisted_setenv_key(key) {
-            return Err(format!("unsupported bounded test env override key: {key}"));
-        }
-        if value.is_empty() {
+    let mut setenv = BTreeMap::new();
+    for (key, value) in policy_env {
+        // Defense-in-depth: strip RUSTC_WRAPPER and SCCACHE_* regardless
+        // of policy. The policy's build_job_environment() already strips
+        // these (INV-ENV-008), but we enforce it here too in case the
+        // caller bypasses policy filtering.
+        if key == "RUSTC_WRAPPER" || key.starts_with("SCCACHE_") {
             continue;
         }
-        setenv.insert(key.clone(), value.clone());
+        if !value.is_empty() {
+            setenv.insert(key.clone(), value.clone());
+        }
     }
 
     Ok(setenv.into_iter().collect())
-}
-
-fn collect_inherited_setenv_pairs() -> Vec<(String, String)> {
-    let mut setenv = BTreeMap::new();
-
-    for key in SYSTEMD_SETENV_ALLOWLIST_EXACT {
-        if let Ok(value) = std::env::var(key) {
-            if !value.is_empty() {
-                setenv.insert((*key).to_string(), value);
-            }
-        }
-    }
-
-    for (key, value) in std::env::vars() {
-        if SYSTEMD_SETENV_ALLOWLIST_PREFIXES
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
-            && !value.is_empty()
-        {
-            setenv.insert(key, value);
-        }
-    }
-
-    setenv.into_iter().collect()
-}
-
-fn is_allowlisted_setenv_key(key: &str) -> bool {
-    SYSTEMD_SETENV_ALLOWLIST_EXACT.contains(&key)
-        || SYSTEMD_SETENV_ALLOWLIST_PREFIXES
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
 }
 
 /// Build the D-Bus runtime environment for user-mode execution.
@@ -330,16 +305,16 @@ fn command_available(command: &str) -> bool {
 
 // NOTE: `check_sccache_containment_for_build()` was removed as part of
 // TCK-00548 review findings (MAJOR-1, MAJOR-3). It checked containment
-// against the CLI process PID (wrong PID — the bounded test unit does
+// against the CLI process PID (wrong PID -- the bounded test unit does
 // not exist yet). The fix unconditionally strips sccache env vars from
 // bounded test commands via the allowlist and env_remove_keys instead.
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedTestLimits, append_systemd_setenv_args, build_bounded_test_command,
-        build_systemd_setenv_pairs, default_runtime_dir, limits_to_properties,
-        parse_cpu_quota_percent,
+        BoundedTestLimits, MAX_SETENV_PAIRS, append_systemd_setenv_args,
+        build_bounded_test_command, build_policy_setenv_pairs, default_runtime_dir,
+        limits_to_properties, parse_cpu_quota_percent,
     };
 
     #[test]
@@ -373,67 +348,69 @@ mod tests {
     }
 
     #[test]
-    fn setenv_pairs_are_deduplicated_and_extra_overrides_inherited() {
-        let inherited = vec![
-            ("NEXTEST_TEST_THREADS".to_string(), "8".to_string()),
-            ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
-            (
-                "RUSTFLAGS".to_string(),
-                "-Cforce-frame-pointers".to_string(),
-            ),
-        ];
-        let extra = vec![
-            ("NEXTEST_TEST_THREADS".to_string(), "4".to_string()),
+    fn policy_setenv_pairs_forward_policy_env() {
+        let policy_env = vec![
+            ("CARGO_TARGET_DIR".to_string(), "target".to_string()),
             ("RUSTFLAGS".to_string(), "-Copt-level=1".to_string()),
-            ("CARGO_BUILD_JOBS".to_string(), String::new()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
         ];
-
-        let pairs =
-            build_systemd_setenv_pairs(inherited, &extra).expect("allowlisted overrides accepted");
-        assert_eq!(
-            pairs,
-            vec![
-                ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
-                ("NEXTEST_TEST_THREADS".to_string(), "4".to_string()),
-                ("RUSTFLAGS".to_string(), "-Copt-level=1".to_string()),
-            ]
-        );
+        let pairs = build_policy_setenv_pairs(&policy_env).expect("policy env accepted");
+        // BTreeMap ordering: sorted by key.
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, "CARGO_TARGET_DIR");
+        assert_eq!(pairs[1].0, "PATH");
+        assert_eq!(pairs[2].0, "RUSTFLAGS");
     }
 
     #[test]
-    fn setenv_pairs_accept_tmpdir_lane_override() {
-        let lane_tmpdir = "/tmp/apm2/private/fac/lanes/lane-00/tmp".to_string();
-        let pairs =
-            build_systemd_setenv_pairs(Vec::new(), &[("TMPDIR".to_string(), lane_tmpdir.clone())])
-                .expect("TMPDIR should be allowlisted for lane env isolation");
-        assert_eq!(pairs, vec![("TMPDIR".to_string(), lane_tmpdir)]);
+    fn policy_setenv_pairs_strip_sccache_defense_in_depth() {
+        // TCK-00549: Even if policy env contains RUSTC_WRAPPER or
+        // SCCACHE_*, they must be stripped (defense-in-depth).
+        let policy_env = vec![
+            ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
+            ("SCCACHE_DIR".to_string(), "/tmp/sccache".to_string()),
+            ("CARGO_HOME".to_string(), "/home/user/.cargo".to_string()),
+        ];
+        let pairs = build_policy_setenv_pairs(&policy_env).expect("policy env accepted");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "CARGO_HOME");
     }
 
     #[test]
-    fn sccache_env_vars_rejected_from_setenv_allowlist() {
-        // TCK-00548: RUSTC_WRAPPER and SCCACHE_* must NOT be in the
-        // allowlist. They are unconditionally stripped from bounded
-        // test commands because cgroup containment cannot be verified
-        // for systemd transient units before they start.
-        let err = build_systemd_setenv_pairs(
-            Vec::new(),
-            &[("RUSTC_WRAPPER".to_string(), "sccache".to_string())],
-        )
-        .expect_err("RUSTC_WRAPPER should be rejected");
-        assert!(
-            err.contains("RUSTC_WRAPPER"),
-            "error should mention key: {err}"
-        );
+    fn policy_setenv_pairs_skip_empty_values() {
+        let policy_env = vec![
+            ("CARGO_HOME".to_string(), "/home/.cargo".to_string()),
+            ("EMPTY_VAR".to_string(), String::new()),
+        ];
+        let pairs = build_policy_setenv_pairs(&policy_env).expect("policy env accepted");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "CARGO_HOME");
+    }
 
-        let err2 = build_systemd_setenv_pairs(
-            Vec::new(),
-            &[("SCCACHE_CACHE_SIZE".to_string(), "100G".to_string())],
-        )
-        .expect_err("SCCACHE_* should be rejected");
-        assert!(
-            err2.contains("SCCACHE_"),
-            "error should mention key: {err2}"
-        );
+    #[test]
+    fn policy_setenv_pairs_reject_exceeding_limit() {
+        let policy_env: Vec<(String, String)> = (0..=MAX_SETENV_PAIRS)
+            .map(|i| (format!("VAR_{i}"), format!("val_{i}")))
+            .collect();
+        let err =
+            build_policy_setenv_pairs(&policy_env).expect_err("should reject exceeding limit");
+        assert!(err.contains("exceeds bounded setenv limit"));
+    }
+
+    #[test]
+    fn policy_setenv_pairs_are_deterministic() {
+        let policy_env = vec![
+            ("Z_VAR".to_string(), "z".to_string()),
+            ("A_VAR".to_string(), "a".to_string()),
+            ("M_VAR".to_string(), "m".to_string()),
+        ];
+        let pairs1 = build_policy_setenv_pairs(&policy_env).expect("first call");
+        let pairs2 = build_policy_setenv_pairs(&policy_env).expect("second call");
+        assert_eq!(pairs1, pairs2);
+        // Verify sorted order.
+        assert_eq!(pairs1[0].0, "A_VAR");
+        assert_eq!(pairs1[1].0, "M_VAR");
+        assert_eq!(pairs1[2].0, "Z_VAR");
     }
 
     #[test]
@@ -443,14 +420,6 @@ mod tests {
             super::SCCACHE_ENV_STRIP_KEYS.contains(&"RUSTC_WRAPPER"),
             "RUSTC_WRAPPER must be in SCCACHE_ENV_STRIP_KEYS"
         );
-    }
-
-    #[test]
-    fn setenv_pairs_reject_unknown_extra_keys() {
-        let err =
-            build_systemd_setenv_pairs(Vec::new(), &[("UNSAFE_ENV".to_string(), "1".to_string())])
-                .expect_err("unknown override key should fail");
-        assert!(err.contains("UNSAFE_ENV"));
     }
 
     #[test]
