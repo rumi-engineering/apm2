@@ -240,6 +240,15 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   and warm execution failure) move the claimed file to `denied/` via `move_to_dir_safe`
   and report `moved_job_path` in the denial receipt. No denial returns without a terminal
   queue state transition.
+- **Systemd-run containment** (`fac_worker.rs`, `warm.rs`): Warm phase subprocesses
+  (which compile untrusted repository code including `build.rs` and proc-macros) are
+  wrapped in `systemd-run` transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec
+  constraints from the lane profile (INV-WARM-014). Falls back to uncontained execution
+  with a logged warning when `systemd-run` is unavailable.
+- **Heartbeat liveness** (`fac_worker.rs`, `warm.rs`): Worker heartbeat is refreshed
+  every 5 seconds during warm phase execution via a callback integrated into the
+  `try_wait` polling loop (INV-WARM-015). Prevents the broker from considering the
+  worker dead during hour-long compilation phases.
 - **Timeout-derived poll cap** (`fac_warm.rs`): The poll iteration cap in `wait_for_receipt`
   is derived from the effective timeout (`timeout / poll_interval + headroom`), not a fixed
   constant. Callers passing `--wait-timeout-secs` above the default (1200s) are no longer

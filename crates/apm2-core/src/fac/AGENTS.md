@@ -1051,13 +1051,19 @@ pre-populating build caches in the lane target namespace.
 - `WarmPhase`: Selectable warm phase enum (Fetch, Build, Nextest, Clippy, Doc).
 - `WarmToolVersions`: Tool version snapshot with bounded optional string fields.
 - `WarmError`: Error taxonomy covering invalid phases, bounds violations,
-  execution failures, timeouts, and hash mismatches.
+  execution failures, timeouts, containment failures, and hash mismatches.
+- `WarmContainment`: Systemd transient unit containment configuration for warm
+  phase subprocesses (backend, properties, optional system-mode config).
 
 ### Core Capabilities
 
-- `execute_warm(phases, ...)`: Execute warm phases and produce a `WarmReceiptV1`.
-- `execute_warm_phase(phase, ...)`: Execute a single phase with timeout
-  enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
+- `execute_warm(phases, ..., containment, heartbeat_fn)`: Execute warm phases
+  and produce a `WarmReceiptV1`. Accepts optional `WarmContainment` for
+  systemd-run transient unit wrapping and optional heartbeat callback for
+  liveness during long-running phases.
+- `execute_warm_phase(phase, ..., containment, heartbeat_fn)`: Execute a
+  single phase with timeout enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
+  Accepts optional containment and heartbeat parameters.
 - `collect_tool_versions(hardened_env)`: Bounded stdout collection from version
   probe commands (`MAX_VERSION_OUTPUT_BYTES`). Uses hardened environment
   (INV-WARM-012, defense-in-depth). Version probes use a deadlock-free
@@ -1090,8 +1096,9 @@ pre-populating build caches in the lane target namespace.
 - [INV-WARM-010] GateReceipt `passed` reflects warm receipt persistence success.
   Persistence failure produces `passed=false` (fail-closed measurement
   integrity).
-- [INV-WARM-011] Warm execution inherits systemd transient unit containment
-  from the worker (TCK-00529/TCK-00511 cgroup + namespace isolation).
+- [INV-WARM-011] Warm phase subprocesses execute under their own `systemd-run`
+  transient units (INV-WARM-014), providing active cgroup containment
+  independent of the worker's own unit. Supersedes passive inheritance model.
 - [INV-WARM-012] Warm phase subprocesses execute with a hardened environment
   constructed via `build_job_environment()` (default-deny + policy allowlist).
   The ambient process environment is NOT inherited. FAC-private state paths
@@ -1104,6 +1111,20 @@ pre-populating build caches in the lane target namespace.
   thread holds a child mutex across blocking `wait()` while the timeout path
   needs the same mutex to `kill()` the process. The calling thread retains
   unconditional kill authority regardless of helper thread state.
+- [INV-WARM-014] Warm phase subprocesses are executed under `systemd-run`
+  transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec constraints
+  matching the lane profile, identical to how standard bounded test jobs are
+  contained. Uses `build_systemd_run_command()` from `execution_backend` for
+  consistent command construction. When `systemd-run` is unavailable, falls
+  back to direct `Command::spawn` with a logged warning (no silent
+  degradation). Environment is forwarded via `--setenv` arguments.
+- [INV-WARM-015] Heartbeat refresh is integrated into the warm phase `try_wait`
+  polling loop via an optional callback. Invoked every 5 seconds
+  (`HEARTBEAT_REFRESH_INTERVAL`) to prevent the worker heartbeat file from
+  going stale during long-running warm phases (which can take hours for large
+  projects). The heartbeat callback is passed from the worker into
+  `execute_warm`/`execute_warm_phase` and runs synchronously on the same
+  thread (no cross-thread sharing).
 
 ## Control-Lane Exception (TCK-00533)
 
