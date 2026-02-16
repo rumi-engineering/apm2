@@ -411,4 +411,12 @@ ticket_meta:
       original prompt and explicitly instructing it to execute the verdict
       command. This is cheaper and higher quality than restarting from
       scratch or falling through to auto-verdict.
+    amendments:
+      - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+        summary: "Retain uniform timeout policy while allowing host-aware throughput profile defaults."
+        supersedes:
+          - "Interpretation that uniform timeout policy implies conservative fixed CPU throughput defaults."
+        replacement:
+          - "Timeout policy remains uniform and fail-closed."
+          - "CPU quota and lane test/build parallelism defaults are profile-driven (`throughput` by default on high-capacity hosts)."
     security: "default-deny, least privilege, fail-closed"

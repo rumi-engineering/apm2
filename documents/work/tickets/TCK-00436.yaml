@@ -66,3 +66,11 @@ ticket_meta:
       This ticket supersedes the local gate execution aspects of TCK-00410's
       `fac check` command with a more comprehensive `fac gates` that covers all
       evidence gates and integrates with the pipeline cache.
+    amendments:
+      - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+        summary: "Bounded test execution remains required, but default throughput policy is now profile-driven and queue-managed."
+        supersedes:
+          - "Bounded test execution used when cgroup v2 available and run_bounded_tests.sh present."
+        replacement:
+          - "Bounded test execution via Rust systemd paths is mandatory."
+          - "Default execution profile on high-capacity hosts is throughput (`gate_profile=throughput`) with host-aware test/build parallelism."

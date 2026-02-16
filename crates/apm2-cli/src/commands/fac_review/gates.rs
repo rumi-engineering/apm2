@@ -9,8 +9,9 @@ use std::process::Command;
 use std::time::Instant;
 
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, LaneState, apply_lane_env_overrides,
-    build_job_environment, compute_test_env, ensure_lane_env_dirs,
+    FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
+    build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
+    resolve_host_test_parallelism,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,8 +25,8 @@ use super::gate_attestation::{
 };
 use super::gate_cache::GateCache;
 use super::jsonl::{
-    GateCompletedEvent, GateErrorEvent, GateStartedEvent, StageEvent, emit_jsonl, emit_jsonl_error,
-    read_log_error_hint, ts_now,
+    GateCompletedEvent, GateErrorEvent, GateProgressTickEvent, GateStartedEvent, StageEvent,
+    emit_jsonl, emit_jsonl_error, read_log_error_hint, ts_now,
 };
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::timeout_policy::{
@@ -35,6 +36,95 @@ use super::timeout_policy::{
 use crate::exit_codes::codes as exit_codes;
 
 const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
+const BALANCED_MIN_PARALLELISM: u32 = 4;
+const BALANCED_MAX_PARALLELISM: u32 = 16;
+const CONSERVATIVE_PARALLELISM: u32 = 2;
+
+/// Throughput profile for bounded FAC gate execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateThroughputProfile {
+    Throughput,
+    Balanced,
+    Conservative,
+}
+
+impl GateThroughputProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::Balanced => "balanced",
+            Self::Conservative => "conservative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResolvedGateExecutionProfile {
+    pub(super) test_parallelism: u32,
+    pub(super) cpu_quota_percent: u32,
+}
+
+pub(super) fn resolve_gate_execution_profile(
+    profile: GateThroughputProfile,
+) -> ResolvedGateExecutionProfile {
+    let host = resolve_host_test_parallelism();
+    let test_parallelism = match profile {
+        GateThroughputProfile::Throughput => host,
+        GateThroughputProfile::Balanced => {
+            let half = host / 2;
+            half.clamp(BALANCED_MIN_PARALLELISM, BALANCED_MAX_PARALLELISM)
+                .min(host)
+        },
+        GateThroughputProfile::Conservative => CONSERVATIVE_PARALLELISM.min(host).max(1),
+    };
+    ResolvedGateExecutionProfile {
+        test_parallelism,
+        cpu_quota_percent: test_parallelism.saturating_mul(100).max(100),
+    }
+}
+
+fn parse_cpu_quota_percent(cpu_quota: &str) -> Result<u32, String> {
+    let normalized = cpu_quota.trim().trim_end_matches('%').trim();
+    if normalized.is_empty() {
+        return Err("cpu_quota cannot be empty".to_string());
+    }
+    normalized
+        .parse::<u32>()
+        .map_err(|_| format!("invalid cpu_quota value: `{cpu_quota}`"))
+}
+
+fn quota_percent_to_parallelism(percent: u32) -> u32 {
+    if percent == 0 {
+        // `CPUQuota=0` in systemd means "no limit"; in that case preserve full
+        // host parallelism instead of forcing single-thread execution.
+        return resolve_host_test_parallelism();
+    }
+    percent.saturating_add(99) / 100
+}
+
+pub(super) fn resolve_effective_execution_profile(
+    requested_cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+) -> Result<(ResolvedGateExecutionProfile, String), String> {
+    let profile = resolve_gate_execution_profile(gate_profile);
+    if requested_cpu_quota.trim().eq_ignore_ascii_case("auto") {
+        return Ok((profile, format!("{}%", profile.cpu_quota_percent)));
+    }
+    let cpu_quota_percent = parse_cpu_quota_percent(requested_cpu_quota)?;
+    let host_parallelism = resolve_host_test_parallelism();
+    let test_parallelism = quota_percent_to_parallelism(cpu_quota_percent)
+        .min(host_parallelism)
+        .max(1);
+    Ok((
+        ResolvedGateExecutionProfile {
+            test_parallelism,
+            cpu_quota_percent,
+        },
+        format!("{cpu_quota_percent}%"),
+    ))
+}
 
 /// Run all evidence gates locally with optional bounded test execution.
 ///
@@ -52,9 +142,32 @@ pub fn run_gates(
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
     json_output: bool,
 ) -> u8 {
     let overall_started = Instant::now();
+    let (resolved_profile, effective_cpu_quota) =
+        match resolve_effective_execution_profile(cpu_quota, gate_profile) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                if json_output {
+                    let _ = emit_jsonl_error("gate_error", &err);
+                } else {
+                    let payload = serde_json::json!({
+                        "error": "gate_error",
+                        "message": err,
+                        "passed": false,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+                            "{\"error\":\"serialization_failure\"}".to_string()
+                        })
+                    );
+                }
+                return exit_codes::GENERIC_ERROR;
+            },
+        };
     if json_output {
         let _ = emit_jsonl(&StageEvent {
             event: "gates_started".to_string(),
@@ -65,14 +178,18 @@ pub fn run_gates(
                 "timeout_seconds": timeout_seconds,
                 "memory_max": memory_max,
                 "pids_max": pids_max,
-                "cpu_quota": cpu_quota,
+                "requested_cpu_quota": cpu_quota,
+                "effective_cpu_quota": effective_cpu_quota,
+                "gate_profile": gate_profile.as_str(),
+                "effective_test_parallelism": resolved_profile.test_parallelism,
             }),
         });
     }
 
     // Build a real-time gate progress callback for JSON mode. Events are
-    // emitted to stdout as each gate starts and finishes, providing streaming
-    // observability instead of buffering until all gates complete.
+    // emitted to stdout as each gate starts, heartbeats while running, and
+    // finishes, providing streaming observability instead of buffering until
+    // all gates complete.
     let gate_progress_callback: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>> =
         if json_output {
             Some(Box::new(
@@ -81,6 +198,19 @@ pub fn run_gates(
                         let _ = emit_jsonl(&GateStartedEvent {
                             event: "gate_started",
                             gate: gate_name,
+                            ts: ts_now(),
+                        });
+                    },
+                    super::evidence::GateProgressEvent::Progress {
+                        gate_name,
+                        elapsed_secs,
+                        bytes_streamed,
+                    } => {
+                        let _ = emit_jsonl(&GateProgressTickEvent {
+                            event: "gate_progress",
+                            gate: gate_name,
+                            elapsed_secs,
+                            bytes_streamed,
                             ts: ts_now(),
                         });
                     },
@@ -138,7 +268,9 @@ pub fn run_gates(
         timeout_seconds,
         memory_max,
         pids_max,
-        cpu_quota,
+        &effective_cpu_quota,
+        gate_profile,
+        resolved_profile.test_parallelism,
         !json_output,
         gate_progress_callback,
     ) {
@@ -221,6 +353,9 @@ struct GatesSummary {
     passed: bool,
     bounded: bool,
     quick: bool,
+    gate_profile: String,
+    effective_cpu_quota: String,
+    effective_test_parallelism: u32,
     requested_timeout_seconds: u64,
     effective_timeout_seconds: u64,
     cache_status: String,
@@ -254,6 +389,8 @@ fn run_gates_inner(
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+    test_parallelism: u32,
     emit_human_logs: bool,
     on_gate_progress: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>>,
 ) -> Result<GatesSummary, String> {
@@ -346,6 +483,9 @@ fn run_gates_inner(
             passed: false,
             bounded: false,
             quick,
+            gate_profile: gate_profile.as_str().to_string(),
+            effective_cpu_quota: cpu_quota.to_string(),
+            effective_test_parallelism: test_parallelism,
             requested_timeout_seconds: timeout_seconds,
             effective_timeout_seconds: timeout_decision.effective_seconds,
             cache_status: "disabled (merge conflicts)".to_string(),
@@ -357,7 +497,8 @@ fn run_gates_inner(
     // TCK-00526: Environment is now built from policy (default-deny with
     // allowlist), replacing the previous ambient-inherit approach.
     let default_nextest_command = build_nextest_command();
-    let mut test_command_environment = compute_nextest_test_environment(&policy, &apm2_home)?;
+    let mut test_command_environment =
+        compute_nextest_test_environment(&policy, &apm2_home, test_parallelism)?;
     let mut bounded = false;
 
     let mut env_remove_keys = Vec::new();
@@ -438,6 +579,8 @@ fn run_gates_inner(
             pids_max,
             cpu_quota,
             bounded,
+            Some(gate_profile.as_str()),
+            Some(test_parallelism),
         );
         let mut cache = GateCache::new(&sha);
         for result in &gate_results {
@@ -526,6 +669,9 @@ fn run_gates_inner(
         passed,
         bounded,
         quick,
+        gate_profile: gate_profile.as_str().to_string(),
+        effective_cpu_quota: cpu_quota.to_string(),
+        effective_test_parallelism: test_parallelism,
         requested_timeout_seconds: timeout_seconds,
         effective_timeout_seconds: timeout_decision.effective_seconds,
         cache_status: if quick {
@@ -618,10 +764,9 @@ fn normalize_quick_test_gate(gates: &mut Vec<GateResult>) {
 fn compute_nextest_test_environment(
     policy: &FacPolicyV1,
     apm2_home: &std::path::Path,
+    test_parallelism: u32,
 ) -> Result<Vec<(String, String)>, String> {
-    let profile = LaneProfileV1::new("lane-00", "b3-256:fac-gates", "boundary-00")
-        .map_err(|err| format!("failed to construct FAC gate lane profile: {err}"))?;
-    let lane_env = compute_test_env(&profile);
+    let lane_env = compute_test_env_for_parallelism(test_parallelism);
 
     // Build policy-filtered environment from the current process environment.
     let ambient: Vec<(String, String)> = std::env::vars().collect();
@@ -635,7 +780,7 @@ fn compute_nextest_test_environment(
     ensure_lane_env_dirs(&lane_dir)?;
     apply_lane_env_overrides(&mut policy_env, &lane_dir);
 
-    // Lane-derived vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
+    // Throughput-profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy
     // are already applied by build_job_environment.
     for (key, value) in &lane_env {
@@ -760,6 +905,55 @@ mod tests {
     static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
+    fn gate_execution_profile_resolves_auto_quota_from_profile() {
+        let (profile, effective_quota) =
+            resolve_effective_execution_profile("auto", GateThroughputProfile::Conservative)
+                .expect("auto profile resolves");
+        assert_eq!(profile.test_parallelism, 2);
+        assert_eq!(profile.cpu_quota_percent, 200);
+        assert_eq!(effective_quota, "200%");
+    }
+
+    #[test]
+    fn gate_execution_profile_applies_explicit_cpu_quota_to_parallelism() {
+        let host = resolve_host_test_parallelism();
+        let (profile, effective_quota) =
+            resolve_effective_execution_profile("150%", GateThroughputProfile::Throughput)
+                .expect("explicit quota resolves");
+        assert_eq!(effective_quota, "150%");
+        assert_eq!(profile.cpu_quota_percent, 150);
+        assert_eq!(profile.test_parallelism, 2_u32.min(host));
+    }
+
+    #[test]
+    fn gate_execution_profile_zero_quota_preserves_host_parallelism() {
+        let host = resolve_host_test_parallelism();
+        let (profile, effective_quota) =
+            resolve_effective_execution_profile("0%", GateThroughputProfile::Conservative)
+                .expect("zero quota resolves");
+        assert_eq!(effective_quota, "0%");
+        assert_eq!(profile.cpu_quota_percent, 0);
+        assert_eq!(profile.test_parallelism, host);
+    }
+
+    #[test]
+    fn gate_execution_profile_rejects_invalid_explicit_cpu_quota() {
+        let err =
+            resolve_effective_execution_profile("not-a-percent", GateThroughputProfile::Throughput)
+                .expect_err("invalid quota must fail");
+        assert!(err.contains("invalid cpu_quota value"));
+    }
+
+    #[test]
+    fn gate_execution_profile_balanced_is_within_expected_bounds() {
+        let host = resolve_host_test_parallelism();
+        let balanced = resolve_gate_execution_profile(GateThroughputProfile::Balanced);
+        assert!(balanced.test_parallelism >= 1);
+        assert!(balanced.test_parallelism <= host);
+        assert!(balanced.test_parallelism <= BALANCED_MAX_PARALLELISM.min(host));
+    }
+
+    #[test]
     fn ensure_clean_working_tree_skips_checks_in_quick_mode() {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let result = ensure_clean_working_tree(temp_dir.path(), true);
@@ -879,6 +1073,15 @@ mod tests {
                         .unwrap()
                         .push(format!("started:{gate_name}"));
                 },
+                GateProgressEvent::Progress {
+                    gate_name,
+                    elapsed_secs,
+                    bytes_streamed,
+                } => {
+                    events_clone.lock().unwrap().push(format!(
+                        "progress:{gate_name}:elapsed={elapsed_secs}:bytes={bytes_streamed}"
+                    ));
+                },
                 GateProgressEvent::Completed {
                     gate_name, passed, ..
                 } => {
@@ -905,6 +1108,11 @@ mod tests {
             cb(GateProgressEvent::Started {
                 gate_name: "test_gate".to_string(),
             });
+            cb(GateProgressEvent::Progress {
+                gate_name: "test_gate".to_string(),
+                elapsed_secs: 10,
+                bytes_streamed: 1024,
+            });
             cb(GateProgressEvent::Completed {
                 gate_name: "test_gate".to_string(),
                 passed: true,
@@ -919,9 +1127,10 @@ mod tests {
         }
 
         let recorded = events.lock().unwrap();
-        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded.len(), 3);
         assert_eq!(recorded[0], "started:test_gate");
-        assert_eq!(recorded[1], "completed:test_gate:passed=true");
+        assert_eq!(recorded[1], "progress:test_gate:elapsed=10:bytes=1024");
+        assert_eq!(recorded[2], "completed:test_gate:passed=true");
     }
 
     /// Regression (MAJOR 2): `check_lane_not_corrupt` must refuse to run
@@ -1136,8 +1345,19 @@ mod tests {
 
         env::set_current_dir(&repo).expect("set test repository as cwd");
 
-        let summary = run_gates_inner(false, true, 30, "128M", 128, "100%", false, None)
-            .expect("gates should run in single-lane mode");
+        let summary = run_gates_inner(
+            false,
+            true,
+            30,
+            "128M",
+            128,
+            "100%",
+            GateThroughputProfile::Conservative,
+            2,
+            false,
+            None,
+        )
+        .expect("gates should run in single-lane mode");
         assert!(summary.passed);
 
         let lane_dir = apm2_home

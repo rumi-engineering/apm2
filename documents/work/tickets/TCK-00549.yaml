@@ -37,3 +37,11 @@ ticket_meta:
     criteria:
       - "Bounded tests run with streaming logs and hard caps without relying on a brittle shell allowlist."
       - "Failure modes produce receipts with actionable diagnostics."
+  amendments:
+    - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+      summary: "Clarify that bounded executor requirements are containment-focused and do not prescribe low default CPU throughput."
+      supersedes:
+        - "Implicit coupling of throughput defaults to conservative bounded caps."
+      replacement:
+        - "Default throughput profile may use host-max queue-managed parallelism."
+        - "Bounded execution remains required for security containment and fail-closed behavior."
