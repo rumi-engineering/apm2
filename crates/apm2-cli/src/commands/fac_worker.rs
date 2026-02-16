@@ -63,6 +63,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use apm2_core::channel::{
@@ -105,6 +106,37 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
+
+use super::fac_gates_job::{GATES_JOB_OPTIONS_SCHEMA, GatesJobOptionsV1};
+#[cfg(not(test))]
+use crate::commands::fac_review as fac_review_api;
+#[cfg(test)]
+mod fac_review_api {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GateThroughputProfile {
+        Throughput,
+        Balanced,
+        Conservative,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn run_gates(
+        _force: bool,
+        _quick: bool,
+        _timeout_seconds: u64,
+        _memory_max: &str,
+        _pids_max: u64,
+        _cpu_quota: &str,
+        _gate_profile: GateThroughputProfile,
+        _json_output: bool,
+        _via_worker: bool,
+        _wait: bool,
+        _wait_timeout_secs: u64,
+    ) -> u8 {
+        crate::exit_codes::codes::GENERIC_ERROR
+    }
+}
 
 #[cfg(test)]
 mod fac_permissions {
@@ -169,6 +201,14 @@ const FALLBACK_BOUNDARY_ID: &str = "local";
 
 /// Default authority clock for local-mode evaluation windows.
 const DEFAULT_AUTHORITY_CLOCK: &str = "local";
+#[cfg(test)]
+const DEFAULT_GATES_TIMEOUT_SECONDS: u64 = 600;
+#[cfg(test)]
+const DEFAULT_GATES_MEMORY_MAX: &str = "48G";
+#[cfg(test)]
+const DEFAULT_GATES_PIDS_MAX: u64 = 1536;
+#[cfg(test)]
+const DEFAULT_GATES_CPU_QUOTA: &str = "auto";
 
 // =============================================================================
 // Worker result types
@@ -240,6 +280,18 @@ struct PendingCandidate {
     spec: FacJobSpecV1,
     /// Raw bytes from the bounded read.
     raw_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct GatesJobOptions {
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: String,
+    pids_max: u64,
+    cpu_quota: String,
+    gate_profile: fac_review_api::GateThroughputProfile,
+    workspace_root: PathBuf,
 }
 
 // =============================================================================
@@ -1129,6 +1181,376 @@ fn parse_queue_lane(lane_str: &str) -> QueueLane {
     }
 }
 
+fn parse_gate_profile(value: &str) -> Result<fac_review_api::GateThroughputProfile, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "throughput" => Ok(fac_review_api::GateThroughputProfile::Throughput),
+        "balanced" => Ok(fac_review_api::GateThroughputProfile::Balanced),
+        "conservative" => Ok(fac_review_api::GateThroughputProfile::Conservative),
+        other => Err(format!(
+            "invalid gates gate_profile `{other}`; expected throughput|balanced|conservative"
+        )),
+    }
+}
+
+fn parse_gates_job_options(spec: &FacJobSpecV1) -> Result<GatesJobOptions, String> {
+    match spec.actuation.decoded_source.as_deref() {
+        Some("fac_gates_worker") => {},
+        Some(other) => {
+            return Err(format!(
+                "unsupported gates decoded_source hint: {other} (expected fac_gates_worker)"
+            ));
+        },
+        None => {
+            return Err("missing gates decoded_source hint".to_string());
+        },
+    }
+
+    let patch_value = spec
+        .source
+        .patch
+        .as_ref()
+        .ok_or_else(|| "missing gates options payload".to_string())?;
+    let payload: GatesJobOptionsV1 = serde_json::from_value(patch_value.clone())
+        .map_err(|err| format!("invalid gates options payload: {err}"))?;
+    if payload.schema != GATES_JOB_OPTIONS_SCHEMA {
+        return Err(format!(
+            "unsupported gates options schema: expected {GATES_JOB_OPTIONS_SCHEMA}, got {}",
+            payload.schema
+        ));
+    }
+    Ok(GatesJobOptions {
+        force: payload.force,
+        quick: payload.quick,
+        timeout_seconds: payload.timeout_seconds,
+        memory_max: payload.memory_max,
+        pids_max: payload.pids_max,
+        cpu_quota: payload.cpu_quota,
+        gate_profile: parse_gate_profile(&payload.gate_profile)?,
+        workspace_root: resolve_workspace_root(&payload.workspace_root)?,
+    })
+}
+
+fn resolve_workspace_root(raw: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(raw);
+    if !candidate.is_dir() {
+        return Err(format!(
+            "workspace_root is not a directory: {}",
+            candidate.display()
+        ));
+    }
+    candidate
+        .canonicalize()
+        .map_err(|err| format!("failed to canonicalize workspace_root {raw}: {err}"))
+}
+
+fn resolve_workspace_head(workspace_root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to run git rev-parse HEAD: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err("git rev-parse HEAD failed".to_string());
+        }
+        return Err(format!("git rev-parse HEAD failed: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+struct CurrentDirGuard {
+    original: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn enter(target: &Path) -> Result<Self, String> {
+        let original = std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+        std::env::set_current_dir(target).map_err(|err| {
+            format!(
+                "failed to change current directory to {}: {err}",
+                target.display()
+            )
+        })?;
+        Ok(Self { original })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
+fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
+    // The worker is single-threaded; changing process CWD here is scoped by
+    // `CurrentDirGuard` and restored on all return paths.
+    let _dir_guard = CurrentDirGuard::enter(&options.workspace_root)?;
+    Ok(fac_review_api::run_gates(
+        options.force,
+        options.quick,
+        options.timeout_seconds,
+        &options.memory_max,
+        options.pids_max,
+        &options.cpu_quota,
+        options.gate_profile,
+        false,
+        false,
+        false,
+        0,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_queued_gates_job(
+    spec: &FacJobSpecV1,
+    claimed_path: &Path,
+    claimed_file_name: &str,
+    queue_root: &Path,
+    fac_root: &Path,
+    boundary_trace: &ChannelBoundaryTrace,
+    queue_trace: &JobQueueAdmissionTrace,
+    budget_trace: Option<&FacBudgetAdmissionTrace>,
+    canonicalizer_tuple_digest: &str,
+    policy_hash: &str,
+) -> JobOutcome {
+    let options = match parse_gates_job_options(spec) {
+        Ok(options) => options,
+        Err(reason) => {
+            let moved_path = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(DENIED_DIR),
+                claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                None,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
+                );
+            }
+            return JobOutcome::Denied { reason };
+        },
+    };
+
+    let current_head = match resolve_workspace_head(&options.workspace_root) {
+        Ok(head) => head,
+        Err(err) => {
+            let reason = format!(
+                "cannot resolve workspace HEAD for {}: {err}",
+                options.workspace_root.display()
+            );
+            let moved_path = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(DENIED_DIR),
+                claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                None,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
+                );
+            }
+            return JobOutcome::Denied { reason };
+        },
+    };
+    if !current_head.eq_ignore_ascii_case(&spec.source.head_sha) {
+        let reason = format!(
+            "gates job head mismatch: worker workspace HEAD {current_head} does not match job head {}",
+            spec.source.head_sha
+        );
+        let moved_path = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            None,
+        ) {
+            eprintln!(
+                "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
+            );
+        }
+        return JobOutcome::Denied { reason };
+    }
+
+    let exit_code = match run_gates_in_workspace(&options) {
+        Ok(code) => code,
+        Err(err) => {
+            let reason = format!("failed to execute gates in workspace: {err}");
+            let moved_path = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(DENIED_DIR),
+                claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                None,
+            ) {
+                eprintln!(
+                    "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
+                );
+            }
+            return JobOutcome::Denied { reason };
+        },
+    };
+
+    if exit_code == exit_codes::SUCCESS {
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Completed,
+            None,
+            "gates completed",
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            None,
+            Some(canonicalizer_tuple_digest),
+            None,
+            policy_hash,
+            None,
+        ) {
+            eprintln!("worker: receipt emission failed for gates job: {receipt_err}");
+            if let Err(move_err) = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(PENDING_DIR),
+                claimed_file_name,
+            ) {
+                eprintln!(
+                    "worker: WARNING: failed to return claimed gates job to pending: {move_err}"
+                );
+            }
+            return JobOutcome::Skipped {
+                reason: "receipt emission failed for gates job".to_string(),
+            };
+        }
+        if let Err(err) = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(COMPLETED_DIR),
+            claimed_file_name,
+        ) {
+            return JobOutcome::Skipped {
+                reason: format!("move gates job to completed failed: {err}"),
+            };
+        }
+        return JobOutcome::Completed {
+            job_id: spec.job_id.clone(),
+        };
+    }
+
+    let reason = format!("gates failed with exit code {exit_code}");
+    let moved_path = move_to_dir_safe(
+        claimed_path,
+        &queue_root.join(DENIED_DIR),
+        claimed_file_name,
+    )
+    .map(|p| {
+        p.strip_prefix(queue_root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .to_string()
+    })
+    .ok();
+    if let Err(receipt_err) = emit_job_receipt(
+        fac_root,
+        spec,
+        FacJobOutcome::Denied,
+        Some(DenialReasonCode::ValidationFailed),
+        &reason,
+        Some(boundary_trace),
+        Some(queue_trace),
+        budget_trace,
+        None,
+        Some(canonicalizer_tuple_digest),
+        moved_path.as_deref(),
+        policy_hash,
+        None,
+    ) {
+        eprintln!("worker: WARNING: receipt emission failed for denied gates job: {receipt_err}");
+    }
+    JobOutcome::Denied { reason }
+}
+
 // =============================================================================
 // Job processing
 // =============================================================================
@@ -2015,6 +2437,25 @@ fn process_job(
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
         return JobOutcome::Denied { reason };
+    }
+
+    // Gates jobs are executed through the FAC gate runner directly. They are
+    // already admission-checked (RFC-0028/0029) and consumed at this point.
+    // Avoid acquiring a second worker lane here: `fac gates` already uses its
+    // own lane lock/containment strategy for heavy phases.
+    if spec.kind == "gates" {
+        return execute_queued_gates_job(
+            spec,
+            &claimed_path,
+            &claimed_file_name,
+            queue_root,
+            fac_root,
+            &boundary_trace,
+            &queue_trace,
+            budget_trace.as_ref(),
+            canonicalizer_tuple_digest,
+            policy_hash,
+        );
     }
 
     // Step 6: Acquire lane lease (INV-WRK-008, BLOCKER-3 fix).
@@ -5020,6 +5461,115 @@ mod tests {
         assert_eq!(parse_queue_lane(""), QueueLane::Bulk);
     }
 
+    #[test]
+    fn test_parse_gates_job_options_rejects_missing_payload() {
+        let spec = make_receipt_test_spec();
+        let err = parse_gates_job_options(&spec).expect_err("missing payload must fail closed");
+        assert!(err.contains("missing gates options payload"));
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_from_patch_payload() {
+        let mut spec = make_receipt_test_spec();
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": true,
+            "quick": true,
+            "timeout_seconds": 77,
+            "memory_max": "1G",
+            "pids_max": 99,
+            "cpu_quota": "150%",
+            "gate_profile": "balanced",
+            "workspace_root": "."
+        }));
+        let options = parse_gates_job_options(&spec).expect("parse payload");
+        assert!(options.force);
+        assert!(options.quick);
+        assert_eq!(options.timeout_seconds, 77);
+        assert_eq!(options.memory_max, "1G");
+        assert_eq!(options.pids_max, 99);
+        assert_eq!(options.cpu_quota, "150%");
+        assert_eq!(
+            options.gate_profile,
+            fac_review_api::GateThroughputProfile::Balanced
+        );
+        assert!(options.workspace_root.is_dir());
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_rejects_missing_decoded_source() {
+        let mut spec = make_receipt_test_spec();
+        spec.actuation.decoded_source = None;
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": DEFAULT_GATES_TIMEOUT_SECONDS,
+            "memory_max": DEFAULT_GATES_MEMORY_MAX,
+            "pids_max": DEFAULT_GATES_PIDS_MAX,
+            "cpu_quota": DEFAULT_GATES_CPU_QUOTA,
+            "gate_profile": "throughput",
+            "workspace_root": "."
+        }));
+        let err = parse_gates_job_options(&spec).expect_err("missing decoded_source must fail");
+        assert!(err.contains("missing gates decoded_source hint"));
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_rejects_schema_mismatch() {
+        let mut spec = make_receipt_test_spec();
+        spec.source.patch = Some(serde_json::json!({
+            "schema": "apm2.fac.gates_job_options.v0",
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": "."
+        }));
+        let err = parse_gates_job_options(&spec).expect_err("schema mismatch must fail closed");
+        assert!(err.contains("unsupported gates options schema"));
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_rejects_invalid_profile() {
+        let mut spec = make_receipt_test_spec();
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "extreme",
+            "workspace_root": "."
+        }));
+        let err = parse_gates_job_options(&spec).expect_err("invalid profile must fail closed");
+        assert!(err.contains("invalid gates gate_profile"));
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_rejects_missing_workspace_root() {
+        let mut spec = make_receipt_test_spec();
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": "/path/does/not/exist"
+        }));
+        let err =
+            parse_gates_job_options(&spec).expect_err("invalid workspace root must fail closed");
+        assert!(err.contains("workspace_root"));
+    }
+
     fn make_receipt_test_spec() -> FacJobSpecV1 {
         FacJobSpecV1 {
             schema: "apm2.fac.job_spec.v1".to_string(),
@@ -5033,7 +5583,7 @@ mod tests {
                 lease_id: "lease-001".to_string(),
                 request_id: "b3-256:".to_string() + &"b".repeat(64),
                 channel_context_token: Some("token".to_string()),
-                decoded_source: None,
+                decoded_source: Some("fac_gates_worker".to_string()),
             },
             source: apm2_core::fac::job_spec::JobSource {
                 kind: "mirror_commit".to_string(),

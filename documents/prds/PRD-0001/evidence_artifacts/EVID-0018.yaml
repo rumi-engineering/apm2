@@ -10,8 +10,8 @@ prd_evidence_artifact:
   verification:
     commands:
     - id: CMD-0018
-      shell: bash
-      command: ./scripts/evidence/verify_cost_reports.sh --dimensions work_id,actor_id
+      shell: cargo
+      command: cargo test --workspace --all-features -- economics::
       expected_exit_code: 0
       cwd: .
       timeout_seconds: 600

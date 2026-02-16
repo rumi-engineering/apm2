@@ -24,35 +24,26 @@
 //! - [INV-WARM-CLI-004] Broker health gate is opened before token issuance
 //!   (fail-closed on missing/stale authority).
 
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
-use apm2_core::crypto::Signer;
-use apm2_core::economics::queue_admission::HtfEvaluationWindow;
 use apm2_core::fac::broker::FacBroker;
-use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
-    Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_JOB_SPEC_SIZE,
-    MAX_QUEUE_LANE_LENGTH, parse_b3_256_digest,
+    Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_QUEUE_LANE_LENGTH,
+    parse_b3_256_digest,
 };
 use apm2_core::fac::warm::{DEFAULT_WARM_PHASES, MAX_WARM_PHASES, WarmPhase};
-use apm2_core::fac::{
-    FacPolicyV1, MAX_POLICY_SIZE, check_disk_space, compute_policy_hash, deserialize_policy,
-    load_or_default_boundary_id, parse_policy_hash, persist_policy,
-};
-use apm2_core::github::resolve_apm2_home;
+use apm2_core::fac::{check_disk_space, load_or_default_boundary_id};
 
+use crate::commands::fac_queue_submit::{
+    current_epoch_secs, enqueue_job, generate_job_suffix, init_broker, load_or_init_policy,
+    resolve_fac_root, resolve_queue_root, resolve_repo_source_info,
+};
 use crate::exit_codes::codes as exit_codes;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Queue subdirectory under `$APM2_HOME`.
-const QUEUE_DIR: &str = "queue";
-const PENDING_DIR: &str = "pending";
 
 /// Default wait timeout for warm job completion (seconds).
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 1200;
@@ -67,15 +58,6 @@ const POLL_ITERATION_HEADROOM: u64 = 10;
 
 /// FAC receipts directory.
 const FAC_RECEIPTS_DIR: &str = "receipts";
-
-/// Default authority clock for local-mode evaluation windows.
-const DEFAULT_AUTHORITY_CLOCK: &str = "local";
-
-/// Maximum size for the signing key file.
-const MAX_SIGNING_KEY_SIZE: usize = 64;
-
-/// Maximum size for broker state file (1 MiB, matching broker constant).
-const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -190,16 +172,16 @@ pub fn run_fac_warm(
     // Generate job ID.
     let job_id = format!("warm-{}", generate_job_suffix());
 
-    // Determine source info (use current repo state).
-    let (repo_id, head_sha) = resolve_repo_info();
+    // Determine source info (repo identity + SHA + workspace root).
+    let repo_source = resolve_repo_source_info();
 
     // Build the job spec.
     let lease_id = format!("warm-lease-{}", generate_job_suffix());
     let spec = match build_warm_job_spec(
         &job_id,
         &lease_id,
-        &repo_id,
-        &head_sha,
+        &repo_source.repo_id,
+        &repo_source.head_sha,
         &phases,
         &queue_lane,
         &boundary_id,
@@ -217,8 +199,17 @@ pub fn run_fac_warm(
     };
 
     // Enqueue the job.
-    let apm2_home = resolve_apm2_home().unwrap_or_else(|| PathBuf::from("/tmp/.apm2"));
-    let queue_root = apm2_home.join(QUEUE_DIR);
+    let queue_root = match resolve_queue_root() {
+        Ok(path) => path,
+        Err(msg) => {
+            return output_error(
+                json_output,
+                "warm_resolve_queue_failed",
+                &msg,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
     if let Err(e) = enqueue_job(&queue_root, &spec) {
         return output_error(
             json_output,
@@ -354,140 +345,6 @@ fn validate_lane(lane: &Option<String>) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Broker / Policy
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Initialize the broker with health gate, following the same flow as the
-/// worker (`fac_worker.rs`). This is required because
-/// `issue_channel_context_token` enforces the admission health gate
-/// (fail-closed).
-fn init_broker(fac_root: &Path, boundary_id: &str) -> Result<FacBroker, String> {
-    // Load or generate a persistent signing key (same path as worker).
-    let signer = load_or_generate_persistent_signer(fac_root)?;
-    let signer_key_bytes = signer.secret_key_bytes().to_vec();
-
-    // Load or create broker state (matching worker pattern).
-    let mk_default_state_broker = || {
-        let default_state = apm2_core::fac::broker::BrokerState::default();
-        let s = Signer::from_bytes(&signer_key_bytes).ok()?;
-        FacBroker::from_signer_and_state(s, default_state).ok()
-    };
-
-    let mut broker = load_broker_state(fac_root).map_or_else(
-        || mk_default_state_broker().unwrap_or_else(FacBroker::new),
-        |state| {
-            Signer::from_bytes(&signer_key_bytes)
-                .ok()
-                .and_then(|s| FacBroker::from_signer_and_state(s, state).ok())
-                .unwrap_or_else(|| mk_default_state_broker().unwrap_or_else(FacBroker::new))
-        },
-    );
-
-    // Perform admission health gate check so the broker can issue tokens.
-    // This mirrors the worker startup sequence exactly.
-    let mut checker = apm2_core::fac::broker_health::BrokerHealthChecker::new();
-
-    let current_tick = broker.current_tick();
-    let tick_end = current_tick.saturating_add(1);
-    let eval_window = broker
-        .build_evaluation_window(boundary_id, DEFAULT_AUTHORITY_CLOCK, current_tick, tick_end)
-        .unwrap_or_else(|_| make_default_eval_window(boundary_id));
-
-    // Advance freshness horizon to keep startup checks in sync.
-    broker.advance_freshness_horizon(tick_end);
-
-    let startup_envelope = broker
-        .issue_time_authority_envelope_default_ttl(
-            boundary_id,
-            DEFAULT_AUTHORITY_CLOCK,
-            current_tick,
-            tick_end,
-        )
-        .ok();
-
-    let _health = broker.check_health(startup_envelope.as_ref(), &eval_window, &[], &mut checker);
-
-    if let Err(e) =
-        broker.evaluate_admission_health_gate(&checker, &eval_window, WorkerHealthPolicy::default())
-    {
-        return Err(format!("admission health gate failed: {e}"));
-    }
-
-    Ok(broker)
-}
-
-/// Load or generate a persistent signing key from
-/// `$FAC_ROOT/signing_key`.
-fn load_or_generate_persistent_signer(fac_root: &Path) -> Result<Signer, String> {
-    let key_path = fac_root.join("signing_key");
-
-    if key_path.exists() {
-        let bytes = read_bounded(&key_path, MAX_SIGNING_KEY_SIZE)?;
-        Signer::from_bytes(&bytes).map_err(|e| format!("invalid signing key: {e}"))
-    } else {
-        let signer = Signer::generate();
-        let key_bytes = signer.secret_key_bytes();
-        if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create key directory: {e}"))?;
-        }
-        fs::write(&key_path, key_bytes.as_ref())
-            .map_err(|e| format!("cannot write signing key: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&key_path, perms)
-                .map_err(|e| format!("cannot set key permissions: {e}"))?;
-        }
-        Ok(signer)
-    }
-}
-
-/// Load persisted broker state from `$FAC_ROOT/broker_state.json`.
-fn load_broker_state(fac_root: &Path) -> Option<apm2_core::fac::broker::BrokerState> {
-    let state_path = fac_root.join("broker_state.json");
-    if !state_path.exists() {
-        return None;
-    }
-    let bytes = read_bounded(&state_path, MAX_BROKER_STATE_FILE_SIZE).ok()?;
-    FacBroker::deserialize_state(&bytes).ok()
-}
-
-/// Creates a default evaluation window for local-only queue admission.
-fn make_default_eval_window(boundary_id: &str) -> HtfEvaluationWindow {
-    HtfEvaluationWindow {
-        boundary_id: boundary_id.to_string(),
-        authority_clock: DEFAULT_AUTHORITY_CLOCK.to_string(),
-        tick_start: 0,
-        tick_end: 1,
-    }
-}
-
-/// Load or initialize policy, returning (`hash_string`, `digest_bytes`,
-/// policy).
-fn load_or_init_policy(fac_root: &Path) -> Result<(String, [u8; 32], FacPolicyV1), String> {
-    let policy_dir = fac_root.join("policy");
-    let policy_path = policy_dir.join("fac_policy.v1.json");
-
-    let policy = if policy_path.exists() {
-        let bytes = read_bounded(&policy_path, MAX_POLICY_SIZE)?;
-        deserialize_policy(&bytes).map_err(|e| format!("cannot load fac policy: {e}"))?
-    } else {
-        let default_policy = FacPolicyV1::default();
-        persist_policy(fac_root, &default_policy)
-            .map_err(|e| format!("cannot persist default policy: {e}"))?;
-        default_policy
-    };
-
-    let policy_hash =
-        compute_policy_hash(&policy).map_err(|e| format!("cannot compute policy hash: {e}"))?;
-    let policy_digest =
-        parse_policy_hash(&policy_hash).ok_or_else(|| "invalid policy hash".to_string())?;
-
-    Ok((policy_hash, policy_digest, policy))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Job Spec Construction
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -569,55 +426,10 @@ fn build_warm_job_spec(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Queue Operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<PathBuf, String> {
-    let pending_dir = queue_root.join(PENDING_DIR);
-    fs::create_dir_all(&pending_dir).map_err(|e| format!("create pending dir: {e}"))?;
-
-    // Also ensure other queue directories exist.
-    for subdir in &["claimed", "completed", "denied", "cancelled", "quarantine"] {
-        let _ = fs::create_dir_all(queue_root.join(subdir));
-    }
-
-    let json = serde_json::to_string_pretty(spec).map_err(|e| format!("serialize: {e}"))?;
-    if json.len() > MAX_JOB_SPEC_SIZE {
-        return Err(format!(
-            "serialized spec too large: {} > {}",
-            json.len(),
-            MAX_JOB_SPEC_SIZE
-        ));
-    }
-
-    let filename = format!("{}.json", spec.job_id);
-    let target = pending_dir.join(&filename);
-
-    // Atomic write: temp file + rename.
-    let temp =
-        tempfile::NamedTempFile::new_in(&pending_dir).map_err(|e| format!("temp file: {e}"))?;
-    {
-        let mut file = temp.as_file();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-        }
-        file.write_all(json.as_bytes())
-            .map_err(|e| format!("write: {e}"))?;
-        file.sync_all().map_err(|e| format!("sync: {e}"))?;
-    }
-    temp.persist(&target)
-        .map_err(|e| format!("persist: {}", e.error))?;
-
-    Ok(target)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Wait for Receipt
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn wait_for_receipt(
+pub fn wait_for_receipt(
     fac_root: &Path,
     job_id: &str,
     timeout: Duration,
@@ -667,65 +479,6 @@ fn wait_for_receipt(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolves the FAC root directory at `$APM2_HOME/private/fac`.
-fn resolve_fac_root() -> Result<PathBuf, String> {
-    let home =
-        resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home directory".to_string())?;
-    Ok(home.join("private").join("fac"))
-}
-
-fn resolve_repo_info() -> (String, String) {
-    // Try to get repo info from current git state.
-    let repo_id = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                String::from_utf8(out.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "local".to_string());
-
-    let head_sha = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                String::from_utf8(out.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
-
-    (repo_id, head_sha)
-}
-
-fn generate_job_suffix() -> String {
-    let ts = current_epoch_secs();
-    let pid = std::process::id();
-    format!("{ts}-{pid}")
-}
-
-fn current_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Formats an epoch timestamp as ISO 8601 UTC.
 fn format_iso8601(epoch_secs: u64) -> String {
     let secs_per_day: u64 = 86400;
@@ -755,44 +508,6 @@ const fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
-}
-
-/// Reads a file with a size bound to prevent unbounded allocation.
-fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?;
-    let file_size = metadata.len();
-    if file_size > max_size as u64 {
-        return Err(format!(
-            "file {} too large: {} > {}",
-            path.display(),
-            file_size,
-            max_size
-        ));
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    let alloc_size = file_size as usize;
-    let mut buf = Vec::with_capacity(alloc_size);
-
-    let read_limit = max_size.saturating_add(1);
-    let mut limited_reader = file.take(read_limit as u64);
-    limited_reader
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-
-    if buf.len() > max_size {
-        return Err(format!(
-            "file {} grew to {} (exceeds max {})",
-            path.display(),
-            buf.len(),
-            max_size
-        ));
-    }
-
-    Ok(buf)
 }
 
 fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {

@@ -23,6 +23,7 @@ mod findings;
 mod findings_store;
 mod gate_attestation;
 mod gate_cache;
+mod gate_checks;
 mod gates;
 mod github_auth;
 mod github_projection;
@@ -4070,6 +4071,7 @@ pub fn run_logs(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn run_gates(
     force: bool,
     quick: bool,
@@ -4079,6 +4081,9 @@ pub fn run_gates(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     json_output: bool,
+    via_worker: bool,
+    wait: bool,
+    wait_timeout_secs: u64,
 ) -> u8 {
     gates::run_gates(
         force,
@@ -4089,6 +4094,9 @@ pub fn run_gates(
         cpu_quota,
         gate_profile,
         json_output,
+        via_worker,
+        wait,
+        wait_timeout_secs,
     )
 }
 

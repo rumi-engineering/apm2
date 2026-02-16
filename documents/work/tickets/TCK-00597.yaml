@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00597"
     title: "Make GitHub integration non-interactive (GH_TOKEN) and lane-scoped (no ~/.config/gh dependence)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

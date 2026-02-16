@@ -1,4 +1,5 @@
-//! Evidence gates (fmt, clippy, doc, test, CI scripts) for FAC push pipeline.
+//! Evidence gates (fmt, clippy, doc, test, native checks) for FAC push
+//! pipeline.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -28,6 +29,7 @@ use super::gate_attestation::{
     gate_command_for_attestation, short_digest,
 };
 use super::gate_cache::{GateCache, ReuseDecision};
+use super::gate_checks;
 use super::merge_conflicts::{
     check_merge_conflicts_against_main, render_merge_conflict_log, render_merge_conflict_summary,
 };
@@ -766,31 +768,82 @@ fn run_single_evidence_gate_with_env_and_progress(
     }
 }
 
+fn run_native_evidence_gate(
+    workspace_root: &Path,
+    sha: &str,
+    gate_name: &str,
+    log_path: &Path,
+    emit_human_logs: bool,
+) -> (bool, StreamStats) {
+    let started = Instant::now();
+    let execution = match gate_name {
+        "test_safety_guard" => gate_checks::run_test_safety_guard(workspace_root),
+        "review_artifact_lint" => gate_checks::run_review_artifact_lint(workspace_root),
+        _ => Err(format!("unknown native evidence gate `{gate_name}`")),
+    };
+    let duration = started.elapsed().as_secs();
+
+    match execution {
+        Ok(check) => {
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+                log_path,
+                check.output.as_bytes(),
+            );
+            let bytes = u64::try_from(check.output.len()).unwrap_or(u64::MAX);
+            emit_evidence_line(
+                sha,
+                gate_name,
+                if check.passed { "PASS" } else { "FAIL" },
+                duration,
+                log_path,
+                None,
+                emit_human_logs,
+            );
+            (
+                check.passed,
+                StreamStats {
+                    bytes_written: bytes,
+                    bytes_total: bytes,
+                    was_truncated: false,
+                },
+            )
+        },
+        Err(err) => {
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+                log_path,
+                format!("execution error: {err}\n").as_bytes(),
+            );
+            emit_evidence_line(
+                sha,
+                gate_name,
+                "FAIL",
+                duration,
+                log_path,
+                None,
+                emit_human_logs,
+            );
+            (
+                false,
+                StreamStats {
+                    bytes_written: 0,
+                    bytes_total: 0,
+                    was_truncated: false,
+                },
+            )
+        },
+    }
+}
+
 /// Snapshot file path for workspace integrity (stored under target/ci/).
 fn workspace_integrity_snapshot(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("target/ci/workspace_integrity.snapshot.tsv")
+    workspace_root.join(gate_checks::WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH)
 }
 
 /// Take a baseline workspace integrity snapshot before test execution.
 /// Returns `true` if snapshot was created successfully.
 fn snapshot_workspace_integrity(workspace_root: &Path) -> bool {
-    let script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
-    if !script.exists() {
-        return true; // No script → nothing to snapshot.
-    }
     let snapshot = workspace_integrity_snapshot(workspace_root);
-    let snapshot_str = snapshot.to_str().unwrap_or("");
-    Command::new("bash")
-        .args([
-            script.to_str().unwrap_or(""),
-            "snapshot",
-            "--snapshot-file",
-            snapshot_str,
-        ])
-        .current_dir(workspace_root)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    gate_checks::snapshot_workspace_integrity(workspace_root, &snapshot).is_ok()
 }
 
 /// Verify workspace integrity against a previously captured snapshot.
@@ -798,60 +851,65 @@ fn verify_workspace_integrity_gate(
     workspace_root: &Path,
     sha: &str,
     log_path: &Path,
-    gate_env: Option<&[(String, String)]>,
     emit_human_logs: bool,
 ) -> (bool, String, StreamStats) {
-    let script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
     let snapshot = workspace_integrity_snapshot(workspace_root);
     let log_path = log_path.to_path_buf();
     let gate_name = "workspace_integrity";
+    let started = Instant::now();
+    let execution = gate_checks::verify_workspace_integrity(workspace_root, &snapshot, None);
+    let duration = started.elapsed().as_secs();
 
-    if !script.exists() || !snapshot.exists() {
-        let msg = if script.exists() {
-            "snapshot file not found — skipped (no pre-test snapshot?)"
-        } else {
-            "workspace_integrity_guard.sh not found — skipped"
-        };
-        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
-            &log_path,
-            format!("{msg}\n").as_bytes(),
-        );
-        let bytes_total = msg.len() as u64;
-        let ts = now_iso8601();
-        let line = format!(
-            "ts={ts} sha={sha} gate={gate_name} status=PASS log={}",
-            log_path.display()
-        );
-        return (
-            true,
-            line,
-            StreamStats {
-                bytes_written: bytes_total,
-                bytes_total,
-                was_truncated: false,
-            },
-        );
-    }
+    let (passed, stream_stats) = match execution {
+        Ok(check) => {
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+                &log_path,
+                check.output.as_bytes(),
+            );
+            let bytes = u64::try_from(check.output.len()).unwrap_or(u64::MAX);
+            emit_evidence_line(
+                sha,
+                gate_name,
+                if check.passed { "PASS" } else { "FAIL" },
+                duration,
+                &log_path,
+                None,
+                emit_human_logs,
+            );
+            (
+                check.passed,
+                StreamStats {
+                    bytes_written: bytes,
+                    bytes_total: bytes,
+                    was_truncated: false,
+                },
+            )
+        },
+        Err(err) => {
+            let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+                &log_path,
+                format!("execution error: {err}\n").as_bytes(),
+            );
+            emit_evidence_line(
+                sha,
+                gate_name,
+                "FAIL",
+                duration,
+                &log_path,
+                None,
+                emit_human_logs,
+            );
+            (
+                false,
+                StreamStats {
+                    bytes_written: 0,
+                    bytes_total: 0,
+                    was_truncated: false,
+                },
+            )
+        },
+    };
 
-    let snapshot_str = snapshot.to_str().unwrap_or("");
-    let passed = run_single_evidence_gate_with_env(
-        workspace_root,
-        sha,
-        gate_name,
-        "bash",
-        &[
-            script.to_str().unwrap_or(""),
-            "verify",
-            "--snapshot-file",
-            snapshot_str,
-        ],
-        &log_path,
-        gate_env,
-        None,
-        emit_human_logs,
-    );
-    let stream_stats = passed.1;
-    let passed = passed.0;
     let ts = now_iso8601();
     let status = if passed { "PASS" } else { "FAIL" };
     let line = format!(
@@ -1241,7 +1299,7 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
     Ok(format!("b3-256:{}", hex::encode(digest.as_bytes())))
 }
 
-/// Run evidence gates (cargo fmt check, clippy, doc, test, CI scripts).
+/// Run evidence gates (cargo fmt check, clippy, doc, test, native gate checks).
 /// Returns `Ok((all_passed, per_gate_results))`.
 /// Fail-closed: any error running a gate counts as failure.
 ///
@@ -1270,7 +1328,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     // TCK-00526: Build policy-filtered environment for ALL gates (not just
     // the test gate). This enforces default-deny on fmt, clippy, doc, and
-    // script gates, preventing ambient secret leakage.
+    // native gate checks, preventing ambient secret leakage.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
     let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
@@ -1305,13 +1363,11 @@ pub(super) fn run_evidence_gates_with_lane_context(
         ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
     ];
 
-    // Script gates that run BEFORE tests (no ordering dependency on test).
-    let pre_test_script_gates: &[(&str, &str)] =
-        &[("test_safety_guard", "scripts/ci/test_safety_guard.sh")];
+    // Native gates that run BEFORE tests (no ordering dependency on test).
+    let pre_test_native_gates: &[&str] = &["test_safety_guard"];
 
-    // Script gates that run AFTER tests (ordering dependency on test).
-    let post_test_script_gates: &[(&str, &str)] =
-        &[("review_artifact_lint", "scripts/ci/review_artifact_lint.sh")];
+    // Native gates that run AFTER tests (ordering dependency on test).
+    let post_test_native_gates: &[&str] = &["review_artifact_lint"];
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
@@ -1387,28 +1443,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         ));
     }
 
-    // Phase 2: pre-test script gates — all receive the policy-filtered env
-    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
-    for &(gate_name, script_path) in pre_test_script_gates {
-        let full_path = workspace_root.join(script_path);
-        if !full_path.exists() {
-            continue;
-        }
+    // Phase 2: pre-test native gates.
+    for gate_name in pre_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
-            workspace_root,
-            sha,
-            gate_name,
-            "bash",
-            &[full_path.to_str().unwrap_or("")],
-            &log_path,
-            Some(&gate_env),
-            gate_wrapper_strip_ref,
-            emit_human_logs,
-            on_gate_progress,
-        );
+        let (passed, stream_stats) =
+            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result(
             gate_name,
@@ -1515,13 +1556,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
     emit_gate_started(opts, "workspace_integrity");
     let wi_started = Instant::now();
     let wi_log_path = logs_dir.join("workspace_integrity.log");
-    let (wi_passed, wi_line, wi_stream_stats) = verify_workspace_integrity_gate(
-        workspace_root,
-        sha,
-        &wi_log_path,
-        Some(&gate_env),
-        emit_human_logs,
-    );
+    let (wi_passed, wi_line, wi_stream_stats) =
+        verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
     let wi_duration = wi_started.elapsed().as_secs();
     let wi_result = build_evidence_gate_result(
         "workspace_integrity",
@@ -1537,28 +1573,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
     }
     evidence_lines.push(wi_line);
 
-    // Phase 4: post-test script gates — all receive the policy-filtered env
-    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
-    for &(gate_name, script_path) in post_test_script_gates {
-        let full_path = workspace_root.join(script_path);
-        if !full_path.exists() {
-            continue;
-        }
+    // Phase 4: post-test native gates.
+    for gate_name in post_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
-            workspace_root,
-            sha,
-            gate_name,
-            "bash",
-            &[full_path.to_str().unwrap_or("")],
-            &log_path,
-            Some(&gate_env),
-            gate_wrapper_strip_ref,
-            emit_human_logs,
-            on_gate_progress,
-        );
+        let (passed, stream_stats) =
+            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result(
             gate_name,
@@ -1691,12 +1712,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
     ];
 
-    let pre_test_script_gates: &[(&str, &str)] =
-        &[("test_safety_guard", "scripts/ci/test_safety_guard.sh")];
+    let pre_test_native_gates: &[&str] = &["test_safety_guard"];
 
-    // Script gates that run AFTER tests (ordering dependency on test).
-    let post_test_script_gates: &[(&str, &str)] =
-        &[("review_artifact_lint", "scripts/ci/review_artifact_lint.sh")];
+    // Native gates that run AFTER tests (ordering dependency on test).
+    let post_test_native_gates: &[&str] = &["review_artifact_lint"];
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
@@ -1911,13 +1930,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         ));
     }
 
-    // Phase 2: pre-test script gates.
-    for &(gate_name, script_path) in pre_test_script_gates {
-        let full_path = workspace_root.join(script_path);
-        if !full_path.exists() {
-            continue;
-        }
-
+    // Phase 2: pre-test native gates.
+    for gate_name in pre_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
@@ -2019,18 +2033,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
-            workspace_root,
-            sha,
-            gate_name,
-            "bash",
-            &[full_path.to_str().unwrap_or("")],
-            &log_path,
-            Some(&gate_env),
-            gate_wrapper_strip_ref,
-            emit_human_logs,
-            on_gate_progress,
-        );
+        let (passed, stream_stats) =
+            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
 
         status.set_result(gate_name, passed, duration);
@@ -2312,13 +2316,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             }
         } else {
             let started = Instant::now();
-            let (passed, line, stream_stats) = verify_workspace_integrity_gate(
-                workspace_root,
-                sha,
-                &log_path,
-                Some(&gate_env),
-                emit_human_logs,
-            );
+            let (passed, line, stream_stats) =
+                verify_workspace_integrity_gate(workspace_root, sha, &log_path, emit_human_logs);
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
@@ -2350,13 +2349,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         }
     }
 
-    // Phase 4: post-test script gates.
-    for &(gate_name, script_path) in post_test_script_gates {
-        let full_path = workspace_root.join(script_path);
-        if !full_path.exists() {
-            continue;
-        }
-
+    // Phase 4: post-test native gates.
+    for gate_name in post_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
@@ -2458,18 +2452,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
-            workspace_root,
-            sha,
-            gate_name,
-            "bash",
-            &[full_path.to_str().unwrap_or("")],
-            &log_path,
-            Some(&gate_env),
-            gate_wrapper_strip_ref,
-            emit_human_logs,
-            on_gate_progress,
-        );
+        let (passed, stream_stats) =
+            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
         status.set_result(gate_name, passed, duration);
         updater.update(&status);

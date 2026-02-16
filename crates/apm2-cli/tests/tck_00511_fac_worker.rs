@@ -21,6 +21,9 @@ mod exit_codes {
     }
 }
 
+#[path = "../src/commands/fac_gates_job.rs"]
+pub mod fac_gates_job;
+
 #[path = "../src/commands/fac_worker.rs"]
 mod fac_worker;
 

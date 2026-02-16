@@ -10,8 +10,8 @@ prd_evidence_artifact:
   verification:
     commands:
     - id: CMD-0004
-      shell: bash
-      command: ./scripts/evidence/verify_ledger_integrity_tests.sh
+      shell: cargo
+      command: cargo test --package apm2-core --no-fail-fast -- ledger::tests:: crypto::hash::unit_tests:: crypto::sign::unit_tests::
       expected_exit_code: 0
       cwd: .
       timeout_seconds: 900

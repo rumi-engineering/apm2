@@ -1,0 +1,334 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00613"
+    title: "Unified Rust gate engine: migrate all CI from shell scripts to apm2 fac gates profiles"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY", "DOMAIN_DOCUMENTATION"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00612"
+        reason: "TCK-00612 introduced gate throughput profiles (throughput/balanced/conservative) and host-aware parallelism. This ticket builds on that profile model to define gate-set profiles (local-full/quick/workflow-preflight/drift-audit)."
+      - ticket_id: "TCK-00436"
+        reason: "Original fac gates unification; this ticket completes the migration by replacing all remaining shell-script gates with Rust-native gate engine."
+      - ticket_id: "TCK-00605"
+        reason: "Rust-native bounded test path; gate engine reuses this execution model."
+  root_cause_analysis:
+    summary: |
+      CI behavior is split across two execution models:
+
+      1. Shell scripts under scripts/ that implement lint, doc, evidence,
+         and compliance checks via bash orchestration.
+      2. Rust-native gates under `apm2 fac gates` that implement bounded
+         test execution with containment controls.
+
+      This split causes:
+      - Inconsistent failure semantics (shell exit codes vs typed results)
+      - Duplicate orchestration logic (workflow YAML + fac review evidence.rs
+        both call scripts independently)
+      - No unified gate registry (can't query "what gates exist" or
+        "what does profile X run")
+      - Script-coupled attestation (gate_attestation.rs fingerprints
+        script paths, not gate inputs)
+      - Shell scripts bypass bounded execution containment controls
+
+      The fix is to build one Rust gate engine with a registry, runner,
+      and profile system, then migrate all CI behavior into it. Shell
+      scripts are deleted entirely.
+
+scope:
+  in_scope:
+    - id: S1_GATE_ENGINE
+      title: "Build Gate trait, GateRegistry, and parallel-phase runner"
+      detail: |
+        Add `gates_engine/` module under
+        `crates/apm2-cli/src/commands/fac_review/`:
+
+        1. `Gate` trait:
+           - `id() -> &str` (unique gate identifier)
+           - `phase() -> Phase` (compile, lint, test, doc, evidence, audit)
+           - `parallel_group() -> Option<&str>` (gates in same group run concurrently)
+           - `run(&self, ctx: &GateContext) -> GateResult`
+
+        2. `GateRegistry`:
+           - Stores all registered gates
+           - `gates_for_profile(profile: &str) -> Vec<&dyn Gate>`
+           - `all_gate_ids() -> Vec<&str>`
+           - Profiles: local-full, quick, workflow-preflight, drift-audit
+
+        3. `GateRunner`:
+           - Executes gates in deterministic phase order
+           - Parallel execution within declared groups
+           - Fail-fast policy per phase (configurable)
+           - Typed `GateResult` with bounded logs + receipt hooks
+           - Respects bounded containment controls (timeout, memory, pids)
+
+        Gate IDs cover all former CI/lint script checks.
+
+        Acceptance:
+          - `GateRegistry` can enumerate all gates and resolve profiles.
+          - `GateRunner` executes gates in phase order with parallel groups.
+          - Fail-fast halts remaining gates in a phase on first failure.
+          - Gate results are typed (not exit codes).
+
+    - id: S2_PROFILE_CLI
+      title: "Add --profile to apm2 fac gates as canonical CI entrypoint"
+      detail: |
+        Extend existing `apm2 fac gates` args:
+
+            #[arg(long, default_value = "local-full")]
+            pub profile: String,
+
+        Profiles map to explicit gate lists:
+          - `local-full`: all gates (lint, compile, test, doc, evidence, audit)
+          - `quick`: fast-feedback subset (fmt, clippy, targeted tests)
+          - `workflow-preflight`: GitHub Actions pre-merge checks
+          - `drift-audit`: documentation/schema drift detection
+
+        `apm2 fac gates --profile quick` replaces ad-hoc script
+        combinations. `apm2 fac gates` (no args) defaults to
+        `local-full`.
+
+        Acceptance:
+          - `apm2 fac gates --help` shows `--profile` with all options.
+          - Each profile resolves to a deterministic gate list.
+          - `apm2 fac gates --profile quick` runs only fast-feedback gates.
+
+    - id: S3_FAC_REVIEW_INTEGRATION
+      title: "Replace bash callsites in FAC review with gate-engine invocation"
+      detail: |
+        Three callsite migrations:
+
+        1. `evidence.rs`: Replace shell script invocations with direct
+           gate-engine calls. The gate engine returns typed results that
+           feed directly into evidence attestation.
+
+        2. `gate_attestation.rs`: Fingerprint Rust gate inputs (gate ID
+           + version + config hash), not script paths. Attestation
+           records become script-independent.
+
+        3. `push.rs`: Update expected gate-set logic to use registry
+           IDs (not file existence checks). Gate completeness is
+           verified against the registry, not the filesystem.
+
+        Acceptance:
+          - Zero shell script execution from fac_review code paths.
+          - Gate attestation fingerprints are deterministic and
+            script-path-free.
+          - push.rs gate-set validation uses registry gate IDs.
+
+    - id: S4_WORKFLOW_MIGRATION
+      title: "Rewrite GitHub Actions workflow to use apm2 fac gates --profile"
+      detail: |
+        Rewrite `.github/workflows/forge-admission-cycle.yml`:
+
+        Replace all direct script execution with:
+
+            apm2 fac gates --profile workflow-preflight
+
+        The workflow becomes a thin shell around the gate engine.
+        All gate logic lives in Rust, not in workflow YAML.
+
+        Acceptance:
+          - Workflow calls `apm2 fac gates --profile workflow-preflight`.
+          - No direct script execution in workflow YAML.
+          - CI pass/fail behavior is identical to pre-migration.
+
+    - id: S5_NON_CI_SCRIPT_MIGRATION
+      title: "Port non-CI scripts to dedicated command families"
+      detail: |
+        Three script families to migrate:
+
+        1. Evidence scripts → `apm2 evidence verify` subcommands
+           (JSON schema parity with original scripts).
+
+        2. Skills sync → `apm2 dev skills-runtime-sync`
+           (port skills/runtime synchronization logic).
+
+        3. RFC loop → `apm2 factory rfc-codex-loop`
+           (port RFC codex loop orchestration).
+
+        Delete original scripts after parity tests pass.
+
+        Acceptance:
+          - `apm2 evidence verify` produces identical output to
+            original evidence scripts.
+          - `apm2 dev skills-runtime-sync` replaces skills sync script.
+          - `apm2 factory rfc-codex-loop` replaces RFC loop script.
+          - Original scripts deleted.
+
+    - id: S6_REFERENCE_REWRITE
+      title: "Rewrite all repository references from script paths to new commands"
+      detail: |
+        Sweep all docs, tickets, SKILL.md files, AGENTS.md files,
+        workflow files, and code comments. Replace references to
+        `scripts/*.sh` paths with the corresponding `apm2` command.
+
+        Remove dead script-coupled code paths from Rust source.
+
+        Acceptance:
+          - `find . -type f -name '*.sh'` returns empty.
+          - `rg -n 'scripts/.+\.sh|run_rfc_codex_loop\.sh'` returns empty.
+          - `rg -n 'Command::new\("bash"|Command::new\("sh"'
+            crates/apm2-cli/src/commands/fac_review` returns empty
+            (non-test code).
+
+    - id: S7_TESTING
+      title: "Comprehensive test suite for gate engine, profiles, and migration"
+      detail: |
+        Unit tests:
+          - One test module per migrated gate (fixtures as data files)
+          - Parser/lint equivalence tests for rule-heavy checks
+          - Profile composition tests (exact gate membership)
+
+        Integration tests:
+          - `apm2 fac gates --profile ...` pass/fail matrix
+          - FAC review evidence integration (zero script execution)
+          - Workflow-preflight gate tests with fixture event payloads
+          - Evidence verify command tests (JSON schema parity)
+
+        End-to-end:
+          - Full `local-full` run on clean repo
+          - Failure-injection suite for each guardrail gate
+          - Command-output stability checks for machine consumers
+
+        Hard compliance gates (must all pass):
+          - `cargo fmt --all`
+          - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+          - `cargo doc --workspace --no-deps`
+          - `cargo test --workspace`
+          - `find . -type f -name '*.sh'` must be empty
+          - `rg -n 'scripts/.+\.sh'` must be empty
+          - `rg -n 'Command::new("bash")|Command::new("sh")'
+            crates/apm2-cli/src/commands/fac_review` must be empty
+            (non-test code)
+
+        Acceptance:
+          - All unit, integration, and e2e tests pass.
+          - All hard compliance gates pass.
+
+  out_of_scope:
+    - "Compatibility wrappers for old script paths (clean cutover, no shims)."
+    - "Removing bounded execution or containment controls (security posture unchanged)."
+    - "Reintroducing wrapper/sccache pass-through in bounded mode without new containment guarantees."
+    - "Global distributed scheduler redesign."
+
+plan:
+  steps:
+    - id: STEP_01
+      title: "Implement gate engine (Gate trait + GateRegistry + GateRunner)"
+      detail: |
+        1. Create gates_engine/ module with Gate trait, GateRegistry,
+           and GateRunner.
+        2. Implement phase ordering, parallel groups, fail-fast policy.
+        3. Register all existing gate checks (lint, compile, test, doc,
+           evidence, audit) as Gate implementations.
+
+    - id: STEP_02
+      title: "Wire --profile into apm2 fac gates CLI"
+      detail: |
+        1. Add --profile arg with local-full/quick/workflow-preflight/
+           drift-audit options.
+        2. Wire profile resolution to GateRegistry.
+        3. Default to local-full when no profile specified.
+
+    - id: STEP_03
+      title: "Migrate FAC review callsites to gate engine"
+      detail: |
+        1. Replace evidence.rs shell invocations with gate-engine calls.
+        2. Update gate_attestation.rs to fingerprint gate IDs.
+        3. Update push.rs gate-set validation to use registry.
+
+    - id: STEP_04
+      title: "Migrate GitHub Actions workflow"
+      detail: |
+        1. Rewrite forge-admission-cycle.yml to call apm2 fac gates
+           --profile workflow-preflight.
+        2. Remove all direct script execution from workflow.
+
+    - id: STEP_05
+      title: "Port non-CI scripts to command families"
+      detail: |
+        1. Port evidence scripts to apm2 evidence verify.
+        2. Port skills sync to apm2 dev skills-runtime-sync.
+        3. Port RFC loop to apm2 factory rfc-codex-loop.
+        4. Delete original scripts after parity tests pass.
+
+    - id: STEP_06
+      title: "Reference rewrite and dead code removal"
+      detail: |
+        1. Sweep all docs, tickets, skills, agents for script references.
+        2. Replace with corresponding apm2 commands.
+        3. Remove dead script-coupled code paths from Rust source.
+        4. Delete all .sh files.
+
+    - id: STEP_07
+      title: "Testing and validation"
+      detail: |
+        1. Run unit tests per migrated gate.
+        2. Run profile composition tests.
+        3. Run integration pass/fail matrix.
+        4. Run e2e local-full on clean repo.
+        5. Run failure-injection suite.
+        6. Verify all hard compliance gates pass.
+
+definition_of_done:
+  evidence_ids: []
+  criteria:
+    - "`apm2 fac gates --help` exposes `--profile` with local-full/quick/workflow-preflight/drift-audit options."
+    - "`apm2 fac gates` defaults to `local-full` profile with host-aware parallelism."
+    - "Gate engine executes gates in deterministic phase order with parallel groups and fail-fast."
+    - "Gate results are typed (GateResult), not shell exit codes."
+    - "FAC review evidence.rs uses gate-engine invocation, not shell scripts."
+    - "gate_attestation.rs fingerprints gate IDs + config hash, not script paths."
+    - "push.rs validates gate completeness against registry, not filesystem."
+    - "GitHub Actions workflow calls `apm2 fac gates --profile workflow-preflight` exclusively."
+    - "`apm2 evidence verify` replaces evidence shell scripts with JSON schema parity."
+    - "`apm2 dev skills-runtime-sync` replaces skills sync script."
+    - "`apm2 factory rfc-codex-loop` replaces RFC loop script."
+    - "`find . -type f -name '*.sh'` returns empty (all shell scripts deleted)."
+    - "`rg -n 'scripts/.+\\.sh'` returns empty (no script path references remain)."
+    - "`rg -n 'Command::new(\"bash\")|Command::new(\"sh\")'` returns empty in fac_review non-test code."
+    - "Bounded containment semantics remain fail-closed and unchanged in security posture."
+    - "All unit, integration, e2e, and hard compliance gates pass."
+    - "`cargo test --workspace` passes."
+    - "Single-PR cutover: no transitional wrappers or compatibility shims."
+
+notes:
+  context: |
+    DESIGN: "CI = Gates" — single cutover to unified Rust gate engine.
+
+    The core insight is that CI behavior should be defined exclusively
+    by gate profiles under `apm2 fac gates`. Shell scripts are a
+    historical artifact from before the Rust gate system existed. Now
+    that the gate engine can handle all check types (lint, compile,
+    test, doc, evidence, audit), there's no reason to maintain two
+    orchestration models.
+
+    The migration is a single PR with no transitional wrappers:
+    1. Implement gate engine + profiles
+    2. Switch fac gates and FAC review to engine
+    3. Migrate workflow
+    4. Port non-CI scripts to existing command families
+    5. Rewrite all references
+    6. Delete all .sh files + dead code
+    7. Run full validation suite and merge
+
+    Assumptions:
+    - No compatibility wrappers for old script paths
+    - CI is defined exclusively by gate profiles under apm2 fac gates
+    - Historical docs are rewritten to eliminate script pointers
+
+    This ticket was informed by a Codex investigation into gate
+    throughput regression (TCK-00612) which revealed the dual
+    shell/Rust execution model as a source of inconsistency and
+    maintenance burden.
+  security: "default-deny, least privilege, fail-closed"

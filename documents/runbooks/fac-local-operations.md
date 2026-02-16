@@ -29,7 +29,7 @@ cargo nextest --version
 ```
 
 **nextest is the preferred and recommended test runner.** When the bounded
-test runner is available (cgroup v2 + `run_bounded_tests.sh`), FAC uses
+test runner is available (cgroup v2 + Rust bounded-runner path), FAC uses
 `cargo nextest run` inside a resource-bounded cgroup unit. When the bounded
 runner inputs are absent, the current implementation falls back to
 `cargo test --workspace`. Fail-closed enforcement (rejecting execution when
@@ -59,8 +59,8 @@ or cgroup v2 is unavailable), `apm2 fac gates` falls back to running evidence
 gates without cgroup resource limits. The bounded execution path is strongly
 recommended. Fail-closed enforcement when bounded execution is unavailable is
 planned as future work (see DD-003 in RFC-0007).
-When the bounded runner script is present but the user bus is unavailable,
-bounded execution does not fall back. It hard-fails in `run_bounded_tests.sh`
+When bounded execution is selected but the user bus is unavailable,
+bounded execution does not fall back. It hard-fails during bounded-runner
 preflight. Fix the user session to enable bounded execution before proceeding.
 
 ### 1.3 Build and install the apm2 CLI
@@ -335,8 +335,8 @@ Symptom: Test gate falls back to `cargo test --workspace` instead of bounded
 ```
 
 Fix: Ensure the bounded runner can start. The fallback to `cargo test
---workspace` is expected only when `run_bounded_tests.sh` is missing or
-cgroup v2 is unavailable.
+--workspace` is expected only when bounded execution prerequisites are
+missing (for example cgroup v2 unavailable).
 
 nextest remains the preferred and recommended test runner for FAC evidence
 gates (DD-003, RFC-0007). If bounded execution is available but

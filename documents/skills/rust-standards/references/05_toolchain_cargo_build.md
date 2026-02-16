@@ -14,7 +14,7 @@ Cargo resolves code, runs build scripts, runs proc-macros, and selects feature s
   - keep `package.rust-version` accurate and enforced by CI (`cargo +<MSRV> check`),
   - allow a pinned nightly for tooling, but keep the codebase free of nightly-only language features unless explicitly contracted.
 [PROVENANCE] Cargo `rust-version` defines the declared toolchain floor; some tools (Miri / llvm-tools) require nightly.
-[VERIFICATION] APM2 CI runs an MSRV check plus tool-extended checks (see `scripts/ci/run_local_ci_orchestrator.sh`).
+[VERIFICATION] APM2 CI runs an MSRV check plus tool-extended checks (see `apm2 fac gates`).
 
 [CONTRACT: CTR-0202] Toolchain Pin Changes Are Security/Correctness Changes.
 - TRIGGER: changes to `rust-toolchain.toml`, `Cargo.toml` workspace lints, `deny.toml`, `Cargo.lock`.
@@ -70,7 +70,7 @@ Cargo resolves code, runs build scripts, runs proc-macros, and selects feature s
 [CONTRACT: CTR-0205] CI Is the Ground-Truth Execution Environment.
 - REJECT IF: acceptance depends on local, ad-hoc execution of untrusted code.
 - ENFORCE BY: treat the CI orchestrator as authoritative for merges.
-[PROVENANCE] APM2 runs a canonical check suite (see `scripts/ci/run_local_ci_orchestrator.sh`).
+[PROVENANCE] APM2 runs a canonical check suite (see `apm2 fac gates`).
 
 ---
 

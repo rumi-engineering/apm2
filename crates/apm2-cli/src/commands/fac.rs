@@ -343,6 +343,7 @@ pub struct BenchArgs {
 
 /// Arguments for `apm2 fac gates`.
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GatesArgs {
     /// Force re-run all gates, ignoring cache.
     #[arg(long, default_value_t = false)]
@@ -381,6 +382,19 @@ pub struct GatesArgs {
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+
+    /// Enqueue gates as a FAC worker job so RFC-0029 queue/budget admission
+    /// is enforced before execution.
+    #[arg(long, default_value_t = false)]
+    pub via_worker: bool,
+
+    /// Wait for queued gates job completion (requires `--via-worker`).
+    #[arg(long, default_value_t = false)]
+    pub wait: bool,
+
+    /// Maximum wait time in seconds when `--wait` is enabled.
+    #[arg(long, default_value_t = 1200)]
+    pub wait_timeout_secs: u64,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -2003,6 +2017,9 @@ pub fn run_fac(
             &args.cpu_quota,
             args.gate_profile,
             resolve_json(args.json),
+            args.via_worker,
+            args.wait,
+            args.wait_timeout_secs,
         ),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
@@ -6008,6 +6025,30 @@ mod tests {
                     fac_review::GateThroughputProfile::Throughput
                 );
                 assert_eq!(args.cpu_quota, "auto");
+                assert!(!args.via_worker);
+                assert!(!args.wait);
+                assert_eq!(args.wait_timeout_secs, 1200);
+            },
+            other => panic!("expected gates subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gates_worker_queue_flags_parse() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "gates",
+            "--via-worker",
+            "--wait",
+            "--wait-timeout-secs",
+            "90",
+        ])
+        .expect("gates parser should accept worker queue flags");
+        match parsed.subcommand {
+            FacSubcommand::Gates(args) => {
+                assert!(args.via_worker);
+                assert!(args.wait);
+                assert_eq!(args.wait_timeout_secs, 90);
             },
             other => panic!("expected gates subcommand, got {other:?}"),
         }

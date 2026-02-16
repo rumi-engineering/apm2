@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00534"
     title: "Crash recovery + reconcile: repair queue/leases on worker startup; emit recovery receipts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

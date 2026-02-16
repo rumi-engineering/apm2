@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00544"
     title: "`apm2 fac pipeline` integration: route evidence phase through queue/lanes (eliminate SHA drift + dirty attests-clean hazard)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
