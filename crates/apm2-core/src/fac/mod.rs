@@ -308,7 +308,7 @@ pub use gc_receipt::{
     MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,
 };
 // Re-export gh_cli (TCK-00597)
-pub use gh_cli::gh_command;
+pub use gh_cli::{GhCommand, gh_command};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,

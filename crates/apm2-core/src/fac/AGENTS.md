@@ -1556,27 +1556,37 @@ require credentials.
 ## gh_cli Submodule (TCK-00597)
 
 The `gh_cli` submodule provides a centralized `gh_command()` constructor that
-returns a `std::process::Command` pre-configured for non-interactive,
-token-based authentication and lane-scoped config directory isolation. All
-`gh` CLI invocations across the codebase use this function instead of raw
-`Command::new("gh")`.
+returns a `GhCommand` wrapper (around `std::process::Command`) pre-configured
+for non-interactive, token-based authentication and lane-scoped config
+directory isolation. All `gh` CLI invocations across the codebase use this
+function instead of raw `Command::new("gh")`.
 
 ### Core Capabilities
 
-- `gh_command()`: Builds a `Command::new("gh")` with:
+- `gh_command()`: Builds a `GhCommand` wrapping `Command::new("gh")` with:
   - `GH_TOKEN` injected from the credential resolution chain (env var ->
-    systemd credential -> APM2 credential file) when available.
+    systemd credential -> APM2 credential file) when available, or set to
+    empty string when no token is resolved (fail-closed: prevents ambient
+    inheritance).
   - `GH_CONFIG_DIR` set to `$XDG_CONFIG_HOME/gh` when `XDG_CONFIG_HOME` is
-    available (lane-scoped via TCK-00575), preventing writes to `~/.config/gh`.
+    available (lane-scoped via TCK-00575), or `/dev/null` otherwise
+    (fail-closed: prevents reads from `~/.config/gh`).
   - `GH_NO_UPDATE_NOTIFIER=1` to suppress interactive update checks.
   - `NO_COLOR=1` to suppress ANSI color codes for deterministic parsing.
   - `GH_PROMPT_DISABLED=1` to prevent interactive prompts.
+- `GhCommand`: A newtype wrapper around `Command` that implements
+  `Deref`/`DerefMut` to `Command` for transparent method chaining, and
+  provides a custom `Debug` implementation that redacts `GH_TOKEN` values
+  (CTR-2604).
 
-### Fail-Open Note
+### Fail-Closed Authentication
 
-If no token is available, the command is still returned without `GH_TOKEN`.
-This allows `gh` to fall back to ambient auth state. Callers that require
-auth should gate on `require_github_credentials()` before invoking `gh`.
+`GH_TOKEN` and `GH_CONFIG_DIR` are always explicitly set in the command
+environment. When no token is resolved, `GH_TOKEN` is set to empty string
+and `GH_CONFIG_DIR` is set to `/dev/null`, preventing inheritance of ambient
+authority from the parent process or `~/.config/gh` state. Callers that
+require auth should gate on `require_github_credentials()` before invoking
+`gh`.
 
 ### Security Invariants (TCK-00597)
 
@@ -1586,3 +1596,11 @@ auth should gate on `require_github_credentials()` before invoking `gh`.
   `XDG_CONFIG_HOME` is available, preventing user-global `~/.config/gh` writes.
 - [INV-GHCLI-003] `GH_NO_UPDATE_NOTIFIER` is set to `1` to suppress
   interactive update prompts.
+- [INV-GHCLI-004] `GH_TOKEN` is always set in the command environment (empty
+  when no token is resolved) to prevent inheritance of ambient `GH_TOKEN`
+  from the parent process.
+- [INV-GHCLI-005] `GH_CONFIG_DIR` is always set (to lane-scoped path or
+  `/dev/null`) to prevent `gh` from reading `~/.config/gh` ambient state.
+- [INV-GHCLI-006] `GhCommand` redacts `GH_TOKEN` in its `Debug`
+  implementation (CTR-2604), preventing secret leakage via tracing or
+  debug formatting.
