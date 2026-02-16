@@ -849,4 +849,102 @@ mod tests {
         let restored: ObservedJobCost = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(cost, restored);
     }
+
+    #[test]
+    fn calibrate_respects_total_kind_limit_with_defaults() {
+        // Regression test for MAJOR f-705-security-1771265568770985-0:
+        // Ensure calibrate() counts the union of defaults + calibrated kinds
+        // against MAX_JOB_KINDS, not each map independently.
+        let mut model = CostModelV1::with_defaults();
+        assert_eq!(model.estimates.len(), 5, "defaults have 5 known kinds");
+
+        let observed = ObservedJobCost {
+            duration_ms: 100_000,
+            cpu_time_ms: 50_000,
+            bytes_written: 10_000_000,
+        };
+
+        // Fill remaining slots: MAX_JOB_KINDS - 5 defaults = 11 new kinds
+        let remaining = MAX_JOB_KINDS - model.estimates.len();
+        for i in 0..remaining {
+            let kind = format!("calibrated_kind_{i}");
+            model
+                .calibrate(&kind, &observed)
+                .unwrap_or_else(|e| panic!("calibrate {kind} should succeed: {e}"));
+        }
+
+        // Model should now have exactly MAX_JOB_KINDS entries
+        assert_eq!(model.estimates.len(), MAX_JOB_KINDS);
+        assert!(model.validate().is_ok(), "model at capacity must validate");
+
+        // One more new kind must be rejected (DoS prevention)
+        let result = model.calibrate("one_too_many", &observed);
+        assert!(
+            matches!(result, Err(CostModelError::TooManyKinds { .. })),
+            "calibrate beyond MAX_JOB_KINDS must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn calibrate_allows_reuse_of_existing_kind() {
+        // Calibrating an already-known kind (from defaults or prior
+        // calibration) does NOT count as a new kind.
+        let mut model = CostModelV1::with_defaults();
+        let observed = ObservedJobCost {
+            duration_ms: 100_000,
+            cpu_time_ms: 50_000,
+            bytes_written: 10_000_000,
+        };
+
+        // Calibrate a default kind — should always succeed regardless of capacity
+        model
+            .calibrate("gates", &observed)
+            .expect("calibrate default kind");
+        model
+            .calibrate("gates", &observed)
+            .expect("re-calibrate default kind");
+
+        // Fill to capacity
+        let remaining = MAX_JOB_KINDS - model.estimates.len();
+        for i in 0..remaining {
+            model
+                .calibrate(&format!("new_{i}"), &observed)
+                .expect("fill to capacity");
+        }
+
+        // Re-calibrating existing kinds at full capacity must still succeed
+        model
+            .calibrate("gates", &observed)
+            .expect("re-calibrate at capacity");
+        model
+            .calibrate("new_0", &observed)
+            .expect("re-calibrate known calibrated kind at capacity");
+    }
+
+    #[test]
+    fn calibrated_model_validates_after_persistence_round_trip() {
+        // Regression test: ensure a fully calibrated model serializes and
+        // validates after reload (no persistent DoS).
+        let mut model = CostModelV1::with_defaults();
+        let observed = ObservedJobCost {
+            duration_ms: 100_000,
+            cpu_time_ms: 50_000,
+            bytes_written: 10_000_000,
+        };
+
+        let remaining = MAX_JOB_KINDS - model.estimates.len();
+        for i in 0..remaining {
+            model
+                .calibrate(&format!("new_{i}"), &observed)
+                .expect("calibrate");
+        }
+
+        // Serialize and restore
+        let bytes = serde_json::to_vec(&model).expect("serialize");
+        let restored: CostModelV1 = serde_json::from_slice(&bytes).expect("deserialize");
+        assert!(
+            restored.validate().is_ok(),
+            "restored model at MAX_JOB_KINDS must validate"
+        );
+    }
 }

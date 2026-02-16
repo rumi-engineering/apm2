@@ -722,11 +722,11 @@ impl FacJobReceiptV1 {
     ///
     /// # Trailing Optional Field Policy
     ///
-    /// Fields added before TCK-00532 (`moved_job_path`, `containment`) omit
-    /// the `0u8` absence marker for backward compatibility with persisted
-    /// receipts. Fields added from TCK-00532 onward (`observed_cost`) always
-    /// emit a presence marker (0u8/1u8) to prevent canonicalization
-    /// collisions across trailing optional fields.
+    /// ALL trailing optional fields (`moved_job_path`, `containment`,
+    /// `observed_cost`) emit a presence marker (0u8 for None, 1u8 for Some)
+    /// to prevent canonicalization collisions. Without markers, two receipts
+    /// with different field occupancy patterns could produce identical
+    /// canonical bytes if the encoded data happens to align.
     ///
     /// # Panics
     ///
@@ -825,16 +825,25 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Legacy trailing fields (pre-TCK-00532): absence marker omitted for
-        // backward compatibility with persisted receipts.
+        // Trailing optional fields: ALL emit presence markers (0u8 for None,
+        // 1u8 for Some) to prevent canonicalization collisions. Without
+        // markers, a receipt with `moved_job_path=Some(data)` and
+        // `containment=None` could produce identical bytes to one with
+        // `moved_job_path=None` and `containment=Some(colliding_data)`.
+        //
+        // Backward-compat note: adding `observed_cost` (TCK-00532) already
+        // changes v1 canonical bytes (its 0u8 marker is new), so adding
+        // absence markers for `moved_job_path` and `containment` is a
+        // no-cost fix — all v1 hashes are recomputed anyway.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
-        // TCK-00548: Containment trace. Absence marker omitted for backward
-        // compatibility with persisted receipts from TCK-00548.
+        // TCK-00548: Containment trace with presence marker.
         if let Some(trace) = &self.containment {
             bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
@@ -843,13 +852,11 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        } else {
+            bytes.push(0u8);
         }
 
-        // TCK-00532: Observed job cost. Presence marker ALWAYS emitted
-        // (0u8 for None, 1u8 for Some) to prevent canonicalization
-        // collisions with preceding trailing optional fields. Safe to
-        // enforce because this field is introduced in this PR and no
-        // persisted receipts with it exist yet.
+        // TCK-00532: Observed job cost with presence marker.
         if let Some(cost) = &self.observed_cost {
             bytes.push(1u8);
             bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
@@ -3621,6 +3628,114 @@ pub mod tests {
         assert_ne!(
             hash_none, hash_some,
             "v2 canonical_bytes must change when containment trace is set"
+        );
+    }
+
+    #[test]
+    fn test_v1_canonical_bytes_no_collision_across_trailing_optional_fields() {
+        // Regression test for BLOCKER f-705-security-1771265555805010-0:
+        // Verify that different occupancy patterns for trailing optional fields
+        // (moved_job_path, containment, observed_cost) always produce different
+        // canonical bytes, preventing hash collisions in the integrity trail.
+        let mut base = make_valid_receipt();
+        base.moved_job_path = None;
+        base.containment = None;
+        base.observed_cost = None;
+        let bytes_all_none = base.canonical_bytes();
+
+        // moved_job_path set, containment None
+        let mut r1 = base.clone();
+        r1.moved_job_path = Some("quarantine/job.json".to_string());
+        let bytes_moved_only = r1.canonical_bytes();
+
+        // moved_job_path None, containment set
+        let mut r2 = base.clone();
+        r2.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "quarantine/job.json".to_string(), // same string content
+            processes_checked: 0,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let bytes_containment_only = r2.canonical_bytes();
+
+        // moved_job_path None, observed_cost set
+        let mut r3 = base;
+        r3.observed_cost = Some(crate::economics::cost_model::ObservedJobCost {
+            duration_ms: 1000,
+            cpu_time_ms: 500,
+            bytes_written: 2000,
+        });
+        let bytes_cost_only = r3.canonical_bytes();
+
+        // All four must be distinct (presence markers disambiguate).
+        assert_ne!(
+            bytes_all_none, bytes_moved_only,
+            "all-None vs moved_job_path=Some must differ"
+        );
+        assert_ne!(
+            bytes_all_none, bytes_containment_only,
+            "all-None vs containment=Some must differ"
+        );
+        assert_ne!(
+            bytes_all_none, bytes_cost_only,
+            "all-None vs observed_cost=Some must differ"
+        );
+        assert_ne!(
+            bytes_moved_only, bytes_containment_only,
+            "moved_job_path=Some vs containment=Some must differ (collision prevented by presence markers)"
+        );
+        assert_ne!(
+            bytes_moved_only, bytes_cost_only,
+            "moved_job_path=Some vs observed_cost=Some must differ"
+        );
+        assert_ne!(
+            bytes_containment_only, bytes_cost_only,
+            "containment=Some vs observed_cost=Some must differ"
+        );
+    }
+
+    #[test]
+    fn test_v1_canonical_bytes_absence_marker_emitted_for_moved_job_path() {
+        // Verify that moved_job_path=None emits a 0u8 presence marker.
+        let mut r = make_valid_receipt();
+        r.moved_job_path = None;
+        r.containment = None;
+        r.observed_cost = None;
+        let bytes_none = r.canonical_bytes();
+
+        r.moved_job_path = Some(String::new());
+        let bytes_empty = r.canonical_bytes();
+
+        // None (0u8) vs Some("") (1u8 + 0u32 length) must differ.
+        assert_ne!(
+            bytes_none, bytes_empty,
+            "moved_job_path=None vs moved_job_path=Some('') must differ"
+        );
+    }
+
+    #[test]
+    fn test_v1_canonical_bytes_absence_marker_emitted_for_containment() {
+        // Verify that containment=None emits a 0u8 presence marker.
+        let mut r = make_valid_receipt();
+        r.moved_job_path = None;
+        r.containment = None;
+        r.observed_cost = None;
+        let bytes_none = r.canonical_bytes();
+
+        r.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: false,
+            cgroup_path: String::new(),
+            processes_checked: 0,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let bytes_some = r.canonical_bytes();
+
+        // None (0u8) vs Some(...) (1u8 + fields) must differ.
+        assert_ne!(
+            bytes_none, bytes_some,
+            "containment=None vs containment=Some must differ"
         );
     }
 }
