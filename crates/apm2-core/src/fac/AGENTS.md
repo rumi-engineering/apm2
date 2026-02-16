@@ -1327,10 +1327,16 @@ inconsistencies deterministically on worker startup.
   (lane reconciliation) succeeds but Phase 2 (queue reconciliation) fails, a
   partial receipt containing Phase 1 actions is persisted before the Phase 2
   error is propagated, ensuring lane recovery mutations are never silently lost.
+  If partial receipt persistence also fails, a combined error is returned that
+  includes both the Phase-2 failure context and the persistence failure context,
+  so apply-mode lane mutations never lack durable receipt evidence.
 - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
-  (EPERM) marks lane CORRUPT (not recovered). Corrupt lanes with alive PIDs
-  contribute their job_id to the active_job_ids set, preventing queue
-  reconciliation from treating those jobs as orphans.
+  (EPERM) marks lane CORRUPT (not recovered). Corrupt marker persistence
+  failure is a hard error in apply mode — ambiguous states must not proceed
+  without durable corruption evidence, because subsequent startups would not
+  see the lane as corrupt and could attempt unsafe recovery. Corrupt lanes
+  with alive PIDs contribute their job_id to the active_job_ids set, preventing
+  queue reconciliation from treating those jobs as orphans.
 - [INV-RECON-003] All in-memory collections are bounded by hard `MAX_*`
   constants (`MAX_LANE_RECOVERY_ACTIONS=64`,
   `MAX_QUEUE_RECOVERY_ACTIONS=4096`). Receipt deserialization enforces
@@ -1346,7 +1352,9 @@ inconsistencies deterministically on worker startup.
 - [INV-RECON-006] Stale lease recovery routes through the CLEANUP state
   transition (`recover_stale_lease`): the lease is persisted as CLEANUP state,
   then removed to reach IDLE. This mirrors the normal lane lifecycle and
-  prevents bypassing cleanup invariants.
+  prevents bypassing cleanup invariants. CLEANUP persist failure is a hard
+  error — lease removal is blocked without durable CLEANUP evidence to
+  prevent silent lifecycle bypass.
 - [INV-RECON-007] Move operations are fail-closed: `move_file_safe` propagates
   rename failures as `ReconcileError::MoveFailed`. Queue reconciliation counters
   only increment after confirmed rename success. Requeue failures attempt
