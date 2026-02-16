@@ -16,7 +16,7 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = "scripts/ci/test_safety_allowlist.txt";
+pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = ".github/review-gate/test-safety-allowlist.txt";
 pub const REVIEW_ARTIFACTS_REL_PATH: &str = "documents/reviews";
 pub const TRUSTED_REVIEWERS_REL_PATH: &str = ".github/review-gate/trusted-reviewers.json";
 pub const WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH: &str =
@@ -205,15 +205,7 @@ fn should_scan_default_target(rel: &str, abs: &Path) -> bool {
         return false;
     }
 
-    if rel.starts_with("scripts/ci/fixtures/") {
-        return false;
-    }
-
     if path_contains_test_segment(rel) || basename_matches_test_pattern(abs) {
-        return true;
-    }
-
-    if rel.starts_with("scripts/ci/test_") {
         return true;
     }
 
@@ -452,7 +444,7 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
         .ok();
         writeln!(
             output,
-            "ERROR: Add tightly-scoped entries to scripts/ci/test_safety_allowlist.txt only when justified."
+            "ERROR: Add tightly-scoped entries to .github/review-gate/test-safety-allowlist.txt only when justified."
         )
         .ok();
         Ok(CheckExecution {
@@ -1254,10 +1246,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("tests")).expect("create tests");
-        fs::create_dir_all(repo.join("scripts/ci")).expect("create scripts/ci");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
         fs::write(repo.join("tests/unsafe_test.sh"), b"rm -rf /\n").expect("write unsafe test");
         fs::write(
-            repo.join("scripts/ci/test_safety_allowlist.txt"),
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
             b"TSG001|tests/unsafe_test.sh:1\n",
         )
         .expect("write allowlist");
@@ -1266,7 +1258,7 @@ mod tests {
         assert!(check.passed, "unexpected output:\n{}", check.output);
 
         fs::write(
-            repo.join("scripts/ci/test_safety_allowlist.txt"),
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("clear allowlist");

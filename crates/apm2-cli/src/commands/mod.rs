@@ -54,6 +54,7 @@ pub mod fac_gc;
 pub mod fac_job;
 pub mod fac_permissions;
 pub mod fac_pr;
+pub mod fac_preflight;
 pub mod fac_quarantine;
 mod fac_queue_submit;
 pub mod fac_review;

@@ -164,7 +164,7 @@ fn gate_input_paths(gate_name: &str) -> &'static [&'static str] {
         ],
         "test_safety_guard" => &[
             "crates/apm2-cli/src/commands/fac_review/gate_checks.rs",
-            "scripts/ci/test_safety_allowlist.txt",
+            ".github/review-gate/test-safety-allowlist.txt",
         ],
         "workspace_integrity" => &["crates/apm2-cli/src/commands/fac_review/gate_checks.rs"],
         "review_artifact_lint" => &[

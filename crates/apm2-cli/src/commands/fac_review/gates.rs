@@ -29,10 +29,7 @@ use super::gate_attestation::{
     gate_command_for_attestation,
 };
 use super::gate_cache::GateCache;
-use super::jsonl::{
-    GateCompletedEvent, GateErrorEvent, GateProgressTickEvent, GateStartedEvent, StageEvent,
-    emit_jsonl, emit_jsonl_error, read_log_error_hint, ts_now,
-};
+use super::jsonl::read_log_error_hint;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::timeout_policy::{
     MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, max_memory_bytes, parse_memory_limit,
@@ -139,14 +136,7 @@ pub(super) fn resolve_effective_execution_profile(
     ))
 }
 
-/// Run all evidence gates locally with optional bounded test execution.
-///
-/// 1. Requires clean working tree for full mode (`--quick` bypasses this)
-/// 2. Resolves HEAD SHA
-/// 3. Runs merge-conflict gate first (always recomputed)
-/// 4. Runs evidence gates (with bounded test runner if available)
-/// 5. Writes attested gate cache receipts for full runs
-/// 6. Prints summary table
+/// Enqueue FAC gates as a worker job.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
 pub fn run_gates(
@@ -158,162 +148,37 @@ pub fn run_gates(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     json_output: bool,
-    via_worker: bool,
     wait: bool,
     wait_timeout_secs: u64,
 ) -> u8 {
-    if wait && !via_worker {
-        let message = "`--wait` requires `--via-worker`";
-        if json_output {
-            let payload = serde_json::json!({
-                "error": "invalid_arguments",
-                "message": message,
-                "passed": false,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-        } else {
-            eprintln!("ERROR: {message}");
-        }
-        return exit_codes::VALIDATION_ERROR;
-    }
+    run_gates_via_worker(
+        force,
+        quick,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        gate_profile,
+        wait,
+        wait_timeout_secs,
+        json_output,
+    )
+}
 
-    if via_worker {
-        return run_gates_via_worker(
-            force,
-            quick,
-            timeout_seconds,
-            memory_max,
-            pids_max,
-            cpu_quota,
-            gate_profile,
-            wait,
-            wait_timeout_secs,
-            json_output,
-        );
-    }
-
-    let overall_started = Instant::now();
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn run_gates_local_worker(
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+) -> Result<u8, String> {
     let (resolved_profile, effective_cpu_quota) =
-        match resolve_effective_execution_profile(cpu_quota, gate_profile) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                if json_output {
-                    let _ = emit_jsonl_error("gate_error", &err);
-                } else {
-                    let payload = serde_json::json!({
-                        "error": "gate_error",
-                        "message": err,
-                        "passed": false,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-                            "{\"error\":\"serialization_failure\"}".to_string()
-                        })
-                    );
-                }
-                return exit_codes::GENERIC_ERROR;
-            },
-        };
-    if json_output {
-        let _ = emit_jsonl(&StageEvent {
-            event: "gates_started".to_string(),
-            ts: ts_now(),
-            extra: serde_json::json!({
-                "quick": quick,
-                "force": force,
-                "timeout_seconds": timeout_seconds,
-                "memory_max": memory_max,
-                "pids_max": pids_max,
-                "requested_cpu_quota": cpu_quota,
-                "effective_cpu_quota": effective_cpu_quota,
-                "gate_profile": gate_profile.as_str(),
-                "effective_test_parallelism": resolved_profile.test_parallelism,
-            }),
-        });
-    }
-
-    // Build a real-time gate progress callback for JSON mode. Events are
-    // emitted to stdout as each gate starts, heartbeats while running, and
-    // finishes, providing streaming observability instead of buffering until
-    // all gates complete.
-    let gate_progress_callback: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>> =
-        if json_output {
-            Some(Box::new(
-                |event: super::evidence::GateProgressEvent| match event {
-                    super::evidence::GateProgressEvent::Started { gate_name } => {
-                        let _ = emit_jsonl(&GateStartedEvent {
-                            event: "gate_started",
-                            gate: gate_name,
-                            ts: ts_now(),
-                        });
-                    },
-                    super::evidence::GateProgressEvent::Progress {
-                        gate_name,
-                        elapsed_secs,
-                        bytes_streamed,
-                    } => {
-                        let _ = emit_jsonl(&GateProgressTickEvent {
-                            event: "gate_progress",
-                            gate: gate_name,
-                            elapsed_secs,
-                            bytes_streamed,
-                            ts: ts_now(),
-                        });
-                    },
-                    super::evidence::GateProgressEvent::Completed {
-                        gate_name,
-                        passed,
-                        duration_secs,
-                        log_path,
-                        bytes_written,
-                        bytes_total,
-                        was_truncated,
-                        log_bundle_hash,
-                        error_hint,
-                    } => {
-                        let status = if passed { "pass" } else { "fail" }.to_string();
-                        let _ = emit_jsonl(&GateCompletedEvent {
-                            event: "gate_completed",
-                            gate: gate_name.clone(),
-                            status,
-                            duration_secs,
-                            log_path: log_path.clone(),
-                            bytes_written,
-                            bytes_total,
-                            was_truncated,
-                            log_bundle_hash: log_bundle_hash.clone(),
-                            error_hint: error_hint.clone(),
-                            ts: ts_now(),
-                        });
-                        if !passed {
-                            let _ = emit_jsonl(&GateErrorEvent {
-                                event: "gate_error",
-                                gate: gate_name,
-                                error: error_hint.unwrap_or_else(|| {
-                                    "gate failed (see log for details)".to_string()
-                                }),
-                                log_path,
-                                duration_secs: Some(duration_secs),
-                                bytes_written,
-                                bytes_total,
-                                was_truncated,
-                                log_bundle_hash,
-                                ts: ts_now(),
-                            });
-                        }
-                    },
-                },
-            ))
-        } else {
-            None
-        };
-
-    match run_gates_inner(
+        resolve_effective_execution_profile(cpu_quota, gate_profile)?;
+    let summary = run_gates_inner(
         force,
         quick,
         timeout_seconds,
@@ -322,79 +187,14 @@ pub fn run_gates(
         &effective_cpu_quota,
         gate_profile,
         resolved_profile.test_parallelism,
-        !json_output,
-        gate_progress_callback,
-    ) {
-        Ok(summary) => {
-            if json_output {
-                // Gate-level events were already streamed in real-time via the
-                // callback. Only the summary/completion events are emitted here.
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_completed".to_string(),
-                    ts: ts_now(),
-                    extra: serde_json::json!({
-                        "passed": summary.passed,
-                        "duration_secs": overall_started.elapsed().as_secs(),
-                        "gate_count": summary.gates.len(),
-                    }),
-                });
-                let summary_value =
-                    serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}));
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_summary".to_string(),
-                    ts: ts_now(),
-                    extra: summary_value,
-                });
-            } else {
-                // JSON-only: emit the summary as pretty-printed JSON.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            }
-            if summary.passed {
-                exit_codes::SUCCESS
-            } else {
-                exit_codes::GENERIC_ERROR
-            }
-        },
-        Err(err) => {
-            if json_output {
-                let _ = emit_jsonl_error("gate_error", &err);
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_completed".to_string(),
-                    ts: ts_now(),
-                    extra: serde_json::json!({
-                        "passed": false,
-                        "duration_secs": overall_started.elapsed().as_secs(),
-                        "error": err,
-                    }),
-                });
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_summary".to_string(),
-                    ts: ts_now(),
-                    extra: serde_json::json!({
-                        "passed": false,
-                        "error": err,
-                    }),
-                });
-            } else {
-                // JSON-only: emit the error as a structured JSON object.
-                let payload = serde_json::json!({
-                    "error": "gate_error",
-                    "message": err,
-                    "passed": false,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
+        false,
+        None,
+    )?;
+    Ok(if summary.passed {
+        exit_codes::SUCCESS
+    } else {
+        exit_codes::GENERIC_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1595,14 +1395,12 @@ mod tests {
         fs::create_dir_all(&repo).expect("create workspace");
         let apm2_home = temp_dir.path().join("apm2_home");
         let bin_dir = temp_dir.path().join("fake-bin");
-        let scripts_dir = repo.join("scripts").join("ci");
         let review_dir = repo.join("documents").join("reviews");
         let review_gate_dir = repo.join(".github").join("review-gate");
         let log_file = repo.join(".fac_gate_env_log");
 
         fs::create_dir_all(apm2_home.join("private").join("fac")).expect("create apm2 home");
         fs::create_dir_all(&bin_dir).expect("create fake bin dir");
-        fs::create_dir_all(&scripts_dir).expect("create scripts dir");
         fs::create_dir_all(&review_dir).expect("create review dir");
         fs::create_dir_all(&review_gate_dir).expect("create review gate dir");
 
@@ -1618,8 +1416,11 @@ mod tests {
         #[allow(clippy::literal_string_with_formatting_args)]
         let fake_cargo = "#!/bin/sh\necho \"phase=$1|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\nexit 0\n";
         fs::write(bin_dir.join("cargo"), fake_cargo).expect("write fake cargo");
-        fs::write(scripts_dir.join("test_safety_allowlist.txt"), b"# empty\n")
-            .expect("write allowlist");
+        fs::write(
+            review_gate_dir.join("test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
 
         let prompt = concat!(
             "{\n",

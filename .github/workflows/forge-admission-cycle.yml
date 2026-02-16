@@ -70,9 +70,10 @@ jobs:
       - name: Enforce FAC credential posture lint
         run: |
           set -euo pipefail
-          ./scripts/ci/credential_hardening.sh lint \
+          cargo run --quiet -p apm2-cli -- \
+            fac preflight credential lint \
             .github/workflows/forge-admission-cycle.yml \
-            scripts/ci/fac_preflight_authorization.sh
+            crates/apm2-cli/src/commands/fac_preflight.rs
 
       - name: Evaluate trusted workflow context
         env:
@@ -86,7 +87,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          ./scripts/ci/fac_preflight_authorization.sh
+          cargo run --quiet -p apm2-cli -- fac preflight authorization
 
   forge-admission-cycle:
     name: apm2 / Forge Admission Cycle
@@ -118,7 +119,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ./scripts/ci/credential_hardening.sh runtime
+          cargo run --quiet -p apm2-cli -- fac preflight credential runtime
 
           if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
             pr_number="${{ github.event.pull_request.number }}"
@@ -138,7 +139,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ./scripts/ci/credential_hardening.sh runtime
+          cargo run --quiet -p apm2-cli -- fac preflight credential runtime
 
           repo="${{ github.repository }}"
           pr_number="${{ steps.pr-context.outputs.pr_number }}"

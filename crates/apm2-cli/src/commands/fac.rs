@@ -70,7 +70,7 @@ use subtle::ConstantTimeEq;
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 pub use crate::commands::fac_broker::BrokerArgs;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
-use crate::commands::{fac_broker, fac_gc, fac_pr, fac_quarantine, fac_review};
+use crate::commands::{fac_broker, fac_gc, fac_pr, fac_preflight, fac_quarantine, fac_review};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -135,6 +135,10 @@ pub enum FacSubcommand {
     /// integrity, and review artifact lint. Results are cached per-SHA so
     /// `apm2 fac pipeline` can skip gates that already passed.
     Gates(GatesArgs),
+
+    /// Internal: CI preflight checks for credential posture and workflow trust.
+    #[command(hide = true)]
+    Preflight(PreflightArgs),
 
     /// Query projection-backed work authority via daemon operator IPC.
     ///
@@ -383,18 +387,52 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub json: bool,
 
-    /// Enqueue gates as a FAC worker job so RFC-0029 queue/budget admission
-    /// is enforced before execution.
-    #[arg(long, default_value_t = false)]
-    pub via_worker: bool,
-
-    /// Wait for queued gates job completion (requires `--via-worker`).
+    /// Wait for queued gates job completion.
     #[arg(long, default_value_t = false)]
     pub wait: bool,
 
     /// Maximum wait time in seconds when `--wait` is enabled.
     #[arg(long, default_value_t = 1200)]
     pub wait_timeout_secs: u64,
+}
+
+/// Arguments for `apm2 fac preflight`.
+#[derive(Debug, Args)]
+pub struct PreflightArgs {
+    #[command(subcommand)]
+    pub subcommand: PreflightSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PreflightSubcommand {
+    /// Credential posture checks (`runtime` or `lint`).
+    Credential(PreflightCredentialArgs),
+    /// Workflow trust-policy authorization check.
+    Authorization(PreflightAuthorizationArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PreflightCredentialArgs {
+    /// Credential preflight mode.
+    #[arg(value_enum)]
+    pub mode: fac_preflight::CredentialMode,
+
+    /// Optional paths to scan for lint mode.
+    ///
+    /// Ignored in `runtime` mode.
+    #[arg(value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PreflightAuthorizationArgs {
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -1986,6 +2024,7 @@ pub fn run_fac(
     if !matches!(
         cmd.subcommand,
         FacSubcommand::Gates(_)
+            | FacSubcommand::Preflight(_)
             | FacSubcommand::Doctor(_)
             | FacSubcommand::Lane(_)
             | FacSubcommand::Services(_)
@@ -2017,10 +2056,19 @@ pub fn run_fac(
             &args.cpu_quota,
             args.gate_profile,
             resolve_json(args.json),
-            args.via_worker,
             args.wait,
             args.wait_timeout_secs,
         ),
+        FacSubcommand::Preflight(args) => match &args.subcommand {
+            PreflightSubcommand::Credential(credential_args) => fac_preflight::run_credential(
+                credential_args.mode,
+                &credential_args.paths,
+                resolve_json(credential_args.json),
+            ),
+            PreflightSubcommand::Authorization(auth_args) => {
+                fac_preflight::run_workflow_authorization(resolve_json(auth_args.json))
+            },
+        },
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
                 run_work_status(status_args, operator_socket, resolve_json(status_args.json))
@@ -2593,6 +2641,7 @@ fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
 const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool {
     match subcommand {
         FacSubcommand::Gates(_)
+        | FacSubcommand::Preflight(_)
         | FacSubcommand::Work(_)
         | FacSubcommand::Doctor(_)
         | FacSubcommand::Services(_)
@@ -6025,7 +6074,6 @@ mod tests {
                     fac_review::GateThroughputProfile::Throughput
                 );
                 assert_eq!(args.cpu_quota, "auto");
-                assert!(!args.via_worker);
                 assert!(!args.wait);
                 assert_eq!(args.wait_timeout_secs, 1200);
             },
@@ -6034,23 +6082,98 @@ mod tests {
     }
 
     #[test]
-    fn test_gates_worker_queue_flags_parse() {
+    fn test_gates_wait_flags_parse() {
         let parsed = FacLogsCliHarness::try_parse_from([
             "fac",
             "gates",
-            "--via-worker",
             "--wait",
             "--wait-timeout-secs",
             "90",
         ])
-        .expect("gates parser should accept worker queue flags");
+        .expect("gates parser should accept wait flags");
         match parsed.subcommand {
             FacSubcommand::Gates(args) => {
-                assert!(args.via_worker);
                 assert!(args.wait);
                 assert_eq!(args.wait_timeout_secs, 90);
             },
             other => panic!("expected gates subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preflight_credential_runtime_flags_parse() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "preflight",
+            "credential",
+            "runtime",
+            "--json",
+        ])
+        .expect("preflight credential runtime should parse");
+        match parsed.subcommand {
+            FacSubcommand::Preflight(args) => match args.subcommand {
+                PreflightSubcommand::Credential(credential_args) => {
+                    assert_eq!(credential_args.mode, fac_preflight::CredentialMode::Runtime);
+                    assert!(credential_args.paths.is_empty());
+                    assert!(credential_args.json);
+                },
+                other @ PreflightSubcommand::Authorization(_) => {
+                    panic!("expected preflight credential subcommand, got {other:?}")
+                },
+            },
+            other => panic!("expected preflight subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preflight_credential_lint_paths_parse() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "preflight",
+            "credential",
+            "lint",
+            ".github/workflows/forge-admission-cycle.yml",
+            "crates/apm2-cli/src/commands/fac_preflight.rs",
+        ])
+        .expect("preflight credential lint should parse");
+        match parsed.subcommand {
+            FacSubcommand::Preflight(args) => match args.subcommand {
+                PreflightSubcommand::Credential(credential_args) => {
+                    assert_eq!(credential_args.mode, fac_preflight::CredentialMode::Lint);
+                    assert_eq!(credential_args.paths.len(), 2);
+                    assert_eq!(
+                        credential_args.paths[0],
+                        PathBuf::from(".github/workflows/forge-admission-cycle.yml")
+                    );
+                    assert_eq!(
+                        credential_args.paths[1],
+                        PathBuf::from("crates/apm2-cli/src/commands/fac_preflight.rs")
+                    );
+                    assert!(!credential_args.json);
+                },
+                other @ PreflightSubcommand::Authorization(_) => {
+                    panic!("expected preflight credential subcommand, got {other:?}")
+                },
+            },
+            other => panic!("expected preflight subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preflight_authorization_flags_parse() {
+        let parsed =
+            FacLogsCliHarness::try_parse_from(["fac", "preflight", "authorization", "--json"])
+                .expect("preflight authorization should parse");
+        match parsed.subcommand {
+            FacSubcommand::Preflight(args) => match args.subcommand {
+                PreflightSubcommand::Authorization(auth_args) => {
+                    assert!(auth_args.json);
+                },
+                other @ PreflightSubcommand::Credential(_) => {
+                    panic!("expected preflight authorization subcommand, got {other:?}")
+                },
+            },
+            other => panic!("expected preflight subcommand, got {other:?}"),
         }
     }
 
@@ -6092,6 +6215,13 @@ mod tests {
             json: false,
         });
         assert!(subcommand_requests_machine_output(&worker));
+
+        let preflight = FacSubcommand::Preflight(PreflightArgs {
+            subcommand: PreflightSubcommand::Authorization(PreflightAuthorizationArgs {
+                json: true,
+            }),
+        });
+        assert!(subcommand_requests_machine_output(&preflight));
     }
 
     #[test]

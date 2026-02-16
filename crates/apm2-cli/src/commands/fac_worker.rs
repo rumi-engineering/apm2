@@ -120,8 +120,8 @@ mod fac_review_api {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::fn_params_excessive_bools)]
-    pub fn run_gates(
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn run_gates_local_worker(
         _force: bool,
         _quick: bool,
         _timeout_seconds: u64,
@@ -129,12 +129,8 @@ mod fac_review_api {
         _pids_max: u64,
         _cpu_quota: &str,
         _gate_profile: GateThroughputProfile,
-        _json_output: bool,
-        _via_worker: bool,
-        _wait: bool,
-        _wait_timeout_secs: u64,
-    ) -> u8 {
-        crate::exit_codes::codes::GENERIC_ERROR
+    ) -> Result<u8, String> {
+        Ok(crate::exit_codes::codes::GENERIC_ERROR)
     }
 }
 
@@ -1289,7 +1285,7 @@ fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
     // The worker is single-threaded; changing process CWD here is scoped by
     // `CurrentDirGuard` and restored on all return paths.
     let _dir_guard = CurrentDirGuard::enter(&options.workspace_root)?;
-    Ok(fac_review_api::run_gates(
+    fac_review_api::run_gates_local_worker(
         options.force,
         options.quick,
         options.timeout_seconds,
@@ -1297,11 +1293,7 @@ fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
         options.pids_max,
         &options.cpu_quota,
         options.gate_profile,
-        false,
-        false,
-        false,
-        0,
-    ))
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1317,6 +1309,7 @@ fn execute_queued_gates_job(
     canonicalizer_tuple_digest: &str,
     policy_hash: &str,
 ) -> JobOutcome {
+    let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
         Ok(options) => options,
         Err(reason) => {
@@ -1345,6 +1338,7 @@ fn execute_queued_gates_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
                 None,
             ) {
                 eprintln!(
@@ -1388,6 +1382,7 @@ fn execute_queued_gates_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1427,6 +1422,7 @@ fn execute_queued_gates_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            None,
         ) {
             eprintln!(
                 "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1465,6 +1461,7 @@ fn execute_queued_gates_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1475,6 +1472,7 @@ fn execute_queued_gates_job(
     };
 
     if exit_code == exit_codes::SUCCESS {
+        let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
         if let Err(receipt_err) = emit_job_receipt(
             fac_root,
             spec,
@@ -1489,6 +1487,7 @@ fn execute_queued_gates_job(
             None,
             policy_hash,
             None,
+            Some(observed_cost),
         ) {
             eprintln!("worker: receipt emission failed for gates job: {receipt_err}");
             if let Err(move_err) = move_to_dir_safe(
@@ -1515,6 +1514,7 @@ fn execute_queued_gates_job(
         }
         return JobOutcome::Completed {
             job_id: spec.job_id.clone(),
+            observed_cost: Some(observed_cost),
         };
     }
 
@@ -1544,6 +1544,7 @@ fn execute_queued_gates_job(
         Some(canonicalizer_tuple_digest),
         moved_path.as_deref(),
         policy_hash,
+        None,
         None,
     ) {
         eprintln!("worker: WARNING: receipt emission failed for denied gates job: {receipt_err}");

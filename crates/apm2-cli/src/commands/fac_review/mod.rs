@@ -4081,7 +4081,6 @@ pub fn run_gates(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     json_output: bool,
-    via_worker: bool,
     wait: bool,
     wait_timeout_secs: u64,
 ) -> u8 {
@@ -4094,9 +4093,30 @@ pub fn run_gates(
         cpu_quota,
         gate_profile,
         json_output,
-        via_worker,
         wait,
         wait_timeout_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn run_gates_local_worker(
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+) -> Result<u8, String> {
+    gates::run_gates_local_worker(
+        force,
+        quick,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        gate_profile,
     )
 }
 
