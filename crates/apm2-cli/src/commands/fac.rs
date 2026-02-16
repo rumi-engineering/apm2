@@ -6490,6 +6490,7 @@ mod tests {
                 verdict: "Allow".to_string(),
                 queue_lane: "consume".to_string(),
                 defect_reason: None,
+                cost_estimate_ticks: None,
             }),
             eio29_budget_admission: Some(BudgetAdmissionTrace {
                 verdict: "Allow".to_string(),

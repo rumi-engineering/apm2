@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::determinism::canonicalize_json;
+use crate::economics::cost_model::CostModelV1;
 use crate::economics::queue_admission::QueueLane;
 
 /// Scheduler state schema identifier for on-disk versioning.
@@ -35,6 +37,7 @@ const SCHEDULER_STATE_HASH_DOMAIN: &[u8] = b"apm2.fac.scheduler_state.v1";
 
 /// Persisted scheduler state for RFC-0029 anti-starvation continuity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerStateV1 {
     /// Schema identifier.
     pub schema: String,
@@ -44,12 +47,17 @@ pub struct SchedulerStateV1 {
     pub last_evaluation_tick: u64,
     /// Epoch seconds of persistence.
     pub persisted_at_secs: u64,
+    /// TCK-00532: Per-job-kind cost model for queue admission.
+    /// Optional for backward compatibility with pre-TCK-00532 state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_model: Option<CostModelV1>,
     /// BLAKE3 content hash for integrity.
     pub content_hash: String,
 }
 
 /// Snapshot of a single lane's scheduler counters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaneSnapshot {
     /// Lane name (e.g. `stop_revoke`, `control`).
     pub lane: String,
@@ -59,17 +67,20 @@ pub struct LaneSnapshot {
     pub max_wait_ticks: u64,
 }
 
-/// Compute the scheduler content hash.
+/// Compute the scheduler content hash using CAC-JSON canonicalization
+/// (SP-INV-004).
 /// # Errors
-/// Returns an error if JSON serialization fails.
+/// Returns an error if JSON serialization or canonicalization fails.
 pub fn compute_scheduler_state_content_hash(state: &SchedulerStateV1) -> Result<String, String> {
     let mut normalized = state.clone();
     normalized.content_hash = String::new();
-    let canonical = serde_json::to_vec(&normalized)
+    let json_str = serde_json::to_string(&normalized)
         .map_err(|e| format!("cannot serialize scheduler state for hashing: {e}"))?;
+    let canonical = canonicalize_json(&json_str)
+        .map_err(|e| format!("cannot canonicalize scheduler state for hashing: {e}"))?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(SCHEDULER_STATE_HASH_DOMAIN);
-    hasher.update(&canonical);
+    hasher.update(canonical.as_bytes());
     Ok(format!("b3-256:{}", hasher.finalize().to_hex()))
 }
 
@@ -143,6 +154,13 @@ pub fn load_scheduler_state(fac_root: &Path) -> Result<Option<SchedulerStateV1>,
                 state_max_backlog()
             ));
         }
+    }
+
+    // TCK-00532: Validate cost model if present.
+    if let Some(ref cost_model) = state.cost_model {
+        cost_model
+            .validate()
+            .map_err(|e| format!("invalid cost model in scheduler state: {e}"))?;
     }
 
     let expected = compute_scheduler_state_content_hash(&state)?;
@@ -337,6 +355,7 @@ mod tests {
             lane_snapshots: snapshots,
             last_evaluation_tick: 99,
             persisted_at_secs: 12_345,
+            cost_model: None,
             content_hash: String::new(),
         };
         state.content_hash = compute_scheduler_state_content_hash(&state).expect("hash");
@@ -450,6 +469,7 @@ mod tests {
             lane_snapshots: snapshots,
             last_evaluation_tick: 321,
             persisted_at_secs: 12_345,
+            cost_model: None,
             content_hash: String::new(),
         };
         let state = SchedulerStateV1 {
@@ -506,5 +526,35 @@ mod tests {
         let data = serde_json::to_vec_pretty(&state).expect("serialize");
         std::fs::write(&state_path, data).expect("write");
         assert!(load_scheduler_state(dir.path()).is_err());
+    }
+
+    #[test]
+    fn deny_unknown_fields_scheduler_state_v1() {
+        // CTR-1604: boundary objects must reject unknown fields.
+        let json = r#"{
+            "schema": "apm2.scheduler_state.v1",
+            "lane_snapshots": [],
+            "last_evaluation_tick": 0,
+            "persisted_at_secs": 0,
+            "content_hash": "",
+            "unexpected_field": "injected"
+        }"#;
+        let result: Result<SchedulerStateV1, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "SchedulerStateV1 must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_lane_snapshot() {
+        let json = r#"{
+            "lane": "control",
+            "backlog": 1,
+            "max_wait_ticks": 10,
+            "extra": "data"
+        }"#;
+        let result: Result<LaneSnapshot, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "LaneSnapshot must reject unknown fields");
     }
 }
