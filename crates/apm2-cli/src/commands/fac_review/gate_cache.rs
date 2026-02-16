@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -172,8 +173,17 @@ fn file_is_symlink(path: &Path) -> Result<bool, String> {
 }
 
 fn read_bounded(path: &Path) -> Result<String, String> {
-    let metadata =
-        fs::metadata(path).map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing to read non-file cache path {}",
+            path.display()
+        ));
+    }
     if metadata.len() > MAX_CACHE_READ_BYTES as u64 {
         return Err(format!(
             "refusing oversized cache file {} ({} bytes)",
@@ -181,7 +191,10 @@ fn read_bounded(path: &Path) -> Result<String, String> {
             metadata.len()
         ));
     }
-    fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    Ok(content)
 }
 
 impl GateCache {

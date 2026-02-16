@@ -4,7 +4,8 @@
 //! produce cache misses, never false-positive reuse.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 const ATTESTATION_SCHEMA: &str = "apm2.fac.gate_attestation.v2";
 const ATTESTATION_DOMAIN: &str = "apm2.fac.gate.attestation/v2";
 const POLICY_SCHEMA: &str = "apm2.fac.gate_reuse_policy.v1";
+const MAX_ATTESTATION_INPUT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateResourcePolicy {
@@ -236,8 +238,39 @@ fn git_rev_parse(workspace_root: &Path, rev: &str) -> Option<String> {
 }
 
 fn file_sha256(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
-    Some(sha256_hex(&bytes))
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    if metadata.len() > MAX_ATTESTATION_INPUT_FILE_BYTES {
+        return None;
+    }
+
+    let mut file = File::open(path).ok()?;
+    let opened_metadata = file.metadata().ok()?;
+    if !opened_metadata.is_file() {
+        return None;
+    }
+    if opened_metadata.len() > MAX_ATTESTATION_INPUT_FILE_BYTES {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    let mut limited = (&mut file).take(MAX_ATTESTATION_INPUT_FILE_BYTES + 1);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = limited.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    if limited.limit() == 0 {
+        return None;
+    }
+
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn input_digest(workspace_root: &Path, gate_name: &str) -> String {
@@ -416,12 +449,15 @@ pub const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use serde_json::{Map, Value, json};
+    use tempfile::tempdir;
 
     use super::{
         ALLOWLISTED_ENV_EXACT, ALLOWLISTED_ENV_PREFIXES, GateResourcePolicy, canonical_json_bytes,
-        command_digest, compute_gate_attestation, environment_facts, gate_command_for_attestation,
-        gate_input_paths,
+        command_digest, compute_gate_attestation, environment_facts, file_sha256,
+        gate_command_for_attestation, gate_input_paths,
     };
 
     #[test]
@@ -653,6 +689,37 @@ mod tests {
         assert_ne!(
             v1_schema, v2_schema,
             "v1 and v2 attestation schemas must differ to invalidate old cache entries"
+        );
+    }
+
+    #[test]
+    fn file_sha256_rejects_oversized_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("oversized.lock");
+        let file = std::fs::File::create(&path).expect("create oversized file");
+        file.set_len(super::MAX_ATTESTATION_INPUT_FILE_BYTES + 1)
+            .expect("set oversized length");
+        assert!(
+            file_sha256(&path).is_none(),
+            "oversized attestation inputs must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_sha256_rejects_symlink() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target.txt");
+        let mut file = std::fs::File::create(&target).expect("create target");
+        file.write_all(b"attestation-target")
+            .expect("write target bytes");
+
+        let symlink_path = dir.path().join("linked.txt");
+        std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
+
+        assert!(
+            file_sha256(&symlink_path).is_none(),
+            "symlink inputs must be rejected for attestation hashing"
         );
     }
 }
