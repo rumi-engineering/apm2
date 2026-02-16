@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::economics::cost_model::CostModelV1;
 use crate::economics::queue_admission::QueueLane;
 
 /// Scheduler state schema identifier for on-disk versioning.
@@ -44,6 +45,10 @@ pub struct SchedulerStateV1 {
     pub last_evaluation_tick: u64,
     /// Epoch seconds of persistence.
     pub persisted_at_secs: u64,
+    /// TCK-00532: Per-job-kind cost model for queue admission.
+    /// Optional for backward compatibility with pre-TCK-00532 state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_model: Option<CostModelV1>,
     /// BLAKE3 content hash for integrity.
     pub content_hash: String,
 }
@@ -143,6 +148,13 @@ pub fn load_scheduler_state(fac_root: &Path) -> Result<Option<SchedulerStateV1>,
                 state_max_backlog()
             ));
         }
+    }
+
+    // TCK-00532: Validate cost model if present.
+    if let Some(ref cost_model) = state.cost_model {
+        cost_model
+            .validate()
+            .map_err(|e| format!("invalid cost model in scheduler state: {e}"))?;
     }
 
     let expected = compute_scheduler_state_content_hash(&state)?;
@@ -337,6 +349,7 @@ mod tests {
             lane_snapshots: snapshots,
             last_evaluation_tick: 99,
             persisted_at_secs: 12_345,
+            cost_model: None,
             content_hash: String::new(),
         };
         state.content_hash = compute_scheduler_state_content_hash(&state).expect("hash");
@@ -450,6 +463,7 @@ mod tests {
             lane_snapshots: snapshots,
             last_evaluation_tick: 321,
             persisted_at_secs: 12_345,
+            cost_model: None,
             content_hash: String::new(),
         };
         let state = SchedulerStateV1 {

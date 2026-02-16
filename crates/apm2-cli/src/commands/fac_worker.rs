@@ -351,8 +351,14 @@ pub fn run_fac_worker(
         },
     );
 
-    let mut queue_state = match load_scheduler_state(&fac_root) {
-        Ok(Some(saved)) => QueueSchedulerState::from_persisted(&saved),
+    let (mut queue_state, cost_model) = match load_scheduler_state(&fac_root) {
+        Ok(Some(saved)) => {
+            let cm = saved
+                .cost_model
+                .clone()
+                .unwrap_or_else(apm2_core::economics::CostModelV1::with_defaults);
+            (QueueSchedulerState::from_persisted(&saved), cm)
+        },
         Ok(None) => {
             let recovery = SchedulerRecoveryReceipt {
                 schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
@@ -374,7 +380,10 @@ pub fn run_fac_worker(
                     recovery.schema, recovery.reason, recovery.timestamp_secs
                 );
             }
-            QueueSchedulerState::new()
+            (
+                QueueSchedulerState::new(),
+                apm2_core::economics::CostModelV1::with_defaults(),
+            )
         },
         Err(e) => {
             let recovery = SchedulerRecoveryReceipt {
@@ -400,7 +409,10 @@ pub fn run_fac_worker(
                     recovery.schema, recovery.reason, recovery.timestamp_secs
                 );
             }
-            QueueSchedulerState::new()
+            (
+                QueueSchedulerState::new(),
+                apm2_core::economics::CostModelV1::with_defaults(),
+            )
         },
     };
 
@@ -657,6 +669,7 @@ pub fn run_fac_worker(
                         &fac_root,
                         &queue_state,
                         broker.current_tick(),
+                        Some(&cost_model),
                     ) {
                         output_worker_error(json_output, &persist_err);
                     }
@@ -675,6 +688,7 @@ pub fn run_fac_worker(
                     &fac_root,
                     &cycle_scheduler,
                     broker.current_tick(),
+                    Some(&cost_model),
                 ) {
                     output_worker_error(json_output, &persist_err);
                     return exit_codes::GENERIC_ERROR;
@@ -733,6 +747,7 @@ pub fn run_fac_worker(
                     summary.jobs_completed as u64,
                     summary.jobs_denied as u64,
                     summary.jobs_quarantined as u64,
+                    &cost_model,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -837,6 +852,7 @@ pub fn run_fac_worker(
                     &fac_root,
                     &cycle_scheduler,
                     broker.current_tick(),
+                    Some(&cost_model),
                 ) {
                     output_worker_error(json_output, &persist_err);
                     return exit_codes::GENERIC_ERROR;
@@ -849,9 +865,12 @@ pub fn run_fac_worker(
             }
         }
 
-        if let Err(persist_err) =
-            persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick())
-        {
+        if let Err(persist_err) = persist_queue_scheduler_state(
+            &fac_root,
+            &cycle_scheduler,
+            broker.current_tick(),
+            Some(&cost_model),
+        ) {
             output_worker_error(json_output, &persist_err);
             return exit_codes::GENERIC_ERROR;
         }
@@ -875,9 +894,12 @@ pub fn run_fac_worker(
         emit_worker_summary(&summary);
     }
 
-    if let Err(persist_err) =
-        persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick())
-    {
+    if let Err(persist_err) = persist_queue_scheduler_state(
+        &fac_root,
+        &queue_state,
+        broker.current_tick(),
+        Some(&cost_model),
+    ) {
         output_worker_error(json_output, &persist_err);
         return exit_codes::GENERIC_ERROR;
     }
@@ -889,9 +911,11 @@ fn persist_queue_scheduler_state(
     fac_root: &Path,
     queue_state: &QueueSchedulerState,
     current_tick: u64,
+    cost_model: Option<&apm2_core::economics::CostModelV1>,
 ) -> Result<(), String> {
     let mut state = queue_state.to_scheduler_state_v1(current_tick);
     state.persisted_at_secs = current_timestamp_epoch_secs();
+    state.cost_model = cost_model.cloned();
     persist_scheduler_state(fac_root, &state)
         .map(|_| ())
         .map_err(|e| format!("failed to persist scheduler state: {e}"))
@@ -1111,6 +1135,7 @@ fn process_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
+    cost_model: &apm2_core::economics::CostModelV1,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -1765,7 +1790,8 @@ fn process_job(
         convergence_horizon: convergence,
         convergence_receipts,
         required_authority_sets: Vec::new(),
-        cost: 1,
+        // TCK-00532: Use cost model estimate instead of hardcoded 1.
+        cost: cost_model.queue_cost(&spec.kind),
         current_tick,
     };
 

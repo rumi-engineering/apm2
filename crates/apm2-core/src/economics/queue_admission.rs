@@ -809,6 +809,11 @@ pub struct QueueAdmissionTrace {
     pub tp003_passed: bool,
     /// Current tick at evaluation time.
     pub evaluated_at_tick: u64,
+    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// Present when the cost model provided the estimate; absent for legacy
+    /// admission traces created before cost model integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_ticks: Option<u64>,
 }
 
 impl QueueAdmissionTrace {
@@ -997,6 +1002,7 @@ impl QueueSchedulerState {
             lane_snapshots,
             last_evaluation_tick: current_tick,
             persisted_at_secs: 0,
+            cost_model: None,
             content_hash: String::new(),
         }
     }
@@ -1436,6 +1442,7 @@ pub fn evaluate_queue_admission(
         tp002_passed,
         tp003_passed,
         evaluated_at_tick: current_tick,
+        cost_estimate_ticks: None,
     };
 
     QueueAdmissionDecision {
@@ -1676,6 +1683,7 @@ pub fn evaluate_anti_entropy_admission(
         tp002_passed: false, // TP-002 not evaluated for anti-entropy
         tp003_passed,
         evaluated_at_tick: current_tick,
+        cost_estimate_ticks: None,
     };
 
     QueueAdmissionDecision {
@@ -1720,6 +1728,7 @@ fn deny_queue(ctx: &DenyContext<'_>) -> QueueAdmissionDecision {
         tp002_passed: ctx.tp002_passed,
         tp003_passed: ctx.tp003_passed,
         evaluated_at_tick: ctx.current_tick,
+        cost_estimate_ticks: None,
     };
 
     QueueAdmissionDecision {

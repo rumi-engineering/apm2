@@ -701,6 +701,13 @@ pub struct FacJobReceiptV1 {
     /// auto-disabled due to containment failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub containment: Option<super::containment::ContainmentTrace>,
+    /// RFC-0029 observed runtime cost metrics (TCK-00532).
+    ///
+    /// Best-effort measurement of actual job resource consumption for
+    /// post-run cost model calibration. Workers populate this from
+    /// wall-clock timers and I/O accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -833,6 +840,17 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        }
+
+        // TCK-00532: Observed job cost. Appended at end for backward
+        // compatibility with pre-TCK-00532 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
         }
 
         bytes
@@ -972,6 +990,17 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        }
+
+        // TCK-00532: Observed job cost. Appended at end for backward
+        // compatibility with pre-TCK-00532 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
         }
 
         bytes
@@ -1202,6 +1231,7 @@ pub struct FacJobReceiptV1Builder {
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
+    observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1302,6 +1332,16 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
         self.containment = Some(trace);
+        self
+    }
+
+    /// Sets the observed runtime cost metrics (TCK-00532).
+    #[must_use]
+    pub const fn observed_cost(
+        mut self,
+        cost: crate::economics::cost_model::ObservedJobCost,
+    ) -> Self {
+        self.observed_cost = Some(cost);
         self
     }
 
@@ -1511,6 +1551,7 @@ impl FacJobReceiptV1Builder {
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
             containment: self.containment,
+            observed_cost: self.observed_cost,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
