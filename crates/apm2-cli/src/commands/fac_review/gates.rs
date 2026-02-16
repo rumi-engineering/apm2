@@ -501,6 +501,11 @@ fn run_gates_inner(
         compute_nextest_test_environment(&policy, &apm2_home, test_parallelism)?;
     let mut bounded = false;
 
+    // TCK-00573 MAJOR-1 fix: compute the effective sandbox hardening hash
+    // BEFORE the profile is moved into build_systemd_bounded_test_command,
+    // so attestation binds to the actual policy-driven profile.
+    let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
+
     let mut env_remove_keys = Vec::new();
     let test_command = if quick {
         None
@@ -574,8 +579,8 @@ fn run_gates_inner(
     // 6. Write attested results to gate cache for full runs only.
     if !quick {
         // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation.
-        let sandbox_hardening_hash =
-            apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+        // Uses the effective policy-driven hash computed above (before the
+        // profile was moved into the bounded test command builder).
         let policy = GateResourcePolicy::from_cli(
             quick,
             timeout_decision.effective_seconds,
