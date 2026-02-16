@@ -653,7 +653,7 @@ pub use safe_rmtree::{
     MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
     safe_rmtree_v1,
 };
-pub use systemd_properties::SystemdUnitProperties;
+pub use systemd_properties::{SandboxHardeningProfile, SystemdUnitProperties};
 pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
     WARM_RECEIPT_SCHEMA, WarmContainment, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1,

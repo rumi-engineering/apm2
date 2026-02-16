@@ -841,6 +841,7 @@ mod tests {
             }),
             eio29_budget_admission: None,
             containment: None,
+            sandbox_hardening_hash: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }

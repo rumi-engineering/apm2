@@ -124,6 +124,7 @@ fn limits_to_properties(limits: BoundedTestLimits<'_>) -> Result<SystemdUnitProp
         timeout_start_sec: limits.timeout_seconds,
         runtime_max_sec: limits.timeout_seconds,
         kill_mode: "control-group".to_string(),
+        sandbox_hardening: apm2_core::fac::SandboxHardeningProfile::default(),
     })
 }
 

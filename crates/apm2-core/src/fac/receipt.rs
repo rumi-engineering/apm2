@@ -701,6 +701,13 @@ pub struct FacJobReceiptV1 {
     /// auto-disabled due to containment failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub containment: Option<super::containment::ContainmentTrace>,
+    /// Sandbox hardening hash for audit (TCK-00573).
+    ///
+    /// BLAKE3 hash of the `SandboxHardeningProfile` used for the job unit,
+    /// formatted as `b3-256:<64hex>`. Enables audit verification that the
+    /// expected hardening profile was applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_hardening_hash: Option<String>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -974,6 +981,16 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
+        // TCK-00573: Sandbox hardening hash. Appended at end for backward
+        // compatibility with pre-TCK-00573 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
         bytes
     }
 
@@ -1180,6 +1197,16 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00573: Validate sandbox hardening hash format if present.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "sandbox_hardening_hash must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1202,6 +1229,7 @@ pub struct FacJobReceiptV1Builder {
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
+    sandbox_hardening_hash: Option<String>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1302,6 +1330,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
         self.containment = Some(trace);
+        self
+    }
+
+    /// Sets the sandbox hardening hash for audit (TCK-00573).
+    #[must_use]
+    pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
+        self.sandbox_hardening_hash = Some(hash.into());
         self
     }
 
@@ -1495,6 +1530,16 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00573: Validate sandbox hardening hash format.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "sandbox_hardening_hash must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
+                ));
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -1511,6 +1556,7 @@ impl FacJobReceiptV1Builder {
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
             containment: self.containment,
+            sandbox_hardening_hash: self.sandbox_hardening_hash,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
