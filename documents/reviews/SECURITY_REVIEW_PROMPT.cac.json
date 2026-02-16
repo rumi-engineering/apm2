@@ -32,8 +32,7 @@
     },
     "constraints": {
       "forbidden_operations": [
-        "NEVER use bare `apm2` — always use `cargo run -p apm2-cli --` so the workspace-built binary is used.",
-        "NEVER pass --sha to any command. The CLI auto-derives the SHA from the PR identity.",
+        "If you're testing local changes, remember not to use the $PATH installed `apm2` — use `cargo run -p apm2-cli --` so the workspace-built binary is used.",
         "All interactions with the repository MUST be read-only. Do not modify any files.",
         "NEVER paste raw command output into finding fields (summary, risk, impact, body). Finding fields must contain your original analysis text only."
       ],
