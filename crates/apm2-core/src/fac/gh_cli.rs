@@ -90,11 +90,13 @@ impl fmt::Debug for GhCommand {
 /// Redact the value of a specific environment variable key in the Debug
 /// representation of a `std::process::Command`.
 ///
-/// The Debug format renders env vars as `"KEY"="VALUE"`. This function
-/// finds `"<key>"="` and replaces everything up to the closing `"` with
-/// `"<key>"="[REDACTED]"`.
+/// The Debug format renders env vars as `KEY="VALUE"` (unquoted key). This
+/// function finds `<key>="` and replaces everything up to the closing `"`
+/// with `<key>="[REDACTED]"`.
 fn redact_env_value_in_debug(debug_str: &str, key: &str) -> String {
-    let needle = format!("\"{key}\"=\"");
+    // std::process::Command Debug renders env vars with unquoted keys:
+    //   GH_TOKEN="secret" OTHER="val" "gh"
+    let needle = format!("{key}=\"");
     let Some(start) = debug_str.find(&needle) else {
         return debug_str.to_string();
     };
@@ -346,23 +348,23 @@ mod tests {
 
     #[test]
     fn redact_env_value_in_debug_handles_missing_key() {
-        let input = r#""gh" "GH_NO_UPDATE_NOTIFIER"="1""#;
+        let input = r#"GH_NO_UPDATE_NOTIFIER="1" "gh""#;
         let result = redact_env_value_in_debug(input, "GH_TOKEN");
         assert_eq!(result, input, "No GH_TOKEN key means no change");
     }
 
     #[test]
     fn redact_env_value_in_debug_replaces_value() {
-        let input = r#""gh" "GH_TOKEN"="secret123" "OTHER"="val""#;
+        let input = r#"GH_TOKEN="secret123" OTHER="val" "gh""#;
         let result = redact_env_value_in_debug(input, "GH_TOKEN");
-        assert_eq!(result, r#""gh" "GH_TOKEN"="[REDACTED]" "OTHER"="val""#);
+        assert_eq!(result, r#"GH_TOKEN="[REDACTED]" OTHER="val" "gh""#);
     }
 
     #[test]
     fn redact_env_value_in_debug_handles_empty_value() {
-        let input = r#""gh" "GH_TOKEN"="" "OTHER"="val""#;
+        let input = r#"GH_TOKEN="" OTHER="val" "gh""#;
         let result = redact_env_value_in_debug(input, "GH_TOKEN");
-        assert_eq!(result, r#""gh" "GH_TOKEN"="[REDACTED]" "OTHER"="val""#);
+        assert_eq!(result, r#"GH_TOKEN="[REDACTED]" OTHER="val" "gh""#);
     }
 
     // --- Deref/DerefMut ---
