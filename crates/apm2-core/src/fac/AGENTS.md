@@ -1569,8 +1569,8 @@ function instead of raw `Command::new("gh")`.
     empty string when no token is resolved (fail-closed: prevents ambient
     inheritance).
   - `GH_CONFIG_DIR` set to `$XDG_CONFIG_HOME/gh` when `XDG_CONFIG_HOME` is
-    available (lane-scoped via TCK-00575), or `/dev/null` otherwise
-    (fail-closed: prevents reads from `~/.config/gh`).
+    available (lane-scoped via TCK-00575), or a deterministic empty temp
+    directory otherwise (fail-closed: prevents reads from `~/.config/gh`).
   - `GH_NO_UPDATE_NOTIFIER=1` to suppress interactive update checks.
   - `NO_COLOR=1` to suppress ANSI color codes for deterministic parsing.
   - `GH_PROMPT_DISABLED=1` to prevent interactive prompts.
@@ -1583,10 +1583,12 @@ function instead of raw `Command::new("gh")`.
 
 `GH_TOKEN` and `GH_CONFIG_DIR` are always explicitly set in the command
 environment. When no token is resolved, `GH_TOKEN` is set to empty string
-and `GH_CONFIG_DIR` is set to `/dev/null`, preventing inheritance of ambient
-authority from the parent process or `~/.config/gh` state. Callers that
-require auth should gate on `require_github_credentials()` before invoking
-`gh`.
+and `GH_CONFIG_DIR` is set to a deterministic empty temp directory under
+`std::env::temp_dir()`, preventing inheritance of ambient authority from the
+parent process or `~/.config/gh` state. The previous `/dev/null` fallback
+caused `gh` to crash with ENOTDIR because `/dev/null` is a character device,
+not a directory. Callers that require auth should gate on
+`require_github_credentials()` before invoking `gh`.
 
 ### Security Invariants (TCK-00597)
 
@@ -1599,8 +1601,10 @@ require auth should gate on `require_github_credentials()` before invoking
 - [INV-GHCLI-004] `GH_TOKEN` is always set in the command environment (empty
   when no token is resolved) to prevent inheritance of ambient `GH_TOKEN`
   from the parent process.
-- [INV-GHCLI-005] `GH_CONFIG_DIR` is always set (to lane-scoped path or
-  `/dev/null`) to prevent `gh` from reading `~/.config/gh` ambient state.
+- [INV-GHCLI-005] `GH_CONFIG_DIR` is always set (to lane-scoped path or an
+  empty temp directory) to prevent `gh` from reading `~/.config/gh` ambient
+  state.
 - [INV-GHCLI-006] `GhCommand` redacts `GH_TOKEN` in its `Debug`
-  implementation (CTR-2604), preventing secret leakage via tracing or
-  debug formatting.
+  implementation using `Command::get_envs()`/`get_args()` structured
+  accessors (CTR-2604), preventing secret leakage via tracing or debug
+  formatting without depending on `Command`'s unstable `Debug` format.

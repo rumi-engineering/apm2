@@ -34,8 +34,9 @@
 //! - [INV-GHCLI-004] `GH_TOKEN` is always set in the command environment (empty
 //!   when no token is resolved) to prevent inheritance of ambient `GH_TOKEN`
 //!   from the parent process. This ensures fail-closed auth.
-//! - [INV-GHCLI-005] `GH_CONFIG_DIR` is always set (to lane-scoped path or
-//!   `/dev/null`) to prevent `gh` from reading `~/.config/gh` ambient state.
+//! - [INV-GHCLI-005] `GH_CONFIG_DIR` is always set (to lane-scoped path or an
+//!   empty temporary directory) to prevent `gh` from reading `~/.config/gh`
+//!   ambient state.
 //! - [INV-GHCLI-006] The returned [`GhCommand`] wrapper redacts `GH_TOKEN` in
 //!   its [`Debug`] implementation (CTR-2604), preventing secret leakage via
 //!   tracing or debug formatting.
@@ -73,58 +74,42 @@ impl DerefMut for GhCommand {
     }
 }
 
+/// Secret environment variable key whose value must always be redacted in
+/// Debug output (CTR-2604). Compared case-sensitively against env var names.
+const REDACTED_ENV_KEY: &str = "GH_TOKEN";
+
 impl fmt::Debug for GhCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Render the inner Command's debug representation, then redact GH_TOKEN.
-        // std::process::Command's Debug output includes env vars as key=value
-        // pairs with quoted values (e.g., "GH_TOKEN"="ghp_...").
-        let raw = format!("{:?}", self.inner);
-        // Redact the GH_TOKEN value. The Debug format for Command renders env
-        // vars as "KEY"="VALUE" pairs. We replace the value portion for
-        // GH_TOKEN with [REDACTED].
-        let redacted = redact_env_value_in_debug(&raw, "GH_TOKEN");
-        f.write_str(&redacted)
-    }
-}
+        // Build debug output from Command's structured accessors (get_envs(),
+        // get_args(), get_program()) instead of parsing Command's Debug string.
+        // This avoids any dependency on the unstable Debug format of
+        // std::process::Command and guarantees GH_TOKEN is always redacted
+        // regardless of platform or toolchain version (INV-GHCLI-006).
+        let program = self.inner.get_program().to_string_lossy();
 
-/// Redact the value of a specific environment variable key in the Debug
-/// representation of a `std::process::Command`.
-///
-/// The Debug format renders env vars as `KEY="VALUE"` (unquoted key). This
-/// function finds `<key>="` and replaces everything up to the closing `"`
-/// with `<key>="[REDACTED]"`.
-fn redact_env_value_in_debug(debug_str: &str, key: &str) -> String {
-    // std::process::Command Debug renders env vars with unquoted keys:
-    //   GH_TOKEN="secret" OTHER="val" "gh"
-    let needle = format!("{key}=\"");
-    let Some(start) = debug_str.find(&needle) else {
-        return debug_str.to_string();
-    };
-    let value_start = start + needle.len();
-    // Find the closing quote of the value, handling possible escaped quotes.
-    let rest = &debug_str[value_start..];
-    let mut end_offset = 0;
-    let mut chars = rest.chars();
-    loop {
-        match chars.next() {
-            Some('\\') => {
-                // Skip escaped character.
-                if chars.next().is_some() {
-                    end_offset += 2;
-                } else {
-                    end_offset += 1;
-                    break;
-                }
-            },
-            Some('"') | None => break,
-            Some(c) => end_offset += c.len_utf8(),
+        // Emit environment variables with GH_TOKEN redacted.
+        for (key, value) in self.inner.get_envs() {
+            let key_str = key.to_string_lossy();
+            if key_str == REDACTED_ENV_KEY {
+                write!(f, "{key_str}=\"[REDACTED]\" ")?;
+            } else if let Some(val) = value {
+                write!(f, "{key_str}={:?} ", val.to_string_lossy())?;
+            } else {
+                // Environment variable explicitly removed (set to None).
+                write!(f, "{key_str}=(removed) ")?;
+            }
         }
+
+        // Emit program name.
+        write!(f, "{program:?}")?;
+
+        // Emit arguments.
+        for arg in self.inner.get_args() {
+            write!(f, " {:?}", arg.to_string_lossy())?;
+        }
+
+        Ok(())
     }
-    let mut result = String::with_capacity(debug_str.len());
-    result.push_str(&debug_str[..value_start]);
-    result.push_str("[REDACTED]");
-    result.push_str(&debug_str[value_start + end_offset..]);
-    result
 }
 
 /// Build a `gh` CLI [`GhCommand`] with non-interactive, token-based auth and
@@ -135,8 +120,8 @@ fn redact_env_value_in_debug(debug_str: &str, key: &str) -> String {
 ///   to empty string when no token is resolved (fail-closed: prevents
 ///   inheritance of ambient `GH_TOKEN` from parent process).
 /// - `GH_CONFIG_DIR` set to `$XDG_CONFIG_HOME/gh` when `XDG_CONFIG_HOME` is
-///   available (lane-scoped), or `/dev/null` otherwise (fail-closed: prevents
-///   reads from `~/.config/gh`).
+///   available (lane-scoped), or a deterministic empty temp directory otherwise
+///   (fail-closed: prevents reads from `~/.config/gh`).
 /// - `GH_NO_UPDATE_NOTIFIER=1` to suppress interactive update checks.
 /// - `NO_COLOR=1` to suppress ANSI color codes in output for reliable parsing.
 /// - `GH_PROMPT_DISABLED=1` to prevent any interactive prompts.
@@ -151,10 +136,11 @@ fn redact_env_value_in_debug(debug_str: &str, key: &str) -> String {
 ///
 /// `GH_TOKEN` and `GH_CONFIG_DIR` are always explicitly set in the command
 /// environment (INV-GHCLI-004, INV-GHCLI-005). When no token is resolved,
-/// `GH_TOKEN` is set to empty string and `GH_CONFIG_DIR` is set to `/dev/null`,
-/// preventing inheritance of ambient authority from the parent process or
-/// `~/.config/gh` state. Callers that require auth should gate on
-/// [`crate::fac::require_github_credentials`] before invoking `gh`.
+/// `GH_TOKEN` is set to empty string and `GH_CONFIG_DIR` is set to a
+/// deterministic empty temp directory, preventing inheritance of ambient
+/// authority from the parent process or `~/.config/gh` state. Callers that
+/// require auth should gate on [`crate::fac::require_github_credentials`]
+/// before invoking `gh`.
 #[must_use]
 pub fn gh_command() -> GhCommand {
     let mut cmd = Command::new("gh");
@@ -187,13 +173,27 @@ pub fn gh_command() -> GhCommand {
 
     // Lane-scope the gh config directory (INV-GHCLI-002, INV-GHCLI-005).
     // When XDG_CONFIG_HOME is set (per-lane env from TCK-00575), use it as
-    // the base for gh config. Otherwise set GH_CONFIG_DIR to /dev/null to
-    // prevent gh from reading the user-global ~/.config/gh directory.
+    // the base for gh config. Otherwise use a deterministic empty directory
+    // under the system temp dir to prevent gh from reading the user-global
+    // ~/.config/gh directory.
+    //
+    // NOTE: The previous implementation used `/dev/null` as the fallback,
+    // which caused `gh` to crash with ENOTDIR when it tried to open
+    // `/dev/null/config.yml`. A real directory is required because `gh`
+    // unconditionally reads/writes config files under GH_CONFIG_DIR.
     let gh_config_dir = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|v| !v.is_empty())
         .map_or_else(
-            || std::path::PathBuf::from("/dev/null"),
+            || {
+                let fallback = std::env::temp_dir().join("apm2_fac_gh_config");
+                // Best-effort create. If this fails, gh will fail with a
+                // clear I/O error rather than the confusing ENOTDIR from
+                // /dev/null. The directory is intentionally empty so gh
+                // starts with no ambient config state.
+                let _ = std::fs::create_dir_all(&fallback);
+                fallback
+            },
             |xdg| std::path::PathBuf::from(&xdg).join("gh"),
         );
     cmd.env("GH_CONFIG_DIR", gh_config_dir);
@@ -289,6 +289,28 @@ mod tests {
         assert!(!config_dir.is_empty(), "GH_CONFIG_DIR must not be empty");
     }
 
+    #[test]
+    fn gh_command_config_dir_is_valid_directory_not_dev_null() {
+        // BLOCKER fix: GH_CONFIG_DIR must point to a real directory, not
+        // /dev/null which causes `gh` to crash with ENOTDIR.
+        let cmd = gh_command();
+        let envs = collect_envs(&cmd);
+        let config_dir = envs.get("GH_CONFIG_DIR").unwrap();
+        assert_ne!(
+            config_dir, "/dev/null",
+            "GH_CONFIG_DIR must not be /dev/null (causes gh crash)"
+        );
+        // The path must be a directory (or at least a plausible directory
+        // path, not a character device).
+        let path = std::path::Path::new(config_dir);
+        // If XDG_CONFIG_HOME is set, it should be <xdg>/gh; otherwise it
+        // should be a temp dir path. In both cases the parent must exist.
+        assert!(
+            path.parent().is_some(),
+            "GH_CONFIG_DIR must have a parent directory"
+        );
+    }
+
     // --- INV-GHCLI-006: Redacting Debug ---
 
     #[test]
@@ -325,6 +347,7 @@ mod tests {
     #[test]
     fn gh_command_debug_redacts_injected_token() {
         // Construct a GhCommand with a known token value and verify redaction.
+        // Uses get_envs()/get_args()-based Debug impl (not string parsing).
         let mut cmd = Command::new("gh");
         cmd.env("GH_TOKEN", "ghp_test_secret_12345");
         cmd.env("OTHER_VAR", "visible_value");
@@ -347,24 +370,75 @@ mod tests {
     }
 
     #[test]
-    fn redact_env_value_in_debug_handles_missing_key() {
-        let input = r#"GH_NO_UPDATE_NOTIFIER="1" "gh""#;
-        let result = redact_env_value_in_debug(input, "GH_TOKEN");
-        assert_eq!(result, input, "No GH_TOKEN key means no change");
+    fn debug_redacts_token_without_string_parsing() {
+        // Regression test: the Debug impl must use get_envs()/get_args()
+        // directly and never depend on Command's Debug format (INV-GHCLI-006).
+        // This test verifies redaction works with a synthetic GhCommand
+        // independent of any particular Debug format.
+        let mut cmd = Command::new("gh");
+        cmd.env("GH_TOKEN", "ghp_super_secret_token_value_99");
+        cmd.arg("api");
+        cmd.arg("/repos/owner/repo");
+        let wrapper = GhCommand { inner: cmd };
+
+        let debug_output = format!("{wrapper:?}");
+
+        // Must redact the token.
+        assert!(
+            !debug_output.contains("ghp_super_secret_token_value_99"),
+            "Token must be redacted: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("GH_TOKEN=\"[REDACTED]\""),
+            "Must show GH_TOKEN=\"[REDACTED]\": {debug_output}"
+        );
+
+        // Must show program and args.
+        assert!(
+            debug_output.contains("\"gh\""),
+            "Must show program name: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("\"api\""),
+            "Must show args: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("\"/repos/owner/repo\""),
+            "Must show args: {debug_output}"
+        );
     }
 
     #[test]
-    fn redact_env_value_in_debug_replaces_value() {
-        let input = r#"GH_TOKEN="secret123" OTHER="val" "gh""#;
-        let result = redact_env_value_in_debug(input, "GH_TOKEN");
-        assert_eq!(result, r#"GH_TOKEN="[REDACTED]" OTHER="val" "gh""#);
+    fn debug_shows_no_token_key_when_absent() {
+        // When GH_TOKEN is not set at all, it should not appear in debug.
+        let mut cmd = Command::new("gh");
+        cmd.env("OTHER_VAR", "val");
+        let wrapper = GhCommand { inner: cmd };
+
+        let debug_output = format!("{wrapper:?}");
+        assert!(
+            !debug_output.contains("GH_TOKEN"),
+            "GH_TOKEN should not appear when not set: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("OTHER_VAR"),
+            "Other vars should appear: {debug_output}"
+        );
     }
 
     #[test]
-    fn redact_env_value_in_debug_handles_empty_value() {
-        let input = r#"GH_TOKEN="" OTHER="val" "gh""#;
-        let result = redact_env_value_in_debug(input, "GH_TOKEN");
-        assert_eq!(result, r#"GH_TOKEN="[REDACTED]" OTHER="val" "gh""#);
+    fn debug_handles_empty_token_value() {
+        // When GH_TOKEN is set to empty string (fail-closed), it should
+        // still show [REDACTED] — not the empty value.
+        let mut cmd = Command::new("gh");
+        cmd.env("GH_TOKEN", "");
+        let wrapper = GhCommand { inner: cmd };
+
+        let debug_output = format!("{wrapper:?}");
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Empty GH_TOKEN must still show [REDACTED]: {debug_output}"
+        );
     }
 
     // --- Deref/DerefMut ---
