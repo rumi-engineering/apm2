@@ -859,7 +859,7 @@ pub struct BundleExportArgs {
 /// Arguments for `apm2 fac bundle import`.
 #[derive(Debug, Args)]
 pub struct BundleImportArgs {
-    /// Path to the evidence bundle envelope JSON file.
+    /// Path to the evidence bundle manifest JSON file.
     pub path: PathBuf,
 
     /// Emit JSON output.
@@ -4595,6 +4595,9 @@ fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
 
 /// Maximum envelope file size for bounded reads during import (256 KiB).
 const MAX_BUNDLE_ENVELOPE_FILE_SIZE: u64 = 262_144;
+/// Maximum manifest file size for bounded reads during import (64 KiB).
+const MAX_BUNDLE_MANIFEST_FILE_SIZE: u64 =
+    apm2_core::fac::evidence_bundle::MAX_MANIFEST_SIZE as u64;
 
 /// Parse a hex-encoded digest string (with optional `b3-256:` prefix) into a
 /// verified 32-byte array, or return `MalformedPolicyDigest` on any failure.
@@ -4894,8 +4897,21 @@ fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
         },
     };
 
-    // Serialize and write the envelope.
-    let data = match apm2_core::fac::evidence_bundle::serialize_envelope(&envelope) {
+    let manifest =
+        match apm2_core::fac::evidence_bundle::build_evidence_bundle_manifest(&envelope, &[]) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "fac_bundle_manifest_build_failed",
+                    &format!("bundle manifest build failed: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        };
+
+    // Serialize and write the envelope + manifest.
+    let envelope_data = match apm2_core::fac::evidence_bundle::serialize_envelope(&envelope) {
         Ok(d) => d,
         Err(e) => {
             return output_error(
@@ -4906,13 +4922,24 @@ fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
             );
         },
     };
+    let manifest_data = match apm2_core::fac::evidence_bundle::serialize_manifest(&manifest) {
+        Ok(d) => d,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_manifest_serialize_failed",
+                &format!("bundle manifest serialize failed: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
 
     // MINOR security fix: use FAC-safe file write (0600 mode, O_NOFOLLOW,
     // symlink check) instead of std::fs::write which inherits default umask
     // and follows symlinks.
     let envelope_path = output_dir.join("envelope.json");
     if let Err(e) =
-        crate::commands::fac_permissions::write_fac_file_with_mode(&envelope_path, &data)
+        crate::commands::fac_permissions::write_fac_file_with_mode(&envelope_path, &envelope_data)
     {
         return output_error(
             json_output,
@@ -4921,11 +4948,23 @@ fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
             exit_codes::GENERIC_ERROR,
         );
     }
+    let manifest_path = output_dir.join("manifest.json");
+    if let Err(e) =
+        crate::commands::fac_permissions::write_fac_file_with_mode(&manifest_path, &manifest_data)
+    {
+        return output_error(
+            json_output,
+            "fac_bundle_manifest_write_failed",
+            &format!("failed to write manifest: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
 
     let result = serde_json::json!({
         "status": "exported",
         "job_id": args.job_id,
         "envelope_path": envelope_path.display().to_string(),
+        "manifest_path": manifest_path.display().to_string(),
         "content_hash": envelope.content_hash,
         "blob_count": envelope.blob_refs.len(),
     });
@@ -4965,6 +5004,8 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
     use std::io::Read;
 
     let path = &args.path;
+    let bundle_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let envelope_path = bundle_dir.join("envelope.json");
 
     // Open once with O_NOFOLLOW — refuses symlinks at the kernel level.
     let file = match open_no_follow_for_import(path) {
@@ -4998,19 +5039,19 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
         return output_error(
             json_output,
             "fac_bundle_import_not_regular_file",
-            &format!("envelope path is not a regular file: {}", path.display()),
+            &format!("manifest path is not a regular file: {}", path.display()),
             exit_codes::VALIDATION_ERROR,
         );
     }
 
-    if metadata.len() > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+    if metadata.len() > MAX_BUNDLE_MANIFEST_FILE_SIZE {
         return output_error(
             json_output,
             "fac_bundle_import_too_large",
             &format!(
-                "envelope file too large: {} bytes > {} max",
+                "manifest file too large: {} bytes > {} max",
                 metadata.len(),
-                MAX_BUNDLE_ENVELOPE_FILE_SIZE
+                MAX_BUNDLE_MANIFEST_FILE_SIZE
             ),
             exit_codes::VALIDATION_ERROR,
         );
@@ -5019,7 +5060,7 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
     // Bounded streaming read from the same handle (no second open).
     let mut data = Vec::new();
     let read_result = file
-        .take(MAX_BUNDLE_ENVELOPE_FILE_SIZE + 1)
+        .take(MAX_BUNDLE_MANIFEST_FILE_SIZE + 1)
         .read_to_end(&mut data);
     match read_result {
         Ok(_) => {},
@@ -5035,36 +5076,160 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
 
     // Belt-and-suspenders: re-check after streaming in case fstat size
     // was stale (filesystem bug) or a non-regular file sneaked past.
-    if data.len() as u64 > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+    if data.len() as u64 > MAX_BUNDLE_MANIFEST_FILE_SIZE {
         return output_error(
             json_output,
             "fac_bundle_import_too_large",
             &format!(
-                "envelope data too large after read: {} bytes > {} max",
+                "manifest data too large after read: {} bytes > {} max",
                 data.len(),
+                MAX_BUNDLE_MANIFEST_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Fail-closed manifest validation.
+    let manifest = match apm2_core::fac::evidence_bundle::import_evidence_bundle_manifest(&data) {
+        Ok(env) => env,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_manifest_validation_failed",
+                &format!("bundle manifest import rejected (fail-closed): {e}"),
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
+
+    let envelope_file = match open_no_follow_for_import(&envelope_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot open {}: {e}", envelope_path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let envelope_metadata = match envelope_file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot fstat envelope {}: {e}", envelope_path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if !envelope_metadata.is_file() {
+        return output_error(
+            json_output,
+            "fac_bundle_import_not_regular_file",
+            &format!(
+                "envelope path is not a regular file: {}",
+                envelope_path.display()
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    if envelope_metadata.len() > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+        return output_error(
+            json_output,
+            "fac_bundle_import_too_large",
+            &format!(
+                "envelope file too large: {} bytes > {} max",
+                envelope_metadata.len(),
                 MAX_BUNDLE_ENVELOPE_FILE_SIZE
             ),
             exit_codes::VALIDATION_ERROR,
         );
     }
 
-    // Fail-closed import validation.
-    let envelope = match apm2_core::fac::evidence_bundle::import_evidence_bundle(&data) {
+    let mut envelope_data = Vec::new();
+    let envelope_read_result = envelope_file
+        .take(MAX_BUNDLE_ENVELOPE_FILE_SIZE + 1)
+        .read_to_end(&mut envelope_data);
+    match envelope_read_result {
+        Ok(_) => {},
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_read_failed",
+                &format!("cannot read {}: {e}", envelope_path.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    }
+
+    if envelope_data.len() as u64 > MAX_BUNDLE_ENVELOPE_FILE_SIZE {
+        return output_error(
+            json_output,
+            "fac_bundle_import_too_large",
+            &format!(
+                "envelope data too large after read: {} bytes > {} max",
+                envelope_data.len(),
+                MAX_BUNDLE_ENVELOPE_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let envelope = match apm2_core::fac::evidence_bundle::import_evidence_bundle(&envelope_data) {
         Ok(env) => env,
         Err(e) => {
             return output_error(
                 json_output,
                 "fac_bundle_import_validation_failed",
-                &format!("bundle import rejected (fail-closed): {e}"),
+                &format!("envelope import rejected (fail-closed): {e}"),
                 exit_codes::VALIDATION_ERROR,
             );
         },
     };
 
-    // Verify all blob_refs exist and have matching BLAKE3 hashes.
-    // The bundle directory is the parent of the envelope file path.
+    if manifest.envelope_content_hash != envelope.content_hash {
+        return output_error(
+            json_output,
+            "fac_bundle_import_validation_failed",
+            &format!(
+                "manifest envelope hash mismatch: manifest={}, envelope={}",
+                manifest.envelope_content_hash, envelope.content_hash
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    if manifest.blob_count != envelope.blob_refs.len() {
+        return output_error(
+            json_output,
+            "fac_bundle_import_validation_failed",
+            &format!(
+                "manifest blob_count mismatch: manifest={}, envelope={}",
+                manifest.blob_count,
+                envelope.blob_refs.len()
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let has_envelope_entry = manifest.entries.iter().any(|entry| {
+        entry.role == "envelope" && entry.content_hash_ref == manifest.envelope_content_hash
+    });
+    if !has_envelope_entry {
+        return output_error(
+            json_output,
+            "fac_bundle_import_validation_failed",
+            "manifest does not contain a matching envelope entry",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
     if !envelope.blob_refs.is_empty() {
-        let bundle_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         if let Err(e) = apm2_core::fac::evidence_bundle::verify_blob_refs(&envelope, bundle_dir) {
             return output_error(
                 json_output,
@@ -6014,28 +6179,38 @@ mod tests {
     ///
     /// This proves the export/import pair forms a usable RFC-0028/0029 harness
     /// (BLOCKER-3 fix). The test constructs a valid receipt, writes it to the
-    /// receipt store, runs the export path, then imports the exported envelope.
+    /// receipt store, runs the export path, then imports the exported manifest.
     #[test]
     fn test_bundle_export_import_round_trip() {
-        use apm2_core::fac::evidence_bundle::{
-            build_evidence_bundle_envelope, import_evidence_bundle, serialize_envelope,
-        };
+        use apm2_core::fac::evidence_bundle::EVIDENCE_BUNDLE_ENVELOPE_SCHEMA;
         use apm2_core::fac::{
-            BudgetAdmissionTrace, ChannelBoundaryTrace, FacJobOutcome, FacJobReceiptV1,
+            BlobStore, BudgetAdmissionTrace, ChannelBoundaryTrace, FacJobOutcome, FacJobReceiptV1,
             QueueAdmissionTrace,
         };
 
-        // Valid 32-byte hex digest for policy binding (64 hex chars).
-        let valid_digest = "ab".repeat(32);
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+        let fac_root = home.path().join("private").join("fac");
+        let receipts_dir = fac_root.join("receipts");
+        std::fs::create_dir_all(&receipts_dir).expect("create receipts dir");
 
-        // Build a valid receipt with RFC-0028 and RFC-0029 traces.
+        let blob_store = BlobStore::new(&fac_root);
+        let receipt_blob = b"round trip receipt blob".to_vec();
+        let receipt_blob_hash = blob_store
+            .store(&receipt_blob)
+            .expect("store receipt blob in CAS");
+        let job_spec_blob = b"round trip job spec blob".to_vec();
+        let job_spec_blob_hash = blob_store
+            .store(&job_spec_blob)
+            .expect("store job spec blob");
+
         let receipt = FacJobReceiptV1 {
             schema: "apm2.fac.job_receipt.v1".to_string(),
             receipt_id: "test-rt-receipt".to_string(),
             job_id: "test-rt-job".to_string(),
-            job_spec_digest: "b3-256:".to_string() + &valid_digest,
-            policy_hash: Some(format!("b3-256:{valid_digest}")),
-            canonicalizer_tuple_digest: Some(format!("b3-256:{valid_digest}")),
+            job_spec_digest: format!("b3-256:{}", hex::encode(job_spec_blob_hash)),
+            policy_hash: Some("b3-256:".to_string() + &"ab".repeat(32)),
+            canonicalizer_tuple_digest: Some("b3-256:".to_string() + &"cd".repeat(32)),
             outcome: FacJobOutcome::Completed,
             reason: "round trip test".to_string(),
             rfc0028_channel_boundary: Some(ChannelBoundaryTrace {
@@ -6058,31 +6233,65 @@ mod tests {
                 reason: None,
             }),
             timestamp_secs: 1_700_000_000,
-            content_hash: String::new(),
+            content_hash: "b3-256:".to_string() + &hex::encode(receipt_blob_hash),
             ..Default::default()
         };
 
+        let receipt_file = receipts_dir.join(format!("{}.json", hex::encode(receipt_blob_hash)));
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt for store");
+        std::fs::write(&receipt_file, bytes).expect("write receipt to store");
+
         // Build a well-formed export config (same logic as production path).
-        let config = build_export_config_from_receipt(&receipt)
+        build_export_config_from_receipt(&receipt)
             .expect("export config should succeed with valid digests");
 
-        // Build envelope.
-        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[])
-            .expect("export should succeed with authoritative config");
-
-        // Serialize.
-        let data = serialize_envelope(&envelope).expect("serialize should succeed");
-
-        // Import must succeed (fail-closed validation passes).
-        let imported = import_evidence_bundle(&data)
-            .expect("import should succeed for well-formed exported bundle");
-
-        assert_eq!(imported.receipt.job_id, "test-rt-job");
+        let output_dir = home.path().join("bundle-export");
+        let export_args = BundleExportArgs {
+            job_id: "test-rt-job".to_string(),
+            output_dir: Some(output_dir.clone()),
+            json: false,
+        };
+        let export_exit = run_bundle_export(&export_args, false);
         assert_eq!(
-            imported.schema,
-            apm2_core::fac::evidence_bundle::EVIDENCE_BUNDLE_SCHEMA
+            export_exit,
+            exit_codes::SUCCESS,
+            "bundle export should succeed"
         );
-        assert_eq!(imported.content_hash, envelope.content_hash);
+
+        let manifest_path = output_dir.join("manifest.json");
+        let envelope_path = output_dir.join("envelope.json");
+        assert!(manifest_path.exists(), "export should write manifest.json");
+        assert!(envelope_path.exists(), "export should write envelope.json");
+
+        let receipt_blob_hex = &receipt.content_hash["b3-256:".len()..];
+        let job_spec_blob_hex = &receipt.job_spec_digest["b3-256:".len()..];
+        assert!(
+            output_dir.join(format!("{receipt_blob_hex}.blob")).exists(),
+            "export should include receipt content blob"
+        );
+        assert!(
+            output_dir
+                .join(format!("{job_spec_blob_hex}.blob"))
+                .exists(),
+            "export should include job spec blob"
+        );
+
+        // Confirm the exported envelope schema matches canonical release schema.
+        let envelope = std::fs::read_to_string(&envelope_path).expect("read exported envelope");
+        let envelope_json: serde_json::Value =
+            serde_json::from_str(&envelope).expect("parse exported envelope json");
+        assert_eq!(envelope_json["schema"], EVIDENCE_BUNDLE_ENVELOPE_SCHEMA);
+
+        let import_args = BundleImportArgs {
+            path: manifest_path,
+            json: false,
+        };
+        let import_exit = run_bundle_import(&import_args, false);
+        assert_eq!(
+            import_exit,
+            exit_codes::SUCCESS,
+            "bundle import should succeed"
+        );
     }
 
     // =========================================================================
