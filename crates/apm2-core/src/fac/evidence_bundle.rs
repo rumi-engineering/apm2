@@ -202,6 +202,19 @@ pub enum EvidenceBundleError {
         /// Human-readable detail of the failure.
         detail: String,
     },
+
+    /// A referenced blob is missing or has a BLAKE3 integrity mismatch
+    /// during import.
+    ///
+    /// Fail-closed: import must not succeed when referenced blob artifacts
+    /// are missing, unreadable, or have mismatched BLAKE3 hashes.
+    #[error("blob import verification failed for {blob_ref}: {detail}")]
+    BlobImportVerificationFailed {
+        /// The blob reference (hex hash) that failed verification.
+        blob_ref: String,
+        /// Human-readable detail of the failure.
+        detail: String,
+    },
 }
 
 // =============================================================================
@@ -477,6 +490,113 @@ pub fn import_evidence_bundle(
     Ok(envelope)
 }
 
+/// Maximum blob file size during import verification (matches blob store cap).
+pub const MAX_BLOB_IMPORT_SIZE: usize = 10_485_760; // 10 MiB
+
+/// Verify that all `blob_refs` in an imported envelope exist in the bundle
+/// directory and their BLAKE3 hashes match the declared values.
+///
+/// Each blob ref is expected to be a hex-encoded BLAKE3 hash (with optional
+/// `b3-256:` prefix). The corresponding file is expected at
+/// `<bundle_dir>/<hex_hash>.blob`.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError::BlobImportVerificationFailed` if any blob
+/// is missing, unreadable, oversized, or has a BLAKE3 hash mismatch.
+pub fn verify_blob_refs(
+    envelope: &EvidenceBundleEnvelopeV1,
+    bundle_dir: &std::path::Path,
+) -> Result<(), EvidenceBundleError> {
+    for blob_ref in &envelope.blob_refs {
+        verify_single_blob_ref(blob_ref, bundle_dir)?;
+    }
+    Ok(())
+}
+
+/// Verify a single blob ref exists and has matching BLAKE3 hash.
+fn verify_single_blob_ref(
+    blob_ref: &str,
+    bundle_dir: &std::path::Path,
+) -> Result<(), EvidenceBundleError> {
+    use std::io::Read;
+
+    let hex_part = blob_ref.strip_prefix("b3-256:").unwrap_or(blob_ref);
+
+    // Validate hex string before constructing filesystem path.
+    let expected_hash =
+        hex::decode(hex_part).map_err(|e| EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: format!("invalid hex in blob ref: {e}"),
+        })?;
+    if expected_hash.len() != 32 {
+        return Err(EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: format!("expected 32-byte hash, got {} bytes", expected_hash.len()),
+        });
+    }
+
+    // Construct blob filename. Use the raw hex part (no path separators)
+    // to prevent traversal.
+    if hex_part.contains('/') || hex_part.contains('\\') || hex_part.contains("..") {
+        return Err(EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: "blob ref contains path separator or traversal sequence".to_string(),
+        });
+    }
+    let blob_path = bundle_dir.join(format!("{hex_part}.blob"));
+
+    // Open the blob file.
+    let file = std::fs::File::open(&blob_path).map_err(|e| {
+        EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: format!("blob file not found or unreadable: {e}"),
+        }
+    })?;
+
+    // Bounded read.
+    let metadata =
+        file.metadata()
+            .map_err(|e| EvidenceBundleError::BlobImportVerificationFailed {
+                blob_ref: blob_ref.to_string(),
+                detail: format!("cannot read blob metadata: {e}"),
+            })?;
+    if metadata.len() > MAX_BLOB_IMPORT_SIZE as u64 {
+        return Err(EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: format!(
+                "blob too large: {} bytes > {} max",
+                metadata.len(),
+                MAX_BLOB_IMPORT_SIZE
+            ),
+        });
+    }
+
+    let mut data = Vec::new();
+    file.take(MAX_BLOB_IMPORT_SIZE as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: format!("failed to read blob: {e}"),
+        })?;
+
+    // Verify BLAKE3 hash. Length already validated to be 32 above.
+    let actual_hash = blake3::hash(&data);
+    let mut expected_arr = [0u8; 32];
+    expected_arr.copy_from_slice(&expected_hash);
+    if !bool::from(actual_hash.as_bytes().ct_eq(&expected_arr)) {
+        return Err(EvidenceBundleError::BlobImportVerificationFailed {
+            blob_ref: blob_ref.to_string(),
+            detail: format!(
+                "BLAKE3 hash mismatch: expected {}, actual {}",
+                hex::encode(expected_arr),
+                actual_hash.to_hex()
+            ),
+        });
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Validation Helpers
 // =============================================================================
@@ -632,8 +752,10 @@ fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32
     // -- schema (length-prefixed) --
     hash_len_prefixed(&mut hasher, envelope.schema.as_bytes());
 
-    // -- receipt canonical bytes (length-prefixed) --
-    let receipt_bytes = envelope.receipt.canonical_bytes();
+    // -- receipt canonical bytes v2 (length-prefixed) --
+    // Uses canonical_bytes_v2() which includes unsafe_direct, policy_hash,
+    // and canonicalizer_tuple_digest for comprehensive integrity binding.
+    let receipt_bytes = envelope.receipt.canonical_bytes_v2();
     hash_len_prefixed(&mut hasher, &receipt_bytes);
 
     // -- boundary check: ALL fields with deterministic framing --
@@ -685,8 +807,14 @@ fn validate_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> Result<(), Evid
 /// Validate the RFC-0028 channel boundary check embedded in the envelope.
 ///
 /// Reconstructs a `ChannelBoundaryCheck` from the envelope boundary data
-/// and runs `validate_channel_boundary()`. Any defects cause rejection.
+/// and runs `validate_channel_boundary()`. Defects from honestly-absent
+/// optional sub-evidence (leakage budget, timing budget, disclosure policy)
+/// are filtered when the corresponding field is `None` in the envelope.
+/// All other defects cause rejection.
+#[allow(clippy::too_many_lines)]
 fn validate_boundary_check(envelope: &EvidenceBundleEnvelopeV1) -> Result<(), EvidenceBundleError> {
+    use crate::channel::ChannelViolationClass;
+
     let bc = &envelope.boundary_check;
 
     // Derive the witness for the claimed channel source.
@@ -718,15 +846,47 @@ fn validate_boundary_check(envelope: &EvidenceBundleEnvelopeV1) -> Result<(), Ev
         token_binding: None,
     };
 
-    // INV-EB-001: validate_channel_boundary must return zero defects.
+    // INV-EB-001: validate_channel_boundary must return zero defects
+    // (excluding defects from honestly-absent optional sub-evidence).
     let defects = validate_channel_boundary(&check);
-    if !defects.is_empty() {
-        let defect_classes: Vec<String> = defects
+
+    // Filter defects from absent optional sub-evidence. These fields do not
+    // exist in FacJobReceiptV1 and are honestly marked None; requiring them
+    // would force fabrication of evidence which is worse than their absence.
+    // When present, the full validation still applies.
+    let filtered_defects: Vec<_> = defects
+        .into_iter()
+        .filter(|d| {
+            // Skip LeakageBudgetExceeded only when leakage_budget_receipt is absent.
+            if d.violation_class == ChannelViolationClass::LeakageBudgetExceeded
+                && bc.leakage_budget_receipt.is_none()
+            {
+                return false;
+            }
+            // Skip TimingChannelBudgetExceeded only when timing_channel_budget is absent.
+            if d.violation_class == ChannelViolationClass::TimingChannelBudgetExceeded
+                && bc.timing_channel_budget.is_none()
+            {
+                return false;
+            }
+            // Skip DisclosurePolicyStateInvalid only when disclosure_policy_binding is
+            // absent.
+            if d.violation_class == ChannelViolationClass::DisclosurePolicyStateInvalid
+                && bc.disclosure_policy_binding.is_none()
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    if !filtered_defects.is_empty() {
+        let defect_classes: Vec<String> = filtered_defects
             .iter()
             .map(|d| format!("{:?}", d.violation_class))
             .collect();
         return Err(EvidenceBundleError::ChannelBoundaryInvalid {
-            defect_count: defects.len(),
+            defect_count: filtered_defects.len(),
             defect_classes: defect_classes.join(", "),
         });
     }
@@ -752,6 +912,43 @@ fn validate_boundary_check(envelope: &EvidenceBundleEnvelopeV1) -> Result<(), Ev
                     "canonicalizer_tuple_digest does not match admitted_canonicalizer_tuple_digest"
                         .to_string(),
             });
+        }
+
+        // MINOR fix: enforce strict equality between the receipt's
+        // policy_hash/canonicalizer_tuple_digest and the policy_binding's
+        // values. The receipt and policy_binding carry the same logical
+        // data; divergence indicates tampering or a construction bug.
+        if let Some(receipt_policy_hash) = &envelope.receipt.policy_hash {
+            let receipt_hex = receipt_policy_hash
+                .strip_prefix("b3-256:")
+                .unwrap_or(receipt_policy_hash);
+            if let Ok(receipt_digest) = hex::decode(receipt_hex) {
+                if receipt_digest.len() == 32 {
+                    let receipt_arr: [u8; 32] = receipt_digest.try_into().expect("length checked");
+                    if !bool::from(binding.policy_digest.ct_eq(&receipt_arr)) {
+                        return Err(EvidenceBundleError::PolicyBindingMismatch {
+                            detail:
+                                "receipt.policy_hash diverges from policy_binding.policy_digest"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(receipt_canon) = &envelope.receipt.canonicalizer_tuple_digest {
+            let receipt_hex = receipt_canon
+                .strip_prefix("b3-256:")
+                .unwrap_or(receipt_canon);
+            if let Ok(receipt_digest) = hex::decode(receipt_hex) {
+                if receipt_digest.len() == 32 {
+                    let receipt_arr: [u8; 32] = receipt_digest.try_into().expect("length checked");
+                    if !bool::from(binding.canonicalizer_tuple_digest.ct_eq(&receipt_arr)) {
+                        return Err(EvidenceBundleError::PolicyBindingMismatch {
+                            detail: "receipt.canonicalizer_tuple_digest diverges from policy_binding.canonicalizer_tuple_digest".to_string(),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -1299,7 +1496,10 @@ pub mod tests {
     }
 
     #[test]
-    fn import_refuses_missing_leakage_budget() {
+    fn import_accepts_absent_leakage_budget() {
+        // Honestly-absent leakage budget receipt is accepted because the
+        // field does not exist in FacJobReceiptV1 and should not be
+        // fabricated.
         let receipt = make_valid_receipt();
         let mut config = make_valid_export_config();
         config.leakage_budget_receipt = None;
@@ -1311,16 +1511,14 @@ pub mod tests {
         let result = import_evidence_bundle(&data);
 
         assert!(
-            matches!(
-                result,
-                Err(EvidenceBundleError::ChannelBoundaryInvalid { .. })
-            ),
-            "should reject when leakage budget receipt missing"
+            result.is_ok(),
+            "should accept envelope with honestly-absent leakage budget, got: {result:?}"
         );
     }
 
     #[test]
-    fn import_refuses_missing_timing_budget() {
+    fn import_accepts_absent_timing_budget() {
+        // Honestly-absent timing channel budget is accepted.
         let receipt = make_valid_receipt();
         let mut config = make_valid_export_config();
         config.timing_channel_budget = None;
@@ -1332,16 +1530,14 @@ pub mod tests {
         let result = import_evidence_bundle(&data);
 
         assert!(
-            matches!(
-                result,
-                Err(EvidenceBundleError::ChannelBoundaryInvalid { .. })
-            ),
-            "should reject when timing channel budget missing"
+            result.is_ok(),
+            "should accept envelope with honestly-absent timing budget, got: {result:?}"
         );
     }
 
     #[test]
-    fn import_refuses_missing_disclosure_policy() {
+    fn import_accepts_absent_disclosure_policy() {
+        // Honestly-absent disclosure policy binding is accepted.
         let receipt = make_valid_receipt();
         let mut config = make_valid_export_config();
         config.disclosure_policy_binding = None;
@@ -1353,11 +1549,61 @@ pub mod tests {
         let result = import_evidence_bundle(&data);
 
         assert!(
+            result.is_ok(),
+            "should accept envelope with honestly-absent disclosure policy, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_accepts_all_absent_optional_subevidence() {
+        // All three optional sub-evidence fields absent — the minimal
+        // honest export from a receipt that lacks these fields.
+        let receipt = make_valid_receipt();
+        let mut config = make_valid_export_config();
+        config.leakage_budget_receipt = None;
+        config.timing_channel_budget = None;
+        config.disclosure_policy_binding = None;
+
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+
+        assert!(
+            result.is_ok(),
+            "should accept envelope with all optional sub-evidence absent, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_malformed_leakage_budget_when_present() {
+        // When leakage budget IS present but malformed, validation still
+        // rejects (only honestly-absent is tolerated).
+        let receipt = make_valid_receipt();
+        let mut config = make_valid_export_config();
+        config.leakage_budget_receipt = Some(LeakageBudgetReceipt {
+            leakage_bits: 0,
+            budget_bits: 0, // zero budget_bits makes is_well_formed() fail
+            estimator_family: LeakageEstimatorFamily::Unknown,
+            confidence_bps: 0,
+            confidence_label: String::new(),
+        });
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+
+        assert!(
             matches!(
                 result,
                 Err(EvidenceBundleError::ChannelBoundaryInvalid { .. })
             ),
-            "should reject when disclosure policy binding missing"
+            "should reject malformed leakage budget when present, got: {result:?}"
         );
     }
 
@@ -1539,6 +1785,49 @@ pub mod tests {
         });
     }
 
+    #[test]
+    fn mutation_detected_unsafe_direct() {
+        assert_mutation_detected("receipt.unsafe_direct", |env| {
+            env.receipt.unsafe_direct = !env.receipt.unsafe_direct;
+        });
+    }
+
+    #[test]
+    fn mutation_detected_policy_hash() {
+        // Mutating receipt.policy_hash without recomputing content_hash causes
+        // either ContentHashMismatch (from content hash check) or
+        // PolicyBindingMismatch (from cross-field consistency check, which
+        // runs after content hash check only when the hash is recomputed).
+        // Both are valid rejection reasons.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        envelope.receipt.policy_hash = Some(
+            "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+        );
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::ContentHashMismatch { .. }
+                    | EvidenceBundleError::PolicyBindingMismatch { .. })
+            ),
+            "mutation of receipt.policy_hash should be detected, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn mutation_detected_canonicalizer_tuple_digest() {
+        assert_mutation_detected("receipt.canonicalizer_tuple_digest", |env| {
+            env.receipt.canonicalizer_tuple_digest = Some(
+                "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    .to_string(),
+            );
+        });
+    }
+
     // =========================================================================
     // Per-field length bounds tests (MINOR fix)
     // =========================================================================
@@ -1579,5 +1868,169 @@ pub mod tests {
             matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
             "should reject overlong blob_ref, got: {result:?}"
         );
+    }
+
+    // =========================================================================
+    // MINOR fix: receipt/policy_binding cross-field consistency
+    // =========================================================================
+
+    #[test]
+    fn import_refuses_receipt_policy_hash_diverged_from_binding() {
+        let mut receipt = make_valid_receipt();
+        // Set a valid but DIFFERENT policy hash on the receipt.
+        receipt.policy_hash = Some(
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        // Recompute content hash for the mutated receipt.
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::PolicyBindingMismatch { .. })
+            ),
+            "should reject when receipt.policy_hash diverges from policy_binding, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_refuses_receipt_canonicalizer_digest_diverged_from_binding() {
+        let mut receipt = make_valid_receipt();
+        // Set a valid but DIFFERENT canonicalizer tuple digest on the receipt.
+        receipt.canonicalizer_tuple_digest = Some(
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        // Recompute content hash for the mutated receipt.
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::PolicyBindingMismatch { .. })
+            ),
+            "should reject when receipt.canonicalizer_tuple_digest diverges from policy_binding, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-3: Blob verification tests
+    // =========================================================================
+
+    #[test]
+    fn verify_blob_refs_succeeds_for_valid_blobs() {
+        let tmpdir = std::env::temp_dir().join(format!("eb_blob_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmpdir);
+
+        let blob_data = b"test blob data";
+        let blob_hash = blake3::hash(blob_data);
+        let hex_hash = blob_hash.to_hex().to_string();
+        let blob_ref = format!("b3-256:{hex_hash}");
+
+        // Write the blob file.
+        std::fs::write(tmpdir.join(format!("{hex_hash}.blob")), blob_data).expect("write blob");
+
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[blob_ref])
+            .expect("export should succeed");
+        // Recompute hash with the blob ref.
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let result = verify_blob_refs(&envelope, &tmpdir);
+        assert!(result.is_ok(), "should verify valid blobs, got: {result:?}");
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn verify_blob_refs_fails_for_missing_blob() {
+        let tmpdir = std::env::temp_dir().join(format!("eb_blob_miss_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmpdir);
+
+        let blob_ref = "b3-256:".to_string() + &"aa".repeat(32);
+
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[blob_ref])
+            .expect("export should succeed");
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let result = verify_blob_refs(&envelope, &tmpdir);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::BlobImportVerificationFailed { .. })
+            ),
+            "should fail for missing blob, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn verify_blob_refs_fails_for_corrupted_blob() {
+        let tmpdir = std::env::temp_dir().join(format!("eb_blob_corrupt_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmpdir);
+
+        let blob_data = b"original data";
+        let blob_hash = blake3::hash(blob_data);
+        let hex_hash = blob_hash.to_hex().to_string();
+        let blob_ref = format!("b3-256:{hex_hash}");
+
+        // Write DIFFERENT data to the blob file (corruption).
+        std::fs::write(tmpdir.join(format!("{hex_hash}.blob")), b"corrupted data!!")
+            .expect("write corrupted blob");
+
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[blob_ref])
+            .expect("export should succeed");
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let result = verify_blob_refs(&envelope, &tmpdir);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::BlobImportVerificationFailed { .. })
+            ),
+            "should fail for corrupted blob, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn verify_blob_refs_empty_refs_succeeds() {
+        let tmpdir = std::env::temp_dir().join(format!("eb_blob_empty_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmpdir);
+
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        let result = verify_blob_refs(&envelope, &tmpdir);
+        assert!(result.is_ok(), "empty blob_refs should succeed");
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
     }
 }

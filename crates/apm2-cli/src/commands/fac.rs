@@ -4535,11 +4535,7 @@ fn build_export_config_from_receipt(
     apm2_core::fac::evidence_bundle::BundleExportConfig,
     apm2_core::fac::evidence_bundle::EvidenceBundleError,
 > {
-    use apm2_core::channel::{
-        BoundaryFlowPolicyBinding, DisclosurePolicyBinding, LeakageBudgetReceipt,
-        LeakageEstimatorFamily, TimingChannelBudget,
-    };
-    use apm2_core::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
+    use apm2_core::channel::BoundaryFlowPolicyBinding;
 
     // Derive policy binding from receipt traces. For local export the receipt
     // itself is the authoritative source — the policy/canonicalizer digests
@@ -4579,38 +4575,14 @@ fn build_export_config_from_receipt(
         })
     };
 
-    // Construct well-formed boundary substructures for the local harness.
-    // These carry conservative defaults that satisfy the fail-closed validation
-    // in validate_channel_boundary.
-    let leakage_budget_receipt = Some(LeakageBudgetReceipt {
-        leakage_bits: 0,
-        budget_bits: 1024,
-        estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
-        confidence_bps: 9500,
-        confidence_label: "high".to_string(),
-    });
-
-    let timing_channel_budget = Some(TimingChannelBudget {
-        release_bucket_ticks: 100,
-        observed_variance_ticks: 10,
-        budget_ticks: 1000,
-    });
-
-    let snapshot_digest = policy_binding
-        .as_ref()
-        .map_or([0u8; 32], |pb| pb.policy_digest);
-    let disclosure_policy_binding = Some(DisclosurePolicyBinding {
-        required_for_effect: false,
-        state_valid: true,
-        active_mode: DisclosurePolicyMode::TradeSecretOnly,
-        expected_mode: DisclosurePolicyMode::TradeSecretOnly,
-        attempted_channel: DisclosureChannelClass::Internal,
-        policy_snapshot_digest: snapshot_digest,
-        admitted_policy_epoch_root_digest: snapshot_digest,
-        policy_epoch: 1,
-        phase_id: "local-export".to_string(),
-        state_reason: String::new(),
-    });
+    // Export only evidence that actually exists in the source receipt.
+    // Leakage budget receipt, timing channel budget, and disclosure policy
+    // binding are NOT present in FacJobReceiptV1 so they are honestly marked
+    // absent (None). The envelope validation is aware of which fields are
+    // present vs absent and does not require fabricated data.
+    let leakage_budget_receipt = None;
+    let timing_channel_budget = None;
+    let disclosure_policy_binding = None;
 
     Ok(apm2_core::fac::evidence_bundle::BundleExportConfig {
         policy_binding,
@@ -4978,31 +4950,47 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
     }
 
     // Fail-closed import validation.
-    match apm2_core::fac::evidence_bundle::import_evidence_bundle(&data) {
-        Ok(envelope) => {
-            let result = serde_json::json!({
-                "status": "imported",
-                "job_id": envelope.receipt.job_id,
-                "schema": envelope.schema,
-                "content_hash": envelope.content_hash,
-                "boundary_source": format!("{:?}", envelope.boundary_check.source),
-                "queue_admission_verdict": envelope.economics_trace.queue_admission.verdict,
-                "budget_admission_verdict": envelope.economics_trace.budget_admission.verdict,
-                "blob_count": envelope.blob_refs.len(),
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result).unwrap_or_default()
+    let envelope = match apm2_core::fac::evidence_bundle::import_evidence_bundle(&data) {
+        Ok(env) => env,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_import_validation_failed",
+                &format!("bundle import rejected (fail-closed): {e}"),
+                exit_codes::VALIDATION_ERROR,
             );
-            exit_codes::SUCCESS
         },
-        Err(e) => output_error(
-            json_output,
-            "fac_bundle_import_validation_failed",
-            &format!("bundle import rejected (fail-closed): {e}"),
-            exit_codes::VALIDATION_ERROR,
-        ),
+    };
+
+    // Verify all blob_refs exist and have matching BLAKE3 hashes.
+    // The bundle directory is the parent of the envelope file path.
+    if !envelope.blob_refs.is_empty() {
+        let bundle_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if let Err(e) = apm2_core::fac::evidence_bundle::verify_blob_refs(&envelope, bundle_dir) {
+            return output_error(
+                json_output,
+                "fac_bundle_import_blob_verification_failed",
+                &format!("blob verification failed (fail-closed): {e}"),
+                exit_codes::VALIDATION_ERROR,
+            );
+        }
     }
+
+    let result = serde_json::json!({
+        "status": "imported",
+        "job_id": envelope.receipt.job_id,
+        "schema": envelope.schema,
+        "content_hash": envelope.content_hash,
+        "boundary_source": format!("{:?}", envelope.boundary_check.source),
+        "queue_admission_verdict": envelope.economics_trace.queue_admission.verdict,
+        "budget_admission_verdict": envelope.economics_trace.budget_admission.verdict,
+        "blob_count": envelope.blob_refs.len(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+    exit_codes::SUCCESS
 }
 
 // =============================================================================
