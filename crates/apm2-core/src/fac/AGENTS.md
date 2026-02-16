@@ -690,7 +690,12 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
 ### CLI Commands
 
 - `apm2 fac bundle export <job_id>`: Exports an evidence bundle for a job to
-  `$APM2_HOME/private/fac/bundles/<job_id>/`. Constructs `BundleExportConfig`
+  `$APM2_HOME/private/fac/bundles/<job_id>/`. Validates `job_id` before path
+  construction: rejects empty strings, absolute paths, `..` traversal, path
+  separators, and any characters outside `[A-Za-z0-9._-]` (path confinement).
+  Creates output directory with 0700 mode via `fac_permissions::ensure_dir_with_mode`.
+  Writes all files (envelope, blobs) via `fac_permissions::write_fac_file_with_mode`
+  (0600 mode, `O_NOFOLLOW`, symlink check). Constructs `BundleExportConfig`
   from authoritative receipt artifacts (policy binding, leakage budget receipt,
   timing channel budget, disclosure policy binding) so exported envelopes satisfy
   import validation. Fail-closed on malformed policy digests: if `policy_hash` or
@@ -727,6 +732,13 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
 - [INV-EB-009] Export fails closed when referenced blobs (content_hash, job_spec_digest)
   cannot be retrieved from the blob store or written to the output directory. Returns
   `BlobExportFailed` instead of silently producing an incomplete bundle.
+- [INV-EB-010] Export validates `job_id` before path construction: rejects empty,
+  absolute paths, `..` traversal, path separators, and non-`[A-Za-z0-9._-]` characters.
+  Prevents path confinement escape from FAC root.
+- [INV-EB-011] Export creates output directories with mode 0700 via
+  `fac_permissions::ensure_dir_with_mode` and writes all files with mode 0600 via
+  `fac_permissions::write_fac_file_with_mode` (`O_NOFOLLOW`, symlink check, atomic
+  rename). Never uses `std::fs::create_dir_all` or `std::fs::write` for bundle output.
 
 ## Policy Environment Enforcement (TCK-00526)
 

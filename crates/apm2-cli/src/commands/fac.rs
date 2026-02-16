@@ -4664,12 +4664,15 @@ fn discover_and_export_blobs(
             })?;
             let blob_filename = format!("{hex_part}.blob");
             let blob_dest = output_dir.join(&blob_filename);
-            std::fs::write(&blob_dest, &blob_data).map_err(|e| {
-                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
-                    blob_ref: raw_hash.to_string(),
-                    detail: format!("{label}: write to {}: {e}", blob_dest.display()),
-                }
-            })?;
+            // MINOR security fix: use FAC-safe file write (0600 mode,
+            // O_NOFOLLOW, symlink check) instead of std::fs::write.
+            crate::commands::fac_permissions::write_fac_file_with_mode(&blob_dest, &blob_data)
+                .map_err(|e| {
+                    apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                        blob_ref: raw_hash.to_string(),
+                        detail: format!("{label}: write to {}: {e}", blob_dest.display()),
+                    }
+                })?;
             Ok(format!("b3-256:{hex_part}"))
         };
 
@@ -4686,8 +4689,51 @@ fn discover_and_export_blobs(
     Ok(exported_refs)
 }
 
+/// Validate that a job ID is safe for use as a filesystem path component.
+///
+/// Rejects empty strings, absolute paths, path separators, `..` components,
+/// and any characters outside `[A-Za-z0-9_-]`. This prevents path traversal
+/// attacks where a crafted `job_id` like `../../../etc/passwd` or `/tmp/evil`
+/// could escape the FAC root directory.
+fn validate_job_id_for_path(job_id: &str) -> Result<(), String> {
+    if job_id.is_empty() {
+        return Err("job_id must not be empty".to_string());
+    }
+    if job_id.starts_with('/') || job_id.starts_with('\\') {
+        return Err(format!(
+            "job_id must not be an absolute path, got {job_id:?}"
+        ));
+    }
+    if job_id.contains("..") {
+        return Err(format!(
+            "job_id must not contain path traversal (..), got {job_id:?}"
+        ));
+    }
+    if !job_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+    {
+        return Err(format!(
+            "job_id contains invalid characters: only [A-Za-z0-9._-] allowed, got {job_id:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Runs `apm2 fac bundle export <job_id>`.
 fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
+    // MAJOR security fix: validate job_id before using as path component.
+    // Untrusted job_id from job receipts could contain path traversal sequences
+    // (e.g., "../../../etc/passwd" or "/tmp/evil") that escape the FAC root.
+    if let Err(reason) = validate_job_id_for_path(&args.job_id) {
+        return output_error(
+            json_output,
+            "fac_bundle_export_invalid_job_id",
+            &reason,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
     let fac_root =
         apm2_core::github::resolve_apm2_home().map(|home| home.join("private").join("fac"));
 
@@ -4718,8 +4764,10 @@ fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
         .clone()
         .unwrap_or_else(|| fac_root.join("bundles").join(&args.job_id));
 
-    // Create output directory.
-    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+    // MINOR security fix: use FAC-safe permissions helper (0700 directories)
+    // instead of std::fs::create_dir_all which inherits the default umask and
+    // follows symlinks.
+    if let Err(e) = crate::commands::fac_permissions::ensure_dir_with_mode(&output_dir) {
         return output_error(
             json_output,
             "fac_bundle_export_mkdir_failed",
@@ -4788,8 +4836,13 @@ fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
         },
     };
 
+    // MINOR security fix: use FAC-safe file write (0600 mode, O_NOFOLLOW,
+    // symlink check) instead of std::fs::write which inherits default umask
+    // and follows symlinks.
     let envelope_path = output_dir.join("envelope.json");
-    if let Err(e) = std::fs::write(&envelope_path, &data) {
+    if let Err(e) =
+        crate::commands::fac_permissions::write_fac_file_with_mode(&envelope_path, &data)
+    {
         return output_error(
             json_output,
             "fac_bundle_export_write_failed",
@@ -6028,5 +6081,97 @@ mod tests {
             msg.contains("policy_hash") && msg.contains("32 bytes"),
             "error must mention field and expected length: {msg}"
         );
+    }
+
+    // =========================================================================
+    // MAJOR security fix: job_id path traversal prevention tests
+    // =========================================================================
+
+    /// TCK-00527: Empty `job_id` must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_empty() {
+        let result = validate_job_id_for_path("");
+        assert!(result.is_err(), "empty job_id must be rejected");
+        assert!(
+            result.unwrap_err().contains("empty"),
+            "error must mention empty"
+        );
+    }
+
+    /// TCK-00527: Absolute path `job_id` must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_absolute_path() {
+        let result = validate_job_id_for_path("/tmp/evil");
+        assert!(result.is_err(), "absolute path job_id must be rejected");
+        assert!(
+            result.unwrap_err().contains("absolute"),
+            "error must mention absolute path"
+        );
+    }
+
+    /// TCK-00527: Backslash absolute path must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_backslash_absolute() {
+        let result = validate_job_id_for_path("\\tmp\\evil");
+        assert!(
+            result.is_err(),
+            "backslash absolute path job_id must be rejected"
+        );
+    }
+
+    /// TCK-00527: Path traversal via `..` must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_dotdot_traversal() {
+        for traversal in &["../../../etc/passwd", "..%2F..%2Fetc", "foo/../bar", ".."] {
+            let result = validate_job_id_for_path(traversal);
+            assert!(
+                result.is_err(),
+                "path traversal job_id {traversal:?} must be rejected"
+            );
+        }
+    }
+
+    /// TCK-00527: Job IDs containing path separators must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_path_separators() {
+        for bad in &["a/b", "a\\b", "foo/bar/baz"] {
+            let result = validate_job_id_for_path(bad);
+            assert!(
+                result.is_err(),
+                "job_id with path separator {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// TCK-00527: Job IDs with special characters must be rejected.
+    #[test]
+    fn test_validate_job_id_rejects_special_chars() {
+        for bad in &["a;b", "a b", "a\x00b", "a*b", "a?b", "$HOME"] {
+            let result = validate_job_id_for_path(bad);
+            assert!(
+                result.is_err(),
+                "job_id with special chars {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// TCK-00527: Valid job IDs must be accepted.
+    #[test]
+    fn test_validate_job_id_accepts_valid_ids() {
+        for valid in &[
+            "abc-123",
+            "ABC_def",
+            "job-42",
+            "a",
+            "test-rt-job",
+            "fac.job.2026-02-15",
+        ] {
+            let result = validate_job_id_for_path(valid);
+            assert!(
+                result.is_ok(),
+                "valid job_id {valid:?} must be accepted: {:?}",
+                result.unwrap_err()
+            );
+        }
     }
 }
