@@ -973,18 +973,15 @@ mod tests {
         let running_lane_id = lane_ids.first().cloned().expect("at least one lane");
         let maybe_idle_lane_id = lane_ids.get(1).cloned();
 
-        // Create target/ and logs/ subdirectories (with files) for ALL lanes
-        // to ensure collect_idle_lane_targets returns non-empty for idle lanes
-        // (non-vacuous assertion, TCK-00573 code-quality fix).
+        // ensure_directories() creates target/ and logs/ for every lane,
+        // so collect_idle_lane_targets will find them for idle lanes.
+        // Write files so estimated_bytes > 0 (non-trivial GC targets).
         for lane_id in &lane_ids {
             let lane_dir = lane_manager.lane_dir(lane_id);
-            let target_dir = lane_dir.join("target");
-            let log_dir = lane_dir.join("logs");
-            std::fs::create_dir_all(&target_dir).expect("create target dir");
-            std::fs::create_dir_all(&log_dir).expect("create logs dir");
-            std::fs::write(target_dir.join("build_artifact"), b"artifact")
+            std::fs::write(lane_dir.join("target").join("build_artifact"), b"artifact")
                 .expect("write target file");
-            std::fs::write(log_dir.join("build.log"), b"log data").expect("write log file");
+            std::fs::write(lane_dir.join("logs").join("build.log"), b"log data")
+                .expect("write log file");
         }
 
         let mut statuses = vec![lane_status(&running_lane_id, LaneState::Running)];
@@ -1023,17 +1020,17 @@ mod tests {
         lane_manager.ensure_directories().expect("dir setup");
         let known_lane_ids = LaneManager::default_lane_ids();
         let known_lane_id = known_lane_ids.first().cloned().expect("at least one lane");
-
-        // Create target/ and logs/ subdirectories (with files) for the known
-        // lane to ensure collect_idle_lane_targets returns non-empty results
-        // (non-vacuous assertion, TCK-00573 code-quality fix).
         let known_lane_dir = lane_manager.lane_dir(&known_lane_id);
-        let target_dir = known_lane_dir.join("target");
-        let log_dir = known_lane_dir.join("logs");
-        std::fs::create_dir_all(&target_dir).expect("create target dir");
-        std::fs::create_dir_all(&log_dir).expect("create logs dir");
-        std::fs::write(target_dir.join("build_artifact"), b"artifact").expect("write target file");
-        std::fs::write(log_dir.join("build.log"), b"log data").expect("write log file");
+
+        // ensure_directories() already creates target/ and logs/ dirs.
+        // Write files so estimated_bytes > 0 (non-trivial GC targets).
+        std::fs::write(
+            known_lane_dir.join("target").join("build_artifact"),
+            b"artifact",
+        )
+        .expect("write target file");
+        std::fs::write(known_lane_dir.join("logs").join("build.log"), b"log data")
+            .expect("write log file");
 
         let statuses = vec![
             lane_status("../escape", LaneState::Idle),

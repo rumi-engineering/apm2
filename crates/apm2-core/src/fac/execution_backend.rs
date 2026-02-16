@@ -674,6 +674,7 @@ fn read_bounded_env(var: &'static str) -> Result<Option<String>, ExecutionBacken
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fac::SandboxHardeningProfile;
     use crate::fac::job_spec::JobConstraints;
     use crate::fac::lane::{LanePolicy, LaneProfileV1, LaneTimeouts, ResourceProfile};
 
@@ -806,7 +807,11 @@ mod tests {
     }
 
     fn test_properties() -> SystemdUnitProperties {
-        SystemdUnitProperties::from_lane_profile(&test_profile(), None)
+        SystemdUnitProperties::from_lane_profile_with_hardening(
+            &test_profile(),
+            None,
+            SandboxHardeningProfile::default(),
+        )
     }
 
     #[test]
@@ -948,7 +953,11 @@ mod tests {
             memory_max_bytes: Some(500_000_000), // Less than profile
             test_timeout_seconds: Some(60),      // Less than profile
         };
-        let props = SystemdUnitProperties::from_lane_profile(&profile, Some(&constraints));
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            Some(&constraints),
+            SandboxHardeningProfile::default(),
+        );
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
             &props,
@@ -1275,7 +1284,11 @@ mod tests {
             },
             policy: LanePolicy::default(),
         };
-        let props = SystemdUnitProperties::from_lane_profile(&zero_profile, None);
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &zero_profile,
+            None,
+            SandboxHardeningProfile::default(),
+        );
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
             &props,
