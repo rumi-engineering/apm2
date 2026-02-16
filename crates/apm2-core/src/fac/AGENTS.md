@@ -693,7 +693,11 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
   `$APM2_HOME/private/fac/bundles/<job_id>/`. Constructs `BundleExportConfig`
   from authoritative receipt artifacts (policy binding, leakage budget receipt,
   timing channel budget, disclosure policy binding) so exported envelopes satisfy
-  import validation. Discovers and exports receipt/spec blobs from the blob store.
+  import validation. Fail-closed on malformed policy digests: if `policy_hash` or
+  `canonicalizer_tuple_digest` is absent or cannot be decoded to a verified 32-byte
+  digest, export returns `MalformedPolicyDigest` error instead of fabricating a
+  placeholder. Discovers and exports receipt/spec blobs from the blob store;
+  blob retrieval or write failures are fatal (`BlobExportFailed` error).
 - `apm2 fac bundle import <path>`: Imports and validates an evidence bundle from a
   file path. Opens with `O_NOFOLLOW` (no symlink following), validates regular file
   via `fstat`, uses bounded streaming read from the same handle (no TOCTOU).
@@ -717,6 +721,12 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
   (`subtle::ConstantTimeEq::ct_eq()`).
 - [INV-EB-007] Import opens files with `O_NOFOLLOW` (Unix) to refuse symlinks at the
   kernel level and validates regular file type via `fstat` on the opened handle.
+- [INV-EB-008] Export fails closed when `policy_hash` or `canonicalizer_tuple_digest`
+  is absent or malformed (non-hex, wrong length). Returns `MalformedPolicyDigest`
+  instead of fabricating placeholder `0x42` digests.
+- [INV-EB-009] Export fails closed when referenced blobs (content_hash, job_spec_digest)
+  cannot be retrieved from the blob store or written to the output directory. Returns
+  `BlobExportFailed` instead of silently producing an incomplete bundle.
 
 ## Policy Environment Enforcement (TCK-00526)
 

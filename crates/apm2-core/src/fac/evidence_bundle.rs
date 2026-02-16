@@ -176,6 +176,32 @@ pub enum EvidenceBundleError {
         /// Maximum allowed length in bytes.
         max: usize,
     },
+
+    /// Policy or canonicalizer digest from the receipt is malformed.
+    ///
+    /// Returned when `policy_hash` or `canonicalizer_tuple_digest` cannot be
+    /// decoded to a valid 32-byte digest. Fail-closed: export must not proceed
+    /// with fabricated placeholder digests.
+    #[error("malformed policy digest: {field}: {detail}")]
+    MalformedPolicyDigest {
+        /// Which digest field is malformed (`policy_hash` or
+        /// `canonicalizer_tuple_digest`).
+        field: String,
+        /// Human-readable detail of the parse failure.
+        detail: String,
+    },
+
+    /// A referenced blob could not be retrieved or written during export.
+    ///
+    /// Fail-closed: export must not succeed when referenced blob artifacts
+    /// are missing or cannot be persisted.
+    #[error("blob export failed for {blob_ref}: {detail}")]
+    BlobExportFailed {
+        /// The blob reference (hex hash) that failed.
+        blob_ref: String,
+        /// Human-readable detail of the failure.
+        detail: String,
+    },
 }
 
 // =============================================================================

@@ -4497,13 +4497,44 @@ fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
 /// Maximum envelope file size for bounded reads during import (256 KiB).
 const MAX_BUNDLE_ENVELOPE_FILE_SIZE: u64 = 262_144;
 
+/// Parse a hex-encoded digest string (with optional `b3-256:` prefix) into a
+/// verified 32-byte array, or return `MalformedPolicyDigest` on any failure.
+fn parse_verified_digest(
+    field_name: &str,
+    raw: &str,
+) -> Result<[u8; 32], apm2_core::fac::evidence_bundle::EvidenceBundleError> {
+    let hex_part = raw.strip_prefix("b3-256:").unwrap_or(raw);
+    let bytes = hex::decode(hex_part).map_err(|e| {
+        apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+            field: field_name.to_string(),
+            detail: format!("hex decode failed: {e}"),
+        }
+    })?;
+    <[u8; 32]>::try_from(bytes).map_err(|v| {
+        apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+            field: field_name.to_string(),
+            detail: format!("expected 32 bytes, got {}", v.len()),
+        }
+    })
+}
+
 /// Build a `BundleExportConfig` from authoritative receipt artifacts.
 ///
 /// Constructs well-formed RFC-0028 and RFC-0029 boundary substructures so
 /// that exported envelopes satisfy `import_evidence_bundle` validation.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError::MalformedPolicyDigest` if `policy_hash` or
+/// `canonicalizer_tuple_digest` is present but cannot be decoded to a valid
+/// 32-byte digest. Fail-closed: export must not proceed with fabricated
+/// placeholder digests.
 fn build_export_config_from_receipt(
     receipt: &apm2_core::fac::FacJobReceiptV1,
-) -> apm2_core::fac::evidence_bundle::BundleExportConfig {
+) -> Result<
+    apm2_core::fac::evidence_bundle::BundleExportConfig,
+    apm2_core::fac::evidence_bundle::EvidenceBundleError,
+> {
     use apm2_core::channel::{
         BoundaryFlowPolicyBinding, DisclosurePolicyBinding, LeakageBudgetReceipt,
         LeakageEstimatorFamily, TimingChannelBudget,
@@ -4513,25 +4544,32 @@ fn build_export_config_from_receipt(
     // Derive policy binding from receipt traces. For local export the receipt
     // itself is the authoritative source — the policy/canonicalizer digests
     // are self-consistent (matching) to pass import validation.
+    //
+    // Fail-closed: if either digest field is present but malformed, reject
+    // the export rather than fabricating a placeholder.
     let policy_binding = {
-        let policy_digest = receipt
-            .policy_hash
-            .as_deref()
-            .and_then(|h| {
-                let hex_part = h.strip_prefix("b3-256:").unwrap_or(h);
-                hex::decode(hex_part).ok()
-            })
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .unwrap_or([0x42u8; 32]);
-        let canonicalizer_digest = receipt
-            .canonicalizer_tuple_digest
-            .as_deref()
-            .and_then(|h| {
-                let hex_part = h.strip_prefix("b3-256:").unwrap_or(h);
-                hex::decode(hex_part).ok()
-            })
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .unwrap_or(policy_digest);
+        let policy_digest = match receipt.policy_hash.as_deref() {
+            Some(h) => parse_verified_digest("policy_hash", h)?,
+            None => {
+                return Err(
+                    apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+                        field: "policy_hash".to_string(),
+                        detail: "field is absent; cannot construct policy binding without a verified digest".to_string(),
+                    },
+                );
+            },
+        };
+        let canonicalizer_digest = match receipt.canonicalizer_tuple_digest.as_deref() {
+            Some(h) => parse_verified_digest("canonicalizer_tuple_digest", h)?,
+            None => {
+                return Err(
+                    apm2_core::fac::evidence_bundle::EvidenceBundleError::MalformedPolicyDigest {
+                        field: "canonicalizer_tuple_digest".to_string(),
+                        detail: "field is absent; cannot construct policy binding without a verified digest".to_string(),
+                    },
+                );
+            },
+        };
 
         Some(BoundaryFlowPolicyBinding {
             policy_digest,
@@ -4560,7 +4598,7 @@ fn build_export_config_from_receipt(
 
     let snapshot_digest = policy_binding
         .as_ref()
-        .map_or([0x42u8; 32], |pb| pb.policy_digest);
+        .map_or([0u8; 32], |pb| pb.policy_digest);
     let disclosure_policy_binding = Some(DisclosurePolicyBinding {
         required_for_effect: false,
         state_valid: true,
@@ -4574,64 +4612,78 @@ fn build_export_config_from_receipt(
         state_reason: String::new(),
     });
 
-    apm2_core::fac::evidence_bundle::BundleExportConfig {
+    Ok(apm2_core::fac::evidence_bundle::BundleExportConfig {
         policy_binding,
         leakage_budget_receipt,
         timing_channel_budget,
         disclosure_policy_binding,
-    }
+    })
 }
 
 /// Discover receipt blob hash from the `content_hash` field and export it.
 ///
 /// Returns the list of exported blob ref strings (hex-encoded BLAKE3 hashes).
-/// If no blobs exist or the blob store is unavailable, returns an empty list
-/// (blobs are best-effort for local export; the receipt JSON is still in the
-/// envelope).
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError::BlobExportFailed` if a referenced blob
+/// cannot be decoded, retrieved from the store, or written to the output
+/// directory. Fail-closed: export must not succeed when referenced blob
+/// artifacts are missing or cannot be persisted.
 fn discover_and_export_blobs(
     fac_root: &std::path::Path,
     receipt: &apm2_core::fac::FacJobReceiptV1,
     output_dir: &std::path::Path,
-) -> Vec<String> {
+) -> Result<Vec<String>, apm2_core::fac::evidence_bundle::EvidenceBundleError> {
     let blob_store = apm2_core::fac::BlobStore::new(fac_root);
     let mut exported_refs = Vec::new();
 
+    // Helper: parse hex, retrieve from store, write to output dir.
+    let export_one_blob =
+        |label: &str,
+         raw_hash: &str|
+         -> Result<String, apm2_core::fac::evidence_bundle::EvidenceBundleError> {
+            let hex_part = raw_hash.strip_prefix("b3-256:").unwrap_or(raw_hash);
+            let hash_bytes = hex::decode(hex_part).map_err(|e| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: hex decode failed: {e}"),
+                }
+            })?;
+            let hash_arr = <[u8; 32]>::try_from(hash_bytes).map_err(|v| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: expected 32 bytes, got {}", v.len()),
+                }
+            })?;
+            let blob_data = blob_store.retrieve(&hash_arr).map_err(|e| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: blob store retrieve failed: {e}"),
+                }
+            })?;
+            let blob_filename = format!("{hex_part}.blob");
+            let blob_dest = output_dir.join(&blob_filename);
+            std::fs::write(&blob_dest, &blob_data).map_err(|e| {
+                apm2_core::fac::evidence_bundle::EvidenceBundleError::BlobExportFailed {
+                    blob_ref: raw_hash.to_string(),
+                    detail: format!("{label}: write to {}: {e}", blob_dest.display()),
+                }
+            })?;
+            Ok(format!("b3-256:{hex_part}"))
+        };
+
     // The receipt content_hash is a BLAKE3 hex digest — parse it to look
     // up the receipt blob in the content-addressed store.
-    let receipt_hash_hex = receipt
-        .content_hash
-        .strip_prefix("b3-256:")
-        .unwrap_or(&receipt.content_hash);
-    if let Ok(hash_bytes) = hex::decode(receipt_hash_hex) {
-        if let Ok(hash_arr) = <[u8; 32]>::try_from(hash_bytes) {
-            if let Ok(blob_data) = blob_store.retrieve(&hash_arr) {
-                let blob_filename = format!("{receipt_hash_hex}.blob");
-                let blob_dest = output_dir.join(&blob_filename);
-                if std::fs::write(&blob_dest, &blob_data).is_ok() {
-                    exported_refs.push(format!("b3-256:{receipt_hash_hex}"));
-                }
-            }
-        }
-    }
+    exported_refs.push(export_one_blob("content_hash", &receipt.content_hash)?);
 
-    // Also export the job_spec_digest blob if available.
-    let spec_hash_hex = receipt
-        .job_spec_digest
-        .strip_prefix("b3-256:")
-        .unwrap_or(&receipt.job_spec_digest);
-    if let Ok(hash_bytes) = hex::decode(spec_hash_hex) {
-        if let Ok(hash_arr) = <[u8; 32]>::try_from(hash_bytes) {
-            if let Ok(blob_data) = blob_store.retrieve(&hash_arr) {
-                let blob_filename = format!("{spec_hash_hex}.blob");
-                let blob_dest = output_dir.join(&blob_filename);
-                if std::fs::write(&blob_dest, &blob_data).is_ok() {
-                    exported_refs.push(format!("b3-256:{spec_hash_hex}"));
-                }
-            }
-        }
-    }
+    // Also export the job_spec_digest blob.
+    exported_refs.push(export_one_blob(
+        "job_spec_digest",
+        &receipt.job_spec_digest,
+    )?);
 
-    exported_refs
+    Ok(exported_refs)
 }
 
 /// Runs `apm2 fac bundle export <job_id>`.
@@ -4680,11 +4732,35 @@ fn run_bundle_export(args: &BundleExportArgs, json_output: bool) -> u8 {
     }
 
     // Discover and export blobs (receipt + job spec) to the output directory.
-    let blob_refs = discover_and_export_blobs(&fac_root, &receipt, &output_dir);
+    // Fail-closed: if any referenced blob cannot be retrieved or written, the
+    // command fails rather than producing an incomplete bundle.
+    let blob_refs = match discover_and_export_blobs(&fac_root, &receipt, &output_dir) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_blob_export_failed",
+                &format!("blob export failed: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
 
     // Build the envelope with authoritative export config constructed from
-    // the receipt (satisfies import validation).
-    let config = build_export_config_from_receipt(&receipt);
+    // the receipt (satisfies import validation). Fail-closed: if policy/
+    // canonicalizer digests cannot be parsed to verified 32-byte arrays, the
+    // command fails rather than fabricating placeholder digests.
+    let config = match build_export_config_from_receipt(&receipt) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "fac_bundle_export_malformed_digest",
+                &format!("failed to construct export config: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
     let envelope = match apm2_core::fac::evidence_bundle::build_evidence_bundle_envelope(
         &receipt, &config, &blob_refs,
     ) {
@@ -5769,12 +5845,17 @@ mod tests {
             QueueAdmissionTrace,
         };
 
+        // Valid 32-byte hex digest for policy binding (64 hex chars).
+        let valid_digest = "ab".repeat(32);
+
         // Build a valid receipt with RFC-0028 and RFC-0029 traces.
         let receipt = FacJobReceiptV1 {
             schema: "apm2.fac.job_receipt.v1".to_string(),
             receipt_id: "test-rt-receipt".to_string(),
             job_id: "test-rt-job".to_string(),
-            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            job_spec_digest: "b3-256:".to_string() + &valid_digest,
+            policy_hash: Some(format!("b3-256:{valid_digest}")),
+            canonicalizer_tuple_digest: Some(format!("b3-256:{valid_digest}")),
             outcome: FacJobOutcome::Completed,
             reason: "round trip test".to_string(),
             rfc0028_channel_boundary: Some(ChannelBoundaryTrace {
@@ -5802,7 +5883,8 @@ mod tests {
         };
 
         // Build a well-formed export config (same logic as production path).
-        let config = build_export_config_from_receipt(&receipt);
+        let config = build_export_config_from_receipt(&receipt)
+            .expect("export config should succeed with valid digests");
 
         // Build envelope.
         let envelope = build_evidence_bundle_envelope(&receipt, &config, &[])
@@ -5821,5 +5903,130 @@ mod tests {
             apm2_core::fac::evidence_bundle::EVIDENCE_BUNDLE_SCHEMA
         );
         assert_eq!(imported.content_hash, envelope.content_hash);
+    }
+
+    // =========================================================================
+    // Fail-closed tests for malformed policy digests (MAJOR finding fix)
+    // =========================================================================
+
+    /// Missing `policy_hash` must produce `MalformedPolicyDigest` error.
+    #[test]
+    fn test_build_export_config_missing_policy_hash_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-missing-ph".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: None, // absent
+            canonicalizer_tuple_digest: Some(format!("b3-256:{}", "cd".repeat(32))),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(result.is_err(), "missing policy_hash must fail");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy_hash"),
+            "error must mention the field: {msg}"
+        );
+    }
+
+    /// Missing `canonicalizer_tuple_digest` must produce
+    /// `MalformedPolicyDigest` error.
+    #[test]
+    fn test_build_export_config_missing_canonicalizer_digest_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-missing-ctd".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: Some(format!("b3-256:{}", "ab".repeat(32))),
+            canonicalizer_tuple_digest: None, // absent
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(
+            result.is_err(),
+            "missing canonicalizer_tuple_digest must fail"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("canonicalizer_tuple_digest"),
+            "error must mention the field: {msg}"
+        );
+    }
+
+    /// Malformed (non-hex) `policy_hash` must produce `MalformedPolicyDigest`
+    /// error.
+    #[test]
+    fn test_build_export_config_malformed_hex_policy_hash_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-bad-hex-ph".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: Some("b3-256:not_valid_hex!!".to_string()),
+            canonicalizer_tuple_digest: Some(format!("b3-256:{}", "cd".repeat(32))),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(result.is_err(), "non-hex policy_hash must fail");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy_hash") && msg.contains("hex"),
+            "error must mention field and hex failure: {msg}"
+        );
+    }
+
+    /// Wrong-length `policy_hash` (valid hex but not 32 bytes) must fail.
+    #[test]
+    fn test_build_export_config_wrong_length_policy_hash_fails() {
+        use apm2_core::fac::{FacJobOutcome, FacJobReceiptV1};
+
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.job_receipt.v1".to_string(),
+            receipt_id: "test-short-ph".to_string(),
+            job_id: "test-job".to_string(),
+            job_spec_digest: "b3-256:".to_string() + &"ab".repeat(32),
+            policy_hash: Some("b3-256:aabb".to_string()), // only 2 bytes
+            canonicalizer_tuple_digest: Some(format!("b3-256:{}", "cd".repeat(32))),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            timestamp_secs: 1_700_000_000,
+            content_hash: String::new(),
+            ..Default::default()
+        };
+
+        let result = build_export_config_from_receipt(&receipt);
+        assert!(result.is_err(), "wrong-length policy_hash must fail");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy_hash") && msg.contains("32 bytes"),
+            "error must mention field and expected length: {msg}"
+        );
     }
 }
