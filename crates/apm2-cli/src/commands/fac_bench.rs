@@ -519,6 +519,7 @@ fn run_gate_measurement(
     let mut cmd = Command::new(exe);
     cmd.args([
         "fac",
+        "--json",
         "gates",
         "--quick",
         "--timeout-seconds",
@@ -531,8 +532,8 @@ fn run_gate_measurement(
         cpu_quota,
     ]);
 
-    let total_duration_ms = millis_from_elapsed(&overall);
     let output_result = run_command_with_bounded_output(cmd, MAX_CHILD_OUTPUT_BYTES, Stdio::null());
+    let total_duration_ms = millis_from_elapsed(&overall);
 
     match output_result {
         Ok((status, output, output_truncated)) => {
