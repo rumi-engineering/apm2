@@ -31,6 +31,7 @@ apm2 fac review run --pr <N> --type all
        +-- evidence.rs       (evidence artifact collection)
        +-- findings.rs       (review findings aggregation)
        +-- gates.rs          (pre-review gate checks: systemd, resources)
+       +-- policy_loader.rs  (shared FAC policy loading + managed CARGO_HOME creation)
        +-- gate_attestation.rs (gate attestation recording)
        +-- gate_cache.rs     (gate result caching)
        +-- logs.rs           (review log retrieval by PR/selector)
@@ -304,6 +305,11 @@ pub use types::ReviewRunType;
   - `fetch_pr_body_for_projection()` no longer makes a redundant GitHub API call when the first call returns empty and the local snapshot is also empty.
   - Restored `review_artifact_lint` in `post_test_script_gates` in both `run_evidence_gates()` and `run_evidence_gates_with_status()` — the gate was accidentally dropped during bounded-runner refactoring.
   - `run_doctor()` `json_output` parameter is now explicit (no underscore prefix) with documentation that doctor `--pr` intentionally always emits JSON as a machine-readable diagnostic surface.
+- TCK-00526: FAC-managed `CARGO_HOME` + env clearing policy enforcement.
+  - `policy_loader.rs` (NEW): Shared module extracted from duplicate implementations in `evidence.rs` and `gates.rs`. Provides `load_or_create_fac_policy()` with bounded I/O (`O_NOFOLLOW` + `Read::take` at `MAX_POLICY_SIZE + 1` bytes, no TOCTOU `exists()` check) and `ensure_managed_cargo_home()` with 0o700 permissions on Unix plus permission verification for existing directories (ownership + mode 0o700, CTR-2611). Both `evidence.rs` and `gates.rs` now delegate to this shared module.
+  - `gates.rs`: `compute_nextest_test_environment()` loads `FacPolicyV1` and calls `build_job_environment()` to produce a policy-filtered environment. Lane-derived env vars (`NEXTEST_TEST_THREADS`, `CARGO_BUILD_JOBS`) are overlaid after policy filtering. Policy loading delegates to `policy_loader::load_or_create_fac_policy()`.
+  - `evidence.rs`: `build_pipeline_test_command()` loads policy and builds policy-filtered environment for bounded pipeline test execution. Policy loading delegates to `policy_loader::load_or_create_fac_policy()`. `build_gate_policy_env()` added to construct policy-filtered env for non-test gates. `run_evidence_gates()` and `run_evidence_gates_with_status()` now pass the policy-filtered environment to ALL gates (fmt, clippy, doc, script gates, workspace integrity), not just the test gate. `run_gate_command_with_heartbeat()` now calls `env_clear()` before applying `extra_env` to enforce default-deny. `WRAPPER_STRIP_KEYS` and `WRAPPER_STRIP_PREFIXES` constants define `RUSTC_WRAPPER` and `SCCACHE_*` keys that are stripped from ALL gate phases (not just bounded test) via `env_remove_keys` on `Command`. `compute_gate_env_remove_keys()` computes the full removal set from both the ambient process env AND the policy-filtered environment (so policy-introduced SCCACHE_* variables are also discovered).
+  - `bounded_test_runner.rs`: `SYSTEMD_SETENV_ALLOWLIST_EXACT` extended with `RUSTUP_HOME`, `PATH`, `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient units. `SYSTEMD_SETENV_ALLOWLIST_PREFIXES` aligned with `FacPolicyV1` default allowlist (`LC_`, `TERM`, `XDG_`) so policy-derived variables are not rejected by the bounded runner's setenv validation.
 - TCK-00607: Doctor activity metrics + one-shot reviewer nudge + timeout consistency.
   - `apm2 fac doctor --pr <N>` now surfaces per-agent `tool_call_count`, `log_line_count`, and `nudge_count` keyed by `run_id` when available.
   - Event scanning for doctor is explicitly bounded (`DOCTOR_EVENT_SCAN_MAX_LINES`, `DOCTOR_EVENT_SCAN_MAX_LINE_BYTES`) and scans both current and rotated review event logs.
