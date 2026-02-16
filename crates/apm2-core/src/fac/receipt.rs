@@ -706,6 +706,13 @@ pub struct FacJobReceiptV1 {
     /// auto-disabled due to containment failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub containment: Option<super::containment::ContainmentTrace>,
+    /// RFC-0029 observed runtime cost metrics (TCK-00532).
+    ///
+    /// Best-effort measurement of actual job resource consumption for
+    /// post-run cost model calibration. Workers populate this from
+    /// wall-clock timers and I/O accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     /// Sandbox hardening hash for audit (TCK-00573).
     ///
     /// BLAKE3 hash of the `SandboxHardeningProfile` used for the job unit,
@@ -833,11 +840,11 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. Uses type-specific marker `2u8`
-        // to ensure injective encoding: different trailing optional field
-        // combinations always produce distinct byte streams (MAJOR-1 fix).
+        // TCK-00548: Containment trace. V1 canonical bytes must remain
+        // bit-for-bit compatible with historical receipts, so this keeps
+        // the legacy `1u8` marker when present and omits absence markers.
         if let Some(trace) = &self.containment {
-            bytes.push(2u8);
+            bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
             bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(trace.cgroup_path.as_bytes());
@@ -846,10 +853,17 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00573: Sandbox hardening hash. Uses type-specific marker
-        // `3u8` to ensure injective encoding: different trailing optional
-        // field combinations always produce distinct byte streams
-        // (MAJOR-1 fix).
+        // TCK-00532: Observed job cost. V1 trailing optionals omit absence
+        // markers for backwards compatibility with existing persisted hashes.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        }
+
+        // TCK-00573: Sandbox hardening hash. Added as an append-only trailing
+        // optional for V1; absence marker is omitted for hash stability.
         if let Some(hash) = &self.sandbox_hardening_hash {
             bytes.push(3u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
@@ -1002,6 +1016,14 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        }
+
+        // TCK-00532: Observed job cost with a type-specific marker in v2.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(4u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
         }
 
         // TCK-00573: Sandbox hardening hash. Uses type-specific marker
@@ -1250,6 +1272,7 @@ pub struct FacJobReceiptV1Builder {
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
+    observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,
     timestamp_secs: Option<u64>,
 }
@@ -1351,6 +1374,16 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
         self.containment = Some(trace);
+        self
+    }
+
+    /// Sets observed runtime cost metrics (TCK-00532).
+    #[must_use]
+    pub const fn observed_cost(
+        mut self,
+        cost: crate::economics::cost_model::ObservedJobCost,
+    ) -> Self {
+        self.observed_cost = Some(cost);
         self
     }
 
@@ -1577,6 +1610,7 @@ impl FacJobReceiptV1Builder {
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
             containment: self.containment,
+            observed_cost: self.observed_cost,
             sandbox_hardening_hash: self.sandbox_hardening_hash,
             moved_job_path,
             timestamp_secs,
@@ -2224,7 +2258,7 @@ impl GateReceiptBuilder {
         let job_spec_digest = self.job_spec_digest;
 
         if let Some(ref digest) = job_spec_digest {
-            if !digest.starts_with("b3-256:") || digest.len() != 71 {
+            if !is_strict_b3_256_digest(digest) {
                 return Err(ReceiptError::InvalidData(format!(
                     "job_spec_digest must be 'b3-256:<64 hex chars>', got length {}",
                     digest.len()
@@ -2271,7 +2305,7 @@ impl GateReceiptBuilder {
 
         // TCK-00573 MAJOR-2: Validate sandbox_hardening_hash format if set.
         if let Some(ref hash) = self.sandbox_hardening_hash {
-            if !hash.starts_with("b3-256:") || hash.len() != 71 {
+            if !is_strict_b3_256_digest(hash) {
                 return Err(ReceiptError::InvalidData(format!(
                     "sandbox_hardening_hash must be 'b3-256:<64 hex chars>', got length {}",
                     hash.len()

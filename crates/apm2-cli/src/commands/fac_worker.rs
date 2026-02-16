@@ -183,7 +183,11 @@ enum JobOutcome {
     /// Job was denied due to token or admission failure.
     Denied { reason: String },
     /// Job was successfully claimed and executed.
-    Completed { job_id: String },
+    Completed {
+        job_id: String,
+        /// Observed runtime cost metrics for post-run cost model calibration.
+        observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
+    },
     /// Job was aborted due to unrecoverable internal error.
     /// NOTE: currently unused because cleanup failures no longer change
     /// job outcome (BLOCKER fix for f-685-code_quality-0). Retained for
@@ -351,8 +355,14 @@ pub fn run_fac_worker(
         },
     );
 
-    let mut queue_state = match load_scheduler_state(&fac_root) {
-        Ok(Some(saved)) => QueueSchedulerState::from_persisted(&saved),
+    let (mut queue_state, mut cost_model) = match load_scheduler_state(&fac_root) {
+        Ok(Some(saved)) => {
+            let cm = saved
+                .cost_model
+                .clone()
+                .unwrap_or_else(apm2_core::economics::CostModelV1::with_defaults);
+            (QueueSchedulerState::from_persisted(&saved), cm)
+        },
         Ok(None) => {
             let recovery = SchedulerRecoveryReceipt {
                 schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
@@ -374,7 +384,10 @@ pub fn run_fac_worker(
                     recovery.schema, recovery.reason, recovery.timestamp_secs
                 );
             }
-            QueueSchedulerState::new()
+            (
+                QueueSchedulerState::new(),
+                apm2_core::economics::CostModelV1::with_defaults(),
+            )
         },
         Err(e) => {
             let recovery = SchedulerRecoveryReceipt {
@@ -400,7 +413,10 @@ pub fn run_fac_worker(
                     recovery.schema, recovery.reason, recovery.timestamp_secs
                 );
             }
-            QueueSchedulerState::new()
+            (
+                QueueSchedulerState::new(),
+                apm2_core::economics::CostModelV1::with_defaults(),
+            )
         },
     };
 
@@ -657,6 +673,7 @@ pub fn run_fac_worker(
                         &fac_root,
                         &queue_state,
                         broker.current_tick(),
+                        Some(&cost_model),
                     ) {
                         output_worker_error(json_output, &persist_err);
                     }
@@ -675,6 +692,7 @@ pub fn run_fac_worker(
                     &fac_root,
                     &cycle_scheduler,
                     broker.current_tick(),
+                    Some(&cost_model),
                 ) {
                     output_worker_error(json_output, &persist_err);
                     return exit_codes::GENERIC_ERROR;
@@ -733,6 +751,7 @@ pub fn run_fac_worker(
                     summary.jobs_completed as u64,
                     summary.jobs_denied as u64,
                     summary.jobs_quarantined as u64,
+                    &cost_model,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -782,8 +801,23 @@ pub fn run_fac_worker(
                         eprintln!("worker: denied {}: {reason}", candidate.spec.job_id);
                     }
                 },
-                JobOutcome::Completed { job_id } => {
+                JobOutcome::Completed {
+                    job_id,
+                    observed_cost,
+                } => {
                     summary.jobs_completed += 1;
+
+                    if let Some(cost) = observed_cost {
+                        let job_kind = &candidate.spec.kind;
+                        if let Err(cal_err) = cost_model.calibrate(job_kind, cost) {
+                            if !json_output {
+                                eprintln!(
+                                    "worker: cost model calibration warning for kind \
+                                     '{job_kind}': {cal_err}"
+                                );
+                            }
+                        }
+                    }
                     if json_output {
                         emit_worker_event(
                             "job_completed",
@@ -837,6 +871,7 @@ pub fn run_fac_worker(
                     &fac_root,
                     &cycle_scheduler,
                     broker.current_tick(),
+                    Some(&cost_model),
                 ) {
                     output_worker_error(json_output, &persist_err);
                     return exit_codes::GENERIC_ERROR;
@@ -849,9 +884,12 @@ pub fn run_fac_worker(
             }
         }
 
-        if let Err(persist_err) =
-            persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick())
-        {
+        if let Err(persist_err) = persist_queue_scheduler_state(
+            &fac_root,
+            &cycle_scheduler,
+            broker.current_tick(),
+            Some(&cost_model),
+        ) {
             output_worker_error(json_output, &persist_err);
             return exit_codes::GENERIC_ERROR;
         }
@@ -875,9 +913,12 @@ pub fn run_fac_worker(
         emit_worker_summary(&summary);
     }
 
-    if let Err(persist_err) =
-        persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick())
-    {
+    if let Err(persist_err) = persist_queue_scheduler_state(
+        &fac_root,
+        &queue_state,
+        broker.current_tick(),
+        Some(&cost_model),
+    ) {
         output_worker_error(json_output, &persist_err);
         return exit_codes::GENERIC_ERROR;
     }
@@ -889,9 +930,11 @@ fn persist_queue_scheduler_state(
     fac_root: &Path,
     queue_state: &QueueSchedulerState,
     current_tick: u64,
+    cost_model: Option<&apm2_core::economics::CostModelV1>,
 ) -> Result<(), String> {
     let mut state = queue_state.to_scheduler_state_v1(current_tick);
     state.persisted_at_secs = current_timestamp_epoch_secs();
+    state.cost_model = cost_model.cloned();
     persist_scheduler_state(fac_root, &state)
         .map(|_| ())
         .map_err(|e| format!("failed to persist scheduler state: {e}"))
@@ -1111,7 +1154,10 @@ fn process_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
+    cost_model: &apm2_core::economics::CostModelV1,
 ) -> JobOutcome {
+    let job_wall_start = Instant::now();
+
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
@@ -1434,6 +1480,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
+            job_wall_start,
         );
     }
 
@@ -1797,7 +1844,7 @@ fn process_job(
         convergence_horizon: convergence,
         convergence_receipts,
         required_authority_sets: Vec::new(),
-        cost: 1,
+        cost: cost_model.queue_cost(&spec.kind),
         current_tick,
     };
 
@@ -2254,6 +2301,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
+            job_wall_start,
         );
     }
 
@@ -2583,6 +2631,7 @@ fn process_job(
             heartbeat_jobs_completed,
             heartbeat_jobs_denied,
             heartbeat_jobs_quarantined,
+            job_wall_start,
         );
     }
 
@@ -2609,7 +2658,9 @@ fn process_job(
             .passed(false)
             .build_and_sign(signer);
 
-    if let Err(receipt_err) = emit_job_receipt(
+    let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
+
+    if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
         fac_root,
         spec,
         FacJobOutcome::Completed,
@@ -2623,6 +2674,7 @@ fn process_job(
         None,
         policy_hash,
         containment_trace.as_ref(),
+        observed_cost,
         Some(&sbx_hash),
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
@@ -2676,6 +2728,7 @@ fn process_job(
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
+        observed_cost: Some(observed_cost),
     }
 }
 
@@ -3122,6 +3175,7 @@ fn handle_stop_revoke(
     canonicalizer_tuple_digest: &str,
     policy_hash: &str,
     sbx_hash: &str,
+    job_wall_start: Instant,
 ) -> JobOutcome {
     let target_job_id = match &spec.cancel_target_job_id {
         Some(id) if !id.is_empty() => id.as_str(),
@@ -3191,7 +3245,8 @@ fn handle_stop_revoke(
                 "worker: stop_revoke: target {target_job_id} already in {terminal_state}/, treating as success"
             );
             // Emit completion receipt for the stop_revoke job itself.
-            let _ = emit_job_receipt(
+            let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
+            let _ = emit_job_receipt_with_observed_cost(
                 fac_root,
                 spec,
                 FacJobOutcome::Completed,
@@ -3205,6 +3260,7 @@ fn handle_stop_revoke(
                 None,
                 policy_hash,
                 None,
+                observed,
                 Some(sbx_hash),
             );
             let _ = move_to_dir_safe(
@@ -3214,6 +3270,7 @@ fn handle_stop_revoke(
             );
             return JobOutcome::Completed {
                 job_id: spec.job_id.clone(),
+                observed_cost: Some(observed),
             };
         }
 
@@ -3443,7 +3500,8 @@ fn handle_stop_revoke(
 
     // Step 4a: Emit completion receipt for the stop_revoke job itself
     // BEFORE moving it to completed/.
-    if let Err(receipt_err) = emit_job_receipt(
+    let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
+    if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
         fac_root,
         spec,
         FacJobOutcome::Completed,
@@ -3457,6 +3515,7 @@ fn handle_stop_revoke(
         None,
         policy_hash,
         None,
+        observed,
         Some(sbx_hash),
     ) {
         // Fail-closed: completion receipt for stop_revoke itself failed.
@@ -3490,6 +3549,7 @@ fn handle_stop_revoke(
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
+        observed_cost: Some(observed),
     }
 }
 
@@ -3532,6 +3592,7 @@ fn execute_warm_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
+    job_wall_start: Instant,
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
@@ -3985,7 +4046,8 @@ fn execute_warm_job(
             .passed(persist_ok)
             .build_and_sign(signer);
 
-    if let Err(receipt_err) = emit_job_receipt(
+    let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
+    if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
         fac_root,
         spec,
         FacJobOutcome::Completed,
@@ -3999,6 +4061,7 @@ fn execute_warm_job(
         None,
         policy_hash,
         containment_trace,
+        observed_cost,
         Some(sbx_hash),
     ) {
         eprintln!("worker: receipt emission failed for warm job: {receipt_err}");
@@ -4041,6 +4104,7 @@ fn execute_warm_job(
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
+        observed_cost: Some(observed_cost),
     }
 }
 
@@ -4561,6 +4625,81 @@ fn emit_job_receipt(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     sandbox_hardening_hash: Option<&str>,
 ) -> Result<PathBuf, String> {
+    emit_job_receipt_internal(
+        fac_root,
+        spec,
+        outcome,
+        denial_reason,
+        reason,
+        rfc0028_channel_boundary,
+        eio29_queue_admission,
+        eio29_budget_admission,
+        patch_digest,
+        canonicalizer_tuple_digest,
+        moved_job_path,
+        policy_hash,
+        containment,
+        None,
+        sandbox_hardening_hash,
+    )
+}
+
+/// Emit a unified `FacJobReceiptV1` with observed runtime cost metrics.
+#[allow(clippy::too_many_arguments)]
+fn emit_job_receipt_with_observed_cost(
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
+    moved_job_path: Option<&str>,
+    policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    observed_cost: apm2_core::economics::cost_model::ObservedJobCost,
+    sandbox_hardening_hash: Option<&str>,
+) -> Result<PathBuf, String> {
+    emit_job_receipt_internal(
+        fac_root,
+        spec,
+        outcome,
+        denial_reason,
+        reason,
+        rfc0028_channel_boundary,
+        eio29_queue_admission,
+        eio29_budget_admission,
+        patch_digest,
+        canonicalizer_tuple_digest,
+        moved_job_path,
+        policy_hash,
+        containment,
+        Some(observed_cost),
+        sandbox_hardening_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_job_receipt_internal(
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
+    moved_job_path: Option<&str>,
+    policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
+    sandbox_hardening_hash: Option<&str>,
+) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
         &spec.job_id,
@@ -4596,6 +4735,9 @@ fn emit_job_receipt(
     if let Some(trace) = containment {
         builder = builder.containment(trace.clone());
     }
+    if let Some(cost) = observed_cost {
+        builder = builder.observed_cost(cost);
+    }
     // TCK-00573: Bind sandbox hardening hash to receipt for audit.
     if let Some(hash) = sandbox_hardening_hash {
         builder = builder.sandbox_hardening_hash(hash);
@@ -4605,6 +4747,21 @@ fn emit_job_receipt(
         .try_build()
         .map_err(|e| format!("cannot build job receipt: {e}"))?;
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+}
+
+/// Compute observed job cost from wall-clock elapsed time.
+///
+/// CPU time and I/O bytes are reported as 0 (best-effort: these metrics
+/// require cgroup accounting which is not yet wired into the worker).
+fn observed_cost_from_elapsed(
+    elapsed: std::time::Duration,
+) -> apm2_core::economics::cost_model::ObservedJobCost {
+    apm2_core::economics::cost_model::ObservedJobCost {
+        duration_ms: u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX)))
+            .unwrap_or(u64::MAX),
+        cpu_time_ms: 0,
+        bytes_written: 0,
+    }
 }
 
 fn compute_job_spec_digest_preview(bytes: &[u8]) -> String {
