@@ -592,6 +592,12 @@ run via `systemd-run --system` with a dedicated service user instead of
 - `build_systemd_run_command()`: Construct the `systemd-run` command for
   either backend with properties from `SystemdUnitProperties`.
 - `probe_user_bus()`: Check whether a user D-Bus session bus socket exists.
+- `ExecutionBackendError::is_platform_unavailable()`: Classifies errors as
+  platform-unavailable (acceptable fallback to uncontained) vs configuration
+  errors (fail-closed denial). Platform-unavailable: `UserModeUnavailable`,
+  `SystemModeUnavailable`, `SystemdRunNotFound`, `CgroupV2Unavailable`.
+  All other variants are configuration errors. Used by warm containment
+  setup to enforce fail-closed policy.
 
 **Environment variables**:
 - `APM2_FAC_EXECUTION_BACKEND`: `user` | `system` | `auto` (default: `auto`)
@@ -863,10 +869,12 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   units.
 - **Warm phases** (`fac/warm.rs`, `fac_worker.rs`): `execute_warm_job()` builds
   a hardened environment via `build_job_environment()` before calling
-  `execute_warm()`. All warm subprocesses (phase commands and version probes)
-  execute with `env_clear()` + hardened env (INV-WARM-012). FAC-private state,
-  secrets, and worker authority context are unreachable from untrusted `build.rs`
-  and proc-macro code.
+  `execute_warm()`. In the containment path (systemd-run), the hardened env is
+  forwarded via `--setenv` arguments; the systemd-run process itself inherits
+  the parent environment (needs D-Bus connectivity). In the direct spawn
+  fallback path, `env_clear()` + hardened env is used (INV-WARM-012).
+  FAC-private state, secrets, and worker authority context are unreachable
+  from untrusted `build.rs` and proc-macro code.
 
 ### Security Invariants (TCK-00526)
 
@@ -1101,13 +1109,19 @@ pre-populating build caches in the lane target namespace.
 - `WarmPhase`: Selectable warm phase enum (Fetch, Build, Nextest, Clippy, Doc).
 - `WarmToolVersions`: Tool version snapshot with bounded optional string fields.
 - `WarmError`: Error taxonomy covering invalid phases, bounds violations,
-  execution failures, timeouts, and hash mismatches.
+  execution failures, timeouts, containment failures, and hash mismatches.
+- `WarmContainment`: Systemd transient unit containment configuration for warm
+  phase subprocesses (backend, properties, optional system-mode config).
 
 ### Core Capabilities
 
-- `execute_warm(phases, ...)`: Execute warm phases and produce a `WarmReceiptV1`.
-- `execute_warm_phase(phase, ...)`: Execute a single phase with timeout
-  enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
+- `execute_warm(phases, ..., containment, heartbeat_fn)`: Execute warm phases
+  and produce a `WarmReceiptV1`. Accepts optional `WarmContainment` for
+  systemd-run transient unit wrapping and optional heartbeat callback for
+  liveness during long-running phases.
+- `execute_warm_phase(phase, ..., containment, heartbeat_fn)`: Execute a
+  single phase with timeout enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
+  Accepts optional containment and heartbeat parameters.
 - `collect_tool_versions(hardened_env)`: Bounded stdout collection from version
   probe commands (`MAX_VERSION_OUTPUT_BYTES`). Uses hardened environment
   (INV-WARM-012, defense-in-depth). Version probes use a deadlock-free
@@ -1140,8 +1154,9 @@ pre-populating build caches in the lane target namespace.
 - [INV-WARM-010] GateReceipt `passed` reflects warm receipt persistence success.
   Persistence failure produces `passed=false` (fail-closed measurement
   integrity).
-- [INV-WARM-011] Warm execution inherits systemd transient unit containment
-  from the worker (TCK-00529/TCK-00511 cgroup + namespace isolation).
+- [INV-WARM-011] Warm phase subprocesses execute under their own `systemd-run`
+  transient units (INV-WARM-014), providing active cgroup containment
+  independent of the worker's own unit. Supersedes passive inheritance model.
 - [INV-WARM-012] Warm phase subprocesses execute with a hardened environment
   constructed via `build_job_environment()` (default-deny + policy allowlist).
   The ambient process environment is NOT inherited. FAC-private state paths
@@ -1154,6 +1169,31 @@ pre-populating build caches in the lane target namespace.
   thread holds a child mutex across blocking `wait()` while the timeout path
   needs the same mutex to `kill()` the process. The calling thread retains
   unconditional kill authority regardless of helper thread state.
+- [INV-WARM-014] Warm phase subprocesses are executed under `systemd-run`
+  transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec constraints
+  matching the lane profile, identical to how standard bounded test jobs are
+  contained. Uses `build_systemd_run_command()` from `execution_backend` for
+  consistent command construction. Transient unit names are unique per
+  lane/job/phase (`apm2-warm-{lane}-{job_id_prefix}-{phase}`) to prevent
+  collisions across concurrent workers or rapid re-execution. When
+  `systemd-run` is platform-unavailable (container environments, no user
+  D-Bus session in auto mode), falls back to direct `Command::spawn` with a
+  logged warning. Configuration errors (invalid backend value, invalid
+  service user, env var issues) deny the job (fail-closed) rather than
+  silently disabling containment. Environment is forwarded via `--setenv`
+  arguments. The systemd-run process itself inherits the parent environment
+  (no `env_clear()`) because it needs `DBUS_SESSION_BUS_ADDRESS` and
+  `XDG_RUNTIME_DIR` for user-mode D-Bus connectivity; the contained child
+  process receives its environment exclusively via `--setenv`.
+- [INV-WARM-015] Heartbeat refresh is integrated into the warm phase `try_wait`
+  polling loop via an optional callback. Invoked every 5 seconds
+  (`HEARTBEAT_REFRESH_INTERVAL`) to prevent the worker heartbeat file from
+  going stale during long-running warm phases (which can take hours for large
+  projects). The heartbeat callback captures the last known cycle count and
+  job counters from the worker's main loop so that observers see accurate
+  state during warm phases. The callback is passed from the worker into
+  `execute_warm`/`execute_warm_phase` and runs synchronously on the same
+  thread (no cross-thread sharing).
 
 ## Control-Lane Exception (TCK-00533)
 

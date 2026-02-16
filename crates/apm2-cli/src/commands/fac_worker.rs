@@ -90,13 +90,13 @@ use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
-    ChannelBoundaryTrace, DenialReasonCode, FAC_LANE_CLEANUP_RECEIPT_SCHEMA, FacJobOutcome,
-    FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
+    ChannelBoundaryTrace, DenialReasonCode, ExecutionBackend, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
+    FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
     LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
     LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemdUnitProperties, build_job_environment, compute_policy_hash,
-    deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, run_preflight,
+    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, build_job_environment,
+    compute_policy_hash, deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight, select_and_validate_backend,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -670,6 +670,10 @@ pub fn run_fac_worker(
                     print_unit,
                     &current_tuple_digest,
                     &boundary_id,
+                    cycle_count,
+                    summary.jobs_completed as u64,
+                    summary.jobs_denied as u64,
+                    summary.jobs_quarantined as u64,
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -1044,6 +1048,10 @@ fn process_job(
     print_unit: bool,
     canonicalizer_tuple_digest: &str,
     boundary_id: &str,
+    heartbeat_cycle_count: u64,
+    heartbeat_jobs_completed: u64,
+    heartbeat_jobs_denied: u64,
+    heartbeat_jobs_quarantined: u64,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -2456,6 +2464,11 @@ fn process_job(
             &lane_mgr,
             &candidate.raw_bytes,
             policy,
+            &lane_systemd_properties,
+            heartbeat_cycle_count,
+            heartbeat_jobs_completed,
+            heartbeat_jobs_denied,
+            heartbeat_jobs_quarantined,
         );
     }
 
@@ -3388,8 +3401,13 @@ fn execute_warm_job(
     lane_mgr: &LaneManager,
     _raw_bytes: &[u8],
     policy: &FacPolicyV1,
+    lane_systemd_properties: &SystemdUnitProperties,
+    heartbeat_cycle_count: u64,
+    heartbeat_jobs_completed: u64,
+    heartbeat_jobs_denied: u64,
+    heartbeat_jobs_quarantined: u64,
 ) -> JobOutcome {
-    use apm2_core::fac::warm::{WarmPhase, execute_warm};
+    use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
     // Parse warm phases from decoded_source (comma-separated phase names).
     let phases: Vec<WarmPhase> = match &spec.actuation.decoded_source {
@@ -3532,6 +3550,165 @@ fn execute_warm_job(
     let ambient_env: Vec<(String, String)> = std::env::vars().collect();
     let hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
 
+    // [INV-WARM-014] Construct systemd-run containment for warm phase
+    // subprocesses. This wraps each cargo command in a transient unit with
+    // MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec from the lane profile,
+    // matching the containment model used by standard bounded test execution.
+    //
+    // Uses select_and_validate_backend() for consistency with other components
+    // (bounded test runner, gate execution). This validates prerequisites
+    // (user bus for user-mode, systemd-run for system-mode) in one call.
+    //
+    // Fail-closed: only fall back to uncontained execution when the platform
+    // genuinely doesn't support systemd-run (container environments, no user
+    // D-Bus session in auto mode). Configuration errors (invalid backend
+    // value, invalid service user, env var issues) deny the job — they
+    // indicate operator misconfiguration that should be fixed, not silently
+    // degraded.
+    let warm_containment = match select_and_validate_backend() {
+        Ok(backend) => {
+            let system_config = if backend == ExecutionBackend::SystemMode {
+                match SystemModeConfig::from_env() {
+                    Ok(cfg) => Some(cfg),
+                    Err(e) => {
+                        // System-mode config failure is a configuration error
+                        // (invalid service user, env var issues) — fail the job.
+                        let reason = format!(
+                            "warm containment denied: system-mode config error \
+                             (not a platform limitation): {e}"
+                        );
+                        eprintln!("worker: warm job {}: {reason}", spec.job_id);
+                        let _ = LaneLeaseV1::remove(lane_dir);
+                        let moved_path = move_to_dir_safe(
+                            claimed_path,
+                            &queue_root.join(DENIED_DIR),
+                            claimed_file_name,
+                        )
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                        let _ = emit_job_receipt(
+                            fac_root,
+                            spec,
+                            FacJobOutcome::Denied,
+                            Some(DenialReasonCode::ValidationFailed),
+                            &reason,
+                            Some(boundary_trace),
+                            Some(queue_trace),
+                            budget_trace,
+                            patch_digest,
+                            Some(canonicalizer_tuple_digest),
+                            moved_path.as_deref(),
+                            policy_hash,
+                            containment_trace,
+                        );
+                        return JobOutcome::Denied { reason };
+                    },
+                }
+            } else {
+                None
+            };
+            Some(WarmContainment {
+                backend,
+                properties: lane_systemd_properties.clone(),
+                system_config,
+            })
+        },
+        Err(e) => {
+            if e.is_platform_unavailable() {
+                // Platform doesn't support systemd-run — acceptable fallback
+                // to uncontained execution with a logged warning.
+                eprintln!(
+                    "worker: WARNING: warm job {} executing WITHOUT systemd-run containment \
+                     (platform unavailable: {e}) — warm phase subprocesses (including build.rs \
+                     and proc-macros) are not resource-limited by transient unit properties",
+                    spec.job_id,
+                );
+                None
+            } else {
+                // Configuration/invariant error — fail-closed, deny the job.
+                let reason = format!(
+                    "warm containment denied: backend configuration error \
+                     (not a platform limitation): {e}"
+                );
+                eprintln!("worker: warm job {}: {reason}", spec.job_id);
+                let _ = LaneLeaseV1::remove(lane_dir);
+                let moved_path = move_to_dir_safe(
+                    claimed_path,
+                    &queue_root.join(DENIED_DIR),
+                    claimed_file_name,
+                )
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
+                let _ = emit_job_receipt(
+                    fac_root,
+                    spec,
+                    FacJobOutcome::Denied,
+                    Some(DenialReasonCode::ValidationFailed),
+                    &reason,
+                    Some(boundary_trace),
+                    Some(queue_trace),
+                    budget_trace,
+                    patch_digest,
+                    Some(canonicalizer_tuple_digest),
+                    moved_path.as_deref(),
+                    policy_hash,
+                    containment_trace,
+                );
+                return JobOutcome::Denied { reason };
+            }
+        },
+    };
+    if warm_containment.is_none() {
+        eprintln!(
+            "worker: WARNING: warm job {} executing WITHOUT systemd-run containment — \
+             warm phase subprocesses (including build.rs and proc-macros) are not \
+             resource-limited by transient unit properties",
+            spec.job_id,
+        );
+    }
+
+    // [INV-WARM-015] Build heartbeat refresh closure for the warm phase
+    // polling loop. This prevents the worker heartbeat file from going stale
+    // during long-running warm phases (which can take hours for large
+    // projects). The heartbeat is refreshed every HEARTBEAT_REFRESH_INTERVAL
+    // (5s) inside the try_wait loop.
+    //
+    // The closure captures the last known cycle_count and job counters from
+    // the worker's main loop so that observers see accurate state during
+    // long warm phases, rather than misleading zeroed counters.
+    //
+    // Synchronization: heartbeat_fn captures fac_root by value (Path clone)
+    // and counter values by copy. Invoked synchronously from the same
+    // thread that calls execute_warm_phase. No cross-thread sharing or
+    // interior mutability.
+    let heartbeat_fac_root = fac_root.to_path_buf();
+    let heartbeat_job_id = spec.job_id.clone();
+    let heartbeat_fn = move || {
+        if let Err(e) = apm2_core::fac::worker_heartbeat::write_heartbeat(
+            &heartbeat_fac_root,
+            heartbeat_cycle_count,
+            heartbeat_jobs_completed,
+            heartbeat_jobs_denied,
+            heartbeat_jobs_quarantined,
+            "warm-executing",
+        ) {
+            // Non-fatal: heartbeat is observability, not correctness.
+            eprintln!(
+                "worker: WARNING: heartbeat refresh failed during warm job {heartbeat_job_id}: {e}",
+            );
+        }
+    };
+
     // Execute warm phases.
     let start_epoch_secs = current_timestamp_epoch_secs();
     let warm_result = execute_warm(
@@ -3544,6 +3721,9 @@ fn execute_warm_job(
         &spec.source.head_sha,
         start_epoch_secs,
         &hardened_env,
+        warm_containment.as_ref(),
+        Some(&heartbeat_fn),
+        &spec.job_id,
     );
 
     let receipt = match warm_result {

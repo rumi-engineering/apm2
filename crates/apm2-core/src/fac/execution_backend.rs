@@ -181,6 +181,27 @@ pub enum ExecutionBackendError {
     },
 }
 
+impl ExecutionBackendError {
+    /// Returns `true` if this error indicates the execution platform is
+    /// genuinely unavailable (no systemd-run, no user bus, no cgroup v2),
+    /// as opposed to a configuration or invariant error.
+    ///
+    /// Callers use this to decide whether falling back to uncontained
+    /// execution is acceptable (platform-unavailable) or whether the job
+    /// should be denied (configuration error). Fail-closed: unknown/new
+    /// variants default to `false` (treated as config errors).
+    #[must_use]
+    pub const fn is_platform_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::UserModeUnavailable { .. }
+                | Self::SystemModeUnavailable { .. }
+                | Self::SystemdRunNotFound
+                | Self::CgroupV2Unavailable
+        )
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Execution Backend
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1178,5 +1199,62 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("APM2_FAC_SERVICE_USER"));
         assert!(msg.contains("non-UTF-8"));
+    }
+
+    // ── Platform-unavailable classification ─────────────────────────
+
+    #[test]
+    fn platform_unavailable_classification() {
+        // Platform-unavailable errors should return true.
+        assert!(
+            ExecutionBackendError::UserModeUnavailable {
+                reason: "no bus".into(),
+            }
+            .is_platform_unavailable()
+        );
+        assert!(
+            ExecutionBackendError::SystemModeUnavailable {
+                reason: "no systemd".into(),
+            }
+            .is_platform_unavailable()
+        );
+        assert!(ExecutionBackendError::SystemdRunNotFound.is_platform_unavailable());
+        assert!(ExecutionBackendError::CgroupV2Unavailable.is_platform_unavailable());
+
+        // Configuration errors should return false (fail-closed).
+        assert!(
+            !ExecutionBackendError::InvalidBackendValue {
+                value: "bogus".into(),
+            }
+            .is_platform_unavailable()
+        );
+        assert!(
+            !ExecutionBackendError::InvalidServiceUser {
+                user: String::new(),
+                reason: "empty".into(),
+            }
+            .is_platform_unavailable()
+        );
+        assert!(
+            !ExecutionBackendError::EnvValueTooLong {
+                var: "X",
+                actual: 999,
+                max: 256,
+            }
+            .is_platform_unavailable()
+        );
+        assert!(
+            !ExecutionBackendError::TooManyProperties { count: 99, max: 32 }
+                .is_platform_unavailable()
+        );
+        assert!(
+            !ExecutionBackendError::PrivilegedServiceUser {
+                user: "root".into(),
+                uid: 0,
+                reason: "uid 0".into(),
+            }
+            .is_platform_unavailable()
+        );
+        assert!(!ExecutionBackendError::EnvValueNotUtf8 { var: "X" }.is_platform_unavailable());
     }
 }

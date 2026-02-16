@@ -632,6 +632,6 @@ pub use safe_rmtree::{
 pub use systemd_properties::SystemdUnitProperties;
 pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
-    WARM_RECEIPT_SCHEMA, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1, WarmToolVersions,
-    collect_tool_versions, execute_warm, execute_warm_phase,
+    WARM_RECEIPT_SCHEMA, WarmContainment, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1,
+    WarmToolVersions, collect_tool_versions, execute_warm, execute_warm_phase,
 };
