@@ -379,7 +379,7 @@ CostModelV1
 ### Invariants
 
 - [INV-CM01] Every known job kind has a deterministic cost estimate.
-- [INV-CM02] Calibration never increases cost estimates beyond their initial conservative defaults (monotone-safe).
+- [INV-CM02] Calibration never increases cost estimates beyond their initial conservative defaults (bounded-safe: estimates adapt bidirectionally within `[floor, default]` but can never exceed the default).
 - [INV-CM03] Calibration never makes the system less safe (never increases concurrency budgets or admission windows).
 - [INV-CM04] Cost model is bounded: maximum of `MAX_JOB_KINDS` (16) entries.
 - [INV-CM05] Unknown job kinds receive the most conservative (largest) estimate.
@@ -390,7 +390,7 @@ CostModelV1
 ### Contracts
 
 - [CTR-CM01] `estimate()` always returns a valid `JobCostEstimate` for any input string (fail-closed to conservative default for unknown kinds).
-- [CTR-CM02] `calibrate()` only adjusts estimates downward within floor bounds.
+- [CTR-CM02] `calibrate()` adjusts estimates bidirectionally within `[floor, default]` bounds (never exceeds the conservative default).
 - [CTR-CM03] `CostModelV1` round-trips through serde deterministically.
 - [CTR-CM04] `canonical_bytes()` produces deterministic output for hashing.
 

@@ -3244,9 +3244,11 @@ fn handle_stop_revoke(
                 &queue_root.join(COMPLETED_DIR),
                 claimed_file_name,
             );
+            // Reuse the same `observed` snapshot for the outcome to keep
+            // emitted receipt and calibration data aligned (NIT fix).
             return JobOutcome::Completed {
                 job_id: spec.job_id.clone(),
-                observed_cost: Some(observed_cost_from_elapsed(job_wall_start.elapsed())),
+                observed_cost: Some(observed),
             };
         }
 
@@ -3522,9 +3524,11 @@ fn handle_stop_revoke(
         };
     }
 
+    // Reuse the same `observed` snapshot for the outcome to keep
+    // emitted receipt and calibration data aligned (NIT fix).
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
-        observed_cost: Some(observed_cost_from_elapsed(job_wall_start.elapsed())),
+        observed_cost: Some(observed),
     }
 }
 

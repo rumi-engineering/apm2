@@ -11,8 +11,8 @@
 //!
 //! - [INV-CM01] Every known job kind has a deterministic cost estimate.
 //! - [INV-CM02] Calibration never increases cost estimates beyond their initial
-//!   conservative defaults (monotone-safe: estimates can only decrease or
-//!   stay).
+//!   conservative defaults (bounded-safe: estimates adapt bidirectionally
+//!   within `[floor, default]` but can never exceed the default).
 //! - [INV-CM03] Calibration never makes the system less safe (never increases
 //!   concurrency budgets or admission windows).
 //! - [INV-CM04] Cost model is bounded: maximum of [`MAX_JOB_KINDS`] entries.
@@ -28,8 +28,8 @@
 //!
 //! - [CTR-CM01] `estimate()` always returns a valid `JobCostEstimate` for any
 //!   input string (fail-closed to conservative default for unknown kinds).
-//! - [CTR-CM02] `calibrate()` only adjusts estimates downward within floor
-//!   bounds.
+//! - [CTR-CM02] `calibrate()` adjusts estimates bidirectionally within `[floor,
+//!   default]` bounds (never exceeds the conservative default).
 //! - [CTR-CM03] `CostModelV1` round-trips through serde deterministically.
 //! - [CTR-CM04] `canonical_bytes()` produces deterministic output for hashing.
 
@@ -81,8 +81,8 @@ pub const MAX_JOB_KIND_LENGTH: usize = 64;
 /// Returns the conservative default cost estimate for a known job kind.
 ///
 /// These values are intentionally high (pessimistic) to ensure the system
-/// starts in a safe state. Calibration can only lower them toward observed
-/// reality, never raise them above these defaults.
+/// starts in a safe state. Calibration adapts estimates bidirectionally
+/// within `[floor, default]` but can never raise them above these defaults.
 #[must_use]
 fn default_estimate(kind: &str) -> JobCostEstimate {
     match kind {
@@ -369,14 +369,15 @@ impl CostModelV1 {
 
     /// Incorporates an observed job cost into the calibration state.
     ///
-    /// Calibration is monotone-safe: estimates can only decrease toward
-    /// observed values, never increase above the initial conservative
-    /// defaults (INV-CM02, INV-CM03).
+    /// Calibration is bounded-safe: estimates adapt bidirectionally toward
+    /// observed EWMA values, but are always clamped within the range
+    /// `[MIN_ESTIMATED_*, default_estimate]` (INV-CM02, INV-CM03).
     ///
-    /// Uses bounded EWMA with floor constraints:
-    /// - `new_estimate` = max(floor, ewma(old, observed))
-    /// - If observed > current estimate, the observation is recorded but the
-    ///   estimate is not raised (monotone-safe).
+    /// Uses bounded EWMA with floor and ceiling constraints:
+    /// - `new_estimate` = clamp(ewma(old, observed), floor, default)
+    /// - Estimates can decrease toward observed reality AND rise back toward
+    ///   the conservative default if observations indicate higher cost.
+    /// - Estimates can NEVER exceed the initial conservative default.
     ///
     /// # Errors
     ///
@@ -446,21 +447,22 @@ impl CostModelV1 {
         let ewma_wall_ms = cal.ewma_wall_ms;
         let ewma_io_bytes = cal.ewma_io_bytes;
 
-        // Now apply the calibrated EWMA back to the estimate, but only
-        // if it would DECREASE the estimate (monotone-safe: never increase).
+        // Apply the calibrated EWMA back to the estimate, clamped within
+        // [floor, default]. Estimates adapt bidirectionally: they can
+        // decrease toward observed reality AND rise back toward the
+        // conservative default if observations indicate higher cost.
+        // They can NEVER exceed the initial conservative default (INV-CM02).
+        // This prevents the ratchet-down DoS where a temporary low-cost
+        // observation permanently locks in an under-budget estimate.
         let default = default_estimate(kind);
 
-        // Wall time: use min of current and EWMA, but never below floor
-        // and never above the initial default.
+        // Wall time: clamp EWMA to [MIN_ESTIMATED_WALL_MS, default].
         let new_wall_ms = ewma_wall_ms
-            .min(current.estimated_wall_ms)
             .max(MIN_ESTIMATED_WALL_MS)
             .min(default.estimated_wall_ms);
 
-        // I/O bytes: same logic (no floor needed since MIN_ESTIMATED_IO_BYTES is 0)
-        let new_io_bytes = ewma_io_bytes
-            .min(current.estimated_io_bytes)
-            .min(default.estimated_io_bytes);
+        // I/O bytes: clamp EWMA to [0, default].
+        let new_io_bytes = ewma_io_bytes.min(default.estimated_io_bytes);
 
         // Ticks: derive from wall time ratio vs default
         // ticks = default_ticks * (new_wall_ms / default_wall_ms), floored
@@ -840,6 +842,58 @@ mod tests {
         // After multiple calibrations, estimate should be closer to observed
         let final_est = model.estimate("gates");
         assert!(final_est.estimated_wall_ms < 600_000);
+    }
+
+    #[test]
+    fn calibration_recovers_from_temporary_low_observations() {
+        // Regression test for MAJOR f-705-security-1771276638939459-0:
+        // Estimates must be able to rise back toward the default when
+        // observations indicate the job has become heavier. The old
+        // .min(current) ratchet prevented recovery from temporary
+        // low-cost observations, causing persistent under-budgeting.
+        let mut model = CostModelV1::with_defaults();
+        let default_wall = default_estimate("gates").estimated_wall_ms;
+
+        // Phase 1: Drive estimate down with low observations
+        let low_observed = ObservedJobCost {
+            duration_ms: 60_000, // 1 min (much lower than 10 min default)
+            cpu_time_ms: 50_000,
+            bytes_written: 50_000_000,
+        };
+        for _ in 0..10 {
+            model
+                .calibrate("gates", &low_observed)
+                .expect("calibrate ok");
+        }
+        let depressed = model.estimate("gates").estimated_wall_ms;
+        assert!(
+            depressed < default_wall,
+            "estimate should have decreased: {depressed} < {default_wall}"
+        );
+
+        // Phase 2: Observe high-cost jobs (back to default level)
+        let high_observed = ObservedJobCost {
+            duration_ms: 550_000, // close to default
+            cpu_time_ms: 500_000,
+            bytes_written: 450_000_000,
+        };
+        for _ in 0..20 {
+            model
+                .calibrate("gates", &high_observed)
+                .expect("calibrate ok");
+        }
+        let recovered = model.estimate("gates").estimated_wall_ms;
+
+        // Estimate must have risen from the depressed level
+        assert!(
+            recovered > depressed,
+            "estimate must recover upward: {recovered} > {depressed}"
+        );
+        // But must still be capped at default
+        assert!(
+            recovered <= default_wall,
+            "estimate must not exceed default: {recovered} <= {default_wall}"
+        );
     }
 
     #[test]

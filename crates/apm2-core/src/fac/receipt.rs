@@ -725,13 +725,15 @@ impl FacJobReceiptV1 {
     /// Encodes all fields except `content_hash` in deterministic order with
     /// length-prefixing to prevent canonicalization collisions.
     ///
-    /// # Trailing Optional Field Policy
+    /// # V1 Immutability Contract
     ///
-    /// ALL trailing optional fields (`moved_job_path`, `containment`,
-    /// `observed_cost`) emit a presence marker (0u8 for None, 1u8 for Some)
-    /// to prevent canonicalization collisions. Without markers, two receipts
-    /// with different field occupancy patterns could produce identical
-    /// canonical bytes if the encoded data happens to align.
+    /// This method represents the V1 canonical form and MUST remain
+    /// bit-for-bit compatible with the historical implementation. Trailing
+    /// optional fields (`moved_job_path`, `containment`, `observed_cost`)
+    /// do NOT emit a `0u8` presence marker when absent; they are simply
+    /// omitted. This matches the original encoding and preserves content
+    /// hashes for all existing persisted receipts. New receipts should
+    /// prefer `canonical_bytes_v2()` which uses proper presence markers.
     ///
     /// # Panics
     ///
@@ -830,25 +832,20 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Trailing optional fields: ALL emit presence markers (0u8 for None,
-        // 1u8 for Some) to prevent canonicalization collisions. Without
-        // markers, a receipt with `moved_job_path=Some(data)` and
-        // `containment=None` could produce identical bytes to one with
-        // `moved_job_path=None` and `containment=Some(colliding_data)`.
-        //
-        // Backward-compat note: adding `observed_cost` (TCK-00532) already
-        // changes v1 canonical bytes (its 0u8 marker is new), so adding
-        // absence markers for `moved_job_path` and `containment` is a
-        // no-cost fix — all v1 hashes are recomputed anyway.
+        // V1 trailing optional fields: NO `0u8` presence marker when absent.
+        // These fields are simply omitted when None, preserving bit-for-bit
+        // hash compatibility with pre-TCK-00514 / pre-TCK-00548 receipts.
+        // Appended at end for backward compatibility.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
-        } else {
-            bytes.push(0u8);
         }
 
-        // TCK-00548: Containment trace with presence marker.
+        // TCK-00548: Containment trace. Appended at end for backward
+        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
+        // marker when absent, matching the pattern for other trailing
+        // optional fields.
         if let Some(trace) = &self.containment {
             bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
@@ -857,18 +854,17 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
-        } else {
-            bytes.push(0u8);
         }
 
-        // TCK-00532: Observed job cost with presence marker.
+        // TCK-00532: Observed job cost. Appended at end for backward
+        // compatibility. No `0u8` presence marker when absent, matching
+        // the V1 trailing optional field pattern. Old receipts without
+        // this field will produce the same hash as before.
         if let Some(cost) = &self.observed_cost {
             bytes.push(1u8);
             bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
-        } else {
-            bytes.push(0u8);
         }
 
         bytes
@@ -3695,7 +3691,7 @@ pub mod tests {
         );
         assert_ne!(
             bytes_moved_only, bytes_containment_only,
-            "moved_job_path=Some vs containment=Some must differ (collision prevented by presence markers)"
+            "moved_job_path=Some vs containment=Some must differ (V1: different field structures prevent collision)"
         );
         assert_ne!(
             bytes_moved_only, bytes_cost_only,
@@ -3708,27 +3704,31 @@ pub mod tests {
     }
 
     #[test]
-    fn test_v1_canonical_bytes_absence_marker_emitted_for_moved_job_path() {
-        // Verify that moved_job_path=None emits a 0u8 presence marker.
+    fn test_v1_canonical_bytes_no_absence_marker_for_moved_job_path() {
+        // V1 immutability contract: moved_job_path=None does NOT emit a 0u8
+        // marker. The field is simply omitted, preserving historical hash
+        // compatibility. Presence is distinguished by the 1u8 tag + data.
         let mut r = make_valid_receipt();
         r.moved_job_path = None;
         r.containment = None;
         r.observed_cost = None;
         let bytes_none = r.canonical_bytes();
 
-        r.moved_job_path = Some(String::new());
-        let bytes_empty = r.canonical_bytes();
+        r.moved_job_path = Some("quarantine/path".to_string());
+        let bytes_some = r.canonical_bytes();
 
-        // None (0u8) vs Some("") (1u8 + 0u32 length) must differ.
-        assert_ne!(
-            bytes_none, bytes_empty,
-            "moved_job_path=None vs moved_job_path=Some('') must differ"
+        // None produces shorter output (no bytes); Some produces 1u8 + len + data.
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "moved_job_path=Some must produce longer canonical bytes than None"
         );
     }
 
     #[test]
-    fn test_v1_canonical_bytes_absence_marker_emitted_for_containment() {
-        // Verify that containment=None emits a 0u8 presence marker.
+    fn test_v1_canonical_bytes_no_absence_marker_for_containment() {
+        // V1 immutability contract: containment=None does NOT emit a 0u8
+        // marker. The field is simply omitted, preserving historical hash
+        // compatibility.
         let mut r = make_valid_receipt();
         r.moved_job_path = None;
         r.containment = None;
@@ -3737,17 +3737,17 @@ pub mod tests {
 
         r.containment = Some(crate::fac::containment::ContainmentTrace {
             verified: false,
-            cgroup_path: String::new(),
+            cgroup_path: "/test".to_string(),
             processes_checked: 0,
             mismatch_count: 0,
             sccache_auto_disabled: false,
         });
         let bytes_some = r.canonical_bytes();
 
-        // None (0u8) vs Some(...) (1u8 + fields) must differ.
-        assert_ne!(
-            bytes_none, bytes_some,
-            "containment=None vs containment=Some must differ"
+        // None produces shorter output (no bytes); Some produces 1u8 + fields.
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "containment=Some must produce longer canonical bytes than None"
         );
     }
 
