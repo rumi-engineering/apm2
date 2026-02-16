@@ -104,6 +104,9 @@ mod ci_import;
 /// Containment verification: cgroup membership checks for child processes
 /// (TCK-00548).
 pub mod containment;
+/// Credential gate for FAC workflows: fail-fast checks for GitHub-facing
+/// commands and typed credential mount descriptors (TCK-00596).
+pub mod credential_gate;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
@@ -256,6 +259,12 @@ pub use containment::{
     check_sccache_containment, check_sccache_containment_with_proc, discover_children,
     discover_children_from_proc, is_cgroup_contained, read_cgroup_path, read_cgroup_path_from_proc,
     verify_containment, verify_containment_with_proc,
+};
+// Re-export credential gate types (TCK-00596)
+pub use credential_gate::{
+    CredentialGateError, CredentialMountV1, CredentialPosture, CredentialSource, EnvMount,
+    FileMountDescriptor, MAX_ENV_MOUNTS, MAX_ENV_NAME_LENGTH, build_github_credential_mount,
+    check_github_credential_posture, require_github_credentials, validate_credential_mount,
 };
 // Re-export determinism types
 pub use determinism::{
