@@ -852,6 +852,12 @@ directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
   directory is already handled by the existing temp prune step (Step 3).
 - **Lane reset** (`fac.rs`): `run_lane_reset()` deletes all lane subdirectories
   including `home/`, `tmp/`, `xdg_cache/`, `xdg_config/` (TCK-00575).
+- **Warm phases** (`fac/warm.rs`, `fac_worker.rs`): `execute_warm_job()` builds
+  a hardened environment via `build_job_environment()` before calling
+  `execute_warm()`. All warm subprocesses (phase commands and version probes)
+  execute with `env_clear()` + hardened env (INV-WARM-012). FAC-private state,
+  secrets, and worker authority context are unreachable from untrusted `build.rs`
+  and proc-macro code.
 
 ### Security Invariants (TCK-00526)
 
@@ -1108,6 +1114,75 @@ systemd process monitoring provides.
   current time with `MAX_HEARTBEAT_AGE_SECS` (120 seconds) threshold.
 - [INV-WHB-005] The heartbeat file is not authoritative for admission or
   security decisions. It is an observability signal only.
+
+## warm Submodule (TCK-00525)
+
+The `warm` submodule implements lane-scoped prewarming with content-addressed
+receipts. Warm reduces cold-start probability for subsequent gates by
+pre-populating build caches in the lane target namespace.
+
+### Key Types
+
+- `WarmReceiptV1`: Content-addressed receipt capturing per-phase exit codes,
+  durations, tool versions, and BLAKE3 content hash. All fields use bounded
+  deserialization (SEC-CTRL-FAC-0016).
+- `WarmPhaseResult`: Per-phase execution result with bounded string fields.
+- `WarmPhase`: Selectable warm phase enum (Fetch, Build, Nextest, Clippy, Doc).
+- `WarmToolVersions`: Tool version snapshot with bounded optional string fields.
+- `WarmError`: Error taxonomy covering invalid phases, bounds violations,
+  execution failures, timeouts, and hash mismatches.
+
+### Core Capabilities
+
+- `execute_warm(phases, ...)`: Execute warm phases and produce a `WarmReceiptV1`.
+- `execute_warm_phase(phase, ...)`: Execute a single phase with timeout
+  enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
+- `collect_tool_versions(hardened_env)`: Bounded stdout collection from version
+  probe commands (`MAX_VERSION_OUTPUT_BYTES`). Uses hardened environment
+  (INV-WARM-012, defense-in-depth). Version probes use a deadlock-free
+  design where the calling thread owns the `Child` directly (no mutex) and
+  the helper thread owns only the `ChildStdout` pipe (INV-WARM-013).
+- `WarmReceiptV1::verify_content_hash()`: Constant-time hash verification
+  via `subtle::ConstantTimeEq`.
+- `WarmReceiptV1::persist(receipts_dir)`: Atomic write (temp+rename) with
+  size validation.
+
+### Security Invariants (TCK-00525)
+
+- [INV-WARM-001] All string fields bounded by `MAX_*` constants during both
+  construction and deserialization (SEC-CTRL-FAC-0016).
+- [INV-WARM-002] Warm uses lane target namespace (`CARGO_TARGET_DIR`).
+- [INV-WARM-003] Warm uses FAC-managed `CARGO_HOME`.
+- [INV-WARM-004] Phase count bounded by `MAX_WARM_PHASES` during both
+  construction and deserialization.
+- [INV-WARM-005] Content hash uses domain-separated BLAKE3 with
+  length-prefixed injective framing.
+- [INV-WARM-006] Content hash verification uses constant-time comparison
+  via `subtle::ConstantTimeEq` (INV-PC-001 consistency).
+- [INV-WARM-007] Phase execution enforces `MAX_PHASE_TIMEOUT_SECS` via
+  `Child::try_wait` polling + `Child::kill` on timeout.
+- [INV-WARM-008] Tool version collection uses bounded stdout reads
+  (`Read::take(MAX_VERSION_OUTPUT_BYTES)`) to prevent OOM.
+- [INV-WARM-009] GateReceipt `payload_hash` and `evidence_bundle_hash` bind to
+  the serialized `WarmReceiptV1` output (not the input job spec), providing
+  verifiable evidence binding.
+- [INV-WARM-010] GateReceipt `passed` reflects warm receipt persistence success.
+  Persistence failure produces `passed=false` (fail-closed measurement
+  integrity).
+- [INV-WARM-011] Warm execution inherits systemd transient unit containment
+  from the worker (TCK-00529/TCK-00511 cgroup + namespace isolation).
+- [INV-WARM-012] Warm phase subprocesses execute with a hardened environment
+  constructed via `build_job_environment()` (default-deny + policy allowlist).
+  The ambient process environment is NOT inherited. FAC-private state paths
+  and secrets are unreachable from `build.rs` / proc-macro execution.
+  `RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped (INV-ENV-008).
+  Version probe commands also use the hardened environment (defense-in-depth).
+- [INV-WARM-013] Version probe timeout uses a mutex-free design: the calling
+  thread owns the `Child` directly and the helper thread owns only the
+  `ChildStdout` pipe. This eliminates the deadlock scenario where a helper
+  thread holds a child mutex across blocking `wait()` while the timeout path
+  needs the same mutex to `kill()` the process. The calling thread retains
+  unconditional kill authority regardless of helper thread state.
 
 ## Control-Lane Exception (TCK-00533)
 

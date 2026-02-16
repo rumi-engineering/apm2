@@ -94,9 +94,9 @@ use apm2_core::fac::{
     FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
     LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
     LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
-    load_or_default_boundary_id, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, run_preflight,
+    RepoMirrorManager, SystemdUnitProperties, build_job_environment, compute_policy_hash,
+    deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -2429,6 +2429,36 @@ fn process_job(
         },
     };
 
+    // Step 8b: Handle warm jobs (TCK-00525).
+    //
+    // Warm jobs execute warm phases (fetch/build/nextest/clippy/doc) using the
+    // lane workspace and lane-managed CARGO_HOME/CARGO_TARGET_DIR. The warm
+    // receipt is persisted to the FAC receipts directory alongside the job receipt.
+    if spec.kind == "warm" {
+        return execute_warm_job(
+            spec,
+            &claimed_path,
+            &claimed_file_name,
+            queue_root,
+            fac_root,
+            signer,
+            &lane_workspace,
+            &lane_dir,
+            &acquired_lane_id,
+            &lane_profile_hash,
+            &boundary_trace,
+            &queue_trace,
+            budget_trace.as_ref(),
+            patch_digest.as_deref(),
+            canonicalizer_tuple_digest,
+            policy_hash,
+            containment_trace.as_ref(),
+            &lane_mgr,
+            &candidate.raw_bytes,
+            policy,
+        );
+    }
+
     // Step 9: Write authoritative GateReceipt and move to completed.
     //
     // BLOCKER FIX (f-685-code_quality-0): Job completion is now recorded
@@ -3318,6 +3348,337 @@ fn handle_stop_revoke(
         return JobOutcome::Skipped {
             reason: format!("move stop_revoke to completed failed: {e}"),
         };
+    }
+
+    JobOutcome::Completed {
+        job_id: spec.job_id.clone(),
+    }
+}
+
+/// Execute a warm job: parse phases, run warm execution, persist receipt.
+///
+/// This handler is dispatched by `process_job` when `spec.kind == "warm"`.
+/// Warm jobs prime the build cache in the lane workspace by running
+/// user-selected phases (fetch/build/nextest/clippy/doc). The warm receipt
+/// is persisted to the FAC receipts directory.
+///
+/// # Lane Lifecycle
+///
+/// The lane lease is cleaned up after job completion. On receipt emission
+/// failure, the lease is removed and the job is returned to pending.
+#[allow(clippy::too_many_arguments)]
+fn execute_warm_job(
+    spec: &FacJobSpecV1,
+    claimed_path: &Path,
+    claimed_file_name: &str,
+    queue_root: &Path,
+    fac_root: &Path,
+    signer: &Signer,
+    lane_workspace: &Path,
+    lane_dir: &Path,
+    acquired_lane_id: &str,
+    lane_profile_hash: &str,
+    boundary_trace: &ChannelBoundaryTrace,
+    queue_trace: &JobQueueAdmissionTrace,
+    budget_trace: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: &str,
+    policy_hash: &str,
+    containment_trace: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    lane_mgr: &LaneManager,
+    _raw_bytes: &[u8],
+    policy: &FacPolicyV1,
+) -> JobOutcome {
+    use apm2_core::fac::warm::{WarmPhase, execute_warm};
+
+    // Parse warm phases from decoded_source (comma-separated phase names).
+    let phases: Vec<WarmPhase> = match &spec.actuation.decoded_source {
+        Some(phases_csv) if !phases_csv.is_empty() => {
+            let mut parsed = Vec::new();
+            for name in phases_csv
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match WarmPhase::parse(name) {
+                    Ok(p) => parsed.push(p),
+                    Err(e) => {
+                        let reason = format!("invalid warm phase '{name}': {e}");
+                        eprintln!("worker: warm job {}: {reason}", spec.job_id);
+                        let _ = LaneLeaseV1::remove(lane_dir);
+                        let moved_path = move_to_dir_safe(
+                            claimed_path,
+                            &queue_root.join(DENIED_DIR),
+                            claimed_file_name,
+                        )
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                        let _ = emit_job_receipt(
+                            fac_root,
+                            spec,
+                            FacJobOutcome::Denied,
+                            Some(DenialReasonCode::ValidationFailed),
+                            &reason,
+                            Some(boundary_trace),
+                            Some(queue_trace),
+                            budget_trace,
+                            patch_digest,
+                            Some(canonicalizer_tuple_digest),
+                            moved_path.as_deref(),
+                            policy_hash,
+                            containment_trace,
+                        );
+                        return JobOutcome::Denied { reason };
+                    },
+                }
+            }
+            parsed
+        },
+        _ => apm2_core::fac::warm::DEFAULT_WARM_PHASES.to_vec(),
+    };
+
+    // Set up CARGO_HOME and CARGO_TARGET_DIR within the lane.
+    let cargo_home = lane_dir.join("cargo_home");
+    let cargo_target_dir = lane_dir.join("target");
+    if let Err(e) = std::fs::create_dir_all(&cargo_home) {
+        let reason = format!("cannot create lane CARGO_HOME: {e}");
+        let _ = LaneLeaseV1::remove(lane_dir);
+        let moved_path = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
+        let _ = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            patch_digest,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            containment_trace,
+        );
+        return JobOutcome::Denied { reason };
+    }
+    if let Err(e) = std::fs::create_dir_all(&cargo_target_dir) {
+        let reason = format!("cannot create lane CARGO_TARGET_DIR: {e}");
+        let _ = LaneLeaseV1::remove(lane_dir);
+        let moved_path = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(DENIED_DIR),
+            claimed_file_name,
+        )
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok();
+        let _ = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(boundary_trace),
+            Some(queue_trace),
+            budget_trace,
+            patch_digest,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            containment_trace,
+        );
+        return JobOutcome::Denied { reason };
+    }
+
+    eprintln!(
+        "worker: warm job {}: executing {} phase(s) in {}",
+        spec.job_id,
+        phases.len(),
+        lane_workspace.display(),
+    );
+
+    // [INV-WARM-009] Build hardened environment via policy-driven default-deny
+    // construction. This ensures warm subprocesses (which compile untrusted
+    // repository code including build.rs and proc-macros) cannot access
+    // FAC-private state, secrets, or worker authority context.
+    let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
+        // Fallback: derive from fac_root (which is $APM2_HOME/private/fac).
+        fac_root
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    });
+    let ambient_env: Vec<(String, String)> = std::env::vars().collect();
+    let hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
+
+    // Execute warm phases.
+    let start_epoch_secs = current_timestamp_epoch_secs();
+    let warm_result = execute_warm(
+        &phases,
+        acquired_lane_id,
+        lane_profile_hash,
+        lane_workspace,
+        &cargo_home,
+        &cargo_target_dir,
+        &spec.source.head_sha,
+        start_epoch_secs,
+        &hardened_env,
+    );
+
+    let receipt = match warm_result {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = format!("warm execution failed: {e}");
+            eprintln!("worker: warm job {}: {reason}", spec.job_id);
+            // Warm execution failure is still a completed job (the phases ran,
+            // just some may have failed). But structural errors (too many phases,
+            // field too long) are denials.
+            let _ = LaneLeaseV1::remove(lane_dir);
+            let moved_path = move_to_dir_safe(
+                claimed_path,
+                &queue_root.join(DENIED_DIR),
+                claimed_file_name,
+            )
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+            let _ = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                patch_digest,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                containment_trace,
+            );
+            return JobOutcome::Denied { reason };
+        },
+    };
+
+    // Persist the warm receipt to the FAC receipts directory.
+    // [Finding #8] GateReceipt emission depends on successful persistence.
+    // If the warm receipt cannot be persisted, the GateReceipt is emitted
+    // with passed=false to reflect the incomplete measurement.
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    let persist_ok = match receipt.persist(&receipts_dir) {
+        Ok(_) => {
+            eprintln!(
+                "worker: warm receipt persisted for {} (hash: {})",
+                spec.job_id, receipt.content_hash
+            );
+            true
+        },
+        Err(e) => {
+            eprintln!(
+                "worker: warm receipt persistence failed for {}: {e}",
+                spec.job_id
+            );
+            false
+        },
+    };
+
+    // [Finding #1/#4] Compute payload_hash from the serialized WarmReceiptV1,
+    // not from the input job spec bytes. This binds the GateReceipt to the
+    // actual warm execution output.
+    let receipt_json = serde_json::to_vec(&receipt).unwrap_or_default();
+    let warm_receipt_hash = compute_evidence_hash(&receipt_json);
+    let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
+    let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
+    let gate_receipt =
+        GateReceiptBuilder::new(&receipt_id, "fac-worker-warm", &spec.actuation.lease_id)
+            .changeset_digest(changeset_digest)
+            .executor_actor_id("fac-worker")
+            .receipt_version(1)
+            .payload_kind("warm-receipt")
+            .payload_schema_version(1)
+            .payload_hash(warm_receipt_hash)
+            .evidence_bundle_hash(warm_receipt_hash)
+            .job_spec_digest(&spec.job_spec_digest)
+            .passed(persist_ok)
+            .build_and_sign(signer);
+
+    if let Err(receipt_err) = emit_job_receipt(
+        fac_root,
+        spec,
+        FacJobOutcome::Completed,
+        None,
+        "warm completed",
+        Some(boundary_trace),
+        Some(queue_trace),
+        budget_trace,
+        patch_digest,
+        Some(canonicalizer_tuple_digest),
+        None,
+        policy_hash,
+        containment_trace,
+    ) {
+        eprintln!("worker: receipt emission failed for warm job: {receipt_err}");
+        let _ = LaneLeaseV1::remove(lane_dir);
+        if let Err(move_err) = move_to_dir_safe(
+            claimed_path,
+            &queue_root.join(PENDING_DIR),
+            claimed_file_name,
+        ) {
+            eprintln!("worker: WARNING: failed to return claimed warm job to pending: {move_err}");
+        }
+        return JobOutcome::Skipped {
+            reason: "receipt emission failed".to_string(),
+        };
+    }
+
+    // Persist the gate receipt alongside the completed job.
+    write_gate_receipt(queue_root, claimed_file_name, &gate_receipt);
+
+    // Move to completed.
+    if let Err(e) = move_to_dir_safe(
+        claimed_path,
+        &queue_root.join(COMPLETED_DIR),
+        claimed_file_name,
+    ) {
+        let _ = LaneLeaseV1::remove(lane_dir);
+        return JobOutcome::Skipped {
+            reason: format!("move warm job to completed failed: {e}"),
+        };
+    }
+
+    // Post-completion lane cleanup (same as standard jobs).
+    if let Err(cleanup_err) =
+        execute_lane_cleanup(fac_root, lane_mgr, acquired_lane_id, lane_workspace)
+    {
+        eprintln!(
+            "worker: WARNING: post-completion lane cleanup failed for warm job on {acquired_lane_id}: {cleanup_err}"
+        );
     }
 
     JobOutcome::Completed {
