@@ -35,7 +35,7 @@ use apm2_core::fac::broker::FacBroker;
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_JOB_SPEC_SIZE,
-    parse_b3_256_digest,
+    MAX_QUEUE_LANE_LENGTH, parse_b3_256_digest,
 };
 use apm2_core::fac::warm::{DEFAULT_WARM_PHASES, MAX_WARM_PHASES, WarmPhase};
 use apm2_core::fac::{
@@ -60,8 +60,10 @@ const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 1200;
 /// Poll interval when waiting for receipt (seconds).
 const WAIT_POLL_INTERVAL_SECS: u64 = 5;
 
-/// Maximum poll iterations to prevent unbounded loops.
-const MAX_POLL_ITERATIONS: u64 = DEFAULT_WAIT_TIMEOUT_SECS / WAIT_POLL_INTERVAL_SECS + 10;
+/// Extra headroom iterations beyond the timeout-derived cap.
+/// Provides a small buffer so the timeout check (elapsed >= timeout) fires
+/// before the iteration cap in normal operation.
+const POLL_ITERATION_HEADROOM: u64 = 10;
 
 /// FAC receipts directory.
 const FAC_RECEIPTS_DIR: &str = "receipts";
@@ -85,7 +87,7 @@ const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
 #[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub fn run_fac_warm(
     phases_str: &Option<String>,
-    _lane: &Option<String>,
+    lane: &Option<String>,
     wait: bool,
     wait_timeout_secs: u64,
     json_output: bool,
@@ -110,6 +112,19 @@ pub fn run_fac_warm(
             return output_error(
                 json_output,
                 "warm_invalid_phases",
+                &msg,
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
+
+    // Validate and resolve queue lane from --lane flag.
+    let queue_lane = match validate_lane(lane) {
+        Ok(l) => l,
+        Err(msg) => {
+            return output_error(
+                json_output,
+                "warm_invalid_lane",
                 &msg,
                 exit_codes::VALIDATION_ERROR,
             );
@@ -186,6 +201,7 @@ pub fn run_fac_warm(
         &repo_id,
         &head_sha,
         &phases,
+        &queue_lane,
         &boundary_id,
         &mut broker,
     ) {
@@ -291,6 +307,50 @@ fn parse_phases(phases_str: &Option<String>) -> Result<Vec<WarmPhase>, String> {
             Ok(phases)
         },
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lane Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default queue lane for warm jobs when `--lane` is not specified.
+const DEFAULT_QUEUE_LANE: &str = "bulk";
+
+/// Validates and resolves the `--lane` flag value.
+///
+/// Returns the validated lane string (defaults to "bulk" when not specified).
+/// Rejects empty, over-length, and unsafe lane names using the same character
+/// set the worker enforces: `[A-Za-z0-9_-]`.
+#[allow(clippy::ref_option)]
+fn validate_lane(lane: &Option<String>) -> Result<String, String> {
+    let lane_str = match lane {
+        None => return Ok(DEFAULT_QUEUE_LANE.to_string()),
+        Some(s) => s.trim(),
+    };
+
+    if lane_str.is_empty() {
+        return Ok(DEFAULT_QUEUE_LANE.to_string());
+    }
+
+    if lane_str.len() > MAX_QUEUE_LANE_LENGTH {
+        return Err(format!(
+            "lane name too long: {} exceeds max {}",
+            lane_str.len(),
+            MAX_QUEUE_LANE_LENGTH
+        ));
+    }
+
+    // Match the worker's queue_lane sanitization: only [A-Za-z0-9_-].
+    if !lane_str
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(format!(
+            "unsafe lane value {lane_str:?}: only [A-Za-z0-9_-] allowed"
+        ));
+    }
+
+    Ok(lane_str.to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -437,6 +497,7 @@ fn build_warm_job_spec(
     repo_id: &str,
     head_sha: &str,
     phases: &[WarmPhase],
+    queue_lane: &str,
     boundary_id: &str,
     broker: &mut FacBroker,
 ) -> Result<FacJobSpecV1, String> {
@@ -453,7 +514,7 @@ fn build_warm_job_spec(
         job_id: job_id.to_string(),
         job_spec_digest: String::new(), // Computed below
         kind: "warm".to_string(),
-        queue_lane: "bulk".to_string(),
+        queue_lane: queue_lane.to_string(),
         priority: 50,
         enqueue_time,
         actuation: Actuation {
@@ -565,6 +626,12 @@ fn wait_for_receipt(
     let start = Instant::now();
     let mut iterations: u64 = 0;
 
+    // Derive the iteration cap from the effective timeout so that callers
+    // passing wait_timeout > DEFAULT_WAIT_TIMEOUT_SECS are not cut short by
+    // a fixed cap. The headroom ensures the elapsed-time check fires first
+    // under normal conditions.
+    let max_poll_iterations = timeout.as_secs() / WAIT_POLL_INTERVAL_SECS + POLL_ITERATION_HEADROOM;
+
     loop {
         if start.elapsed() >= timeout {
             return Err(format!(
@@ -575,9 +642,9 @@ fn wait_for_receipt(
         }
 
         iterations = iterations.saturating_add(1);
-        if iterations > MAX_POLL_ITERATIONS {
+        if iterations > max_poll_iterations {
             return Err(format!(
-                "warm job {job_id} exceeded max poll iterations ({MAX_POLL_ITERATIONS})",
+                "warm job {job_id} exceeded max poll iterations ({max_poll_iterations})",
             ));
         }
 
@@ -739,4 +806,126 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
         eprintln!("warm: ERROR: [{code}] {message}");
     }
     exit_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // validate_lane tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_lane_none_defaults_to_bulk() {
+        assert_eq!(validate_lane(&None).unwrap(), "bulk");
+    }
+
+    #[test]
+    fn test_validate_lane_empty_defaults_to_bulk() {
+        assert_eq!(validate_lane(&Some(String::new())).unwrap(), "bulk");
+        assert_eq!(validate_lane(&Some("  ".to_string())).unwrap(), "bulk");
+    }
+
+    #[test]
+    fn test_validate_lane_valid_values() {
+        for lane in &[
+            "bulk", "control", "consume", "replay", "lane-01", "my_lane", "A-Z",
+        ] {
+            let result = validate_lane(&Some(lane.to_string()));
+            assert!(
+                result.is_ok(),
+                "expected Ok for lane {lane:?}, got {result:?}"
+            );
+            assert_eq!(result.unwrap(), *lane);
+        }
+    }
+
+    #[test]
+    fn test_validate_lane_rejects_unsafe_chars() {
+        for unsafe_lane in &["lane;rm", "lane foo", "lane/bar", "lane..baz", "lane\nX"] {
+            let result = validate_lane(&Some(unsafe_lane.to_string()));
+            assert!(
+                result.is_err(),
+                "expected Err for unsafe lane {unsafe_lane:?}, got {result:?}"
+            );
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("unsafe lane value"),
+                "error should mention unsafe lane: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_lane_rejects_overlong() {
+        let long_lane = "x".repeat(MAX_QUEUE_LANE_LENGTH + 1);
+        let result = validate_lane(&Some(long_lane));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too long"));
+    }
+
+    #[test]
+    fn test_validate_lane_accepts_max_length() {
+        let max_lane = "a".repeat(MAX_QUEUE_LANE_LENGTH);
+        let result = validate_lane(&Some(max_lane.clone()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), max_lane);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Poll iteration cap tests (Fix #3)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_poll_iteration_cap_scales_with_timeout() {
+        // For a 1200s timeout with 5s interval + 10 headroom: 250 iterations
+        let cap_1200 = 1200u64 / WAIT_POLL_INTERVAL_SECS + POLL_ITERATION_HEADROOM;
+        assert_eq!(cap_1200, 250);
+
+        // For a 3600s timeout: should be 730, not 250
+        let cap_3600 = 3600u64 / WAIT_POLL_INTERVAL_SECS + POLL_ITERATION_HEADROOM;
+        assert_eq!(cap_3600, 730);
+
+        // The cap for 3600s must exceed the old fixed cap of 250
+        assert!(cap_3600 > cap_1200);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase parsing tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_phases_default() {
+        let result = parse_phases(&None);
+        assert!(result.is_ok());
+        let phases = result.unwrap();
+        assert!(!phases.is_empty());
+    }
+
+    #[test]
+    fn test_parse_phases_empty_string_error() {
+        let result = parse_phases(&Some(String::new()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_phases_valid_single() {
+        let result = parse_phases(&Some("fetch".to_string()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_phases_valid_multiple() {
+        let result = parse_phases(&Some("fetch,build".to_string()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_parse_phases_invalid_phase() {
+        let result = parse_phases(&Some("nonexistent_phase".to_string()));
+        assert!(result.is_err());
+    }
 }
