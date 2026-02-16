@@ -198,6 +198,22 @@ pub fn run_restart(
     refresh_identity: bool,
     json_output: bool,
 ) -> u8 {
+    // TCK-00596: Fail-fast credential gate for GitHub-facing restart command.
+    if let Err(err) = apm2_core::fac::require_github_credentials() {
+        let message = err.to_string();
+        eprintln!("ERROR: {message}");
+        let payload = serde_json::json!({
+            "error": "fac_restart_credentials_missing",
+            "message": message,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
+
     match run_restart_inner(repo, pr, force, refresh_identity, json_output) {
         Ok(summary) => {
             let _ = json_output;

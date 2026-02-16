@@ -1351,3 +1351,51 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   these keys from appearing in `--setenv` args; (2) `env_remove_keys`
   strips them from the spawned process environment to prevent parent
   env inheritance.
+
+## credential_gate Submodule (TCK-00596)
+
+The `credential_gate` submodule provides fail-fast credential posture
+checking and typed credential mount descriptors for FAC workflows. It ensures
+GitHub-facing commands (`fac push`, `fac review dispatch`, `fac restart`,
+`fac pipeline`) fail immediately with actionable remediation messages when
+credentials are missing, while local-only commands (`fac gates`) never
+require credentials.
+
+### Key Types
+
+- `CredentialPosture`: Receipt-safe posture report (resolved flag + source
+  provenance). Never carries secret material.
+- `CredentialSource`: Enum of resolution sources (env var, systemd credential,
+  APM2 credential file, GitHub App).
+- `CredentialMountV1`: Typed descriptor for how secrets are mounted into an
+  execution context. Carries only env var names and file paths, never values.
+- `EnvMount`: Environment variable mount descriptor (name + source).
+- `FileMountDescriptor`: File path mount descriptor (path + source).
+- `CredentialGateError`: Fail-closed error taxonomy with actionable
+  remediation instructions.
+
+### Core Capabilities
+
+- `check_github_credential_posture()`: Non-failing posture check that
+  delegates to the three-tier resolution chain (env -> systemd -> APM2 file)
+  and reports source without exposing secret values.
+- `require_github_credentials()`: Fail-fast gate returning
+  `CredentialGateError::GitHubCredentialsMissing` with detailed remediation
+  when no credential source is available.
+- `build_github_credential_mount()`: Builds a `CredentialMountV1` descriptor
+  suitable for inclusion in job specs and evidence bundles.
+- `validate_credential_mount()`: Validates bounded collection sizes on a
+  mount descriptor.
+
+### Security Invariants (TCK-00596)
+
+- [INV-CREDGATE-001] `CredentialPosture` never carries raw secret material.
+  It reports only the source of resolution, not the secret value itself.
+- [INV-CREDGATE-002] `require_github_credentials()` returns `Err` with
+  actionable remediation when no credential source is available.
+- [INV-CREDGATE-003] `CredentialMountV1` uses only provenance descriptors
+  (env var names, file paths). `Debug` and `Serialize` impls are safe to log.
+- [INV-CREDGATE-004] Missing credentials block only GitHub-facing workflows;
+  the gate is never called on the `apm2 fac gates` path.
+- Bounded collections: `env_mounts` capped at `MAX_ENV_MOUNTS` (16),
+  env var names capped at `MAX_ENV_NAME_LENGTH` (256).

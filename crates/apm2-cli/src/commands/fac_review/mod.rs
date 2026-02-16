@@ -3251,6 +3251,22 @@ pub fn run_dispatch(
     force: bool,
     _json_output: bool,
 ) -> u8 {
+    // TCK-00596: Fail-fast credential gate for GitHub-facing dispatch command.
+    if let Err(err) = apm2_core::fac::require_github_credentials() {
+        let message = err.to_string();
+        eprintln!("ERROR: {message}");
+        let payload = serde_json::json!({
+            "error": "fac_dispatch_credentials_missing",
+            "message": message,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
+
     let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
         Ok(value) => value,
         Err(err) => {

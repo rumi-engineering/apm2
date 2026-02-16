@@ -17,6 +17,16 @@ use crate::exit_codes::codes as exit_codes;
 /// Returns an exit code: 0 on success, 1 if evidence gates fail or an error
 /// occurs.
 pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) -> u8 {
+    // TCK-00596: Fail-fast credential gate for GitHub-facing pipeline command.
+    if let Err(err) = apm2_core::fac::require_github_credentials() {
+        let message = err.to_string();
+        eprintln!("ERROR: {message}");
+        if json_output {
+            let _ = emit_jsonl_error("pipeline_credentials_missing", &message);
+        }
+        return exit_codes::GENERIC_ERROR;
+    }
+
     match run_pipeline_inner(repo, pr_number, sha, json_output) {
         Ok(passed) => {
             if json_output {

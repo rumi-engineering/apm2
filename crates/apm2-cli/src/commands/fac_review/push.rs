@@ -1260,6 +1260,15 @@ pub fn run_push(
         }
     };
 
+    // TCK-00596: Fail-fast credential gate for GitHub-facing push command.
+    // This ensures actionable errors before any git push or PR creation.
+    if let Err(err) = apm2_core::fac::require_github_credentials() {
+        let message = err.to_string();
+        human_log!("ERROR: {message}");
+        emit_machine_error!("fac_push_credentials_missing", &message);
+        return exit_codes::GENERIC_ERROR;
+    }
+
     // Resolve branch name.
     let branch = if let Some(b) = branch {
         b.to_string()
