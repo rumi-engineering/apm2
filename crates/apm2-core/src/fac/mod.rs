@@ -157,6 +157,7 @@ mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
 pub mod transcript_binding;
+pub mod warm;
 pub mod worker_heartbeat;
 
 // Re-export broker types (TCK-00510)
@@ -633,3 +634,8 @@ pub use safe_rmtree::{
     safe_rmtree_v1,
 };
 pub use systemd_properties::SystemdUnitProperties;
+pub use warm::{
+    DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
+    WARM_RECEIPT_SCHEMA, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1, WarmToolVersions,
+    collect_tool_versions, execute_warm, execute_warm_phase,
+};

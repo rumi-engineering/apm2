@@ -54,6 +54,7 @@ pub mod fac_permissions;
 pub mod fac_pr;
 pub mod fac_quarantine;
 pub mod fac_review;
+pub mod fac_warm;
 pub mod fac_worker;
 pub mod factory;
 pub mod pack;
