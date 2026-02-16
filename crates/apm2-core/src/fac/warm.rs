@@ -765,19 +765,37 @@ fn format_epoch_secs(secs: u64) -> String {
 /// from a malicious or verbose tool wrapper producing unbounded stdout
 /// (finding #7: bounded I/O on untrusted process output).
 ///
-/// The stdout read runs inside a helper thread while the child handle is
-/// shared via `Arc<Mutex<Child>>`. If the helper thread does not finish
-/// within `MAX_VERSION_TIMEOUT_SECS`, the calling thread acquires the
-/// mutex and kills the child, which closes the pipe and unblocks the
-/// helper's `read_to_end`. This prevents a hung or malicious tool binary
-/// from blocking warm receipt generation indefinitely.
+/// # Deadlock-free design (round 6 fix)
 ///
-/// Synchronization protocol: `child_arc` (`Arc<Mutex<Child>>`) protects
-/// the `Child` handle. The helper thread holds the lock only for
-/// `.wait()` (after stdout read completes). The calling thread acquires
-/// the lock only on timeout to call `.kill()` + `.wait()`. These are
-/// mutually exclusive phases: the helper is blocked on the pipe read
-/// (not holding the lock) when the timeout fires, so no deadlock occurs.
+/// The calling thread retains direct ownership of the `Child` process handle
+/// (no mutex). The helper thread receives only the `ChildStdout` pipe and
+/// performs the bounded `read_to_end`. This eliminates the deadlock scenario
+/// where a helper thread holds a child mutex across a blocking `wait()` while
+/// the timeout path needs the same mutex to `kill()` the process.
+///
+/// Synchronization protocol (mutex-free):
+/// - The calling thread owns `Child` directly. It can call `kill()` and
+///   `wait()` at any time without acquiring a lock.
+/// - The helper thread owns `ChildStdout` (taken from `Child` before spawn). It
+///   performs `read_to_end` on the bounded reader. When the calling thread
+///   kills the child, the pipe closes, which unblocks `read_to_end` with an
+///   error or EOF. The helper then returns.
+/// - The calling thread polls `handle.is_finished()` with short sleeps. On
+///   timeout, it kills the child directly, waits for the child to exit (reaping
+///   the zombie), then joins the helper thread.
+/// - On normal completion, the calling thread waits for the child to exit, then
+///   joins the helper to retrieve the read result.
+///
+/// Happens-before edges:
+///   H1: helper `read_to_end` completes -> helper thread returns (program
+///       order)
+///   H2: calling thread `child.kill()` -> pipe close -> helper `read_to_end`
+///       unblocks (OS pipe semantics)
+///   H3: helper thread terminates -> `handle.join()` returns (thread join
+///       synchronizes-with)
+///   Guarantee: the calling thread always has exclusive kill authority over
+///   the child, and the helper thread always terminates after kill (via
+///   H2->H3).
 fn version_output(
     program: &str,
     args: &[&str],
@@ -794,64 +812,45 @@ fn version_output(
         .spawn()
         .ok()?;
 
-    // Take stdout before wrapping child — ChildStdout is independent of
-    // the Child handle and can be moved into the helper thread separately.
+    // Take stdout pipe before spawning the helper thread. The calling
+    // thread retains direct ownership of `child` (no mutex). The helper
+    // thread receives only the pipe and reads from it.
     let stdout = child.stdout.take()?;
 
-    // Share child via Arc<Mutex> so the calling thread can kill it on
-    // timeout while the helper thread can wait on it after reading stdout.
-    let child_arc = std::sync::Arc::new(std::sync::Mutex::new(child));
-    let child_clone = std::sync::Arc::clone(&child_arc);
-
-    // Helper thread performs the blocking stdout read and process wait.
-    // The calling thread joins with a bounded timeout so that a hung
-    // child cannot block indefinitely.
-    let handle = std::thread::spawn(move || -> Option<String> {
+    // Helper thread: owns the stdout pipe, performs bounded read, returns
+    // the raw bytes. Does NOT touch the Child handle -- no mutex needed.
+    let handle = std::thread::spawn(move || -> Option<Vec<u8>> {
         let mut bounded = stdout.take(MAX_VERSION_OUTPUT_BYTES);
         let mut buf = Vec::with_capacity(256);
         if bounded.read_to_end(&mut buf).is_err() {
-            // Read failed (pipe error or child killed by timeout).
-            // Acquire lock and clean up.
-            if let Ok(mut c) = child_clone.lock() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
             return None;
         }
-
-        // Reap the child — if the process already exited during read,
-        // this returns immediately.
-        if let Ok(mut c) = child_clone.lock() {
-            match c.wait() {
-                Ok(status) if status.success() => {},
-                _ => return None,
-            }
-        } else {
-            return None;
-        }
-
-        String::from_utf8(buf).ok().map(|s| s.trim().to_string())
+        Some(buf)
     });
 
-    // Join the helper thread with a bounded deadline. Poll `is_finished`
-    // with short sleeps to avoid busy-waiting while still respecting the
-    // timeout. This is the std-only equivalent of a timed join.
+    // Calling thread: poll helper completion with a bounded deadline.
+    // The calling thread retains direct kill authority over the child.
     let timeout = Duration::from_secs(MAX_VERSION_TIMEOUT_SECS);
     let deadline = Instant::now() + timeout;
     loop {
         if handle.is_finished() {
-            return handle.join().ok().flatten();
+            // Helper finished reading. Reap the child process.
+            let status = child.wait().ok()?;
+            // Join helper to get the read result.
+            let buf = handle.join().ok()??;
+            if !status.success() {
+                return None;
+            }
+            return String::from_utf8(buf).ok().map(|s| s.trim().to_string());
         }
         if Instant::now() >= deadline {
-            // Helper thread is still blocked — likely on `read_to_end`.
-            // Kill the child to close the pipe and unblock the read.
-            if let Ok(mut c) = child_arc.lock() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-            // Join the helper thread — the killed child closes the
-            // pipe, unblocking `read_to_end`. The thread returns
-            // promptly.
+            // Timeout: kill the child directly (no mutex needed).
+            // This closes the stdout pipe, which unblocks the helper's
+            // `read_to_end` (returns EOF or error).
+            let _ = child.kill();
+            let _ = child.wait();
+            // Join the helper -- it will return promptly now that the
+            // pipe is closed.
             let _ = handle.join();
             return None;
         }
@@ -1148,6 +1147,64 @@ mod tests {
         // Should not panic even if tools are missing.
         let env = test_hardened_env();
         let _ = collect_tool_versions(&env);
+    }
+
+    // ── Deadlock-free version probe regression test (round 6 fix) ───────
+
+    /// Regression test for the round 6 MAJOR finding: `version_output` must
+    /// not deadlock when a tool writes more than `MAX_VERSION_OUTPUT_BYTES`
+    /// to stdout.
+    ///
+    /// This test spawns a subprocess that writes 2x the bounded limit.
+    /// Under the old mutex-based design, the helper thread would complete
+    /// its bounded read, then lock the child mutex and call `wait()`. The
+    /// child would be blocked writing remaining stdout (pipe full, nobody
+    /// reading), causing `wait()` to block. The timeout path would then
+    /// try to acquire the same mutex, deadlocking.
+    ///
+    /// Under the fixed design, the calling thread owns the `Child` directly
+    /// (no mutex), so it can always kill the child on timeout regardless
+    /// of what the helper thread is doing.
+    #[test]
+    fn test_version_output_no_deadlock_on_oversized_stdout() {
+        let env = test_hardened_env();
+        // Construct a deterministic byte count exceeding the bounded limit.
+        // Use 2x the limit to ensure the pipe fills after the bounded read
+        // completes.
+        let byte_count = MAX_VERSION_OUTPUT_BYTES * 2;
+
+        // Use `dd` to write oversized output. `dd` is available on all
+        // Unix systems. The `if=/dev/zero` source produces null bytes.
+        //
+        // `version_output` uses a 30s timeout. dd writing 16 KiB should
+        // complete near-instantly. The test verifies that `version_output`
+        // returns None (because dd outputs binary zeros, not valid
+        // UTF-8 version text, and the exit status may vary) without
+        // hanging. If the old deadlock existed, this test would hang
+        // for 30+ seconds and then the test runner timeout would kill it.
+        let start = Instant::now();
+        let result = version_output(
+            "dd",
+            &["if=/dev/zero", "bs=1", &format!("count={byte_count}")],
+            &env,
+        );
+
+        // dd outputs binary zeros, so the result should be None (not
+        // valid version text). The important assertion is that we
+        // returned at all (no deadlock) and did so quickly.
+        assert!(
+            result.is_none(),
+            "oversized binary output should not produce a version string"
+        );
+
+        // If the old deadlock existed, we would hang for the full 30s
+        // timeout (or longer). Completing in under 10s proves the
+        // deadlock is fixed. In practice dd finishes in milliseconds.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "version_output should complete quickly, not deadlock (took {elapsed:?})"
+        );
     }
 
     // ── Bounded deserialization tests (finding #3) ───────────────────────

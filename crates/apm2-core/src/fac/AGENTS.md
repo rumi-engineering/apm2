@@ -1060,7 +1060,9 @@ pre-populating build caches in the lane target namespace.
   enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
 - `collect_tool_versions(hardened_env)`: Bounded stdout collection from version
   probe commands (`MAX_VERSION_OUTPUT_BYTES`). Uses hardened environment
-  (INV-WARM-012, defense-in-depth).
+  (INV-WARM-012, defense-in-depth). Version probes use a deadlock-free
+  design where the calling thread owns the `Child` directly (no mutex) and
+  the helper thread owns only the `ChildStdout` pipe (INV-WARM-013).
 - `WarmReceiptV1::verify_content_hash()`: Constant-time hash verification
   via `subtle::ConstantTimeEq`.
 - `WarmReceiptV1::persist(receipts_dir)`: Atomic write (temp+rename) with
@@ -1096,6 +1098,12 @@ pre-populating build caches in the lane target namespace.
   and secrets are unreachable from `build.rs` / proc-macro execution.
   `RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped (INV-ENV-008).
   Version probe commands also use the hardened environment (defense-in-depth).
+- [INV-WARM-013] Version probe timeout uses a mutex-free design: the calling
+  thread owns the `Child` directly and the helper thread owns only the
+  `ChildStdout` pipe. This eliminates the deadlock scenario where a helper
+  thread holds a child mutex across blocking `wait()` while the timeout path
+  needs the same mutex to `kill()` the process. The calling thread retains
+  unconditional kill authority regardless of helper thread state.
 
 ## Control-Lane Exception (TCK-00533)
 
