@@ -137,71 +137,12 @@ pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
 /// permissions (0o700), is owned by the current user (CTR-2611), and is
 /// not a symlink (INV-LANE-ENV-001).
 ///
-/// Uses `symlink_metadata` instead of `metadata` to avoid following
-/// symlinks. An attacker could plant a symlink to redirect cargo home
-/// to a malicious location, bypassing isolation.
+/// Delegates to the shared [`apm2_core::fac::verify_dir_permissions`]
+/// helper with a "managed `CARGO_HOME`" context label (TCK-00575 round 2
+/// NIT: deduplicated permission verification).
 #[cfg(unix)]
 fn verify_cargo_home_permissions(cargo_home: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-
-    use subtle::ConstantTimeEq;
-
-    // SAFETY: symlink_metadata does NOT follow symlinks, detecting the
-    // symlink itself rather than its target.
-    let metadata = std::fs::symlink_metadata(cargo_home).map_err(|e| {
-        format!(
-            "cannot stat managed CARGO_HOME at {}: {e}",
-            cargo_home.display()
-        )
-    })?;
-
-    // Reject symlinks explicitly — an attacker could create a symlink
-    // pointing cargo home to a poisoned directory.
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "managed CARGO_HOME at {} is a symlink; refusing to follow — \
-             this may indicate a cargo home poisoning attempt",
-            cargo_home.display()
-        ));
-    }
-
-    if !metadata.is_dir() {
-        return Err(format!(
-            "managed CARGO_HOME at {} is not a directory",
-            cargo_home.display()
-        ));
-    }
-
-    // Constant-time UID comparison to prevent timing side-channels
-    // consistent with project style (INV-PC-001).
-    let current_uid = nix::unistd::geteuid().as_raw();
-    let uid_matches: bool = current_uid
-        .to_le_bytes()
-        .ct_eq(&metadata.uid().to_le_bytes())
-        .into();
-    if !uid_matches {
-        return Err(format!(
-            "managed CARGO_HOME at {} is owned by uid {} but current user is uid {}; \
-             refusing to use a directory owned by another user",
-            cargo_home.display(),
-            metadata.uid(),
-            current_uid,
-        ));
-    }
-
-    let mode = metadata.mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "managed CARGO_HOME at {} has too-permissive mode {:#05o} \
-             (group/other access detected); expected 0o700. \
-             Fix with: chmod 700 {}",
-            cargo_home.display(),
-            mode,
-            cargo_home.display(),
-        ));
-    }
-
-    Ok(())
+    apm2_core::fac::verify_dir_permissions(cargo_home, "managed CARGO_HOME")
 }
 
 /// Open a policy file for reading with `O_NOFOLLOW` to atomically reject
