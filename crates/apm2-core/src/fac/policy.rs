@@ -1058,6 +1058,23 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_validate_rejects_sandbox_hardening_af_prefix_without_suffix() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.sandbox_hardening.restrict_address_families = vec!["AF_".to_string()];
+        let err = policy.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FacPolicyError::InvalidFieldValue {
+                    field: "sandbox_hardening",
+                    ..
+                }
+            ),
+            "expected InvalidFieldValue for sandbox_hardening, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_policy_hash_changes_on_sandbox_hardening_mutation() {
         let mut policy1 = FacPolicyV1::default_policy();
         let policy2 = FacPolicyV1::default_policy();

@@ -152,11 +152,13 @@ impl SandboxHardeningProfile {
                 ));
             }
             // Only allow known AF_ prefixed identifiers (alphanumeric + underscore).
-            if !af.starts_with("AF_")
-                || !af[3..]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            let valid = af.strip_prefix("AF_").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            if !valid {
                 return Err(format!(
                     "restrict_address_families[{i}] has invalid format: '{af}'; \
                      expected AF_<NAME> with alphanumeric characters"
@@ -728,6 +730,16 @@ mod tests {
     fn hardening_profile_rejects_invalid_address_family_format() {
         let profile = SandboxHardeningProfile {
             restrict_address_families: vec!["AF_UNIX".to_string(), "INVALID".to_string()],
+            ..Default::default()
+        };
+        let err = profile.validate().unwrap_err();
+        assert!(err.contains("invalid format"), "error: {err}");
+    }
+
+    #[test]
+    fn hardening_profile_rejects_af_prefix_without_suffix() {
+        let profile = SandboxHardeningProfile {
+            restrict_address_families: vec!["AF_".to_string()],
             ..Default::default()
         };
         let err = profile.validate().unwrap_err();
