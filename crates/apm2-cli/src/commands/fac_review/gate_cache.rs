@@ -558,4 +558,102 @@ mod tests {
             "policy_merge_conflict_recompute"
         );
     }
+
+    // --- TCK-00544: dirty-state cache poisoning regression tests ---
+
+    /// Regression test: a cache entry seeded with a "dirty" attestation
+    /// digest (simulating the old v1 git_blob-based input binding) must NOT
+    /// be reusable when the pipeline presents a "clean" v2 file_sha256-based
+    /// attestation digest for the same SHA.
+    ///
+    /// This proves that the attestation schema version bump from v1 to v2
+    /// invalidates all pre-existing cache entries, closing the dirty-state
+    /// cache poisoning vector.
+    #[test]
+    fn dirty_seeded_cache_entry_not_reusable_by_clean_attestation() {
+        let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let mut cache = GateCache::new(sha);
+
+        // Simulate a cache entry created under old v1 semantics: the
+        // attestation digest was derived from HEAD:path (git blob) which
+        // could differ from actual file content in a dirty workspace.
+        let dirty_v1_digest = "v1_dirty_git_blob_based_attestation_digest_abc123";
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            5,
+            Some(dirty_v1_digest.to_string()),
+            false,
+            Some("evidence-log-digest".to_string()),
+            None,
+        );
+
+        // The pipeline now computes a v2 attestation digest using
+        // file_sha256 (actual file content) with v2 schema/domain in the
+        // root material. This will always differ from v1 digests.
+        let clean_v2_digest = "v2_clean_file_sha256_based_attestation_digest_xyz789";
+        let reuse = cache.check_reuse("rustfmt", Some(clean_v2_digest), true);
+
+        assert!(
+            !reuse.reusable,
+            "dirty-seeded v1 cache entry must NOT be reusable with clean v2 digest"
+        );
+        assert_eq!(
+            reuse.reason, "attestation_mismatch",
+            "reuse denial must be due to attestation_mismatch, not any other reason"
+        );
+    }
+
+    /// Verify that a cache entry without an attestation digest is never
+    /// reusable — fail-closed behavior.
+    #[test]
+    fn cache_entry_without_attestation_digest_not_reusable() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            None, // no attestation digest
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+
+        let reuse = cache.check_reuse("rustfmt", Some("any-digest"), true);
+        assert!(
+            !reuse.reusable,
+            "cache entry without attestation digest must not be reusable"
+        );
+        assert_eq!(
+            reuse.reason, "attestation_mismatch",
+            "reason must be attestation_mismatch when cached digest is None"
+        );
+    }
+
+    /// Verify that missing `evidence_log_digest` prevents reuse even when
+    /// attestation matches — defense in depth against incomplete cache
+    /// entries.
+    #[test]
+    fn cache_entry_without_evidence_digest_not_reusable() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("matching-digest".to_string()),
+            false,
+            None, // no evidence log digest
+            None,
+        );
+
+        let reuse = cache.check_reuse("rustfmt", Some("matching-digest"), true);
+        assert!(
+            !reuse.reusable,
+            "cache entry without evidence log digest must not be reusable"
+        );
+        assert_eq!(
+            reuse.reason, "evidence_digest_missing",
+            "reason must be evidence_digest_missing"
+        );
+    }
 }
