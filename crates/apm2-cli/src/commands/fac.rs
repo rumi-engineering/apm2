@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
     PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
     SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
     TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
@@ -3808,7 +3808,8 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
 /// Execute `apm2 fac lane reset <lane_id>`.
 ///
 /// Resets a lane by deleting its workspace, target, logs, and per-lane env
-/// isolation subdirectories (`home`, `tmp`, `xdg_cache`, `xdg_config`) using
+/// isolation subdirectories (`home`, `tmp`, `xdg_cache`, `xdg_config`,
+/// `xdg_data`, `xdg_state`, `xdg_runtime`) using
 /// `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
 ///
 /// # State Machine
@@ -3928,18 +3929,13 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     };
 
-    // TCK-00575: Include per-lane env isolation directories (home, tmp,
-    // xdg_cache, xdg_config) in the reset so that stale env state does not
+    // TCK-00575: Include all per-lane env isolation directories (home, tmp,
+    // xdg_cache, xdg_config, xdg_data, xdg_state, xdg_runtime) in the reset
+    // so that stale env state does not
     // persist across lane reuses.
-    let subdirs = [
-        "workspace",
-        "target",
-        "logs",
-        "home",
-        "tmp",
-        "xdg_cache",
-        "xdg_config",
-    ];
+    let mut subdirs: Vec<&str> = vec!["workspace", "target", "logs"];
+    subdirs.extend_from_slice(LANE_ENV_DIRS);
+
     let mut total_files: u64 = 0;
     let mut total_dirs: u64 = 0;
     let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
@@ -5170,6 +5166,53 @@ mod tests {
             .lane_status(lane_id)
             .expect("lane status after reset");
         assert_ne!(status_after.state, LaneState::Corrupt);
+    }
+
+    #[test]
+    fn test_lane_reset_removes_all_per_lane_env_dirs() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+
+        let mut reset_targets = vec![
+            lane_dir.join("workspace"),
+            lane_dir.join("target"),
+            lane_dir.join("logs"),
+        ];
+        for &subdir in LANE_ENV_DIRS {
+            reset_targets.push(lane_dir.join(subdir));
+        }
+
+        for target in &reset_targets {
+            std::fs::create_dir_all(target).expect("create lane reset target");
+            std::fs::write(target.join("stale-state"), b"stale").expect("write stale state");
+        }
+
+        let exit_code = run_lane_reset(
+            &LaneResetArgs {
+                lane_id: lane_id.to_string(),
+                force: false,
+                json: false,
+            },
+            false,
+        );
+        assert_eq!(exit_code, exit_codes::SUCCESS);
+
+        for target in &reset_targets {
+            assert!(
+                !target.exists(),
+                "target {} should be deleted by lane reset",
+                target.display()
+            );
+        }
     }
 
     #[test]

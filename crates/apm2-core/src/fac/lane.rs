@@ -1364,7 +1364,9 @@ impl LaneManager {
     /// 1. Reset workspace (`git reset --hard HEAD`)
     /// 2. Remove untracked files (`git clean -ffdxq`)
     /// 3. Remove temporary directory (`tmp`) via safe deletion
-    /// 4. Prune per-lane env dirs (`home/`, `xdg_cache/`, `xdg_config/`)
+    /// 4. Prune per-lane env dirs from `LANE_ENV_DIRS` (excluding `tmp`):
+    ///    (`home/`, `xdg_cache/`, `xdg_config/`, `xdg_data/`, `xdg_state/`,
+    ///    `xdg_runtime/`)
     /// 5. Enforce log quota by pruning oldest logs to 100 MiB
     ///
     /// # Errors
@@ -1509,14 +1511,14 @@ impl LaneManager {
         }
         steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
 
-        // Step 3b (TCK-00575): Prune per-lane environment directories
-        // (home, xdg_cache, xdg_config). The `tmp` dir is already handled
-        // above in step 3.
-        for env_subdir in &[
-            super::policy::LANE_ENV_DIR_HOME,
-            super::policy::LANE_ENV_DIR_XDG_CACHE,
-            super::policy::LANE_ENV_DIR_XDG_CONFIG,
-        ] {
+        // Step 3b (TCK-00575): Prune per-lane environment directories from
+        // `LANE_ENV_DIRS`. The `tmp` dir is already handled above in
+        // step 3.
+        for &env_subdir in super::policy::LANE_ENV_DIRS {
+            if env_subdir == super::policy::LANE_ENV_DIR_TMP {
+                continue;
+            }
+
             let env_dir = lanes_dir.join(env_subdir);
             if env_dir.exists() {
                 if let Err(err) = safe_rmtree_v1(&env_dir, &lanes_dir) {
@@ -2292,6 +2294,7 @@ const fn validate_string_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fac::policy;
 
     fn init_git_workspace(path: &Path) {
         if path.exists() {
@@ -3159,9 +3162,48 @@ mod tests {
             "all steps should be reported",
         );
 
+        for &env_subdir in policy::LANE_ENV_DIRS {
+            assert!(
+                !lane_dir.join(env_subdir).exists(),
+                "{env_subdir} should be removed during lane cleanup"
+            );
+        }
+
         let status = manager.lane_status(lane_id).expect("status");
         assert_eq!(status.state, LaneState::Idle);
         assert!(LaneLeaseV1::load(&lane_dir).expect("load lease").is_none());
+    }
+
+    #[test]
+    fn run_lane_cleanup_removes_all_env_dirs() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        for &env_subdir in policy::LANE_ENV_DIRS {
+            let env_dir = lane_dir.join(env_subdir);
+            fs::create_dir_all(&env_dir).expect("create env dir");
+            fs::write(env_dir.join("stale-state"), b"stale").expect("write stale env state");
+        }
+
+        manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("lane cleanup should succeed");
+
+        for &env_subdir in policy::LANE_ENV_DIRS {
+            assert!(
+                !lane_dir.join(env_subdir).exists(),
+                "{env_subdir} should be deleted during cleanup"
+            );
+        }
     }
 
     #[test]
