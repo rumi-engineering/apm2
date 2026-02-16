@@ -592,6 +592,12 @@ run via `systemd-run --system` with a dedicated service user instead of
 - `build_systemd_run_command()`: Construct the `systemd-run` command for
   either backend with properties from `SystemdUnitProperties`.
 - `probe_user_bus()`: Check whether a user D-Bus session bus socket exists.
+- `ExecutionBackendError::is_platform_unavailable()`: Classifies errors as
+  platform-unavailable (acceptable fallback to uncontained) vs configuration
+  errors (fail-closed denial). Platform-unavailable: `UserModeUnavailable`,
+  `SystemModeUnavailable`, `SystemdRunNotFound`, `CgroupV2Unavailable`.
+  All other variants are configuration errors. Used by warm containment
+  setup to enforce fail-closed policy.
 
 **Environment variables**:
 - `APM2_FAC_EXECUTION_BACKEND`: `user` | `system` | `auto` (default: `auto`)
@@ -1117,11 +1123,16 @@ pre-populating build caches in the lane target namespace.
   transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec constraints
   matching the lane profile, identical to how standard bounded test jobs are
   contained. Uses `build_systemd_run_command()` from `execution_backend` for
-  consistent command construction. When `systemd-run` is unavailable, falls
-  back to direct `Command::spawn` with a logged warning (no silent
-  degradation). Environment is forwarded via `--setenv` arguments. The
-  systemd-run process itself inherits the parent environment (no
-  `env_clear()`) because it needs `DBUS_SESSION_BUS_ADDRESS` and
+  consistent command construction. Transient unit names are unique per
+  lane/job/phase (`apm2-warm-{lane}-{job_id_prefix}-{phase}`) to prevent
+  collisions across concurrent workers or rapid re-execution. When
+  `systemd-run` is platform-unavailable (container environments, no user
+  D-Bus session in auto mode), falls back to direct `Command::spawn` with a
+  logged warning. Configuration errors (invalid backend value, invalid
+  service user, env var issues) deny the job (fail-closed) rather than
+  silently disabling containment. Environment is forwarded via `--setenv`
+  arguments. The systemd-run process itself inherits the parent environment
+  (no `env_clear()`) because it needs `DBUS_SESSION_BUS_ADDRESS` and
   `XDG_RUNTIME_DIR` for user-mode D-Bus connectivity; the contained child
   process receives its environment exclusively via `--setenv`.
 - [INV-WARM-015] Heartbeat refresh is integrated into the warm phase `try_wait`

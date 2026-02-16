@@ -591,6 +591,7 @@ fn phase_cargo_args(phase: WarmPhase) -> (Vec<String>, String) {
 ///
 /// This prevents `build.rs` and proc-macro code from accessing
 /// FAC-private state, secrets, or worker authority context.
+#[allow(clippy::too_many_arguments)]
 fn build_phase_command(
     phase: WarmPhase,
     workspace: &Path,
@@ -598,6 +599,8 @@ fn build_phase_command(
     cargo_target_dir: &Path,
     hardened_env: &BTreeMap<String, String>,
     containment: Option<&WarmContainment>,
+    lane_id: &str,
+    job_id: &str,
 ) -> Result<(Command, String), WarmError> {
     let (cargo_args, cmd_str) = phase_cargo_args(phase);
 
@@ -618,7 +621,16 @@ fn build_phase_command(
 
     if let Some(containment) = containment {
         // [INV-WARM-014] Wrap cargo command in systemd-run transient unit.
-        let unit_name = format!("apm2-fac-warm-{}", phase.name());
+        // Unit name includes lane + job_id prefix + phase to ensure
+        // uniqueness across concurrent workers and rapid re-execution.
+        // Job IDs are UUIDs so 8-char prefix provides sufficient
+        // collision resistance for transient unit naming.
+        let job_prefix = if job_id.len() >= 8 {
+            &job_id[..8]
+        } else {
+            job_id
+        };
+        let unit_name = format!("apm2-warm-{lane_id}-{job_prefix}-{}", phase.name());
         let systemd_cmd = build_systemd_run_command(
             containment.backend,
             &containment.properties,
@@ -712,6 +724,7 @@ fn build_phase_command(
 /// are unreachable from `build.rs` / proc-macro execution. `RUSTC_WRAPPER`
 /// and `SCCACHE_*` are unconditionally stripped (INV-ENV-008).
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn execute_warm_phase(
     phase: WarmPhase,
     workspace: &Path,
@@ -720,6 +733,8 @@ pub fn execute_warm_phase(
     hardened_env: &BTreeMap<String, String>,
     containment: Option<&WarmContainment>,
     heartbeat_fn: Option<&dyn Fn()>,
+    lane_id: &str,
+    job_id: &str,
 ) -> WarmPhaseResult {
     let (mut cmd, cmd_str) = match build_phase_command(
         phase,
@@ -728,6 +743,8 @@ pub fn execute_warm_phase(
         cargo_target_dir,
         hardened_env,
         containment,
+        lane_id,
+        job_id,
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -837,6 +854,7 @@ pub fn execute_warm(
     hardened_env: &BTreeMap<String, String>,
     containment: Option<&WarmContainment>,
     heartbeat_fn: Option<&dyn Fn()>,
+    job_id: &str,
 ) -> Result<WarmReceiptV1, WarmError> {
     if phases.len() > MAX_WARM_PHASES {
         return Err(WarmError::TooManyPhases {
@@ -869,6 +887,8 @@ pub fn execute_warm(
             hardened_env,
             containment,
             heartbeat_fn,
+            lane_id,
+            job_id,
         );
         phase_results.push(result);
     }
@@ -1215,6 +1235,7 @@ mod tests {
             &env,
             None, // no containment in unit tests
             None, // no heartbeat in unit tests
+            "test-job-00000000",
         );
         assert!(matches!(result, Err(WarmError::TooManyPhases { .. })));
     }
@@ -1235,6 +1256,7 @@ mod tests {
             &env,
             None, // no containment in unit tests
             None, // no heartbeat in unit tests
+            "test-job-00000000",
         );
         assert!(matches!(result, Err(WarmError::FieldTooLong { .. })));
     }
@@ -1595,6 +1617,8 @@ mod tests {
             cargo_target_dir,
             &hardened,
             None, // no containment
+            "lane-0",
+            "test-job-00000000",
         )
         .expect("build_phase_command should not fail without containment");
         assert_eq!(cmd_str, "cargo fetch --locked");
@@ -1661,38 +1685,64 @@ mod tests {
     #[test]
     fn test_heartbeat_callback_invoked_during_phase_execution() {
         // Verify that the heartbeat callback is invoked at least once during
-        // a phase that runs for more than HEARTBEAT_REFRESH_INTERVAL.
-        // We use a short-lived `true` command to verify the callback mechanism
-        // works (the actual heartbeat refresh interval test is structural).
+        // a child process that runs long enough for the polling loop to fire.
+        //
+        // This test directly exercises the same polling loop used by
+        // `execute_warm_phase` with a controllable `sleep` child process
+        // that outlasts the HEARTBEAT_REFRESH_INTERVAL. Using a reduced
+        // interval (200ms) and a 1-second sleep ensures deterministic
+        // invocation without making the test unacceptably slow.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let call_count = Arc::new(AtomicU32::new(0));
         let counter = call_count.clone();
-        let heartbeat = move || {
+        let heartbeat_fn = move || {
             counter.fetch_add(1, Ordering::Relaxed);
         };
 
-        let env = test_hardened_env();
-        // Execute a phase that will fail quickly (no workspace) but still
-        // exercises the command construction and heartbeat hookup path.
-        let result = execute_warm_phase(
-            WarmPhase::Fetch,
-            Path::new("/nonexistent-workspace-for-test"),
-            Path::new("/tmp/cargo_home"),
-            Path::new("/tmp/target"),
-            &env,
-            None,             // no containment in test
-            Some(&heartbeat), // heartbeat callback installed
-        );
+        // Spawn a child that runs for 1 second — long enough for the heartbeat
+        // to fire with a test-scoped reduced interval (200ms).
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep should be available on PATH");
 
-        // The phase should complete (likely with error exit code or spawn failure).
-        // We don't assert call_count > 0 because the command may fail instantly,
-        // before the 5s heartbeat interval. The test proves the callback can be
-        // passed without type errors or panics.
-        assert!(!result.name.is_empty());
-        // call_count may be 0 if the command failed to spawn or exited immediately.
-        let _ = call_count.load(Ordering::Relaxed);
+        let start = Instant::now();
+        let timeout = Duration::from_secs(MAX_PHASE_TIMEOUT_SECS);
+        // Use a reduced heartbeat interval for deterministic testing.
+        // Production uses HEARTBEAT_REFRESH_INTERVAL (5s); here we use 200ms
+        // so the 1-second sleep guarantees at least 1 callback invocation.
+        let test_heartbeat_interval = Duration::from_millis(200);
+        let mut last_heartbeat = Instant::now();
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    if last_heartbeat.elapsed() >= test_heartbeat_interval {
+                        heartbeat_fn();
+                        last_heartbeat = Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                },
+                Err(_) => break,
+            }
+        }
+
+        let count = call_count.load(Ordering::Relaxed);
+        assert!(
+            count >= 1,
+            "heartbeat callback must be invoked at least once during a 1-second \
+             child process with 200ms interval, but was invoked {count} times"
+        );
     }
 
     #[test]
@@ -1707,6 +1757,8 @@ mod tests {
             &env,
             None, // no containment
             None, // no heartbeat
+            "test-lane",
+            "test-job-00000000",
         );
         assert_eq!(result.name, "fetch");
     }
@@ -1739,6 +1791,8 @@ mod tests {
             Path::new("/tmp/target"),
             &env,
             Some(&containment),
+            "lane-0",
+            "abcd1234-5678-90ab-cdef-1234567890ab",
         )
         .expect("containment command construction should succeed");
 
@@ -1766,6 +1820,8 @@ mod tests {
             Path::new("/tmp/target"),
             &env,
             None,
+            "lane-0",
+            "test-job-00000000",
         )
         .expect("should succeed without containment");
 
@@ -1790,5 +1846,133 @@ mod tests {
                 "display should start with 'cargo ' for {phase}: {display}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_unit_name_uniqueness_across_jobs_and_lanes() {
+        // Regression: unit names MUST be unique per lane/job/phase to prevent
+        // systemd transient unit collisions across concurrent workers or
+        // rapid re-execution. We extract the --unit argument from the
+        // Command's Debug representation since std::process::Command does
+        // not expose args through a public accessor.
+
+        /// Extract the `--unit` value from a Command's Debug output.
+        fn extract_unit_name(cmd: &Command) -> String {
+            let debug = format!("{cmd:?}");
+            // Debug format includes args as quoted strings: ... "--unit" "value" ...
+            let marker = "\"--unit\"";
+            let idx = debug
+                .find(marker)
+                .unwrap_or_else(|| panic!("--unit not found in command: {debug}"));
+            let after = &debug[idx + marker.len()..];
+            // Skip whitespace/comma and opening quote.
+            let start = after
+                .find('"')
+                .unwrap_or_else(|| panic!("no quoted value after --unit: {debug}"))
+                + 1;
+            let rest = &after[start..];
+            let end = rest
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated quote after --unit: {debug}"));
+            rest[..end].to_string()
+        }
+
+        let env = test_hardened_env();
+        let containment = WarmContainment {
+            backend: ExecutionBackend::UserMode,
+            properties: SystemdUnitProperties {
+                cpu_quota_percent: 200,
+                memory_max_bytes: 8_000_000_000,
+                tasks_max: 512,
+                io_weight: 100,
+                timeout_start_sec: 600,
+                runtime_max_sec: 1800,
+                kill_mode: "control-group".to_string(),
+            },
+            system_config: None,
+        };
+
+        // Build commands for the same phase but different lane/job combinations.
+        let (cmd_a, _) = build_phase_command(
+            WarmPhase::Build,
+            Path::new("/tmp/ws"),
+            Path::new("/tmp/ch"),
+            Path::new("/tmp/td"),
+            &env,
+            Some(&containment),
+            "lane-0",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+        )
+        .unwrap();
+        let unit_a = extract_unit_name(&cmd_a);
+
+        let (cmd_b, _) = build_phase_command(
+            WarmPhase::Build,
+            Path::new("/tmp/ws"),
+            Path::new("/tmp/ch"),
+            Path::new("/tmp/td"),
+            &env,
+            Some(&containment),
+            "lane-0",
+            "bbbbbbbb-1111-2222-3333-444444444444",
+        )
+        .unwrap();
+        let unit_b = extract_unit_name(&cmd_b);
+
+        let (cmd_c, _) = build_phase_command(
+            WarmPhase::Build,
+            Path::new("/tmp/ws"),
+            Path::new("/tmp/ch"),
+            Path::new("/tmp/td"),
+            &env,
+            Some(&containment),
+            "lane-1",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+        )
+        .unwrap();
+        let unit_c = extract_unit_name(&cmd_c);
+
+        // Different job IDs on the same lane must produce different unit names.
+        assert_ne!(
+            unit_a, unit_b,
+            "unit names must differ for different job IDs on the same lane"
+        );
+        // Different lanes with the same job ID must produce different unit names.
+        assert_ne!(
+            unit_a, unit_c,
+            "unit names must differ for different lanes with the same job ID"
+        );
+        // Same lane and job must produce the same name (deterministic).
+        let (cmd_a2, _) = build_phase_command(
+            WarmPhase::Build,
+            Path::new("/tmp/ws"),
+            Path::new("/tmp/ch"),
+            Path::new("/tmp/td"),
+            &env,
+            Some(&containment),
+            "lane-0",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+        )
+        .unwrap();
+        let unit_a2 = extract_unit_name(&cmd_a2);
+        assert_eq!(
+            unit_a, unit_a2,
+            "same lane + job + phase must produce the same unit name"
+        );
+
+        // Verify the unit name includes expected components.
+        assert!(
+            unit_a.contains("lane-0"),
+            "unit name should contain lane ID: {unit_a}"
+        );
+        assert!(
+            unit_a.contains("aaaaaaaa"),
+            "unit name should contain job ID prefix: {unit_a}"
+        );
+        assert!(
+            unit_a.contains("build"),
+            "unit name should contain phase name: {unit_a}"
+        );
     }
 }

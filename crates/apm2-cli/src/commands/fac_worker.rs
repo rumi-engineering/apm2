@@ -3559,41 +3559,113 @@ fn execute_warm_job(
     // (bounded test runner, gate execution). This validates prerequisites
     // (user bus for user-mode, systemd-run for system-mode) in one call.
     //
-    // When systemd-run is unavailable (e.g., container environments), fall
-    // back to direct Command::spawn with a logged warning. No silent
-    // degradation — the operator is informed of reduced containment.
+    // Fail-closed: only fall back to uncontained execution when the platform
+    // genuinely doesn't support systemd-run (container environments, no user
+    // D-Bus session in auto mode). Configuration errors (invalid backend
+    // value, invalid service user, env var issues) deny the job — they
+    // indicate operator misconfiguration that should be fixed, not silently
+    // degraded.
     let warm_containment = match select_and_validate_backend() {
         Ok(backend) => {
             let system_config = if backend == ExecutionBackend::SystemMode {
                 match SystemModeConfig::from_env() {
                     Ok(cfg) => Some(cfg),
                     Err(e) => {
-                        eprintln!(
-                            "worker: WARNING: system-mode config failed for warm containment, \
-                             falling back to uncontained execution: {e}"
+                        // System-mode config failure is a configuration error
+                        // (invalid service user, env var issues) — fail the job.
+                        let reason = format!(
+                            "warm containment denied: system-mode config error \
+                             (not a platform limitation): {e}"
                         );
-                        None
+                        eprintln!("worker: warm job {}: {reason}", spec.job_id);
+                        let _ = LaneLeaseV1::remove(lane_dir);
+                        let moved_path = move_to_dir_safe(
+                            claimed_path,
+                            &queue_root.join(DENIED_DIR),
+                            claimed_file_name,
+                        )
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                        let _ = emit_job_receipt(
+                            fac_root,
+                            spec,
+                            FacJobOutcome::Denied,
+                            Some(DenialReasonCode::ValidationFailed),
+                            &reason,
+                            Some(boundary_trace),
+                            Some(queue_trace),
+                            budget_trace,
+                            patch_digest,
+                            Some(canonicalizer_tuple_digest),
+                            moved_path.as_deref(),
+                            policy_hash,
+                            containment_trace,
+                        );
+                        return JobOutcome::Denied { reason };
                     },
                 }
             } else {
                 None
             };
-            if backend == ExecutionBackend::SystemMode && system_config.is_none() {
-                None
-            } else {
-                Some(WarmContainment {
-                    backend,
-                    properties: lane_systemd_properties.clone(),
-                    system_config,
-                })
-            }
+            Some(WarmContainment {
+                backend,
+                properties: lane_systemd_properties.clone(),
+                system_config,
+            })
         },
         Err(e) => {
-            eprintln!(
-                "worker: WARNING: execution backend selection/validation failed for warm \
-                 containment, falling back to uncontained execution: {e}"
-            );
-            None
+            if e.is_platform_unavailable() {
+                // Platform doesn't support systemd-run — acceptable fallback
+                // to uncontained execution with a logged warning.
+                eprintln!(
+                    "worker: WARNING: warm job {} executing WITHOUT systemd-run containment \
+                     (platform unavailable: {e}) — warm phase subprocesses (including build.rs \
+                     and proc-macros) are not resource-limited by transient unit properties",
+                    spec.job_id,
+                );
+                None
+            } else {
+                // Configuration/invariant error — fail-closed, deny the job.
+                let reason = format!(
+                    "warm containment denied: backend configuration error \
+                     (not a platform limitation): {e}"
+                );
+                eprintln!("worker: warm job {}: {reason}", spec.job_id);
+                let _ = LaneLeaseV1::remove(lane_dir);
+                let moved_path = move_to_dir_safe(
+                    claimed_path,
+                    &queue_root.join(DENIED_DIR),
+                    claimed_file_name,
+                )
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
+                let _ = emit_job_receipt(
+                    fac_root,
+                    spec,
+                    FacJobOutcome::Denied,
+                    Some(DenialReasonCode::ValidationFailed),
+                    &reason,
+                    Some(boundary_trace),
+                    Some(queue_trace),
+                    budget_trace,
+                    patch_digest,
+                    Some(canonicalizer_tuple_digest),
+                    moved_path.as_deref(),
+                    policy_hash,
+                    containment_trace,
+                );
+                return JobOutcome::Denied { reason };
+            }
         },
     };
     if warm_containment.is_none() {
@@ -3651,6 +3723,7 @@ fn execute_warm_job(
         &hardened_env,
         warm_containment.as_ref(),
         Some(&heartbeat_fn),
+        &spec.job_id,
     );
 
     let receipt = match warm_result {
