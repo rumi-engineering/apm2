@@ -855,12 +855,7 @@ impl FacJobReceiptV1 {
 
         // TCK-00532: Observed job cost. V1 trailing optionals omit absence
         // markers for backwards compatibility with existing persisted hashes.
-        if let Some(cost) = &self.observed_cost {
-            bytes.push(1u8);
-            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
-            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
-            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
-        }
+        Self::append_observed_cost_marker_v1(&mut bytes, self.observed_cost.as_ref());
 
         // TCK-00573: Sandbox hardening hash. Added as an append-only trailing
         // optional for V1; absence marker is omitted for hash stability.
@@ -871,6 +866,30 @@ impl FacJobReceiptV1 {
         }
 
         bytes
+    }
+
+    fn append_observed_cost_marker_v1(
+        bytes: &mut Vec<u8>,
+        observed_cost: Option<&crate::economics::cost_model::ObservedJobCost>,
+    ) {
+        if let Some(cost) = observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        }
+    }
+
+    fn append_observed_cost_marker_v2(
+        bytes: &mut Vec<u8>,
+        observed_cost: Option<&crate::economics::cost_model::ObservedJobCost>,
+    ) {
+        if let Some(cost) = observed_cost {
+            bytes.push(4u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        }
     }
 
     /// Returns v2 canonical bytes that include `unsafe_direct` in the
@@ -1019,12 +1038,7 @@ impl FacJobReceiptV1 {
         }
 
         // TCK-00532: Observed job cost with a type-specific marker in v2.
-        if let Some(cost) = &self.observed_cost {
-            bytes.push(4u8);
-            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
-            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
-            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
-        }
+        Self::append_observed_cost_marker_v2(&mut bytes, self.observed_cost.as_ref());
 
         // TCK-00573: Sandbox hardening hash. Uses type-specific marker
         // `3u8` to ensure injective encoding (MAJOR-1 fix).
