@@ -16,9 +16,13 @@
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
+#[cfg(unix)]
+use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
 use apm2_core::fac::policy::MAX_POLICY_SIZE;
 use apm2_core::fac::{FacPolicyV1, deserialize_policy, persist_policy};
 
@@ -78,26 +82,26 @@ pub fn load_or_create_fac_policy(fac_root: &Path) -> Result<FacPolicyV1, String>
 }
 
 /// Ensure the managed `CARGO_HOME` directory exists with restrictive
-/// permissions (0o700 on Unix, CTR-2611). This is a one-time setup for
-/// FAC-managed cargo home isolation (TCK-00526).
+/// permissions (0o700 in operator mode, 0o770 in system-mode, CTR-2611). This
+/// is a one-time setup for FAC-managed cargo home isolation (TCK-00526).
 ///
 /// Uses atomic creation (mkdir, handle `AlreadyExists`) to eliminate the
 /// TOCTOU window between existence checks and creation. Rejects symlinks
 /// via `symlink_metadata` to prevent isolation escape (INV-LANE-ENV-001).
 ///
 /// If the directory already exists, verifies that it is owned by the current
-/// user and has mode 0o700 on Unix. Returns an error if permissions are too
-/// permissive or the path is a symlink, preventing cross-user state leakage
-/// or cargo home poisoning.
+/// runtime context and has restrictive permissions on Unix. Returns an error if
+/// permissions are too permissive or the path is a symlink, preventing
+/// cross-user state leakage or cargo home poisoning.
 pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     // Atomic creation: attempt mkdir first, handle AlreadyExists.
     // This eliminates the TOCTOU window between exists() and create().
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        let mode = managed_cargo_home_mode();
         match std::fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(mode)
             .create(cargo_home)
         {
             Ok(()) => {
@@ -134,7 +138,7 @@ pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
 }
 
 /// Verify that an existing managed `CARGO_HOME` directory has restrictive
-/// permissions (0o700), is owned by the current user (CTR-2611), and is
+/// permissions, is owned by the current runtime context (CTR-2611), and is
 /// not a symlink (INV-LANE-ENV-001).
 ///
 /// Delegates to the shared [`apm2_core::fac::verify_dir_permissions`]
@@ -143,6 +147,15 @@ pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn verify_cargo_home_permissions(cargo_home: &Path) -> Result<(), String> {
     apm2_core::fac::verify_dir_permissions(cargo_home, "managed CARGO_HOME")
+}
+
+#[cfg(unix)]
+fn managed_cargo_home_mode() -> u32 {
+    if matches!(select_backend(), Ok(ExecutionBackend::SystemMode)) {
+        0o770
+    } else {
+        0o700
+    }
 }
 
 /// Open a policy file for reading with `O_NOFOLLOW` to atomically reject
@@ -209,13 +222,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cargo_home = dir.path().join("existing_cargo");
         fs::create_dir_all(&cargo_home).expect("mkdir");
-        // On Unix, ensure permissions are 0o700 (the verification check will
-        // reject more permissive modes).
+        // On Unix, ensure permissions are valid for the active mode.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700))
-                .expect("set permissions");
+            fs::set_permissions(
+                &cargo_home,
+                fs::Permissions::from_mode(managed_cargo_home_mode()),
+            )
+            .expect("set permissions");
         }
         ensure_managed_cargo_home(&cargo_home).expect("ensure existing");
     }
@@ -240,9 +255,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cargo_home = dir.path().join("correct_cargo");
         fs::create_dir_all(&cargo_home).expect("mkdir");
-        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700))
-            .expect("set permissions");
-        ensure_managed_cargo_home(&cargo_home).expect("should accept 0o700");
+        fs::set_permissions(
+            &cargo_home,
+            fs::Permissions::from_mode(managed_cargo_home_mode()),
+        )
+        .expect("set permissions");
+        ensure_managed_cargo_home(&cargo_home).expect("should accept mode for active backend");
     }
 
     /// Regression: a symlink at the managed `CARGO_HOME` path must be
@@ -271,7 +289,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("valid_target");
         fs::create_dir_all(&target).expect("create target");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("set permissions");
+        fs::set_permissions(
+            &target,
+            fs::Permissions::from_mode(managed_cargo_home_mode()),
+        )
+        .expect("set permissions");
         let symlink_path = dir.path().join("link_to_valid");
         std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
         let err = verify_cargo_home_permissions(&symlink_path).expect_err("should reject");
