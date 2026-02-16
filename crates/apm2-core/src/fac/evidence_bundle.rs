@@ -52,11 +52,21 @@ use crate::fac::receipt::{BudgetAdmissionTrace, FacJobReceiptV1, QueueAdmissionT
 // Constants
 // =============================================================================
 
-/// Schema identifier for the evidence bundle envelope.
+/// Schema identifier for the evidence bundle envelope (legacy, accepted on
+/// import for backwards compatibility).
 pub const EVIDENCE_BUNDLE_SCHEMA: &str = "apm2.fac.evidence_bundle.v1";
+
+/// Schema identifier for the evidence bundle envelope (v1, canonical).
+pub const EVIDENCE_BUNDLE_ENVELOPE_SCHEMA: &str = "apm2.fac.evidence_bundle_envelope.v1";
+
+/// Schema identifier for the evidence bundle manifest (v1).
+pub const EVIDENCE_BUNDLE_MANIFEST_SCHEMA: &str = "apm2.fac.evidence_bundle_manifest.v1";
 
 /// Maximum envelope file size to read (256 KiB).
 pub const MAX_ENVELOPE_SIZE: usize = 262_144;
+
+/// Maximum manifest file size to read (64 KiB).
+pub const MAX_MANIFEST_SIZE: usize = 65_536;
 
 /// Maximum blob count in a single bundle.
 pub const MAX_BUNDLE_BLOB_COUNT: usize = 256;
@@ -67,8 +77,23 @@ pub const MAX_BLOB_REF_LENGTH: usize = 256;
 /// Maximum job ID length.
 pub const MAX_JOB_ID_LENGTH: usize = 256;
 
+/// Maximum outcome reason string length in the manifest.
+pub const MAX_OUTCOME_REASON_LENGTH: usize = 1024;
+
+/// Maximum envelope hash reference length in the manifest.
+pub const MAX_ENVELOPE_HASH_REF_LENGTH: usize = 256;
+
+/// Maximum manifest entry count.
+pub const MAX_MANIFEST_ENTRIES: usize = 256;
+
+/// Maximum entry description length.
+pub const MAX_ENTRY_DESCRIPTION_LENGTH: usize = 512;
+
 /// BLAKE3 domain separator for envelope content hash.
 const ENVELOPE_HASH_DOMAIN: &[u8] = b"apm2.fac.evidence_bundle.content_hash.v1\0";
+
+/// BLAKE3 domain separator for manifest content hash.
+const MANIFEST_HASH_DOMAIN: &[u8] = b"apm2.fac.evidence_bundle_manifest.content_hash.v1\0";
 
 // =============================================================================
 // Error Types
@@ -214,6 +239,61 @@ pub enum EvidenceBundleError {
         blob_ref: String,
         /// Human-readable detail of the failure.
         detail: String,
+    },
+
+    /// Manifest file exceeds size limit.
+    #[error("manifest too large: {size} > {max}")]
+    ManifestTooLarge {
+        /// Actual manifest size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
+    },
+
+    /// Manifest JSON parse failure.
+    #[error("manifest parse error: {detail}")]
+    ManifestParseError {
+        /// Human-readable parse error detail.
+        detail: String,
+    },
+
+    /// Manifest schema mismatch.
+    #[error("manifest schema mismatch: expected {expected}, found {actual}")]
+    ManifestSchemaMismatch {
+        /// Expected schema identifier.
+        expected: String,
+        /// Actual schema identifier found in manifest.
+        actual: String,
+    },
+
+    /// Manifest content hash verification failed.
+    #[error("manifest content hash mismatch: expected {expected}, actual {actual}")]
+    ManifestContentHashMismatch {
+        /// Expected content hash.
+        expected: String,
+        /// Actual content hash computed from manifest body.
+        actual: String,
+    },
+
+    /// Manifest entries exceed the maximum allowed count.
+    #[error("too many manifest entries: {count} > {max}")]
+    TooManyManifestEntries {
+        /// Actual entry count.
+        count: usize,
+        /// Maximum allowed entry count.
+        max: usize,
+    },
+
+    /// Channel boundary check is required but missing.
+    ///
+    /// Fail-closed: export and import operations require the channel boundary
+    /// check to be present. This prevents construction of bundles that bypass
+    /// RFC-0028 boundary validation.
+    #[error("channel boundary check required for {operation}")]
+    ChannelBoundaryCheckRequired {
+        /// The operation that requires the boundary check (`export` or
+        /// `import`).
+        operation: String,
     },
 }
 
@@ -444,10 +524,12 @@ pub fn import_evidence_bundle(
             detail: e.to_string(),
         })?;
 
-    // Schema check.
-    if envelope.schema != EVIDENCE_BUNDLE_SCHEMA {
+    // Schema check: accept both legacy and canonical envelope schemas.
+    if envelope.schema != EVIDENCE_BUNDLE_SCHEMA
+        && envelope.schema != EVIDENCE_BUNDLE_ENVELOPE_SCHEMA
+    {
         return Err(EvidenceBundleError::SchemaMismatch {
-            expected: EVIDENCE_BUNDLE_SCHEMA.to_string(),
+            expected: format!("{EVIDENCE_BUNDLE_SCHEMA} or {EVIDENCE_BUNDLE_ENVELOPE_SCHEMA}"),
             actual: envelope.schema,
         });
     }
@@ -990,6 +1072,335 @@ fn validate_economics_traces(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Manifest Types
+// =============================================================================
+
+/// A single entry in the evidence bundle manifest.
+///
+/// Each entry describes one evidence artifact (envelope, blob, or auxiliary
+/// file) by its content hash and role within the bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceBundleManifestEntryV1 {
+    /// Role label for this entry (e.g., `"envelope"`, `"blob"`, `"job_spec"`).
+    pub role: String,
+    /// Content-addressed hash reference (`b3-256:<hex>`).
+    pub content_hash_ref: String,
+    /// Human-readable description of the entry (bounded by
+    /// `MAX_ENTRY_DESCRIPTION_LENGTH`).
+    pub description: String,
+}
+
+/// A self-describing manifest for evidence bundle discovery and indexing.
+///
+/// The manifest is a lightweight outer document that references the envelope
+/// by its content hash, carries summary metadata for indexing, and lists all
+/// constituent artifacts.  It is designed for bounded parsing at the import
+/// boundary with fail-closed semantics.
+///
+/// # Security Invariants
+///
+/// - [INV-MF-001] Import refuses manifests larger than `MAX_MANIFEST_SIZE`.
+/// - [INV-MF-002] Import refuses when schema does not match
+///   `EVIDENCE_BUNDLE_MANIFEST_SCHEMA`.
+/// - [INV-MF-003] Import refuses when content hash does not verify.
+/// - [INV-MF-004] Import refuses when `entries.len()` exceeds
+///   `MAX_MANIFEST_ENTRIES`.
+/// - [INV-MF-005] All string fields are bounded during import.
+/// - [INV-MF-006] Channel boundary check presence is required for manifest
+///   construction (fail-closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceBundleManifestV1 {
+    /// Schema identifier (must be `EVIDENCE_BUNDLE_MANIFEST_SCHEMA`).
+    pub schema: String,
+    /// The job ID this manifest belongs to.
+    pub job_id: String,
+    /// String representation of the job outcome (e.g., `"Completed"`,
+    /// `"Denied"`).
+    pub outcome: String,
+    /// Human-readable outcome reason (bounded by `MAX_OUTCOME_REASON_LENGTH`).
+    pub outcome_reason: String,
+    /// Epoch timestamp (seconds) when the manifest was created.
+    pub timestamp_secs: u64,
+    /// Content hash of the associated envelope (`b3-256:<hex>`).
+    pub envelope_content_hash: String,
+    /// Number of blobs referenced by the envelope.
+    pub blob_count: usize,
+    /// Whether an RFC-0028 channel boundary check was present at manifest
+    /// construction time.  Must be `true` for a valid manifest.
+    pub channel_boundary_checked: bool,
+    /// Manifest entries describing each artifact in the bundle.
+    pub entries: Vec<EvidenceBundleManifestEntryV1>,
+    /// BLAKE3 content hash of the manifest body (excluding this field).
+    pub content_hash: String,
+}
+
+// =============================================================================
+// Manifest Hashing
+// =============================================================================
+
+/// Compute the BLAKE3 content hash of a manifest.
+///
+/// The hash covers all fields except `content_hash` using domain-separated,
+/// length-prefixed encoding for deterministic framing.
+#[allow(clippy::cast_possible_truncation)]
+fn compute_manifest_content_hash(manifest: &EvidenceBundleManifestV1) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MANIFEST_HASH_DOMAIN);
+
+    // -- schema --
+    hash_len_prefixed(&mut hasher, manifest.schema.as_bytes());
+
+    // -- job_id --
+    hash_len_prefixed(&mut hasher, manifest.job_id.as_bytes());
+
+    // -- outcome --
+    hash_len_prefixed(&mut hasher, manifest.outcome.as_bytes());
+
+    // -- outcome_reason --
+    hash_len_prefixed(&mut hasher, manifest.outcome_reason.as_bytes());
+
+    // -- timestamp_secs --
+    hasher.update(&manifest.timestamp_secs.to_le_bytes());
+
+    // -- envelope_content_hash --
+    hash_len_prefixed(&mut hasher, manifest.envelope_content_hash.as_bytes());
+
+    // -- blob_count --
+    hasher.update(&(manifest.blob_count as u64).to_le_bytes());
+
+    // -- channel_boundary_checked --
+    hasher.update(&[u8::from(manifest.channel_boundary_checked)]);
+
+    // -- entries (length-prefixed array + per-element framing) --
+    hasher.update(&(manifest.entries.len() as u64).to_le_bytes());
+    for entry in &manifest.entries {
+        hash_len_prefixed(&mut hasher, entry.role.as_bytes());
+        hash_len_prefixed(&mut hasher, entry.content_hash_ref.as_bytes());
+        hash_len_prefixed(&mut hasher, entry.description.as_bytes());
+    }
+
+    *hasher.finalize().as_bytes()
+}
+
+// =============================================================================
+// Manifest Export
+// =============================================================================
+
+/// Build an evidence bundle manifest from an envelope.
+///
+/// The manifest is a lightweight outer document referencing the envelope
+/// by its content hash and carrying summary metadata for indexing.
+///
+/// # Channel Boundary Check Requirement
+///
+/// The envelope must have been constructed from a receipt that includes an
+/// RFC-0028 channel boundary trace.  The `channel_boundary_checked` field
+/// is set based on the boundary check data in the envelope.  If the boundary
+/// check fields indicate an unchecked state (source is `Unknown` and
+/// `broker_verified` is false), the manifest construction fails with
+/// `ChannelBoundaryCheckRequired`.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError` if:
+/// - The entry count exceeds `MAX_MANIFEST_ENTRIES`.
+/// - The channel boundary check requirement is not met.
+pub fn build_evidence_bundle_manifest(
+    envelope: &EvidenceBundleEnvelopeV1,
+    additional_entries: &[EvidenceBundleManifestEntryV1],
+) -> Result<EvidenceBundleManifestV1, EvidenceBundleError> {
+    // Determine channel boundary check status from the envelope.
+    // Fail-closed: if the boundary check fields indicate an unchecked
+    // state, refuse to build the manifest.
+    let boundary_checked = envelope.boundary_check.source != ChannelSource::Unknown
+        || envelope.boundary_check.broker_verified;
+
+    if !boundary_checked {
+        return Err(EvidenceBundleError::ChannelBoundaryCheckRequired {
+            operation: "manifest_build".to_string(),
+        });
+    }
+
+    // Build the default entries: envelope + blobs.
+    let mut entries = Vec::with_capacity(1 + envelope.blob_refs.len() + additional_entries.len());
+
+    // Entry for the envelope itself.
+    entries.push(EvidenceBundleManifestEntryV1 {
+        role: "envelope".to_string(),
+        content_hash_ref: envelope.content_hash.clone(),
+        description: "Evidence bundle envelope".to_string(),
+    });
+
+    // Entries for each blob.
+    for (i, blob_ref) in envelope.blob_refs.iter().enumerate() {
+        entries.push(EvidenceBundleManifestEntryV1 {
+            role: "blob".to_string(),
+            content_hash_ref: blob_ref.clone(),
+            description: format!("Blob artifact #{i}"),
+        });
+    }
+
+    // Additional caller-supplied entries.
+    entries.extend_from_slice(additional_entries);
+
+    // Enforce entry count bound.
+    if entries.len() > MAX_MANIFEST_ENTRIES {
+        return Err(EvidenceBundleError::TooManyManifestEntries {
+            count: entries.len(),
+            max: MAX_MANIFEST_ENTRIES,
+        });
+    }
+
+    // Build manifest without content hash first.
+    let mut manifest = EvidenceBundleManifestV1 {
+        schema: EVIDENCE_BUNDLE_MANIFEST_SCHEMA.to_string(),
+        job_id: envelope.receipt.job_id.clone(),
+        outcome: format!("{:?}", envelope.receipt.outcome),
+        outcome_reason: envelope.receipt.reason.clone(),
+        timestamp_secs: envelope.receipt.timestamp_secs,
+        envelope_content_hash: envelope.content_hash.clone(),
+        blob_count: envelope.blob_refs.len(),
+        channel_boundary_checked: boundary_checked,
+        entries,
+        content_hash: String::new(),
+    };
+
+    // Compute content hash over canonical bytes.
+    let hash = compute_manifest_content_hash(&manifest);
+    manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+    Ok(manifest)
+}
+
+/// Serialize a manifest to JSON bytes.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError::ManifestParseError` if serialization fails.
+pub fn serialize_manifest(
+    manifest: &EvidenceBundleManifestV1,
+) -> Result<Vec<u8>, EvidenceBundleError> {
+    serde_json::to_vec_pretty(manifest).map_err(|e| EvidenceBundleError::ManifestParseError {
+        detail: e.to_string(),
+    })
+}
+
+// =============================================================================
+// Manifest Import (fail-closed)
+// =============================================================================
+
+/// Import and validate an evidence bundle manifest from JSON bytes.
+///
+/// This function enforces fail-closed validation:
+/// 1. INV-MF-001: Bounded size check.
+/// 2. INV-MF-002: Schema verification.
+/// 3. INV-MF-004: Entry count bound.
+/// 4. INV-MF-005: Per-field length bounds.
+/// 5. INV-MF-003: Content hash integrity.
+/// 6. INV-MF-006: Channel boundary check must be `true`.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError` for any validation failure.
+pub fn import_evidence_bundle_manifest(
+    data: &[u8],
+) -> Result<EvidenceBundleManifestV1, EvidenceBundleError> {
+    // INV-MF-001: Bounded read.
+    if data.len() > MAX_MANIFEST_SIZE {
+        return Err(EvidenceBundleError::ManifestTooLarge {
+            size: data.len(),
+            max: MAX_MANIFEST_SIZE,
+        });
+    }
+
+    // Parse manifest.
+    let manifest: EvidenceBundleManifestV1 =
+        serde_json::from_slice(data).map_err(|e| EvidenceBundleError::ManifestParseError {
+            detail: e.to_string(),
+        })?;
+
+    // INV-MF-002: Schema check.
+    if manifest.schema != EVIDENCE_BUNDLE_MANIFEST_SCHEMA {
+        return Err(EvidenceBundleError::ManifestSchemaMismatch {
+            expected: EVIDENCE_BUNDLE_MANIFEST_SCHEMA.to_string(),
+            actual: manifest.schema,
+        });
+    }
+
+    // INV-MF-004: Entry count bound.
+    if manifest.entries.len() > MAX_MANIFEST_ENTRIES {
+        return Err(EvidenceBundleError::TooManyManifestEntries {
+            count: manifest.entries.len(),
+            max: MAX_MANIFEST_ENTRIES,
+        });
+    }
+
+    // INV-MF-005: Per-field length bounds.
+    if manifest.job_id.len() > MAX_JOB_ID_LENGTH {
+        return Err(EvidenceBundleError::FieldTooLong {
+            field: "manifest.job_id".to_string(),
+            actual: manifest.job_id.len(),
+            max: MAX_JOB_ID_LENGTH,
+        });
+    }
+    if manifest.outcome_reason.len() > MAX_OUTCOME_REASON_LENGTH {
+        return Err(EvidenceBundleError::FieldTooLong {
+            field: "manifest.outcome_reason".to_string(),
+            actual: manifest.outcome_reason.len(),
+            max: MAX_OUTCOME_REASON_LENGTH,
+        });
+    }
+    if manifest.envelope_content_hash.len() > MAX_ENVELOPE_HASH_REF_LENGTH {
+        return Err(EvidenceBundleError::FieldTooLong {
+            field: "manifest.envelope_content_hash".to_string(),
+            actual: manifest.envelope_content_hash.len(),
+            max: MAX_ENVELOPE_HASH_REF_LENGTH,
+        });
+    }
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.description.len() > MAX_ENTRY_DESCRIPTION_LENGTH {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("manifest.entries[{i}].description"),
+                actual: entry.description.len(),
+                max: MAX_ENTRY_DESCRIPTION_LENGTH,
+            });
+        }
+        if entry.content_hash_ref.len() > MAX_ENVELOPE_HASH_REF_LENGTH {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("manifest.entries[{i}].content_hash_ref"),
+                actual: entry.content_hash_ref.len(),
+                max: MAX_ENVELOPE_HASH_REF_LENGTH,
+            });
+        }
+    }
+
+    // INV-MF-003: Content hash integrity.
+    let computed = compute_manifest_content_hash(&manifest);
+    let expected_hex = format!("b3-256:{}", hex::encode(computed));
+    if !bool::from(
+        expected_hex
+            .as_bytes()
+            .ct_eq(manifest.content_hash.as_bytes()),
+    ) {
+        return Err(EvidenceBundleError::ManifestContentHashMismatch {
+            expected: expected_hex,
+            actual: manifest.content_hash,
+        });
+    }
+
+    // INV-MF-006: Channel boundary check must be true.
+    if !manifest.channel_boundary_checked {
+        return Err(EvidenceBundleError::ChannelBoundaryCheckRequired {
+            operation: "manifest_import".to_string(),
+        });
+    }
+
+    Ok(manifest)
 }
 
 // =============================================================================
@@ -2032,5 +2443,542 @@ pub mod tests {
         assert!(result.is_ok(), "empty blob_refs should succeed");
 
         let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    // =========================================================================
+    // TCK-00542: Manifest struct tests
+    // =========================================================================
+
+    #[test]
+    fn manifest_build_and_import_round_trip() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        let manifest =
+            build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build should succeed");
+
+        assert_eq!(manifest.schema, EVIDENCE_BUNDLE_MANIFEST_SCHEMA);
+        assert_eq!(manifest.job_id, "test-job-001");
+        assert_eq!(manifest.outcome, "Completed");
+        assert_eq!(manifest.envelope_content_hash, envelope.content_hash);
+        assert!(manifest.channel_boundary_checked);
+        assert_eq!(manifest.entries.len(), 1); // envelope entry only
+        assert_eq!(manifest.entries[0].role, "envelope");
+
+        let data = serialize_manifest(&manifest).expect("serialize should succeed");
+        let imported = import_evidence_bundle_manifest(&data).expect("import should succeed");
+        assert_eq!(imported, manifest);
+    }
+
+    #[test]
+    fn manifest_with_blob_refs_round_trip() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let blob_refs = vec!["b3-256:aabbccdd".to_string(), "b3-256:eeff0011".to_string()];
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &blob_refs)
+            .expect("export should succeed");
+
+        let manifest =
+            build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build should succeed");
+
+        // 1 envelope + 2 blobs = 3 entries
+        assert_eq!(manifest.entries.len(), 3);
+        assert_eq!(manifest.entries[0].role, "envelope");
+        assert_eq!(manifest.entries[1].role, "blob");
+        assert_eq!(manifest.entries[2].role, "blob");
+        assert_eq!(manifest.blob_count, 2);
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let imported = import_evidence_bundle_manifest(&data).expect("import");
+        assert_eq!(imported, manifest);
+    }
+
+    #[test]
+    fn manifest_with_additional_entries_round_trip() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        let extra = vec![EvidenceBundleManifestEntryV1 {
+            role: "job_spec".to_string(),
+            content_hash_ref: "b3-256:deadbeef".to_string(),
+            description: "Job specification artifact".to_string(),
+        }];
+
+        let manifest = build_evidence_bundle_manifest(&envelope, &extra)
+            .expect("manifest build should succeed");
+
+        assert_eq!(manifest.entries.len(), 2); // envelope + job_spec
+        assert_eq!(manifest.entries[1].role, "job_spec");
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let imported = import_evidence_bundle_manifest(&data).expect("import");
+        assert_eq!(imported, manifest);
+    }
+
+    #[test]
+    fn manifest_content_hash_is_deterministic() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        let m1 =
+            build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build should succeed");
+        let m2 =
+            build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build should succeed");
+
+        assert_eq!(
+            m1.content_hash, m2.content_hash,
+            "manifest content hash must be deterministic"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_oversized() {
+        let data = vec![0u8; MAX_MANIFEST_SIZE + 1];
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::ManifestTooLarge { .. })),
+            "should reject oversized manifest"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_schema_mismatch() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.schema = "wrong.schema.v1".to_string();
+        // Recompute hash for the altered schema.
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::ManifestSchemaMismatch { .. })
+            ),
+            "should reject manifest schema mismatch"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_tampered_content_hash() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.content_hash =
+            "b3-256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::ManifestContentHashMismatch { .. })
+            ),
+            "should reject tampered manifest content hash"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_too_many_entries() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        // Build a manifest manually with too many entries.
+        let entries: Vec<EvidenceBundleManifestEntryV1> = (0..=MAX_MANIFEST_ENTRIES)
+            .map(|i| EvidenceBundleManifestEntryV1 {
+                role: "blob".to_string(),
+                content_hash_ref: format!("b3-256:{i:064x}"),
+                description: format!("entry {i}"),
+            })
+            .collect();
+
+        let result = build_evidence_bundle_manifest(&envelope, &entries);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::TooManyManifestEntries { .. })
+            ),
+            "should reject too many manifest entries, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_job_id() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.job_id = "x".repeat(MAX_JOB_ID_LENGTH + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong manifest job_id, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_outcome_reason() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.outcome_reason = "x".repeat(MAX_OUTCOME_REASON_LENGTH + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong outcome_reason, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_envelope_hash_ref() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.envelope_content_hash = "h".repeat(MAX_ENVELOPE_HASH_REF_LENGTH + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong envelope_content_hash, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_entry_description() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.entries[0].description = "d".repeat(MAX_ENTRY_DESCRIPTION_LENGTH + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong entry description, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_overlong_entry_hash_ref() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        manifest.entries[0].content_hash_ref = "h".repeat(MAX_ENVELOPE_HASH_REF_LENGTH + 1);
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong entry content_hash_ref, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00542: Channel boundary check requirement
+    // =========================================================================
+
+    #[test]
+    fn manifest_build_refuses_unchecked_boundary() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        // Set to unchecked state: Unknown source + broker_verified=false.
+        envelope.boundary_check.source = ChannelSource::Unknown;
+        envelope.boundary_check.broker_verified = false;
+
+        let result = build_evidence_bundle_manifest(&envelope, &[]);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::ChannelBoundaryCheckRequired { .. })
+            ),
+            "should refuse manifest build when boundary not checked, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_import_refuses_channel_boundary_unchecked() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        // Force channel_boundary_checked to false.
+        manifest.channel_boundary_checked = false;
+        let hash = compute_manifest_content_hash(&manifest);
+        manifest.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::ChannelBoundaryCheckRequired { .. })
+            ),
+            "should refuse import when channel_boundary_checked is false, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00542: Manifest mutation detection tests
+    // =========================================================================
+
+    /// Helper: build a valid manifest, mutate a field WITHOUT recomputing
+    /// `content_hash`, and verify import fails with `ContentHashMismatch`.
+    fn assert_manifest_mutation_detected(
+        label: &str,
+        mutator: impl FnOnce(&mut EvidenceBundleManifestV1),
+    ) {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+        let mut manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+
+        // Apply mutation WITHOUT recomputing content_hash.
+        mutator(&mut manifest);
+
+        let data = serialize_manifest(&manifest).expect("serialize");
+        let result = import_evidence_bundle_manifest(&data);
+        assert!(
+            result.is_err(),
+            "mutation of {label} should be detected, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn manifest_mutation_detected_job_id() {
+        assert_manifest_mutation_detected("job_id", |m| {
+            m.job_id = "tampered-job".to_string();
+        });
+    }
+
+    #[test]
+    fn manifest_mutation_detected_outcome() {
+        assert_manifest_mutation_detected("outcome", |m| {
+            m.outcome = "Denied".to_string();
+        });
+    }
+
+    #[test]
+    fn manifest_mutation_detected_outcome_reason() {
+        assert_manifest_mutation_detected("outcome_reason", |m| {
+            m.outcome_reason = "tampered reason".to_string();
+        });
+    }
+
+    #[test]
+    fn manifest_mutation_detected_timestamp() {
+        assert_manifest_mutation_detected("timestamp_secs", |m| {
+            m.timestamp_secs = 0;
+        });
+    }
+
+    #[test]
+    fn manifest_mutation_detected_envelope_hash() {
+        assert_manifest_mutation_detected("envelope_content_hash", |m| {
+            m.envelope_content_hash = "b3-256:tampered".to_string();
+        });
+    }
+
+    #[test]
+    fn manifest_mutation_detected_blob_count() {
+        assert_manifest_mutation_detected("blob_count", |m| {
+            m.blob_count = 999;
+        });
+    }
+
+    #[test]
+    fn manifest_mutation_detected_entries() {
+        assert_manifest_mutation_detected("entries", |m| {
+            m.entries.push(EvidenceBundleManifestEntryV1 {
+                role: "tampered".to_string(),
+                content_hash_ref: "b3-256:000".to_string(),
+                description: "tampered entry".to_string(),
+            });
+        });
+    }
+
+    // =========================================================================
+    // TCK-00542: Envelope schema backwards compatibility
+    // =========================================================================
+
+    #[test]
+    fn envelope_import_accepts_legacy_schema() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        // The default schema from build is EVIDENCE_BUNDLE_SCHEMA (legacy).
+        assert_eq!(envelope.schema, EVIDENCE_BUNDLE_SCHEMA);
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            result.is_ok(),
+            "should accept legacy schema, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn envelope_import_accepts_canonical_schema() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        // Switch to canonical envelope schema.
+        envelope.schema = EVIDENCE_BUNDLE_ENVELOPE_SCHEMA.to_string();
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            result.is_ok(),
+            "should accept canonical envelope schema, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn envelope_import_refuses_unknown_schema() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        envelope.schema = "apm2.fac.unknown.v1".to_string();
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::SchemaMismatch { .. })),
+            "should reject unknown schema, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00542: deny_unknown_fields enforcement
+    // =========================================================================
+
+    #[test]
+    fn manifest_import_refuses_unknown_fields() {
+        // Construct valid manifest JSON, then inject an unknown field.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+        let manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        let data = serialize_manifest(&manifest).expect("serialize");
+
+        // Parse as generic JSON, inject extra field, re-serialize.
+        let mut json_val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
+        json_val["unknown_field"] = serde_json::json!("should_be_rejected");
+        let tampered = serde_json::to_vec(&json_val).expect("re-serialize");
+
+        let result = import_evidence_bundle_manifest(&tampered);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::ManifestParseError { .. })),
+            "should reject manifest with unknown fields, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_entry_import_refuses_unknown_fields() {
+        // Construct valid manifest JSON, inject unknown field into entry.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+        let manifest = build_evidence_bundle_manifest(&envelope, &[]).expect("manifest build");
+        let data = serialize_manifest(&manifest).expect("serialize");
+
+        let mut json_val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
+        json_val["entries"][0]["extra_field"] = serde_json::json!(true);
+        let tampered = serde_json::to_vec(&json_val).expect("re-serialize");
+
+        let result = import_evidence_bundle_manifest(&tampered);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::ManifestParseError { .. })),
+            "should reject manifest entry with unknown fields, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00542: Hash stability / determinism regression tests
+    // =========================================================================
+
+    #[test]
+    fn manifest_hash_stable_across_builds() {
+        // Build the same manifest three times and verify all hashes match.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export");
+
+        let hashes: Vec<String> = (0..3)
+            .map(|_| {
+                build_evidence_bundle_manifest(&envelope, &[])
+                    .expect("build")
+                    .content_hash
+            })
+            .collect();
+
+        assert_eq!(hashes[0], hashes[1], "hash stability: run 0 vs 1");
+        assert_eq!(hashes[1], hashes[2], "hash stability: run 1 vs 2");
+    }
+
+    #[test]
+    fn manifest_hash_differs_for_different_envelopes() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        let env1 = build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export1");
+        let env2 =
+            build_evidence_bundle_envelope(&receipt, &config, &["b3-256:aabbccdd".to_string()])
+                .expect("export2");
+
+        let m1 = build_evidence_bundle_manifest(&env1, &[]).expect("manifest1");
+        let m2 = build_evidence_bundle_manifest(&env2, &[]).expect("manifest2");
+
+        assert_ne!(
+            m1.content_hash, m2.content_hash,
+            "different envelopes should produce different manifest hashes"
+        );
     }
 }
