@@ -1052,11 +1052,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
-
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn gate_execution_profile_resolves_auto_quota_from_profile() {
@@ -1371,10 +1368,10 @@ mod tests {
             fn drop(&mut self) {
                 for (name, value) in self.vars.drain(..) {
                     if let Some(value) = value {
-                        // SAFETY: serialized via TEST_ENV_LOCK
+                        // SAFETY: serialized via crate::commands::env_var_test_lock
                         unsafe { std::env::set_var(name, value) };
                     } else {
-                        // SAFETY: serialized via TEST_ENV_LOCK
+                        // SAFETY: serialized via crate::commands::env_var_test_lock
                         unsafe { std::env::remove_var(name) };
                     }
                 }
@@ -1385,8 +1382,7 @@ mod tests {
             }
         }
 
-        let _guard = TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
+        let _guard = crate::commands::env_var_test_lock()
             .lock()
             .expect("serialize env-mutating integration test");
 
@@ -1463,7 +1459,7 @@ mod tests {
             env::var("PATH").unwrap_or_default()
         );
 
-        // SAFETY: serialized via TEST_ENV_LOCK
+        // SAFETY: serialized via crate::commands::env_var_test_lock
         unsafe {
             env::set_var("PATH", path_override);
             env::set_var("APM2_HOME", &apm2_home);
