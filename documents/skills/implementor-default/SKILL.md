@@ -85,6 +85,13 @@ decision_tree:
             `apm2 fac review findings --pr <PR_NUMBER> --json`
             This shows all BLOCKER, MAJOR, MINOR, and NIT findings from prior review rounds.
             Use these findings as your fix list — each one is a concrete issue to address.
+            Orchestrator handoffs may include a doctor summary string such as
+            `security=deny(2B/1M/0m/0N) code-quality=approve(0B/0M/1m/3N)`;
+            treat that as triage context only, and always use the command output above
+            as the authoritative full finding payload.
+            Orchestrator dispatch now occurs only after all review dimensions have
+            non-pending formal verdicts, so the findings set is complete and should be
+            addressed in one pass across all dimensions.
             If no PR exists yet (fresh implementation), skip this step.
         - id: LOAD_REQUIRED_READING
           action: "Read SKILL references marked REQUIRED READING and any orchestrator-provided warm handoff files before edits."

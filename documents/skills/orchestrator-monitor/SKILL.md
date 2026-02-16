@@ -27,6 +27,8 @@ notes:
   - "Use `apm2 fac logs --pr <N> --json` as the canonical per-PR log discovery command, then `tail -f` the returned review/pipeline log paths for up-to-date execution output."
   - "Use `apm2 fac doctor --pr <N> --json` as the single per-PR source of findings_summary, merge_readiness, agents, and recommended_action."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
+  - "Canonical control loop: `apm2 fac doctor --pr <N> --json --wait-for-recommended-action --exit-on done`, then route by `recommended_action.action`."
+  - "When doctor emits `recommended_action.command`, execute it verbatim instead of re-deriving command arguments."
 
 references[1]:
   - path: "@documents/skills/implementor-default/SKILL.md"
@@ -86,51 +88,51 @@ decision_tree:
             and formal/computed verdict state for implementor handoff.
         - id: CLASSIFY
           action: |
-            For each PR, assign exactly one state:
-            MERGED | READY_TO_MERGE | PR_CONFLICTING | CI_FAILED | REVIEW_FAILED |
-            REVIEW_MISSING | WAITING_CI | BLOCKED_UNKNOWN.
+            For each PR, treat `recommended_action.action` as the authoritative classification:
+            done | approve | merge | dispatch_implementor | restart_reviews | fix | escalate | wait.
+            The legacy labels (MERGED, READY_TO_MERGE, PR_CONFLICTING, CI_FAILED, REVIEW_FAILED,
+            REVIEW_MISSING, WAITING_CI, BLOCKED_UNKNOWN) are documentation aliases only.
         - id: PLAN_DISPATCH
           action: |
             Create this tick's action list using fixed orchestration bounds:
             (1) never more than 3 total actions per tick,
             (2) never more than 1 action for a single PR per tick,
             (3) at most 1 implementor dispatch and at most 1 restart action per tick.
-            Prioritize states in this order:
-            READY_TO_MERGE, PR_CONFLICTING, CI_FAILED, REVIEW_FAILED, REVIEW_MISSING, WAITING_CI, BLOCKED_UNKNOWN.
+            Prioritize actions in this order:
+            done, approve, merge, dispatch_implementor, restart_reviews, fix, escalate, wait.
       next: EXECUTE_ACTIONS
 
     - id: EXECUTE_ACTIONS
       purpose: "Apply bounded actions while preventing duplicate workers per PR."
-      steps[5]:
-        - id: READY_TO_MERGE_ACTION
-          action: "For READY_TO_MERGE PRs, check main branch and check if the commit was merged, if not, check again shortly until the commit is merged.
-        - id: REVIEW_MONITOR_ACTION
+      steps[4]:
+        - id: TERMINAL_ACTION
           action: |
-            For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
-            Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac doctor --pr <N> --json`
-        - id: FIX_AGENT_ACTION
+            For `recommended_action.action in {done, merge}`, mark the PR completed for this wave.
+            For `approve`, continue polling doctor with `--exit-on done` to await auto-merge completion.
+        - id: COMMAND_DRIVEN_ACTION
           action: |
-            For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent
-            with `/implementor-default <TICKET_ID or PR_CONTEXT>`.
-            Inject @documents/skills/implementor-default/SKILL.md in its context.
-            Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
-        - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run `apm2 fac doctor --pr <N> --json` (per-PR, both lane-scoped and aggregate) and refresh/tail per-PR logs from fac_logs."
+            For all non-terminal actions, if `recommended_action.command` exists, execute it verbatim.
+            Do not synthesize command flags from raw JSON fields.
+        - id: DISPATCH_IMPLEMENTOR_ACTION
+          action: |
+            For `recommended_action.action=dispatch_implementor`, run `recommended_action.command`
+            to retrieve current findings, then dispatch one fresh implementor with
+            `/implementor-default <TICKET_ID or PR_CONTEXT>`.
+            Include `@documents/skills/implementor-default/SKILL.md`, ticket ID, and worktree path
+            in the warm handoff payload.
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE
 
     - id: STALL_AND_BACKPRESSURE
-      purpose: "Contain fanout and recover from stalled workers."
-      steps[3]:
+      purpose: "Contain fanout while deferring stall detection to doctor."
+      steps[1]:
         - id: ENFORCE_BACKPRESSURE
           action: |
             Apply per-PR queue guards before adding actions:
             (1) if a specific PR's review agents are at capacity (check via `apm2 fac doctor --pr <N> --json`), skip net-new implementor dispatches for that PR this tick,
             (2) if a review for the current SHA is already active on a given PR, do not restart it.
             Note: backpressure is always scoped per-PR — a saturated PR does not block dispatch for other PRs.
-        - id: IDLE_AGENT_RECOVERY
-          action: "If an implementor has no progress signal for >=180 seconds, replace with a fresh agent."
       next: SYNC_TICK_FACTS
 
     - id: SYNC_TICK_FACTS
@@ -164,15 +166,18 @@ decision_tree:
 
     - id: FIX_AGENT_PROMPT_CONTRACT
       purpose: "Ensure implementor agent briefs are consistent and conservatively gated."
-      steps[8]:
+      steps[6]:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
           action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
         - id: REQUIRE_FINDINGS_SOURCE
-          action: "Build findings handoff from `apm2 fac doctor --pr <PR_NUMBER> --json` (`findings_summary` + recommendation reason) and include it in the implementor prompt."
+          action: |
+            Build findings handoff from `recommended_action.reason` plus
+            `recommended_action.command` output. The reason already carries per-dimension
+            verdict/count rollups; use command output for full finding payload.
         - id: INCLUDE_REQUIRED_CONTEXT
           action: |
-            Include PR number, branch, HEAD SHA, explicit findings list, and required reference:
-            @documents/skills/implementor-default/SKILL.md.
+            Include PR number, ticket ID, worktree path, explicit findings list, and required
+            reference: @documents/skills/implementor-default/SKILL.md.
         - id: REQUIRE_BRANCH_SYNC_BEFORE_EDIT
           action: |
             Require implementor-owned worktree health loop before any code edits:
@@ -180,18 +185,16 @@ decision_tree:
             (2) synchronize branch ancestry with current mainline policy,
             (3) reduce merge-conflict count to zero,
             (4) proceed only when worktree is conflict-free.
-        - id: ENFORCE_BRANCH_HYGIENE_GATE
-          action: |
-            If branch sync facts are missing from artifacts or unresolved conflicts remain,
-            redispatch a fresh fix subagent.
         - id: REQUIRE_PRE_COMMIT_ORDER
           action: |
             During active edits, run `apm2 fac gates --quick` for short-loop validation.
             Immediately before push, run `apm2 fac gates` and preserve per-gate outcomes in FAC artifacts.
+        - id: ENFORCE_BRANCH_HYGIENE_GATE
+          action: |
+            If branch sync facts are missing from artifacts or unresolved conflicts remain,
+            redispatch a fresh fix subagent.
         - id: REQUIRE_FAC_PUSH
           action: "Push only via `apm2 fac push` (`--ticket` preferred, `--branch` fallback)."
-        - id: REQUIRE_EVIDENCE
-          action: "Require exact command and diff facts in artifacts; do not rely on narrative explanations."
       next: HEARTBEAT_LOOP
 
     - id: REVIEW_GATE_DEFINITION
@@ -214,61 +217,63 @@ decision_tree:
 operational_playbook:
   purpose: "Action table keyed to FAC CLI observations. Use this to decide what to do next."
   scenarios[12]:
-    - trigger: "Doctor reports deny with actionable findings"
-      observed_via: "`apm2 fac doctor --pr <N> --json` shows `recommended_action.action=dispatch_implementor` and findings_summary blocker/major > 0"
-      action: "Dispatch a fresh implementor agent with `/implementor-default` including the full findings list in the handoff. Do not reuse a stalled agent."
+    - trigger: "Doctor reports action=done"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=done`"
+      action: "PR is complete. Remove it from active monitoring scope."
 
-    - trigger: "Only MINOR/NIT findings present"
-      observed_via: "`apm2 fac doctor --pr <N> --json` findings_summary shows blocker=0 and major=0"
-      action: "Do not manually set verdicts. Continue monitoring doctor until merge_readiness becomes true or a new recommendation is emitted."
+    - trigger: "Doctor reports action=approve"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=approve`"
+      action: "All review dimensions approve. Continue polling with `--exit-on done` until merge completion."
 
-    - trigger: "Review posted with PASS verdict and no findings"
-      observed_via: "`apm2 fac doctor --pr <N> --json` shows state=done, terminal_reason=pass for both lanes"
-      action: "PR is READY_TO_MERGE. Verify main branch has the PR merged in and only proceed to the next ticket once"
+    - trigger: "Doctor reports action=merge"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=merge`"
+      action: "Treat as terminal-ready in the current tick and move to done monitoring."
+
+    - trigger: "Doctor reports action=dispatch_implementor"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=dispatch_implementor`"
+      action: "Execute `recommended_action.command` to retrieve structured findings, then dispatch one fresh implementor with `/implementor-default` and full warm handoff payload."
+
+    - trigger: "Doctor reports action=restart_reviews"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=restart_reviews`"
+      action: "Execute `recommended_action.command` verbatim. Doctor already selected `--force` and `--refresh-identity` flags when needed."
+
+    - trigger: "Doctor reports action=wait"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=wait`"
+      action: "Execute `recommended_action.command` to continue bounded polling; do not hand-roll poll loops."
+
+    - trigger: "Doctor reports action=fix"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=fix`"
+      action: "Execute `recommended_action.command` (normally `apm2 fac doctor --pr <N> --fix`) and repoll."
+
+    - trigger: "Doctor reports action=escalate"
+      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=escalate`"
+      action: "Execute `recommended_action.command` for full context and escalate to human operator with the captured output."
+
+    - trigger: "Doctor reason indicates stuck/idle reviewer agents"
+      observed_via: "`recommended_action.reason` includes idle/dispatched warning text"
+      action: "Follow `recommended_action.command`; doctor now owns stale/idle detection. Do not run manual idle-agent heuristics."
 
     - trigger: "Implementor agent pushed a new commit"
-      observed_via: "Agent reports `apm2 fac push` completed, or head SHA changed in `apm2 fac doctor --pr <N> --json`"
-      action: "Monitor review dispatch. Reviews auto-start via CI workflow on push. Check lane status after ~2 minutes. If reviews have not started, use `apm2 fac restart --pr <N>`."
-
-    - trigger: "Review lane shows state=alive"
-      observed_via: "`apm2 fac doctor --pr <N> --json` reports active reviewer agents and recommended_action=wait"
-      action: "Review is in progress. Monitor with `apm2 fac review tail --pr <N> --type <security|quality>` or tail the log file from `apm2 fac logs --pr <N> --json`. Do not restart or dispatch."
-
-    - trigger: "No active reviewers and verdict pending"
-      observed_via: "`apm2 fac doctor --pr <N> --json` reports `recommended_action.action=restart_reviews`"
-      action: "Run the exact command in `recommended_action.command` (normally `apm2 fac restart --pr <N> --refresh-identity`)."
-
-    - trigger: "Integrity/corruption health signal"
-      observed_via: "`apm2 fac doctor --pr <N> --json` reports `recommended_action.action=fix`"
-      action: "Run `apm2 fac doctor --pr <N> --fix`. Do not manually delete state files."
-
-    - trigger: "Review lane shows failed/crashed terminal state"
-      observed_via: "`apm2 fac doctor --pr <N> --json` reports failed/crashed lanes or `recommended_action.action=restart_reviews`"
-      action: "Follow `recommended_action.command`; use `apm2 fac logs --pr <N> --json` only for diagnosis context."
+      observed_via: "Agent reports `apm2 fac push` completed, or head SHA changed in doctor output"
+      action: "Resume doctor polling; review dispatch should appear automatically for the new SHA."
 
     - trigger: "Evidence gates failed during push"
-      observed_via: "`apm2 fac push` exits with error mentioning failing gates (rustfmt, clippy, test, etc.)"
-      action: "Implementor must fix the failing gate. Use `apm2 fac gates --quick` for fast iteration, then `apm2 fac gates` for full validation before retrying `apm2 fac push`."
-
-    - trigger: "PR has merge conflicts with main"
-      observed_via: "`apm2 fac gates` reports merge_conflict_main=FAIL"
-      action: "Implementor must rebase or merge main into the branch and resolve conflicts before any further work. Dispatch a fresh implementor agent with conflict resolution instructions."
+      observed_via: "`apm2 fac push` exits with gate failures (rustfmt, clippy, test, etc.)"
+      action: "Dispatch implementor remediation; require `apm2 fac gates --quick` during iteration and `apm2 fac gates` before the next push."
 
     - trigger: "Stale SHA — review completed for old commit"
-      observed_via: "`apm2 fac doctor --pr <N> --json` shows terminal state but head_sha does not match current PR head"
-      action: "Reviews are bound to a specific SHA. If the PR head has advanced, use `apm2 fac restart --pr <N>` to dispatch fresh reviews for the current head."
+      observed_via: "`apm2 fac doctor --pr <N> --json` indicates stale head binding"
+      action: "Execute doctor-provided restart recommendation for the current head SHA."
 
-    - trigger: "CI workflow stuck in a dispatch loop"
-      observed_via: "CI check keeps re-running, or status comment is being repeatedly edited"
-      action: "Check for corrupt state files (state=corrupt-state). Kill any stale reviewer processes (`ps aux | grep apm2.*fac.*review`). Run `apm2 fac doctor --pr <N> --fix` to repair state, then `apm2 fac restart --pr <N>`. Do not manually delete state files."
-
-invariants[15]:
-  - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. They are frequently stale, cached, or out of sync with actual gate results. Always use `apm2 fac doctor --pr <N> --json` as the authoritative orchestration source, with `apm2 fac logs` for line-by-line diagnostics. Never make orchestration decisions based on GitHub API responses alone."
+invariants[11]:
+  - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. Always use `apm2 fac doctor --pr <N> --json` as the authoritative orchestration surface."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
+  - "When doctor provides `recommended_action.command`, execute it verbatim. Do not re-derive commands from raw JSON fields."
+  - "Use `--exit-on done` as the completion detector; do not parse lifecycle internals to infer completion."
+  - "Treat `recommended_action.action` as the primary classification signal."
+  - "Doctor owns stale/idle reviewer detection; orchestrator does not run independent idle-agent recovery heuristics."
   - "One active implementor agent per PR at any time."
-  - "At most one active review batch (2 review agents: security + quality) per PR at any time."
-  - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
+  - "At most one active review batch (security + quality) per PR at any time."
+  - "All implementor dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
-  - "Implementor handoff prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
-  - "Use fresh fix agents after failed review rounds or stalled progress."
-  - "Throughput optimization should be paired with quality countermetrics (reopen rate, rollback count, repeat BLOCKER rate)."
+  - "Implementor prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."

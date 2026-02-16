@@ -1,0 +1,929 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00609"
+    title: "Close the doctor command gap: every recommended action must carry an executable command"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00605"
+        reason: "TCK-00605 introduced build_recommended_action, the doctor --wait-for-recommended-action poll loop, and auto-merge via maybe_auto_merge_if_ready()."
+      - ticket_id: "TCK-00607"
+        reason: "TCK-00607 S4 auto-nudge changes the review completion flow that feeds into doctor verdicts."
+  root_cause_analysis:
+    summary: |
+      `build_recommended_action()` in
+      `crates/apm2-cli/src/commands/fac_review/mod.rs:2334-2442` is the
+      brain of the orchestrator control loop. The orchestrator-monitor
+      agent polls doctor, reads `recommended_action`, and reacts. Every
+      orchestrator decision routes through this single function.
+
+      The function emits 6 actions. Two have executable commands; four do
+      not. The two WITH commands (`fix`, `restart_reviews`) work flawlessly
+      in the field — the orchestrator runs the command and polls again. The
+      four WITHOUT commands (`dispatch_implementor`, `merge`, `escalate`,
+      `wait`) are exactly where every field failure occurred, because the
+      orchestrator LLM must improvise what to do next.
+
+      Current action cascade:
+
+          1. integrity/corruption  → "fix"                 command: ✓
+          2. merge_ready           → "merge"               command: ✗
+          3. merge conflicts       → "escalate"            command: ✗
+          4. deny/blocker/major    → "dispatch_implementor" command: ✗
+          5. no agents + pending   → "restart_reviews"     command: ✓
+          6. budget exhausted      → "escalate"            command: ✗
+          7. default               → "wait"                command: ✗
+
+      Five defects compound this structural gap:
+
+      DEFECT 1: dispatch_implementor fires before all verdicts are in
+
+      The check at lines 2379-2393 fires when ANY dimension has
+      deny/blocker/major, without verifying that ALL dimensions have
+      non-pending formal_verdicts:
+
+          let requires_implementor_remediation = input.findings_summary.iter().any(|entry| {
+              entry.formal_verdict.eq_ignore_ascii_case("deny")
+                  || entry.counts.blocker > 0
+                  || entry.counts.major > 0
+          });
+          if requires_implementor_remediation { ... }
+
+      The has_pending_verdict check exists at line 2396-2399 but is only
+      used in the restart_reviews branch. The dispatch_implementor branch
+      never consults it. Impact: orchestrator dispatches implementors with
+      partial findings, then dispatches again when the second dimension
+      completes. Double dispatch, wasted resources, possible conflicts.
+
+      DEFECT 2: dispatch_implementor has command: None
+
+      The orchestrator-monitor skill devotes an entire 8-step node
+      (FIX_AGENT_PROMPT_CONTRACT) to constructing the implementor
+      dispatch. It must assemble: ticket ID, PR number, branch, HEAD SHA,
+      worktree path, findings list, and the implementor skill reference.
+      All of this information is already available inside
+      build_recommended_action() (via DoctorActionInputs and the
+      DoctorPrSummary being constructed). But command is None, so the
+      LLM must re-derive it from raw JSON fields.
+
+      Compare with restart_reviews (lines 2405-2421) which constructs a
+      complete command including --force and --refresh-identity flags
+      based on terminal_reason analysis. The dispatch_implementor branch
+      should follow the same pattern.
+
+      DEFECT 3: merge action is unreachable in practice
+
+      Auto-merge fires synchronously inside `finalize_projected_verdict()`
+      at lifecycle.rs:2128 via `maybe_auto_merge_if_ready()`. This runs
+      in the reviewer agent's process during `verdict set`. By the time
+      the orchestrator polls doctor:
+
+        - If auto-merge succeeded: lifecycle_state=merged. But
+          build_recommended_action() never checks lifecycle state for
+          merged — it has no branch for "this PR is already done." The
+          function either returns "merge" (if merge_ready is still true
+          from stale verdict/gate data) or falls through to "wait."
+          Neither is correct. The orchestrator needs "done."
+
+        - If auto-merge failed: lifecycle has a MergeFailed event.
+          merge_ready may still be true (verdicts approve, gates pass,
+          sha fresh) because merge_ready doesn't check for MergeFailed
+          events. Doctor would emit "merge" — but the merge already
+          failed. The orchestrator can't do anything with this.
+
+      The field report confirms: "the merge action never fired because
+      the PR isn't merged by the CLI." The orchestrator used
+      --exit-on dispatch_implementor,merge but the happy path (all
+      approve → auto-merge → done) never produced an exit signal.
+
+      DEFECT 4: wait action has no command
+
+      The terminal fallback (line 2436-2441) returns command: None. The
+      orchestrator receives "wait" with no actionable next step. It must
+      independently decide to poll again, construct the poll command
+      with the right flags, and manage timing — all LLM reasoning that
+      should be deterministic.
+
+      DEFECT 5: escalate action has no command
+
+      Both escalate paths (merge conflicts at line 2370, budget exhaustion
+      at line 2427) return command: None. The orchestrator receives
+      "escalate" but has no guidance on what escalation looks like.
+
+      ROOT CAUSE PATTERN
+
+      Doctor was built as a diagnostic tool for humans. Its action
+      vocabulary and command surface were designed for a human to read
+      "dispatch_implementor" and know what to do. But the primary
+      consumer is now the orchestrator-monitor agent — an LLM in a
+      tight poll loop making programmatic decisions. Every action
+      without a command is a gap where the LLM must improvise, which
+      is expensive, slow, and error-prone.
+
+      The two actions WITH commands (fix, restart_reviews) never appear
+      in bug reports. The four WITHOUT commands are the source of every
+      field failure. The fix is to close the command gap: every action
+      must carry an executable command or sufficient structured context
+      for the orchestrator to act without re-deriving state.
+
+scope:
+  in_scope:
+    - id: S1_GATE_DISPATCH_ON_ALL_VERDICTS
+      title: "Gate dispatch_implementor on all expected verdicts being non-pending"
+      detail: |
+        In `build_recommended_action()` at
+        `crates/apm2-cli/src/commands/fac_review/mod.rs:2379-2393`:
+
+        Add a check that ALL expected dimensions have a non-pending
+        formal_verdict before emitting dispatch_implementor. If any
+        dimension is still pending, fall through to wait.
+
+        Current logic (lines 2379-2393):
+            let requires_implementor_remediation = input.findings_summary.iter().any(|entry| {
+                entry.formal_verdict.eq_ignore_ascii_case("deny")
+                    || entry.counts.blocker > 0
+                    || entry.counts.major > 0
+            });
+            if requires_implementor_remediation {
+                return DoctorRecommendedAction {
+                    action: "dispatch_implementor".to_string(), ...
+                };
+            }
+
+        Fixed logic:
+            let all_verdicts_resolved = !input.findings_summary.iter().any(|entry| {
+                entry.formal_verdict.eq_ignore_ascii_case("pending")
+            });
+            let requires_implementor_remediation = input.findings_summary.iter().any(|entry| {
+                entry.formal_verdict.eq_ignore_ascii_case("deny")
+                    || entry.counts.blocker > 0
+                    || entry.counts.major > 0
+            });
+            if requires_implementor_remediation && all_verdicts_resolved {
+                return DoctorRecommendedAction {
+                    action: "dispatch_implementor".to_string(), ...
+                };
+            }
+
+        The existing has_pending_verdict variable at line 2399 is scoped
+        inside a later block. Either hoist it above the dispatch check or
+        compute all_verdicts_resolved independently.
+
+        Acceptance:
+          - Security finishes with "deny", code-quality still "pending" →
+            doctor recommends "wait", NOT "dispatch_implementor".
+          - Both dimensions finish (security=deny, code-quality=approve) →
+            doctor recommends "dispatch_implementor".
+          - Both dimensions finish with deny → doctor recommends
+            "dispatch_implementor" with the complete findings set.
+
+    - id: S2_DISPATCH_IMPLEMENTOR_COMMAND
+      title: "Populate command and context on dispatch_implementor action"
+      detail: |
+        In `build_recommended_action()`, the dispatch_implementor return
+        at lines 2387-2392 has `command: None`.
+
+        Doctor already has all the information the orchestrator needs to
+        construct the implementor dispatch — it is available either in
+        DoctorActionInputs or in the DoctorPrSummary being built by the
+        caller (run_doctor_inner). The minimal viable command is:
+
+            command: Some(format!(
+                "apm2 fac doctor --pr {} --json",
+                input.pr_number
+            ))
+
+        This tells the orchestrator: "run this command to get the full
+        context you need for the implementor handoff." But this is already
+        what the orchestrator does, so it adds minimal value.
+
+        The higher-value approach: add a structured `context` field to
+        DoctorRecommendedAction that carries the implementor-relevant
+        data inline. But DoctorRecommendedAction is a serialized public
+        struct — adding a field is a schema change.
+
+        The pragmatic middle ground: populate `command` with an
+        `apm2 fac review findings --pr <N> --json` command (gives the
+        orchestrator the exact findings to include in the handoff), and
+        include the reason field with enough structured detail for the
+        orchestrator to act:
+
+            command: Some(format!(
+                "apm2 fac review findings --pr {}",
+                input.pr_number
+            ))
+
+        Additionally, enrich the `reason` field to include the dimension
+        verdicts and finding counts inline, so the orchestrator does not
+        need to cross-reference findings_summary separately. Example:
+
+            reason: "security=deny(2B/1M) code-quality=approve(0B/0M/1m/3N); review findings require implementor remediation"
+
+        This mirrors the field report request for "a merged view showing
+        security: APPROVE (0B/0M/0m/2N) in one field."
+
+        Acceptance:
+          - dispatch_implementor action has command != None.
+          - reason includes per-dimension verdict and finding counts.
+          - Orchestrator can construct implementor handoff from
+            recommended_action alone without parsing findings_summary.
+
+    - id: S3_MERGED_AND_APPROVE_ACTIONS
+      title: "Add 'done' action for merged PRs and 'approve' for all-verdicts-approve"
+      detail: |
+        build_recommended_action() currently has no branch for two states
+        the orchestrator needs:
+
+        (a) PR is already merged (lifecycle.state == "merged"):
+
+            The function never checks lifecycle state for the merged
+            terminal. When auto-merge succeeds via
+            maybe_auto_merge_if_ready() (lifecycle.rs:2006-2097), the
+            lifecycle transitions to "merged" — but build_recommended_action
+            falls through to "merge" (if merge_ready is still true) or
+            "wait". Neither is correct.
+
+            Add a check early in the cascade (after the integrity check,
+            before merge_ready):
+
+                if let Some(lifecycle) = input.lifecycle {
+                    if lifecycle.state.eq_ignore_ascii_case("merged") {
+                        return DoctorRecommendedAction {
+                            action: "done".to_string(),
+                            reason: "PR has been merged to main".to_string(),
+                            priority: "low".to_string(),
+                            command: None,
+                        };
+                    }
+                }
+
+        (b) All verdicts approve but merge_ready is false
+            (e.g., gates not yet cached, sha_freshness unknown):
+
+            The orchestrator's happy-path classification is READY_TO_MERGE,
+            which requires only all_verdicts_approve — NOT the full
+            merge_ready conjunction (gates_pass + sha_fresh +
+            no_merge_conflicts). When all verdicts approve, auto-merge
+            will fire (or already fired). The orchestrator just needs to
+            know "all reviews are done and they all approve" so it can
+            stop dispatching implementors and wait for auto-merge.
+
+            Add a check after the merge_ready check:
+
+                if input.merge_readiness.all_verdicts_approve {
+                    return DoctorRecommendedAction {
+                        action: "approve".to_string(),
+                        reason: "all review dimensions approve; awaiting auto-merge".to_string(),
+                        priority: "low".to_string(),
+                        command: Some(format!(
+                            "apm2 fac doctor --pr {} --json --wait-for-recommended-action",
+                            input.pr_number
+                        )),
+                    };
+                }
+
+        Update DOCTOR_WAIT_EXIT_ACTIONS to include "done" and "approve":
+
+            const DOCTOR_WAIT_EXIT_ACTIONS: [&str; 7] = [
+                "fix", "escalate", "merge", "dispatch_implementor",
+                "restart_reviews", "done", "approve",
+            ];
+
+        Update DoctorExitActionArg enum to include Done and Approve
+        variants with corresponding as_str() mappings.
+
+        The action cascade becomes:
+
+            1. integrity/corruption    → "fix"                  command: ✓
+            2. lifecycle=merged        → "done"                 command: ✓ (None — terminal)
+            3. merge_ready             → "merge"                command: ✓ (None — terminal)
+            4. all_verdicts_approve    → "approve"              command: ✓
+            5. merge conflicts         → "escalate"             command: ✓
+            6. deny/blocker/major      → "dispatch_implementor" command: ✓
+               (gated on all_verdicts_resolved)
+            7. no agents + pending     → "restart_reviews"      command: ✓
+            8. budget exhausted        → "escalate"             command: ✓
+            9. default                 → "wait"                 command: ✓
+
+        Acceptance:
+          - Merged PR returns action="done".
+          - All verdicts approve (but merge_ready=false) returns
+            action="approve".
+          - Orchestrator using --exit-on approve exits on happy path
+            without needing to parse merge_readiness fields.
+          - Orchestrator using --exit-on done can detect post-merge
+            state without parsing lifecycle.state.
+
+    - id: S4_WAIT_AND_ESCALATE_COMMANDS
+      title: "Populate command on wait and escalate actions"
+      detail: |
+        Two remaining actions with command: None.
+
+        WAIT (lines 2436-2441):
+        Change to:
+            command: Some(format!(
+                "apm2 fac doctor --pr {} --json --wait-for-recommended-action",
+                input.pr_number
+            ))
+
+        ESCALATE — merge conflicts (lines 2370-2377):
+        Change to:
+            command: Some(format!(
+                "apm2 fac doctor --pr {} --json",
+                input.pr_number
+            ))
+
+        The escalate command points back to doctor because escalation
+        requires human review of the full doctor output. The command
+        gives the orchestrator something to report when it escalates.
+
+        ESCALATE — budget exhausted (lines 2427-2433):
+        Same pattern:
+            command: Some(format!(
+                "apm2 fac doctor --pr {} --json",
+                input.pr_number
+            ))
+
+        Acceptance:
+          - Every action in the cascade has command != None (or command
+            is intentionally None only for terminal actions like "done"
+            and "merge" where no further CLI action is needed).
+          - Orchestrator never receives a non-terminal action with no
+            guidance on what to do next.
+
+    - id: S5_UPDATE_EXISTING_TESTS
+      title: "Update existing tests for new action semantics"
+      detail: |
+        1. Update dispatch_implementor tests to include both dimensions
+           with non-pending verdicts:
+           - test_build_recommended_action_dispatches_on_formal_deny_without_findings
+             (line 5803): Add code-quality with formal_verdict="approve".
+           - test_build_recommended_action_dispatches_on_major_findings_without_formal_deny
+             (line 5828): Add security with formal_verdict="approve".
+
+        2. Update any test asserting command: None for actions that now
+           have commands (wait, escalate, dispatch_implementor).
+
+        3. Update test_normalize_doctor_exit_actions_defaults_include_escalate
+           to also check for "done" and "approve" in defaults.
+
+        Acceptance:
+          - All existing tests updated and passing.
+          - No test asserts command: None for actions that now have commands.
+
+    - id: S6_ADD_NEW_TESTS
+      title: "Add tests for new action behaviors"
+      detail: |
+        New tests for verdict gating:
+        1. test_build_recommended_action_waits_when_one_dimension_pending_despite_deny:
+           Security=deny+blocker, code-quality=pending → action="wait"
+        2. test_build_recommended_action_dispatches_when_all_dimensions_resolved:
+           Security=deny, code-quality=approve → action="dispatch_implementor"
+        3. test_build_recommended_action_dispatches_when_both_deny:
+           Security=deny, code-quality=deny → action="dispatch_implementor"
+
+        New tests for done action:
+        4. test_build_recommended_action_returns_done_for_merged_lifecycle:
+           lifecycle.state="merged" → action="done"
+        5. test_build_recommended_action_done_takes_priority_over_merge_ready:
+           lifecycle.state="merged" AND merge_ready=true → action="done"
+
+        New tests for approve action:
+        6. test_build_recommended_action_returns_approve_when_all_verdicts_approve_but_not_merge_ready:
+           all_verdicts_approve=true, gates_pass=false → action="approve"
+        7. test_build_recommended_action_merge_takes_priority_over_approve:
+           merge_ready=true → action="merge" (not "approve")
+
+        New tests for commands:
+        8. test_build_recommended_action_wait_has_command:
+           Default fallback → command contains "--wait-for-recommended-action"
+        9. test_build_recommended_action_dispatch_implementor_has_command:
+           dispatch_implementor → command is Some
+        10. test_build_recommended_action_dispatch_implementor_reason_includes_dimension_summary:
+            dispatch_implementor → reason contains per-dimension counts
+
+        New tests for exit-on:
+        11. test_doctor_exit_on_accepts_done_action:
+            --exit-on done parses successfully
+        12. test_doctor_exit_on_accepts_approve_action:
+            --exit-on approve parses successfully
+
+        Acceptance:
+          - All 12 new tests pass.
+          - Full coverage of the new action cascade branches.
+
+    - id: S7_REMOVE_DUPLICATE_TICKET_YAMLS_FROM_RFC_AMENDMENT
+      title: "Remove duplicate ticket YAMLs from RFC-0019 amendment A1"
+      detail: |
+        `documents/rfcs/RFC-0019/20_fac_execution_substrate_build_farm_revision.md`
+        contained a "17. Ticket YAMLs (drop-in proposals)" section starting at
+        line 1876 with ~4135 lines of inline ticket YAML proposals (TCK-00510,
+        TCK-00511, and others). These are duplicates of tickets that have since
+        been properly created in `documents/work/tickets/`.
+
+        The section has been removed. The canonical ticket location is
+        `documents/work/tickets/TCK-NNNNN.yaml` — RFC amendment files should
+        reference tickets by ID, not embed full YAML copies.
+
+        This change is already applied (4135 lines deleted, 1 trailing
+        newline inserted).
+
+        Acceptance:
+          - No `ticket_meta:` blocks remain in the RFC amendment file.
+          - The file ends cleanly after the "warm and GC interfaces /
+            compute lease concept / Nix reproduction" outline.
+
+    - id: S8_HARDEN_STUCK_STALE_AGENT_DETECTION
+      title: "Harden detection of stuck/stale agents so orchestrators don't have to"
+      detail: |
+        The agent registry (lifecycle.rs) tracks `TrackedAgent` entries with
+        state transitions: Dispatched → Running → Completed/Crashed/Reaped.
+        The reaper (`reap_registry_stale_entries()` at lifecycle.rs:1680-1762)
+        auto-reaps agents with dead PIDs or no PID after 240s. But
+        `build_recommended_action()` has no awareness of agent staleness —
+        it only checks `active_agents == 0` for the restart_reviews branch.
+
+        Three gaps force orchestrators to manually detect and recover stuck
+        agents:
+
+        GAP 1: IDLE RUNNING AGENTS NOT DETECTED
+
+        Doctor already collects `last_activity_seconds_ago` (age of most
+        recent event from review events log) and `elapsed_seconds` (time
+        since agent started) in DoctorAgentSnapshot, but
+        build_recommended_action() never consults these. An agent in Running
+        state with a live PID but zero activity for 30+ minutes will produce
+        action="wait" indefinitely.
+
+        Fix: Before the terminal "wait" fallback, check active agents for
+        staleness. If ALL active agents have `last_activity_seconds_ago >
+        AGENT_IDLE_TIMEOUT` (e.g., 300 seconds), emit action="restart_reviews"
+        with reason "all active reviewer agents are idle (no activity for
+        {N}s); recommend restart" and command pointing to
+        `apm2 fac restart --pr <N> --force --refresh-identity`.
+
+        This requires adding agent snapshot data to DoctorActionInputs.
+        Currently DoctorActionInputs carries `active_agents: usize` (a
+        count). Extend it to carry a lightweight activity summary:
+
+            pub struct DoctorAgentActivitySummary {
+                pub active_agents: usize,
+                pub all_active_idle: bool,       // all active agents idle > threshold
+                pub max_idle_seconds: Option<u64>, // worst-case idle time
+            }
+
+        GAP 2: DISPATCHED-NEVER-RUNNING NOT SURFACED
+
+        The reaper handles Dispatched-without-PID after 240s TTL, but doctor
+        recommends "wait" during that entire window. The orchestrator sees
+        "wait" and has no way to know a dispatch may have failed.
+
+        Fix: If any agent is in Dispatched state with elapsed > 120s (the
+        base DISPATCH_PENDING_TTL), include a warning in the recommended
+        action reason: "reviewer dispatch pending for {N}s (may be stuck)".
+        This doesn't change the action — the reaper will handle cleanup —
+        but gives the orchestrator visibility.
+
+        GAP 3: DOCTOR --FIX SHOULD AUTO-REAP AND RESTART
+
+        Currently `derive_doctor_repair_plan()` (mod.rs:1365-1404) sets
+        `reap_stale_agents = true` when it detects dead-PID agents or
+        capacity overflow. But it does NOT trigger a restart after reaping.
+        The orchestrator must poll again, see restart_reviews, and execute
+        it — an extra round-trip.
+
+        Fix: In `run_repair_plan()`, after reaping stale agents, if verdicts
+        are still pending and active_agents drops to zero, also execute a
+        restart (equivalent to `apm2 fac restart --pr <N>`). Log the
+        compound repair: "reaped stale agents and restarted reviews."
+
+        Acceptance:
+          - Running agent with no activity for >300s triggers
+            action="restart_reviews" (not "wait").
+          - Dispatched agent pending for >120s includes warning text in
+            recommended_action.reason.
+          - `apm2 fac doctor --pr <N> --fix` reaps stale agents AND
+            restarts reviews in a single invocation when applicable.
+          - Orchestrator control loop no longer needs IDLE_AGENT_RECOVERY
+            step (180s timeout) — doctor handles it.
+
+    - id: S9_UPDATE_ORCHESTRATOR_MONITOR_SKILL
+      title: "Update orchestrator-monitor SKILL.md for new action vocabulary"
+      detail: |
+        `documents/skills/orchestrator-monitor/SKILL.md` must be updated to
+        reflect the changes in S1-S8. The orchestrator's control loop
+        simplifies dramatically when every action has a command.
+
+        CHANGES REQUIRED:
+
+        1. SIMPLIFY HEARTBEAT_LOOP CLASSIFY step (line 88-91):
+
+           The 8-state classification (MERGED, READY_TO_MERGE, PR_CONFLICTING,
+           CI_FAILED, REVIEW_FAILED, REVIEW_MISSING, WAITING_CI,
+           BLOCKED_UNKNOWN) is now largely redundant — doctor's action
+           vocabulary covers these states directly:
+             - MERGED            → doctor action "done"
+             - READY_TO_MERGE    → doctor action "approve" or "merge"
+             - PR_CONFLICTING    → doctor action "escalate" (conflicts)
+             - REVIEW_FAILED     → doctor action "dispatch_implementor"
+             - REVIEW_MISSING    → doctor action "restart_reviews"
+             - WAITING_CI        → doctor action "wait"
+             - BLOCKED_UNKNOWN   → doctor action "escalate" (budget)
+             - CI_FAILED         → doctor action "fix"
+
+           Update CLASSIFY to: "Read recommended_action from doctor output.
+           The action field is the authoritative classification." Keep the
+           state names as documentation labels but stop requiring the
+           orchestrator to derive them from raw JSON fields.
+
+        2. SIMPLIFY EXECUTE_ACTIONS node (lines 102-121):
+
+           Currently 5 sub-steps with manual logic per state. Replace with
+           a command-driven dispatch pattern:
+
+             - If action has command: execute the command.
+             - If action is terminal (done, merge): record completion, move on.
+             - If action is "dispatch_implementor": execute command to get
+               findings, then dispatch implementor with handoff payload.
+
+           The READY_TO_MERGE_ACTION ("check main branch... check again
+           shortly until merged") is replaced by polling with
+           `--exit-on done` — auto-merge handles the actual merge.
+
+        3. SIMPLIFY FIX_AGENT_PROMPT_CONTRACT node (lines 165-195):
+
+           The 8-step prompt construction is now partially addressed by
+           dispatch_implementor having a command and enriched reason with
+           per-dimension verdicts. The node should focus on what the
+           orchestrator ADDS beyond what doctor provides:
+             - Ticket ID (from orchestrator context, not doctor)
+             - Worktree path (from orchestrator state)
+             - implementor skill invocation syntax
+
+           The node no longer needs to: derive findings from raw
+           findings_summary JSON, compute HEAD SHA, or determine which
+           dimensions failed — this is all in the enriched reason.
+
+        4. UPDATE operational_playbook scenarios (lines 214-263):
+
+           Add new scenarios:
+             - trigger: "Doctor reports action=done"
+               action: "PR is complete. Remove from active monitoring set."
+             - trigger: "Doctor reports action=approve"
+               action: "All reviews approve. Poll with --exit-on done to
+               await auto-merge completion."
+             - trigger: "Doctor reports stuck/idle agents"
+               action: "Follow recommended_action.command (restart with
+               --force). Do not manually inspect agent logs."
+
+           Update existing scenarios to reference command field:
+             - "dispatch_implementor" scenario: "Execute
+               recommended_action.command to retrieve findings, then
+               construct implementor handoff."
+             - "wait" scenario: "Execute recommended_action.command (polls
+               with --wait-for-recommended-action)."
+
+        5. REMOVE IDLE_AGENT_RECOVERY from STALL_AND_BACKPRESSURE (line 133):
+
+           The 180s idle agent timeout is now handled by doctor (S8). Remove
+           the orchestrator-side idle detection. Keep ENFORCE_BACKPRESSURE
+           but simplify: doctor's action already accounts for capacity.
+
+        6. UPDATE invariants (lines 265-275):
+
+           Add: "When doctor provides recommended_action.command, execute it
+           verbatim. Do not re-derive commands from raw JSON fields."
+           Add: "Use --exit-on done to detect PR completion instead of
+           parsing lifecycle.state from doctor JSON."
+
+        7. ADD simplified control loop pattern to notes (lines 24-29):
+
+           The ideal orchestrator loop is now:
+               for pr in scope:
+                 loop:
+                   result = apm2 fac doctor --pr {pr} --json \
+                       --wait-for-recommended-action \
+                       --exit-on done
+                   match result.action:
+                     "done" → break
+                     "dispatch_implementor" → dispatch_with_handoff(result)
+                     _ → execute(result.command)
+
+           Document this pattern in notes as the canonical control loop.
+
+        Acceptance:
+          - SKILL.md references "done" and "approve" as valid doctor actions.
+          - FIX_AGENT_PROMPT_CONTRACT simplified to focus on orchestrator-
+            added context (ticket ID, worktree, skill invocation), not
+            re-deriving findings from raw JSON.
+          - IDLE_AGENT_RECOVERY removed or replaced with "doctor handles
+            stuck agent detection."
+          - Operational playbook has scenarios for done, approve, and
+            stuck-agent recovery.
+          - The simplified control loop pattern is documented.
+
+    - id: S10_UPDATE_IMPLEMENTOR_DEFAULT_SKILL
+      title: "Update implementor-default SKILL.md for doctor integration awareness"
+      detail: |
+        `documents/skills/implementor-default/SKILL.md` needs targeted
+        updates to align with the new doctor action vocabulary. The
+        implementor workflow itself doesn't change — implementors still
+        write code, run gates, and push. But the context they receive from
+        orchestrator handoffs changes because the orchestrator now gets
+        richer information from doctor.
+
+        CHANGES REQUIRED:
+
+        1. UPDATE FETCH_REVIEW_FINDINGS step (START node, line 82-88):
+
+           Currently says:
+               `apm2 fac review findings --pr <PR_NUMBER> --json`
+
+           This is correct and unchanged. But add a note that orchestrator
+           handoffs now include per-dimension verdict summaries from
+           doctor's enriched dispatch_implementor reason (e.g.,
+           "security=deny(2B/1M) code-quality=approve"). The implementor
+           should still fetch full findings via the command, but can use
+           the summary for triage priority.
+
+        2. ADD awareness of doctor action gating in orientation/notes:
+
+           The implementor should know that it is only dispatched AFTER all
+           review dimensions have completed (S1 gating). This means:
+             - The findings set is COMPLETE — no more reviews are pending.
+             - The implementor should address ALL findings across ALL
+               dimensions in a single pass, not just the dimension that
+               triggered dispatch.
+             - There will be no surprise "second dispatch" for a later
+               dimension completing.
+
+        3. UPDATE references section (lines 20-57):
+
+           Verify the RFC-0019 amendment reference at line 26 still points
+           to a valid file (it does — we cleaned up the amendment in S7
+           but didn't remove valid content). No change needed unless the
+           file path changed.
+
+        Acceptance:
+          - SKILL.md notes that dispatch occurs only after all verdicts
+            are resolved.
+          - FETCH_REVIEW_FINDINGS step mentions orchestrator handoff
+            includes per-dimension summary.
+          - No broken references after S7 amendment cleanup.
+
+  out_of_scope:
+    - "Adding a full `apm2 fac dispatch-implementor --pr <N>` CLI verb that autonomously launches an implementor agent. This would be the ideal long-term fix for S2, but is a large change requiring agent lifecycle management in the CLI. The pragmatic S2 fix (command + enriched reason) is sufficient to close the orchestrator improvisation gap."
+    - "Adding `apm2 fac merge --pr <N>` CLI verb. Auto-merge via maybe_auto_merge_if_ready() handles the merge path; the new 'done' and 'approve' actions make the merged/approved state observable to orchestrators."
+    - "Changing the --wait-for-recommended-action poll loop mechanics (the loop correctly polls until action matches exit_on; this ticket changes what actions are emitted, not how the loop works)."
+    - "Adding --repo filter or --exclude-examples to global doctor mode (useful but separate concern from the action cascade)."
+    - "Adding --active-only or --current-sha-only agent filtering (useful but orthogonal to the action command gap)."
+    - "Adding worktree_status.behind_main_by field (useful but orthogonal)."
+
+plan:
+  steps:
+    - id: STEP_01
+      title: "Add 'done' action for merged lifecycle state"
+      detail: |
+        In build_recommended_action(), after the integrity check (line
+        2358) and before the merge_ready check (line 2360), add:
+
+            if let Some(lifecycle) = input.lifecycle {
+                if lifecycle.state.eq_ignore_ascii_case("merged") {
+                    return DoctorRecommendedAction {
+                        action: "done".to_string(),
+                        reason: "PR has been merged to main".to_string(),
+                        priority: "low".to_string(),
+                        command: None,
+                    };
+                }
+            }
+
+    - id: STEP_02
+      title: "Add 'approve' action for all-verdicts-approve"
+      detail: |
+        After the merge_ready check (line 2368) and before the merge
+        conflict check (line 2370), add:
+
+            if input.merge_readiness.all_verdicts_approve {
+                return DoctorRecommendedAction {
+                    action: "approve".to_string(),
+                    reason: "all review dimensions approve; awaiting auto-merge".to_string(),
+                    priority: "low".to_string(),
+                    command: Some(format!(
+                        "apm2 fac doctor --pr {} --json --wait-for-recommended-action",
+                        input.pr_number
+                    )),
+                };
+            }
+
+    - id: STEP_03
+      title: "Gate dispatch_implementor on all_verdicts_resolved"
+      detail: |
+        Before the requires_implementor_remediation check (line 2379),
+        compute:
+            let all_verdicts_resolved = !input.findings_summary.iter().any(|entry| {
+                entry.formal_verdict.eq_ignore_ascii_case("pending")
+            });
+
+        Change the guard from:
+            if requires_implementor_remediation {
+        To:
+            if requires_implementor_remediation && all_verdicts_resolved {
+
+    - id: STEP_04
+      title: "Populate command on dispatch_implementor"
+      detail: |
+        Change the dispatch_implementor return to include a command:
+            command: Some(format!(
+                "apm2 fac review findings --pr {}",
+                input.pr_number
+            ))
+
+        Enrich the reason to include per-dimension summary:
+            Build a compact summary string from input.findings_summary,
+            e.g. "security=deny(2B/1M) code-quality=approve(0B/0M/1m/3N)"
+            and prepend it to the existing reason/push_hint.
+
+    - id: STEP_05
+      title: "Populate command on wait and escalate actions"
+      detail: |
+        1. Wait (line 2436): set command to
+           "apm2 fac doctor --pr {pr} --json --wait-for-recommended-action"
+        2. Escalate — merge conflicts (line 2370): set command to
+           "apm2 fac doctor --pr {pr} --json"
+        3. Escalate — budget exhausted (line 2427): set command to
+           "apm2 fac doctor --pr {pr} --json"
+
+    - id: STEP_06
+      title: "Update DOCTOR_WAIT_EXIT_ACTIONS and DoctorExitActionArg"
+      detail: |
+        1. Add "done" and "approve" to DOCTOR_WAIT_EXIT_ACTIONS array.
+        2. Add Done and Approve variants to DoctorExitActionArg enum.
+        3. Add corresponding as_str() mappings.
+        4. Update normalize_doctor_exit_actions if needed.
+
+    - id: STEP_07
+      title: "Update existing tests"
+      detail: |
+        Update all tests that assert on action values or command: None
+        for actions that now have commands. Update dispatch_implementor
+        tests to include both dimensions with non-pending verdicts.
+
+    - id: STEP_08
+      title: "Add new tests"
+      detail: |
+        Add the 12 tests described in S6. Cover: verdict gating (3),
+        done action (2), approve action (2), command fields (3),
+        exit-on variants (2).
+
+    - id: STEP_09
+      title: "Add agent activity summary to DoctorActionInputs"
+      detail: |
+        1. Define DoctorAgentActivitySummary struct with:
+           active_agents, all_active_idle, max_idle_seconds.
+        2. Populate from DoctorAgentSnapshot data already collected in
+           run_doctor_inner().
+        3. Replace active_agents: usize in DoctorActionInputs with the
+           new summary struct.
+        4. Update build_recommended_action() to use summary fields.
+
+    - id: STEP_10
+      title: "Add stuck/idle agent detection to build_recommended_action()"
+      detail: |
+        Before the terminal "wait" fallback:
+        1. If all_active_idle (all active agents idle > threshold),
+           return restart_reviews with --force --refresh-identity command.
+        2. If any Dispatched agent > 120s, append warning to wait reason.
+
+        In run_repair_plan():
+        3. After reaping stale agents, if active_agents drops to zero and
+           verdicts pending, auto-restart reviews.
+
+    - id: STEP_11
+      title: "Update orchestrator-monitor SKILL.md"
+      detail: |
+        Apply all changes described in S9:
+        1. Simplify CLASSIFY to reference doctor action vocabulary.
+        2. Simplify EXECUTE_ACTIONS to command-driven dispatch.
+        3. Simplify FIX_AGENT_PROMPT_CONTRACT.
+        4. Update operational_playbook with done/approve/stuck scenarios.
+        5. Remove IDLE_AGENT_RECOVERY.
+        6. Update invariants.
+        7. Add simplified control loop pattern to notes.
+
+    - id: STEP_12
+      title: "Update implementor-default SKILL.md"
+      detail: |
+        Apply changes described in S10:
+        1. Add note about per-dimension summary in orchestrator handoffs.
+        2. Add awareness that dispatch is gated on all verdicts resolved.
+        3. Verify references still valid after S7 amendment cleanup.
+
+    - id: STEP_13
+      title: "Verify full cascade and all changes"
+      detail: |
+        1. cargo test -p apm2-cli — all tests pass.
+        2. Verify every action in build_recommended_action() has either
+           command: Some(...) or is a terminal action (done, merge).
+        3. Verify the action cascade order is:
+           fix → done → merge → approve → escalate(conflicts) →
+           dispatch_implementor → restart_reviews(idle) →
+           restart_reviews(no agents) → escalate(budget) → wait
+        4. Grep-verify no remaining command: None for non-terminal actions.
+        5. Verify SKILL.md files are consistent with new action vocabulary.
+        6. Verify no broken references in implementor-default SKILL.md.
+
+definition_of_done:
+  evidence_ids: []
+  criteria:
+    - "Every non-terminal recommended action has `command: Some(...)` — orchestrators never receive an actionable recommendation with no executable next step."
+    - "`build_recommended_action()` returns `done` when lifecycle.state is `merged`."
+    - "`build_recommended_action()` returns `approve` when all_verdicts_approve=true but merge_ready=false."
+    - "`build_recommended_action()` returns `dispatch_implementor` only when ALL expected dimensions have non-pending formal_verdicts AND at least one has deny/blocker/major."
+    - "dispatch_implementor reason includes per-dimension verdict and finding counts inline (e.g., 'security=deny(2B/1M) code-quality=approve')."
+    - "dispatch_implementor command points to `apm2 fac review findings --pr <N>` for structured findings retrieval."
+    - "`--exit-on done` and `--exit-on approve` are valid DoctorExitActionArg variants."
+    - "`--wait-for-recommended-action --exit-on approve` exits on the happy path (all verdicts approve) without the orchestrator needing to parse merge_readiness."
+    - "`--wait-for-recommended-action --exit-on done` exits when auto-merge has completed."
+    - "wait action command contains `--wait-for-recommended-action` so orchestrators have an actionable polling next step."
+    - "Existing dispatch_implementor tests updated to include both dimensions and continue to pass."
+    - "12 new tests cover verdict gating, done/approve actions, command fields, and exit-on parsing."
+    - "Running agent idle >300s with live PID triggers action=restart_reviews (not wait)."
+    - "`apm2 fac doctor --pr <N> --fix` reaps stale agents AND restarts reviews in one invocation when verdicts are pending."
+    - "orchestrator-monitor SKILL.md references done, approve, and stuck-agent actions; FIX_AGENT_PROMPT_CONTRACT simplified; IDLE_AGENT_RECOVERY removed."
+    - "orchestrator-monitor SKILL.md documents the simplified control loop pattern (poll → match action → execute command)."
+    - "implementor-default SKILL.md notes dispatch is gated on all verdicts resolved and handoffs include per-dimension summaries."
+    - "`cargo test -p apm2-cli` passes."
+
+notes:
+  context: |
+    ARCHITECTURAL CONTEXT
+
+    The orchestrator-monitor agent (documents/skills/orchestrator-monitor/
+    SKILL.md) is a reactive controller. It polls doctor, reads
+    recommended_action, and acts. Every orchestrator decision routes
+    through build_recommended_action() — that function IS the control
+    plane.
+
+    The orchestrator classifies each PR into one of 8 states (MERGED,
+    READY_TO_MERGE, PR_CONFLICTING, CI_FAILED, REVIEW_FAILED,
+    REVIEW_MISSING, WAITING_CI, BLOCKED_UNKNOWN). But doctor only emits
+    6 actions. The mapping is lossy — the orchestrator LLM must
+    re-derive state from raw JSON fields to fill the gap.
+
+    FIELD EVIDENCE
+
+    From multi-PR orchestration runs:
+
+    1. dispatch_implementor fires when security denies but code-quality
+       is still pending. Orchestrator dispatches with partial findings.
+       Code-quality finishes → second dispatch_implementor → double
+       dispatch.
+
+    2. "merge action never fired because the PR isn't merged by the CLI."
+       Orchestrator used --exit-on dispatch_implementor,merge for happy
+       path detection. But auto-merge fires in the reviewer's verdict-set
+       codepath (lifecycle.rs:2128 → maybe_auto_merge_if_ready), not via
+       doctor. By the time doctor polls, either the PR is merged (but
+       doctor has no "done" action) or auto-merge hasn't fired yet (but
+       doctor has no "approve" action distinct from "merge"). The
+       orchestrator's happy path has no exit signal.
+
+    3. All command:None actions required LLM improvisation. The
+       orchestrator-monitor skill devotes an 8-step
+       FIX_AGENT_PROMPT_CONTRACT to constructing the implementor dispatch
+       — work that exists solely because dispatch_implementor has no
+       command.
+
+    THE FIX PATTERN
+
+    Two actions WITH commands (fix, restart_reviews) never appear in bug
+    reports. Four WITHOUT commands are the source of every field failure.
+    Close the command gap and the orchestrator reduces to:
+
+        loop:
+          result = apm2 fac doctor --pr N --json \
+              --wait-for-recommended-action \
+              --exit-on done
+          if result.action == "done": break
+          execute(result.command)
+
+    Every action becomes either:
+    - Terminal (done, merge): orchestrator observes and moves on
+    - Actionable (fix, restart_reviews, dispatch_implementor, wait,
+      approve, escalate): orchestrator executes the command
+
+    The LLM reasoning is reserved for the implementor (actual code
+    changes) and the reviewer (actual code review). The orchestrator
+    control loop becomes deterministic.
+  security: "default-deny, least privilege, fail-closed"
